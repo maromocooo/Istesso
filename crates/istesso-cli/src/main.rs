@@ -1,6 +1,6 @@
 //! `istesso` — the command line entry point of Istesso.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use unicode_width::UnicodeWidthStr;
 
 use istesso_agent::{cache, survey, Agent, AgentOptions, HostView, Paths, SurveyOptions};
+use istesso_measure::{Clock, Jitter, ProbeSummary, Report};
 use istesso_pair::{tcp, Identity, PairCode, Peer, PeerStore};
 use istesso_proto::{
     AppEntry, AppInstance, Badge, HostApps, HostManifest, HostRef, HostState, Launch, NetKind,
@@ -77,6 +78,62 @@ enum Command {
     },
     /// Show this device's name and key fingerprint
     Id,
+    /// Work with latency measurements (see docs/measurements/README.md)
+    Measure {
+        #[command(subcommand)]
+        action: MeasureAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeasureAction {
+    /// Compute the added latency from the logs of both sides
+    ///
+    /// Added latency is the round trip on the client's clock minus the
+    /// application's own response time on the host's clock. Inputs are
+    /// paired by their number, so the two clocks need not agree.
+    Report {
+        /// Log written on the host, for example by `istesso-flash --log`
+        #[arg(long, value_name = "FILE")]
+        host: PathBuf,
+        /// Log written by the measuring client
+        #[arg(long, value_name = "FILE")]
+        client: PathBuf,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send synthetic inputs to the test application and time its answers
+    ///
+    /// Measures the path of an input without any video: to the host,
+    /// through the application until its frame is committed, and back.
+    /// The application's own response time is taken off, which leaves the
+    /// transfer in both directions. Run `istesso-flash --listen` on the
+    /// host first. The inputs are neither encrypted nor authenticated:
+    /// use this on a trusted network only.
+    Inputs {
+        /// Where the test application listens: address, optionally with a port
+        #[arg(long, value_name = "ADDRESS[:PORT]")]
+        to: String,
+        /// Number of inputs to send
+        #[arg(long, default_value_t = istesso_measure::MIN_SAMPLES as u64)]
+        count: u64,
+        /// Shortest interval between two inputs, in milliseconds
+        #[arg(long, default_value_t = 200)]
+        min_ms: u64,
+        /// Longest interval between two inputs, in milliseconds
+        #[arg(long, default_value_t = 400)]
+        max_ms: u64,
+        /// Seed of the intervals. The same seed repeats the same run
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Milliseconds to wait for the last answers
+        #[arg(long, default_value_t = 1000)]
+        timeout_ms: u64,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -229,6 +286,7 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("Cache        {}", paths.cache.display());
             Ok(())
         }
+        Command::Measure { action } => run_measure(action),
     }
 }
 
@@ -941,6 +999,113 @@ fn render_hosts(views: &[HostView], now: u64) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// measure
+// ---------------------------------------------------------------------------
+
+fn run_measure(action: MeasureAction) -> Result<(), String> {
+    match action {
+        MeasureAction::Report { host, client, json } => {
+            let host = istesso_measure::host_samples(&read_measurement_log(&host)?);
+            let client = istesso_measure::client_samples(&read_measurement_log(&client)?);
+            let report = Report::build(&host, &client);
+            if json {
+                print_json(&report)
+            } else {
+                print!("{}", report.render());
+                Ok(())
+            }
+        }
+        MeasureAction::Inputs {
+            to,
+            count,
+            min_ms,
+            max_ms,
+            seed,
+            timeout_ms,
+            json,
+        } => {
+            let target = resolve(&to, istesso_measure::DEFAULT_FLASH_PORT)?;
+            let local: SocketAddr = if target.is_ipv4() {
+                (Ipv4Addr::UNSPECIFIED, 0).into()
+            } else {
+                (Ipv6Addr::UNSPECIFIED, 0).into()
+            };
+            let socket =
+                UdpSocket::bind(local).map_err(|e| format!("cannot open a socket: {e}"))?;
+            socket
+                .connect(target)
+                .map_err(|e| format!("cannot reach {to}: {e}"))?;
+
+            let seed = seed.unwrap_or_else(seed_from_time);
+            let mut intervals = Jitter::new(
+                seed,
+                Duration::from_millis(min_ms),
+                Duration::from_millis(max_ms),
+            );
+            let samples = istesso_measure::probe(
+                &socket,
+                &Clock::new(),
+                count,
+                &mut intervals,
+                Duration::from_millis(timeout_ms),
+            )
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::ConnectionRefused => format!(
+                    "nothing takes synthetic inputs at {to}. Start `istesso-flash --listen` there first"
+                ),
+                _ => format!("the measurement stopped: {e}"),
+            })?;
+            let summary = ProbeSummary::of(&samples);
+            if json {
+                print_json(&summary)
+            } else {
+                print!("{}", render_probe(&summary, seed));
+                Ok(())
+            }
+        }
+    }
+}
+
+fn read_measurement_log(path: &std::path::Path) -> Result<Vec<istesso_measure::Record>, String> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    istesso_measure::read_log(std::io::BufReader::new(file))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A seed that differs from run to run. It is printed, so a run can be repeated.
+fn seed_from_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Never names the target: results get pasted into measurement records,
+/// which must not contain addresses.
+fn render_probe(summary: &ProbeSummary, seed: u64) -> String {
+    let mut out = format!(
+        "Synthetic inputs: {} sent, {} answered, {} lost (seed {seed})\n\n",
+        summary.sent,
+        summary.answered,
+        summary.sent - summary.answered
+    );
+    out.push_str(&istesso_measure::table(&[
+        ("transfer, both ways", summary.transfer),
+        ("round trip (client)", summary.round_trip),
+        ("app response (host)", summary.app_response),
+    ]));
+    if summary.answered < istesso_measure::MIN_SAMPLES {
+        out.push_str(&format!(
+            "\nOnly {} answers: the measurement guide asks for {} or more.\n",
+            summary.answered,
+            istesso_measure::MIN_SAMPLES
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,6 +1133,45 @@ mod tests {
         assert_eq!(with_default_port("::1", 47800), "[::1]:47800");
         assert_eq!(with_default_port("[::1]", 47800), "[::1]:47800");
         assert_eq!(with_default_port("[::1]:5000", 47800), "[::1]:5000");
+    }
+
+    #[test]
+    fn probe_results_name_no_address_and_flag_short_runs() {
+        let samples: Vec<istesso_measure::ProbeSample> = (0..3)
+            .map(|id| istesso_measure::ProbeSample {
+                id,
+                sent_ns: id * 300_000_000,
+                answer: (id != 1).then_some(istesso_measure::Answer {
+                    received_ns: id * 300_000_000 + 9_000_000,
+                    input_ns: 5_000_000,
+                    commit_ns: 6_000_000,
+                }),
+            })
+            .collect();
+        let text = render_probe(&ProbeSummary::of(&samples), 42);
+        assert!(text.starts_with("Synthetic inputs: 3 sent, 2 answered, 1 lost (seed 42)"));
+        // 9 ms round trip, 1 ms in the application.
+        let row = |label: &str| -> Vec<String> {
+            let line = text.lines().find(|l| l.starts_with(label)).unwrap();
+            line[label.len()..]
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            row("transfer, both ways"),
+            ["8.00", "8.00", "8.00", "8.00", "2"]
+        );
+        assert_eq!(
+            row("round trip (client)"),
+            ["9.00", "9.00", "9.00", "9.00", "2"]
+        );
+        assert_eq!(
+            row("app response (host)"),
+            ["1.00", "1.00", "1.00", "1.00", "2"]
+        );
+        assert!(text.contains("Only 2 answers"), "{text}");
+        assert!(!text.contains("192.") && !text.contains("127."), "{text}");
     }
 
     #[test]

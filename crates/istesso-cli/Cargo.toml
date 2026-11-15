@@ -18,6 +18,7 @@ istesso-catalog.workspace = true
 istesso-pair.workspace = true
 istesso-link.workspace = true
 istesso-agent.workspace = true
+istesso-measure.workspace = true
 unicode-width.workspace = true
 clap.workspace = true
 serde.workspace = true

@@ -36,7 +36,8 @@
 
 | 作業 | 動かす場所 |
 |---|---|
-| 共通コア（`istesso-proto`、`istesso-pair`、`istesso-link`、`istesso-agent`、`istesso-catalog`、`istesso-doctor`、`istesso-cli`） | どの PC でも可 |
+| 共通コア（`istesso-proto`、`istesso-pair`、`istesso-link`、`istesso-agent`、`istesso-catalog`、`istesso-doctor`、`istesso-measure`、`istesso-cli`） | どの PC でも可 |
+| 計測のテストアプリ（`istesso-flash`） | 窓を開ける PC。ビルドとテストはどの PC でも可 |
 | Mac ホスト（画面の取り込み、VideoToolbox、入力、Core Audio） | Mac の実機。常時稼働の Mac を優先 |
 | Linux ホスト（仮想コンポジター、NVENC、PipeWire） | GPU を積んだ Ubuntu の実機 |
 | 遅延と音切れの計測 | 有線 LAN でつないだ2台の実機 |

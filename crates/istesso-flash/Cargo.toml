@@ -1,0 +1,14 @@
+[package]
+name = "istesso-flash"
+description = "Test application for latency measurements: a window that switches shade on every input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+istesso-measure.workspace = true
+clap.workspace = true
+winit.workspace = true
+softbuffer.workspace = true

@@ -96,6 +96,8 @@ Air の上でコーディングエージェントを動かし、Ubuntu へは SS
 - 入力のたびに窓全体の色を切り替えるだけの、小さなテストアプリ。同じ見た目のものを Linux と macOS の両方で動かせるようにする（手順 5 の当てるテストで使う）。
 - 入力と表示の時刻を記録する仕組み。内容は [measurements/README.md](measurements/README.md) のとおり。
 
+道具は `istesso-flash`（テストアプリ）と `istesso measure`（記録と集計）です。使い方は [measurements/README.md](measurements/README.md) の「道具」に、2台で動かした結果は [measurements/2026-11-16-step1-tools.md](measurements/2026-11-16-step1-tools.md) にあります。クライアント側で表示の時刻を記録する部分は、受信側を組む手順 3 で足します。
+
 ### 手順 2：基準を取る
 
 この機材で、成熟した実装がどこまで届くかを知るための計測です。合格ラインを現実的な数値にするために行います。
