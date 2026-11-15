@@ -3,14 +3,48 @@
 //! Everything that crosses a process or machine boundary is defined here so
 //! that hosts, clients and tools agree on one vocabulary. The types are plain
 //! data with `serde` derives; no I/O happens in this crate.
+//!
+//! Devices are updated one at a time, so two hosts often run different
+//! versions. Readers are therefore tolerant: unknown fields are ignored, new
+//! fields have defaults, and values an older reader does not know either map
+//! to a catch-all variant or are skipped (see [`known_only`]).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Version of the wire vocabulary. Bump on incompatible changes.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Version of the JSON layout written by `ud doctor`.
-pub const MANIFEST_SCHEMA: u32 = 1;
+///
+/// 2: network interfaces list only real adapters and carry their kind and
+/// current addresses.
+pub const MANIFEST_SCHEMA: u32 = 2;
+
+/// Reads a list and drops the items this version does not understand.
+///
+/// Used for lists whose items are enums that grow over time (roles, encoders,
+/// ways to launch an app), so that a newer host does not make its whole
+/// message unreadable for an older one.
+pub fn known_only<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient<T> {
+        Known(T),
+        Unknown(serde::de::IgnoredAny),
+    }
+    let items = Vec::<Lenient<T>>::deserialize(deserializer)?;
+    Ok(items
+        .into_iter()
+        .filter_map(|item| match item {
+            Lenient::Known(value) => Some(value),
+            Lenient::Unknown(_) => None,
+        })
+        .collect())
+}
 
 // ---------------------------------------------------------------------------
 // Host manifest ("role table")
@@ -24,6 +58,7 @@ pub enum OsFamily {
     Linux,
     Windows,
     Android,
+    #[serde(other)]
     Unknown,
 }
 
@@ -82,6 +117,7 @@ pub enum GpuVendor {
     Amd,
     Intel,
     Apple,
+    #[serde(other)]
     Other,
 }
 
@@ -111,12 +147,14 @@ pub enum DisplayServer {
     X11,
     Quartz,
     Headless,
+    #[serde(other)]
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoCaps {
     pub display_server: DisplayServer,
+    #[serde(deserialize_with = "known_only")]
     pub encoders: Vec<EncoderApi>,
 }
 
@@ -127,6 +165,7 @@ pub enum AudioServer {
     PulseAudio,
     CoreAudio,
     Wasapi,
+    #[serde(other)]
     Unknown,
 }
 
@@ -138,11 +177,30 @@ pub struct AudioCaps {
     pub app_capture: bool,
 }
 
-/// A network interface that could receive a Wake-on-LAN packet.
+/// How a network adapter is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetKind {
+    Ethernet,
+    Wifi,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+/// A real network adapter of the host, wired or wireless. Virtual interfaces,
+/// bridges and Thunderbolt networking are left out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetInterface {
     pub name: String,
+    /// Hardware address; the target of a Wake-on-LAN packet.
     pub mac: String,
+    #[serde(default)]
+    pub kind: NetKind,
+    /// IPv4 addresses currently assigned. Empty while the adapter is not
+    /// connected. (IPv6 follows once the control channel listens on it.)
+    #[serde(default)]
+    pub addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -191,9 +249,44 @@ pub struct HostManifest {
     pub audio: AudioCaps,
     pub power: PowerCaps,
     pub tools: Tools,
+    #[serde(deserialize_with = "known_only")]
     pub roles: Vec<Role>,
     /// Things the user should know before relying on this host.
     pub warnings: Vec<String>,
+}
+
+impl HostManifest {
+    /// True when a sleeping host could be woken with a Wake-on-LAN packet:
+    /// it stays in one place and has a wired adapter.
+    pub fn wake_possible(&self) -> bool {
+        !self.power.portable
+            && self
+                .power
+                .interfaces
+                .iter()
+                .any(|i| i.kind == NetKind::Ethernet)
+    }
+
+    /// Addresses other devices can try to reach this host at, wired first.
+    pub fn addresses(&self) -> Vec<String> {
+        let mut interfaces: Vec<&NetInterface> = self.power.interfaces.iter().collect();
+        interfaces.sort_by_key(|i| i.kind != NetKind::Ethernet);
+        interfaces
+            .into_iter()
+            .flat_map(|i| i.addresses.iter().cloned())
+            .collect()
+    }
+}
+
+/// How busy a host is right now.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HostStatus {
+    /// One-minute load average divided by the number of cores: 0.0 is idle,
+    /// 1.0 means every core is busy.
+    #[serde(default)]
+    pub load: Option<f32>,
+    #[serde(default)]
+    pub memory_available_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +322,7 @@ pub struct AppEntry {
 pub enum HostState {
     Awake,
     Asleep,
+    #[serde(other)]
     Unknown,
 }
 
@@ -333,6 +427,95 @@ mod tests {
         let json = serde_json::to_string(&badge).unwrap();
         let back: Badge = serde_json::from_str(&json).unwrap();
         assert_eq!(back, badge);
+    }
+
+    #[test]
+    fn values_from_a_newer_version_do_not_break_older_readers() {
+        // Unknown enum values fall back to the catch-all variant ...
+        let family: OsFamily = serde_json::from_str("\"haiku\"").unwrap();
+        assert_eq!(family, OsFamily::Unknown);
+        let state: HostState = serde_json::from_str("\"hibernating\"").unwrap();
+        assert_eq!(state, HostState::Unknown);
+        let kind: NetKind = serde_json::from_str("\"cellular\"").unwrap();
+        assert_eq!(kind, NetKind::Other);
+
+        // ... unknown list items are skipped, known ones are kept ...
+        let video: VideoCaps = serde_json::from_str(
+            r#"{"display_server":"wayland","encoders":["nvenc","quantum","software"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            video.encoders,
+            vec![EncoderApi::Nvenc, EncoderApi::Software]
+        );
+
+        // ... and fields that did not exist yet get their defaults.
+        let interface: NetInterface =
+            serde_json::from_str(r#"{"name":"en0","mac":"aa:bb:cc:dd:ee:ff","speed":1000}"#)
+                .unwrap();
+        assert_eq!(interface.kind, NetKind::Other);
+        assert!(interface.addresses.is_empty());
+    }
+
+    #[test]
+    fn wake_and_addresses_follow_the_adapters() {
+        let adapter = |name: &str, kind, address: &str| NetInterface {
+            name: name.to_string(),
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            kind,
+            addresses: vec![address.to_string()],
+        };
+        let mut manifest = HostManifest {
+            schema: MANIFEST_SCHEMA,
+            name: "studio".to_string(),
+            os: OsInfo {
+                family: OsFamily::Macos,
+                name: "macOS".to_string(),
+                version: "26.5".to_string(),
+                kernel: String::new(),
+                arch: "aarch64".to_string(),
+            },
+            hardware: Hardware::default(),
+            video: VideoCaps {
+                display_server: DisplayServer::Quartz,
+                encoders: vec![EncoderApi::VideoToolbox],
+            },
+            audio: AudioCaps {
+                server: AudioServer::CoreAudio,
+                app_capture: true,
+            },
+            power: PowerCaps {
+                portable: false,
+                interfaces: vec![
+                    adapter("en1", NetKind::Wifi, "192.168.1.31"),
+                    adapter("en0", NetKind::Ethernet, "192.168.1.30"),
+                ],
+            },
+            tools: Tools::default(),
+            roles: vec![Role::MacApps],
+            warnings: Vec::new(),
+        };
+        assert!(manifest.wake_possible());
+        assert_eq!(manifest.addresses(), vec!["192.168.1.30", "192.168.1.31"]);
+
+        // A laptop moves and sleeps with its lid closed.
+        manifest.power.portable = true;
+        assert!(!manifest.wake_possible());
+
+        // Wi-Fi alone is not enough for Wake-on-LAN.
+        manifest.power.portable = false;
+        manifest
+            .power
+            .interfaces
+            .retain(|i| i.kind == NetKind::Wifi);
+        assert!(!manifest.wake_possible());
+
+        // The manifest survives a round trip through JSON.
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HostManifest>(&json).unwrap(),
+            manifest
+        );
     }
 
     #[test]

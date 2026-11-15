@@ -27,15 +27,18 @@ const MAX_FRAME: usize = 16 * 1024;
 const ACK: &[u8] = b"OK";
 
 /// Waits for one device to connect to `listener` and pairs with it.
+///
+/// Returns what the other device said about itself and the address it
+/// connected from, which is a first hint for reaching it later.
 pub fn host(
     listener: &TcpListener,
     code: &PairCode,
     identity: &Identity,
     device_name: &str,
     timeout: Duration,
-) -> Result<Hello> {
+) -> Result<(Hello, SocketAddr)> {
     let deadline = Instant::now() + timeout;
-    let mut stream = accept_until(listener, deadline)?;
+    let (mut stream, remote) = accept_until(listener, deadline)?;
     set_timeouts(&stream, deadline)?;
 
     let peer_message = read_tagged(&mut stream)?;
@@ -46,7 +49,7 @@ pub fn host(
     write_frame(&mut stream, &session.seal_hello(identity, device_name)?)?;
     let hello = session.open_hello(&read_frame(&mut stream)?)?;
     write_frame(&mut stream, ACK)?;
-    Ok(hello)
+    Ok((hello, remote))
 }
 
 /// Connects to a waiting host and pairs with it.
@@ -74,13 +77,13 @@ pub fn join(
     Ok(hello)
 }
 
-fn accept_until(listener: &TcpListener, deadline: Instant) -> Result<TcpStream> {
+fn accept_until(listener: &TcpListener, deadline: Instant) -> Result<(TcpStream, SocketAddr)> {
     listener.set_nonblocking(true)?;
     loop {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((stream, remote)) => {
                 stream.set_nonblocking(false)?;
-                return Ok(stream);
+                return Ok((stream, remote));
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
@@ -178,7 +181,8 @@ mod tests {
         let host_thread =
             std::thread::spawn(move || host(&listener, &host_code, &studio, "Mac Studio", TIMEOUT));
         let seen_by_joiner = join(addr, &code, &air, "MacBook Air", TIMEOUT).unwrap();
-        let seen_by_host = host_thread.join().unwrap().unwrap();
+        let (seen_by_host, joiner_addr) = host_thread.join().unwrap().unwrap();
+        assert!(joiner_addr.ip().is_loopback());
 
         assert_eq!(seen_by_joiner.device_name, "Mac Studio");
         assert_eq!(seen_by_joiner.public_key, studio_key);

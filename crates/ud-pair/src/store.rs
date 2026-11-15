@@ -118,31 +118,37 @@ impl PeerStore {
 
     /// Removes the peer with this id or (unambiguous) name and returns it.
     pub fn remove(&mut self, selector: &str) -> Result<Option<Peer>> {
-        let by_id = self.peers.iter().position(|p| p.id == selector);
-        let index = match by_id {
-            Some(index) => index,
-            None => {
-                let matches: Vec<usize> = self
-                    .peers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| p.name.eq_ignore_ascii_case(selector))
-                    .map(|(i, _)| i)
-                    .collect();
-                match matches.as_slice() {
-                    [] => return Ok(None),
-                    [index] => *index,
-                    _ => {
-                        return Err(Error::InvalidName(format!(
-                            "several devices are named '{selector}'; use the id instead"
-                        )))
-                    }
-                }
-            }
+        let Some(index) = self.position(selector)? else {
+            return Ok(None);
         };
         let removed = self.peers.remove(index);
         self.save()?;
         Ok(Some(removed))
+    }
+
+    /// The peer with this id or (unambiguous) name.
+    pub fn find(&self, selector: &str) -> Result<Option<&Peer>> {
+        Ok(self.position(selector)?.map(|index| &self.peers[index]))
+    }
+
+    fn position(&self, selector: &str) -> Result<Option<usize>> {
+        if let Some(index) = self.peers.iter().position(|p| p.id == selector) {
+            return Ok(Some(index));
+        }
+        let matches: Vec<usize> = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.name.eq_ignore_ascii_case(selector))
+            .map(|(i, _)| i)
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [index] => Ok(Some(*index)),
+            _ => Err(Error::InvalidName(format!(
+                "several devices are named '{selector}'; use the id instead"
+            ))),
+        }
     }
 
     /// The peer that owns `public_key`, if it is trusted.
@@ -246,7 +252,12 @@ mod tests {
         store.add(Peer::from_hello(&hello("mac", 1))).unwrap();
         store.add(Peer::from_hello(&hello("mac", 2))).unwrap();
         assert!(matches!(store.remove("mac"), Err(Error::InvalidName(_))));
+        assert!(matches!(store.find("mac"), Err(Error::InvalidName(_))));
         assert_eq!(store.peers().len(), 2);
+        // The id always works.
+        let id = store.peers()[1].id.clone();
+        assert_eq!(store.find(&id).unwrap().unwrap().id, id);
+        assert!(store.find("nobody").unwrap().is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

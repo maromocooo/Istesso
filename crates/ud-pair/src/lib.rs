@@ -65,7 +65,9 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 == 1 || !text.is_ascii() {
+    // Checking every character also keeps out the sign that `from_str_radix`
+    // would otherwise accept ("+f" is not hex).
+    if text.len() % 2 == 1 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..text.len())
@@ -95,6 +97,8 @@ mod tests {
         assert_eq!(from_hex("abc"), None);
         assert_eq!(from_hex("zz"), None);
         assert_eq!(from_hex("é1"), None);
+        assert_eq!(from_hex("+f"), None);
+        assert_eq!(from_hex("0x"), None);
         assert_eq!(hex_array::<4>("0011"), None);
     }
 }

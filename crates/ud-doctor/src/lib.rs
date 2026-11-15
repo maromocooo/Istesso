@@ -7,12 +7,13 @@
 
 pub mod parse;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
 use ud_proto::{
     AudioCaps, AudioServer, DisplayServer, EncoderApi, GpuVendor, Hardware, HostManifest,
-    NetInterface, OsFamily, OsInfo, PowerCaps, Role, Tools, VideoCaps, MANIFEST_SCHEMA,
+    NetInterface, NetKind, OsFamily, OsInfo, PowerCaps, Role, Tools, VideoCaps, MANIFEST_SCHEMA,
 };
 
 /// macOS release that introduced Core Audio process taps (driver-free
@@ -47,6 +48,68 @@ pub fn detect() -> HostManifest {
 /// set of probes.
 pub fn hostname() -> String {
     detect_hostname(&detect_os())
+}
+
+/// The machine's real network adapters with the addresses they hold right
+/// now, wired adapters first.
+pub fn interfaces() -> Vec<NetInterface> {
+    let mut list = match OsFamily::current() {
+        OsFamily::Macos => run("networksetup", &["-listallhardwareports"])
+            .map(|t| parse::networksetup_ports(&t))
+            .unwrap_or_default(),
+        OsFamily::Linux => linux_interfaces(),
+        _ => Vec::new(),
+    };
+    let mut assigned = assigned_addresses();
+    for interface in &mut list {
+        interface.addresses = assigned.remove(&interface.name).unwrap_or_default();
+    }
+    list.sort_by(|a, b| {
+        (a.kind != NetKind::Ethernet)
+            .cmp(&(b.kind != NetKind::Ethernet))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    list
+}
+
+/// Addresses on the local network at which other devices can reach this
+/// machine.
+pub fn lan_addresses() -> Vec<String> {
+    interfaces()
+        .into_iter()
+        .flat_map(|interface| interface.addresses)
+        .collect()
+}
+
+/// True when `ip` belongs to a network this machine is directly attached to.
+///
+/// Used to judge addresses heard on the local network: a device that
+/// announces itself there cannot legitimately live anywhere else.
+pub fn on_attached_network(ip: std::net::Ipv4Addr) -> bool {
+    let networks: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) => Some((v4.ip, v4.netmask)),
+            _ => None,
+        })
+        .collect();
+    parse::in_any_network(ip, &networks)
+}
+
+/// IPv4 addresses per interface name, as the operating system reports them.
+fn assigned_addresses() -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for interface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if let if_addrs::IfAddr::V4(v4) = &interface.addr {
+            if parse::is_lan_address(v4.ip) {
+                map.entry(interface.name.clone())
+                    .or_default()
+                    .push(v4.ip.to_string());
+            }
+        }
+    }
+    map
 }
 
 /// Decides what a host is good for from the detected facts.
@@ -330,13 +393,11 @@ fn detect_power(os: &OsInfo) -> PowerCaps {
             portable: run("pmset", &["-g", "batt"])
                 .map(|t| parse::pmset_has_battery(&t))
                 .unwrap_or(false),
-            interfaces: run("networksetup", &["-listallhardwareports"])
-                .map(|t| parse::networksetup_ports(&t))
-                .unwrap_or_default(),
+            interfaces: interfaces(),
         },
         OsFamily::Linux => PowerCaps {
             portable: linux_has_battery(),
-            interfaces: linux_interfaces(),
+            interfaces: interfaces(),
         },
         _ => PowerCaps::default(),
     }
@@ -353,25 +414,40 @@ fn linux_has_battery() -> bool {
     })
 }
 
-/// Physical network interfaces with a usable MAC address.
+/// Physical Ethernet and Wi-Fi adapters. Bridges, tunnels and container
+/// interfaces have no backing device and are skipped.
 fn linux_interfaces() -> Vec<NetInterface> {
     let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
         return Vec::new();
     };
-    let mut out: Vec<NetInterface> = entries
+    entries
         .flatten()
         .filter(|e| e.path().join("device").exists())
         .filter_map(|e| {
-            let mac = std::fs::read_to_string(e.path().join("address")).ok()?;
-            let mac = mac.trim().to_lowercase();
+            let path = e.path();
+            let field = |name: &str| {
+                std::fs::read_to_string(path.join(name))
+                    .ok()
+                    .map(|s| s.trim().to_lowercase())
+            };
+            // 1 is ARPHRD_ETHER, which Ethernet and Wi-Fi both report.
+            if field("type")? != "1" {
+                return None;
+            }
+            let mac = field("address")?;
+            let wireless = path.join("wireless").exists() || path.join("phy80211").exists();
             parse::is_mac_address(&mac).then(|| NetInterface {
                 name: e.file_name().to_string_lossy().into_owned(),
                 mac,
+                kind: if wireless {
+                    NetKind::Wifi
+                } else {
+                    NetKind::Ethernet
+                },
+                addresses: Vec::new(),
             })
         })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+        .collect()
 }
 
 fn detect_tools(os: &OsInfo) -> Tools {
@@ -545,5 +621,24 @@ mod tests {
         assert!(!manifest.video.encoders.is_empty());
         // The manifest must always serialise; agents read it as JSON.
         serde_json::to_string(&manifest).unwrap();
+    }
+
+    #[test]
+    fn adapters_are_real_and_addresses_are_reachable() {
+        for interface in interfaces() {
+            assert!(parse::is_mac_address(&interface.mac), "{interface:?}");
+            assert_ne!(interface.kind, NetKind::Other, "{interface:?}");
+            for address in &interface.addresses {
+                let ip: std::net::Ipv4Addr = address.parse().unwrap();
+                assert!(parse::is_lan_address(ip), "{interface:?}");
+            }
+        }
+        assert_eq!(
+            lan_addresses().len(),
+            interfaces()
+                .iter()
+                .map(|i| i.addresses.len())
+                .sum::<usize>()
+        );
     }
 }

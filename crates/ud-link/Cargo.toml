@@ -1,0 +1,17 @@
+[package]
+name = "ud-link"
+description = "Authenticated, encrypted control channel between paired devices."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ud-proto.workspace = true
+ud-pair.workspace = true
+snow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
