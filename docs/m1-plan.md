@@ -87,7 +87,7 @@ Air の上でコーディングエージェントを動かし、Ubuntu へは SS
 - 2台の間の往復時間の分布を測って記録する（[measurements/README.md](measurements/README.md) の「経路そのものの遅れ」）。有線か Wi-Fi か、Wi-Fi なら規格、周波数帯、リンク速度も書く。
 - クライアントのディスプレイのリフレッシュレートを確かめて記録する。
 
-結果は [measurements/2026-11-16-step0-wifi-path.md](measurements/2026-11-16-step0-wifi-path.md) にあります。Wi-Fi の経路は、Mac の AWDL が原因で 95 パーセンタイルが約 95 ms でした。NVENC の確認は、ホストへのパッケージの導入を待っています。
+結果は [measurements/2026-11-16-step0-wifi-path.md](measurements/2026-11-16-step0-wifi-path.md) にあります。Wi-Fi の経路は、Mac の AWDL が原因で 95 パーセンタイルが約 95 ms でした。NVENC は、GStreamer の `nvcudah265enc` で使えることを確かめました（古い `nvh265enc` は、いまのドライバーでは動きません）。
 
 ### 手順 1：計測の道具を先に作る
 
@@ -108,11 +108,13 @@ Air の上でコーディングエージェントを動かし、Ubuntu へは SS
 - 同じテストアプリを、Ubuntu に直接つないだディスプレイで操作したときの値も測る。これが「中継なし」の基準になる。
 - 結果を見て合格ラインを数値で決め、ADR 0002 と `requirements.md` を更新する。
 
+準備の状況（2026-11-16）：Mac に Moonlight 6.2.0 を入れました（Homebrew）。Ubuntu には Sunshine 2026.914.233613 のパッケージを置き、公開されているチェックサムと一致することを確かめてあります。導入には `sudo` が要るので、人の実行を待っています。Moonlight は、ペアリングと配信の開始をコマンドラインから行えます（`moonlight pair`、`moonlight stream`）。
+
 ### 手順 3：既製の部品だけで1本通す
 
 自前のコードを書く前に、予定している方式でどの数値が出るかを知るための段階です。
 
-- ホスト：仮想コンポジター（[gst-wayland-display](https://github.com/games-on-whales/gst-wayland-display) の `waylanddisplaysrc`）→ NVENC → RTP → UDP。
+- ホスト：仮想コンポジター（[gst-wayland-display](https://github.com/games-on-whales/gst-wayland-display) の `waylanddisplaysrc`）→ NVENC（`nvcudah265enc`）→ RTP → UDP。
 - クライアント：受信 → VideoToolbox で復号 → 表示。この段階では GStreamer の要素を並べるだけで構わない。
 - 低遅延の設定を1つずつ試し、効果を記録する。B フレームなし、並べ替えなし（`zerolatency`）、固定ビットレート、キーフレームは要求されたときだけ、など。
 - コーデックは H.265 から始める。AV1 は、両方の PC でハードウェアが使えることを確かめてから比べる。

@@ -10,7 +10,7 @@
 |---|---|
 | ホスト | Ubuntu 24.04（カーネル 6.17.0-19）、Core i9-14900K、メモリ 188 GiB、RTX 4090（ドライバー 590.48.01）、GStreamer 1.24.2、PipeWire 1.0.5。デスクトップは X11 のセッション |
 | クライアント | MacBook Air（M4、メモリ 32 GiB）、macOS 26.5.1。電源につないだ状態 |
-| 接続 | 2台とも Wi-Fi で、どちらも 6 GHz 帯のチャンネル 53。クライアント：802.11ax、160 MHz 幅、リンク速度 1921 Mbps、信号 −48 dBm（雑音 −92 dBm）。ホスト：Qualcomm WCN785x（ath12k）、送信速度 432 Mbps、信号の強さ 46/100。ホストのリンクの規格は、`iw` がないので読めていない。ホストの有線の口は2つとも未接続 |
+| 接続 | 2台とも Wi-Fi で、どちらも 6 GHz 帯のチャンネル 53。クライアント：802.11ax、160 MHz 幅、リンク速度 1921 Mbps、信号 −48 dBm（雑音 −92 dBm）。ホスト：Qualcomm WCN785x（ath12k）、送信速度 432 Mbps、信号の強さ 46/100。ホストのリンクは、`iw` を入れたあと（同日 08:36）に読むと、802.11ax、160 MHz 幅、信号 −72 dBm、受信 216 Mbps（1 ストリーム）、送信 576 Mbps、省電力は有効。ホストの有線の口は2つとも未接続 |
 | クライアントのディスプレイ | 外部（3440×1440）が 85 Hz、内蔵が 60 Hz |
 
 往復時間の値は「結果」にあります。
@@ -68,23 +68,44 @@ Roles     gpu, always_on_candidate, hardware_encode, app_audio_capture
 |---|---|
 | NVIDIA のライブラリ | `libnvidia-encode.so.1`、`libnvcuvid.so.1`、`libcuda.so.1` がある。エンコードのセッションは 0 |
 | 入っている GStreamer のプラグイン | base、good、ugly、libav、vaapi、pipewire |
-| `nvh265enc`、`nvh264enc`、`nvav1enc` | **ない**。`nvcodec` プラグインを含む `gstreamer1.0-plugins-bad` が入っていない |
-| `h265parse` | **ない**（同じパッケージに含まれる） |
+| `nvh265enc`、`nvh264enc`、`nvav1enc` | 計測の時点では**ない**。`nvcodec` プラグインを含む `gstreamer1.0-plugins-bad` が入っていなかった。導入後の結果は下の「導入のあと」 |
+| `h265parse` | 計測の時点では**ない**（同じパッケージに含まれる） |
 | `rtph265pay`、`rtph265depay`、`udpsink`、`udpsrc`、`rtpjitterbuffer` | ある |
 | `rtpav1pay` | ない。Ubuntu 24.04 のパッケージには見当たらない。AV1 を比べるときに要る |
 | `waylanddisplaysrc` | ない。手順 3 でビルドする |
 | `tmux` | ない。ホストで長く動かすプロセスに使う決まり（m1-plan.md） |
 | `iw` | ない。Wi-Fi の状態（省電力、いまのリンクの規格）を読むのに使う |
 
-`gstreamer1.0-plugins-bad` の候補は 1.24.2-1ubuntu4（universe）で、中に `libgstnvcodec.so` と `libgstvideoparsersbad.so` があることを、パッケージの一覧で確かめました。**導入していないので、NVENC が GStreamer から実際に動くかは未確認です。**
+`gstreamer1.0-plugins-bad` の候補は 1.24.2-1ubuntu4（universe）で、中に `libgstnvcodec.so` と `libgstvideoparsersbad.so` があることを、パッケージの一覧で確かめました。
 
-人に頼む作業：
+人に頼んだ作業：
 
 ```sh
 sudo apt install gstreamer1.0-plugins-bad tmux iw
 ```
 
-このパッケージは依存として libx265 などのライブラリも入れます。このプロジェクトが使うのは `nvcodec` と `videoparsersbad` だけで、x265 は使いません（[components.md](../components.md)）。導入のあと、`gst-inspect-1.0 nvh265enc` と、85 fps での実際のエンコードで確かめます。
+このパッケージは依存として libx265 などのライブラリも入れます。このプロジェクトが使うのは `nvcodec` と `videoparsersbad` だけで、x265 は使いません（[components.md](../components.md)）。
+
+#### 導入のあと（同日 08:40）
+
+**NVENC は GStreamer から使えます。ただし、使えるのは新しいほうの要素 `nvcudah265enc` だけです。**
+
+| 要素 | 結果 |
+|---|---|
+| `nvh265enc`（古い実装） | 動かない。どのプリセットを選んでも `Selected preset not supported` で止まる。この要素が使う古いプリセットを、いまのドライバー（590.48.01）が受け付けないため、と見ている |
+| `nvcudah265enc`（新しい実装） | 動く。プリセットは p1〜p7 と `tune` の組み合わせで選ぶ |
+| `nvav1enc` | この版の GStreamer（1.24.2）にはない。AV1 を比べるには、新しい GStreamer が要る |
+
+`nvcudah265enc` で、実時間で流れてくる 85 fps の映像を 10 秒ぶん圧縮しました。設定は `preset=p1 tune=ultra-low-latency zero-reorder-delay=true b-frames=0 rate-control=cbr bitrate=20000 gop-size=-1` です。
+
+| 解像度 | フレーム | 出力 | かかった時間 |
+|---|---|---|---|
+| 1920×1080 | 850（I が 1、P が 849、B なし） | H.265 Main、21.8 Mbps | 10.7 秒 |
+| 3440×1440 | 850（I が 1、P が 849、B なし） | H.265 Main | 12.7 秒 |
+
+3440×1440 では実時間に追いついていません。テスト用の映像（ノイズ）を CPU で作る部分が遅い可能性があり、エンコーダーの限界かどうかは分けていません。手順 3 で、実際の取り込みから測ります。
+
+1フレームあたりの圧縮の時間は、まだ測っていません。
 
 クライアントには GStreamer が入っていません。手順 3 で受信側を GStreamer の要素で組むなら、そのときに要ります。
 
@@ -183,10 +204,11 @@ NetworkManager の設定は省電力が有効（`wifi.powersave = 3`）です。
 次に行うこと：
 
 1. **AWDL を一時的に止めて測り直す**（人が実行）。`sudo ifconfig awdl0 down` のあと、同じ計測をして、跳ねが消えることを確かめます。macOS が自動で戻すことがあるので、計測の前後に `ifconfig awdl0` の `status` を見ます。戻すには `sudo ifconfig awdl0 up` です。
+   - 追記（同日 08:36）：08:32:54 に `sudo ifconfig awdl0 down` を実行したところ、63 秒後の 08:33:57 に macOS が AWDL を戻しました（ログでは、AirDrop の探索の再開と同時）。1回止めるだけでは足りないので、計測のあいだは `sudo sh -c 'while :; do ifconfig awdl0 down; sleep 1; done'` で止め続けます。
 2. 効果を確かめたら、対処を選びます（人が決める）。候補は次のとおりです。
    - ユニバーサルコントロール、AirDrop、AirPlay レシーバー、Handoff を切る。どれが効くかは、1つずつ切って測ります。
    - Mac を有線にする（アダプターが要る）。
    - ルーターのチャンネルを AWDL と同じ 5 GHz 帯のチャンネル 44 にして、移動を減らす。Mac は 6 GHz 帯ではなく 5 GHz 帯でつなぐことになります。
 3. ホストを有線にできるなら、電波区間が1つ減り、5 分おきのスキャンもなくなります。
-4. ホストに `gstreamer1.0-plugins-bad` を入れてもらい、NVENC を確かめます。
+4. ~~ホストに `gstreamer1.0-plugins-bad` を入れてもらい、NVENC を確かめます。~~ 済み（上の「導入のあと」）。手順 3 では `nvcudah265enc` を使います。
 5. 接続を変えたら、この計測をやり直します（README.md）。
