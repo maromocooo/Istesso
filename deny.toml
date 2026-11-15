@@ -32,6 +32,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The crates of this workspace refer to each other by path, without a version.
+# That is fine for crates that are never published.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
