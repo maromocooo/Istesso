@@ -1,0 +1,18 @@
+[package]
+name = "istesso-agent"
+description = "The resident part of Istesso: answers paired devices and keeps track of them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+istesso-proto.workspace = true
+istesso-pair.workspace = true
+istesso-link.workspace = true
+istesso-doctor.workspace = true
+istesso-catalog.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mdns-sd.workspace = true

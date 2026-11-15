@@ -402,6 +402,89 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "istesso-agent"
+version = "0.0.1"
+dependencies = [
+ "istesso-catalog",
+ "istesso-doctor",
+ "istesso-link",
+ "istesso-pair",
+ "istesso-proto",
+ "mdns-sd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "istesso-catalog"
+version = "0.0.1"
+dependencies = [
+ "istesso-proto",
+ "plist",
+]
+
+[[package]]
+name = "istesso-cli"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "istesso-agent",
+ "istesso-catalog",
+ "istesso-doctor",
+ "istesso-link",
+ "istesso-pair",
+ "istesso-proto",
+ "serde",
+ "serde_json",
+ "unicode-width",
+]
+
+[[package]]
+name = "istesso-doctor"
+version = "0.0.1"
+dependencies = [
+ "if-addrs",
+ "istesso-proto",
+ "serde_json",
+]
+
+[[package]]
+name = "istesso-link"
+version = "0.0.1"
+dependencies = [
+ "istesso-pair",
+ "istesso-proto",
+ "serde",
+ "serde_json",
+ "snow",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "istesso-pair"
+version = "0.0.1"
+dependencies = [
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hkdf",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "spake2",
+ "thiserror",
+]
+
+[[package]]
+name = "istesso-proto"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,89 +882,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "ud-agent"
-version = "0.0.1"
-dependencies = [
- "mdns-sd",
- "serde",
- "serde_json",
- "ud-catalog",
- "ud-doctor",
- "ud-link",
- "ud-pair",
- "ud-proto",
-]
-
-[[package]]
-name = "ud-catalog"
-version = "0.0.1"
-dependencies = [
- "plist",
- "ud-proto",
-]
-
-[[package]]
-name = "ud-cli"
-version = "0.0.1"
-dependencies = [
- "clap",
- "serde",
- "serde_json",
- "ud-agent",
- "ud-catalog",
- "ud-doctor",
- "ud-link",
- "ud-pair",
- "ud-proto",
- "unicode-width",
-]
-
-[[package]]
-name = "ud-doctor"
-version = "0.0.1"
-dependencies = [
- "if-addrs",
- "serde_json",
- "ud-proto",
-]
-
-[[package]]
-name = "ud-link"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "snow",
- "thiserror",
- "ud-pair",
- "ud-proto",
- "zeroize",
-]
-
-[[package]]
-name = "ud-pair"
-version = "0.0.1"
-dependencies = [
- "chacha20poly1305",
- "ed25519-dalek",
- "hkdf",
- "rand_core",
- "serde",
- "serde_json",
- "sha2",
- "spake2",
- "thiserror",
-]
-
-[[package]]
-name = "ud-proto"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "unicode-ident"

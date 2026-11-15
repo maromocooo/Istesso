@@ -11,12 +11,12 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates
-ud-proto = { path = "crates/ud-proto" }
-ud-doctor = { path = "crates/ud-doctor" }
-ud-catalog = { path = "crates/ud-catalog" }
-ud-pair = { path = "crates/ud-pair" }
-ud-link = { path = "crates/ud-link" }
-ud-agent = { path = "crates/ud-agent" }
+istesso-proto = { path = "crates/istesso-proto" }
+istesso-doctor = { path = "crates/istesso-doctor" }
+istesso-catalog = { path = "crates/istesso-catalog" }
+istesso-pair = { path = "crates/istesso-pair" }
+istesso-link = { path = "crates/istesso-link" }
+istesso-agent = { path = "crates/istesso-agent" }
 
 # Third-party crates. Every dependency must pass the licence allowlist in deny.toml.
 serde = { version = "1", features = ["derive"] }
