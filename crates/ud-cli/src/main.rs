@@ -70,7 +70,8 @@ enum Command {
     Hosts {
         #[arg(long)]
         json: bool,
-        /// Milliseconds to wait for a device before giving up on it
+        /// Milliseconds to wait for a device to show up before giving up
+        /// on it
         #[arg(long, default_value_t = 800)]
         timeout: u64,
     },
@@ -755,13 +756,17 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
 
 fn run_agent(options: AgentOptions) -> Result<(), String> {
     let paths = Paths::from_env();
-    let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
-    let addr = agent.local_addr().map_err(|e| e.to_string())?;
+    // Everything that takes time happens before the port is opened: from
+    // that moment on callers expect a prompt reaction.
+    let name = ud_doctor::hostname();
+    let addresses = ud_doctor::lan_addresses();
     let paired = open_peers()?.peers().len();
 
-    println!("{} ({})", ud_doctor::hostname(), agent.fingerprint());
+    let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
+    let addr = agent.local_addr().map_err(|e| e.to_string())?;
+    println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
-    let reachable: Vec<String> = ud_doctor::lan_addresses()
+    let reachable: Vec<String> = addresses
         .iter()
         .map(|address| with_port(address, addr.port()))
         .collect();
@@ -782,7 +787,7 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
 fn run_hosts(json: bool, timeout_ms: u64) -> Result<(), String> {
     let options = SurveyOptions {
         timeout: Duration::from_millis(timeout_ms.clamp(50, 60_000)),
-        local_apps: false,
+        ..SurveyOptions::default()
     };
     let views = survey(&Paths::from_env(), &options)?;
     if json {
@@ -976,9 +981,43 @@ mod tests {
         assert!(text.contains("something to know"));
     }
 
+    /// A made-up manifest, so that most tests do not have to inspect the
+    /// machine they run on (slow on macOS).
+    fn sample_manifest(name: &str) -> HostManifest {
+        HostManifest {
+            schema: ud_proto::MANIFEST_SCHEMA,
+            name: name.to_string(),
+            os: ud_proto::OsInfo {
+                family: ud_proto::OsFamily::Macos,
+                name: "macOS".to_string(),
+                version: "26.5".to_string(),
+                kernel: "25.5.0".to_string(),
+                arch: "aarch64".to_string(),
+            },
+            hardware: ud_proto::Hardware {
+                cpu_model: "Apple M4".to_string(),
+                cpu_cores: 10,
+                memory_bytes: 32 << 30,
+                gpus: Vec::new(),
+            },
+            video: ud_proto::VideoCaps {
+                display_server: ud_proto::DisplayServer::Quartz,
+                encoders: vec![ud_proto::EncoderApi::VideoToolbox],
+            },
+            audio: ud_proto::AudioCaps {
+                server: ud_proto::AudioServer::CoreAudio,
+                app_capture: true,
+            },
+            power: ud_proto::PowerCaps::default(),
+            tools: ud_proto::Tools::default(),
+            roles: vec![Role::MacApps, Role::HardwareEncode],
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn manifest_rendering_shows_adapters_without_hardware_addresses() {
-        let mut manifest = ud_doctor::detect();
+        let mut manifest = sample_manifest("studio");
         manifest.power.interfaces = vec![
             ud_proto::NetInterface {
                 name: "en0".to_string(),
@@ -1061,12 +1100,7 @@ mod tests {
     }
 
     fn view(name: &str, local: bool, state: HostState) -> HostView {
-        let mut manifest = ud_doctor::detect();
-        manifest.name = name.to_string();
-        manifest.os.name = "macOS".to_string();
-        manifest.os.version = "26.5".to_string();
-        manifest.roles = vec![Role::MacApps, Role::HardwareEncode];
-        manifest.power.portable = false;
+        let mut manifest = sample_manifest(name);
         manifest.power.interfaces = vec![ud_proto::NetInterface {
             name: "en0".to_string(),
             mac: "a0:ce:c8:11:22:33".to_string(),

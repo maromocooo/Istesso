@@ -27,9 +27,49 @@ pub(crate) mod testing {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use ud_proto::{
+        AudioCaps, AudioServer, DisplayServer, EncoderApi, Hardware, HostManifest, OsFamily,
+        OsInfo, PowerCaps, Role, Tools, VideoCaps, MANIFEST_SCHEMA,
+    };
+
     use crate::Paths;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A made-up manifest. Tests use it instead of inspecting the machine
+    /// they run on, which takes a second or more on macOS and would make
+    /// them depend on that machine's speed.
+    pub fn manifest(name: &str) -> HostManifest {
+        HostManifest {
+            schema: MANIFEST_SCHEMA,
+            name: name.to_string(),
+            os: OsInfo {
+                family: OsFamily::Linux,
+                name: "Ubuntu".to_string(),
+                version: "24.04".to_string(),
+                kernel: "6.8.0".to_string(),
+                arch: "x86_64".to_string(),
+            },
+            hardware: Hardware {
+                cpu_model: "Test CPU".to_string(),
+                cpu_cores: 8,
+                memory_bytes: 32 << 30,
+                gpus: Vec::new(),
+            },
+            video: VideoCaps {
+                display_server: DisplayServer::Wayland,
+                encoders: vec![EncoderApi::Software],
+            },
+            audio: AudioCaps {
+                server: AudioServer::PipeWire,
+                app_capture: true,
+            },
+            power: PowerCaps::default(),
+            tools: Tools::default(),
+            roles: vec![Role::AlwaysOnCandidate],
+            warnings: Vec::new(),
+        }
+    }
 
     /// A directory that is removed when the value is dropped.
     pub struct TempDir(PathBuf);

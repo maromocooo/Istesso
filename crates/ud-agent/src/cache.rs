@@ -291,7 +291,7 @@ mod tests {
         let paths = dir.paths();
 
         // Plant a recognisable manifest as if a full inspection had just run.
-        let mut planted = ud_doctor::detect();
+        let mut planted = crate::testing::manifest("this machine");
         planted.hardware.cpu_model = "planted".to_string();
         remember_local_manifest(&paths, &planted);
 

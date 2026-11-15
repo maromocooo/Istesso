@@ -61,6 +61,20 @@ impl Client {
         &self.peer
     }
 
+    /// Changes how long to wait for the other device from now on.
+    ///
+    /// Finding out whether a device is there should be quick, so that a
+    /// sleeping machine costs little. Once it has answered the handshake it
+    /// is known to be there, and its answers may take longer: a host may have
+    /// to inspect itself or scan its applications first.
+    pub fn set_timeout(&self, timeout: Duration) -> Result<()> {
+        let stream = self.channel.stream();
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|_| stream.set_write_timeout(Some(timeout)))
+            .map_err(Error::from_io)
+    }
+
     /// Sends a request and waits for the answer. An error reported by the
     /// other device comes back as [`Error::Remote`].
     pub fn call(&mut self, request: &Request) -> Result<Response> {

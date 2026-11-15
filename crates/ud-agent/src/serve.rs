@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use ud_link::{ErrorCode, LocalKeys, Request, Response, Session, DEFAULT_PORT};
 use ud_pair::{Identity, PeerStore, Permission};
-use ud_proto::AppEntry;
+use ud_proto::{AppEntry, HostManifest};
 
 use crate::cache;
 use crate::discovery::Discovery;
@@ -24,7 +24,8 @@ use crate::survey::{refresh_peers, SurveyOptions};
 const MAX_CONNECTIONS: usize = 64;
 /// How long the agent waits for a caller's next message.
 const WAIT: Duration = Duration::from_secs(5);
-/// How long a full inspection of this machine stays valid.
+/// How long a full inspection of this machine stays valid. The agent repeats
+/// the inspection twice as often and always answers from memory.
 pub const MANIFEST_MAX_AGE: Duration = Duration::from_secs(600);
 /// How long a scan of the installed applications stays valid.
 const APPS_MAX_AGE: Duration = Duration::from_secs(30);
@@ -70,6 +71,7 @@ struct Shared {
     paths: Paths,
     keys: LocalKeys,
     fingerprint: String,
+    manifest: Mutex<Option<HostManifest>>,
     apps: Mutex<Option<(Instant, Vec<AppEntry>)>>,
     connections: AtomicUsize,
     verbose: bool,
@@ -94,6 +96,7 @@ impl Agent {
                 paths,
                 keys,
                 fingerprint: identity.fingerprint(),
+                manifest: Mutex::new(None),
                 apps: Mutex::new(None),
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
@@ -114,11 +117,15 @@ impl Agent {
     /// Serves paired devices until the process ends.
     pub fn run(self) {
         // Inspect the machine once up front and then regularly, so that
-        // callers are answered from memory.
+        // callers are answered from memory. A full inspection takes a second
+        // or more on macOS; no caller should have to wait for one.
         let shared = self.shared.clone();
-        std::thread::spawn(move || loop {
-            cache::refresh_local_manifest(&shared.paths);
-            std::thread::sleep(MANIFEST_MAX_AGE / 2);
+        std::thread::spawn(move || {
+            shared.manifest();
+            loop {
+                std::thread::sleep(MANIFEST_MAX_AGE / 2);
+                shared.refresh_manifest();
+            }
         });
 
         // Discovery is a convenience; the agent works without it.
@@ -235,7 +242,7 @@ impl Shared {
             Request::Manifest => {
                 asked.push("manifest");
                 Response::Manifest {
-                    manifest: Box::new(cache::local_manifest(&self.paths, MANIFEST_MAX_AGE)),
+                    manifest: Box::new(self.manifest()),
                 }
             }
             Request::Apps => {
@@ -251,6 +258,30 @@ impl Shared {
         }
     }
 
+    /// This machine's manifest, from memory.
+    ///
+    /// Only the first call can be slow: it takes the last inspection from
+    /// disk when that is recent, and inspects the machine otherwise. Later
+    /// calls return what is in memory however old it is; keeping it fresh is
+    /// the job of the background thread. The network adapters are read on
+    /// every call, since they change when the machine moves.
+    fn manifest(&self) -> HostManifest {
+        let mut manifest = {
+            let mut slot = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
+            slot.get_or_insert_with(|| cache::local_manifest(&self.paths, MANIFEST_MAX_AGE))
+                .clone()
+        };
+        manifest.power.interfaces = ud_doctor::interfaces();
+        manifest
+    }
+
+    /// Inspects the machine again and replaces what is in memory. Callers
+    /// keep getting the previous result while this runs.
+    fn refresh_manifest(&self) {
+        let fresh = cache::refresh_local_manifest(&self.paths);
+        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh);
+    }
+
     /// The installed applications, scanned at most once per `APPS_MAX_AGE`.
     fn apps(&self) -> Vec<AppEntry> {
         let mut cached = self.apps.lock().unwrap_or_else(|e| e.into_inner());
@@ -262,5 +293,63 @@ impl Shared {
                 apps
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{self, TempDir};
+
+    fn agent(paths: &Paths) -> Agent {
+        let options = AgentOptions {
+            bind: Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            discovery: false,
+            refresh_peers: None,
+            verbose: false,
+        };
+        Agent::bind(paths.clone(), &options, Arc::new(|_| {})).unwrap()
+    }
+
+    #[test]
+    fn the_manifest_is_answered_from_memory() {
+        let dir = TempDir::new("serve-memory");
+        let paths = dir.paths();
+        cache::remember_local_manifest(&paths, &testing::manifest("planted for this test"));
+        let agent = agent(&paths);
+
+        // The first answer takes the recent inspection from disk ...
+        assert_eq!(agent.shared.manifest().name, "planted for this test");
+        // ... and later answers do not depend on the disk or on a new
+        // inspection, so no caller ever waits for one.
+        std::fs::remove_file(paths.local_manifest()).unwrap();
+        assert_eq!(agent.shared.manifest().name, "planted for this test");
+        // The adapters are the ones of this machine, read just now.
+        assert_eq!(
+            agent.shared.manifest().power.interfaces,
+            ud_doctor::interfaces()
+        );
+
+        // The background refresh replaces what is in memory with a real
+        // inspection and writes it down for the other commands.
+        agent.shared.refresh_manifest();
+        assert_ne!(agent.shared.manifest().name, "planted for this test");
+        assert!(paths.local_manifest().exists());
+    }
+
+    #[test]
+    fn applications_are_scanned_once_and_then_remembered() {
+        let dir = TempDir::new("serve-apps");
+        let agent = agent(&dir.paths());
+        assert!(agent.shared.apps.lock().unwrap().is_none());
+        let first = agent.shared.apps();
+        let scanned_at = agent.shared.apps.lock().unwrap().as_ref().unwrap().0;
+        assert_eq!(agent.shared.apps(), first);
+        // The second call did not scan again.
+        assert_eq!(
+            agent.shared.apps.lock().unwrap().as_ref().unwrap().0,
+            scanned_at
+        );
     }
 }

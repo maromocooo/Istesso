@@ -21,10 +21,15 @@ use crate::status::local_status;
 
 #[derive(Debug, Clone)]
 pub struct SurveyOptions {
-    /// How long to wait for a device at each step. Devices on the local
-    /// network answer within milliseconds; the default leaves room for Wi-Fi
-    /// waking up.
+    /// How long to wait for a device to show up: for the connection and for
+    /// each step of the handshake. Devices on the local network react within
+    /// milliseconds; the default leaves room for Wi-Fi waking up. This is
+    /// what a sleeping machine costs.
     pub timeout: Duration,
+    /// How long to wait for each answer of a device that did show up. A host
+    /// may have to inspect itself or scan its applications before it can
+    /// answer, which takes a second or more on some machines.
+    pub answer_timeout: Duration,
     /// Also list the applications installed on this machine. Paired devices
     /// always report theirs, so that the list is remembered for the times
     /// they do not answer.
@@ -35,6 +40,7 @@ impl Default for SurveyOptions {
     fn default() -> Self {
         SurveyOptions {
             timeout: Duration::from_millis(800),
+            answer_timeout: Duration::from_secs(5),
             local_apps: false,
         }
     }
@@ -211,8 +217,12 @@ fn query_peer(
             Ok(connected) => connected,
             Err(err) => return unreachable_view(peer, snapshot, err.to_string()),
         };
-    let fetched =
-        (|| -> ud_link::Result<_> { Ok((client.manifest()?, client.status()?, client.apps()?)) })();
+    // The device is there. From here on it gets more time: being slow to
+    // answer is not the same as being away.
+    let fetched = (|| -> ud_link::Result<_> {
+        client.set_timeout(options.answer_timeout)?;
+        Ok((client.manifest()?, client.status()?, client.apps()?))
+    })();
     let (manifest, status, apps) = match fetched {
         Ok(fetched) => fetched,
         Err(err) => return unreachable_view(peer, snapshot, err.to_string()),
@@ -341,11 +351,12 @@ fn telling(err: &ud_link::Error) -> u8 {
 mod tests {
     use std::net::TcpListener;
 
+    use ud_link::{Request, Response, Session};
     use ud_pair::{Hello, Permission};
 
     use super::*;
     use crate::serve::{Agent, AgentOptions};
-    use crate::testing::TempDir;
+    use crate::testing::{self, TempDir};
 
     /// A pretend device: its own directory, identity and list of peers.
     struct Device {
@@ -358,6 +369,10 @@ mod tests {
         fn new(name: &'static str) -> Self {
             let dir = TempDir::new(name);
             let identity = Identity::load_or_create(&dir.paths().identity()).unwrap();
+            // The device already knows what it can do, as it does after its
+            // first inspection. How long that inspection takes is not what
+            // these tests are about.
+            cache::remember_local_manifest(&dir.paths(), &testing::manifest(name));
             Device {
                 dir,
                 name,
@@ -409,6 +424,46 @@ mod tests {
         fn knows_address_of(&self, other: &Device, addr: SocketAddr) {
             cache::suggest_address(&self.paths(), &other.id(), other.name, &addr.to_string())
                 .unwrap();
+        }
+
+        /// Starts a stand-in for this device's agent that takes `delay`
+        /// before its first answer, the way a host does that has to inspect
+        /// itself before it can describe itself.
+        fn start_slow_host(&self, delay: Duration) -> SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (paths, name) = (self.paths(), self.name);
+            std::thread::spawn(move || {
+                let identity = Identity::load_or_create(&paths.identity()).unwrap();
+                let keys = LocalKeys::new(&identity).unwrap();
+                let (stream, _) = listener.accept().unwrap();
+                let peers = PeerStore::open(paths.peers()).unwrap();
+                let Ok(mut session) =
+                    Session::accept(stream, &keys, &peers, Duration::from_secs(10))
+                else {
+                    return;
+                };
+                let mut delay = Some(delay);
+                while let Ok(Some(request)) = session.next_request() {
+                    if let Some(delay) = delay.take() {
+                        std::thread::sleep(delay);
+                    }
+                    let response = match request {
+                        Request::Ping => Response::Pong,
+                        Request::Manifest => Response::Manifest {
+                            manifest: Box::new(testing::manifest(name)),
+                        },
+                        Request::Apps => Response::Apps { apps: Vec::new() },
+                        Request::Status => Response::Status {
+                            status: HostStatus::default(),
+                        },
+                    };
+                    if session.respond(&response).is_err() {
+                        break;
+                    }
+                }
+            });
+            addr
         }
     }
 
@@ -479,8 +534,7 @@ mod tests {
         pair(&air, &studio);
 
         // The Studio was seen earlier and has gone to sleep since.
-        let mut manifest = ud_doctor::detect();
-        manifest.name = "studio".to_string();
+        let manifest = testing::manifest("studio");
         let remembered = HostSnapshot {
             id: studio.id(),
             name: "studio".to_string(),
@@ -545,10 +599,8 @@ mod tests {
         pair(&air, &ubuntu);
         let addr = ubuntu.start_agent();
         air.knows_address_of(&ubuntu, addr);
-        assert_eq!(
-            survey(&air.paths(), &SurveyOptions::default()).unwrap()[1].state,
-            HostState::Awake
-        );
+        let before = survey(&air.paths(), &SurveyOptions::default()).unwrap();
+        assert_eq!(before[1].state, HostState::Awake, "{:?}", before[1].problem);
 
         // The agent keeps running while the pairing is removed on its side.
         let mut store = PeerStore::open(ubuntu.paths().peers()).unwrap();
@@ -558,6 +610,47 @@ mod tests {
         assert_eq!(views[1].state, HostState::Unknown);
         let problem = views[1].problem.as_deref().unwrap();
         assert!(problem.contains("does not trust"), "{problem}");
+    }
+
+    #[test]
+    fn a_device_that_is_slow_to_answer_is_still_there() {
+        let air = Device::new("air");
+        let studio = Device::new("studio");
+        pair(&air, &studio);
+        // The Studio reacts at once but needs a while for its first answer,
+        // longer than the Air is prepared to wait for a device to show up.
+        let addr = studio.start_slow_host(Duration::from_millis(1200));
+        air.knows_address_of(&studio, addr);
+
+        let options = SurveyOptions {
+            timeout: Duration::from_millis(500),
+            ..SurveyOptions::default()
+        };
+        let views = survey(&air.paths(), &options).unwrap();
+        assert_eq!(views[1].state, HostState::Awake, "{:?}", views[1].problem);
+        assert_eq!(views[1].manifest, Some(testing::manifest("studio")));
+    }
+
+    #[test]
+    fn a_device_that_never_answers_is_not_waited_for_forever() {
+        let air = Device::new("air");
+        let studio = Device::new("studio");
+        pair(&air, &studio);
+        let addr = studio.start_slow_host(Duration::from_secs(3));
+        air.knows_address_of(&studio, addr);
+
+        let options = SurveyOptions {
+            timeout: Duration::from_millis(500),
+            answer_timeout: Duration::from_millis(200),
+            ..SurveyOptions::default()
+        };
+        let started = Instant::now();
+        let views = survey(&air.paths(), &options).unwrap();
+        // Well before the host would have answered.
+        assert!(started.elapsed() < Duration::from_millis(2500));
+        assert_eq!(views[1].state, HostState::Unknown);
+        let problem = views[1].problem.as_deref().unwrap();
+        assert!(problem.contains("timed out"), "{problem}");
     }
 
     #[test]
