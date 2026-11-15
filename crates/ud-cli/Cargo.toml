@@ -1,0 +1,21 @@
+[package]
+name = "ud-cli"
+description = "Command line entry point (`ud`) for the unified desktop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ud"
+path = "src/main.rs"
+
+[dependencies]
+ud-proto.workspace = true
+ud-doctor.workspace = true
+ud-catalog.workspace = true
+ud-pair.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
