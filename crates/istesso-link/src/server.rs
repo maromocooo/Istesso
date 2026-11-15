@@ -1,0 +1,301 @@
+//! The answering end of a conversation.
+
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
+use istesso_pair::{Peer, PeerStore, Permission};
+
+use crate::channel::{Channel, LocalKeys};
+use crate::message::{ErrorCode, Request, Response};
+use crate::{Error, Result};
+
+/// A conversation that a paired device opened with this one.
+pub struct Session {
+    channel: Channel<TcpStream>,
+    peer: Peer,
+    remote: SocketAddr,
+}
+
+impl Session {
+    /// Runs the handshake on a freshly accepted connection.
+    ///
+    /// Fails with [`Error::UnknownPeer`] when the caller is not in `peers`;
+    /// the caller is told that it is not trusted. `timeout` bounds each wait
+    /// for the other device, during the handshake and afterwards.
+    pub fn accept(
+        stream: TcpStream,
+        keys: &LocalKeys,
+        peers: &PeerStore,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let remote = stream.peer_addr().map_err(Error::from_io)?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|_| stream.set_write_timeout(Some(timeout)))
+            .and_then(|_| stream.set_nodelay(true))
+            .map_err(Error::from_io)?;
+
+        let mut found: Option<Peer> = None;
+        let channel = Channel::respond(stream, keys, |key| {
+            found = peers.find_by_key(key).cloned();
+            found.is_some()
+        })?;
+        let peer = found.ok_or(Error::UnknownPeer)?;
+        Ok(Session {
+            channel,
+            peer,
+            remote,
+        })
+    }
+
+    /// The paired device that called.
+    pub fn peer(&self) -> &Peer {
+        &self.peer
+    }
+
+    /// Where the call came from.
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote
+    }
+
+    pub fn allows(&self, permission: Permission) -> bool {
+        self.peer.permissions.contains(&permission)
+    }
+
+    /// Waits for the next request. `Ok(None)` means the caller is done: it
+    /// hung up or stayed silent for the whole timeout.
+    ///
+    /// Requests this version does not know are answered here and skipped.
+    pub fn next_request(&mut self) -> Result<Option<Request>> {
+        loop {
+            let bytes = match self.channel.recv() {
+                Ok(bytes) => bytes,
+                Err(Error::Closed | Error::Timeout) => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            match serde_json::from_slice::<Request>(&bytes) {
+                Ok(request) => return Ok(Some(request)),
+                Err(_) => self.respond(&Response::error(
+                    ErrorCode::Unsupported,
+                    "this version of istesso does not know that request",
+                ))?,
+            }
+        }
+    }
+
+    pub fn respond(&mut self, response: &Response) -> Result<()> {
+        let bytes = serde_json::to_vec(response).map_err(|_| Error::Malformed)?;
+        self.channel.send(&bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+
+    use istesso_pair::Identity;
+    use istesso_proto::HostStatus;
+
+    use super::*;
+    use crate::testing::TempStore;
+    use crate::Client;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A host that answers pings and status requests from paired devices.
+    fn serve(
+        listener: TcpListener,
+        identity: Identity,
+        trusted: TempStore,
+    ) -> thread::JoinHandle<Result<String>> {
+        thread::spawn(move || {
+            let keys = LocalKeys::new(&identity)?;
+            let (stream, _) = listener.accept().map_err(Error::from_io)?;
+            let mut session = Session::accept(stream, &keys, &trusted.store, TIMEOUT)?;
+            assert!(session.allows(Permission::View));
+            assert!(!session.allows(Permission::InstallApps));
+            assert!(session.remote_addr().ip().is_loopback());
+            while let Some(request) = session.next_request()? {
+                let response = match request {
+                    Request::Ping => Response::Pong,
+                    Request::Status => Response::Status {
+                        status: HostStatus {
+                            load: Some(0.5),
+                            memory_available_bytes: None,
+                        },
+                    },
+                    _ => Response::error(ErrorCode::Forbidden, "not in this test"),
+                };
+                session.respond(&response)?;
+            }
+            Ok(session.peer().name.clone())
+        })
+    }
+
+    #[test]
+    fn paired_devices_hold_a_conversation() {
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+        let studio_id = air_trusts.store.peers()[0].id.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = serve(listener, studio, studio_trusts);
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let mut client =
+            Client::connect(addr, &keys, &air_trusts.store, Some(&studio_id), TIMEOUT).unwrap();
+        assert_eq!(client.peer().name, "Mac Studio");
+        client.ping().unwrap();
+        assert_eq!(client.status().unwrap().load, Some(0.5));
+        // Errors reported by the host are passed on, and the conversation
+        // carries on afterwards.
+        assert!(matches!(client.manifest(), Err(Error::Remote(_))));
+        client.ping().unwrap();
+        drop(client);
+
+        assert_eq!(host.join().unwrap().unwrap(), "MacBook Air");
+    }
+
+    #[test]
+    fn a_device_that_is_not_paired_gets_nothing() {
+        let stranger = Identity::generate();
+        let studio = Identity::generate();
+        // The stranger knows the host's key, but the host does not know the
+        // stranger.
+        let stranger_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = serve(listener, studio, studio_trusts);
+
+        let keys = LocalKeys::new(&stranger).unwrap();
+        let result = Client::connect(addr, &keys, &stranger_trusts.store, None, TIMEOUT);
+        assert!(matches!(result, Err(Error::NotTrusted)));
+        assert!(matches!(host.join().unwrap(), Err(Error::UnknownPeer)));
+    }
+
+    #[test]
+    fn an_impostor_at_a_known_address_is_not_talked_to() {
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let impostor = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        // The impostor would happily accept the Air.
+        let impostor_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = serve(listener, impostor, impostor_trusts);
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let result = Client::connect(addr, &keys, &air_trusts.store, None, TIMEOUT);
+        assert!(matches!(result, Err(Error::UnknownPeer)));
+        // The impostor did not even learn who was calling.
+        assert!(matches!(host.join().unwrap(), Err(Error::Closed)));
+    }
+
+    #[test]
+    fn another_paired_device_at_the_address_is_not_mistaken_for_the_expected_one() {
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let ubuntu = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio), ("ubuntu", &ubuntu)]);
+        let ubuntu_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+        let studio_id = air_trusts
+            .store
+            .peers()
+            .iter()
+            .find(|p| p.name == "Mac Studio")
+            .unwrap()
+            .id
+            .clone();
+
+        // The address that used to be the Studio's now belongs to the Ubuntu box.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = serve(listener, ubuntu, ubuntu_trusts);
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let result = Client::connect(addr, &keys, &air_trusts.store, Some(&studio_id), TIMEOUT);
+        match result {
+            Err(Error::WrongPeer { expected, found }) => {
+                assert_eq!(expected, studio_id);
+                assert!(found.starts_with("ubuntu"), "{found}");
+            }
+            other => panic!("unexpected: {:?}", other.err()),
+        }
+        let _ = host.join();
+    }
+
+    #[test]
+    fn requests_from_a_newer_version_get_a_clear_answer() {
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = serve(listener, studio, studio_trusts);
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut channel = Channel::initiate(stream, &keys, |key| {
+            air_trusts
+                .store
+                .find_by_key(key)
+                .map(|_| ())
+                .ok_or(Error::UnknownPeer)
+        })
+        .unwrap();
+        channel.send(br#"{"type":"teleport","to":"mars"}"#).unwrap();
+        let answer: Response = serde_json::from_slice(&channel.recv().unwrap()).unwrap();
+        assert!(matches!(
+            answer,
+            Response::Error {
+                code: ErrorCode::Unsupported,
+                ..
+            }
+        ));
+        // The conversation is still usable.
+        channel.send(br#"{"type":"ping"}"#).unwrap();
+        let answer: Response = serde_json::from_slice(&channel.recv().unwrap()).unwrap();
+        assert_eq!(answer, Response::Pong);
+        drop(channel);
+        host.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_silent_caller_is_dropped_after_the_timeout() {
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = thread::spawn(move || {
+            let keys = LocalKeys::new(&studio).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut session = Session::accept(
+                stream,
+                &keys,
+                &studio_trusts.store,
+                Duration::from_millis(200),
+            )
+            .unwrap();
+            session.next_request()
+        });
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let _client = Client::connect(addr, &keys, &air_trusts.store, None, TIMEOUT).unwrap();
+        // The client says nothing; the host gives up on its own.
+        assert!(matches!(host.join().unwrap(), Ok(None)));
+    }
+}

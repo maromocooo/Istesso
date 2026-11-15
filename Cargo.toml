@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+istesso-proto = { path = "crates/istesso-proto" }
+istesso-doctor = { path = "crates/istesso-doctor" }
+istesso-catalog = { path = "crates/istesso-catalog" }
+istesso-pair = { path = "crates/istesso-pair" }
+istesso-link = { path = "crates/istesso-link" }
+istesso-agent = { path = "crates/istesso-agent" }
+
+# Third-party crates. Every dependency must pass the licence allowlist in deny.toml.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+plist = "1"
+spake2 = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Noise protocol for the control channel. Only the primitives we use are enabled.
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-sha2", "use-getrandom"] }
+if-addrs = "0.15"
+mdns-sd = { version = "0.21", default-features = false }
+unicode-width = "0.2"
+zeroize = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

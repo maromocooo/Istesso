@@ -1,0 +1,12 @@
+[package]
+name = "istesso-catalog"
+description = "Finds installed applications and merges the lists of several hosts into one catalogue."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+istesso-proto.workspace = true
+plist.workspace = true
