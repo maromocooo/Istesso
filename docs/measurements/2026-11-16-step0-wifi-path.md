@@ -204,7 +204,7 @@ NetworkManager の設定は省電力が有効（`wifi.powersave = 3`）です。
 次に行うこと：
 
 1. **AWDL を一時的に止めて測り直す**（人が実行）。`sudo ifconfig awdl0 down` のあと、同じ計測をして、跳ねが消えることを確かめます。macOS が自動で戻すことがあるので、計測の前後に `ifconfig awdl0` の `status` を見ます。戻すには `sudo ifconfig awdl0 up` です。
-   - 追記（同日 08:36）：08:32:54 に `sudo ifconfig awdl0 down` を実行したところ、63 秒後の 08:33:57 に macOS が AWDL を戻しました（ログでは、AirDrop の探索の再開と同時）。1回止めるだけでは足りないので、計測のあいだは `sudo sh -c 'while :; do ifconfig awdl0 down; sleep 1; done'` で止め続けます。
+   - 追記（同日 08:36）：08:32:54 に `sudo ifconfig awdl0 down` を実行したところ、63 秒後の 08:33:57 に macOS が AWDL を戻しました（ログでは、AirDrop の探索の再開と同時）。1回止めるだけでは足りないので、計測のあいだは `sudo sh -c 'while :; do ifconfig awdl0 down; sleep 1; done'` で止め続けます。結果は [AWDL を止めた状態の記録](2026-11-16-wifi-path-awdl-off.md) にあります。跳ねは消え、Mac からホストへの 95 パーセンタイルは 94.8 ms から 16.1 ms になりました。
 2. 効果を確かめたら、対処を選びます（人が決める）。候補は次のとおりです。
    - ユニバーサルコントロール、AirDrop、AirPlay レシーバー、Handoff を切る。どれが効くかは、1つずつ切って測ります。
    - Mac を有線にする（アダプターが要る）。

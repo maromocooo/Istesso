@@ -87,7 +87,7 @@ Air の上でコーディングエージェントを動かし、Ubuntu へは SS
 - 2台の間の往復時間の分布を測って記録する（[measurements/README.md](measurements/README.md) の「経路そのものの遅れ」）。有線か Wi-Fi か、Wi-Fi なら規格、周波数帯、リンク速度も書く。
 - クライアントのディスプレイのリフレッシュレートを確かめて記録する。
 
-結果は [measurements/2026-11-16-step0-wifi-path.md](measurements/2026-11-16-step0-wifi-path.md) にあります。Wi-Fi の経路は、Mac の AWDL が原因で 95 パーセンタイルが約 95 ms でした。NVENC は、GStreamer の `nvcudah265enc` で使えることを確かめました（古い `nvh265enc` は、いまのドライバーでは動きません）。
+結果は [measurements/2026-11-16-step0-wifi-path.md](measurements/2026-11-16-step0-wifi-path.md) にあります。Wi-Fi の経路は、Mac の AWDL が原因で 95 パーセンタイルが約 95 ms でした。AWDL を止め続けると 16.1 ms になります（[記録](measurements/2026-11-16-wifi-path-awdl-off.md)）。残りはホスト側の電波区間で、ホストを有線にするのが次の改善です。NVENC は、GStreamer の `nvcudah265enc` で使えることを確かめました（古い `nvh265enc` は、いまのドライバーでは動きません）。
 
 ### 手順 1：計測の道具を先に作る
 
