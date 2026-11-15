@@ -1110,7 +1110,7 @@ mod tests {
             name: "en0".to_string(),
             mac: "a0:ce:c8:11:22:33".to_string(),
             kind: NetKind::Ethernet,
-            addresses: Vec::new(),
+            addresses: vec!["192.168.1.30".to_string()],
         }];
         let answered = state == HostState::Awake;
         HostView {
@@ -1164,6 +1164,24 @@ mod tests {
             "timed out waiting for the other device; last seen 2 hours ago; \
              can be woken over the network"
         );
+    }
+
+    #[test]
+    fn a_host_on_wifi_is_not_said_to_be_wakeable() {
+        // A desktop whose wired ports have no cable in them, as seen on a
+        // real machine: it is on Wi-Fi only.
+        let mut silent = view("ubuntu", false, HostState::Unknown);
+        let manifest = silent.manifest.as_mut().unwrap();
+        manifest.power.interfaces[0].addresses.clear();
+        manifest.power.interfaces.push(istesso_proto::NetInterface {
+            name: "wlp7s0".to_string(),
+            mac: "a0:ce:c8:44:55:66".to_string(),
+            kind: NetKind::Wifi,
+            addresses: vec!["192.168.1.99".to_string()],
+        });
+        let text = render_hosts(&[silent], 1_000_000);
+        assert!(text.contains("no answer"), "{text}");
+        assert!(!text.contains("can be woken"), "{text}");
     }
 
     #[test]
@@ -1224,6 +1242,25 @@ mod tests {
                 "  {} this device  (also on studio (no answer), ubuntu)",
                 pad("Firefox", 32)
             )
+        );
+    }
+
+    #[test]
+    fn a_host_with_two_installs_of_an_app_is_named_once() {
+        // Discord as a package and as a snap on the same machine.
+        let mut ubuntu = view("ubuntu", false, HostState::Awake);
+        let mut snap = installed("Discord");
+        snap.id = "discord_discord.desktop".to_string();
+        ubuntu.apps = vec![installed("Discord"), snap];
+        let mut air = view("air", true, HostState::Awake);
+        air.apps = vec![installed("Discord")];
+
+        let merged = istesso_catalog::merge(&[air.to_host_apps(), ubuntu.to_host_apps()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].instances.len(), 2);
+        assert_eq!(
+            render_unified(&merged[0]),
+            format!("  {} this device  (also on ubuntu)", pad("Discord", 32))
         );
     }
 

@@ -8,7 +8,7 @@
 pub mod linux;
 pub mod macos;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use istesso_proto::{AppEntry, AppInstance, Badge, HostApps, HostState, OsFamily, UnifiedApp};
 
@@ -50,14 +50,22 @@ pub fn match_key(name: &str) -> String {
 }
 
 /// Merges the app lists of several hosts into one catalogue.
+///
+/// A host that has the same application installed twice (a package and a
+/// snap, say) contributes one instance: the first one it listed, which is the
+/// one its own desktop would show first.
 pub fn merge(hosts: &[HostApps]) -> Vec<UnifiedApp> {
     // key -> (instances, per-instance host facts needed to pick a host)
     let mut groups: BTreeMap<String, Vec<(AppInstance, f32, bool)>> = BTreeMap::new();
+    let mut listed: BTreeSet<(String, String)> = BTreeSet::new();
     for host_apps in hosts {
         let host = &host_apps.host;
         for app in &host_apps.apps {
             let key = match_key(&app.name);
             if key.is_empty() {
+                continue;
+            }
+            if !listed.insert((key.clone(), host.id.clone())) {
                 continue;
             }
             let instance = AppInstance {

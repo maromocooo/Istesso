@@ -257,14 +257,16 @@ pub struct HostManifest {
 
 impl HostManifest {
     /// True when a sleeping host could be woken with a Wake-on-LAN packet:
-    /// it stays in one place and has a wired adapter.
+    /// it stays in one place and is attached to the network by cable. A
+    /// wired adapter without an address has no cable in it, and waking over
+    /// Wi-Fi rarely works.
     pub fn wake_possible(&self) -> bool {
         !self.power.portable
             && self
                 .power
                 .interfaces
                 .iter()
-                .any(|i| i.kind == NetKind::Ethernet)
+                .any(|i| i.kind == NetKind::Ethernet && !i.addresses.is_empty())
     }
 
     /// Addresses other devices can try to reach this host at, wired first.
@@ -502,8 +504,12 @@ mod tests {
         manifest.power.portable = true;
         assert!(!manifest.wake_possible());
 
-        // Wi-Fi alone is not enough for Wake-on-LAN.
+        // A wired adapter with no cable in it cannot receive the packet.
         manifest.power.portable = false;
+        manifest.power.interfaces[1].addresses.clear();
+        assert!(!manifest.wake_possible());
+
+        // Wi-Fi alone is not enough for Wake-on-LAN.
         manifest
             .power
             .interfaces
