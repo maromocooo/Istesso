@@ -15,6 +15,9 @@
 | usbip-win2 | Windows が受け側になる場合の USB/IP クライアント | BSD-2-Clause（0.9.7.0 以降） | <https://github.com/vadimgrn/usbip-win2> |
 | python-elgato-streamdeck（実装の参考） | Stream Deck の直接制御 | MIT | <https://github.com/abcminiuser/python-elgato-streamdeck> |
 | RustCrypto（spake2、chacha20poly1305、hkdf、sha2）、dalek | ペアリングの暗号部品 | MIT OR Apache-2.0、BSD-3-Clause | <https://github.com/RustCrypto/PAKEs> |
+| snow | 制御チャンネルの Noise プロトコル（ADR 0007）。使う部品だけを有効にしている | Apache-2.0 OR MIT | <https://github.com/mcginty/snow> |
+| mdns-sd | LAN 内の発見（mDNS / DNS-SD） | Apache-2.0 OR MIT | <https://github.com/keepsimple1/mdns-sd> |
+| if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。導入を軽くするため、コンポジターと仮想入力、配信プラグインだけを取り込みます。
 
@@ -65,7 +68,7 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 依存クレートのライセンスは `deny.toml` の許可リストで検査します。
 
 ```sh
-cargo deny check licenses bans sources
+cargo deny check
 ```
 
-2026-11-15 時点の依存 87 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、Unicode-3.0 のいずれかで利用できます。
+2026-11-15 時点の依存 99 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、Unicode-3.0 のいずれかで利用できます（cargo-deny 0.20.2 でライセンス・禁止項目・取得元・既知の脆弱性を検査済み）。

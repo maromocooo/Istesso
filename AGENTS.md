@@ -26,7 +26,7 @@
 
 ### 4. セキュリティ
 
-- 暗号の部品を自作しないでください。`ud-pair` の手順を変えるときは `docs/adr/0006-pairing.md` を先に更新します。
+- 暗号の部品を自作しないでください。`ud-pair` の手順を変えるときは `docs/adr/0006-pairing.md` を、`ud-link` の手順を変えるときは `docs/adr/0007-control-channel.md` を先に更新します。
 - ペアリングコード、鍵、トークンをログや標準出力の診断に出さないでください。
 - 権限の要る処理（root、画面収録、アクセシビリティ）を増やすときは、必要な理由を ADR に残します。
 
@@ -36,7 +36,7 @@
 
 | 作業 | 動かす場所 |
 |---|---|
-| 共通コア（`ud-proto`、`ud-pair`、`ud-catalog`、`ud-doctor`、`ud-cli`） | どの PC でも可 |
+| 共通コア（`ud-proto`、`ud-pair`、`ud-link`、`ud-agent`、`ud-catalog`、`ud-doctor`、`ud-cli`） | どの PC でも可 |
 | Mac ホスト（画面の取り込み、VideoToolbox、入力、Core Audio） | Mac の実機。常時稼働の Mac を優先 |
 | Linux ホスト（仮想コンポジター、NVENC、PipeWire） | GPU を積んだ Ubuntu の実機 |
 | 遅延と音切れの計測 | 有線 LAN でつないだ2台の実機 |
