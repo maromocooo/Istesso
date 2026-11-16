@@ -157,6 +157,21 @@ impl Paths {
     pub fn agent_socket(&self) -> PathBuf {
         self.runtime.join("agent.sock")
     }
+
+    /// The places where that socket can be, in the order they are tried.
+    ///
+    /// The second is next to the cache. An agent that was started where
+    /// there is no runtime directory listens there: at boot, before anyone
+    /// logged in. The person who asks later, from a login that has one,
+    /// would look in the wrong place otherwise.
+    pub fn agent_sockets(&self) -> Vec<PathBuf> {
+        let mut all = vec![self.agent_socket()];
+        let beside_cache = self.cache.join("run").join("agent.sock");
+        if !all.contains(&beside_cache) {
+            all.push(beside_cache);
+        }
+        all
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +242,28 @@ mod tests {
         });
         assert_eq!(paths.runtime, PathBuf::from("/second/run"));
         assert_eq!(paths.config, PathBuf::from("/custom"));
+    }
+
+    #[test]
+    fn the_agent_is_also_looked_for_next_to_the_cache() {
+        // Started at boot there is no runtime directory; asked from a
+        // login there is. Both look next to the cache as well.
+        let at_boot = Paths::resolve(&env());
+        let from_a_login = Paths::resolve(&Environment {
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(
+            at_boot.agent_sockets(),
+            [PathBuf::from("/home/u/.cache/istesso/run/agent.sock")]
+        );
+        assert_eq!(
+            from_a_login.agent_sockets(),
+            [
+                PathBuf::from("/run/user/1000/istesso/agent.sock"),
+                PathBuf::from("/home/u/.cache/istesso/run/agent.sock"),
+            ]
+        );
     }
 
     #[test]

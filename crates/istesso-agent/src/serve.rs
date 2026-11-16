@@ -5,8 +5,8 @@
 //! short timeouts and small buffers; the number of simultaneous connections
 //! is capped.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,10 @@ const WAIT: Duration = Duration::from_secs(5);
 pub const MANIFEST_MAX_AGE: Duration = Duration::from_secs(600);
 /// How long a scan of the installed applications stays valid.
 const APPS_MAX_AGE: Duration = Duration::from_secs(30);
+/// How often the list of paired devices is read to end the conversations
+/// of a device that is no longer in it. The command that removes a pairing
+/// says so at once; this is for a list that was changed in another way.
+const PAIRINGS_READ_EVERY: Duration = Duration::from_secs(1);
 
 /// Receives one line for each thing worth telling the person running the
 /// agent.
@@ -81,6 +85,33 @@ struct Shared {
     log: Log,
     /// The applications of this machine that are shown to other devices.
     sessions: Sessions,
+    /// The conversations that are open, to end those of a device the
+    /// moment it is unpaired.
+    open: Mutex<Vec<Conversation>>,
+    conversations: AtomicU64,
+}
+
+/// A conversation with a paired device that is open.
+struct Conversation {
+    number: u64,
+    id: String,
+    public_key: String,
+    name: String,
+    /// A second handle on the connection, to close it from elsewhere.
+    stream: TcpStream,
+}
+
+/// Takes a conversation off the list when it is over.
+struct Listed<'a> {
+    shared: &'a Shared,
+    number: u64,
+}
+
+impl Drop for Listed<'_> {
+    fn drop(&mut self) {
+        let mut open = self.shared.open.lock().unwrap_or_else(|e| e.into_inner());
+        open.retain(|conversation| conversation.number != self.number);
+    }
 }
 
 impl Agent {
@@ -108,6 +139,8 @@ impl Agent {
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
                 log,
+                open: Mutex::new(Vec::new()),
+                conversations: AtomicU64::new(0),
             }),
         })
     }
@@ -193,13 +226,29 @@ impl Agent {
         #[cfg(unix)]
         match crate::session::local::listen(&self.shared.paths) {
             Ok(listener) => {
-                let sessions = self.shared.sessions.clone();
-                std::thread::spawn(move || crate::session::local::serve(listener, sessions));
+                let shared = self.shared.clone();
+                let answer: crate::session::local::Answerer = Arc::new(move |request| {
+                    // A pairing was removed: its device is cut off before
+                    // the command that removed it is told so.
+                    if matches!(request, crate::session::HostRequest::PairingsChanged) {
+                        shared.cut_unpaired();
+                    }
+                    shared.sessions.answer_host(request)
+                });
+                std::thread::spawn(move || crate::session::local::serve(listener, answer));
             }
             Err(why) => (self.shared.log)(format!(
                 "`istesso sessions --local` will not work on this machine: {why}"
             )),
         }
+
+        // However the list of paired devices was changed, a device that
+        // is no longer in it loses its conversations within this time.
+        let shared = self.shared.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(PAIRINGS_READ_EVERY);
+            shared.cut_unpaired();
+        });
 
         if let Some(interval) = self.options.refresh_peers {
             let shared = self.shared.clone();
@@ -247,6 +296,7 @@ impl Shared {
             }
         };
         let remote = stream.peer_addr().ok();
+        let handle = stream.try_clone();
         let mut session = match Session::accept(stream, &self.keys, &peers, WAIT) {
             Ok(session) => session,
             Err(err) => {
@@ -271,8 +321,19 @@ impl Shared {
         let _ =
             cache::suggest_address(&self.paths, &session.peer().id, &session.peer().name, &hint);
 
+        // From here on the conversation can be ended from elsewhere.
+        let _listed = handle.ok().map(|stream| self.list(session.peer(), stream));
+
         let mut asked: Vec<&'static str> = Vec::new();
         while let Ok(Some(request)) = session.next_request() {
+            // What the device may do is read now, not remembered from the
+            // handshake: a conversation can stay open for as long as a
+            // window does. A device that was unpaired is not answered.
+            let peer = session.peer();
+            let Some(rights) = crate::session::rights(&self.paths, &peer.id, &peer.public_key)
+            else {
+                break;
+            };
             let response = match request {
                 // Streaming sessions have their own table, and their own
                 // rules about who may ask.
@@ -282,7 +343,7 @@ impl Shared {
                             self.apps()
                         })
                 }
-                request if session.allows(Permission::View) => self.answer(&request, &mut asked),
+                request if rights.contains(&Permission::View) => self.answer(&request, &mut asked),
                 _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
             if session.respond(&response).is_err() {
@@ -296,6 +357,56 @@ impl Shared {
                 asked.join(", ")
             ));
         }
+    }
+
+    /// Puts a conversation on the list of the open ones.
+    fn list(&self, peer: &istesso_pair::Peer, stream: TcpStream) -> Listed<'_> {
+        let number = self.conversations.fetch_add(1, Ordering::SeqCst);
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        open.push(Conversation {
+            number,
+            id: peer.id.clone(),
+            public_key: peer.public_key.clone(),
+            name: peer.name.clone(),
+            stream,
+        });
+        Listed {
+            shared: self,
+            number,
+        }
+    }
+
+    /// Ends the conversations of devices that are not in the list of
+    /// paired devices any more, and says how many. A list that cannot be
+    /// read pairs nobody.
+    fn cut_unpaired(&self) -> usize {
+        let peers = PeerStore::open(self.paths.peers()).ok();
+        let paired = |conversation: &Conversation| {
+            peers.as_ref().is_some_and(|peers| {
+                peers.peers().iter().any(|known| {
+                    known.id == conversation.id && known.public_key == conversation.public_key
+                })
+            })
+        };
+        let mut cut = Vec::new();
+        {
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            open.retain(|conversation| {
+                paired(conversation) || {
+                    // Both ways: nothing more is read from the device,
+                    // and an answer that was being held back is not sent.
+                    let _ = conversation.stream.shutdown(Shutdown::Both);
+                    cut.push(conversation.name.clone());
+                    false
+                }
+            });
+        }
+        for name in &cut {
+            (self.log)(format!(
+                "ended a conversation with {name}: it is no longer paired"
+            ));
+        }
+        cut.len()
     }
 
     fn answer(&self, request: &Request, asked: &mut Vec<&'static str>) -> Response {
@@ -401,6 +512,75 @@ mod tests {
         agent.shared.refresh_manifest();
         assert_ne!(agent.shared.manifest().name, "planted for this test");
         assert!(paths.local_manifest().exists());
+    }
+
+    #[test]
+    fn a_device_that_is_unpaired_loses_its_conversations() {
+        use istesso_link::Client;
+        use istesso_pair::{Hello, Peer};
+
+        let dir = TempDir::new("serve-cut");
+        let paths = dir.paths();
+        let agent = agent(&paths);
+        let addr = agent.local_addr().unwrap();
+        let shared = agent.shared.clone();
+        std::thread::spawn(move || agent.run());
+
+        // Two devices that are paired with the agent, each in a
+        // conversation that just sits there.
+        let host_key = Identity::load_or_create(&paths.identity())
+            .unwrap()
+            .public_key();
+        let device = |name: &str| {
+            let identity = Identity::generate();
+            let mut peers = PeerStore::open(paths.peers()).unwrap();
+            let peer = Peer::from_hello(&Hello {
+                device_name: name.to_string(),
+                public_key: identity.public_key(),
+            });
+            peers.add(peer.clone()).unwrap();
+            (identity, peer)
+        };
+        let connect = |identity: &Identity| {
+            // The device's own list knows the agent's key.
+            let own = TempDir::new("serve-cut-device");
+            let mut known = PeerStore::open(own.paths().peers()).unwrap();
+            known
+                .add(Peer::from_hello(&Hello {
+                    device_name: "host".to_string(),
+                    public_key: host_key,
+                }))
+                .unwrap();
+            let keys = LocalKeys::new(identity).unwrap();
+            Client::connect(addr, &keys, &known, None, Duration::from_secs(5))
+        };
+        let (laptop_identity, laptop) = device("laptop");
+        let (tablet_identity, _) = device("tablet");
+        let mut laptop_talks = connect(&laptop_identity).unwrap();
+        let mut tablet_talks = connect(&tablet_identity).unwrap();
+        laptop_talks.ping().unwrap();
+        tablet_talks.ping().unwrap();
+        let open = || shared.open.lock().unwrap().len();
+        assert_eq!(open(), 2);
+
+        // Nobody tells the agent. It reads the list itself, and ends the
+        // laptop's conversation without the laptop having said a word.
+        let removed = PeerStore::open(paths.peers())
+            .unwrap()
+            .remove(&laptop.id)
+            .unwrap();
+        assert!(removed.is_some());
+        let unpaired = Instant::now();
+        while open() > 1 {
+            assert!(unpaired.elapsed() < PAIRINGS_READ_EVERY * 3, "still open");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(laptop_talks.ping().is_err());
+        // The other device is not touched, and the laptop does not get in
+        // again.
+        tablet_talks.ping().unwrap();
+        assert_eq!(open(), 1);
+        assert!(connect(&laptop_identity).is_err());
     }
 
     #[test]

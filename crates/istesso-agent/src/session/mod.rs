@@ -15,9 +15,10 @@
 //! A session belongs to the device that started it. When that device is
 //! unpaired, or loses a right that starting takes, the session is closed to
 //! it: nothing is shown to it and it cannot ask about the session any more.
-//! The application is not ended for that. It stays with the person at the
-//! host, who sees every session of the machine and can end each one
-//! ([`local`]).
+//! The application is not ended for that. A session whose device was
+//! unpaired is marked and from then on open to every device that may start
+//! applications here. The person at the host sees every session of the
+//! machine and can end each one ([`local`]).
 //!
 //! * [`Sessions`] is the table: it answers the session requests and keeps
 //!   one supervising thread per session.
@@ -36,6 +37,7 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -76,15 +78,19 @@ pub mod policy {
     /// of the eight a host takes. Fewer than all of them, so that a device
     /// cannot hold every place: with six, two are always left for another
     /// device. Sessions nobody is shown count, and so do the sessions of a
-    /// device that was unpaired, until the person at the host ends them.
+    /// device that was unpaired, until somebody ends them.
     pub const SESSIONS_PER_DEVICE: usize = 6;
 
-    /// Whether `peer` may see, attach to and stop a session that the device
-    /// with this id and key started. For now only that device itself; the
-    /// question whether every paired device of the same person may is open
-    /// (ADR 0010, "決めてほしいこと").
-    pub fn may_use(owner_id: &str, owner_key: &str, peer: &Peer) -> bool {
-        owner_id == peer.id && owner_key == peer.public_key
+    /// Whether `peer`, which has what starting takes, may see, attach to
+    /// and stop a session that the device with this id and key started.
+    ///
+    /// That device itself may. Once it was unpaired (`left`), every device
+    /// may: the application was kept so that the work in it is not lost,
+    /// and somebody has to be able to get back to it. Whether every paired
+    /// device may use every session is still open (ADR 0010,
+    /// "決めてほしいこと").
+    pub fn may_use(owner_id: &str, owner_key: &str, left: bool, peer: &Peer) -> bool {
+        left || (owner_id == peer.id && owner_key == peer.public_key)
     }
 }
 
@@ -216,6 +222,9 @@ struct Inner {
     table: Mutex<Table>,
     /// Signalled whenever a session changes or is asked to do something.
     changed: Condvar,
+    /// Goes up when somebody says that the list of paired devices changed,
+    /// so that no session waits for its next reading of it.
+    pairings_epoch: AtomicU64,
 }
 
 #[derive(Default)]
@@ -228,7 +237,10 @@ struct Table {
 struct Entry {
     info: SessionInfo,
     app_name: String,
-    owner: Owner,
+    /// The device that started it.
+    owner: Device,
+    /// The device that is shown it, or was the last to be.
+    viewer: Device,
     number: u64,
     /// When the client that is shown the session last asked about it.
     seen: Instant,
@@ -245,14 +257,59 @@ struct Entry {
     ended_at: Option<Instant>,
 }
 
-/// The device that started a session.
+/// A device as a session remembers it.
 #[derive(Clone)]
-struct Owner {
+struct Device {
     id: String,
     public_key: String,
-    /// What it was called when it started the session. It may not be in
-    /// the list of paired devices any more.
+    /// What it was called at the time. It may not be in the list of paired
+    /// devices any more.
     name: String,
+}
+
+impl Device {
+    fn of(peer: &Peer) -> Self {
+        Device {
+            id: peer.id.clone(),
+            public_key: peer.public_key.clone(),
+            name: peer.name.clone(),
+        }
+    }
+}
+
+/// What a device may do with sessions on this host at this moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// It is paired and has what starting takes.
+    Allowed,
+    /// It is paired and lacks a right that starting takes. Also when the
+    /// list of paired devices cannot be read: nothing is allowed then, and
+    /// nothing is concluded from it.
+    Barred,
+    /// It is not in the list of paired devices.
+    Unpaired,
+}
+
+fn standing(peers: Option<&PeerStore>, device: &Device) -> Standing {
+    let Some(peers) = peers else {
+        return Standing::Barred;
+    };
+    let known = peers
+        .peers()
+        .iter()
+        .find(|known| known.id == device.id && known.public_key == device.public_key);
+    match known {
+        None => Standing::Unpaired,
+        Some(known) if may_start(&known.permissions) => Standing::Allowed,
+        Some(_) => Standing::Barred,
+    }
+}
+
+/// When a session's supervisor last read what devices may do.
+#[derive(Default)]
+struct Checked {
+    at: Option<Instant>,
+    epoch: u64,
 }
 
 /// Who asks about a session.
@@ -284,6 +341,8 @@ struct Orders {
 
 struct Attach {
     number: u64,
+    /// The device that asks to be shown the session.
+    device: Device,
     peer: SessionPeer,
     display: DisplayMode,
     offer: serde_json::Value,
@@ -307,6 +366,19 @@ fn report(info: &SessionInfo) -> Response {
     }
 }
 
+/// A session's report for a device that asks about it. What the media path
+/// agreed on is for the client that is shown the session and for nobody
+/// else: a session can be open to several devices.
+fn report_to(info: &SessionInfo, shown: bool) -> Response {
+    let mut info = info.clone();
+    if !shown {
+        info.answer = None;
+    }
+    Response::Session {
+        session: Box::new(info),
+    }
+}
+
 fn ending(reason: EndReason, message: impl Into<String>) -> SessionEnd {
     SessionEnd {
         reason,
@@ -317,7 +389,7 @@ fn ending(reason: EndReason, message: impl Into<String>) -> SessionEnd {
 /// What the device may do on this host at this moment: read from the list
 /// on disk, not remembered from when a conversation or a session began.
 /// `None` when it is no longer paired.
-fn rights(paths: &Paths, id: &str, public_key: &str) -> Option<Vec<Permission>> {
+pub(crate) fn rights(paths: &Paths, id: &str, public_key: &str) -> Option<Vec<Permission>> {
     let peers = PeerStore::open(paths.peers()).ok()?;
     peers
         .peers()
@@ -386,6 +458,7 @@ impl Sessions {
                 rules,
                 table: Mutex::new(Table::default()),
                 changed: Condvar::new(),
+                pairings_epoch: AtomicU64::new(0),
             }),
         }
     }
@@ -505,11 +578,7 @@ impl Sessions {
 
         let id = SessionId(format!("{:016x}", OsRng.next_u64()));
         let input_socket = inner.paths.session_input_socket(&id);
-        let owner = Owner {
-            id: peer.id.clone(),
-            public_key: peer.public_key.clone(),
-            name: peer.name.clone(),
-        };
+        let owner = Device::of(peer);
         let info = SessionInfo {
             id: id.clone(),
             app: app.id.clone(),
@@ -521,6 +590,7 @@ impl Sessions {
             display: None,
             answer: None,
             end: None,
+            left_by: None,
         };
         {
             let mut table = inner.lock();
@@ -535,6 +605,9 @@ impl Sessions {
                     info: info.clone(),
                     app_name: app.name.clone(),
                     owner: owner.clone(),
+                    // The device that starts a session is the first to be
+                    // shown it.
+                    viewer: owner.clone(),
                     number,
                     seen: Instant::now(),
                     waiting: 0,
@@ -585,7 +658,16 @@ impl Sessions {
             .collect();
         mine.sort_by_key(|e| e.number);
         Response::Sessions {
-            sessions: mine.into_iter().map(|e| e.info.clone()).collect(),
+            sessions: mine
+                .into_iter()
+                .map(|e| {
+                    // A list is not the place for what the media path
+                    // agreed on with the client that is shown the session.
+                    let mut info = e.info.clone();
+                    info.answer = None;
+                    info
+                })
+                .collect(),
         }
     }
 
@@ -613,7 +695,7 @@ impl Sessions {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if entry.info.revision > after || left.is_zero() {
-                return report(&entry.info);
+                return report_to(&entry.info, shown);
             }
             if shown {
                 entry.waiting += 1;
@@ -670,6 +752,7 @@ impl Sessions {
             }
             entry.orders.attach = Some(Attach {
                 number,
+                device: Device::of(peer),
                 peer: SessionPeer {
                     id: peer.id.clone(),
                     address: address_text(&remote),
@@ -732,7 +815,7 @@ impl Sessions {
             // A session that is still starting leaves as soon as it runs;
             // there is nothing to wait for now.
             if !shown || entry.info.state == SessionState::Starting || left.is_zero() {
-                return report(&entry.info);
+                return report_to(&entry.info, shown);
             }
             table = inner
                 .changed
@@ -761,11 +844,11 @@ impl Sessions {
                     entry.orders.close = true;
                     inner.changed.notify_all();
                 }
-                return report(&entry.info);
+                return report_to(&entry.info, false);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if over || left.is_zero() {
-                return report(&entry.info);
+                return report_to(&entry.info, false);
             }
             entry.orders.force = true;
             inner.changed.notify_all();
@@ -775,6 +858,13 @@ impl Sessions {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    /// Somebody changed the list of paired devices: every session reads it
+    /// now instead of when its turn comes.
+    pub fn pairings_changed(&self) {
+        self.inner.pairings_epoch.fetch_add(1, Ordering::SeqCst);
+        self.inner.changed.notify_all();
     }
 
     /// Every session of this host that is not over, whichever device
@@ -831,7 +921,12 @@ impl Sessions {
 
 impl Entry {
     fn is_for(&self, peer: &Peer) -> bool {
-        policy::may_use(&self.owner.id, &self.owner.public_key, peer)
+        policy::may_use(
+            &self.owner.id,
+            &self.owner.public_key,
+            self.info.left_by.is_some(),
+            peer,
+        )
     }
 
     /// Whether `peer` is the device that started it, whoever else may use
@@ -879,8 +974,8 @@ impl Table {
 
     /// Why `peer` cannot start one more session, when it cannot: it has as
     /// many as one device may, or the host has as many as it takes. Nothing
-    /// is ended to make room. The device is told which of its sessions
-    /// nobody is shown, so that a person can decide.
+    /// is ended to make room. The device is told which of the sessions it
+    /// may use nobody is shown, so that a person can decide.
     fn full_for(&self, peer: &Peer, rules: &Rules) -> Option<String> {
         let live: Vec<&Entry> = self
             .sessions
@@ -895,7 +990,10 @@ impl Table {
         idle.sort_by_key(|e| e.number);
         let idle: Vec<String> = idle
             .iter()
-            .map(|e| format!("{} ({})", e.app_name, e.info.id))
+            .map(|e| match &e.info.left_by {
+                Some(device) => format!("{} ({}, opened by {device})", e.app_name, e.info.id),
+                None => format!("{} ({})", e.app_name, e.info.id),
+            })
             .collect();
 
         if own >= rules.max_sessions_per_device {
@@ -915,13 +1013,16 @@ impl Table {
                 live.len()
             );
             if !idle.is_empty() {
-                why.push_str(&format!("; of yours, nobody is shown: {}", idle.join(", ")));
+                why.push_str(&format!("; nobody is shown: {}", idle.join(", ")));
             }
             // Places that only the person at the host can free.
-            let closed = live.iter().filter(|e| e.revoked).count();
+            let closed = live
+                .iter()
+                .filter(|e| e.revoked && e.info.left_by.is_none())
+                .count();
             if closed > 0 {
                 why.push_str(&format!(
-                    "; {closed} were started by devices that may no longer use them: \
+                    "; {closed} were started by devices that may not use them now: \
                      `istesso sessions --local` on the host lists them"
                 ));
             }
@@ -938,7 +1039,7 @@ impl Table {
 /// What the supervising thread of a session is given.
 struct Job {
     id: SessionId,
-    owner: Owner,
+    owner: Device,
     app_name: String,
     runner: Arc<dyn Runner>,
     plan: LaunchPlan,
@@ -1000,40 +1101,61 @@ impl Inner {
         self.changed.notify_all();
     }
 
-    /// Whether the device that started a session may still use one: read
-    /// from the list of paired devices now.
-    fn allowed(&self, owner: &Owner) -> bool {
-        rights(&self.paths, &owner.id, &owner.public_key).is_some_and(|rights| may_start(&rights))
+    /// What `device` may do right now: read from the list of paired
+    /// devices.
+    fn standing_of(&self, device: &Device) -> Standing {
+        standing(PeerStore::open(self.paths.peers()).ok().as_ref(), device)
     }
 
-    /// Notes that the device that started a session lost the right to use
-    /// it, or has it back. The person at the host is the one who sees this.
-    fn mark(&self, job: &Job, revoked: bool) {
-        if let Some(entry) = self.lock().sessions.get_mut(&job.id.0) {
-            entry.revoked = revoked;
+    /// Notes what the device that started a session may do with it now.
+    /// A session whose device was unpaired is kept, and says from then on
+    /// who opened it: that does not go away when the device is paired
+    /// again.
+    fn mark(&self, job: &Job, owner: Standing) {
+        let revoked = owner != Standing::Allowed;
+        let (id, name, app) = (&job.id, &job.owner.name, &job.app_name);
+        let mut said = Vec::new();
+        {
+            let mut table = self.lock();
+            let Some(entry) = table.sessions.get_mut(&id.0) else {
+                return;
+            };
+            if entry.revoked != revoked {
+                entry.revoked = revoked;
+                said.push(if revoked {
+                    format!("{name} may not use it now; {app} keeps running")
+                } else {
+                    format!("{name} may use it again")
+                });
+            }
+            if owner == Standing::Unpaired && entry.info.left_by.is_none() {
+                entry.info.left_by = Some(name.clone());
+                entry.info.revision += 1;
+                said.push(format!(
+                    "{name} was unpaired; {app} is kept for every device that may start \
+                     applications here, and for `istesso sessions --local`"
+                ));
+            }
         }
-        self.changed.notify_all();
-        let (id, name) = (&job.id, &job.owner.name);
-        (self.log)(if revoked {
-            format!(
-                "session {id}: {name} may no longer use it; {} keeps running, and \
-                 `istesso sessions --local` on this machine lists it",
-                job.app_name
-            )
-        } else {
-            format!("session {id}: {name} may use it again")
-        });
+        if !said.is_empty() {
+            self.changed.notify_all();
+        }
+        for line in said {
+            (self.log)(format!("session {id}: {line}"));
+        }
     }
 
     /// Takes what was asked for since the last round, looks whether the
     /// client that is shown the session is still there, and reads again
-    /// what the device that started the session may do. `attaching` is set
-    /// while a client is being attached: the one before it no longer
-    /// counts.
-    fn round(&self, job: &Job, rights_read: &mut Option<Instant>, attaching: bool) -> Round {
+    /// what the devices that have to do with the session may do.
+    /// `attaching` is the client that is being attached, if one is: the
+    /// one before it no longer counts.
+    fn round(&self, job: &Job, checked: &mut Checked, attaching: Option<&Device>) -> Round {
         let id = &job.id;
         let mut round = Round::default();
-        let showing = {
+        // Whose rights keep the picture going: the client that is being
+        // attached, or else the one that is shown the session.
+        let subject = {
             let mut table = self.lock();
             let Some(entry) = table.sessions.get_mut(&id.0) else {
                 return round;
@@ -1047,7 +1169,7 @@ impl Inner {
                 entry.info.state,
                 SessionState::Starting | SessionState::Running
             );
-            if showing && !attaching && round.attach.is_none() {
+            if showing && attaching.is_none() && round.attach.is_none() {
                 let lost_after = self.rules.client_lost_after;
                 if orders.detach {
                     round.leave = Some("its client left".to_string());
@@ -1058,31 +1180,42 @@ impl Inner {
                     ));
                 }
             }
-            showing || attaching
+            attaching
+                .cloned()
+                .or_else(|| showing.then(|| entry.viewer.clone()))
         };
-        // The rights are read for every session, shown or not: a session
-        // nobody is shown still holds a place and can be attached to. They
-        // are read every so often, and always before a client is attached.
+        // The list of paired devices is read for every session, shown or
+        // not: a session nobody is shown still holds a place and can be
+        // attached to. It is read every so often, at once when somebody
+        // says that it changed, and always before a client is attached.
+        let epoch = self.pairings_epoch.load(Ordering::SeqCst);
         let due = round.attach.is_some()
-            || rights_read.is_none_or(|at| at.elapsed() >= self.rules.recheck_rights_every);
-        if due {
-            *rights_read = Some(Instant::now());
-            let revoked = !self.allowed(&job.owner);
-            if revoked != round.revoked {
-                self.mark(job, revoked);
-            }
-            round.revoked = revoked;
+            || epoch != checked.epoch
+            || checked
+                .at
+                .is_none_or(|at| at.elapsed() >= self.rules.recheck_rights_every);
+        if !due {
+            return round;
         }
-        if round.revoked {
-            // A pairing that is removed, or a right that is taken away,
-            // stops the picture and keeps it stopped. It does not end the
-            // application.
-            if let Some(attach) = round.attach.take() {
+        *checked = Checked {
+            at: Some(Instant::now()),
+            epoch,
+        };
+        let peers = PeerStore::open(self.paths.peers()).ok();
+        let owner = standing(peers.as_ref(), &job.owner);
+        self.mark(job, owner);
+        round.revoked = owner != Standing::Allowed;
+        // A pairing that is removed, or a right that is taken away, stops
+        // the picture and keeps it stopped. It does not end the
+        // application.
+        if let Some(attach) = &round.attach {
+            if standing(peers.as_ref(), &attach.device) != Standing::Allowed {
                 self.attach_went(id, attach.number, Err(NOT_ALLOWED.to_string()));
+                round.attach = None;
             }
-            if showing {
-                round.leave = Some(NOT_ALLOWED.to_string());
-            }
+        }
+        if subject.is_some_and(|device| standing(peers.as_ref(), &device) != Standing::Allowed) {
+            round.leave = Some(NOT_ALLOWED.to_string());
         }
         round
     }
@@ -1100,7 +1233,7 @@ impl Inner {
         let id = &job.id;
         let mut stream: Option<Box<dyn RunningStream>> = None;
         let mut app: Option<Box<dyn RunningApp>> = None;
-        let mut rights_read: Option<Instant> = None;
+        let mut checked = Checked::default();
 
         let end = 'session: {
             // The host's side of the stream comes first: it makes the
@@ -1141,7 +1274,7 @@ impl Inner {
                     );
                     break 'session ending(EndReason::StreamFailed, why);
                 }
-                let round = self.round(&job, &mut rights_read, false);
+                let round = self.round(&job, &mut checked, None);
                 if round.force {
                     break 'session ending(EndReason::Stopped, "");
                 }
@@ -1162,7 +1295,7 @@ impl Inner {
             // The application, on the display the runner made. Nothing is
             // started for a device that lost its rights while the runner
             // got ready.
-            if !self.allowed(&job.owner) {
+            if self.standing_of(&job.owner) != Standing::Allowed {
                 break 'session ending(EndReason::Stopped, NOT_STARTED);
             }
             let application = match self.launcher.launch(&job.plan, &env) {
@@ -1189,7 +1322,7 @@ impl Inner {
 
             // The attach order that the runner has been told and has not
             // answered yet, and since when.
-            let mut attaching: Option<(u64, Instant)> = None;
+            let mut attaching: Option<(u64, Instant, Device)> = None;
             loop {
                 if let Some(how) = application.poll() {
                     let why = format!("the application ended ({how})");
@@ -1210,7 +1343,7 @@ impl Inner {
                         break 'session ending(EndReason::StreamFailed, why);
                     }
                     Some(StreamEvent::Said(RunnerEvent::Attached { display, answer })) => {
-                        let Some((number, _)) = attaching.take() else {
+                        let Some((number, _, device)) = attaching.take() else {
                             continue;
                         };
                         if !fits(&answer) {
@@ -1225,6 +1358,7 @@ impl Inner {
                             entry.info.attachment += 1;
                             entry.info.display = Some(display);
                             entry.info.answer = Some(answer);
+                            entry.viewer = device;
                             entry.seen = Instant::now();
                             entry.attached.push((number, Ok(())));
                         });
@@ -1238,7 +1372,7 @@ impl Inner {
                             message
                         };
                         self.detached(id, &why);
-                        if let Some((number, _)) = attaching.take() {
+                        if let Some((number, ..)) = attaching.take() {
                             self.attach_went(id, number, Err(why));
                         }
                         continue;
@@ -1246,20 +1380,21 @@ impl Inner {
                     Some(StreamEvent::Said(RunnerEvent::Ready { .. })) => continue,
                     None => {}
                 }
-                if let Some((number, since)) = attaching {
-                    if since.elapsed() > rules.attach_within {
-                        attaching = None;
-                        let why = format!(
-                            "the host's side of the stream did not take the client within {} seconds",
-                            rules.attach_within.as_secs_f32()
-                        );
-                        let _ = running.tell(&RunnerCommand::Detach);
-                        self.detached(id, &why);
-                        self.attach_went(id, number, Err(why));
-                    }
+                let late = |(_, since, _): &mut (u64, Instant, Device)| {
+                    since.elapsed() > rules.attach_within
+                };
+                if let Some((number, ..)) = attaching.take_if(late) {
+                    let why = format!(
+                        "the host's side of the stream did not take the client within {} seconds",
+                        rules.attach_within.as_secs_f32()
+                    );
+                    let _ = running.tell(&RunnerCommand::Detach);
+                    self.detached(id, &why);
+                    self.attach_went(id, number, Err(why));
                 }
 
-                let round = self.round(&job, &mut rights_read, attaching.is_some());
+                let being_attached = attaching.as_ref().map(|(_, _, device)| device);
+                let round = self.round(&job, &mut checked, being_attached);
                 if round.force {
                     break 'session ending(EndReason::Stopped, "");
                 }
@@ -1271,7 +1406,7 @@ impl Inner {
                 if let Some(attach) = round.attach {
                     // A client that was still being attached has lost its
                     // turn to this one.
-                    if let Some((before, _)) = attaching.take() {
+                    if let Some((before, ..)) = attaching.take() {
                         let why = "another window took the session".to_string();
                         self.attach_went(id, before, Err(why));
                     }
@@ -1281,7 +1416,9 @@ impl Inner {
                         offer: attach.offer,
                     });
                     match told {
-                        Ok(()) => attaching = Some((attach.number, Instant::now())),
+                        Ok(()) => {
+                            attaching = Some((attach.number, Instant::now(), attach.device));
+                        }
                         Err(why) => self.attach_went(id, attach.number, Err(why)),
                     }
                 } else if let Some(why) = round.leave {
@@ -1289,7 +1426,7 @@ impl Inner {
                     self.detached(id, &why);
                     // A client that was being attached is not shown it
                     // either.
-                    if let Some((number, _)) = attaching.take() {
+                    if let Some((number, ..)) = attaching.take() {
                         self.attach_went(id, number, Err(why));
                     }
                 }

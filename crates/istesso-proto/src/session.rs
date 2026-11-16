@@ -132,6 +132,12 @@ pub struct SessionInfo {
     /// Why the session ends. Set from `stopping` on.
     #[serde(default)]
     pub end: Option<SessionEnd>,
+    /// Set when the device that started the session was unpaired while it
+    /// ran: the name that device had. The application was kept, and the
+    /// session is open to every device that may start applications on the
+    /// host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_by: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +393,7 @@ mod tests {
             display: None,
             answer: None,
             end: None,
+            left_by: None,
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
@@ -414,6 +421,17 @@ mod tests {
         assert_eq!(
             text,
             r#"{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"stopping","revision":5,"attachment":2,"display":{"width":1720,"height":720,"fps":85},"answer":{"key_request_port":50005},"end":{"reason":"stopped","message":""}}"#
+        );
+        assert_eq!(serde_json::from_str::<SessionInfo>(&text).unwrap(), info);
+
+        // A session that an unpaired device left behind says who opened
+        // it. Other sessions do not carry the field.
+        assert!(!text.contains("left_by"), "{text}");
+        info.left_by = Some("old laptop".to_string());
+        let text = serde_json::to_string(&info).unwrap();
+        assert!(
+            text.ends_with(r#""message":""},"left_by":"old laptop"}"#),
+            "{text}"
         );
         assert_eq!(serde_json::from_str::<SessionInfo>(&text).unwrap(), info);
     }

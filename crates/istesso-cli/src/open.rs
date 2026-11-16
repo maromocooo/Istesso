@@ -183,7 +183,7 @@ fn choose_session<'a>(
                     "{} on {} ({})",
                     r.info.id,
                     r.host_name,
-                    sessions::state_words(r.info.state)
+                    sessions::words(&r.info)
                 )
             })
             .collect();
@@ -371,10 +371,18 @@ fn open_there(
             SessionState::Starting => {
                 eprintln!("Starting {name} on {host} (session {})...", info.id)
             }
-            SessionState::Running if coming_back => eprintln!(
-                "Showing {name} from {host} again (session {}). {how_to_end}",
-                info.id
-            ),
+            SessionState::Running if coming_back => {
+                // Somebody else's work, kept when their device was
+                // unpaired: said, so that nobody takes it for their own.
+                let whose = match &info.left_by {
+                    Some(device) => format!(", which {device} opened before it was unpaired"),
+                    None => String::new(),
+                };
+                eprintln!(
+                    "Showing {name} from {host} again (session {}{whose}). {how_to_end}",
+                    info.id
+                )
+            }
             SessionState::Running => eprintln!("{name} is running on {host}. {how_to_end}"),
             _ => {}
         },
@@ -599,6 +607,7 @@ mod tests {
                 display: None,
                 answer: None,
                 end: None,
+                left_by: None,
             },
         }
     }

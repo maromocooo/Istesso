@@ -360,6 +360,7 @@ mod tests {
                             display: None,
                             answer: None,
                             end,
+                            left_by: None,
                         }),
                     };
                     let response = match &request {

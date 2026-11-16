@@ -245,7 +245,18 @@ enum PeersAction {
         json: bool,
     },
     /// Stop trusting a device (by id or name)
-    Remove { selector: String },
+    ///
+    /// The device is cut off at once. The applications it had opened on
+    /// this machine are listed and keep running, so that no work is lost:
+    /// devices that may control this machine can show and end them.
+    Remove {
+        selector: String,
+        /// Ask the applications that device had opened on this machine to
+        /// close, instead of keeping them. One that has unsaved work may
+        /// stay and ask.
+        #[arg(long)]
+        close_apps: bool,
+    },
     /// Tell this machine where a paired device can be reached
     ///
     /// Addresses are normally learnt while pairing and from the devices
@@ -836,12 +847,21 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
             }
             Ok(())
         }
-        PeersAction::Remove { selector } => {
+        PeersAction::Remove {
+            selector,
+            close_apps,
+        } => {
             let mut peers = open_peers()?;
             match peers.remove(&selector).map_err(|e| e.to_string())? {
                 Some(peer) => {
-                    cache::forget(&Paths::from_env(), &peer.id);
+                    let paths = Paths::from_env();
+                    cache::forget(&paths, &peer.id);
                     println!("Removed {} ({})", peer.name, peer.id);
+                    // The agent on this machine ends what the device has
+                    // open now, not when it next looks (ADR 0010).
+                    for line in sessions::unpaired(&paths, &peer.id, &peer.name, close_apps) {
+                        println!("{line}");
+                    }
                     Ok(())
                 }
                 None => Err(format!("no paired device matches '{selector}'")),

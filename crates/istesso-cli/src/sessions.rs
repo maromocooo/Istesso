@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use istesso_agent::session::client::{link_to, sessions_on, stop_session, ClientRules, OpenError};
-use istesso_agent::session::local::{sessions_here, stop_here};
+use istesso_agent::session::local::{after_unpairing, sessions_here, stop_here};
 use istesso_agent::session::{HostSession, Rules};
 use istesso_agent::{survey, HostView, Paths, SurveyOptions};
 use istesso_link::ErrorCode;
@@ -43,7 +43,10 @@ pub fn running(paths: &Paths, views: &[HostView]) -> (Vec<Running>, Vec<String>)
             .map_err(OpenError::Unreachable)
             .and_then(|link| sessions_on(&link, &rules));
         match listed {
-            Ok(sessions) => all.extend(sessions.into_iter().map(|info| {
+            Ok(sessions) => all.extend(sessions.into_iter().map(|mut info| {
+                // What the media path agreed on is for the window that is
+                // shown the session. It has no place in a list.
+                info.answer = None;
                 Running {
                     host_id: view.id.clone(),
                     host_name: view.name.clone(),
@@ -72,6 +75,16 @@ pub fn state_words(state: SessionState) -> &'static str {
         SessionState::Stopping => "ending",
         SessionState::Ended => "ended",
         SessionState::Unknown => "unknown",
+    }
+}
+
+/// A session's state, and whose it was when the device that opened it has
+/// been unpaired since.
+pub fn words(info: &SessionInfo) -> String {
+    let state = state_words(info.state);
+    match &info.left_by {
+        Some(device) => format!("{state}; opened by {device}, which was unpaired"),
+        None => state.to_string(),
     }
 }
 
@@ -132,7 +145,7 @@ pub fn render(running: &[Running]) -> String {
             r.info.id,
             crate::pad(&r.app_name, app),
             crate::pad(&r.host_name, host),
-            state_words(r.info.state)
+            words(&r.info)
         ));
     }
     out
@@ -218,12 +231,16 @@ pub fn stop(session: &str, force: bool) -> Result<(), String> {
 
 /// What `istesso sessions --local` says about a session's state.
 fn local_state_words(session: &HostSession) -> String {
-    let state = state_words(session.info.state);
-    if session.revoked {
-        format!("{state}; {} may no longer use it", session.started_by.name)
-    } else {
-        state.to_string()
+    if session.info.left_by.is_none() && session.revoked {
+        // Still paired, without a right that starting takes: only from
+        // here can the session be ended.
+        return format!(
+            "{}; {} may not use it now",
+            state_words(session.info.state),
+            session.started_by.name
+        );
     }
+    words(&session.info)
 }
 
 /// The table `istesso sessions --local` prints.
@@ -297,6 +314,113 @@ pub fn stop_local(session: &str, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `istesso peers remove`, after the pairing is gone: tells the agent on
+/// this machine, so that the device is cut off now, and says what the
+/// device had opened here. Those applications are kept; with `close` they
+/// are asked to close, which they may answer with a question. The lines
+/// to print.
+pub fn unpaired(paths: &Paths, device: &str, name: &str, close: bool) -> Vec<String> {
+    let left = match after_unpairing(paths, device) {
+        // No agent here, so nothing that device started runs here.
+        Ok(None) => return Vec::new(),
+        Ok(Some(left)) => left,
+        Err(why) => {
+            return vec![format!(
+                "The agent on this machine could not be told ({why}). It reads the list of \
+                 paired devices every second, and cuts {name} off then."
+            )]
+        }
+    };
+    let mut lines = vec![format!(
+        "{name} is cut off from this machine: its conversations are ended, and nothing is \
+         shown to it."
+    )];
+    if left.is_empty() {
+        return lines;
+    }
+    let still = if close {
+        // All of them are asked first; then they get a moment together.
+        for session in &left {
+            let _ = stop_here(paths, &session.info.id, false, Duration::ZERO);
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let running: Vec<String> = sessions_here(paths)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|session| session.info.id.0)
+                .collect();
+            let still: Vec<String> = left
+                .iter()
+                .map(|session| session.info.id.0.clone())
+                .filter(|id| running.contains(id))
+                .collect();
+            if still.is_empty() || std::time::Instant::now() >= until {
+                break Some(still);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        None
+    };
+    lines.extend(unpaired_words(name, &left, still.as_deref()));
+    lines
+}
+
+/// What is said about the applications a device that was unpaired had
+/// opened on this machine. `still` is set when they were asked to close:
+/// the ids of those that have not.
+fn unpaired_words(name: &str, left: &[HostSession], still: Option<&[String]>) -> Vec<String> {
+    let app = column("", left.iter().map(|s| s.app_name.as_str()));
+    let count = match left.len() {
+        1 => "an application".to_string(),
+        n => format!("{n} applications"),
+    };
+    let mut lines = Vec::new();
+    match still {
+        None => {
+            lines.push(format!(
+                "It had opened {count} on this machine, which {} running:",
+                if left.len() == 1 { "keeps" } else { "keep" }
+            ));
+            for session in left {
+                lines.push(format!("  {} {}", session.info.id, session.app_name));
+            }
+            lines.push(format!(
+                "Devices that may control this machine can show and end them: `istesso \
+                 sessions` lists them there as opened by {name}. From here, `istesso sessions \
+                 stop <session> --local` asks one to close."
+            ));
+        }
+        Some(still) => {
+            lines.push(format!(
+                "It had opened {count} on this machine, which {} asked to close:",
+                if left.len() == 1 { "was" } else { "were" }
+            ));
+            for session in left {
+                let became = if still.contains(&session.info.id.0) {
+                    "still running: it may be asking whether to save"
+                } else {
+                    "ended"
+                };
+                lines.push(format!(
+                    "  {} {} {became}",
+                    session.info.id,
+                    crate::pad(&session.app_name, app)
+                ));
+            }
+            if !still.is_empty() {
+                lines.push(
+                    "What still runs is kept. Devices that may control this machine can show \
+                     it, to answer; `istesso sessions stop <session> --local --force` ends it."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    lines
+}
+
 /// What became of an application of this machine that was asked to close.
 fn after_asking_here(last: &HostSession, name: &str) -> String {
     if last.info.state == SessionState::Ended {
@@ -342,6 +466,7 @@ mod tests {
                 display: None,
                 answer: None,
                 end: None,
+                left_by: None,
             },
         }
     }
@@ -447,12 +572,31 @@ mod tests {
             lines[1],
             "5b0c9e3a7f21d684 Blender     laptop     shown in a window"
         );
-        // A session its device can no longer use says so: only from here
+        // A session its device may not use now says so: only from here
         // can it be ended.
         assert_eq!(
             lines[2],
-            "9f8e7d6c5b4a3921 Editor      old tablet running, not shown; old tablet may no \
-             longer use it"
+            "9f8e7d6c5b4a3921 Editor      old tablet running, not shown; old tablet may not \
+             use it now"
+        );
+        // One that was kept when its device was unpaired says who opened
+        // it, here and in the list a device with the rights gets.
+        let mut left = sessions[1].clone();
+        left.info.left_by = Some("old tablet".to_string());
+        assert_eq!(
+            local_state_words(&left),
+            "running, not shown; opened by old tablet, which was unpaired"
+        );
+        let mut remote = some();
+        remote[0].info.left_by = Some("old tablet".to_string());
+        let listed = render(&remote);
+        assert!(
+            listed
+                .lines()
+                .nth(1)
+                .unwrap()
+                .ends_with("ubuntu running, not shown; opened by old tablet, which was unpaired"),
+            "{listed}"
         );
 
         let ids: Vec<&str> = sessions.iter().map(|s| s.info.id.0.as_str()).collect();
@@ -471,6 +615,62 @@ mod tests {
         let mut over = sessions[0].clone();
         over.info.state = SessionState::Ended;
         assert_eq!(after_asking_here(&over, "Blender"), "Blender ended.");
+    }
+
+    #[test]
+    fn removing_a_pairing_says_what_the_device_left_running() {
+        let left = [
+            here(
+                "Blender",
+                "5b0c9e3a7f21d684",
+                "laptop",
+                SessionState::Detached,
+                true,
+            ),
+            here(
+                "Editor",
+                "9f8e7d6c5b4a3921",
+                "laptop",
+                SessionState::Detached,
+                true,
+            ),
+        ];
+        // Kept, which is the default: what runs, who can get to it, and
+        // how to close it after all.
+        let kept = unpaired_words("laptop", &left, None);
+        assert_eq!(
+            kept[..3],
+            [
+                "It had opened 2 applications on this machine, which keep running:",
+                "  5b0c9e3a7f21d684 Blender",
+                "  9f8e7d6c5b4a3921 Editor",
+            ]
+        );
+        assert!(kept[3].contains("as opened by laptop"), "{kept:?}");
+        assert!(
+            kept[3].contains("`istesso sessions stop <session> --local` asks one to close"),
+            "{kept:?}"
+        );
+        let one = unpaired_words("laptop", &left[..1], None);
+        assert_eq!(
+            one[0],
+            "It had opened an application on this machine, which keeps running:"
+        );
+
+        // Asked to close: one did, one has a question.
+        let still = ["9f8e7d6c5b4a3921".to_string()];
+        let asked = unpaired_words("laptop", &left, Some(&still));
+        assert_eq!(
+            asked[..3],
+            [
+                "It had opened 2 applications on this machine, which were asked to close:",
+                "  5b0c9e3a7f21d684 Blender ended",
+                "  9f8e7d6c5b4a3921 Editor  still running: it may be asking whether to save",
+            ]
+        );
+        assert!(asked[3].contains("--local --force"), "{asked:?}");
+        // All of them did: nothing more to say.
+        assert_eq!(unpaired_words("laptop", &left, Some(&[])).len(), 3);
     }
 
     #[test]

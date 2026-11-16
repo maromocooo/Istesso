@@ -339,6 +339,7 @@ mod tests {
                 }),
                 answer: None,
                 end: None,
+                left_by: None,
             }],
         };
         let json = serde_json::to_string(&listed).unwrap();
@@ -366,6 +367,7 @@ mod tests {
                 }),
                 answer: Some(serde_json::json!({"key_request_port": 50005})),
                 end: None,
+                left_by: None,
             }),
         };
         let json = serde_json::to_string(&response).unwrap();

@@ -8,7 +8,7 @@
 //! person who is logged in at the host.
 //!
 //! The agent answers them on a socket in its runtime directory
-//! ([`Paths::agent_socket`]). Who may ask is decided by the file system and
+//! ([`Paths::agent_sockets`]). Who may ask is decided by the file system and
 //! by nothing else: the directory is this user's alone (mode 0700, made so
 //! and checked before the socket is opened), so the kernel lets only this
 //! user, and root, reach the socket. The asking side checks the same
@@ -61,15 +61,28 @@ pub enum HostRequest {
         #[serde(default)]
         force: bool,
     },
+    /// The list of paired devices was changed: look at it now. Said by
+    /// the command that removes a pairing, so that the device is cut off
+    /// at that moment and not when the agent next looks.
+    PairingsChanged,
 }
 
 /// What the agent answers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum HostAnswer {
-    Sessions { sessions: Vec<HostSession> },
-    Session { session: Box<HostSession> },
-    Refused { code: ErrorCode, message: String },
+    Sessions {
+        sessions: Vec<HostSession>,
+    },
+    Session {
+        session: Box<HostSession>,
+    },
+    /// What was asked has been done; there is nothing to report.
+    Done,
+    Refused {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 impl Sessions {
@@ -90,17 +103,72 @@ impl Sessions {
             HostRequest::Stop { session, force } => {
                 self.host_stop(session, *force).map_or_else(refused, one)
             }
+            HostRequest::PairingsChanged => {
+                self.pairings_changed();
+                HostAnswer::Done
+            }
         }
+    }
+}
+
+/// Answers the person at this machine. The agent puts its own part in
+/// front of [`Sessions::answer_host`].
+pub type Answerer = std::sync::Arc<dyn Fn(&HostRequest) -> HostAnswer + Send + Sync>;
+
+/// Why the agent on this machine could not be asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoLink {
+    /// None answers, for this user.
+    NoAgent,
+    Other(String),
+}
+
+impl std::fmt::Display for NoLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoLink::NoAgent => f.write_str(
+                "no istesso agent that keeps sessions answers on this machine for this user; \
+                 `istesso agent` starts one",
+            ),
+            NoLink::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Tells the agent on this machine that a device was unpaired, so that it
+/// cuts the device off now, and asks what that device had started here.
+/// `None` when no agent runs here: then nothing of that device does.
+pub fn after_unpairing(paths: &Paths, device: &str) -> Result<Option<Vec<HostSession>>, String> {
+    let mut link = match HostLink::open(paths) {
+        Ok(link) => link,
+        Err(NoLink::NoAgent) => return Ok(None),
+        Err(other) => return Err(other.to_string()),
+    };
+    match link.ask(&HostRequest::PairingsChanged)? {
+        HostAnswer::Done => {}
+        HostAnswer::Refused { message, .. } => return Err(message),
+        _ => return Err(unexpected()),
+    }
+    match link.ask(&HostRequest::Sessions)? {
+        HostAnswer::Sessions { sessions } => Ok(Some(
+            sessions
+                .into_iter()
+                .filter(|session| session.started_by.id == device)
+                .collect(),
+        )),
+        HostAnswer::Refused { message, .. } => Err(message),
+        _ => Err(unexpected()),
     }
 }
 
 /// Every session of this machine that is not over, asked of the agent that
 /// runs here.
 pub fn sessions_here(paths: &Paths) -> Result<Vec<HostSession>, String> {
-    match HostLink::open(paths)?.ask(&HostRequest::Sessions)? {
+    let mut link = HostLink::open(paths).map_err(|why| why.to_string())?;
+    match link.ask(&HostRequest::Sessions)? {
         HostAnswer::Sessions { sessions } => Ok(sessions),
         HostAnswer::Refused { message, .. } => Err(message),
-        HostAnswer::Session { .. } => Err(unexpected()),
+        _ => Err(unexpected()),
     }
 }
 
@@ -113,11 +181,11 @@ pub fn stop_here(
     force: bool,
     watch: Duration,
 ) -> Result<HostSession, String> {
-    let mut link = HostLink::open(paths)?;
+    let mut link = HostLink::open(paths).map_err(|why| why.to_string())?;
     let mut ask = |request: &HostRequest| match link.ask(request)? {
         HostAnswer::Session { session } => Ok(*session),
         HostAnswer::Refused { message, .. } => Err(message),
-        HostAnswer::Sessions { .. } => Err(unexpected()),
+        _ => Err(unexpected()),
     };
     let mut last = ask(&HostRequest::Stop {
         session: session.clone(),
@@ -153,9 +221,8 @@ mod unix {
     use istesso_link::ErrorCode;
     use istesso_proto::session::{decode_line, encode_line};
 
-    use super::{HostAnswer, HostRequest};
+    use super::{Answerer, HostAnswer, HostRequest, NoLink};
     use crate::paths::Paths;
-    use crate::session::Sessions;
 
     /// The longest request that is read.
     const MAX_REQUEST: u64 = 4096;
@@ -197,19 +264,32 @@ mod unix {
         Ok(())
     }
 
-    /// Opens the socket the person at this machine asks on. An error when
-    /// its directory cannot be made this user's alone, or when another
-    /// agent of this user already answers there.
+    /// Opens the socket the person at this machine asks on, in the first
+    /// of its places that can be made this user's alone. An error when
+    /// none can, or when another agent of this user already answers.
     pub fn listen(paths: &Paths) -> std::io::Result<UnixListener> {
-        let path = paths.agent_socket();
+        let mut first = None;
+        for path in paths.agent_sockets() {
+            match listen_at(&path) {
+                Ok(listener) => return Ok(listener),
+                Err(taken) if taken.kind() == ErrorKind::AddrInUse => return Err(taken),
+                Err(why) => {
+                    first.get_or_insert(why);
+                }
+            }
+        }
+        Err(first.unwrap_or_else(|| std::io::Error::other("the socket has no place")))
+    }
+
+    fn listen_at(path: &Path) -> std::io::Result<UnixListener> {
         let dir = path
             .parent()
             .ok_or_else(|| std::io::Error::other("the socket has no directory"))?;
         users_alone(dir, true)?;
         // A socket that is there already is either in use, or was left by
         // an agent that ended. Anything else is not removed.
-        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_socket()) {
-            if UnixStream::connect(&path).is_ok() {
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
+            if UnixStream::connect(path).is_ok() {
                 return Err(std::io::Error::new(
                     ErrorKind::AddrInUse,
                     format!(
@@ -218,15 +298,15 @@ mod unix {
                     ),
                 ));
             }
-            std::fs::remove_file(&path)?;
+            std::fs::remove_file(path)?;
         }
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(listener)
     }
 
     /// Answers on the socket until the process ends.
-    pub fn serve(listener: UnixListener, sessions: Sessions) {
+    pub fn serve(listener: UnixListener, answer: Answerer) {
         let open = Arc::new(AtomicUsize::new(0));
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
@@ -237,9 +317,9 @@ mod unix {
                 open.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
-            let (sessions, open) = (sessions.clone(), open.clone());
+            let (answer, open) = (answer.clone(), open.clone());
             std::thread::spawn(move || {
-                converse(stream, &sessions);
+                converse(stream, &answer);
                 open.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -247,7 +327,7 @@ mod unix {
 
     /// One conversation: a line in, a line out, until the other side
     /// closes it or says something that is not a request.
-    fn converse(stream: UnixStream, sessions: &Sessions) {
+    fn converse(stream: UnixStream, answer: &Answerer) {
         let _ = stream.set_read_timeout(Some(PATIENCE));
         let _ = stream.set_write_timeout(Some(PATIENCE));
         let Ok(mut out) = stream.try_clone() else {
@@ -261,7 +341,7 @@ mod unix {
                 return;
             }
             let answer = match decode_line::<HostRequest>(&line) {
-                Some(request) => sessions.answer_host(&request),
+                Some(request) => answer(&request),
                 None => HostAnswer::Refused {
                     code: ErrorCode::Unsupported,
                     message: "the agent on this machine does not know that request".to_string(),
@@ -281,36 +361,52 @@ mod unix {
     }
 
     impl HostLink {
-        pub fn open(paths: &Paths) -> Result<Self, String> {
-            let none = || {
-                "no istesso agent that keeps sessions answers on this machine for this user; \
-                 `istesso agent` starts one"
-                    .to_string()
-            };
-            let path = paths.agent_socket();
-            let dir = path.parent().ok_or_else(none)?;
+        /// Finds the agent in the places where its socket can be.
+        pub fn open(paths: &Paths) -> Result<Self, NoLink> {
+            let mut doubt = None;
+            for path in paths.agent_sockets() {
+                match Self::open_at(&path) {
+                    Ok(link) => return Ok(link),
+                    Err(NoLink::NoAgent) => {}
+                    Err(other) => {
+                        doubt.get_or_insert(other);
+                    }
+                }
+            }
+            Err(doubt.unwrap_or(NoLink::NoAgent))
+        }
+
+        fn open_at(path: &Path) -> Result<Self, NoLink> {
+            let dir = path.parent().ok_or(NoLink::NoAgent)?;
             // An answer is only believed from a socket nobody else could
             // have put there.
             match users_alone(dir, false) {
                 Ok(()) => {}
-                Err(missing) if missing.kind() == ErrorKind::NotFound => return Err(none()),
-                Err(why) => return Err(format!("not asking the agent on this machine: {why}")),
+                Err(missing) if missing.kind() == ErrorKind::NotFound => {
+                    return Err(NoLink::NoAgent)
+                }
+                Err(why) => {
+                    return Err(NoLink::Other(format!(
+                        "not asking the agent on this machine: {why}"
+                    )))
+                }
             }
-            let out = UnixStream::connect(&path).map_err(|why| match why.kind() {
-                ErrorKind::NotFound | ErrorKind::ConnectionRefused => none(),
-                _ => format!("the agent on this machine cannot be asked: {why}"),
+            let cannot = |why: std::io::Error| {
+                NoLink::Other(format!("the agent on this machine cannot be asked: {why}"))
+            };
+            let out = UnixStream::connect(path).map_err(|why| match why.kind() {
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused => NoLink::NoAgent,
+                _ => cannot(why),
             })?;
-            let cloned = out
+            let read = out
                 .set_read_timeout(Some(PATIENCE))
                 .and_then(|()| out.set_write_timeout(Some(PATIENCE)))
-                .and_then(|()| out.try_clone());
-            match cloned {
-                Ok(read) => Ok(HostLink {
-                    out,
-                    lines: BufReader::new(read),
-                }),
-                Err(why) => Err(format!("the agent on this machine cannot be asked: {why}")),
-            }
+                .and_then(|()| out.try_clone())
+                .map_err(cannot)?;
+            Ok(HostLink {
+                out,
+                lines: BufReader::new(read),
+            })
         }
 
         pub fn ask(&mut self, request: &HostRequest) -> Result<HostAnswer, String> {
@@ -341,8 +437,10 @@ pub struct HostLink;
 
 #[cfg(not(unix))]
 impl HostLink {
-    pub fn open(_paths: &Paths) -> Result<Self, String> {
-        Err("the agent cannot be asked about its sessions on this system yet".to_string())
+    pub fn open(_paths: &Paths) -> Result<Self, NoLink> {
+        Err(NoLink::Other(
+            "the agent cannot be asked about its sessions on this system yet".to_string(),
+        ))
     }
 
     pub fn ask(&mut self, _request: &HostRequest) -> Result<HostAnswer, String> {
@@ -369,6 +467,7 @@ mod tests {
                 display: None,
                 answer: None,
                 end: None,
+                left_by: None,
             },
             app_name: "Editor".to_string(),
             started_by: StartedBy {
@@ -443,6 +542,11 @@ mod tests {
             session: Box::new(editor()),
         };
         assert_eq!(decode_line::<HostAnswer>(&encode_line(&one)), Some(one));
+        assert_eq!(
+            encode_line(&HostRequest::PairingsChanged),
+            r#"{"v":1,"ask":"pairings_changed"}"#
+        );
+        assert_eq!(encode_line(&HostAnswer::Done), r#"{"v":1,"answer":"done"}"#);
         let refused = HostAnswer::Refused {
             code: ErrorCode::NotFound,
             message: "no such session".to_string(),

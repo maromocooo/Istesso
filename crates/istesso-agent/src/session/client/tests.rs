@@ -520,6 +520,74 @@ fn a_host_that_stops_showing_the_session_closes_the_window() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unpairing_cuts_the_device_off_at_once_and_it_cannot_come_back() {
+    use super::super::local::after_unpairing;
+
+    let pair = pair();
+    // A window that is open, with a client that gives up on a host after
+    // a second, and a conversation that just sits there.
+    let rules = ClientRules {
+        host_lost_after: Duration::from_secs(1),
+        ..quick_client()
+    };
+    let (link, viewer, opening) = (pair.link(), pair.viewer.clone(), pair.opening(None));
+    let window = std::thread::spawn(move || {
+        open_window(
+            link,
+            viewer.as_ref(),
+            &opening,
+            &AtomicBool::new(false),
+            &rules,
+            &mut |_| {},
+        )
+    });
+    pair.journal.wait_for("viewer show", 1);
+    let id = pair.session().id;
+    let mut idle = (pair.link())().unwrap();
+    idle.ping().unwrap();
+
+    // The person at the host removes the pairing, and the command that
+    // does it tells the agent.
+    let laptop = pair.laptop.id();
+    let removed = PeerStore::open(pair.host.paths().peers())
+        .unwrap()
+        .remove(&laptop)
+        .unwrap();
+    assert!(removed.is_some());
+    let unpaired = Instant::now();
+    let left = after_unpairing(&pair.host.paths(), &laptop)
+        .unwrap()
+        .unwrap();
+    // What the device had opened is reported, to be kept or closed.
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        (&left[0].info.id, left[0].app_name.as_str()),
+        (&id, "Editor")
+    );
+
+    // Its conversations are over by the time the command is answered ...
+    assert!(idle.ping().is_err());
+    // ... the picture stops within a round ...
+    pair.journal.wait_for("runner detach", 1);
+    assert!(unpaired.elapsed() < Duration::from_secs(1));
+    // ... and it cannot begin another conversation.
+    assert!((pair.link())().is_err());
+    let outcome = window.join().unwrap();
+    assert!(
+        matches!(&outcome, Ok(Outcome::HostLost { session, .. }) if *session == id),
+        "{outcome:?}"
+    );
+
+    // The application was not ended. It is kept, and says who opened it.
+    let kept = pair.sessions.host_look(&id).unwrap();
+    assert_eq!(kept.info.state, SessionState::Detached);
+    assert_eq!(kept.info.left_by.as_deref(), Some("laptop"));
+    assert!(kept.revoked);
+    assert_eq!(pair.on_host()[2..], ["runner detach"]);
+}
+
 #[test]
 fn a_refusal_closes_the_viewer_and_keeps_its_code() {
     // The host lets the laptop look, not control.
@@ -627,6 +695,7 @@ fn a_host_that_goes_away_closes_the_window() {
                 display: None,
                 answer: None,
                 end: None,
+                left_by: None,
             }),
         };
         for answer in [

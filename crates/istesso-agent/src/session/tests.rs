@@ -772,6 +772,8 @@ fn a_session_nobody_is_shown_is_closed_to_a_device_that_was_unpaired() {
     let seen = host.settles(&id, |s| s.revoked);
     assert!(unpaired.elapsed() < Duration::from_secs(2));
     assert_eq!(seen.info.state, SessionState::Detached);
+    // It is kept, and says from now on who opened it.
+    assert_eq!(seen.info.left_by.as_deref(), Some("laptop"));
     assert_eq!(
         (seen.started_by.name.as_str(), &seen.started_by.id),
         ("laptop", &host.laptop.id)
@@ -842,7 +844,9 @@ fn unpairing_stops_the_picture_and_pairing_again_gives_the_session_back() {
     // The same device, paired again, finds its application as it left it.
     host.pair_again(&host.laptop);
     host.settles(&id, |s| !s.revoked);
-    assert_eq!(host.list(&host.laptop).len(), 1);
+    let listed = host.list(&host.laptop);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].left_by.as_deref(), Some("laptop"));
     let back = session(host.attach(&id));
     assert_eq!((back.state, back.attachment), (SessionState::Running, 2));
     assert_eq!(host.since_running(), ["runner detach", "runner attach"]);
@@ -916,22 +920,150 @@ fn a_device_may_have_only_so_many_sessions() {
     let third = session(host.start_as(&tablet, "editor.desktop")).id;
     host.settles(&third, |s| s.info.state == SessionState::Running);
 
-    // A device that is unpaired keeps its places until the person at the
-    // host ends its applications. Another device is told where they went.
-    host.unpair(&host.laptop);
-    host.settles(&first, |s| s.revoked);
+    // A device that lost a right keeps its places, and only the person at
+    // the host can free them. Another device is told so.
+    let mut record = host.laptop.clone();
+    record.permissions = vec![Permission::View];
+    host.pair_again(&record);
+    host.settles(&first, |s| {
+        s.revoked && s.info.state == SessionState::Detached
+    });
     host.settles(&second, |s| s.revoked);
     let (code, message) = refusal(host.start_as(&tablet, "paint.desktop"));
     assert_eq!(code, ErrorCode::Unavailable);
     assert_eq!(
         message,
         "this host already runs 3 sessions, as many as it takes; 2 were started by devices \
-         that may no longer use them: `istesso sessions --local` on the host lists them"
+         that may not use them now: `istesso sessions --local` on the host lists them"
+    );
+
+    // A device that is unpaired leaves its applications to the devices
+    // that have the rights. They are told which ones nobody is shown, and
+    // can end one to make room.
+    host.unpair(&host.laptop);
+    host.settles(&first, |s| s.info.left_by.is_some());
+    host.settles(&second, |s| s.info.left_by.is_some());
+    let (_, message) = refusal(host.start_as(&tablet, "paint.desktop"));
+    assert_eq!(
+        message,
+        format!(
+            "this host already runs 3 sessions, as many as it takes; nobody is shown: \
+             Editor ({first}, opened by laptop), Paint ({second}, opened by laptop)"
+        )
     );
     assert_eq!(host.journal.count("app stop"), 0);
-    host.sessions.host_stop(&first, true).unwrap();
+    session(host.ask(
+        &tablet,
+        Request::SessionStop {
+            session: first.clone(),
+            force: true,
+        },
+    ));
     host.settles(&first, |s| s.info.state == SessionState::Ended);
     session(host.start_as(&tablet, "paint.desktop"));
+}
+
+#[test]
+fn a_session_left_by_an_unpaired_device_is_open_to_devices_with_the_rights() {
+    let host = host();
+    let id = host.running().id;
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    let phone = pair(&host.paths, "phone", vec![Permission::View]);
+    // An ordinary session is its device's alone.
+    assert!(host.list(&tablet).is_empty());
+
+    host.unpair(&host.laptop);
+    let kept = host.settles(&id, |s| {
+        s.info.left_by.is_some() && s.info.state == SessionState::Detached
+    });
+    assert_eq!(kept.info.left_by.as_deref(), Some("laptop"));
+    assert_eq!(host.since_running(), ["runner detach"]);
+
+    // The tablet finds it in its list, marked as opened by a device that
+    // was unpaired ...
+    let listed = host.list(&tablet);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (&listed[0].id, listed[0].left_by.as_deref(), listed[0].state),
+        (&id, Some("laptop"), SessionState::Detached)
+    );
+    // ... and is shown it: the picture goes to the tablet from now on.
+    let attach = Request::SessionAttach {
+        session: id.clone(),
+        display: mode(),
+        offer: serde_json::json!({"port": 50020}),
+    };
+    let shown = session(host.ask_from(&tablet, "192.0.2.88:50000", attach.clone()));
+    assert_eq!((shown.state, shown.attachment), (SessionState::Running, 2));
+    match host.runner.told().pop().unwrap() {
+        RunnerCommand::Attach { peer, .. } => {
+            assert_eq!(peer.id, tablet.id);
+            assert_eq!(peer.address, "192.0.2.88");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    // The laptop is still unpaired. That is nothing to the tablet's
+    // picture, however often the list of paired devices is read.
+    let as_tablet = |request| host.ask_from(&tablet, "192.0.2.88:50000", request);
+    let look = Request::SessionWait {
+        session: id.clone(),
+        after: 0,
+        timeout_ms: 0,
+        attachment: 2,
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let seen = session(as_tablet(look.clone()));
+    assert_eq!(seen.state, SessionState::Running);
+    assert_eq!(host.since_running(), ["runner detach", "runner attach"]);
+    // What the media path agreed on with the tablet is told to the window
+    // that is shown the session, and to nobody else that may use it.
+    assert!(seen.answer.is_some());
+    assert_eq!(host.list(&tablet)[0].answer, None);
+    let asking = Request::SessionWait {
+        session: id.clone(),
+        after: 0,
+        timeout_ms: 0,
+        attachment: 0,
+    };
+    assert_eq!(session(as_tablet(asking)).answer, None);
+
+    // A device that may only look gets nothing, as with any session, and
+    // the laptop stays out.
+    for device in [&phone, &host.laptop] {
+        let (code, _) = refusal(host.ask(device, Request::SessionList));
+        assert_eq!(code, ErrorCode::Forbidden);
+        let (code, _) = refusal(host.ask(device, attach.clone()));
+        assert_eq!(code, ErrorCode::Forbidden);
+    }
+
+    // The picture stops for the device that is shown the session when
+    // that device loses a right, whoever started the session.
+    let mut record = tablet.clone();
+    record.permissions = vec![Permission::View];
+    host.pair_again(&record);
+    host.settles(&id, |s| s.info.state == SessionState::Detached);
+    assert_eq!(
+        host.since_running(),
+        ["runner detach", "runner attach", "runner detach"]
+    );
+    host.pair_again(&tablet);
+
+    // Paired again, the laptop is one device among the others: the
+    // session stays marked, and open to all of them.
+    host.pair_again(&host.laptop);
+    host.settles(&id, |s| !s.revoked);
+    assert_eq!(
+        host.list(&host.laptop)[0].left_by.as_deref(),
+        Some("laptop")
+    );
+    assert_eq!(host.list(&tablet).len(), 1);
+    // Any of them can end it.
+    session(as_tablet(Request::SessionStop {
+        session: id.clone(),
+        force: true,
+    }));
+    let over = host.settles(&id, |s| s.info.state == SessionState::Ended);
+    assert_eq!(over.info.end.unwrap().reason, EndReason::Stopped);
 }
 
 #[cfg(unix)]
@@ -939,7 +1071,7 @@ fn a_device_may_have_only_so_many_sessions() {
 fn the_person_at_the_host_asks_on_a_socket_only_they_can_reach() {
     use std::os::unix::fs::PermissionsExt;
 
-    use super::local::{listen, serve, sessions_here, stop_here, HostLink};
+    use super::local::{after_unpairing, listen, serve, sessions_here, stop_here, HostLink};
 
     let mode_of = |path: &std::path::Path| {
         std::fs::symlink_metadata(path)
@@ -971,7 +1103,12 @@ fn the_person_at_the_host_asks_on_a_socket_only_they_can_reach() {
     let second = listen(&host.paths).unwrap_err();
     assert_eq!(second.kind(), std::io::ErrorKind::AddrInUse, "{second}");
     let sessions = host.sessions.clone();
-    std::thread::spawn(move || serve(listener, sessions));
+    std::thread::spawn(move || {
+        serve(
+            listener,
+            Arc::new(move |request| sessions.answer_host(request)),
+        );
+    });
 
     assert_eq!(sessions_here(&host.paths).unwrap(), []);
     let id = host.running().id;
@@ -1021,6 +1158,7 @@ fn the_person_at_the_host_asks_on_a_socket_only_they_can_reach() {
     let Err(doubt) = HostLink::open(&host.paths) else {
         panic!("asked through a directory that is open to others");
     };
+    let doubt = doubt.to_string();
     assert!(doubt.contains("can be entered by other users"), "{doubt}");
 
     // A socket that an agent left behind is replaced.
@@ -1045,6 +1183,46 @@ fn the_person_at_the_host_asks_on_a_socket_only_they_can_reach() {
     std::fs::write(&taken, "not a socket").unwrap();
     assert!(listen(&third.paths).is_err());
     assert_eq!(std::fs::read_to_string(&taken).unwrap(), "not a socket");
+
+    // An agent that has no runtime directory, as when it is started at
+    // boot, listens next to the cache. Somebody who asks from a login,
+    // where there is one, finds it there.
+    let boot = host_named("s", quick_rules());
+    let no_place = boot.paths.config.join("not-a-directory");
+    std::fs::write(&no_place, "").unwrap();
+    let at_boot = Paths {
+        runtime: no_place.join("run"),
+        ..boot.paths.clone()
+    };
+    let listener = listen(&at_boot).unwrap();
+    assert!(boot.paths.cache.join("run/agent.sock").exists());
+    assert!(!boot.paths.agent_socket().exists());
+    let sessions = boot.sessions.clone();
+    std::thread::spawn(move || {
+        serve(
+            listener,
+            Arc::new(move |request| sessions.answer_host(request)),
+        );
+    });
+    let from_a_login = boot.paths.clone();
+    std::fs::create_dir_all(&from_a_login.runtime).unwrap();
+    std::fs::set_permissions(
+        &from_a_login.runtime,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let id = boot.running().id;
+    assert_eq!(sessions_here(&from_a_login).unwrap()[0].info.id, id);
+    // The command that removes a pairing learns what the device left.
+    let left = after_unpairing(&from_a_login, &boot.laptop.id).unwrap();
+    assert_eq!(left.unwrap().len(), 1);
+    assert_eq!(
+        after_unpairing(&from_a_login, "nobody").unwrap(),
+        Some(vec![])
+    );
+    // Where no agent runs, nothing of that device does.
+    let nobody = host_named("s", quick_rules());
+    assert_eq!(after_unpairing(&nobody.paths, "nobody"), Ok(None));
 }
 
 #[test]
@@ -1231,7 +1409,7 @@ fn a_full_host_refuses_and_names_what_nobody_is_shown() {
     assert_eq!(
         message,
         format!(
-            "this host already runs 3 sessions, as many as it takes; of yours, nobody is shown: \
+            "this host already runs 3 sessions, as many as it takes; nobody is shown: \
              Editor ({first}), Paint ({second})"
         )
     );
