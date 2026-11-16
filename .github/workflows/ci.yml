@@ -23,6 +23,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Build the screen probe
+        if: runner.os == 'macOS'
+        run: swift build --package-path macos/screen-probe
 
   licenses:
     runs-on: ubuntu-latest

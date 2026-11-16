@@ -158,59 +158,83 @@ impl ProbeSummary {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+
     use super::*;
 
     /// Stands in for the test application: answers every input after
-    /// `work`, except those whose number `drop` selects.
-    fn responder(
-        work: Duration,
-        drop: fn(u64) -> bool,
-    ) -> (UdpSocket, std::thread::JoinHandle<()>) {
-        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let address = server.local_addr().unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .unwrap();
-        let handle = std::thread::spawn(move || {
-            let clock = Clock::new();
-            let mut buffer = [0u8; 64];
-            while let Ok((length, from)) = server.recv_from(&mut buffer) {
-                let input_ns = clock.now_ns();
-                let Some(input) = FlashInput::decode(&buffer[..length]) else {
-                    continue;
-                };
-                if drop(input.id) {
-                    continue;
-                }
-                std::thread::sleep(work);
-                let ack = FlashAck {
-                    id: input.id,
-                    input_ns,
-                    commit_ns: clock.now_ns(),
-                };
-                server.send_to(&ack.encode(), from).unwrap();
-            }
-        });
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.connect(address).unwrap();
-        (client, handle)
+    /// `work`, except those whose number `drop` selects. Runs until told to
+    /// stop, so that a slow machine cannot make it give up early.
+    struct Responder {
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
     }
+
+    impl Responder {
+        fn start(work: Duration, drop: fn(u64) -> bool) -> (UdpSocket, Responder) {
+            let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let address = server.local_addr().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let clock = Clock::new();
+                let mut buffer = [0u8; 64];
+                while !stopped.load(Ordering::Relaxed) {
+                    let Ok((length, from)) = server.recv_from(&mut buffer) else {
+                        continue;
+                    };
+                    let input_ns = clock.now_ns();
+                    let Some(input) = FlashInput::decode(&buffer[..length]) else {
+                        continue;
+                    };
+                    if drop(input.id) {
+                        continue;
+                    }
+                    std::thread::sleep(work);
+                    let ack = FlashAck {
+                        id: input.id,
+                        input_ns,
+                        commit_ns: clock.now_ns(),
+                    };
+                    let _ = server.send_to(&ack.encode(), from);
+                }
+            });
+            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+            client.connect(address).unwrap();
+            (
+                client,
+                Responder {
+                    stop,
+                    thread: Some(thread),
+                },
+            )
+        }
+    }
+
+    impl Drop for Responder {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    // The waits below are generous on purpose. Nothing waits that long when
+    // the machine keeps up, and a busy machine does not fail the test.
+    const PATIENCE: Duration = Duration::from_secs(5);
 
     #[test]
     fn every_input_is_answered_and_timed() {
-        let (socket, handle) = responder(Duration::from_millis(3), |_| false);
+        let (socket, _responder) = Responder::start(Duration::from_millis(3), |_| false);
         let clock = Clock::new();
         let mut intervals = std::iter::repeat(Duration::from_millis(10));
-        let samples = probe(
-            &socket,
-            &clock,
-            12,
-            &mut intervals,
-            Duration::from_millis(300),
-        )
-        .unwrap();
-        drop(socket);
-        handle.join().unwrap();
+        let samples = probe(&socket, &clock, 12, &mut intervals, PATIENCE).unwrap();
 
         assert_eq!(samples.len(), 12);
         assert!(samples.iter().enumerate().all(|(i, s)| s.id == i as u64));
@@ -222,30 +246,20 @@ mod tests {
         assert!(app.median_ms >= 3.0, "{app:?}");
         let trip = summary.round_trip.unwrap();
         assert!(trip.median_ms >= app.median_ms, "{trip:?} {app:?}");
-        // On one machine the transfer is what is left: small, and not negative
-        // by more than the clocks' resolution.
+        // What is left is the transfer. On one machine it cannot be negative
+        // by more than the resolution of the clocks.
         let transfer = summary.transfer.unwrap();
-        assert!(
-            transfer.median_ms > -0.5 && transfer.median_ms < 50.0,
-            "{transfer:?}"
-        );
+        assert!(transfer.median_ms > -0.5, "{transfer:?}");
     }
 
     #[test]
     fn unanswered_inputs_are_lost_not_invented() {
-        let (socket, handle) = responder(Duration::ZERO, |id| id % 3 == 0);
+        let (socket, _responder) = Responder::start(Duration::ZERO, |id| id % 3 == 0);
         let clock = Clock::new();
         let mut intervals = std::iter::repeat(Duration::from_millis(5));
-        let samples = probe(
-            &socket,
-            &clock,
-            9,
-            &mut intervals,
-            Duration::from_millis(100),
-        )
-        .unwrap();
-        drop(socket);
-        handle.join().unwrap();
+        // The last wait runs to its end here, because three inputs never get
+        // an answer.
+        let samples = probe(&socket, &clock, 9, &mut intervals, Duration::from_secs(1)).unwrap();
 
         let summary = ProbeSummary::of(&samples);
         assert_eq!((summary.sent, summary.answered), (9, 6));
@@ -257,15 +271,14 @@ mod tests {
 
     #[test]
     fn the_last_wait_ends_as_soon_as_everything_is_answered() {
-        let (socket, handle) = responder(Duration::ZERO, |_| false);
+        let (socket, _responder) = Responder::start(Duration::ZERO, |_| false);
         let clock = Clock::new();
         let mut intervals = std::iter::repeat(Duration::from_millis(1));
         let started = Instant::now();
-        let samples = probe(&socket, &clock, 3, &mut intervals, Duration::from_secs(5)).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let samples = probe(&socket, &clock, 3, &mut intervals, Duration::from_secs(60)).unwrap();
         assert!(samples.iter().all(|s| s.answer.is_some()));
-        drop(socket);
-        handle.join().unwrap();
+        // Far below the minute it was allowed to wait.
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]

@@ -38,6 +38,7 @@
 |---|---|
 | 共通コア（`istesso-proto`、`istesso-pair`、`istesso-link`、`istesso-agent`、`istesso-catalog`、`istesso-doctor`、`istesso-measure`、`istesso-cli`） | どの PC でも可 |
 | 計測のテストアプリ（`istesso-flash`） | 窓を開ける PC。ビルドとテストはどの PC でも可 |
+| 画面での計測（`macos/screen-probe`） | Mac の実機。起動するターミナルに画面収録の許可が要る（ADR 0008） |
 | Mac ホスト（画面の取り込み、VideoToolbox、入力、Core Audio） | Mac の実機。常時稼働の Mac を優先 |
 | Linux ホスト（仮想コンポジター、NVENC、PipeWire） | GPU を積んだ Ubuntu の実機 |
 | 遅延と音切れの計測 | 有線 LAN でつないだ2台の実機 |

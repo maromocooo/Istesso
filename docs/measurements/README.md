@@ -29,6 +29,8 @@
 | `istesso-flash` | テストアプリ。窓全体を2つの灰色のどちらかで塗り、入力のたびに切り替える。Linux（X11、Wayland）と macOS で同じ見た目になる |
 | `istesso measure inputs` | テストアプリへ入力を送り、返事までの時間を測る。映像なしで、入力の経路だけを確かめる |
 | `istesso measure report` | 両側のログから、追加遅延と内訳を出す |
+| `istesso-screen-probe` | Mac の画面を読んで、手元の窓と中継した窓が同じ入力に反応した時刻を記録する（`macos/screen-probe`、[ADR 0008](../adr/0008-screen-recording-for-measurement.md)） |
+| `istesso measure compare` | 上の2つのログから、中継した窓が手元の窓よりどれだけ遅いかを出す |
 | `scripts/ping-stats.py` | `ping` の出力から、往復時間の分布と、跳ねの周期を出す |
 
 ### テストアプリ
@@ -66,13 +68,21 @@ istesso measure report --host host.jsonl --client client.jsonl
 
 対になった入力から、追加遅延と内訳の中央値、95 パーセンタイル、99 パーセンタイル、最大値を出します。片側にしかない入力は数だけを表示し、計算には入れません。
 
-クライアント側のログを書くのは受信側です。受信側を組む手順 3 で足すので、まだありません。
+クライアント側のログは、いまは `istesso-screen-probe` が外から書きます。自前の受信側（手順 3 以降）は、受信と復号の時刻も入れて、中から書きます。
 
 ### Mac で計測するプログラムの起動のしかた
 
 コーディングエージェントのシェルから直接起動したプログラムは、優先度が低い状態（`ps -M` の PRI が 20）で動きます。ふつうのアプリは 46 前後です。この状態では、タイマーが遅れ、応答時間の遅い側の裾が伸びます（[2026-11-16 の記録](2026-11-16-step1-tools.md)）。
 
-クライアント側で時刻を測るプログラムは、`.app` にして `open` で起動するか、人がターミナルから起動してください。
+クライアント側で遅延に関わるプログラム（テストアプリ、配信ソフト、受信側）は、`.app` にして `open` で起動するか、人がターミナルから起動してください。テストアプリは次のようにします。
+
+```sh
+cargo build --release -p istesso-flash
+scripts/macos-app.sh target/release/istesso-flash "Istesso Flash" dev.istesso.flash target/release
+open -n -g "target/release/Istesso Flash.app" --args --listen 127.0.0.1:47811 --position=100,100
+```
+
+`istesso-screen-probe` は例外で、エージェントのシェルから起動して構いません。記録するのはシステムが付けた画面更新の時刻で、自分の動きの速さは値に入りません。
 
 ## 測り方
 
@@ -93,6 +103,38 @@ istesso measure report --host host.jsonl --client client.jsonl
 2. クライアントで `istesso measure inputs --to <ホスト>` を実行する。200〜400 ms の間隔で 500 回、合成の入力を送る。
 3. 「transfer, both ways」（転送の往復）が、同じ時間帯の `ping` の分布と合っていることを確かめる。「app response」が、テストアプリ自身の応答時間になる。
 
+### 画面での計測（手元の窓との差。経路か設定を変えたときに行う）
+
+手元で動かしたテストアプリの窓と、中継したテストアプリの窓を、Mac の同じディスプレイに並べ、同じ入力への反応を画面から読みます。配信ソフトの中を知らなくても測れるので、既存の配信ソフトにも自前の実装にも同じ方法が使えます。
+
+1. ホストでテストアプリを全画面で動かす（`--fullscreen --listen <アドレス>:47811 --log host.jsonl`）。配信ソフトで、その画面を Mac に窓で映す。
+2. Mac でテストアプリを `open` で起動する（`--listen 127.0.0.1:47811 --log local.jsonl --position=X,Y`）。中継の窓と同じディスプレイに、重ならないように置く。
+3. Mac で道具を動かす。500 回、200〜400 ms の間隔で、両方のテストアプリに同じ入力を送る。
+
+   ```sh
+   swift build -c release --package-path macos/screen-probe
+   macos/screen-probe/.build/release/istesso-screen-probe \
+       --local 127.0.0.1:47811 --relayed <ホスト>:47811 \
+       --local-log probe-local.jsonl --relayed-log probe-relayed.jsonl
+   ```
+
+4. 差と、追加遅延を出す。
+
+   ```sh
+   istesso measure compare --local probe-local.jsonl --relayed probe-relayed.jsonl --refresh-hz 85
+   istesso measure report --host host.jsonl --client probe-relayed.jsonl
+   ```
+
+気をつけること：
+
+- 2つの窓は同じディスプレイに置く。ディスプレイが違うと、ディスプレイの差を測ってしまう。道具は、違うディスプレイのときは測らずに止まる。
+- 道具が見るのは、それぞれの窓の中央。ほかの窓をかぶせない。中継側の窓は、既定では Moonlight の窓を探す。ほかの窓にするときは `--relayed-window` で指定する。
+- Mac が Wi-Fi なら、AWDL を止めておく（[記録](2026-11-16-wifi-path-awdl-off.md)）。
+- Moonlight は、マウスカーソルのあるディスプレイに窓を出す。起動のときだけ、カーソルを目的のディスプレイに置く。
+- 道具を変えたときは、手元のテストアプリを 2 つ並べて（ポートと `--title` を変える）、差が 0 になることを確かめる。
+
+測れるのは、画面更新 1 回の刻みまでです。ディスプレイのパネルと入力機器の遅れ、配信ソフト自身の入力の経路は入りません（ADR 0008）。
+
 ### ソフトウェアでの計測（常に行う）
 
 1. ホストでテストアプリを動かす。入力のたびに窓全体の色が切り替わる。
@@ -102,7 +144,7 @@ istesso measure report --host host.jsonl --client client.jsonl
 
 ### カメラでの確認（節目ごとに行う）
 
-ソフトウェアの計測には、入力機器とディスプレイの遅れが入りません。数値が体感と合っているかを、カメラで確かめます。
+ソフトウェアの計測にも、画面での計測にも、入力機器とディスプレイの遅れが入りません。数値が体感と合っているかを、カメラで確かめます。回数を稼ぐのは画面での計測に任せ、カメラは確認に使います。
 
 1. 240 fps で、キーを押す指と画面を同じ画角に収めて撮る。
 2. 押してから画面が変わるまでのコマ数を数える。1コマは約 4.2 ms。

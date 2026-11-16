@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use unicode_width::UnicodeWidthStr;
 
 use istesso_agent::{cache, survey, Agent, AgentOptions, HostView, Paths, SurveyOptions};
-use istesso_measure::{Clock, Jitter, ProbeSummary, Report};
+use istesso_measure::{Clock, Comparison, Jitter, ProbeSummary, Report};
 use istesso_pair::{tcp, Identity, PairCode, Peer, PeerStore};
 use istesso_proto::{
     AppEntry, AppInstance, Badge, HostApps, HostManifest, HostRef, HostState, Launch, NetKind,
@@ -100,6 +100,26 @@ enum MeasureAction {
         #[arg(long, value_name = "FILE")]
         client: PathBuf,
         /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare a relayed window with a local one watched on the same screen
+    ///
+    /// Takes the two logs of the screen probe (macos/screen-probe): for
+    /// every input, when the local window and when the relayed window
+    /// first showed it. Prints how much later the relayed window was.
+    Compare {
+        /// The probe's log for the window of the local test application
+        #[arg(long, value_name = "FILE")]
+        local: PathBuf,
+        /// The probe's log for the window relayed from the host
+        #[arg(long, value_name = "FILE")]
+        relayed: PathBuf,
+        /// Refresh rate of the display both windows were on, to count the
+        /// difference in refreshes
+        #[arg(long, value_name = "HZ")]
+        refresh_hz: Option<f64>,
+        /// Print the comparison as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1013,6 +1033,22 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
                 print_json(&report)
             } else {
                 print!("{}", report.render());
+                Ok(())
+            }
+        }
+        MeasureAction::Compare {
+            local,
+            relayed,
+            refresh_hz,
+            json,
+        } => {
+            let local = istesso_measure::client_samples(&read_measurement_log(&local)?);
+            let relayed = istesso_measure::client_samples(&read_measurement_log(&relayed)?);
+            let comparison = Comparison::build(&local, &relayed, refresh_hz);
+            if json {
+                print_json(&comparison)
+            } else {
+                print!("{}", comparison.render());
                 Ok(())
             }
         }

@@ -26,7 +26,7 @@ use istesso_measure::{
     Side,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
@@ -64,6 +64,12 @@ struct Args {
     #[arg(long, value_name = "WIDTHxHEIGHT", default_value = "960x600", value_parser = parse_size)]
     size: (u32, u32),
 
+    /// Where the top left corner of the window goes, in points from the top
+    /// left of the main display. Left to the window system when not given,
+    /// and ignored where the window system does not let applications choose
+    #[arg(long, value_name = "X,Y", value_parser = parse_position, allow_hyphen_values = true)]
+    position: Option<(i32, i32)>,
+
     /// Title of the window
     #[arg(long, default_value = "Istesso Flash")]
     title: String,
@@ -79,6 +85,12 @@ fn parse_size(text: &str) -> Result<(u32, u32), String> {
             "expected WIDTHxHEIGHT, for example 960x600, not {text:?}"
         )),
     }
+}
+
+fn parse_position(text: &str) -> Result<(i32, i32), String> {
+    text.split_once(',')
+        .and_then(|(x, y)| Some((x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?)))
+        .ok_or_else(|| format!("expected X,Y, for example 100,80, not {text:?}"))
 }
 
 /// What reaches the event loop from outside the window system.
@@ -118,6 +130,9 @@ impl App {
             .with_title(self.args.title.clone())
             .with_inner_size(LogicalSize::new(f64::from(width), f64::from(height)))
             .with_decorations(!self.args.borderless);
+        if let Some((x, y)) = self.args.position {
+            attributes = attributes.with_position(LogicalPosition::new(f64::from(x), f64::from(y)));
+        }
         if self.args.fullscreen {
             attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
@@ -126,6 +141,11 @@ impl App {
                 .create_window(attributes)
                 .map_err(|e| format!("cannot open a window: {e}"))?,
         );
+        if let Some((x, y)) = self.args.position {
+            // Asked for again once the window exists: at creation macOS moves a window that
+            // was placed on another display than the one in use back onto that one.
+            window.set_outer_position(LogicalPosition::new(f64::from(x), f64::from(y)));
+        }
         let context = softbuffer::Context::new(window.clone())
             .map_err(|e| format!("cannot draw on this display: {e}"))?;
         let surface = softbuffer::Surface::new(&context, window.clone())
@@ -408,6 +428,16 @@ mod tests {
             "960x600x2",
         ] {
             assert!(parse_size(wrong).is_err(), "{wrong:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn positions_are_x_then_y_and_may_be_negative() {
+        assert_eq!(parse_position("100,80"), Ok((100, 80)));
+        // A display to the left of or above the main one has negative coordinates.
+        assert_eq!(parse_position("-3440, 12"), Ok((-3440, 12)));
+        for wrong in ["", "100", "100,", ",80", "a,b", "1,2,3", "100x80"] {
+            assert!(parse_position(wrong).is_err(), "{wrong:?} was accepted");
         }
     }
 

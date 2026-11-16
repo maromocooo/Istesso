@@ -3,5 +3,7 @@
 .DS_Store
 *.swp
 /dist
+# SwiftPM build output (macos/screen-probe)
+.build/
 # Bundles handed over between machines; never part of the history.
 /handoff/

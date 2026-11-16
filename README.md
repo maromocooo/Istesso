@@ -81,6 +81,7 @@ cargo test -p istesso-agent -- --ignored      # LAN 内の発見。マルチキ�
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo deny check                         # cargo-deny が必要
+swift build --package-path macos/screen-probe   # Mac だけ。遅延の計測の道具
 ```
 
 コーディングエージェント向けの規約は [AGENTS.md](AGENTS.md) にあります。
