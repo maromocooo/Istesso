@@ -71,7 +71,21 @@ input, and is told things in lines of JSON on standard output, each with the key
               (from reading the word to: the encoder being there, the first frame leaving it,
               that frame handed on)
 
-The frame log gets a "picture" line for each, with the same times.
+    close     ask the application to close its windows, as the close button of a window
+              manager does (xdg_toplevel.close to every toplevel). An application with nothing
+              to lose ends; one with unsaved work asks and stays; nothing is closed by force.
+              Answered with {"istesso":"close","asked":true}, or false when the compositor
+              plugin cannot do it (it needs the third patch in scripts/patches)
+
+Without being asked, it says how many windows the application has, whenever that changes, and
+when the last one has gone (with the same third patch; otherwise it says neither):
+
+    {"istesso":"windows","count":N}
+    {"istesso":"empty"}                 the last window has gone: the application is over,
+                                        whatever its processes do
+
+The frame log gets a "picture" line for each stop and resume, with the same times, and a
+"windows" line for each count.
 
 Needs GStreamer with its Python bindings, the NVIDIA elements and gst-wayland-display
 (GST_PLUGIN_PATH); with --to-channel also the shared library built by
@@ -299,6 +313,9 @@ def main():
         pacing = "as-built"
         if args.render_on_commit:
             print("note: this compositor plugin has no render-on-commit property; it paces frames the way it was built", file=sys.stderr)
+    if compositor.find_property("window-messages") is not None:
+        # Told how many windows the application has, so that its end can be passed on.
+        compositor.set_property("window-messages", True)
     if args.cursor:
         if compositor.find_property("cursor-messages") is None:
             print("error: this compositor plugin has no cursor-messages property; build it with the second patch in scripts/patches", file=sys.stderr)
@@ -530,11 +547,24 @@ def main():
         accepted = media.istesso_media_host_set_cursor(host, ctypes.byref(cursor)) == 0
         log.write('{"kind":"cursor","t_ns":%d,"shape":"%s"%s,"accepted":%d}\n' % (time.monotonic_ns(), kind, detail, 1 if accepted else 0))
 
+    windows = {"count": 0}
+
+    def on_windows(count):
+        # How many windows the application has (the element's application message
+        # wayland.windows). The last one gone means that the application is over.
+        log.write('{"kind":"windows","t_ns":%d,"count":%d}\n' % (time.monotonic_ns(), count))
+        say("windows", count=count)
+        if count == 0 and windows["count"] > 0:
+            say("empty")
+        windows["count"] = count
+
     def on_message(bus, message):
         if message.type == Gst.MessageType.APPLICATION:
             structure = message.get_structure()
             if args.cursor and structure is not None and structure.get_name() == "wayland.cursor":
                 on_cursor(structure)
+            elif structure is not None and structure.get_name() == "wayland.windows":
+                on_windows(structure.get_uint("count")[1])
         elif message.type == Gst.MessageType.ERROR:
             error, detail = message.parse_error()
             print(f"error: {error.message}", file=sys.stderr)
@@ -669,6 +699,12 @@ def main():
                 stop_picture(False)
             elif word == "resume":
                 resume_picture()
+            elif word == "close":
+                # Taken by the compositor the way it takes input: an event that travels up from
+                # its source pad. A plugin without the patch does not know it and says so.
+                asked = compositor_pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, Gst.Structure.new_empty("CloseWindows")))
+                log.write('{"kind":"close","t_ns":%d,"asked":%d}\n' % (time.monotonic_ns(), 1 if asked else 0))
+                say("close", asked=bool(asked))
             elif word:
                 print(f"note: {word!r} is not something this program can be told", file=sys.stderr)
         return True
