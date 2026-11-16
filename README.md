@@ -17,6 +17,7 @@
 | `istesso peers list` / `remove` / `address` | 信頼している端末の一覧、失効、到達先アドレスの手動指定 |
 | `istesso apps export` / `istesso apps merge` | 一覧をファイルで持ち寄って統合する（ネットワークを使わない方法） |
 | `istesso id` | この端末の名前と鍵の指紋、設定とキャッシュの場所 |
+| `istesso open <アプリ>` | アプリを開く。手元にあれば手元で起動する。ほかの端末にしかなければ、そこで起動して、手元に窓を出す（M3 の最初の一切れ。映像の経路がまだ入っていないので、ほかの端末のアプリは、試験用のランナーとビューアーでだけ動く。[ADR 0010](docs/adr/0010-session-start.md)） |
 
 映像・音・USB の中継はまだ入っていません。予定は [docs/milestones.md](docs/milestones.md) にあります。
 
