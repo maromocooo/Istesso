@@ -40,7 +40,7 @@ use istesso_pair::{Identity, Peer, PeerStore, Permission};
 
 use crate::clock;
 use crate::timed::{wait_for, Ready, Timed, Wake};
-use crate::wire::{self, Ask, ErrorCode, Header, Kind, Reply, StreamInfo};
+use crate::wire::{self, Ask, Cursor, ErrorCode, Header, Kind, Reply, StreamInfo};
 use crate::{Error, Log, Result};
 
 /// Callers a host deals with at the same time that have not yet shown who
@@ -114,6 +114,11 @@ struct Shared {
     seq: AtomicU64,
     /// Somebody needs a key frame, and the encoder has not been told yet.
     key_wanted: AtomicBool,
+    /// What the cursor is, as the packet that says so, and the number of that packet: one
+    /// more for every time the cursor is set. Nothing until it has been set.
+    cursor: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
+    /// The number of the packet in `cursor`, to look at without taking it. 0: none.
+    cursor_no: AtomicU64,
     /// How long a caller has for the handshake and its first message.
     hello_wait_ms: AtomicU64,
     /// For tests: the viewers are not looked up while this is set.
@@ -150,6 +155,9 @@ struct Watcher {
     busy: AtomicBool,
     /// When something was last sent, on [`clock::now_ns`].
     last_sent_ns: AtomicU64,
+    /// Which cursor this viewer was told last (its number), and when.
+    cursor_told: AtomicU64,
+    cursor_told_ns: AtomicU64,
     /// Makes the viewer's thread look up.
     wake: Wake,
     /// The connection, for waiting on it without holding `line`.
@@ -262,6 +270,8 @@ impl Host {
             serving: Arc::new(AtomicUsize::new(0)),
             seq: AtomicU64::new(0),
             key_wanted: AtomicBool::new(false),
+            cursor: Mutex::new(None),
+            cursor_no: AtomicU64::new(0),
             hello_wait_ms: AtomicU64::new(HELLO_WAIT.as_millis() as u64),
             recheck_paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -356,6 +366,32 @@ impl Host {
         Ok(sent)
     }
 
+    /// Says what the pointer's cursor looks like from now on. The viewers draw it themselves,
+    /// where their own pointers are; the frames are expected not to have it in them.
+    ///
+    /// The cursor is whatever an application on this host has handed in. One that may not
+    /// travel is refused here and reaches nobody: an image of more than 256 pixels a side or
+    /// of none, one whose bytes are not as many as its size says, a hot spot outside the
+    /// image. A viewer is told the latest cursor only, at most once in a frame's interval,
+    /// and never before a frame that is still on its way to it; a viewer that connects
+    /// later is told what the cursor is then.
+    pub fn set_cursor(&self, cursor: &Cursor) -> Result<()> {
+        let shared = &*self.shared;
+        let mut packet = Vec::new();
+        wire::encode_cursor(cursor, shared.seq.load(Ordering::SeqCst), &mut packet)?;
+        {
+            let mut now = shared.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            let number = shared.cursor_no.load(Ordering::SeqCst) + 1;
+            *now = Some((number, Arc::new(packet)));
+            shared.cursor_no.store(number, Ordering::SeqCst);
+        }
+        // Each viewer's own thread tells it, when it is that viewer's turn.
+        for watcher in shared.watchers().list.iter() {
+            watcher.wake.wake();
+        }
+        Ok(())
+    }
+
     /// Whether a key frame is needed: a viewer has connected, has asked for
     /// one, or was held back. True once for each time it is needed; the
     /// caller tells the encoder.
@@ -444,17 +480,17 @@ impl Watcher {
     /// The connection, for a moment. `None` while the viewer's thread has
     /// it for something that may take long: the frames wait for nobody.
     fn line_for_a_frame(&self) -> Option<MutexGuard<'_, Line>> {
-        for _ in 0..200 {
-            match self.line.try_lock() {
-                Ok(line) => return Some(line),
-                Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
-                Err(TryLockError::WouldBlock) if self.busy.load(Ordering::SeqCst) => return None,
-                // The viewer's thread is saying that the picture stands
-                // still, which takes microseconds.
-                Err(TryLockError::WouldBlock) => std::thread::yield_now(),
-            }
+        match self.line.try_lock() {
+            Ok(line) => Some(line),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if self.busy.load(Ordering::SeqCst) => None,
+            // Only the viewer's own thread can have it, and it has not said that it
+            // will be long: it is saying that the picture stands still, or what the
+            // cursor is. That is sealing a small packet and handing it to the
+            // connection without waiting, some microseconds; the frame waits them
+            // out rather than be lost.
+            Err(TryLockError::WouldBlock) => Some(self.line()),
         }
-        None
     }
 }
 
@@ -528,6 +564,13 @@ impl Shared {
                     .last_sent_ns
                     .store(clock::now_ns(), Ordering::SeqCst);
                 if all {
+                    // The cursor goes behind the frame, never in front of it.
+                    if self.cursor_due(watcher) == Some(Duration::ZERO) {
+                        if let Err(err) = self.tell_cursor(watcher, &mut line) {
+                            drop(line);
+                            self.close(watcher, &err);
+                        }
+                    }
                     return Offered::Written;
                 }
                 line.unsent_since = Some(Instant::now());
@@ -541,6 +584,44 @@ impl Shared {
                 Offered::No
             }
         }
+    }
+
+    /// How long until this viewer may be told what the cursor is: not at all (`None`) when
+    /// it has been told the latest one, at once when a frame's interval has passed since
+    /// it was last told one. An application that changes its cursor with every frame
+    /// costs a viewer one small packet per frame at most, and only ever the latest.
+    fn cursor_due(&self, watcher: &Watcher) -> Option<Duration> {
+        if watcher.cursor_told.load(Ordering::SeqCst) == self.cursor_no.load(Ordering::SeqCst) {
+            return None;
+        }
+        let interval = 1_000_000_000 / u64::from(self.info.fps.clamp(1, 1000));
+        let since = clock::now_ns().saturating_sub(watcher.cursor_told_ns.load(Ordering::SeqCst));
+        Some(Duration::from_nanos(interval.saturating_sub(since)))
+    }
+
+    /// Seals the latest cursor for one viewer and puts it on its connection, behind
+    /// everything that was sealed for it before. Only called while nothing of an earlier
+    /// packet is waiting for the connection.
+    fn tell_cursor(&self, watcher: &Watcher, line: &mut Line) -> Result<()> {
+        let now = self
+            .cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some((number, packet)) = now else {
+            return Ok(());
+        };
+        line.channel.send(&packet)?;
+        if !line.channel.stream().push()? {
+            line.unsent_since = Some(Instant::now());
+            watcher.unsent.store(true, Ordering::SeqCst);
+            watcher.wake.wake();
+        }
+        let at = clock::now_ns();
+        watcher.cursor_told.store(number, Ordering::SeqCst);
+        watcher.cursor_told_ns.store(at, Ordering::SeqCst);
+        watcher.last_sent_ns.store(at, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Takes callers until the host is closed. Every caller gets a thread
@@ -670,6 +751,8 @@ impl Shared {
             unsent: AtomicBool::new(false),
             busy: AtomicBool::new(false),
             last_sent_ns: AtomicU64::new(clock::now_ns()),
+            cursor_told: AtomicU64::new(0),
+            cursor_told_ns: AtomicU64::new(0),
             wake: Wake::new()?,
             fd,
             line: Mutex::new(Line {
@@ -741,7 +824,26 @@ impl Shared {
             if let Err(err) = self.finish_what_was_begun(watcher) {
                 return self.close(watcher, &err);
             }
-            match wait_for(&Fd(watcher.fd), Some(&watcher.wake), TICK) {
+            // What the cursor is, when this viewer has not been told the latest and may
+            // be told again; otherwise this thread looks up when it may.
+            let mut tick = TICK;
+            match self.cursor_due(watcher) {
+                Some(Duration::ZERO) => {
+                    let mut line = watcher.line();
+                    // Looked at again now that the connection is in hand: a frame may
+                    // have gone out meanwhile, and the cursor behind it.
+                    let still_due = self.cursor_due(watcher) == Some(Duration::ZERO);
+                    if still_due && line.unsent_since.is_none() {
+                        if let Err(err) = self.tell_cursor(watcher, &mut line) {
+                            drop(line);
+                            return self.close(watcher, &err);
+                        }
+                    }
+                }
+                Some(wait) => tick = tick.min(wait),
+                None => {}
+            }
+            match wait_for(&Fd(watcher.fd), Some(&watcher.wake), tick) {
                 Ok(Ready::Woken) => {
                     watcher.wake.clear();
                     continue;

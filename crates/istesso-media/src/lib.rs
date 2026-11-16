@@ -40,8 +40,8 @@ pub mod wire;
 #[cfg(unix)]
 pub use host::Host;
 #[cfg(unix)]
-pub use viewer::{Asker, Frame, Viewer};
-pub use wire::{Chroma, Codec, Colour, StreamInfo, DEFAULT_PORT};
+pub use viewer::{Asker, Event, Frame, Viewer};
+pub use wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, DEFAULT_PORT};
 
 /// Receives one line for each thing worth telling the person who runs a
 /// host. Never a key, and never an address.

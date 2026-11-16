@@ -43,6 +43,18 @@ means something a little different:
 A key frame is made when a viewer connects or asks for one over its connection ("key_request"
 with "by":"client"); nothing listens for unauthenticated requests then.
 
+With --cursor (only with --to-channel) the compositor leaves the pointer's cursor out of the
+picture and says what it looks like whenever that changes; this program hands that to the
+library, which tells the viewers, and they draw the cursor themselves where their own pointer
+is. Needs the compositor plugin with the second patch in scripts/patches. A line is written for
+every cursor the compositor reports:
+
+    cursor      "shape" is "hidden", "named" (no image; the viewer shows a cursor of its own)
+                or "image", with the image's size, hot spot and scale; "accepted" is 0 when the
+                library refused it (too large, or its numbers do not fit its bytes)
+
+The unencrypted stream of --to never carries the cursor: there it stays in the picture.
+
 Needs GStreamer with its Python bindings, the NVIDIA elements and gst-wayland-display
 (GST_PLUGIN_PATH); with --to-channel also the shared library built by
 `cargo build --release -p istesso-media`.
@@ -80,6 +92,14 @@ class MediaSent(ctypes.Structure):
     _fields_ = [("seq", ctypes.c_uint64)] + [(name, ctypes.c_uint32) for name in ("viewers", "queued", "messages", "reserved")]
 
 
+class MediaCursor(ctypes.Structure):
+    """IstessoMediaCursor of the same header."""
+
+    _fields_ = [(name, ctypes.c_uint32) for name in ("shape", "width", "height", "hotspot_x", "hotspot_y", "scale")] + [
+        ("pixels", ctypes.c_char_p), ("pixels_len", ctypes.c_size_t), ("name", ctypes.c_char_p),
+    ]
+
+
 def open_channel(args, bind, width, height):
     """Loads istesso-media and starts listening for paired devices. Returns the library and the host, or the library and None."""
     path = args.media_lib or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "target", "release", "libistesso_media.so")
@@ -96,6 +116,8 @@ def open_channel(args, bind, width, height):
     ]
     media.istesso_media_host_key_frame_wanted.restype = ctypes.c_int32
     media.istesso_media_host_key_frame_wanted.argtypes = [ctypes.c_void_p]
+    media.istesso_media_host_set_cursor.restype = ctypes.c_int32
+    media.istesso_media_host_set_cursor.argtypes = [ctypes.c_void_p, ctypes.POINTER(MediaCursor)]
     media.istesso_media_host_close.restype = None
     media.istesso_media_host_close.argtypes = [ctypes.c_void_p]
     media.istesso_media_last_error.restype = ctypes.c_char_p
@@ -170,6 +192,19 @@ def main():
         "$XDG_RUNTIME_DIR/istesso/input.sock)",
     )
     parser.add_argument(
+        "--input-socket",
+        metavar="PATH",
+        help="with --input: the socket to take the input on, for a pipeline that runs next to another one "
+        "($XDG_RUNTIME_DIR/istesso/input.sock, where `istesso agent` hands input over, unless given)",
+    )
+    parser.add_argument(
+        "--cursor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="with --to-channel: leave the cursor out of the picture and tell the viewers what it looks like, so that "
+        "they draw it themselves. Needs the compositor plugin with the cursor-messages patch in scripts/patches",
+    )
+    parser.add_argument(
         "--render-on-commit",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -189,6 +224,8 @@ def main():
     args = parser.parse_args()
 
     channel = args.to_channel is not None
+    if args.cursor and not channel:
+        parser.error("--cursor needs --to-channel: the unencrypted stream does not carry the cursor, which stays in its picture")
     if channel:
         if args.lose:
             parser.error("--lose throws packets away, and the channel has none to throw away")
@@ -244,13 +281,19 @@ def main():
         pacing = "as-built"
         if args.render_on_commit:
             print("note: this compositor plugin has no render-on-commit property; it paces frames the way it was built", file=sys.stderr)
+    if args.cursor:
+        if compositor.find_property("cursor-messages") is None:
+            print("error: this compositor plugin has no cursor-messages property; build it with the second patch in scripts/patches", file=sys.stderr)
+            return 1
+        # From here on the cursor is not in the frames; what it looks like comes as messages on the bus.
+        compositor.set_property("cursor-messages", True)
     log = open(os.devnull, "w") if args.log == "-" else open(args.log, "x", buffering=1 << 20)
     log.write(
         '{"kind":"header","side":"host","tool":"m1-step3-host","version":"2","started_unix_ms":%d,'
-        '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s","pacing":"%s","transport":"%s"}\n'
+        '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s","pacing":"%s","transport":"%s","cursor":"%s"}\n'
         % (
             time.time_ns() // 1_000_000, width, height, args.fps, args.bitrate, args.gop, vbv or 0, args.chroma, args.colour, args.preset, args.frames, pacing,
-            "channel" if channel else "udp",
+            "channel" if channel else "udp", "told" if args.cursor else "in-picture",
         )
     )
 
@@ -426,8 +469,37 @@ def main():
     loop = GLib.MainLoop()
     failed = []
 
+    def on_cursor(structure):
+        # What the compositor says the cursor is (the element's application message
+        # wayland.cursor), handed to the library as it is. The library checks it again.
+        kind = structure.get_string("kind")
+        cursor = MediaCursor()
+        detail = ""
+        pixels = None
+        if kind == "image":
+            numbers = [structure.get_uint(name)[1] for name in ("width", "height", "hotspot-x", "hotspot-y", "scale")]
+            image = structure.get_value("image")
+            mapped, data = image.map(Gst.MapFlags.READ)
+            if not mapped:
+                return
+            pixels = bytes(data.data)
+            image.unmap(data)
+            cursor.shape, cursor.pixels, cursor.pixels_len = 2, pixels, len(pixels)
+            cursor.width, cursor.height, cursor.hotspot_x, cursor.hotspot_y, cursor.scale = numbers
+            detail = ',"width":%d,"height":%d,"hotspot_x":%d,"hotspot_y":%d,"scale":%d' % tuple(numbers)
+        elif kind == "named":
+            cursor.shape, cursor.name = 1, (structure.get_string("name") or "").encode()
+        elif kind != "hidden":
+            return
+        accepted = media.istesso_media_host_set_cursor(host, ctypes.byref(cursor)) == 0
+        log.write('{"kind":"cursor","t_ns":%d,"shape":"%s"%s,"accepted":%d}\n' % (time.monotonic_ns(), kind, detail, 1 if accepted else 0))
+
     def on_message(bus, message):
-        if message.type == Gst.MessageType.ERROR:
+        if message.type == Gst.MessageType.APPLICATION:
+            structure = message.get_structure()
+            if args.cursor and structure is not None and structure.get_name() == "wayland.cursor":
+                on_cursor(structure)
+        elif message.type == Gst.MessageType.ERROR:
             error, detail = message.parse_error()
             print(f"error: {error.message}", file=sys.stderr)
             failed.append(error)
@@ -453,9 +525,12 @@ def main():
     GLib.timeout_add(1000, every_second)
     if args.input:
         source_pad = pipeline.get_by_name("compositor").get_static_pad("src")
-        directory = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache"), "istesso")
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        path = os.path.join(directory, "input.sock")
+        if args.input_socket:
+            path = args.input_socket
+        else:
+            directory = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache"), "istesso")
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            path = os.path.join(directory, "input.sock")
         if os.path.exists(path):
             os.unlink(path)  # left by an earlier run
         inputs = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
