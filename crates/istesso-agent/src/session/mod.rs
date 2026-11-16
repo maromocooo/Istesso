@@ -747,6 +747,7 @@ impl Sessions {
                 peer: SessionPeer {
                     id: peer.id.clone(),
                     address: address_text(&remote),
+                    public_key: Some(peer.public_key.clone()),
                 },
                 input_socket: input_socket.to_string_lossy().into_owned(),
                 offer: asked.offer.clone(),
@@ -866,6 +867,7 @@ impl Sessions {
                 peer: SessionPeer {
                     id: peer.id.clone(),
                     address: address_text(&remote),
+                    public_key: Some(peer.public_key.clone()),
                 },
                 display,
                 offer: offer.clone(),

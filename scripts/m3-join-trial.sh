@@ -109,15 +109,50 @@ for event in ({"kind": "pointer_at", "x": x, "y": y}, {"kind": "button", "code":
 PY
 }
 
+# A viewer that connects to the picture's port by itself, for a few seconds, without the
+# command: whether it was sent a picture. With ISTESSO_CONFIG_DIR in the environment it is
+# another device.
+probe() { # a name for its files, the port, seconds
+    log="$WORK/probe-$1-$(date +%s).frames"
+    ISTESSO_CHANNEL="$JOIN_ADDRESS:$2" "$HERE/macos/gst-viewer/build/gst-viewer" 60 780 240 135 "Istesso Join Probe" - "$log" > "$WORK/probe-$1.txt" 2>&1 &
+    probing=$!
+    sleep "$3"
+    kill $probing 2> /dev/null
+    wait $probing 2> /dev/null
+    grep -q '"kind":"decoded"' "$log" 2> /dev/null
+}
+no_picture() { ! probe "$@"; }
+picture_port() { on_host 'sed -n "s/.*offered on port \([0-9]*\).*/\1/p" $D/agent.log | tail -1'; }
+
+# Types into a window and saves with Control-S. An application that has only just appeared may not take keys yet: when its file is still
+# empty a moment later, the same is typed once more.
+type_into() { # the socket, the file on the host, the key codes
+    socket=$1
+    file=$2
+    shift 2
+    for _ in 1 2 3; do
+        sleep 2
+        click "$socket" 480 320
+        keys "$socket" "$@"
+        sleep 0.5
+        keys "$socket" +29 31
+        sleep 1.5
+        on_host "[ -s \$D/$file ]" && return 0
+    done
+    return 1
+}
+
 echo "== setting up =="
-on_host 'mkdir -p $D/data/applications $D/cache $D/logs && : > $D/scratch.txt &&
-    printf "[Desktop Entry]\nType=Application\nName='"$APP"'\nExec=gnome-text-editor --standalone --ignore-session %s\n" $D/scratch.txt > $D/data/applications/istesso-join-editor.desktop &&
+# The editor keeps what was open, and what was typed and not saved, between its runs. Each
+# run of this trial gives it a new place for that, so that it starts with the one empty file.
+on_host 'run=$(date +%s); mkdir -p $D/data/applications $D/cache $D/logs $D/state && : > $D/scratch.txt &&
+    printf "[Desktop Entry]\nType=Application\nName='"$APP"'\nExec=env XDG_DATA_HOME=%s gnome-text-editor --standalone --ignore-session %s\n" $D/state/$run-1 $D/scratch.txt > $D/data/applications/istesso-join-editor.desktop &&
     : > $D/scratch-2.txt &&
-    printf "[Desktop Entry]\nType=Application\nName='"$SECOND"'\nExec=gnome-text-editor --standalone --ignore-session %s\n" $D/scratch-2.txt > $D/data/applications/istesso-join-second.desktop &&
+    printf "[Desktop Entry]\nType=Application\nName='"$SECOND"'\nExec=env XDG_DATA_HOME=%s gnome-text-editor --standalone --ignore-session %s\n" $D/state/$run-2 $D/scratch-2.txt > $D/data/applications/istesso-join-second.desktop &&
     { [ -z "'"${JOIN_REGISTRY:-}"'" ] || cp '"${JOIN_REGISTRY:-/dev/null}"' $D/registry.bin; }'
-start_agent() {
+start_agent() { # more of the agent's environment, if any
     on_host 'tmux kill-session -t join-agent 2>/dev/null; sleep 0.3; : > $D/agent.log
-        tmux new-session -d -s join-agent "XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run \
+        tmux new-session -d -s join-agent "'"${1:-}"' XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run \
             ISTESSO_RUNNER_PLUGIN='"$JOIN_PLUGIN"' ISTESSO_RUNNER_REGISTRY=$D/registry.bin ISTESSO_RUNNER_LOGS=$D/logs \
             ISTESSO_RUNNER_MEDIA_LIB=$D/src/target/release/libistesso_media.so ISTESSO_RUNNER_PORTS='"$PORTS"' \
             $D/src/target/release/istesso agent --port '"$PORT"' --bind :: --no-discovery \
@@ -147,11 +182,7 @@ check "what is done in the window goes to the host for this session" wait_for "$
 sleep 2
 check "a capture of the viewer's own window is taken (before typing)" capture window-1-before
 # A click into the text, then: i s t e s s o, Enter, and Control-S to save.
-click "$input" 480 320
-keys "$input" 23 31 20 18 31 31 24 28
-sleep 0.5
-keys "$input" +29 31
-sleep 1.5
+type_into "$input" scratch.txt 23 31 20 18 31 31 24 28
 check "a capture of the window is taken (after typing)" capture window-2-typed
 check "the typed text arrived in the application: the file it saved says so" on_host 'grep -qx "istesso" $D/scratch.txt'
 
@@ -162,6 +193,7 @@ check "Ctrl-C ends the command without an error" [ $? -eq 0 ]
 check "the command says that the application keeps running" said "$WORK/open-1.txt" "keeps running on"
 sessions > "$WORK/list.txt"
 check "the session is listed as running, not shown" said "$WORK/list.txt" "$APP.*running, not shown"
+check "after leaving, the viewer connecting to the picture's port by itself is sent nothing" no_picture left "$(picture_port)" 3
 id=$(awk -v app="$APP" 'index($0, app) { print $1; exit }' "$WORK/list.txt")
 "$BIN" open "$APP" --viewer "$HERE/scripts/session-viewer.py" --size 960x540 --fps 60 --position "$POSITION" > "$WORK/open-2.txt" 2>&1 &
 cli=$!
@@ -197,24 +229,64 @@ frames=$(sed -n 's/.*frames are written down in \([^;]*\);.*/\1/p' "$WORK/two-2.
 check "the second one's picture is drawn" drawn
 input_one=$(sed -n 's/.*input goes to \(.*\)$/\1/p' "$WORK/two-1.txt" | tail -1)
 input_two=$(sed -n 's/.*input goes to \(.*\)$/\1/p' "$WORK/two-2.txt" | tail -1)
-sleep 2
 # o n e into the first window, t w o into the second, each saved with Control-S.
-click "$input_one" 480 320
-keys "$input_one" 24 49 18
-click "$input_two" 480 320
-keys "$input_two" 20 17 24
-sleep 0.5
-keys "$input_one" +29 31
-keys "$input_two" +29 31
-sleep 1.5
+type_into "$input_one" scratch.txt 24 49 18
+type_into "$input_two" scratch-2.txt 20 17 24
 check "what was typed into the first window is in the first application's file, and only there" on_host '[ "$(cat $D/scratch.txt)" = one ]'
 check "what was typed into the second window is in the second application's file, and only there" on_host '[ "$(cat $D/scratch-2.txt)" = two ]'
 kill -INT $one $two
 wait $one $two
 
-echo "== cleaning up =="
 end_all
 check "both are ended and nothing is listed" nothing
+
+echo "== the picture is for the one device that is shown the session =="
+# Two devices of the trial's own, paired with a trial agent that has an identity of its own:
+# the ordinary lists of paired devices are neither read nor written in this part.
+pair_with_trial_host() { # the device's configuration directory, its name
+    on_host 'ISTESSO_CONFIG_DIR=$D/config nohup $D/src/target/release/istesso pair host --port '"${PORTS##*-}"' --timeout 20 --name join-host > $D/pair.txt 2>&1 < /dev/null &
+        for _ in 1 2 3 4 5 6 7 8 9 10; do grep -q "^Pairing code" $D/pair.txt && break; sleep 0.2; done'
+    code=$(on_host 'sed -n "s/^Pairing code: //p" $D/pair.txt; : > $D/pair.txt')
+    ISTESSO_CONFIG_DIR="$1" "$BIN" pair join "$JOIN_ADDRESS:${PORTS##*-}" "$code" --name "$2" > /dev/null 2>&1
+}
+A="$WORK/dev-a"
+B="$WORK/dev-b"
+check "a trial agent with its own identity and its own list of paired devices starts" start_agent 'ISTESSO_CONFIG_DIR=$D/config'
+on_host 'tmux kill-session -t join-agent 2>/dev/null'
+check "the first device of the trial is paired with it" pair_with_trial_host "$A" join-a
+check "the second device of the trial is paired with it" pair_with_trial_host "$B" join-b
+check "the trial agent starts again and knows both" start_agent 'ISTESSO_CONFIG_DIR=$D/config'
+TRIAL_HOST=$(on_host 'ISTESSO_CONFIG_DIR=$D/config $D/src/target/release/istesso id' | awk '/^Fingerprint/ { print $2 }')
+ISTESSO_CONFIG_DIR="$A" "$BIN" peers address "$TRIAL_HOST" "$JOIN_ADDRESS:$PORT" > /dev/null
+ISTESSO_CONFIG_DIR="$B" "$BIN" peers address "$TRIAL_HOST" "$JOIN_ADDRESS:$PORT" > /dev/null
+
+ISTESSO_CONFIG_DIR="$A" "$BIN" open "$APP" --viewer "$HERE/scripts/session-viewer.py" --size 960x540 --fps 60 --position "$POSITION" > "$WORK/one-a.txt" 2>&1 &
+first=$!
+check "the first device opens the application and is shown it" wait_for "$WORK/one-a.txt" "go to the host over the control channel, for this session" 40
+frames=$(sed -n 's/.*frames are written down in \([^;]*\);.*/\1/p' "$WORK/one-a.txt" | tail -1)
+check "its picture is drawn" drawn
+port=$(picture_port)
+ISTESSO_CONFIG_DIR="$B" check "the second device, paired and allowed to look and control, connects to the picture's port and is sent nothing" no_picture b-uninvited "$port" 3
+check "the host refused it by name" on_host 'grep -q "refused to show the picture to join-b" $D/logs/pipeline-*.log'
+kill -0 $first 2> /dev/null
+check "the first device's window is still there" [ $? -eq 0 ]
+
+ISTESSO_CONFIG_DIR="$B" "$BIN" open "$APP" --viewer "$HERE/scripts/session-viewer.py" --size 960x540 --fps 60 --position "$second_position" > "$WORK/one-b.txt" 2>&1 &
+second=$!
+check "the second device attaches to the same session with the command" wait_for "$WORK/one-b.txt" "again (session" 40
+frames=$(sed -n 's/.*frames are written down in \([^;]*\);.*/\1/p' "$WORK/one-b.txt" | tail -1)
+check "now its picture is drawn" drawn
+check "the first device is told that the application moved to the second" wait_for "$WORK/one-a.txt" "it is shown on join-b now" 10
+wait $first
+ISTESSO_CONFIG_DIR="$A" check "the first device, connecting to the picture's port by itself now, is sent nothing" no_picture a-replaced "$port" 3
+kill -INT $second
+wait $second
+ISTESSO_CONFIG_DIR="$B" check "after the second device left, it is sent nothing either" no_picture b-left "$port" 3
+for id in $(ISTESSO_CONFIG_DIR="$B" "$BIN" sessions 2> /dev/null | awk '/Istesso Join/ { print $1 }'); do
+    ISTESSO_CONFIG_DIR="$B" "$BIN" sessions stop "$id" --force > /dev/null 2>&1
+done
+
+echo "== cleaning up =="
 on_host 'tmux kill-session -t join-agent 2>/dev/null; sleep 0.5; pgrep -f "[s]ession-runner.py|[m]1-step3-host.py --to-channel '"${PORTS%%-*}"'" > /dev/null && echo "  something of the trial still runs on the host" || echo "  nothing of the trial runs on the host"'
 pgrep -f "[g]st-viewer .*$APP" > /dev/null && echo "  the trial's viewer still runs on this machine" || echo "  the trial's viewer does not run on this machine"
 echo "$failed checks failed"

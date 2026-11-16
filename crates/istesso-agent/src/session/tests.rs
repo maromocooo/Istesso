@@ -1448,6 +1448,7 @@ fn nobody_is_attached_while_the_list_cannot_be_read() {
             peer: SessionPeer {
                 id: host.laptop.id.clone(),
                 address: "192.0.2.10".to_string(),
+                public_key: None,
             },
             display: mode(),
             offer: serde_json::Value::Null,

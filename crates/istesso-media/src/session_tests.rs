@@ -11,7 +11,7 @@ use istesso_pair::{Identity, Permission};
 
 use crate::testing::TempPeers;
 use crate::wire::{self, Ask, Chroma, Codec, Colour, Cursor, CursorImage, Reply, StreamInfo};
-use crate::{Error, Event, Host, Viewer};
+use crate::{Admit, Error, Event, Host, Viewer};
 
 const SOON: Duration = Duration::from_secs(5);
 
@@ -325,6 +325,162 @@ fn a_device_without_the_right_to_view_is_refused() {
 
     pair.studio_peers.allow("air", &[Permission::View]);
     assert!(pair.connect().is_ok());
+}
+
+/// The device as the one that alone is shown the picture.
+fn only(name: &str, identity: &Identity) -> Admit {
+    let peer = crate::testing::peer(name, identity);
+    Admit::Only {
+        id: peer.id,
+        public_key: peer.public_key,
+    }
+}
+
+#[test]
+fn a_host_that_was_never_told_shows_its_picture_to_every_paired_device_that_may_look() {
+    let pair = pair();
+    let pad = pair.another_device("pad");
+    let _air = pair.watching();
+    let _pad = pair.connect_as(&pad).unwrap();
+    pair.until(|| pair.host.viewers() == 2);
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 2);
+}
+
+#[test]
+fn while_one_device_is_named_another_paired_device_is_refused() {
+    let pair = pair();
+    let pad = pair.another_device("pad");
+    pair.host.admit(only("air", &pair.air));
+
+    // Paired, allowed to look, and not the one: refused, and told so.
+    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+    pair.until(|| pair.said("refused to show the picture to pad"));
+    assert_eq!(pair.host.viewers(), 0);
+    // The named device is shown the picture, and only it.
+    let mut air = pair.watching();
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(take(&mut air).unwrap().unwrap().data, b"key");
+    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+    assert_eq!(pair.host.viewers(), 1);
+
+    // The id alone is not the device: the key has to be its own as well.
+    let Admit::Only { id, .. } = only("air", &pair.air) else {
+        unreachable!()
+    };
+    let Admit::Only { public_key, .. } = only("pad", &pad) else {
+        unreachable!()
+    };
+    pair.host.admit(Admit::Only { id, public_key });
+    assert_eq!(pair.host.viewers(), 0);
+    assert!(matches!(pair.connect(), Err(Error::Forbidden)));
+    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+}
+
+#[test]
+fn naming_another_device_cuts_the_one_before_it_at_once() {
+    let pair = pair();
+    let pad = pair.another_device("pad");
+    pair.host.admit(only("air", &pair.air));
+    let mut air = pair.watching();
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(take(&mut air).unwrap().unwrap().data, b"key");
+
+    // The session moves to the other device. No frame that is handed in
+    // after that goes to the first one: not the very next one either.
+    pair.host.admit(only("pad", &pad));
+    assert_eq!(pair.host.viewers(), 0);
+    assert_eq!(
+        pair.host.send_frame(b"delta", 1, 1, false).unwrap().viewers,
+        0
+    );
+    pair.until(|| pair.said("stopped showing the picture to air"));
+    let over = match take(&mut air) {
+        Ok(Some(got)) => panic!("the first device was sent {:?}", got.data),
+        Ok(None) => panic!("the first device was left waiting"),
+        Err(err) => err,
+    };
+    assert!(matches!(over, Error::Link(LinkError::Closed)), "{over}");
+    // It does not get in again, and the other one does.
+    assert!(matches!(pair.connect(), Err(Error::Forbidden)));
+    let mut second = pair.connect_as(&pad).unwrap();
+    pair.until(|| pair.host.viewers() == 1);
+    assert_eq!(pair.host.send_frame(b"key", 2, 2, true).unwrap().viewers, 1);
+    assert_eq!(take(&mut second).unwrap().unwrap().data, b"key");
+}
+
+#[test]
+fn nobody_cuts_everybody_and_lets_nobody_in() {
+    let pair = pair();
+    let pad = pair.another_device("pad");
+    let mut air = pair.watching();
+    let mut second = pair.connect_as(&pad).unwrap();
+    pair.until(|| pair.host.viewers() == 2);
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 2);
+
+    pair.host.admit(Admit::Nobody);
+    assert_eq!(pair.host.viewers(), 0);
+    assert_eq!(pair.host.send_frame(b"key", 1, 1, true).unwrap().viewers, 0);
+    for viewer in [&mut air, &mut second] {
+        let over = loop {
+            match take(viewer) {
+                Ok(Some(got)) => assert_eq!(got.data, b"key"),
+                Ok(None) => panic!("a viewer was left waiting"),
+                Err(err) => break err,
+            }
+        };
+        assert!(matches!(over, Error::Link(LinkError::Closed)), "{over}");
+    }
+    assert!(matches!(pair.connect(), Err(Error::Forbidden)));
+    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+
+    // A host for a session begins like that, before anybody can connect.
+    let studio = Identity::generate();
+    let peers = TempPeers::trusting(&[("air", &pair.air)]);
+    let closed = Host::listen_admitting(
+        "127.0.0.1:0".parse().unwrap(),
+        &studio,
+        peers.path(),
+        info(),
+        Arc::new(|_| {}),
+        Admit::Nobody,
+    )
+    .unwrap();
+    let keys = LocalKeys::new(&pair.air).unwrap();
+    let trusting = TempPeers::trusting(&[("studio", &studio)]);
+    let refused = Viewer::connect(closed.local_addr(), &keys, &trusting.open(), None, SOON);
+    assert!(matches!(refused, Err(Error::Forbidden)));
+    // Told otherwise, it is as a host that was never told.
+    closed.admit(Admit::Paired);
+    assert!(Viewer::connect(closed.local_addr(), &keys, &trusting.open(), None, SOON).is_ok());
+}
+
+#[test]
+fn the_named_device_still_loses_the_picture_when_it_is_unpaired() {
+    let pair = pair();
+    pair.host.admit(only("air", &pair.air));
+    let mut viewer = pair.watching();
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"key");
+
+    // Being named does not stand in for being paired: the list is looked
+    // at as before, and the stream stops within its second.
+    pair.studio_peers.remove("air");
+    let removed = Instant::now();
+    while pair.host.viewers() > 0 {
+        assert!(removed.elapsed() < Duration::from_secs(1), "still sending");
+        let _ = pair.host.send_frame(b"delta", 1, 1, false).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    pair.until(|| pair.said("no longer paired"));
+    assert!(matches!(
+        pair.connect(),
+        Err(Error::Link(LinkError::NotTrusted))
+    ));
+    // Nor does losing the right to look.
+    let pad = pair.another_device("pad");
+    pair.host.admit(only("pad", &pad));
+    pair.studio_peers.allow("pad", &[Permission::Control]);
+    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
 }
 
 #[test]

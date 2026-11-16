@@ -122,9 +122,17 @@ def open_channel(args, bind, width, height):
     media.istesso_media_host_close.argtypes = [ctypes.c_void_p]
     media.istesso_media_last_error.restype = ctypes.c_char_p
     media.istesso_media_last_error.argtypes = []
+    listen = media.istesso_media_host_listen
+    if args.control:
+        # The picture of a session: for nobody until its runner names a device.
+        listen = media.istesso_media_host_listen_closed
+        listen.restype = ctypes.c_void_p
+        listen.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(MediaStreamInfo)]
+        media.istesso_media_host_admit.restype = ctypes.c_int32
+        media.istesso_media_host_admit.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
     # H.265 (1), with all of its colour or a quarter of it, said to be sRGB (1) or nothing said (0).
     info = MediaStreamInfo(1, width, height, args.fps, int(args.chroma), 1 if args.colour == "srgb" else 0)
-    host = media.istesso_media_host_listen(args.config_dir.encode() if args.config_dir else None, bind.encode(), ctypes.byref(info))
+    host = listen(args.config_dir.encode() if args.config_dir else None, bind.encode(), ctypes.byref(info))
     if not host:
         print(f"error: cannot listen for paired devices: {media.istesso_media_last_error().decode()}", file=sys.stderr)
         return media, None
@@ -196,6 +204,14 @@ def main():
         metavar="PATH",
         help="with --input: the socket to take the input on, for a pipeline that runs next to another one "
         "($XDG_RUNTIME_DIR/istesso/input.sock, where `istesso agent` hands input over, unless given)",
+    )
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        help="with --to-channel: take the lines of a session's runner on standard input (docs/adr/0010-session-start.md), "
+        "one JSON object a line. `attach` names the one device that is shown the picture, by its id and public key; "
+        "`detach` means nobody. Nobody is shown the picture before the first `attach`. When standard input is closed, "
+        "the pipeline stops. Other lines are passed over for now",
     )
     parser.add_argument(
         "--cursor",
@@ -419,6 +435,42 @@ def main():
         key_frame("signal")
         return True
 
+    control = {"rest": b""}
+
+    def on_control(fd, condition):
+        """A session's runner says who is shown the picture: `attach` one device, `detach` nobody."""
+        try:
+            data = os.read(0, 65536)
+        except BlockingIOError:
+            return True
+        if not data:
+            # The runner closed its end: the session is over.
+            media.istesso_media_host_admit(host, None, None)
+            stop()
+            return False
+        *lines, control["rest"] = (control["rest"] + data).split(b"\n")
+        for line in lines:
+            try:
+                told = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(told, dict) or told.get("v") != 1:
+                continue
+            if told.get("cmd") == "attach":
+                peer = told.get("peer") or {}
+                device, key = peer.get("id"), peer.get("public_key")
+                if device and key:
+                    media.istesso_media_host_admit(host, device.encode(), key.encode())
+                    print(f"control: the picture is for the device {device} alone", flush=True)
+                else:
+                    # Half a device is nobody.
+                    media.istesso_media_host_admit(host, None, None)
+                    print("control: attach named no device with id and public key; the picture is for nobody", flush=True)
+            elif told.get("cmd") == "detach":
+                media.istesso_media_host_admit(host, None, None)
+                print("control: the picture is for nobody", flush=True)
+        return True
+
     taken = {"count": 0}
 
     def on_input(fd, condition):
@@ -539,6 +591,9 @@ def main():
         GLib.io_add_watch(inputs.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_input)
     if channel:
         GLib.timeout_add(4, on_wanted)
+    if channel and args.control:
+        os.set_blocking(0, False)
+        GLib.io_add_watch(0, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN | GLib.IOCondition.HUP, on_control)
     elif args.key_requests:
         # Both kinds of address: the reports come from wherever the stream goes.
         requests = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)

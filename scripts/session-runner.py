@@ -24,14 +24,17 @@ What it needs, from the environment:
 
 What it cannot do yet, because the pipeline cannot. Each is said on standard error when asked:
 
-  detach          the pipeline goes on making and offering the picture. Nobody receives it
-                  once the viewer has gone, but the encoder stays open, and any paired device
-                  that may look at this host can connect to the port
-  pause, resume   the same: the encoder is not closed and opened
+  detach          the picture is for nobody from then on (the pipeline is told, and cuts the
+                  viewer), but the pipeline goes on making it: the encoder stays open
+  pause, resume   the encoder is not closed and opened
   close           the compositor has no way yet to ask a window to close (xdg_toplevel.close)
   empty           it does not know when the last window is gone; the agent sees the
                   application end instead
-  the picture goes to whichever paired device connects, not only to `peer.address`
+
+Who is shown the picture: the one device the agent names in `start` and in `attach`, by its id
+and its public key. The pipeline is told on its standard input (--control) and admits nobody
+else; a `start` or `attach` without the key admits nobody. The address in `peer` is not used
+for this: the device is known by its key.
 """
 
 import fcntl
@@ -122,7 +125,7 @@ def main():
         sys.executable, "-u", os.path.join(HERE, "scripts", "m1-step3-host.py"),
         "--to-channel", str(port), "--cursor",
         "--size", f"{display['width']}x{display['height']}", "--fps", str(display["fps"]),
-        "--frames", "cuda", "--input-socket", input_socket, "--log", "-",
+        "--frames", "cuda", "--input-socket", input_socket, "--log", "-", "--control",
     ]  # fmt: skip
     node = nvidia_render_node()
     if node:
@@ -136,7 +139,7 @@ def main():
     log_path = os.path.join(logs, f"pipeline-{session}.log")
     pipeline = subprocess.Popen(
         command,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=environment,
@@ -174,6 +177,18 @@ def main():
             return 1
         time.sleep(0.05)
 
+    def tell_pipeline(told):
+        """Passes a line on to the pipeline: it keeps the picture to the device that is named."""
+        try:
+            pipeline.stdin.write(json.dumps(told, separators=(",", ":")) + "\n")
+            pipeline.stdin.flush()
+        except OSError:
+            pass
+
+    # The device that started the session is the first to be shown it.
+    tell_pipeline({"v": 1, "cmd": "attach", "peer": start.get("peer") or {}})
+    if not (start.get("peer") or {}).get("public_key"):
+        note("start named no public key for the device: the picture is for nobody until an attach does")
     answer = {"transport": "channel", "channel_port": port}
     # The application finds the compositor by these two alone, also where the agent runs
     # without a runtime directory in its own environment.
@@ -208,23 +223,34 @@ def main():
             if command == "attach":
                 # A viewer that connects to the same port is sent the picture, beginning with
                 # a key frame. The size stays the one the session was started with.
+                tell_pipeline({"v": 1, "cmd": "attach", "peer": told.get("peer") or {}})
                 say("attached", display=display, answer=answer)
-                note("attach: the picture is offered on the same port, in the size the session started with")
+                note("attach: the picture is for that device alone now, on the same port, in the size the session started with")
             elif command == "detach":
-                note("detach: NOT obeyed yet. The pipeline cannot stop offering the picture or close its encoder")
+                tell_pipeline({"v": 1, "cmd": "detach"})
+                note("detach: the picture is for nobody now. NOT done yet: closing the encoder")
             elif command in ("pause", "resume"):
                 note(f"{command}: NOT obeyed yet. The pipeline cannot close and open its encoder")
             elif command == "close":
                 note("close: NOT obeyed yet. The compositor cannot ask a window to close")
         time.sleep(0.05)
 
-    # Standard input was closed: the session is over.
-    pipeline.send_signal(signal.SIGINT)
+    # Standard input was closed: the session is over. Nobody is shown the picture, and the
+    # pipeline stops when its own input is closed.
+    tell_pipeline({"v": 1, "cmd": "detach"})
     try:
-        pipeline.wait(timeout=1.5)
+        pipeline.stdin.close()
+    except OSError:
+        pass
+    try:
+        pipeline.wait(timeout=1.0)
     except subprocess.TimeoutExpired:
-        pipeline.kill()
-        pipeline.wait()
+        pipeline.send_signal(signal.SIGINT)
+        try:
+            pipeline.wait(timeout=0.8)
+        except subprocess.TimeoutExpired:
+            pipeline.kill()
+            pipeline.wait()
     note(f"session {session}: stopped")
     return 0
 

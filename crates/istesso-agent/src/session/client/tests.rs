@@ -266,6 +266,7 @@ fn a_window_opens_for_an_application_of_another_device() {
             host: SessionPeer {
                 id: pair.host.id(),
                 address: "127.0.0.1".into(),
+                public_key: None,
             },
             display: pair.runner.display(),
             answer: serde_json::json!({"fake": "answer"}),

@@ -181,6 +181,12 @@ pub struct SessionPeer {
     /// The other end of the control connection that belongs to this
     /// session, as text a program can use as it is ([`address_text`]).
     pub address: String,
+    /// Its public key, as the list of paired devices has it. An agent
+    /// says it to a runner, so that the picture can be kept to this one
+    /// device: the id alone is a fingerprint, and whoever checks compares
+    /// both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 /// What a host's agent tells a runner.
@@ -545,6 +551,7 @@ mod tests {
             peer: SessionPeer {
                 id: "1a2b-3c4d-5e6f-7a8b".to_string(),
                 address: "192.0.2.10".to_string(),
+                public_key: None,
             },
             input_socket: "/run/user/1000/istesso/input-5b0c9e3a7f21d684.sock".to_string(),
             offer: json!({"rtp_port": 50004}),
@@ -581,6 +588,7 @@ mod tests {
             peer: SessionPeer {
                 id: "1a2b-3c4d-5e6f-7a8b".to_string(),
                 address: "192.0.2.10".to_string(),
+                public_key: None,
             },
             display: DisplayMode {
                 width: 1280,
@@ -697,6 +705,7 @@ mod tests {
             host: SessionPeer {
                 id: "9f8e-7d6c-5b4a-3921".to_string(),
                 address: "192.0.2.20".to_string(),
+                public_key: None,
             },
             display: mode(),
             answer: json!({"key_request_port": 50005}),
