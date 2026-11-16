@@ -262,9 +262,7 @@ impl Shared {
             let response = match request {
                 // Streaming sessions have their own table, and their own
                 // rules about who may ask.
-                request @ (Request::SessionStart { .. }
-                | Request::SessionWait { .. }
-                | Request::SessionStop { .. }) => {
+                request if crate::session::is_session_request(&request) => {
                     self.sessions
                         .answer(&request, session.peer(), session.remote_addr(), || {
                             self.apps()
@@ -305,13 +303,9 @@ impl Shared {
                     status: local_status(),
                 }
             }
-            // Answered where the connection is, before this is reached.
-            Request::SessionStart { .. }
-            | Request::SessionWait { .. }
-            | Request::SessionStop { .. } => Response::error(
-                ErrorCode::Unsupported,
-                "sessions are not answered like a question about the host",
-            ),
+            // Sessions are answered where the connection is, before this is
+            // reached.
+            _ => Response::error(ErrorCode::Unsupported, "not a question about the host"),
         }
     }
 

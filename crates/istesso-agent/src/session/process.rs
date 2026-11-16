@@ -6,7 +6,7 @@
 //! it starts can be ended with it.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -43,11 +43,25 @@ impl<E: DeserializeOwned + Send + 'static> LineProcess<E> {
     /// Starts `program` without arguments. What it writes to its standard
     /// error goes to `log`, line by line, with `label` in front.
     pub(crate) fn spawn(program: &Path, label: String, log: Log) -> std::io::Result<Self> {
-        let mut child = Command::new(program)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut tries = 0;
+        let mut child = loop {
+            let spawned = Command::new(program)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            match spawned {
+                Ok(child) => break child,
+                // A program that was written a moment ago can still be held
+                // open: by whoever installs it, or, for an instant, by
+                // another process this one is starting. That passes.
+                Err(busy) if busy.kind() == ErrorKind::ExecutableFileBusy && tries < 10 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(other) => return Err(other),
+            }
+        };
         let stdin = child.stdin.take();
         let (sender, lines) = mpsc::channel();
         if let Some(stdout) = child.stdout.take() {
@@ -187,8 +201,10 @@ impl CommandRunner {
 
 impl Runner for CommandRunner {
     fn start(&self, start: &RunnerCommand) -> Result<Box<dyn RunningStream>, String> {
-        let RunnerCommand::Start { session, .. } = start;
-        let label = format!("session {session}: runner");
+        let label = match start {
+            RunnerCommand::Start { session, .. } => format!("session {session}: runner"),
+            _ => "runner".to_string(),
+        };
         let mut process = LineProcess::spawn(&self.program, label, self.log.clone())
             .map_err(|e| format!("the host's session runner could not be started ({e})"))?;
         process.tell(start).map_err(|e| {
@@ -206,6 +222,12 @@ impl RunningStream for ProcessStream {
             Said::Line(event) => StreamEvent::Said(event),
             Said::Exited(status) => StreamEvent::Exited(how_it_ended(status)),
         })
+    }
+
+    fn tell(&mut self, command: &RunnerCommand) -> Result<(), String> {
+        self.0
+            .tell(command)
+            .map_err(|e| format!("the host's session runner does not listen any more ({e})"))
     }
 
     fn stop(&mut self, grace: Duration) {
@@ -331,6 +353,10 @@ mod unix {
     }
 
     impl RunningApp for ProcessApp {
+        fn pid(&self) -> Option<u32> {
+            Some(self.child.id())
+        }
+
         fn poll(&mut self) -> Option<String> {
             if self.status.is_none() {
                 self.status = self.child.try_wait().ok().flatten();
@@ -344,8 +370,10 @@ mod unix {
             self.gone.then(|| how_it_ended(status))
         }
 
-        /// Asks the application to end the way a session manager does
-        /// (SIGTERM), and ends it (SIGKILL) when it has not after `grace`.
+        /// Ends the application by force: tells it to end (SIGTERM), and
+        /// ends it (SIGKILL) when it has not after `grace`. Asking it to
+        /// close, which it may answer with a question, is not done here:
+        /// that goes through the runner, to the application's windows.
         fn stop(&mut self, grace: Duration) {
             if self.poll().is_some() {
                 return;

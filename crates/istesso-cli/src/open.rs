@@ -1,9 +1,10 @@
-//! `istesso open`: start an application, wherever it is installed.
+//! `istesso open`: open an application, wherever it is installed.
 //!
 //! An application of this machine is started here, with nothing in between.
-//! One that only another device has is started there and shown in a window
-//! here (`docs/adr/0010-session-start.md`): the command then stays for as
-//! long as the window does.
+//! One that only another device has runs there and is shown in a window
+//! here (`docs/adr/0010-session-start.md`). It keeps running there when the
+//! window is gone, so the command first looks whether it is running
+//! already, and comes back to it before it starts anything new.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -12,23 +13,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use istesso_agent::session::client::{
-    link_to, open_window, ClientRules, CommandViewer, OpenError, Opening, Outcome,
+    link_to, open_window, ClientRules, CommandViewer, OpenError, Opening, Outcome, Progress,
 };
 use istesso_agent::{survey, HostView, Paths, SurveyOptions};
 use istesso_link::ErrorCode;
 use istesso_proto::{
-    AppEntry, AppInstance, Badge, EndReason, HostApps, HostState, Launch, SessionInfo,
-    SessionState, StreamKind, UnifiedApp, ViewerWish,
+    AppEntry, AppInstance, Badge, EndReason, HostApps, HostState, Launch, SessionId, SessionState,
+    StreamKind, UnifiedApp, ViewerWish,
 };
 
-/// What the command is called. Written down once: the name is still open
-/// with the person who uses it (ADR 0010).
+use crate::sessions::{self, Running};
+
+/// What the command is called. Written down once (ADR 0010).
 pub const COMMAND: &str = "open";
 
 /// What was typed after `istesso open`.
 pub struct Options {
     pub app: String,
     pub host: Option<String>,
+    /// Start the application even when it is running already.
+    pub new: bool,
+    /// Come back to this session of the application.
+    pub session: Option<String>,
     pub viewer: Option<PathBuf>,
     pub size: Option<(u32, u32)>,
     pub fps: Option<u32>,
@@ -44,15 +50,37 @@ pub fn run(options: Options) -> Result<(), String> {
     let views = survey(&paths, &survey_options)?;
     let hosts: Vec<HostApps> = views.iter().map(HostView::to_host_apps).collect();
     let catalogue = istesso_catalog::merge(&hosts);
-
     let app = find_app(&catalogue, &options.app)?;
+
+    // What the person was doing comes before anything new: an application
+    // that is running already is shown again.
+    if !options.new {
+        let (running, _) = sessions::running(&paths, &views);
+        let of_app = sessions_of(app, &running, options.host.as_deref());
+        if let Some(found) = choose_session(&app.name, &of_app, options.session.as_deref())? {
+            let target = Target {
+                name: &app.name,
+                host: &found.host_name,
+                host_id: &found.host_id,
+                app_id: &found.info.app,
+            };
+            return open_there(&paths, &target, Some(found.info.id.clone()), &options);
+        }
+    }
+
     let instance = choose_instance(app, options.host.as_deref())?;
     if instance.local {
         open_here(&instance.app)?;
         println!("Opened {} on this device.", app.name);
         return Ok(());
     }
-    open_there(&paths, app, instance, &options)
+    let target = Target {
+        name: &app.name,
+        host: &instance.host_name,
+        host_id: &instance.host_id,
+        app_id: &instance.app.id,
+    };
+    open_there(&paths, &target, None, &options)
 }
 
 /// `WIDTHxHEIGHT`, in pixels.
@@ -116,6 +144,73 @@ fn find_app<'a>(catalogue: &'a [UnifiedApp], asked: &str) -> Result<&'a UnifiedA
             "'{asked}' matches several applications: {}; say which one",
             list(several)
         )),
+    }
+}
+
+/// The sessions of `app` among those that run for this device, on the
+/// device the person named or on any.
+fn sessions_of<'a>(
+    app: &UnifiedApp,
+    running: &'a [Running],
+    host: Option<&str>,
+) -> Vec<&'a Running> {
+    running
+        .iter()
+        .filter(|r| !matches!(r.info.state, SessionState::Stopping | SessionState::Ended))
+        .filter(|r| {
+            app.instances
+                .iter()
+                .any(|i| i.host_id == r.host_id && i.app.id == r.info.app)
+        })
+        .filter(|r| {
+            host.is_none_or(|host| r.host_id == host || r.host_name.eq_ignore_ascii_case(host))
+        })
+        .collect()
+}
+
+/// The session to come back to, if there is one: the one the person named,
+/// or the only one. `None` means that the application is to be started.
+fn choose_session<'a>(
+    name: &str,
+    of_app: &[&'a Running],
+    asked: Option<&str>,
+) -> Result<Option<&'a Running>, String> {
+    let list = || -> String {
+        let all: Vec<String> = of_app
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} on {} ({})",
+                    r.info.id,
+                    r.host_name,
+                    sessions::state_words(r.info.state)
+                )
+            })
+            .collect();
+        all.join(", ")
+    };
+    match asked {
+        Some(asked) => sessions::pick(of_app.iter().copied(), asked)
+            .map(Some)
+            .map_err(|_| {
+                if of_app.is_empty() {
+                    format!(
+                        "{name} is not running for this device; leave out --session to start it"
+                    )
+                } else {
+                    format!("no session '{asked}' of {name}; there is {}", list())
+                }
+            }),
+        None => match of_app {
+            [] => Ok(None),
+            &[only] => Ok(Some(only)),
+            _ => Err(format!(
+                "{name} is running {} times: {}; say which one with --session <id>, or start \
+                 another with --new",
+                of_app.len(),
+                list()
+            )),
+        },
     }
 }
 
@@ -216,16 +311,25 @@ fn open_here(app: &AppEntry) -> Result<(), String> {
     Ok(())
 }
 
-/// Starts the application on the device that has it and shows it here,
-/// until the window is closed, the application ends, or the person stops
-/// the command.
+/// An application on another device.
+struct Target<'a> {
+    name: &'a str,
+    host: &'a str,
+    host_id: &'a str,
+    /// The application's id on that device.
+    app_id: &'a str,
+}
+
+/// Shows an application of another device here: starts it there, or with
+/// `session` comes back to one that is running. Stays until the window is
+/// gone.
 fn open_there(
     paths: &Paths,
-    app: &UnifiedApp,
-    instance: &AppInstance,
+    target: &Target<'_>,
+    session: Option<SessionId>,
     options: &Options,
 ) -> Result<(), String> {
-    let (name, host) = (&app.name, &instance.host_name);
+    let (name, host) = (target.name, target.host);
     let viewer = options
         .viewer
         .clone()
@@ -242,11 +346,12 @@ fn open_there(
             )
         })?;
     let viewer = CommandViewer::new(viewer, Arc::new(|line| eprintln!("{line}")));
-    let link = link_to(paths, &instance.host_id, Duration::from_millis(800))?;
+    let link = link_to(paths, target.host_id, Duration::from_millis(800))?;
+    let coming_back = session.is_some();
     let opening = Opening {
-        host: instance.host_id.clone(),
-        app: instance.app.id.clone(),
-        title: name.clone(),
+        host: target.host_id.to_string(),
+        app: target.app_id.to_string(),
+        title: name.to_string(),
         kind: StreamKind::AppWindow,
         wish: ViewerWish {
             width: options.size.map(|(width, _)| width),
@@ -255,18 +360,27 @@ fn open_there(
             x: options.position.map(|(x, _)| x),
             y: options.position.map(|(_, y)| y),
         },
+        session,
     };
 
     let interrupted = Arc::new(AtomicBool::new(false));
     stop_on_signals(&interrupted);
-    let mut progress = |info: &SessionInfo| match info.state {
-        SessionState::Starting => {
-            eprintln!("Starting {name} on {host} (session {})...", info.id)
-        }
-        SessionState::Running => {
-            eprintln!("{name} is running on {host}. Close the window or press Ctrl-C to end it.")
-        }
-        _ => {}
+    let how_to_end = "Closing the window asks it to close; Ctrl-C leaves it running.";
+    let mut progress = |progress: Progress<'_>| match progress {
+        Progress::Session(info) => match info.state {
+            SessionState::Starting => {
+                eprintln!("Starting {name} on {host} (session {})...", info.id)
+            }
+            SessionState::Running if coming_back => eprintln!(
+                "Showing {name} from {host} again (session {}). {how_to_end}",
+                info.id
+            ),
+            SessionState::Running => eprintln!("{name} is running on {host}. {how_to_end}"),
+            _ => {}
+        },
+        Progress::AskedToClose => eprintln!(
+            "Asked {name} to close. The window stays until it has: it may ask whether to save."
+        ),
     };
     let outcome = open_window(
         link,
@@ -281,7 +395,7 @@ fn open_there(
     Ok(())
 }
 
-/// Ctrl-C, a closed terminal and a request to end all mean "stop": the
+/// Ctrl-C, a closed terminal and a request to end all mean "leave": the
 /// host is told, instead of being left to find out.
 fn stop_on_signals(interrupted: &Arc<AtomicBool>) {
     #[cfg(unix)]
@@ -296,16 +410,16 @@ fn stop_on_signals(interrupted: &Arc<AtomicBool>) {
     let _ = interrupted;
 }
 
-/// Why no window was opened, for the person who asked.
-fn explain(refusal: &OpenError, name: &str, host: &str) -> String {
+/// Why nothing came of it, for the person who asked.
+pub fn explain(refusal: &OpenError, name: &str, host: &str) -> String {
     match refusal {
         OpenError::Refused(refusal) => match refusal.code {
             ErrorCode::Unsupported => format!(
-                "the istesso on {host} is too old to start applications for other devices; \
+                "the istesso on {host} is too old to show its applications to other devices; \
                  update it"
             ),
             ErrorCode::Forbidden => format!(
-                "{host} does not let this device start its applications ({})",
+                "{host} does not let this device do that ({})",
                 refusal.message
             ),
             _ => format!("{host} cannot show {name}: {}", refusal.message),
@@ -315,20 +429,41 @@ fn explain(refusal: &OpenError, name: &str, host: &str) -> String {
     }
 }
 
-/// What to say when the window is gone: a line for a normal end, an error
-/// for everything else.
+/// What to say when the window is gone: a line when that is what the
+/// person asked for, an error for everything else.
 fn conclude(outcome: Outcome, name: &str, host: &str) -> Result<String, String> {
+    let stays = |session: &SessionId| {
+        format!(
+            "{name} keeps running on {host} (session {session}). `istesso {COMMAND} {name}` \
+             shows it again; `istesso sessions stop {session}` asks it to close."
+        )
+    };
     match outcome {
-        Outcome::Closed => Ok(format!("Closed {name}; it was ended on {host}.")),
-        Outcome::Interrupted => Ok(format!("Stopped {name} on {host}.")),
         Outcome::Ended(end) => match end.reason {
-            EndReason::Stopped => Ok(format!("{name} was stopped on {host}.")),
+            EndReason::Stopped => Ok(format!("{name} was ended on {host}.")),
             EndReason::AppExited => Ok(format!("{name} ended on {host}: {}.", end.message)),
             _ if end.message.is_empty() => Err(format!("{name} on {host} ended unexpectedly")),
             _ => Err(format!("{name} on {host} ended: {}", end.message)),
         },
-        Outcome::HostLost(why) => Err(format!("lost {host}: {why}")),
-        Outcome::ViewerFailed(why) => Err(format!("{why}; {name} was ended on {host}")),
+        Outcome::Left(session) => Ok(stays(&session)),
+        Outcome::ViewerGone {
+            session, ok: true, ..
+        } => Ok(stays(&session)),
+        Outcome::ViewerGone {
+            session,
+            ok: false,
+            how,
+        } => Err(format!("the viewer ended ({how}). {}", stays(&session))),
+        Outcome::TakenOver(_) => Ok(format!("{name} is shown in another window now.")),
+        Outcome::Detached(session) => Err(format!(
+            "{host} stopped showing {name} to this device: it had not heard from it for too \
+             long, or no longer allows it. {}",
+            stays(&session)
+        )),
+        Outcome::HostLost { session, why } => Err(format!(
+            "lost {host}: {why}. {name} (session {session}) may still be running there; \
+             `istesso sessions` tells"
+        )),
     }
 }
 
@@ -449,6 +584,111 @@ mod tests {
         assert!(parse_position("a,b").is_err());
     }
 
+    fn runs(host: &str, app: &str, id: &str, state: SessionState) -> Running {
+        Running {
+            host_id: format!("id-{host}"),
+            host_name: host.to_string(),
+            app_name: app.to_string(),
+            info: istesso_proto::SessionInfo {
+                id: SessionId(id.to_string()),
+                app: format!("{}.desktop", app.to_lowercase().replace(' ', "-")),
+                kind: StreamKind::AppWindow,
+                state,
+                revision: 2,
+                attachment: 1,
+                display: None,
+                answer: None,
+                end: None,
+            },
+        }
+    }
+
+    #[test]
+    fn an_application_that_is_running_is_come_back_to() {
+        let catalogue = catalogue();
+        let blender = find_app(&catalogue, "blender").unwrap();
+        let running = vec![
+            runs(
+                "ubuntu",
+                "Blender",
+                "5b0c9e3a7f21d684",
+                SessionState::Detached,
+            ),
+            runs(
+                "ubuntu",
+                "Hex Editor",
+                "1111222233334444",
+                SessionState::Running,
+            ),
+            runs(
+                "ubuntu",
+                "Blender",
+                "aaaa000011112222",
+                SessionState::Stopping,
+            ),
+        ];
+        let choose =
+            |app: &UnifiedApp, running: &[Running], host: Option<&str>, asked: Option<&str>| {
+                let of_app = sessions_of(app, running, host);
+                choose_session(&app.name, &of_app, asked)
+                    .map(|found| found.map(|r| r.info.id.0.clone()))
+            };
+        // The one session of the application that is not ending, shown
+        // somewhere or not. Sessions of other applications do not count.
+        assert_eq!(
+            choose(blender, &running, None, None).unwrap().as_deref(),
+            Some("5b0c9e3a7f21d684")
+        );
+        // Not running: it is to be started.
+        let logic = find_app(&catalogue, "logic").unwrap();
+        assert_eq!(choose(logic, &running, None, None).unwrap(), None);
+        assert_eq!(choose(blender, &[], None, None).unwrap(), None);
+        // Only the named device is looked at.
+        assert_eq!(
+            choose(blender, &running, Some("studio"), None).unwrap(),
+            None
+        );
+        assert!(choose(blender, &running, Some("Ubuntu"), None)
+            .unwrap()
+            .is_some());
+
+        // Twice: the person says which, by the id or its beginning.
+        let twice = vec![
+            runs(
+                "ubuntu",
+                "Blender",
+                "5b0c9e3a7f21d684",
+                SessionState::Detached,
+            ),
+            runs(
+                "studio",
+                "Blender",
+                "9f8e7d6c5b4a3921",
+                SessionState::Running,
+            ),
+        ];
+        let unclear = choose(blender, &twice, None, None).unwrap_err();
+        assert!(unclear.contains("running 2 times"), "{unclear}");
+        assert!(
+            unclear.contains("5b0c9e3a7f21d684 on ubuntu (running, not shown)"),
+            "{unclear}"
+        );
+        assert!(
+            unclear.contains("--session") && unclear.contains("--new"),
+            "{unclear}"
+        );
+        assert_eq!(
+            choose(blender, &twice, None, Some("9f8e"))
+                .unwrap()
+                .as_deref(),
+            Some("9f8e7d6c5b4a3921")
+        );
+        let wrong = choose(blender, &twice, None, Some("1234")).unwrap_err();
+        assert!(wrong.contains("no session '1234' of Blender"), "{wrong}");
+        let none = choose(logic, &twice, None, Some("9f8e")).unwrap_err();
+        assert!(none.contains("Logic is not running"), "{none}");
+    }
+
     #[test]
     fn refusals_say_what_to_do() {
         let refused = |code, message: &str| {
@@ -489,7 +729,8 @@ mod tests {
     }
 
     #[test]
-    fn an_ordinary_end_is_a_line_and_anything_else_an_error() {
+    fn a_window_that_is_gone_says_what_became_of_the_application() {
+        let id = || SessionId("5b0c9e3a7f21d684".to_string());
         let ended = |reason, message: &str| {
             conclude(
                 Outcome::Ended(SessionEnd {
@@ -500,8 +741,7 @@ mod tests {
                 "ubuntu",
             )
         };
-        assert!(conclude(Outcome::Closed, "Blender", "ubuntu").is_ok());
-        assert!(conclude(Outcome::Interrupted, "Blender", "ubuntu").is_ok());
+        // The application is gone.
         assert_eq!(
             ended(
                 EndReason::AppExited,
@@ -514,13 +754,50 @@ mod tests {
             ended(EndReason::StreamFailed, "no encoder"),
             Err("Blender on ubuntu ended: no encoder".to_string())
         );
-        assert!(ended(EndReason::Revoked, "").is_err());
-        assert!(conclude(Outcome::HostLost("no answer".into()), "Blender", "ubuntu").is_err());
-        assert!(conclude(
-            Outcome::ViewerFailed("it broke".into()),
-            "Blender",
-            "ubuntu"
-        )
-        .is_err());
+        assert!(ended(EndReason::Other, "").is_err());
+
+        // The application runs on, and the person is told how to come back
+        // and how to end it.
+        let left = conclude(Outcome::Left(id()), "Blender", "ubuntu").unwrap();
+        assert!(
+            left.starts_with("Blender keeps running on ubuntu"),
+            "{left}"
+        );
+        assert!(
+            left.contains("`istesso open Blender` shows it again"),
+            "{left}"
+        );
+        assert!(
+            left.contains("`istesso sessions stop 5b0c9e3a7f21d684` asks it to close"),
+            "{left}"
+        );
+        let quit = Outcome::ViewerGone {
+            session: id(),
+            ok: true,
+            how: "exit status 0".into(),
+        };
+        assert_eq!(conclude(quit, "Blender", "ubuntu").unwrap(), left);
+        let broke = Outcome::ViewerGone {
+            session: id(),
+            ok: false,
+            how: "signal 11".into(),
+        };
+        let broke = conclude(broke, "Blender", "ubuntu").unwrap_err();
+        assert!(
+            broke.contains("signal 11") && broke.contains("keeps running"),
+            "{broke}"
+        );
+        let dropped = conclude(Outcome::Detached(id()), "Blender", "ubuntu").unwrap_err();
+        assert!(
+            dropped.contains("stopped showing") && dropped.contains("keeps running"),
+            "{dropped}"
+        );
+        assert!(conclude(Outcome::TakenOver(id()), "Blender", "ubuntu").is_ok());
+        let lost = Outcome::HostLost {
+            session: id(),
+            why: "no answer".into(),
+        };
+        let lost = conclude(lost, "Blender", "ubuntu").unwrap_err();
+        assert!(lost.contains("may still be running"), "{lost}");
     }
 }

@@ -143,31 +143,73 @@ impl Client {
         })
     }
 
-    /// Asks about a session and tells the host that this device is still
-    /// there. The host answers at once when the session changed after
-    /// revision `after`, and holds the answer back for up to `hold`
-    /// otherwise: give the conversation more time than that
-    /// ([`Client::set_timeout`]).
+    /// Asks about a session. The host answers at once when the session
+    /// changed after revision `after`, and holds the answer back for up to
+    /// `hold` otherwise: give the conversation more time than that
+    /// ([`Client::set_timeout`]). With `attachment` set to the one this
+    /// client is, the question also tells the host that the client is still
+    /// there; with 0 it only asks.
     pub fn session_wait(
         &mut self,
         session: &istesso_proto::SessionId,
         after: u64,
         hold: Duration,
+        attachment: u64,
     ) -> Result<istesso_proto::SessionInfo> {
         self.session(&Request::SessionWait {
             session: session.clone(),
             after,
             timeout_ms: u32::try_from(hold.as_millis()).unwrap_or(u32::MAX),
+            attachment,
         })
     }
 
-    /// Asks the host to stop the application and the stream.
+    /// Asks the application of a session to close, or with `force` ends it.
     pub fn session_stop(
         &mut self,
         session: &istesso_proto::SessionId,
+        force: bool,
     ) -> Result<istesso_proto::SessionInfo> {
         self.session(&Request::SessionStop {
             session: session.clone(),
+            force,
+        })
+    }
+
+    /// The sessions this device started on the other one that are not
+    /// over, oldest first.
+    pub fn session_list(&mut self) -> Result<Vec<istesso_proto::SessionInfo>> {
+        match self.call(&Request::SessionList)? {
+            Response::Sessions { sessions } => Ok(sessions),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Asks the other device to show this one a session that is running.
+    /// The answer comes when the stream is set up, which can take seconds:
+    /// give the conversation time ([`Client::set_timeout`]).
+    pub fn session_attach(
+        &mut self,
+        session: &istesso_proto::SessionId,
+        display: istesso_proto::DisplayMode,
+        offer: serde_json::Value,
+    ) -> Result<istesso_proto::SessionInfo> {
+        self.session(&Request::SessionAttach {
+            session: session.clone(),
+            display,
+            offer,
+        })
+    }
+
+    /// Tells the other device that this client stops showing the session.
+    pub fn session_detach(
+        &mut self,
+        session: &istesso_proto::SessionId,
+        attachment: u64,
+    ) -> Result<istesso_proto::SessionInfo> {
+        self.session(&Request::SessionDetach {
+            session: session.clone(),
+            attachment,
         })
     }
 

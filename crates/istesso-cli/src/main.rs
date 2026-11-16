@@ -17,6 +17,7 @@ use istesso_proto::{
 };
 
 mod open;
+mod sessions;
 
 #[derive(Parser)]
 #[command(
@@ -87,9 +88,13 @@ enum Command {
     /// Open an application, wherever it is installed
     ///
     /// An application of this machine is started here. One that only
-    /// another device has is started there and shown in a window here; the
-    /// command then stays until the window is closed, the application
-    /// ends, or Ctrl-C.
+    /// another device has runs there and is shown in a window here. It
+    /// keeps running there when the window is gone: the command comes back
+    /// to an application that is running before it starts one.
+    ///
+    /// Closing the window asks the application to close, and the window
+    /// stays until it has: it may ask whether to save. Ctrl-C leaves the
+    /// application running. `istesso sessions` lists what runs.
     #[command(name = open::COMMAND)]
     Open {
         /// Name of the application, as `istesso apps list --all` shows it
@@ -98,6 +103,13 @@ enum Command {
         /// automatically
         #[arg(long, value_name = "DEVICE")]
         host: Option<String>,
+        /// Start the application even if it is running already
+        #[arg(long, conflicts_with = "session")]
+        new: bool,
+        /// Come back to this session, when the application runs more than
+        /// once (the id from `istesso sessions`, or the beginning of it)
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
         /// Program that shows the picture (default: $ISTESSO_VIEWER)
         #[arg(long, value_name = "PROGRAM")]
         viewer: Option<PathBuf>,
@@ -111,6 +123,33 @@ enum Command {
         /// display
         #[arg(long, value_name = "X,Y", value_parser = open::parse_position, allow_hyphen_values = true)]
         position: Option<(i32, i32)>,
+    },
+    /// List the applications of other devices that run for this one, or
+    /// stop one
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List them, shown in a window or not (the default)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask an application to close, the way closing its window does
+    ///
+    /// The application may have a question first (unsaved work), and stay.
+    /// `istesso open` shows it then.
+    Stop {
+        /// The session's id from `istesso sessions`, or the beginning of it
+        session: String,
+        /// End the application instead of asking it: it is told to end,
+        /// and ended three seconds later if it has not
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -271,6 +310,8 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Open {
             app,
             host,
+            new,
+            session,
             viewer,
             size,
             fps,
@@ -278,11 +319,18 @@ fn run(cli: Cli) -> Result<(), String> {
         } => open::run(open::Options {
             app,
             host,
+            new,
+            session,
             viewer,
             size,
             fps,
             position,
         }),
+        Command::Sessions { action } => match action {
+            None => sessions::list(false),
+            Some(SessionsAction::List { json }) => sessions::list(json),
+            Some(SessionsAction::Stop { session, force }) => sessions::stop(&session, force),
+        },
     }
 }
 

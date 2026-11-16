@@ -70,8 +70,11 @@ pub enum SessionState {
     /// The host is setting up the virtual display and starting the
     /// application.
     Starting,
-    /// The application runs; `display` and `answer` are set.
+    /// The application runs and a client is shown it; `display` and
+    /// `answer` are that client's.
     Running,
+    /// The application runs; nobody is shown it.
+    Detached,
     /// The host is stopping the application and the stream; `end` says why.
     Stopping,
     /// Over.
@@ -83,18 +86,14 @@ pub enum SessionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
-    /// A device asked for it.
+    /// Its owner ended it by force.
     Stopped,
-    /// The application ended by itself.
+    /// The application ended by itself, asked to close or not.
     AppExited,
     /// The application could not be started.
     AppFailed,
     /// The host's side of the stream could not be started, or it failed.
     StreamFailed,
-    /// The device that showed the session stopped saying that it is there.
-    ClientLost,
-    /// The device's pairing or permission was taken away.
-    Revoked,
     #[serde(other)]
     Other,
 }
@@ -117,11 +116,17 @@ pub struct SessionInfo {
     pub state: SessionState,
     /// Goes up by one with every change of this record.
     pub revision: u64,
-    /// What the host produces. Set from `running` on.
+    /// Counts the clients that were shown this session. The one that is
+    /// shown it now has this number; a client with a lower one has been
+    /// replaced.
+    #[serde(default)]
+    pub attachment: u64,
+    /// What the host produces. Set once the session has run.
     #[serde(default)]
     pub display: Option<DisplayMode>,
-    /// From the host's media path, for the caller's. Set from `running` on.
-    /// The control plane does not look inside.
+    /// From the host's media path, for the client that is shown the
+    /// session. Set while `running`. The control plane does not look
+    /// inside.
     #[serde(default)]
     pub answer: Option<serde_json::Value>,
     /// Why the session ends. Set from `stopping` on.
@@ -151,7 +156,7 @@ pub struct SessionPeer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum RunnerCommand {
-    /// Set up a virtual display and the stream to `peer`.
+    /// Set up a virtual display and the stream to `peer`, the first client.
     Start {
         session: SessionId,
         kind: StreamKind,
@@ -168,6 +173,26 @@ pub enum RunnerCommand {
         #[serde(default)]
         offer: serde_json::Value,
     },
+    /// Send the picture to this client from now on, and to nobody else.
+    /// Answered with `attached`, or with `detached` when it cannot be done.
+    Attach {
+        peer: SessionPeer,
+        /// What this client's viewer asked for.
+        display: DisplayMode,
+        /// From this client's viewer.
+        #[serde(default)]
+        offer: serde_json::Value,
+    },
+    /// The application was started on the display, as this process. For a
+    /// runner that has to find the application's windows itself; one whose
+    /// display the application connects to needs nothing from it.
+    Application { pid: u32 },
+    /// The client is gone: stop sending. The display and the application
+    /// stay as they are.
+    Detach,
+    /// Ask the application's windows to close, the way a window manager
+    /// does. What the application makes of it is its own business.
+    Close,
 }
 
 /// What a runner tells its agent.
@@ -184,9 +209,24 @@ pub enum RunnerEvent {
         #[serde(default)]
         answer: serde_json::Value,
     },
+    /// The picture goes to the client of the last `attach` now.
+    Attached {
+        /// What is really produced.
+        display: DisplayMode,
+        /// For that client's viewer.
+        #[serde(default)]
+        answer: serde_json::Value,
+    },
+    /// The picture goes to nobody: an `attach` could not be done, or the
+    /// stream broke. The display and the application go on.
+    Detached {
+        /// One line for a person.
+        #[serde(default)]
+        message: String,
+    },
     /// The last window on the display has closed.
     Empty,
-    /// It cannot go on; it ends after this.
+    /// It cannot go on; it ends after this, and the application with it.
     Error { message: String },
 }
 
@@ -244,6 +284,9 @@ pub enum ViewerEvent {
     },
     /// The first picture is on the screen.
     Shown,
+    /// The person wants to close the window. The viewer keeps it open: the
+    /// application is asked, and may have a question first.
+    Close,
     /// It cannot go on; it ends after this.
     Error { message: String },
 }
@@ -340,18 +383,28 @@ mod tests {
             kind: StreamKind::AppWindow,
             state: SessionState::Starting,
             revision: 1,
+            attachment: 1,
             display: None,
             answer: None,
             end: None,
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
-            r#"{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"starting","revision":1,"display":null,"answer":null,"end":null}"#
+            r#"{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"starting","revision":1,"attachment":1,"display":null,"answer":null,"end":null}"#
+        );
+
+        // Nobody is shown it: the application runs on.
+        info.state = SessionState::Detached;
+        info.revision = 3;
+        info.display = Some(mode());
+        assert_eq!(
+            serde_json::to_string(&info).unwrap(),
+            r#"{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"detached","revision":3,"attachment":1,"display":{"width":1720,"height":720,"fps":85},"answer":null,"end":null}"#
         );
 
         info.state = SessionState::Stopping;
-        info.revision = 3;
-        info.display = Some(mode());
+        info.revision = 5;
+        info.attachment = 2;
         info.answer = Some(json!({"key_request_port": 50005}));
         info.end = Some(SessionEnd {
             reason: EndReason::Stopped,
@@ -360,7 +413,7 @@ mod tests {
         let text = serde_json::to_string(&info).unwrap();
         assert_eq!(
             text,
-            r#"{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"stopping","revision":3,"display":{"width":1720,"height":720,"fps":85},"answer":{"key_request_port":50005},"end":{"reason":"stopped","message":""}}"#
+            r#"{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"stopping","revision":5,"attachment":2,"display":{"width":1720,"height":720,"fps":85},"answer":{"key_request_port":50005},"end":{"reason":"stopped","message":""}}"#
         );
         assert_eq!(serde_json::from_str::<SessionInfo>(&text).unwrap(), info);
     }
@@ -372,6 +425,7 @@ mod tests {
         let text = r#"{"id":"5b0c9e3a7f21d684","app":"a","kind":"app_window","state":"suspended","revision":7,"end":{"reason":"host_asleep"},"owner":"1a2b"}"#;
         let info: SessionInfo = serde_json::from_str(text).unwrap();
         assert_eq!(info.state, SessionState::Unknown);
+        assert_eq!(info.attachment, 0);
         assert_eq!(info.display, None);
         assert_eq!(info.answer, None);
         let end = info.end.unwrap();
@@ -418,6 +472,55 @@ mod tests {
         assert_eq!(
             encode_line(&RunnerEvent::Empty),
             r#"{"v":1,"event":"empty"}"#
+        );
+        // A client comes back: the runner is told, and answers.
+        let attach = RunnerCommand::Attach {
+            peer: SessionPeer {
+                id: "1a2b-3c4d-5e6f-7a8b".to_string(),
+                address: "192.0.2.10".to_string(),
+            },
+            display: DisplayMode {
+                width: 1280,
+                height: 720,
+                fps: 60,
+            },
+            offer: json!({"rtp_port": 50010}),
+        };
+        assert_eq!(
+            encode_line(&attach),
+            r#"{"v":1,"cmd":"attach","peer":{"id":"1a2b-3c4d-5e6f-7a8b","address":"192.0.2.10"},"display":{"width":1280,"height":720,"fps":60},"offer":{"rtp_port":50010}}"#
+        );
+        assert_eq!(
+            decode_line::<RunnerEvent>(
+                r#"{"v":1,"event":"attached","display":{"width":1280,"height":720,"fps":60},"answer":{"key_request_port":50011}}"#
+            ),
+            Some(RunnerEvent::Attached {
+                display: DisplayMode {
+                    width: 1280,
+                    height: 720,
+                    fps: 60
+                },
+                answer: json!({"key_request_port": 50011}),
+            })
+        );
+        assert_eq!(
+            decode_line::<RunnerEvent>(r#"{"v":1,"event":"detached"}"#),
+            Some(RunnerEvent::Detached {
+                message: String::new()
+            })
+        );
+        // Leaving, and asking the application to close, need no more words.
+        assert_eq!(
+            encode_line(&RunnerCommand::Application { pid: 4711 }),
+            r#"{"v":1,"cmd":"application","pid":4711}"#
+        );
+        assert_eq!(
+            encode_line(&RunnerCommand::Detach),
+            r#"{"v":1,"cmd":"detach"}"#
+        );
+        assert_eq!(
+            encode_line(&RunnerCommand::Close),
+            r#"{"v":1,"cmd":"close"}"#
         );
         assert_eq!(
             encode_line(&RunnerEvent::Error {
@@ -504,6 +607,10 @@ mod tests {
         assert_eq!(
             encode_line(&ViewerEvent::Shown),
             r#"{"v":1,"event":"shown"}"#
+        );
+        assert_eq!(
+            decode_line::<ViewerEvent>(r#"{"v":1,"event":"close"}"#),
+            Some(ViewerEvent::Close)
         );
     }
 

@@ -9,8 +9,12 @@
 # wished for (1280x720 at 60 frames a second where nothing was), reads `show`, says `shown`,
 # and ends when its standard input is closed.
 #
-#   ISTESSO_FAKE_VIEWER_CLOSE_AFTER=<seconds>  end that long after `show`, the way a viewer
-#                                              does whose window the person closed
+#   ISTESSO_FAKE_VIEWER_CLOSE_AFTER=<seconds>  say `close` that long after `show`, the way a
+#                                              viewer does when the person clicks the window's
+#                                              close button. The window stays: the application
+#                                              is asked, and may have a question first
+#   ISTESSO_FAKE_VIEWER_QUIT_AFTER=<seconds>   end that long after `show`, the way a viewer does
+#                                              that the person quits
 set -u
 
 IFS= read -r prepare || exit 1
@@ -31,12 +35,22 @@ address=$(printf '%s' "$show" | sed -n 's/.*"host":{[^}]*"address":"\([^"]*\)".*
 echo "fake viewer: showing session $session, picture $display from $address" >&2
 echo '{"v":1,"event":"shown"}'
 
-if [ -n "${ISTESSO_FAKE_VIEWER_CLOSE_AFTER:-}" ]; then
-    sleep "$ISTESSO_FAKE_VIEWER_CLOSE_AFTER"
-    echo "fake viewer: the window was closed" >&2
+if [ -n "${ISTESSO_FAKE_VIEWER_QUIT_AFTER:-}" ]; then
+    sleep "$ISTESSO_FAKE_VIEWER_QUIT_AFTER"
+    echo "fake viewer: the person quits the viewer" >&2
     exit 0
+fi
+closer=
+if [ -n "${ISTESSO_FAKE_VIEWER_CLOSE_AFTER:-}" ]; then
+    (
+        sleep "$ISTESSO_FAKE_VIEWER_CLOSE_AFTER"
+        echo "fake viewer: the person closes the window" >&2
+        echo '{"v":1,"event":"close"}'
+    ) &
+    closer=$!
 fi
 
 # Until the command closes the input: that is how a viewer is told to close its window.
 cat > /dev/null
-echo "fake viewer: asked to close" >&2
+[ -n "$closer" ] && kill "$closer" 2>/dev/null
+echo "fake viewer: asked to close its window" >&2

@@ -4,11 +4,16 @@
 //! This is the host's side of the control plane. A paired device asks for an
 //! application by its id; the agent starts the program that makes the
 //! picture (the *runner*, which belongs to the media path), then the
-//! application inside the runner's display, follows both, and ends both
-//! together. How the picture and the input travel is not known here.
+//! application inside the runner's display, and follows both.
 //!
-//! * [`Sessions`] is the table: it answers the three session requests and
-//!   keeps one supervising thread per session.
+//! A session lasts until its application ends or its owner ends it. Whether
+//! a client is shown it has nothing to do with that: a client that goes
+//! away is *detached*, the picture stops, and the application runs on until
+//! a client attaches again. How the picture and the input travel is not
+//! known here.
+//!
+//! * [`Sessions`] is the table: it answers the session requests and keeps
+//!   one supervising thread per session.
 //! * [`Runner`] and [`Launcher`] are the two things a session is made of.
 //!   The real ones start processes ([`CommandRunner`], [`DesktopLauncher`]);
 //!   tests put their own in.
@@ -18,6 +23,8 @@ pub mod client;
 mod process;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -39,23 +46,30 @@ use crate::serve::Log;
 
 pub use process::{app_environment, CommandRunner, DesktopLauncher};
 
-/// The rules of this first slice that are still open with the person who
-/// uses it (ADR 0010, "決めてほしいこと"). Each is written down here and
-/// nowhere else.
+/// The rules a person decided, or has yet to decide (ADR 0010). Each is
+/// written down here and nowhere else.
 pub mod policy {
     use std::time::Duration;
 
-    use istesso_pair::Permission;
+    use istesso_pair::{Peer, Permission};
 
-    /// What a device needs to start an application on this host: to look
-    /// and to control. A newly paired device has both, so it may.
+    /// What a device needs to start an application on this host, and to be
+    /// shown one: to look and to control. A newly paired device has both.
     pub const START_NEEDS: [Permission; 2] = [Permission::View, Permission::Control];
 
-    /// A client that has not asked about its session for this long is
-    /// gone, and the session is stopped, application and all. A client
-    /// gives a host that does not answer the same time before it closes
-    /// its window. (R-03 wants the application to stay; see the ADR.)
+    /// A client that is shown a session and has not asked about it for this
+    /// long is gone: the picture stops going to it. The application runs
+    /// on. A client gives a host that does not answer the same time before
+    /// it closes its window.
     pub const CLIENT_LOST_AFTER: Duration = Duration::from_secs(15);
+
+    /// Whether `peer` may see, attach to and stop a session that the device
+    /// with this id and key started. For now only that device itself; the
+    /// question whether every paired device of the same person may is open
+    /// (ADR 0010, "決めてほしいこと").
+    pub fn may_use(owner_id: &str, owner_key: &str, peer: &Peer) -> bool {
+        owner_id == peer.id && owner_key == peer.public_key
+    }
 }
 
 /// The largest `offer` or `answer` that is carried, as JSON text.
@@ -68,7 +82,10 @@ pub struct Rules {
     pub client_lost_after: Duration,
     /// How long a runner may take to say that it is ready.
     pub runner_ready_within: Duration,
-    /// How long an application gets to end after it was asked to.
+    /// How long a runner may take to answer an `attach`.
+    pub attach_within: Duration,
+    /// How long an application that is ended by force gets to end by
+    /// itself.
     pub app_stop_grace: Duration,
     /// How long a runner gets to end after its input was closed, and again
     /// after it was told to.
@@ -79,7 +96,7 @@ pub struct Rules {
     /// The longest an answer to `session_wait` is held back. Shorter than
     /// the agent waits for a caller's next message.
     pub wait_at_most: Duration,
-    /// Sessions that may run at the same time.
+    /// Sessions that may run at the same time, shown to someone or not.
     pub max_sessions: usize,
     /// How often a session is looked after.
     pub tick: Duration,
@@ -92,6 +109,7 @@ impl Default for Rules {
         Rules {
             client_lost_after: policy::CLIENT_LOST_AFTER,
             runner_ready_within: Duration::from_secs(15),
+            attach_within: Duration::from_secs(10),
             app_stop_grace: Duration::from_secs(3),
             runner_stop_grace: Duration::from_secs(2),
             remember_ended_for: Duration::from_secs(60),
@@ -122,10 +140,13 @@ pub enum StreamEvent {
     Exited(String),
 }
 
-/// The host's side of one stream, starting or running.
+/// The host's side of one stream, from its start to the end of the session.
 pub trait RunningStream: Send {
     /// The next thing it did, without waiting.
     fn poll(&mut self) -> Option<StreamEvent>;
+    /// Tells it what comes after the start: a client attaches, the client
+    /// is gone, the application should close.
+    fn tell(&mut self, command: &RunnerCommand) -> Result<(), String>;
     /// Ends it: the agreed way first, by force when that takes longer than
     /// `grace`.
     fn stop(&mut self, grace: Duration);
@@ -146,9 +167,14 @@ pub trait Launcher: Send + Sync {
 
 /// An application that was started for a session.
 pub trait RunningApp: Send {
+    /// The process that was started, where there is one.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
     /// `Some` once it has ended by itself, with how.
     fn poll(&mut self) -> Option<String>;
-    /// Asks it to end, and ends it when that takes longer than `grace`.
+    /// Ends it: tells it to end, and makes it when that takes longer than
+    /// `grace`.
     fn stop(&mut self, grace: Duration);
 }
 
@@ -168,34 +194,59 @@ struct Inner {
     runner: Option<Arc<dyn Runner>>,
     launcher: Arc<dyn Launcher>,
     rules: Rules,
-    table: Mutex<HashMap<String, Entry>>,
-    /// Signalled whenever a session changes or is asked to stop.
+    table: Mutex<Table>,
+    /// Signalled whenever a session changes or is asked to do something.
     changed: Condvar,
+}
+
+#[derive(Default)]
+struct Table {
+    sessions: HashMap<String, Entry>,
+    /// How many sessions were started, to list them in that order.
+    started: u64,
 }
 
 struct Entry {
     info: SessionInfo,
+    app_name: String,
     owner: Owner,
-    /// When the owner last asked about the session.
+    number: u64,
+    /// When the client that is shown the session last asked about it.
     seen: Instant,
-    /// Questions of the owner that are being held back right now.
+    /// Questions of that client that are being held back right now.
     waiting: usize,
-    /// The owner asked for the session to stop.
-    stop: bool,
+    /// What the supervisor is to do next.
+    orders: Orders,
+    /// How the `attach` orders went, by their number, until the device that
+    /// gave them has been told.
+    attached: Vec<(u64, Result<(), String>)>,
     ended_at: Option<Instant>,
 }
 
-/// The device that started a session. Nobody else may ask about it.
+/// The device that started a session.
 #[derive(Clone)]
 struct Owner {
     id: String,
     public_key: String,
 }
 
-impl Owner {
-    fn is(&self, peer: &Peer) -> bool {
-        self.id == peer.id && self.public_key == peer.public_key
-    }
+#[derive(Default)]
+struct Orders {
+    /// End the application.
+    force: bool,
+    /// Ask the application to close.
+    close: bool,
+    /// The client that is shown the session leaves.
+    detach: bool,
+    /// Show the session to this client.
+    attach: Option<Attach>,
+}
+
+struct Attach {
+    number: u64,
+    peer: SessionPeer,
+    display: DisplayMode,
+    offer: serde_json::Value,
 }
 
 /// What a device asked for with `session_start`.
@@ -235,9 +286,35 @@ fn rights(paths: &Paths, id: &str, public_key: &str) -> Option<Vec<Permission>> 
         .map(|known| known.permissions.clone())
 }
 
-fn may_start(paths: &Paths, id: &str, public_key: &str) -> bool {
-    rights(paths, id, public_key)
-        .is_some_and(|rights| policy::START_NEEDS.iter().all(|need| rights.contains(need)))
+fn may_start(rights: &[Permission]) -> bool {
+    policy::START_NEEDS.iter().all(|need| rights.contains(need))
+}
+
+fn fits(media: &serde_json::Value) -> bool {
+    serde_json::to_vec(media).is_ok_and(|text| text.len() <= MAX_MEDIA_BYTES)
+}
+
+/// Why a picture of this size and rate cannot be asked for, if it cannot.
+fn unreasonable(display: DisplayMode) -> Option<String> {
+    let DisplayMode { width, height, fps } = display;
+    let sane = (16..=16384).contains(&width)
+        && (16..=16384).contains(&height)
+        && (1..=1000).contains(&fps);
+    (!sane)
+        .then(|| format!("a picture of {width}x{height} at {fps} frames a second cannot be made"))
+}
+
+/// True for the requests this table answers.
+pub fn is_session_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::SessionStart { .. }
+            | Request::SessionWait { .. }
+            | Request::SessionStop { .. }
+            | Request::SessionList
+            | Request::SessionAttach { .. }
+            | Request::SessionDetach { .. }
+    )
 }
 
 impl Sessions {
@@ -267,13 +344,13 @@ impl Sessions {
                 runner,
                 launcher,
                 rules,
-                table: Mutex::new(HashMap::new()),
+                table: Mutex::new(Table::default()),
                 changed: Condvar::new(),
             }),
         }
     }
 
-    /// Answers `session_start`, `session_wait` and `session_stop`.
+    /// Answers the session requests ([`is_session_request`]).
     ///
     /// `peer` is the device that asks, as its handshake proved it, and
     /// `remote` is where its connection comes from. `apps` lists this
@@ -285,7 +362,16 @@ impl Sessions {
         remote: SocketAddr,
         apps: impl FnOnce() -> Vec<AppEntry>,
     ) -> Response {
-        self.inner.forget_old();
+        let inner = &self.inner;
+        inner.forget_old();
+        // Looked up now, not when the conversation began: a conversation
+        // can stay open for as long as a window does.
+        let Some(rights) = rights(&inner.paths, &peer.id, &peer.public_key) else {
+            return refuse(
+                ErrorCode::Forbidden,
+                "this device is no longer paired with the host",
+            );
+        };
         match request {
             Request::SessionStart {
                 app,
@@ -293,6 +379,12 @@ impl Sessions {
                 display,
                 offer,
             } => {
+                if !may_start(&rights) {
+                    return refuse(
+                        ErrorCode::Forbidden,
+                        "this device may not start applications on the host",
+                    );
+                }
                 let asked = Asked {
                     app,
                     kind: *kind,
@@ -301,12 +393,31 @@ impl Sessions {
                 };
                 self.start(peer, remote, &asked, apps)
             }
+            Request::SessionAttach {
+                session,
+                display,
+                offer,
+            } => {
+                if !may_start(&rights) {
+                    return refuse(
+                        ErrorCode::Forbidden,
+                        "this device may not be shown applications of the host",
+                    );
+                }
+                self.attach(peer, remote, session, *display, offer)
+            }
             Request::SessionWait {
                 session,
                 after,
                 timeout_ms,
-            } => self.wait(peer, session, *after, *timeout_ms),
-            Request::SessionStop { session } => self.stop(peer, session),
+                attachment,
+            } => self.wait(peer, session, *after, *timeout_ms, *attachment),
+            Request::SessionDetach {
+                session,
+                attachment,
+            } => self.detach(peer, session, *attachment),
+            Request::SessionStop { session, force } => self.stop(peer, session, *force),
+            Request::SessionList => self.list(peer),
             _ => refuse(ErrorCode::Unsupported, "not a question about a session"),
         }
     }
@@ -319,29 +430,14 @@ impl Sessions {
         apps: impl FnOnce() -> Vec<AppEntry>,
     ) -> Response {
         let inner = &self.inner;
-        // Looked up now, not when the conversation began: a conversation
-        // can stay open for a long time.
-        if !may_start(&inner.paths, &peer.id, &peer.public_key) {
-            return refuse(
-                ErrorCode::Forbidden,
-                "this device may not start applications on the host",
-            );
-        }
         if asked.kind != StreamKind::AppWindow {
             return refuse(
                 ErrorCode::Unavailable,
                 "only application windows can be shown so far",
             );
         }
-        let DisplayMode { width, height, fps } = asked.display;
-        let sane = (16..=16384).contains(&width)
-            && (16..=16384).contains(&height)
-            && (1..=1000).contains(&fps);
-        if !sane {
-            return refuse(
-                ErrorCode::Unavailable,
-                format!("a picture of {width}x{height} at {fps} frames a second cannot be made"),
-            );
+        if let Some(why) = unreasonable(asked.display) {
+            return refuse(ErrorCode::Unavailable, why);
         }
         if !fits(asked.offer) {
             return refuse(
@@ -372,30 +468,59 @@ impl Sessions {
             kind: asked.kind,
             state: SessionState::Starting,
             revision: 1,
+            // The device that starts a session is the first to be shown it.
+            attachment: 1,
             display: None,
             answer: None,
             end: None,
         };
         {
             let mut table = inner.lock();
-            let live = table.values().filter(|e| e.ended_at.is_none()).count();
+            let live = table
+                .sessions
+                .values()
+                .filter(|e| e.ended_at.is_none())
+                .count();
             if live >= inner.rules.max_sessions {
+                // Nothing is ended to make room. The device is told which
+                // of its own sessions nobody is shown, so that a person can
+                // decide.
+                let mut idle: Vec<&Entry> = table
+                    .sessions
+                    .values()
+                    .filter(|e| e.info.state == SessionState::Detached && e.is_for(peer))
+                    .collect();
+                idle.sort_by_key(|e| e.number);
+                let idle: Vec<String> = idle
+                    .iter()
+                    .map(|e| format!("{} ({})", e.app_name, e.info.id))
+                    .collect();
+                let hint = if idle.is_empty() {
+                    String::new()
+                } else {
+                    format!("; of yours, nobody is shown: {}", idle.join(", "))
+                };
                 return refuse(
                     ErrorCode::Unavailable,
-                    format!("this host already runs {live} sessions, as many as it takes"),
+                    format!("this host already runs {live} sessions, as many as it takes{hint}"),
                 );
             }
-            table.insert(
+            table.started += 1;
+            let number = table.started;
+            table.sessions.insert(
                 id.0.clone(),
                 Entry {
                     info: info.clone(),
+                    app_name: app.name.clone(),
                     owner: Owner {
                         id: peer.id.clone(),
                         public_key: peer.public_key.clone(),
                     },
+                    number,
                     seen: Instant::now(),
                     waiting: 0,
-                    stop: false,
+                    orders: Orders::default(),
+                    attached: Vec::new(),
                     ended_at: None,
                 },
             );
@@ -414,11 +539,10 @@ impl Sessions {
                 session: info.id.clone(),
                 kind: asked.kind,
                 display: asked.display,
+                // Where the conversation comes from, not what the device
+                // says about itself: the picture is sent nowhere else.
                 peer: SessionPeer {
                     id: peer.id.clone(),
-                    // Where the conversation comes from, not what the
-                    // device says about itself: the picture is sent
-                    // nowhere else.
                     address: address_text(&remote),
                 },
                 input_socket: input_socket.to_string_lossy().into_owned(),
@@ -431,53 +555,199 @@ impl Sessions {
         report(&info)
     }
 
-    fn wait(&self, peer: &Peer, session: &SessionId, after: u64, timeout_ms: u32) -> Response {
+    fn list(&self, peer: &Peer) -> Response {
+        let table = self.inner.lock();
+        let mut mine: Vec<&Entry> = table
+            .sessions
+            .values()
+            .filter(|e| e.ended_at.is_none() && e.is_for(peer))
+            .collect();
+        mine.sort_by_key(|e| e.number);
+        Response::Sessions {
+            sessions: mine.into_iter().map(|e| e.info.clone()).collect(),
+        }
+    }
+
+    fn wait(
+        &self,
+        peer: &Peer,
+        session: &SessionId,
+        after: u64,
+        timeout_ms: u32,
+        attachment: u64,
+    ) -> Response {
         let inner = &self.inner;
         let hold = Duration::from_millis(timeout_ms.into()).min(inner.rules.wait_at_most);
         let deadline = Instant::now() + hold;
         let mut table = inner.lock();
         loop {
-            let Some(entry) = owned(&mut table, session, peer) else {
+            let Some(entry) = table.owned(session, peer) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
-            entry.seen = Instant::now();
+            // Only the client that is shown the session speaks for it: a
+            // question from anywhere else does not keep the picture going.
+            let shown = attachment != 0 && attachment == entry.info.attachment;
+            if shown {
+                entry.seen = Instant::now();
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if entry.info.revision > after || left.is_zero() {
                 return report(&entry.info);
             }
-            entry.waiting += 1;
+            if shown {
+                entry.waiting += 1;
+            }
             table = inner
                 .changed
                 .wait_timeout(table, left)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
-            if let Some(entry) = table.get_mut(&session.0) {
-                entry.waiting -= 1;
+            if shown {
+                if let Some(entry) = table.sessions.get_mut(&session.0) {
+                    entry.waiting = entry.waiting.saturating_sub(1);
+                }
             }
         }
     }
 
-    fn stop(&self, peer: &Peer, session: &SessionId) -> Response {
+    /// Shows a session that runs to the caller. Answered when the runner
+    /// sends the picture there, or when it is clear that it will not: the
+    /// session goes on either way.
+    fn attach(
+        &self,
+        peer: &Peer,
+        remote: SocketAddr,
+        session: &SessionId,
+        display: DisplayMode,
+        offer: &serde_json::Value,
+    ) -> Response {
         let inner = &self.inner;
-        // The answer says `stopping` or `ended`; the supervisor gets there
-        // within a tick.
+        if let Some(why) = unreasonable(display) {
+            return refuse(ErrorCode::Unavailable, why);
+        }
+        if !fits(offer) {
+            return refuse(
+                ErrorCode::Unavailable,
+                "the offer of the media path is larger than 64 KiB",
+            );
+        }
+        let number = OsRng.next_u64();
+        // A little longer than the runner is given, so that the supervisor
+        // is the one that gives up.
+        let deadline = Instant::now() + inner.rules.attach_within + inner.rules.tick * 20;
+        let mut table = inner.lock();
+        {
+            let Some(entry) = table.owned(session, peer) else {
+                return refuse(ErrorCode::NotFound, "no such session");
+            };
+            match entry.info.state {
+                SessionState::Running | SessionState::Detached => {}
+                SessionState::Starting => {
+                    return refuse(ErrorCode::Unavailable, "the session is still starting")
+                }
+                _ => return refuse(ErrorCode::Unavailable, "the session is ending"),
+            }
+            entry.orders.attach = Some(Attach {
+                number,
+                peer: SessionPeer {
+                    id: peer.id.clone(),
+                    address: address_text(&remote),
+                },
+                display,
+                offer: offer.clone(),
+            });
+        }
+        inner.changed.notify_all();
+        loop {
+            let Some(entry) = table.owned(session, peer) else {
+                return refuse(ErrorCode::NotFound, "no such session");
+            };
+            if let Some(at) = entry.attached.iter().position(|(n, _)| *n == number) {
+                return match entry.attached.swap_remove(at).1 {
+                    Ok(()) => report(&entry.info),
+                    Err(why) => refuse(ErrorCode::Unavailable, why),
+                };
+            }
+            if entry.ended_at.is_some() || entry.info.state == SessionState::Stopping {
+                return refuse(
+                    ErrorCode::Unavailable,
+                    "the session ended before it could be shown",
+                );
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return refuse(
+                    ErrorCode::Unavailable,
+                    "the host's side of the stream did not answer",
+                );
+            }
+            table = inner
+                .changed
+                .wait_timeout(table, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    fn detach(&self, peer: &Peer, session: &SessionId, attachment: u64) -> Response {
+        let inner = &self.inner;
         let deadline = Instant::now() + inner.rules.tick * 10;
         let mut table = inner.lock();
         loop {
-            let Some(entry) = owned(&mut table, session, peer) else {
+            let Some(entry) = table.owned(session, peer) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
-            entry.seen = Instant::now();
-            entry.stop = true;
-            inner.changed.notify_all();
+            // A window that has been replaced has nothing to leave any more.
+            let shown = attachment == entry.info.attachment
+                && matches!(
+                    entry.info.state,
+                    SessionState::Starting | SessionState::Running
+                );
+            if shown {
+                entry.orders.detach = true;
+                inner.changed.notify_all();
+            }
             let left = deadline.saturating_duration_since(Instant::now());
-            let stopping = matches!(
+            // A session that is still starting leaves as soon as it runs;
+            // there is nothing to wait for now.
+            if !shown || entry.info.state == SessionState::Starting || left.is_zero() {
+                return report(&entry.info);
+            }
+            table = inner
+                .changed
+                .wait_timeout(table, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    fn stop(&self, peer: &Peer, session: &SessionId, force: bool) -> Response {
+        let inner = &self.inner;
+        let deadline = Instant::now() + inner.rules.tick * 10;
+        let mut table = inner.lock();
+        loop {
+            let Some(entry) = table.owned(session, peer) else {
+                return refuse(ErrorCode::NotFound, "no such session");
+            };
+            let over = matches!(
                 entry.info.state,
                 SessionState::Stopping | SessionState::Ended
             );
-            if stopping || left.is_zero() {
+            if !force {
+                // Asking is all that is done. What the application makes of
+                // it shows in the session's state, later or never.
+                if !over {
+                    entry.orders.close = true;
+                    inner.changed.notify_all();
+                }
                 return report(&entry.info);
             }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if over || left.is_zero() {
+                return report(&entry.info);
+            }
+            entry.orders.force = true;
+            inner.changed.notify_all();
             table = inner
                 .changed
                 .wait_timeout(table, left)
@@ -489,25 +759,31 @@ impl Sessions {
     /// The report of a session, whoever asks. For tests.
     #[cfg(test)]
     pub(crate) fn look(&self, session: &SessionId) -> Option<SessionInfo> {
-        self.inner.lock().get(&session.0).map(|e| e.info.clone())
+        self.inner
+            .lock()
+            .sessions
+            .get(&session.0)
+            .map(|e| e.info.clone())
     }
 }
 
-/// The session `session`, when it is one of `peer`'s. Somebody else's
-/// session is not there for `peer`, like one that never was.
-fn owned<'a>(
-    table: &'a mut HashMap<String, Entry>,
-    session: &SessionId,
-    peer: &Peer,
-) -> Option<&'a mut Entry> {
-    if !session.is_well_formed() {
-        return None;
+impl Entry {
+    fn is_for(&self, peer: &Peer) -> bool {
+        policy::may_use(&self.owner.id, &self.owner.public_key, peer)
     }
-    table.get_mut(&session.0).filter(|e| e.owner.is(peer))
 }
 
-fn fits(media: &serde_json::Value) -> bool {
-    serde_json::to_vec(media).is_ok_and(|text| text.len() <= MAX_MEDIA_BYTES)
+impl Table {
+    /// The session `session`, when `peer` may use it. A session that is not
+    /// for `peer` is not there for it, like one that never was.
+    fn owned(&mut self, session: &SessionId, peer: &Peer) -> Option<&mut Entry> {
+        if !session.is_well_formed() {
+            return None;
+        }
+        self.sessions
+            .get_mut(&session.0)
+            .filter(|entry| entry.is_for(peer))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,21 +800,33 @@ struct Job {
     input_socket: std::path::PathBuf,
 }
 
+/// What the supervisor found to do in one round.
+#[derive(Default)]
+struct Round {
+    force: bool,
+    close: bool,
+    attach: Option<Attach>,
+    /// The client that is shown the session is to be left, and why.
+    leave: Option<String>,
+}
+
 impl Inner {
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
+    fn lock(&self) -> MutexGuard<'_, Table> {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn forget_old(&self) {
         let keep = self.rules.remember_ended_for;
         self.lock()
-            .retain(|_, e| e.waiting > 0 || e.ended_at.is_none_or(|at| at.elapsed() < keep));
+            .sessions
+            .retain(|_, e| e.ended_at.is_none_or(|at| at.elapsed() < keep));
     }
 
-    /// Changes the report of a session and wakes everyone who waits for it.
-    fn update(&self, id: &SessionId, change: impl FnOnce(&mut SessionInfo)) {
-        if let Some(entry) = self.lock().get_mut(&id.0) {
-            change(&mut entry.info);
+    /// Changes a session and wakes everyone who waits for it. The report's
+    /// revision goes up.
+    fn update(&self, id: &SessionId, change: impl FnOnce(&mut Entry)) {
+        if let Some(entry) = self.lock().sessions.get_mut(&id.0) {
+            change(entry);
             entry.info.revision += 1;
             if entry.info.state == SessionState::Ended {
                 entry.ended_at = Some(Instant::now());
@@ -547,37 +835,69 @@ impl Inner {
         self.changed.notify_all();
     }
 
-    /// Why the session has to stop now, if it has to: its owner asked for
-    /// it, went away, or is no longer allowed.
-    fn must_stop(&self, id: &SessionId, rights_read: &mut Instant) -> Option<SessionEnd> {
-        let owner = {
-            let table = self.lock();
-            let entry = table.get(&id.0)?;
-            if entry.stop {
-                return Some(ending(EndReason::Stopped, ""));
-            }
-            let lost_after = self.rules.client_lost_after;
-            if entry.waiting == 0 && entry.seen.elapsed() > lost_after {
-                return Some(ending(
-                    EndReason::ClientLost,
-                    format!(
-                        "the device that showed it has not asked about it for {} seconds",
+    /// Nobody is shown the session any more. The application runs on.
+    fn detached(&self, id: &SessionId, why: &str) {
+        self.update(id, |entry| {
+            entry.info.state = SessionState::Detached;
+            entry.info.answer = None;
+        });
+        (self.log)(format!("session {id}: nobody is shown it now ({why})"));
+    }
+
+    /// Tells the device that gave attach order `number` how it went.
+    fn attach_went(&self, id: &SessionId, number: u64, outcome: Result<(), String>) {
+        if let Some(entry) = self.lock().sessions.get_mut(&id.0) {
+            entry.attached.push((number, outcome));
+        }
+        self.changed.notify_all();
+    }
+
+    /// Takes what the session's owner asked for since the last round, and
+    /// looks whether the client that is shown the session is still there
+    /// and still allowed. `attaching` is set while a client is being
+    /// attached: the one before it no longer counts.
+    fn round(&self, id: &SessionId, rights_read: &mut Option<Instant>, attaching: bool) -> Round {
+        let mut round = Round::default();
+        let (owner, shown) = {
+            let mut table = self.lock();
+            let Some(entry) = table.sessions.get_mut(&id.0) else {
+                return round;
+            };
+            let orders = std::mem::take(&mut entry.orders);
+            round.force = orders.force;
+            round.close = orders.close;
+            round.attach = orders.attach;
+            let shown = matches!(
+                entry.info.state,
+                SessionState::Starting | SessionState::Running
+            ) && !attaching
+                && round.attach.is_none();
+            if shown {
+                let lost_after = self.rules.client_lost_after;
+                if orders.detach {
+                    round.leave = Some("its client left".to_string());
+                } else if entry.waiting == 0 && entry.seen.elapsed() > lost_after {
+                    round.leave = Some(format!(
+                        "its client has not asked about it for {} seconds",
                         lost_after.as_secs_f32()
-                    ),
-                ));
+                    ));
+                }
             }
-            entry.owner.clone()
+            (entry.owner.clone(), shown)
         };
-        if rights_read.elapsed() >= self.rules.recheck_rights_every {
-            *rights_read = Instant::now();
-            if !may_start(&self.paths, &owner.id, &owner.public_key) {
-                return Some(ending(
-                    EndReason::Revoked,
-                    "the device is no longer allowed to start applications on this host",
-                ));
+        // A pairing that is removed, or a right that is taken away, stops
+        // the picture soon. It does not end the application.
+        let due = rights_read.is_none_or(|at| at.elapsed() >= self.rules.recheck_rights_every);
+        if shown && round.leave.is_none() && due {
+            *rights_read = Some(Instant::now());
+            let allowed = rights(&self.paths, &owner.id, &owner.public_key)
+                .is_some_and(|rights| may_start(&rights));
+            if !allowed {
+                round.leave =
+                    Some("its device is no longer allowed to be shown applications".to_string());
             }
         }
-        None
+        round
     }
 
     /// Rests for one tick, or until something changes.
@@ -593,7 +913,7 @@ impl Inner {
         let id = &job.id;
         let mut stream: Option<Box<dyn RunningStream>> = None;
         let mut app: Option<Box<dyn RunningApp>> = None;
-        let mut rights_read = Instant::now();
+        let mut rights_read: Option<Instant> = None;
 
         let end = 'session: {
             // The host's side of the stream comes first: it makes the
@@ -606,6 +926,8 @@ impl Inner {
                 Err(why) => break 'session ending(EndReason::StreamFailed, why),
             };
             let asked = Instant::now();
+            // The client may leave before there is anything to show.
+            let mut left_early: Option<String> = None;
             let (env, display, answer) = loop {
                 match running.poll() {
                     Some(StreamEvent::Said(RunnerEvent::Ready {
@@ -617,28 +939,26 @@ impl Inner {
                         break 'session ending(EndReason::StreamFailed, message)
                     }
                     Some(StreamEvent::Exited(how)) => {
-                        break 'session ending(
-                            EndReason::StreamFailed,
-                            format!(
-                                "the host's side of the stream ended before it was ready ({how})"
-                            ),
-                        )
+                        let why = format!(
+                            "the host's side of the stream ended before it was ready ({how})"
+                        );
+                        break 'session ending(EndReason::StreamFailed, why);
                     }
-                    Some(StreamEvent::Said(RunnerEvent::Empty)) => continue,
+                    Some(StreamEvent::Said(_)) => continue,
                     None => {}
                 }
                 if asked.elapsed() > rules.runner_ready_within {
-                    break 'session ending(
-                        EndReason::StreamFailed,
-                        format!(
-                            "the host's side of the stream was not ready within {} seconds",
-                            rules.runner_ready_within.as_secs_f32()
-                        ),
+                    let why = format!(
+                        "the host's side of the stream was not ready within {} seconds",
+                        rules.runner_ready_within.as_secs_f32()
                     );
+                    break 'session ending(EndReason::StreamFailed, why);
                 }
-                if let Some(end) = self.must_stop(id, &mut rights_read) {
-                    break 'session end;
+                let round = self.round(id, &mut rights_read, false);
+                if round.force {
+                    break 'session ending(EndReason::Stopped, "");
                 }
+                left_early = left_early.or(round.leave);
                 self.pause();
             };
             if !fits(&answer) {
@@ -652,25 +972,32 @@ impl Inner {
             let application = match self.launcher.launch(&job.plan, &env) {
                 Ok(application) => app.insert(application),
                 Err(why) => {
-                    break 'session ending(
-                        EndReason::AppFailed,
-                        format!("the application could not be started ({why})"),
-                    )
+                    let why = format!("the application could not be started ({why})");
+                    break 'session ending(EndReason::AppFailed, why);
                 }
             };
-            self.update(id, |info| {
-                info.state = SessionState::Running;
-                info.display = Some(display);
-                info.answer = Some(answer);
+            self.update(id, |entry| {
+                entry.info.state = SessionState::Running;
+                entry.info.display = Some(display);
+                entry.info.answer = Some(answer);
+                entry.seen = Instant::now();
             });
             (self.log)(format!("session {id}: {} is running", job.app_name));
+            if let Some(pid) = application.pid() {
+                let _ = running.tell(&RunnerCommand::Application { pid });
+            }
+            if let Some(why) = left_early {
+                let _ = running.tell(&RunnerCommand::Detach);
+                self.detached(id, &why);
+            }
 
+            // The attach order that the runner has been told and has not
+            // answered yet, and since when.
+            let mut attaching: Option<(u64, Instant)> = None;
             loop {
                 if let Some(how) = application.poll() {
-                    break 'session ending(
-                        EndReason::AppExited,
-                        format!("the application ended ({how})"),
-                    );
+                    let why = format!("the application ended ({how})");
+                    break 'session ending(EndReason::AppExited, why);
                 }
                 match running.poll() {
                     Some(StreamEvent::Said(RunnerEvent::Empty)) => {
@@ -683,24 +1010,96 @@ impl Inner {
                         break 'session ending(EndReason::StreamFailed, message)
                     }
                     Some(StreamEvent::Exited(how)) => {
-                        break 'session ending(
-                            EndReason::StreamFailed,
-                            format!("the host's side of the stream ended ({how})"),
-                        )
+                        let why = format!("the host's side of the stream ended ({how})");
+                        break 'session ending(EndReason::StreamFailed, why);
+                    }
+                    Some(StreamEvent::Said(RunnerEvent::Attached { display, answer })) => {
+                        let Some((number, _)) = attaching.take() else {
+                            continue;
+                        };
+                        if !fits(&answer) {
+                            let why = "the answer of the host's media path is larger than 64 KiB";
+                            let _ = running.tell(&RunnerCommand::Detach);
+                            self.detached(id, why);
+                            self.attach_went(id, number, Err(why.to_string()));
+                            continue;
+                        }
+                        self.update(id, |entry| {
+                            entry.info.state = SessionState::Running;
+                            entry.info.attachment += 1;
+                            entry.info.display = Some(display);
+                            entry.info.answer = Some(answer);
+                            entry.seen = Instant::now();
+                            entry.attached.push((number, Ok(())));
+                        });
+                        (self.log)(format!("session {id}: shown to a client again"));
+                        continue;
+                    }
+                    Some(StreamEvent::Said(RunnerEvent::Detached { message })) => {
+                        let why = if message.is_empty() {
+                            "the host's side of the stream sends to nobody".to_string()
+                        } else {
+                            message
+                        };
+                        self.detached(id, &why);
+                        if let Some((number, _)) = attaching.take() {
+                            self.attach_went(id, number, Err(why));
+                        }
+                        continue;
                     }
                     Some(StreamEvent::Said(RunnerEvent::Ready { .. })) => continue,
                     None => {}
                 }
-                if let Some(end) = self.must_stop(id, &mut rights_read) {
-                    break 'session end;
+                if let Some((number, since)) = attaching {
+                    if since.elapsed() > rules.attach_within {
+                        attaching = None;
+                        let why = format!(
+                            "the host's side of the stream did not take the client within {} seconds",
+                            rules.attach_within.as_secs_f32()
+                        );
+                        let _ = running.tell(&RunnerCommand::Detach);
+                        self.detached(id, &why);
+                        self.attach_went(id, number, Err(why));
+                    }
+                }
+
+                let round = self.round(id, &mut rights_read, attaching.is_some());
+                if round.force {
+                    break 'session ending(EndReason::Stopped, "");
+                }
+                if round.close {
+                    // Only the compositor can ask a window to close.
+                    (self.log)(format!("session {id}: asking {} to close", job.app_name));
+                    let _ = running.tell(&RunnerCommand::Close);
+                }
+                if let Some(attach) = round.attach {
+                    // A client that was still being attached has lost its
+                    // turn to this one.
+                    if let Some((before, _)) = attaching.take() {
+                        let why = "another window took the session".to_string();
+                        self.attach_went(id, before, Err(why));
+                    }
+                    let told = running.tell(&RunnerCommand::Attach {
+                        peer: attach.peer,
+                        display: attach.display,
+                        offer: attach.offer,
+                    });
+                    match told {
+                        Ok(()) => attaching = Some((attach.number, Instant::now())),
+                        Err(why) => self.attach_went(id, attach.number, Err(why)),
+                    }
+                } else if let Some(why) = round.leave {
+                    let _ = running.tell(&RunnerCommand::Detach);
+                    self.detached(id, &why);
                 }
                 self.pause();
             }
         };
 
-        self.update(id, |info| {
-            info.state = SessionState::Stopping;
-            info.end = Some(end.clone());
+        self.update(id, |entry| {
+            entry.info.state = SessionState::Stopping;
+            entry.info.answer = None;
+            entry.info.end = Some(end.clone());
         });
         // The application first: it can end while its display is still
         // there.
@@ -712,7 +1111,7 @@ impl Inner {
         }
         // The runner made the socket; it is of no use to anyone now.
         let _ = std::fs::remove_file(&job.input_socket);
-        self.update(id, |info| info.state = SessionState::Ended);
+        self.update(id, |entry| entry.info.state = SessionState::Ended);
         (self.log)(format!(
             "session {id}: {} ended: {:?}{}{}",
             job.app_name,
@@ -733,629 +1132,4 @@ fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(dir)
-}
-
-#[cfg(test)]
-mod tests {
-    use istesso_pair::{Hello, Identity};
-
-    use super::testing::{app, quick_rules, FakeLauncher, FakeRunner, Journal};
-    use super::*;
-    use crate::testing::TempDir;
-
-    const LAPTOP: &str = "192.0.2.10:50000";
-
-    /// A host with one paired device, a fake runner and a fake launcher.
-    struct Host {
-        _dir: TempDir,
-        paths: Paths,
-        sessions: Sessions,
-        journal: Journal,
-        runner: Arc<FakeRunner>,
-        launcher: Arc<FakeLauncher>,
-        laptop: Peer,
-    }
-
-    fn pair(paths: &Paths, name: &str, permissions: Vec<Permission>) -> Peer {
-        let mut peer = Peer::from_hello(&Hello {
-            device_name: name.to_string(),
-            public_key: Identity::generate().public_key(),
-        });
-        peer.permissions = permissions;
-        let mut store = PeerStore::open(paths.peers()).unwrap();
-        store.add(peer.clone()).unwrap();
-        peer
-    }
-
-    fn host_with(rules: Rules) -> Host {
-        let dir = TempDir::new("session");
-        let paths = dir.paths();
-        let journal = Journal::default();
-        let runner = Arc::new(FakeRunner::new(&journal));
-        let launcher = Arc::new(FakeLauncher::new(&journal));
-        let sessions = Sessions::with(
-            paths.clone(),
-            Arc::new(|_| {}),
-            Some(runner.clone()),
-            launcher.clone(),
-            rules,
-        );
-        let laptop = pair(&paths, "laptop", Permission::defaults());
-        Host {
-            _dir: dir,
-            paths,
-            sessions,
-            journal,
-            runner,
-            launcher,
-            laptop,
-        }
-    }
-
-    fn host() -> Host {
-        host_with(quick_rules())
-    }
-
-    fn mode() -> DisplayMode {
-        DisplayMode {
-            width: 1280,
-            height: 720,
-            fps: 60,
-        }
-    }
-
-    impl Host {
-        fn ask(&self, peer: &Peer, request: Request) -> Response {
-            self.sessions
-                .answer(&request, peer, LAPTOP.parse().unwrap(), || {
-                    vec![app("editor.desktop", "Editor")]
-                })
-        }
-
-        fn start_as(&self, peer: &Peer, app: &str) -> Response {
-            self.ask(
-                peer,
-                Request::SessionStart {
-                    app: app.to_string(),
-                    kind: StreamKind::AppWindow,
-                    display: mode(),
-                    offer: serde_json::json!({"port": 50004}),
-                },
-            )
-        }
-
-        /// Starts the editor for the laptop and returns the first report.
-        fn start(&self) -> SessionInfo {
-            session(self.start_as(&self.laptop, "editor.desktop"))
-        }
-
-        fn wait(&self, id: &SessionId, after: u64, timeout_ms: u32) -> Response {
-            self.ask(
-                &self.laptop,
-                Request::SessionWait {
-                    session: id.clone(),
-                    after,
-                    timeout_ms,
-                },
-            )
-        }
-
-        /// Asks until the session is in `state`, as a client does.
-        fn follow_until(&self, id: &SessionId, state: SessionState) -> SessionInfo {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut after = 0;
-            loop {
-                let info = session(self.wait(id, after, 200));
-                if info.state == state {
-                    return info;
-                }
-                assert!(Instant::now() < deadline, "still {:?}", info.state);
-                after = info.revision;
-            }
-        }
-
-        fn stop(&self, id: &SessionId) -> Response {
-            self.ask(
-                &self.laptop,
-                Request::SessionStop {
-                    session: id.clone(),
-                },
-            )
-        }
-    }
-
-    fn session(response: Response) -> SessionInfo {
-        match response {
-            Response::Session { session } => *session,
-            other => panic!("not a report: {other:?}"),
-        }
-    }
-
-    fn refusal(response: Response) -> (ErrorCode, String) {
-        match response {
-            Response::Error { code, message } => (code, message),
-            other => panic!("not a refusal: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_application_is_started_inside_the_runners_display() {
-        let host = host();
-        let started = host.start();
-        assert!(started.id.is_well_formed());
-        assert_eq!(started.app, "editor.desktop");
-        assert_eq!(started.state, SessionState::Starting);
-        assert_eq!(started.revision, 1);
-        assert_eq!(
-            (started.display, started.answer, started.end),
-            (None, None, None)
-        );
-
-        let running = host.follow_until(&started.id, SessionState::Running);
-        assert_eq!(running.revision, 2);
-        // What the runner said it produces, and its answer, are passed on.
-        assert_eq!(running.display, Some(host.runner.display()));
-        assert_eq!(running.answer, Some(serde_json::json!({"fake": "answer"})));
-        assert_eq!(running.end, None);
-
-        // The runner was told who the picture is for and where input comes
-        // from; the device's own word is not what the address is taken from.
-        match host.runner.started().pop().unwrap() {
-            RunnerCommand::Start {
-                session,
-                kind,
-                display,
-                peer,
-                input_socket,
-                offer,
-            } => {
-                assert_eq!(session, started.id);
-                assert_eq!(kind, StreamKind::AppWindow);
-                assert_eq!(display, mode());
-                assert_eq!(peer.id, host.laptop.id);
-                assert_eq!(peer.address, "192.0.2.10");
-                assert_eq!(offer, serde_json::json!({"port": 50004}));
-                let socket = std::path::PathBuf::from(input_socket);
-                assert_eq!(
-                    Some(socket.clone()),
-                    Some(host.paths.session_input_socket(&started.id))
-                );
-                assert_eq!(
-                    socket.file_name().unwrap().to_string_lossy(),
-                    format!("input-{}.sock", started.id)
-                );
-                // The place for it is there, and private.
-                let dir = socket.parent().unwrap();
-                assert!(dir.is_dir());
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = std::fs::metadata(dir).unwrap().permissions().mode();
-                    assert_eq!(mode & 0o777, 0o700);
-                }
-            }
-        }
-        // The application got the runner's environment, after the runner
-        // was ready.
-        assert_eq!(
-            host.journal.all(),
-            [
-                "runner start",
-                "app launch editor WAYLAND_DISPLAY=wayland-fake"
-            ]
-        );
-    }
-
-    #[test]
-    fn stopping_ends_the_application_before_the_stream() {
-        let host = host();
-        let id = host.start().id;
-        host.follow_until(&id, SessionState::Running);
-
-        let answer = session(host.stop(&id));
-        assert!(matches!(
-            answer.state,
-            SessionState::Stopping | SessionState::Ended
-        ));
-        assert_eq!(answer.end.as_ref().unwrap().reason, EndReason::Stopped);
-        let ended = host.follow_until(&id, SessionState::Ended);
-        assert_eq!(ended.end.unwrap().reason, EndReason::Stopped);
-        assert_eq!(host.journal.all()[2..], ["app stop", "runner stop"]);
-        // Asking again does no harm and says the same.
-        let again = session(host.stop(&id));
-        assert_eq!(again.state, SessionState::Ended);
-        assert_eq!(host.journal.all().len(), 4);
-    }
-
-    #[test]
-    fn an_application_that_ends_takes_its_session_with_it() {
-        let host = host();
-        let id = host.start().id;
-        let running = host.follow_until(&id, SessionState::Running);
-
-        // The client is waiting with a long timeout; the answer comes as
-        // soon as the application is gone, not when the time is up.
-        let waiter = {
-            let (sessions, laptop, id) = (host.sessions.clone(), host.laptop.clone(), id.clone());
-            std::thread::spawn(move || {
-                let asked = Instant::now();
-                let request = Request::SessionWait {
-                    session: id,
-                    after: running.revision,
-                    timeout_ms: 3000,
-                };
-                let answer = sessions.answer(&request, &laptop, LAPTOP.parse().unwrap(), Vec::new);
-                (session(answer), asked.elapsed())
-            })
-        };
-        std::thread::sleep(Duration::from_millis(100));
-        host.launcher.end_app("exit status 0");
-        let (info, took) = waiter.join().unwrap();
-        assert!(matches!(
-            info.state,
-            SessionState::Stopping | SessionState::Ended
-        ));
-        assert!(took < Duration::from_millis(1500), "{took:?}");
-
-        let ended = host.follow_until(&id, SessionState::Ended);
-        let end = ended.end.unwrap();
-        assert_eq!(end.reason, EndReason::AppExited);
-        assert_eq!(end.message, "the application ended (exit status 0)");
-        // Both are stopped in the usual order. For an application that is
-        // already gone there is nothing left to do.
-        assert_eq!(host.journal.all()[2..], ["app stop", "runner stop"]);
-    }
-
-    #[test]
-    fn a_stream_that_cannot_start_ends_the_session_before_any_application() {
-        // The runner refuses.
-        let host = host();
-        host.runner.refuse("no encoder on this machine");
-        let id = host.start().id;
-        let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
-        assert_eq!(end.reason, EndReason::StreamFailed);
-        assert_eq!(end.message, "no encoder on this machine");
-        assert!(host.journal.all().is_empty());
-
-        // The runner starts, says it cannot go on, and ends.
-        let host = self::host();
-        host.runner.instead_of_ready(vec![
-            StreamEvent::Said(RunnerEvent::Error {
-                message: "the GPU is busy".into(),
-            }),
-            StreamEvent::Exited("exit status 1".into()),
-        ]);
-        let id = host.start().id;
-        let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
-        assert_eq!(
-            (end.reason, end.message.as_str()),
-            (EndReason::StreamFailed, "the GPU is busy")
-        );
-        assert_eq!(host.journal.all(), ["runner start", "runner stop"]);
-
-        // The runner ends without a word.
-        let host = self::host();
-        host.runner
-            .instead_of_ready(vec![StreamEvent::Exited("signal 11".into())]);
-        let id = host.start().id;
-        let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
-        assert_eq!(end.reason, EndReason::StreamFailed);
-        assert!(
-            end.message.contains("before it was ready (signal 11)"),
-            "{}",
-            end.message
-        );
-
-        // The runner never says that it is ready.
-        let host = host_with(Rules {
-            runner_ready_within: Duration::from_millis(150),
-            ..quick_rules()
-        });
-        host.runner.instead_of_ready(Vec::new());
-        let id = host.start().id;
-        let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
-        assert_eq!(end.reason, EndReason::StreamFailed);
-        assert!(end.message.contains("not ready within"), "{}", end.message);
-        assert_eq!(host.journal.all(), ["runner start", "runner stop"]);
-    }
-
-    #[test]
-    fn a_stream_that_dies_ends_the_application() {
-        let host = host();
-        let id = host.start().id;
-        host.follow_until(&id, SessionState::Running);
-        host.runner.say(StreamEvent::Exited("signal 9".into()));
-        let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
-        assert_eq!(end.reason, EndReason::StreamFailed);
-        assert_eq!(
-            end.message,
-            "the host's side of the stream ended (signal 9)"
-        );
-        assert_eq!(host.journal.all()[2..], ["app stop", "runner stop"]);
-    }
-
-    #[test]
-    fn a_runner_can_say_that_the_last_window_closed() {
-        let host = host();
-        let id = host.start().id;
-        host.follow_until(&id, SessionState::Running);
-        host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
-        let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
-        assert_eq!(end.reason, EndReason::AppExited);
-        assert_eq!(host.journal.all()[2..], ["app stop", "runner stop"]);
-    }
-
-    #[test]
-    fn an_application_that_does_not_start_ends_the_stream() {
-        let host = host();
-        host.launcher.fail_launch("No such file or directory");
-        let id = host.start().id;
-        let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
-        assert_eq!(end.reason, EndReason::AppFailed);
-        assert_eq!(
-            end.message,
-            "the application could not be started (No such file or directory)"
-        );
-        assert_eq!(host.journal.all(), ["runner start", "runner stop"]);
-    }
-
-    #[test]
-    fn a_client_that_stops_asking_loses_its_session() {
-        let host = host_with(Rules {
-            client_lost_after: Duration::from_millis(400),
-            ..quick_rules()
-        });
-        let id = host.start().id;
-        // While the client keeps asking, nothing happens, however long.
-        let asked = Instant::now();
-        let mut after = 0;
-        while asked.elapsed() < Duration::from_millis(1200) {
-            let info = session(host.wait(&id, after, 150));
-            assert!(
-                matches!(info.state, SessionState::Starting | SessionState::Running),
-                "{:?}",
-                info.end
-            );
-            after = info.revision;
-        }
-        // It goes quiet.
-        std::thread::sleep(Duration::from_millis(900));
-        let info = session(host.wait(&id, 0, 0));
-        let end = info.end.expect("the session is being stopped");
-        assert_eq!(end.reason, EndReason::ClientLost);
-        host.follow_until(&id, SessionState::Ended);
-        assert_eq!(host.journal.all()[2..], ["app stop", "runner stop"]);
-    }
-
-    #[test]
-    fn taking_the_right_away_ends_a_running_session() {
-        let host = host();
-        let id = host.start().id;
-        host.follow_until(&id, SessionState::Running);
-
-        // The laptop may still look, but no longer control.
-        let mut record = host.laptop.clone();
-        record.permissions = vec![Permission::View];
-        PeerStore::open(host.paths.peers())
-            .unwrap()
-            .add(record)
-            .unwrap();
-        let ended = host.follow_until(&id, SessionState::Ended);
-        assert_eq!(ended.end.unwrap().reason, EndReason::Revoked);
-        assert_eq!(host.journal.all()[2..], ["app stop", "runner stop"]);
-        // And it cannot start another one.
-        let (code, _) = refusal(host.start_as(&host.laptop, "editor.desktop"));
-        assert_eq!(code, ErrorCode::Forbidden);
-    }
-
-    #[test]
-    fn removing_the_pairing_ends_a_running_session() {
-        let host = host();
-        let id = host.start().id;
-        host.follow_until(&id, SessionState::Running);
-        PeerStore::open(host.paths.peers())
-            .unwrap()
-            .remove(&host.laptop.id)
-            .unwrap();
-        let ended = host.follow_until(&id, SessionState::Ended);
-        assert_eq!(ended.end.unwrap().reason, EndReason::Revoked);
-    }
-
-    #[test]
-    fn a_session_is_only_there_for_the_device_that_started_it() {
-        let host = host();
-        let id = host.start().id;
-        host.follow_until(&id, SessionState::Running);
-
-        let tablet = pair(&host.paths, "tablet", Permission::defaults());
-        for request in [
-            Request::SessionWait {
-                session: id.clone(),
-                after: 0,
-                timeout_ms: 0,
-            },
-            Request::SessionStop {
-                session: id.clone(),
-            },
-        ] {
-            let (code, _) = refusal(host.ask(&tablet, request));
-            assert_eq!(code, ErrorCode::NotFound);
-        }
-        // A device that took over the name and the id, but not the key.
-        let mut impostor = host.laptop.clone();
-        impostor.public_key = "00".repeat(32);
-        let (code, _) = refusal(host.ask(
-            &impostor,
-            Request::SessionStop {
-                session: id.clone(),
-            },
-        ));
-        assert_eq!(code, ErrorCode::NotFound);
-        // The session is untouched.
-        assert_eq!(
-            host.sessions.look(&id).unwrap().state,
-            SessionState::Running
-        );
-
-        // Ids that are not ids, and ids of nothing.
-        for bad in [
-            "",
-            "../../etc/passwd",
-            "5B0C9E3A7F21D684",
-            "0000000000000000",
-        ] {
-            let (code, _) = refusal(host.wait(&SessionId(bad.to_string()), 0, 0));
-            assert_eq!(code, ErrorCode::NotFound, "{bad}");
-        }
-    }
-
-    #[test]
-    fn starting_is_refused_with_a_reason() {
-        let host = host();
-        // A device that may only look.
-        let viewer = pair(&host.paths, "kiosk", vec![Permission::View]);
-        let (code, message) = refusal(host.start_as(&viewer, "editor.desktop"));
-        assert_eq!(code, ErrorCode::Forbidden);
-        assert!(message.contains("may not start"), "{message}");
-        // A device whose pairing was removed while its conversation is open.
-        let mut gone = host.laptop.clone();
-        gone.id = "ffff-ffff-ffff-ffff".into();
-        let (code, _) = refusal(host.start_as(&gone, "editor.desktop"));
-        assert_eq!(code, ErrorCode::Forbidden);
-
-        // An application the host does not list.
-        let (code, _) = refusal(host.start_as(&host.laptop, "/bin/sh"));
-        assert_eq!(code, ErrorCode::NotFound);
-
-        // One it lists but cannot show as a window.
-        host.launcher
-            .refuse_plan("the application runs in a terminal");
-        let (code, message) = refusal(host.start_as(&host.laptop, "editor.desktop"));
-        assert_eq!(code, ErrorCode::Unavailable);
-        assert_eq!(message, "the application runs in a terminal");
-        host.launcher.allow_plan();
-
-        // Requests that cannot be met.
-        let ask = |kind, width, offer: serde_json::Value| {
-            refusal(host.ask(
-                &host.laptop,
-                Request::SessionStart {
-                    app: "editor.desktop".into(),
-                    kind,
-                    display: DisplayMode {
-                        width,
-                        height: 720,
-                        fps: 60,
-                    },
-                    offer,
-                },
-            ))
-        };
-        assert_eq!(
-            ask(StreamKind::Game, 1280, serde_json::Value::Null).0,
-            ErrorCode::Unavailable
-        );
-        assert_eq!(
-            ask(StreamKind::AppWindow, 0, serde_json::Value::Null).0,
-            ErrorCode::Unavailable
-        );
-        let huge = serde_json::Value::String("x".repeat(MAX_MEDIA_BYTES));
-        let (code, message) = ask(StreamKind::AppWindow, 1280, huge);
-        assert_eq!(code, ErrorCode::Unavailable);
-        assert!(message.contains("64 KiB"), "{message}");
-        // None of this started anything.
-        assert!(host.journal.all().is_empty());
-
-        // A host without a runner.
-        let bare = Sessions::with(
-            host.paths.clone(),
-            Arc::new(|_| {}),
-            None,
-            host.launcher.clone(),
-            quick_rules(),
-        );
-        let request = Request::SessionStart {
-            app: "editor.desktop".into(),
-            kind: StreamKind::AppWindow,
-            display: mode(),
-            offer: serde_json::Value::Null,
-        };
-        let (code, message) = refusal(bare.answer(
-            &request,
-            &host.laptop,
-            LAPTOP.parse().unwrap(),
-            || vec![app("editor.desktop", "Editor")],
-        ));
-        assert_eq!(code, ErrorCode::Unavailable);
-        assert!(message.contains("no session runner"), "{message}");
-    }
-
-    #[test]
-    fn a_host_runs_only_so_many_sessions() {
-        let host = host_with(Rules {
-            max_sessions: 2,
-            ..quick_rules()
-        });
-        let first = host.start().id;
-        let second = host.start().id;
-        assert_ne!(first, second);
-        let (code, message) = refusal(host.start_as(&host.laptop, "editor.desktop"));
-        assert_eq!(code, ErrorCode::Unavailable);
-        assert!(message.contains("2 sessions"), "{message}");
-        // One that is over makes room.
-        session(host.stop(&first));
-        host.follow_until(&first, SessionState::Ended);
-        host.start();
-    }
-
-    #[test]
-    fn a_question_is_answered_at_once_or_held_back() {
-        let host = host();
-        let id = host.start().id;
-        let running = host.follow_until(&id, SessionState::Running);
-
-        // Something the caller has not seen: at once.
-        let asked = Instant::now();
-        assert_eq!(session(host.wait(&id, 0, 3000)), running);
-        assert!(asked.elapsed() < Duration::from_millis(300));
-        // Nothing new and no patience: at once.
-        let asked = Instant::now();
-        assert_eq!(session(host.wait(&id, running.revision, 0)), running);
-        assert!(asked.elapsed() < Duration::from_millis(300));
-        // Nothing new: for as long as the caller said ...
-        let asked = Instant::now();
-        assert_eq!(session(host.wait(&id, running.revision, 300)), running);
-        let took = asked.elapsed();
-        assert!(
-            took >= Duration::from_millis(280) && took < Duration::from_millis(1500),
-            "{took:?}"
-        );
-        // ... but never longer than the host allows.
-        let asked = Instant::now();
-        session(host.wait(&id, running.revision, 60_000));
-        let took = asked.elapsed();
-        let cap = quick_rules().wait_at_most;
-        assert!(
-            took >= cap - Duration::from_millis(20) && took < cap * 3,
-            "{took:?}"
-        );
-    }
-
-    #[test]
-    fn a_session_that_is_over_is_remembered_for_a_while() {
-        let host = host_with(Rules {
-            remember_ended_for: Duration::from_millis(300),
-            ..quick_rules()
-        });
-        let id = host.start().id;
-        host.follow_until(&id, SessionState::Running);
-        session(host.stop(&id));
-        let ended = host.follow_until(&id, SessionState::Ended);
-        // A late question still gets the reason ...
-        assert_eq!(session(host.wait(&id, 0, 0)), ended);
-        // ... until the host has forgotten.
-        std::thread::sleep(Duration::from_millis(400));
-        let (code, _) = refusal(host.wait(&id, 0, 0));
-        assert_eq!(code, ErrorCode::NotFound);
-    }
 }

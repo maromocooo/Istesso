@@ -356,6 +356,7 @@ mod tests {
                             kind: StreamKind::AppWindow,
                             state,
                             revision,
+                            attachment: 1,
                             display: None,
                             answer: None,
                             end,
@@ -366,7 +367,7 @@ mod tests {
                         Request::SessionWait { session, .. } if *session == id => {
                             report(SessionState::Running, 2, None)
                         }
-                        Request::SessionStop { session } if *session == id => report(
+                        Request::SessionStop { session, .. } if *session == id => report(
                             SessionState::Stopping,
                             3,
                             Some(SessionEnd {
@@ -402,15 +403,15 @@ mod tests {
         assert_eq!(started.id, id);
         assert_eq!(started.state, SessionState::Starting);
         let running = client
-            .session_wait(&id, started.revision, Duration::from_millis(1500))
+            .session_wait(&id, started.revision, Duration::from_millis(1500), 1)
             .unwrap();
         assert_eq!(running.state, SessionState::Running);
-        let stopping = client.session_stop(&id).unwrap();
+        let stopping = client.session_stop(&id, true).unwrap();
         assert_eq!(stopping.end.unwrap().reason, EndReason::Stopped);
         // Somebody else's session, or none: a refusal the caller can tell
         // from other failures.
         let other = SessionId("0000000000000000".to_string());
-        match client.session_stop(&other) {
+        match client.session_stop(&other, false) {
             Err(Error::Remote(refusal)) => assert_eq!(refusal.code, ErrorCode::NotFound),
             other => panic!("unexpected: {other:?}"),
         }
@@ -429,9 +430,17 @@ mod tests {
         assert_eq!(
             asked[1],
             Request::SessionWait {
-                session: id,
+                session: id.clone(),
                 after: 1,
-                timeout_ms: 1500
+                timeout_ms: 1500,
+                attachment: 1,
+            }
+        );
+        assert_eq!(
+            asked[2],
+            Request::SessionStop {
+                session: id,
+                force: true
             }
         );
     }
