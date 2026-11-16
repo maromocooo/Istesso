@@ -6,6 +6,7 @@ and writes one line per frame at three places:
 
     frame_out   the frame left the compositor; with the shade in its middle (-1 when the
                 frame stays on the GPU and cannot be looked at)
+    converted   the frame left the colour conversion, on its way into the encoder
     encoded     the encoded frame left the encoder; with its size
     sent        its packets were handed to the network; with their RTP timestamp
 
@@ -179,6 +180,10 @@ def main():
         log.write('{"kind":"frame_out","pts":%d,"t_ns":%d,"luma":%d}\n' % (buffer.pts, now, sorted(pixel)[1]))
         return Gst.PadProbeReturn.OK
 
+    def on_converted(pad, info):
+        log.write('{"kind":"converted","pts":%d,"t_ns":%d}\n' % (info.get_buffer().pts, time.monotonic_ns()))
+        return Gst.PadProbeReturn.OK
+
     def on_encoded(pad, info):
         now = time.monotonic_ns()
         buffer = info.get_buffer()
@@ -272,6 +277,7 @@ def main():
         pipeline.get_by_name(name).get_static_pad(pad_name).add_probe(kinds, callback)
 
     watch("compositor", "src", Gst.PadProbeType.BUFFER, on_frame)
+    watch("convert", "src", Gst.PadProbeType.BUFFER, on_converted)
     watch("enc", "src", Gst.PadProbeType.BUFFER, on_encoded)
     watch("net", "sink", Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, on_send)
 

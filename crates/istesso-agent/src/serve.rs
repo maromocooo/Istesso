@@ -52,6 +52,9 @@ pub struct AgentOptions {
     pub refresh_peers: Option<Duration>,
     /// Also report every conversation, not just the refused ones.
     pub verbose: bool,
+    /// For measuring: write down when input was passed on, and never what it
+    /// was ([`crate::passing`]). `None`, the default, writes nothing.
+    pub input_timings: Option<std::path::PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -62,6 +65,7 @@ impl Default for AgentOptions {
             discovery: true,
             refresh_peers: Some(Duration::from_secs(300)),
             verbose: false,
+            input_timings: None,
         }
     }
 }
@@ -80,6 +84,7 @@ struct Shared {
     apps: Mutex<Option<(Instant, Vec<AppEntry>)>>,
     connections: AtomicUsize,
     verbose: bool,
+    passing: Option<crate::PassLog>,
     log: Log,
 }
 
@@ -94,6 +99,13 @@ impl Agent {
                 SocketAddr::new(options.bind, options.port)
             )
         })?;
+        let passing = match &options.input_timings {
+            Some(path) => Some(
+                crate::PassLog::create(path)
+                    .map_err(|e| format!("cannot write to {}: {e}", path.display()))?,
+            ),
+            None => None,
+        };
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -105,6 +117,7 @@ impl Agent {
                 apps: Mutex::new(None),
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
+                passing,
                 log,
             }),
         })
@@ -277,6 +290,7 @@ impl Shared {
                     // Passed on and not answered. Input that was not asked for first, or
                     // that nothing takes any more, is dropped.
                     let Some(sink) = &input else { continue };
+                    let in_hand = crate::PassLog::mark();
                     // The device sends something at least every two seconds, so this is
                     // looked at often enough.
                     if checked.elapsed() >= INPUT_RECHECK {
@@ -290,6 +304,10 @@ impl Shared {
                         }
                     }
                     events.iter().for_each(|event| sink.send(event));
+                    // The empty message that only says "still here" passes nothing on.
+                    if let (Some(passing), false) = (&self.passing, events.is_empty()) {
+                        passing.passed(in_hand, events.len());
+                    }
                     continue;
                 }
                 Request::InputOpen if !session.allows(Permission::Control) => {
@@ -399,6 +417,7 @@ mod tests {
             discovery: false,
             refresh_peers: None,
             verbose: false,
+            ..AgentOptions::default()
         };
         Agent::bind(paths.clone(), &options, Arc::new(|_| {})).unwrap()
     }

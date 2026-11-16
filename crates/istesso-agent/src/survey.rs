@@ -458,6 +458,7 @@ mod tests {
                 discovery: false,
                 refresh_peers: None,
                 verbose: false,
+                ..AgentOptions::default()
             })
         }
 
@@ -754,6 +755,7 @@ mod tests {
             discovery: true,
             refresh_peers: None,
             verbose: false,
+            ..AgentOptions::default()
         };
         let ubuntu_addr = ubuntu.start_agent_with(&options);
         air.start_agent_with(&options);

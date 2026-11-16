@@ -39,14 +39,15 @@ BITRATE = 30000
 
 
 def encoder(bitrate=BITRATE, fps=85, gop=GOP, vbv=None, chroma=CHROMA, preset="p1", colour="srgb"):
-    """The pipeline from frames in CUDA memory to an H.265 stream; the encoder is called "enc".
+    """The pipeline from frames in CUDA memory to an H.265 stream; the colour conversion is called
+    "convert" and the encoder "enc".
 
     bitrate and vbv are in kbit (a second), gop in frames (-1: no key frames but the first and
     those asked for).
     """
     buffer = f" vbv-buffer-size={vbv}" if vbv else ""
     return (
-        f"cudaconvert ! video/x-raw(memory:CUDAMemory),format={RAW_FORMATS[chroma]}{COLOURS[colour]} ! "
+        f"cudaconvert name=convert ! video/x-raw(memory:CUDAMemory),format={RAW_FORMATS[chroma]}{COLOURS[colour]} ! "
         f"nvcudah265enc name=enc preset={preset} tune=ultra-low-latency zero-reorder-delay=true b-frames=0 "
         f"rate-control=cbr bitrate={bitrate} gop-size={gop}{buffer} ! "
         "h265parse config-interval=-1"

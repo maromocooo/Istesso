@@ -66,6 +66,11 @@ enum Command {
         /// Report every conversation with a paired device
         #[arg(short, long)]
         verbose: bool,
+        /// For measuring: write to this file when input from a paired
+        /// device was passed on. Times only, never what the input was; the
+        /// file can be read by its owner only
+        #[arg(long, value_name = "PATH")]
+        input_timings: Option<PathBuf>,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -119,6 +124,11 @@ enum InputAction {
         /// person has answered the system's question
         #[arg(long, value_name = "SECONDS", default_value_t = 0)]
         keep_trying: u64,
+        /// For measuring: write to this file when input was taken from the
+        /// socket and how long it was until it had been sent. Times only,
+        /// never what the input was; the file can be read by its owner only
+        #[arg(long, value_name = "PATH")]
+        timings: Option<PathBuf>,
     },
 }
 
@@ -396,11 +406,13 @@ fn run(cli: Cli) -> Result<(), String> {
             bind,
             no_discovery,
             verbose,
+            input_timings,
         } => run_agent(AgentOptions {
             bind,
             port,
             discovery: !no_discovery,
             verbose,
+            input_timings,
             ..AgentOptions::default()
         }),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
@@ -420,11 +432,13 @@ fn run(cli: Cli) -> Result<(), String> {
                 socket,
                 address,
                 keep_trying,
+                timings,
             } => relay_input(
                 &to,
                 &socket,
                 address.as_deref(),
                 Duration::from_secs(keep_trying),
+                timings.as_deref(),
             ),
         },
     }
@@ -504,10 +518,18 @@ fn relay_input(
     socket: &std::path::Path,
     address: Option<&str>,
     keep_trying: Duration,
+    timings: Option<&std::path::Path>,
 ) -> Result<(), String> {
     use std::io::ErrorKind;
     use std::os::unix::net::UnixDatagram;
 
+    let passing = match timings {
+        Some(path) => Some(
+            istesso_agent::PassLog::create(path)
+                .map_err(|e| format!("cannot write to {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
     let began = std::time::Instant::now();
     let mut said = false;
     let mut client = loop {
@@ -571,6 +593,7 @@ fn relay_input(
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(e) => return Err(failed(e)),
         }
+        let in_hand = istesso_agent::PassLog::mark();
         // Whatever else has arrived meanwhile goes into the same message.
         listener.set_nonblocking(true).map_err(failed)?;
         while let Ok(length) = listener.recv(&mut buffer) {
@@ -580,6 +603,9 @@ fn relay_input(
         client
             .send_input(&events)
             .map_err(|e| format!("the conversation with the device ended: {e}"))?;
+        if let (Some(passing), false) = (&passing, events.is_empty()) {
+            passing.passed(in_hand, events.len());
+        }
     }
 }
 
@@ -589,6 +615,7 @@ fn relay_input(
     _socket: &std::path::Path,
     _address: Option<&str>,
     _keep_trying: Duration,
+    _timings: Option<&std::path::Path>,
 ) -> Result<(), String> {
     Err("relaying input is not available on this system yet".into())
 }

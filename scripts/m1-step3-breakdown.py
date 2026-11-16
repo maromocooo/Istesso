@@ -153,6 +153,56 @@ def first_at_or_after(times, moment):
     return at if at < len(times) else None
 
 
+def input_path(args, probe, order, client_frames, host_frames, host_line, handed, first_row):
+    """The way of a key from the probe to the host's pipeline, program by program.
+
+    The relay on the client and the agent on the host each write when a message of input was in
+    hand (time of day) and how long it took to hand it on. The time of day is put onto the clock
+    of the frame log of the same machine, where the probe's and the pipeline's times are. The two
+    machines' clocks are not compared: what lies between them is what remains of the first row.
+    """
+    slack, far = 200_000, 50_000_000  # what the pairing of clocks may be off by; a neighbour further off is not one
+    print()
+    print("Of the first row, program by program (a key press: probe, relay, control channel, agent, pipeline)")
+    print(HEADER)
+    known = 0.0
+    if args.relay_timings:
+        mac_line = Timeline([l for l in client_frames if l.get("kind") == "clock"], "the client's frame log")
+        got = sorted((mac_line.mono(l["unix_ns"]), l["took_ns"]) for l in read(args.relay_timings) if l.get("kind") == "passed")
+        times = [g for g, _ in got]
+        to_relay, in_relay = [], []
+        for number in order:
+            sent = probe[number]["sent_ns"]
+            at = first_at_or_after(times, sent - slack)
+            if at is not None and times[at] - sent < far:
+                to_relay.append((times[at] - sent) / 1e6)
+                in_relay.append(got[at][1] / 1e6)
+        if to_relay:
+            print(row("client: probe to relay (socket, wake-up)", to_relay))
+            print(row("client: relay, in hand to sent", in_relay))
+            known += sum(to_relay) / len(to_relay) + sum(in_relay) / len(in_relay)
+        print(f"  ({len(to_relay)} of {len(order)} inputs found in the relay's log)")
+    if args.agent_timings:
+        got = sorted((host_line.mono(l["unix_ns"]), l["took_ns"]) for l in read(args.agent_timings) if l.get("kind") == "passed")
+        times = [g for g, _ in got]
+        in_agent, to_pipeline = [], []
+        for at_pipeline in handed:
+            at = bisect.bisect_right(times, at_pipeline + slack) - 1
+            if at >= 0 and at_pipeline - times[at] < far:
+                in_agent.append(got[at][1] / 1e6)
+                to_pipeline.append((at_pipeline - times[at]) / 1e6)
+        if to_pipeline:
+            print(row("host: agent, in hand to handed on", in_agent))
+            print(row("host: agent in hand to key in (with the above)", to_pipeline))
+            known += sum(to_pipeline) / len(to_pipeline)
+        print(f"  ({len(to_pipeline)} of {len(handed)} key presses found in the agent's log)")
+    if args.relay_timings and args.agent_timings and first_row:
+        whole = sum(first_row) / len(first_row)
+        print(f"The first row is {whole:.2f} ms on average; without the stretches above {whole - known:.2f} ms remain: the "
+              "network both ways, the agent reading and decrypting, the host's key in to input, and what pairing the "
+              "clocks is off by.")
+
+
 def key_frames(host_frames, client_frames, out, decoded):
     """Says how many key frames there were and why, and what missing packets cost.
 
@@ -215,6 +265,8 @@ def main():
     parser.add_argument("--probe-local")
     parser.add_argument("--local-app")
     parser.add_argument("--ping")
+    parser.add_argument("--relay-timings", metavar="FILE", help="what `istesso input relay --timings` wrote on the client")
+    parser.add_argument("--agent-timings", metavar="FILE", help="what `istesso agent --input-timings` wrote on the host")
     parser.add_argument(
         "--relayed-inputs",
         choices=["network", "keys"],
@@ -237,6 +289,8 @@ def main():
 
     out = sorted((l for l in host_frames if l.get("kind") == "frame_out"), key=lambda l: l["t_ns"])
     encoded = {l["pts"]: l for l in host_frames if l.get("kind") == "encoded"}
+    # When a frame left the colour conversion, where the host's log says so (newer logs do).
+    converted = {l["pts"]: l["t_ns"] for l in host_frames if l.get("kind") == "converted"}
     # The encoder restamps its frames by a constant. The log has a frame's lines in the order
     # compositor, encoder, network, so the constant is what most neighbours differ by.
     restamps, last_out = collections.Counter(), None
@@ -314,6 +368,8 @@ def main():
     ]
     parts = {key: [] for _, key in names}
     totals, sizes, handing, packets, keyframes = [], [], [], [], 0
+    # The encode stretch in two: up to the end of the colour conversion, and the encoder itself.
+    convert_part, encoder_part = [], []
     dropped = {"no frame after the commit": 0, "frame not found on the host's network side": 0, "frame did not arrive": 0,
                "not decoded": 0, "not at the sink": 0, "not drawn": 0}
     per_input = []
@@ -397,6 +453,11 @@ def main():
         }
         for key, value in values.items():
             parts[key].append(value)
+        # The conversion keeps the compositor's time stamp; the encoder is what moves it.
+        converted_at = converted.get(frame["pts"], converted.get(frame["pts"] + restamp))
+        if converted_at is not None:
+            convert_part.append(ms(frame["t_ns"], converted_at))
+            encoder_part.append(ms(converted_at, enc["t_ns"]))
         totals.append(ms(client["sent_ns"], client["shown_ns"]))
         handing.append(ms(net["first_ns"], net["last_ns"]))
         packets.append(arr["packets"])
@@ -424,6 +485,12 @@ def main():
     print(row("all of it: input sent to shown", totals))
     means = sum(sum(v) / len(v) for v in parts.values())
     print(f"The means of the stretches add up to {means:.2f} ms.")
+    if convert_part:
+        print()
+        print(f"The stretch from frame out to encoded, in two ({len(convert_part)} inputs)")
+        print(HEADER)
+        print(row("upload, convert: frame out to converted", convert_part))
+        print(row("encode: converted to encoded", encoder_part))
     if not draws_logged:
         print("The sink did not say when it drew: its share is inside the last stretch.")
     # What the slow inputs were slow at.
@@ -454,6 +521,9 @@ def main():
             print()
             print(f"The host's pipeline took {len(handed)} key presses and the application {len(sent_inputs)}: "
                   "the two are not put side by side")
+
+    if args.relayed_inputs == "keys" and (args.relay_timings or args.agent_timings):
+        input_path(args, probe, order, client_frames, host_frames, host_line, handed, parts["network"])
 
     # The compositor on its own.
     gaps = [(out[i]["t_ns"] - out[i - 1]["t_ns"]) / 1e6 for i in range(1, len(out))]
