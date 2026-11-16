@@ -1,10 +1,17 @@
 //! Test application for latency measurements.
 //!
-//! A window filled with one of two shades of grey that switches to the other
+//! A window that shows one of two shades of grey and switches to the other
 //! on every input: any key, any mouse button, or a synthetic input over UDP
-//! (`istesso_measure::flash`). It does nothing else, so the time from an
-//! input to the changed picture is as short and as even as an application
-//! can make it. What a relay adds on top of that is what M1 measures.
+//! (`istesso_measure::flash`). It reacts to an input at once and does nothing
+//! else with it, so the time from an input to the changed picture is as short
+//! and as even as an application can make it. What a relay adds on top of
+//! that is what M1 measures.
+//!
+//! Around the shade the window shows scrolling text, the screen of an
+//! application at work, so that the relay has a real picture to carry
+//! (`--picture text`, the default). `--picture grey` fills the whole window
+//! with the shade instead: the easiest picture there is, for a best-case
+//! reference.
 //!
 //! For every input the application records when the input arrived and when
 //! the frame that shows it was committed, both on this machine's clock
@@ -18,19 +25,22 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use istesso_measure::{
-    Clock, FlashAck, FlashInput, Header, HostSample, InputSource, LogWriter, Record, Rgb, Shade,
-    Side,
+    Clock, FlashAck, FlashInput, Header, HostSample, InputSource, LogWriter, Record, Shade, Side,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
+
+mod picture;
+
+use picture::{Picture, Sheet};
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +50,20 @@ use winit::window::{Fullscreen, Window, WindowId};
     after_help = "Any key or mouse button switches the shade. Escape quits."
 )]
 struct Args {
+    /// What the window shows around the shade
+    #[arg(long, value_enum, default_value_t = Picture::Text)]
+    picture: Picture,
+
+    /// How fast the text moves up, in points per second. 0 keeps it still
+    #[arg(long, value_name = "POINTS", default_value_t = 240)]
+    scroll: u32,
+
+    /// How often the moving text is redrawn, in frames per second. The
+    /// refresh rate of the display when not given, or 60 where the display
+    /// does not say
+    #[arg(long, value_name = "HZ", value_parser = clap::value_parser!(u32).range(1..=1000))]
+    fps: Option<u32>,
+
     /// Write one line per input to this file: when the input arrived and when
     /// the frame that shows it was committed. The file must not exist yet
     #[arg(long, value_name = "FILE")]
@@ -119,6 +143,12 @@ struct App {
     socket: Option<UdpSocket>,
     window: Option<Rc<Window>>,
     surface: Option<Surface>,
+    /// The text, painted for the window's present size.
+    sheet: Option<Sheet>,
+    /// Time between two frames of moving text. `None` when nothing moves.
+    frame_period: Option<Duration>,
+    /// When the next frame of moving text is due.
+    next_frame: Option<Instant>,
     /// Why the application has to stop, if it does.
     failure: Option<String>,
 }
@@ -150,17 +180,25 @@ impl App {
             .map_err(|e| format!("cannot draw on this display: {e}"))?;
         let surface = softbuffer::Surface::new(&context, window.clone())
             .map_err(|e| format!("cannot draw into the window: {e}"))?;
+        if self.args.picture == Picture::Text && self.args.scroll > 0 {
+            let refresh = window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+                .map(|millihertz| (millihertz + 500) / 1000)
+                .filter(|hertz| *hertz > 0);
+            let fps = self.args.fps.or(refresh).unwrap_or(60);
+            self.frame_period = Some(Duration::from_secs(1) / fps);
+        }
         self.window = Some(window);
         self.surface = Some(surface);
         Ok(())
     }
 
-    /// Fills the window with the current shade and commits the frame.
+    /// Paints the picture as it is now and commits the frame.
     ///
     /// `false` when there is nothing to draw into: the window is not open
     /// yet, or it is minimised.
     fn draw(&mut self) -> Result<bool, String> {
-        let pixel = pixel(self.shade.rgb());
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return Ok(false);
         };
@@ -173,7 +211,27 @@ impl App {
         let failed = |e: softbuffer::SoftBufferError| format!("cannot draw a frame: {e}");
         surface.resize(width, height).map_err(failed)?;
         let mut buffer = surface.buffer_mut().map_err(failed)?;
-        buffer.fill(pixel);
+        match self.args.picture {
+            Picture::Grey => buffer.fill(picture::pixel(self.shade.rgb())),
+            Picture::Text => {
+                let (across, down) = (size.width as usize, size.height as usize);
+                // A font pixel is two points wide: text of an everyday size.
+                let factor = window.scale_factor();
+                let scale = (2.0 * factor).round().max(1.0) as usize;
+                if !self
+                    .sheet
+                    .as_ref()
+                    .is_some_and(|sheet| sheet.fits(across, down, scale))
+                {
+                    self.sheet = Some(Sheet::new(across, down, scale));
+                }
+                if let Some(sheet) = &self.sheet {
+                    let speed = (f64::from(self.args.scroll) * factor).round() as u32;
+                    let offset = picture::scrolled(self.clock.now_ns(), speed, sheet.height());
+                    picture::paint_text(&mut buffer, across, down, sheet, offset, self.shade);
+                }
+            }
+        }
         buffer.present().map_err(failed)?;
         Ok(true)
     }
@@ -247,6 +305,32 @@ impl ApplicationHandler<Outside> for App {
         }
     }
 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
+        // The text moves on its own, at a steady rate. An input does not wait
+        // for it: `flash` paints a frame of its own the moment it arrives.
+        let Some(period) = self.frame_period else {
+            return;
+        };
+        let now = Instant::now();
+        match self.next_frame {
+            Some(due) if now >= due => {
+                let drawn = self.draw().map(|_| ());
+                self.check(event_loop, drawn);
+                // Keep the rhythm; after a stall, start again from now.
+                let next = due + period;
+                self.next_frame = Some(if next > now { next } else { now + period });
+            }
+            Some(_) => {}
+            None => self.next_frame = Some(now + period),
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(due) = self.next_frame {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Outside) {
         let Outside::Input { id, input_ns, from } = event;
         if self.last_synthetic == Some(id) {
@@ -297,11 +381,6 @@ impl ApplicationHandler<Outside> for App {
     }
 }
 
-/// softbuffer's pixel layout: 0x00RRGGBB.
-fn pixel(colour: Rgb) -> u32 {
-    u32::from(colour.r) << 16 | u32::from(colour.g) << 8 | u32::from(colour.b)
-}
-
 /// Reads synthetic inputs and passes them to the event loop, stamped on arrival.
 fn listen(socket: UdpSocket, clock: Clock, event_loop: EventLoopProxy<Outside>) {
     std::thread::spawn(move || {
@@ -333,7 +412,11 @@ fn listen(socket: UdpSocket, clock: Clock, event_loop: EventLoopProxy<Outside>) 
     });
 }
 
-fn open_log(path: &PathBuf, clock: &Clock) -> Result<LogWriter<BufWriter<File>>, String> {
+fn open_log(
+    path: &PathBuf,
+    clock: &Clock,
+    picture: Picture,
+) -> Result<LogWriter<BufWriter<File>>, String> {
     // Never overwrite an earlier measurement.
     let file = OpenOptions::new()
         .write(true)
@@ -351,6 +434,7 @@ fn open_log(path: &PathBuf, clock: &Clock) -> Result<LogWriter<BufWriter<File>>,
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_unix_ms,
         clock_origin_unix_ns: Some(clock.origin_unix_ns()),
+        picture: Some(picture.name().to_string()),
     }))
     .map_err(|e| format!("cannot write to {}: {e}", path.display()))?;
     Ok(log)
@@ -361,7 +445,7 @@ fn run(args: Args) -> Result<(), String> {
     let log = args
         .log
         .as_ref()
-        .map(|path| open_log(path, &clock))
+        .map(|path| open_log(path, &clock, args.picture))
         .transpose()?;
 
     let event_loop = EventLoop::<Outside>::with_user_event()
@@ -393,6 +477,9 @@ fn run(args: Args) -> Result<(), String> {
         socket,
         window: None,
         surface: None,
+        sheet: None,
+        frame_period: None,
+        next_frame: None,
         failure: None,
     };
     event_loop
@@ -447,10 +534,21 @@ mod tests {
     }
 
     #[test]
-    fn pixels_are_packed_as_softbuffer_expects() {
-        assert_eq!(pixel(Rgb::new(0x12, 0x34, 0x56)), 0x0012_3456);
-        assert_eq!(pixel(Shade::Dark.rgb()), 0x0020_2020);
-        assert_eq!(pixel(Shade::Light.rgb()), 0x00E0_E0E0);
+    fn the_moving_text_is_what_the_window_shows_unless_asked_otherwise() {
+        let args = Args::try_parse_from(["istesso-flash"]).unwrap();
+        assert_eq!(args.picture, Picture::Text);
+        assert_eq!((args.scroll, args.fps), (240, None));
+        let args = Args::try_parse_from(["istesso-flash", "--picture", "grey"]).unwrap();
+        assert_eq!(args.picture, Picture::Grey);
+        let args = Args::try_parse_from(["istesso-flash", "--scroll", "0", "--fps", "85"]).unwrap();
+        assert_eq!((args.scroll, args.fps), (0, Some(85)));
+        for wrong in [
+            vec!["istesso-flash", "--picture", "video"],
+            vec!["istesso-flash", "--fps", "0"],
+            vec!["istesso-flash", "--scroll", "-3"],
+        ] {
+            assert!(Args::try_parse_from(wrong.clone()).is_err(), "{wrong:?}");
+        }
     }
 
     #[test]

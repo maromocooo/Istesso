@@ -44,6 +44,11 @@ pub struct Header {
     /// writer does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_origin_unix_ns: Option<u64>,
+    /// What the test application showed: `text` (scrolling text around the
+    /// shade) or `grey` (the whole window in the shade). Absent in the logs
+    /// of other tools, and of versions that only had the grey picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
 }
 
 /// How an input reached the application on the host.
@@ -176,6 +181,7 @@ mod tests {
             version: "0.0.1".into(),
             started_unix_ms: 1_794_000_000_000,
             clock_origin_unix_ns: Some(1_794_000_000_000_123_456),
+            picture: Some("text".into()),
         })
     }
 
@@ -188,12 +194,15 @@ mod tests {
             text.contains("\"clock_origin_unix_ns\":1794000000000123456"),
             "{text}"
         );
+        assert!(text.contains("\"picture\":\"text\""), "{text}");
         assert_eq!(read_log(text.as_bytes()).unwrap(), vec![header()]);
 
         // Logs written before the field existed, and by tools that leave it out.
         let old = "{\"kind\":\"header\",\"side\":\"client\",\"tool\":\"t\",\"version\":\"1\",\"started_unix_ms\":5}\n";
         match &read_log(old.as_bytes()).unwrap()[0] {
-            Record::Header(h) => assert_eq!(h.clock_origin_unix_ns, None),
+            Record::Header(h) => {
+                assert_eq!((h.clock_origin_unix_ns, h.picture.clone()), (None, None))
+            }
             other => panic!("{other:?}"),
         }
     }
