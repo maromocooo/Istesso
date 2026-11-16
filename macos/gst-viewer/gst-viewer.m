@@ -7,7 +7,9 @@
 //
 // Usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE [FRAME_LOG [KEY_REQUEST_PORT [INPUT_SOCKET]]]
 //   X Y            top left corner of the window, in points from the top left of the main display
-//   WIDTH HEIGHT   size of the picture area, in points
+//   WIDTH HEIGHT   size of the picture area, in points. 0 0: the whole display that X Y lies on,
+//                  without a title bar (a verdict is measured with the relayed picture shown
+//                  like that, one pixel of it to one of the display)
 //   PIPELINE       a gst-launch style description ending in a video sink, for example
 //                  "udpsrc port=5004 caps=... ! rtph265depay ! h265parse ! avdec_h265 ! glimagesink sync=false"
 //   FRAME_LOG      optional: a file to write the way of every frame through the pipeline to;
@@ -16,6 +18,8 @@
 //                  whenever one is needed (see below)
 //   INPUT_SOCKET   optional, with VideoToolbox: write what the person does in the window with
 //                  keyboard and mouse to this local socket (see below)
+// With ISTESSO_ON_TOP set in the environment the window stays above the others: a measuring tool
+// that watches the middle of the window sees nothing once another window lies over it.
 //
 // Decoding with VideoToolbox. GStreamer's own VideoToolbox element holds frames back, so the
 // pipeline may instead end in an application sink called "vt" that hands over H.265 access
@@ -804,6 +808,19 @@ static unsigned long modifier_bit(unsigned short key) {
 
 @end
 
+// A window without a title bar does not take the keyboard unless it says that it can.
+@interface WholeDisplayWindow : NSWindow
+@end
+
+@implementation WholeDisplayWindow
+- (BOOL)canBecomeKeyWindow {
+    return YES;
+}
+- (BOOL)canBecomeMainWindow {
+    return YES;
+}
+@end
+
 static GstBusSyncReply on_message(GstBus *bus, GstMessage *message, gpointer user_data) {
     if (gst_is_video_overlay_prepare_window_handle_message(message)) {
         NSView *view = (__bridge NSView *)user_data;
@@ -853,18 +870,44 @@ int main(int argc, char *argv[]) {
         }
         double x = atof(argv[1]), y = atof(argv[2]);
         double width = atof(argv[3]), height = atof(argv[4]);
-        if (width < 1 || height < 1) {
-            fprintf(stderr, "error: WIDTH and HEIGHT have to be positive\n");
+        BOOL whole_display = width == 0 && height == 0;
+        if (!whole_display && (width < 1 || height < 1)) {
+            fprintf(stderr, "error: WIDTH and HEIGHT have to be positive, or both 0 for the whole display\n");
             return 2;
         }
 
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
-                                                       styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
-                                                         backing:NSBackingStoreBuffered
-                                                           defer:NO];
+        NSRect display = NSZeroRect;
+        if (whole_display) {
+            // The display the point lies on. Screens count from the bottom left of the main one.
+            double main_height = NSScreen.screens.firstObject.frame.size.height;
+            NSPoint point = NSMakePoint(x + 1, main_height - y - 1);
+            for (NSScreen *screen in NSScreen.screens) {
+                if (NSPointInRect(point, screen.frame)) {
+                    display = screen.frame;
+                }
+            }
+            if (NSIsEmptyRect(display)) {
+                fprintf(stderr, "error: X Y is on no display\n");
+                return 2;
+            }
+            width = display.size.width;
+            height = display.size.height;
+        }
+        NSWindow *window = whole_display
+            ? [[WholeDisplayWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
+                                                    styleMask:NSWindowStyleMaskBorderless
+                                                      backing:NSBackingStoreBuffered
+                                                        defer:NO]
+            : [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
+                                          styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                            backing:NSBackingStoreBuffered
+                                              defer:NO];
         window.title = [NSString stringWithUTF8String:argv[5]];
+        if (getenv("ISTESSO_ON_TOP") != NULL) {
+            window.level = NSFloatingWindowLevel;
+        }
         NSView *view = input_socket >= 0 ? [[InputView alloc] initWithFrame:NSMakeRect(0, 0, width, height)]
                                          : [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         window.contentView = view;
@@ -876,7 +919,11 @@ int main(int argc, char *argv[]) {
         // display than the one in use back onto that one. Coordinates count from the top left
         // of the main display, which is the first screen.
         double mainHeight = NSScreen.screens.firstObject.frame.size.height;
-        [window setFrameTopLeftPoint:NSMakePoint(x, mainHeight - y)];
+        if (whole_display) {
+            [window setFrame:display display:YES];
+        } else {
+            [window setFrameTopLeftPoint:NSMakePoint(x, mainHeight - y)];
+        }
 
         GError *error = NULL;
         GstElement *pipeline = gst_parse_launch(argv[6], &error);

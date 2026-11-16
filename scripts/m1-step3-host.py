@@ -48,7 +48,7 @@ from m1_encoder import BITRATE, CHROMA, COLOURS, GOP, RAW_FORMATS, encoder, rate
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--to", required=True, metavar="ADDR[:PORT]", help="where to send the stream (port 5004 unless given)")
+    parser.add_argument("--to", required=True, metavar="ADDR[:PORT]", help="where to send the stream (port 5004 unless given); an IPv6 address goes in brackets")
     parser.add_argument("--log", required=True, metavar="FILE", help="the frame log to write; an existing file is not overwritten")
     parser.add_argument("--render-node", metavar="PATH", help="DRM render node for the compositor, for example /dev/dri/renderD129")
     parser.add_argument("--size", default="1720x720", metavar="WxH")
@@ -100,7 +100,12 @@ def main():
     )
     args = parser.parse_args()
 
-    address, _, port = args.to.partition(":")
+    if args.to.startswith("["):
+        # An IPv6 address, in brackets as usual where a port follows.
+        address, _, port = args.to[1:].partition("]")
+        port = port.lstrip(":")
+    else:
+        address, _, port = args.to.partition(":")
     width, _, height = args.size.partition("x")
     width, height = int(width), int(height)
     node = f" render-node={args.render_node}" if args.render_node else ""
@@ -289,8 +294,10 @@ def main():
         inputs.setblocking(False)
         GLib.io_add_watch(inputs.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_input)
     if args.key_requests:
-        requests = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        requests.bind(("", int(port or 5004) + 1))
+        # Both kinds of address: the reports come from wherever the stream goes.
+        requests = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        requests.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        requests.bind(("::", int(port or 5004) + 1))
         requests.setblocking(False)
         GLib.io_add_watch(requests.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_report)
     for number in (signal.SIGINT, signal.SIGTERM):

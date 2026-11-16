@@ -24,6 +24,11 @@ use crate::survey::{refresh_peers, SurveyOptions};
 const MAX_CONNECTIONS: usize = 64;
 /// How long the agent waits for a caller's next message.
 const WAIT: Duration = Duration::from_secs(5);
+/// How often a device that sends input is looked up again in the list of
+/// paired devices. A conversation with input stays open for as long as a
+/// window does; a pairing that is removed, or a right that is taken away,
+/// must stop it soon, not when the window is closed.
+const INPUT_RECHECK: Duration = Duration::from_secs(1);
 /// How long a full inspection of this machine stays valid. The agent repeats
 /// the inspection twice as often and always answers from memory.
 pub const MANIFEST_MAX_AGE: Duration = Duration::from_secs(600);
@@ -214,6 +219,19 @@ impl InputSink {
     }
 }
 
+/// Whether the device is, at this moment, still paired and still allowed to
+/// control this host: read from the list on disk, not remembered from when
+/// the conversation began.
+fn may_still_control(paths: &Paths, peer: &istesso_pair::Peer) -> bool {
+    PeerStore::open(paths.peers()).is_ok_and(|peers| {
+        peers.peers().iter().any(|known| {
+            known.id == peer.id
+                && known.public_key == peer.public_key
+                && known.permissions.contains(&Permission::Control)
+        })
+    })
+}
+
 impl Shared {
     fn handle(&self, stream: TcpStream) {
         // Read the list of paired devices for every caller: a pairing that
@@ -252,14 +270,26 @@ impl Shared {
 
         let mut asked: Vec<&'static str> = Vec::new();
         let mut input: Option<InputSink> = None;
+        let mut checked = Instant::now();
         while let Ok(Some(request)) = session.next_request() {
             let response = match request {
                 Request::Input { events } => {
                     // Passed on and not answered. Input that was not asked for first, or
                     // that nothing takes any more, is dropped.
-                    if let Some(sink) = &input {
-                        events.iter().for_each(|event| sink.send(event));
+                    let Some(sink) = &input else { continue };
+                    // The device sends something at least every two seconds, so this is
+                    // looked at often enough.
+                    if checked.elapsed() >= INPUT_RECHECK {
+                        checked = Instant::now();
+                        if !may_still_control(&self.paths, session.peer()) {
+                            (self.log)(format!(
+                                "stopped taking input from {}: it is no longer allowed to control this host",
+                                session.peer().name
+                            ));
+                            break;
+                        }
                     }
+                    events.iter().for_each(|event| sink.send(event));
                     continue;
                 }
                 Request::InputOpen if !session.allows(Permission::Control) => {
@@ -430,6 +460,37 @@ mod tests {
         // The listener goes away: input is lost, nothing else happens.
         drop(listener);
         sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
+    }
+
+    #[test]
+    fn a_device_stops_being_allowed_to_send_input_when_its_rights_change() {
+        let dir = TempDir::new("rights");
+        let paths = dir.paths();
+        let mut peer = istesso_pair::Peer {
+            id: "aaaa-bbbb-cccc-dddd".into(),
+            name: "a laptop".into(),
+            public_key: "11".repeat(32),
+            paired_at: 0,
+            permissions: Permission::defaults(),
+        };
+        // Not paired at all.
+        assert!(!may_still_control(&paths, &peer));
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(may_still_control(&paths, &peer));
+        // Another device that took over the name does not inherit the right.
+        let mut impostor = peer.clone();
+        impostor.public_key = "22".repeat(32);
+        assert!(!may_still_control(&paths, &impostor));
+        // The pairing is removed while a conversation is open.
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.remove(&peer.id).unwrap();
+        assert!(!may_still_control(&paths, &peer));
+        // Paired again, but only for looking.
+        peer.permissions = vec![Permission::View];
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(!may_still_control(&paths, &peer));
     }
 
     #[test]

@@ -36,7 +36,7 @@ use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
 
 mod gpu;
 mod picture;
@@ -138,6 +138,11 @@ struct Args {
     #[arg(long)]
     fullscreen: bool,
 
+    /// Keep the window above the others. A measuring tool that watches the
+    /// middle of the window sees nothing once another window lies over it
+    #[arg(long)]
+    on_top: bool,
+
     /// Size of the window's content, in points
     #[arg(long, value_name = "WIDTHxHEIGHT", default_value = "960x600", value_parser = parse_size)]
     size: (u32, u32),
@@ -227,7 +232,12 @@ impl App {
         let mut attributes = Window::default_attributes()
             .with_title(self.args.title.clone())
             .with_inner_size(LogicalSize::new(f64::from(width), f64::from(height)))
-            .with_decorations(!self.args.borderless);
+            .with_decorations(!self.args.borderless)
+            .with_window_level(if self.args.on_top {
+                WindowLevel::AlwaysOnTop
+            } else {
+                WindowLevel::Normal
+            });
         if let Some((x, y)) = self.args.position {
             attributes = attributes.with_position(LogicalPosition::new(f64::from(x), f64::from(y)));
         }
