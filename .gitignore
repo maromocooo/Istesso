@@ -5,5 +5,7 @@
 /dist
 # SwiftPM build output (macos/screen-probe)
 .build/
+# Output of macos/gst-viewer/build.sh
+/macos/gst-viewer/build/
 # Bundles handed over between machines; never part of the history.
 /handoff/

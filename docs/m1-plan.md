@@ -160,7 +160,38 @@ Air の上でコーディングエージェントを動かし、Ubuntu へは SS
 | `1301f86`（2026-05-01） | ビルドでき、GStreamer 1.24.2 から `waylanddisplaysrc` として読み込める。出力は DMABuf か RGBx。プロパティは `render-node`、`keyboard`、`mouse` |
 | `c49af96`（2026-05-11） | ビルドはできるが、読み込めない。libwayland 1.23 の関数（`wl_client_set_max_buffer_size`）を使っている |
 
-まず `1301f86` に固定して進めます。ビルドに要る開発用のパッケージは導入済みです（`libgstreamer1.0-dev`、`libgstreamer-plugins-base1.0-dev`、`libgstreamer-plugins-bad1.0-dev`、`libwayland-dev`、`libxkbcommon-dev`、`libinput-dev`、`libudev-dev`、`libgbm-dev`、`libegl-dev`、`libssl-dev`）。映像を実際に取り出せるかは、まだ確かめていません。古いコミットを使い続けるか、新しい GStreamer を別に用意するかは、数値を取ったあとで ADR に残します。
+まず `1301f86` に固定して進めます。ビルドに要る開発用のパッケージは導入済みです（`libgstreamer1.0-dev`、`libgstreamer-plugins-base1.0-dev`、`libgstreamer-plugins-bad1.0-dev`、`libwayland-dev`、`libxkbcommon-dev`、`libinput-dev`、`libudev-dev`、`libgbm-dev`、`libegl-dev`、`libssl-dev`）。古いコミットを使い続けるか、新しい GStreamer を別に用意するかは、数値を取ったあとで ADR に残します。
+
+進み具合（2026-11-16）：既製の部品だけで、1本通りました。テストアプリが仮想コンポジターの中で動き、その映像が Mac の窓に出ます。
+
+ホスト（`tmux` の中で動かす。`<Mac>` はクライアントのアドレス）：
+
+```sh
+GST_PLUGIN_PATH=<gst-wayland-display>/target/release gst-launch-1.0 \
+  waylanddisplaysrc render-node=/dev/dri/renderD129 ! 'video/x-raw,width=1720,height=720,framerate=85/1' ! \
+  cudaupload ! cudaconvert ! 'video/x-raw(memory:CUDAMemory),format=NV12' ! \
+  nvcudah265enc preset=p1 tune=ultra-low-latency zero-reorder-delay=true b-frames=0 rate-control=cbr bitrate=30000 gop-size=170 ! \
+  h265parse config-interval=-1 ! rtph265pay config-interval=-1 mtu=1200 ! \
+  udpsink host=<Mac> port=5004 sync=false async=false
+```
+
+クライアント（`macos/gst-viewer` に渡すパイプライン）：
+
+```text
+udpsrc port=5004 buffer-size=2097152 caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96" !
+  rtph265depay ! h265parse ! avdec_h265 max-threads=1 !
+  queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! glimagesink sync=false
+```
+
+組んでみてわかったこと：
+
+- **GStreamer の `vtdec_hw` は使えません。** VideoToolbox で復号する要素ですが、フレームをためてから出すので、遅れが約 200 ms 増えます。ソフトウェアの復号（`avdec_h265`）に替えると消えます。VideoToolbox そのものの問題ではありません（Moonlight は VideoToolbox で 2.7 ms で復号しています）。自前の受信側（手順 4）では、VideoToolbox を直接使います。
+- GStreamer が自分で開く窓は、置き場所を選べず、いつも主ディスプレイに出ます。計測では手元の窓と同じディスプレイに並べる必要があるので、窓を自分で開いて映像だけを受け取る `macos/gst-viewer` を足しました。
+- 仮想コンポジターは、起動するたびに `wayland-1`、`wayland-2` と待ち受けの名前を変えます。前のものが残っていると、テストアプリが古いほうにつながり、映像が黒いままになります。パイプラインを止めるときは `gst-launch-1.0` が終わったことを確かめ、名前はログの `socket_name` から読みます。
+- テストアプリは、仮想コンポジターの中では出力いっぱいに広がります。`--borderless` で枠なしにします。
+- レンダリングには NVIDIA の GPU（`/dev/dri/renderD129`）を使えました。出力はいまのところ RGBx で、GPU へ上げ直しています（`cudaupload`）。
+
+数値は、Mac の AWDL を止めた状態で 500 回測ってから、記録に書きます。AWDL が有効なままの試し（150 回、85 Hz）では、手元の窓との差は中央値で 23.5 ms でした。
 
 ### 手順 4：自前の実装に置き換える
 

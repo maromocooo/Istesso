@@ -31,6 +31,7 @@
 | `istesso measure report` | 両側のログから、追加遅延と内訳を出す |
 | `istesso-screen-probe` | Mac の画面を読んで、手元の窓と中継した窓が同じ入力に反応した時刻を記録する（`macos/screen-probe`、[ADR 0008](../adr/0008-screen-recording-for-measurement.md)） |
 | `istesso measure compare` | 上の2つのログから、中継した窓が手元の窓よりどれだけ遅いかを出す |
+| `gst-viewer` | 手順 3 の受信側。GStreamer のパイプラインの映像を、指定した位置の窓に出す（`macos/gst-viewer`。`brew install gstreamer` のあと `macos/gst-viewer/build.sh`） |
 | `scripts/ping-stats.py` | `ping` の出力から、往復時間の分布と、跳ねの周期を出す |
 
 ### テストアプリ
