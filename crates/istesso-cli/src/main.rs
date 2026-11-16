@@ -107,7 +107,10 @@ enum MeasureAction {
     ///
     /// Takes the two logs of the screen probe (macos/screen-probe): for
     /// every input, when the local window and when the relayed window
-    /// first showed it. Prints how much later the relayed window was.
+    /// first showed it. With the logs of both copies of the test
+    /// application it prints the added latency of each window and how
+    /// much more the relayed one has, percentile by percentile, next to
+    /// the pass line (ADR 0002).
     Compare {
         /// The probe's log for the window of the local test application
         #[arg(long, value_name = "FILE")]
@@ -115,6 +118,12 @@ enum MeasureAction {
         /// The probe's log for the window relayed from the host
         #[arg(long, value_name = "FILE")]
         relayed: PathBuf,
+        /// Log written by the local test application (`istesso-flash --log`)
+        #[arg(long, value_name = "FILE", requires = "relayed_app")]
+        local_app: Option<PathBuf>,
+        /// Log written by the test application on the host
+        #[arg(long, value_name = "FILE", requires = "local_app")]
+        relayed_app: Option<PathBuf>,
         /// Refresh rate of the display both windows were on, to count the
         /// difference in refreshes
         #[arg(long, value_name = "HZ")]
@@ -1039,12 +1048,26 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
         MeasureAction::Compare {
             local,
             relayed,
+            local_app,
+            relayed_app,
             refresh_hz,
             json,
         } => {
             let local = istesso_measure::client_samples(&read_measurement_log(&local)?);
             let relayed = istesso_measure::client_samples(&read_measurement_log(&relayed)?);
-            let comparison = Comparison::build(&local, &relayed, refresh_hz);
+            let app_log = |path: Option<PathBuf>| -> Result<Option<Vec<_>>, String> {
+                path.map(|p| read_measurement_log(&p).map(|r| istesso_measure::host_samples(&r)))
+                    .transpose()
+            };
+            let local_app = app_log(local_app)?;
+            let relayed_app = app_log(relayed_app)?;
+            let comparison = Comparison::build(
+                &local,
+                &relayed,
+                local_app.as_deref(),
+                relayed_app.as_deref(),
+                refresh_hz,
+            );
             if json {
                 print_json(&comparison)
             } else {
@@ -1150,6 +1173,28 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn compare_takes_the_applications_logs_as_a_pair() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "istesso",
+                "measure",
+                "compare",
+                "--local",
+                "probe-local.jsonl",
+                "--relayed",
+                "probe-relayed.jsonl",
+            ];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--local-app", "local.jsonl", "--relayed-app", "host.jsonl"]).is_ok());
+        // Added latency of one window alone says nothing about the pass line.
+        assert!(parse(&["--local-app", "local.jsonl"]).is_err());
+        assert!(parse(&["--relayed-app", "host.jsonl"]).is_err());
     }
 
     #[test]

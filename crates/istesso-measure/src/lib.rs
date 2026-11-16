@@ -31,7 +31,7 @@ pub mod report;
 pub mod stats;
 
 pub use clock::Clock;
-pub use compare::Comparison;
+pub use compare::{Comparison, Gap, PASS_LINE, VERDICT_SAMPLES};
 pub use flash::{classify, FlashAck, FlashInput, Rgb, Shade, DEFAULT_FLASH_PORT};
 pub use jitter::Jitter;
 pub use probe::{probe, Answer, ProbeSample, ProbeSummary};
