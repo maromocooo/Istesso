@@ -81,16 +81,27 @@ pub mod policy {
     /// device that was unpaired, until somebody ends them.
     pub const SESSIONS_PER_DEVICE: usize = 6;
 
-    /// Whether `peer`, which has what starting takes, may see, attach to
-    /// and stop a session that the device with this id and key started.
+    /// Whether `peer` may see, attach to and stop a session that the device
+    /// with this id and key started. `rights` is what the list of paired
+    /// devices gives `peer` at the moment it asks.
     ///
-    /// That device itself may. Once it was unpaired (`left`), every device
-    /// may: the application was kept so that the work in it is not lost,
-    /// and somebody has to be able to get back to it. Whether every paired
-    /// device may use every session is still open (ADR 0010,
+    /// Nobody may without what starting takes. With it, the device that
+    /// started the session may. Once that device was unpaired (`left`),
+    /// every device that has the rights may: the application was kept so
+    /// that the work in it is not lost, and somebody has to be able to
+    /// get back to it. That widening is the person's decision of
+    /// 2026-11-16; it never reaches a device that lacks a right. Whether
+    /// every paired device may use every session is still open (ADR 0010,
     /// "決めてほしいこと").
-    pub fn may_use(owner_id: &str, owner_key: &str, left: bool, peer: &Peer) -> bool {
-        left || (owner_id == peer.id && owner_key == peer.public_key)
+    pub fn may_use(
+        owner_id: &str,
+        owner_key: &str,
+        left: bool,
+        peer: &Peer,
+        rights: &[Permission],
+    ) -> bool {
+        let has_the_rights = START_NEEDS.iter().all(|need| rights.contains(need));
+        has_the_rights && (left || (owner_id == peer.id && owner_key == peer.public_key))
     }
 }
 
@@ -277,31 +288,76 @@ impl Device {
     }
 }
 
+/// What the list of paired devices says about a device at this moment:
+/// read from disk, not remembered from when a conversation or a session
+/// began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pairing {
+    /// The list cannot be read: it is not there, it is damaged, or the
+    /// system does not hand it out. Nothing is known. That is not an
+    /// unpairing: nothing is allowed, and nothing is concluded.
+    Unknown,
+    /// The list was read, and the device is not in it.
+    Unpaired,
+    /// The list was read, and holds the device with these rights.
+    Paired(Vec<Permission>),
+}
+
+/// Reads the list of paired devices. `None` when it cannot be read.
+///
+/// A list that is not there counts as one that cannot be read. Taking the
+/// last pairing away leaves an empty list behind, not none, so a missing
+/// file says that something went wrong and not that everyone was
+/// unpaired.
+pub(crate) fn read_peers(paths: &Paths) -> Option<PeerStore> {
+    let path = paths.peers();
+    if !path.is_file() {
+        return None;
+    }
+    let peers = PeerStore::open(&path).ok()?;
+    // The file can go between the look and the reading, which then gives
+    // an empty list. An empty list is believed when the file is there.
+    (!peers.peers().is_empty() || path.is_file()).then_some(peers)
+}
+
+pub(crate) fn pairing(peers: Option<&PeerStore>, id: &str, public_key: &str) -> Pairing {
+    let Some(peers) = peers else {
+        return Pairing::Unknown;
+    };
+    let known = peers
+        .peers()
+        .iter()
+        .find(|known| known.id == id && known.public_key == public_key);
+    match known {
+        None => Pairing::Unpaired,
+        Some(known) => Pairing::Paired(known.permissions.clone()),
+    }
+}
+
+/// [`pairing`], from a reading of the list that is made now.
+pub(crate) fn pairing_now(paths: &Paths, id: &str, public_key: &str) -> Pairing {
+    pairing(read_peers(paths).as_ref(), id, public_key)
+}
+
 /// What a device may do with sessions on this host at this moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Standing {
     /// It is paired and has what starting takes.
     Allowed,
-    /// It is paired and lacks a right that starting takes. Also when the
-    /// list of paired devices cannot be read: nothing is allowed then, and
-    /// nothing is concluded from it.
+    /// It is paired and lacks a right that starting takes.
     Barred,
-    /// It is not in the list of paired devices.
+    /// The list of paired devices was read, and it is not in it.
     Unpaired,
+    /// The list of paired devices cannot be read.
+    Unknown,
 }
 
 fn standing(peers: Option<&PeerStore>, device: &Device) -> Standing {
-    let Some(peers) = peers else {
-        return Standing::Barred;
-    };
-    let known = peers
-        .peers()
-        .iter()
-        .find(|known| known.id == device.id && known.public_key == device.public_key);
-    match known {
-        None => Standing::Unpaired,
-        Some(known) if may_start(&known.permissions) => Standing::Allowed,
-        Some(_) => Standing::Barred,
+    match pairing(peers, &device.id, &device.public_key) {
+        Pairing::Unknown => Standing::Unknown,
+        Pairing::Unpaired => Standing::Unpaired,
+        Pairing::Paired(rights) if may_start(&rights) => Standing::Allowed,
+        Pairing::Paired(_) => Standing::Barred,
     }
 }
 
@@ -312,11 +368,19 @@ struct Checked {
     epoch: u64,
 }
 
+/// A device that asks about a session, with what the list of paired
+/// devices gives it at that moment.
+#[derive(Clone, Copy)]
+struct Caller<'a> {
+    peer: &'a Peer,
+    rights: &'a [Permission],
+}
+
 /// Who asks about a session.
 #[derive(Clone, Copy)]
 enum Asker<'a> {
     /// A paired device, on the control channel.
-    Device(&'a Peer),
+    Device(Caller<'a>),
     /// The person at this machine ([`local`]).
     Host,
 }
@@ -326,6 +390,8 @@ const NOT_ALLOWED: &str = "its device may no longer use applications of this hos
 /// Why an application is not started for such a device.
 const NOT_STARTED: &str =
     "the device that asked for it may no longer start applications on this host";
+/// Why nothing is allowed while the list of paired devices cannot be read.
+const CANNOT_READ: &str = "the host cannot read its list of paired devices right now";
 
 #[derive(Default)]
 struct Orders {
@@ -384,18 +450,6 @@ fn ending(reason: EndReason, message: impl Into<String>) -> SessionEnd {
         reason,
         message: message.into(),
     }
-}
-
-/// What the device may do on this host at this moment: read from the list
-/// on disk, not remembered from when a conversation or a session began.
-/// `None` when it is no longer paired.
-pub(crate) fn rights(paths: &Paths, id: &str, public_key: &str) -> Option<Vec<Permission>> {
-    let peers = PeerStore::open(paths.peers()).ok()?;
-    peers
-        .peers()
-        .iter()
-        .find(|known| known.id == id && known.public_key == public_key)
-        .map(|known| known.permissions.clone())
 }
 
 fn may_start(rights: &[Permission]) -> bool {
@@ -475,32 +529,18 @@ impl Sessions {
         remote: SocketAddr,
         apps: impl FnOnce() -> Vec<AppEntry>,
     ) -> Response {
-        let inner = &self.inner;
-        inner.forget_old();
+        self.inner.forget_old();
         // Looked up now, not when the conversation began: a conversation
         // can stay open for as long as a window does.
-        let Some(rights) = rights(&inner.paths, &peer.id, &peer.public_key) else {
-            return refuse(
-                ErrorCode::Forbidden,
-                "this device is no longer paired with the host",
-            );
+        let rights = match self.admit(request, peer) {
+            Ok(rights) => rights,
+            Err((code, why)) => return refuse(code, why),
         };
-        // What starting takes, everything about a session takes. A device
-        // that lost a right is not shown its sessions, and does not follow,
-        // list or end them either: they are with the person at the host.
-        if !may_start(&rights) {
-            let what = match request {
-                Request::SessionStart { .. } => {
-                    "this device may not start applications on the host"
-                }
-                _ => {
-                    "this device may not use applications of the host: \
-                     that takes the right to look and to control"
-                }
-            };
-            return refuse(ErrorCode::Forbidden, what);
-        }
-        match request {
+        let caller = Caller {
+            peer,
+            rights: &rights,
+        };
+        let response = match request {
             Request::SessionStart {
                 app,
                 kind,
@@ -513,39 +553,83 @@ impl Sessions {
                     display: *display,
                     offer,
                 };
-                self.start(peer, remote, &asked, apps)
+                self.start(caller, remote, &asked, apps)
             }
             Request::SessionAttach {
                 session,
                 display,
                 offer,
-            } => self.attach(peer, remote, session, *display, offer),
+            } => self.attach(caller, remote, session, *display, offer),
             Request::SessionWait {
                 session,
                 after,
                 timeout_ms,
                 attachment,
-            } => self.wait(peer, session, *after, *timeout_ms, *attachment),
+            } => self.wait(caller, session, *after, *timeout_ms, *attachment),
             Request::SessionDetach {
                 session,
                 attachment,
-            } => self.detach(peer, session, *attachment),
+            } => self.detach(caller, session, *attachment),
             Request::SessionStop { session, force } => {
-                self.stop(Asker::Device(peer), session, *force)
+                self.stop(Asker::Device(caller), session, *force)
             }
-            Request::SessionList => self.list(peer),
+            Request::SessionList => self.list(caller),
             _ => refuse(ErrorCode::Unsupported, "not a question about a session"),
+        };
+        // These two are held back, for seconds. They are answered only to
+        // a device that still has the rights when the answer is ready.
+        if matches!(
+            request,
+            Request::SessionWait { .. } | Request::SessionAttach { .. }
+        ) {
+            if let Err((code, why)) = self.admit(request, peer) {
+                return refuse(code, why);
+            }
+        }
+        response
+    }
+
+    /// What `peer` may do at this moment, if it may make `request`: every
+    /// request about a session takes what starting takes, whichever
+    /// session it is about. A device that lost a right is not shown
+    /// sessions, and does not follow, list or end them either. A list of
+    /// paired devices that cannot be read admits nobody.
+    fn admit(
+        &self,
+        request: &Request,
+        peer: &Peer,
+    ) -> Result<Vec<Permission>, (ErrorCode, &'static str)> {
+        match pairing_now(&self.inner.paths, &peer.id, &peer.public_key) {
+            Pairing::Unknown => Err((ErrorCode::Unavailable, CANNOT_READ)),
+            Pairing::Unpaired => Err((
+                ErrorCode::Forbidden,
+                "this device is no longer paired with the host",
+            )),
+            Pairing::Paired(rights) if may_start(&rights) => Ok(rights),
+            Pairing::Paired(_) => Err((
+                ErrorCode::Forbidden,
+                match request {
+                    Request::SessionStart { .. } => {
+                        "this device may not start applications on the host"
+                    }
+                    _ => {
+                        "this device may not use applications of the host: \
+                         that takes the right to look and to control"
+                    }
+                },
+            )),
         }
     }
 
     fn start(
         &self,
-        peer: &Peer,
+        caller: Caller<'_>,
         remote: SocketAddr,
         asked: &Asked<'_>,
         apps: impl FnOnce() -> Vec<AppEntry>,
     ) -> Response {
         let inner = &self.inner;
+        let peer = caller.peer;
         if asked.kind != StreamKind::AppWindow {
             return refuse(
                 ErrorCode::Unavailable,
@@ -594,7 +678,7 @@ impl Sessions {
         };
         {
             let mut table = inner.lock();
-            if let Some(full) = table.full_for(peer, &inner.rules) {
+            if let Some(full) = table.full_for(caller, &inner.rules) {
                 return refuse(ErrorCode::Unavailable, full);
             }
             table.started += 1;
@@ -649,12 +733,12 @@ impl Sessions {
         report(&info)
     }
 
-    fn list(&self, peer: &Peer) -> Response {
+    fn list(&self, caller: Caller<'_>) -> Response {
         let table = self.inner.lock();
         let mut mine: Vec<&Entry> = table
             .sessions
             .values()
-            .filter(|e| e.ended_at.is_none() && e.is_for(peer))
+            .filter(|e| e.ended_at.is_none() && e.is_for(caller))
             .collect();
         mine.sort_by_key(|e| e.number);
         Response::Sessions {
@@ -673,7 +757,7 @@ impl Sessions {
 
     fn wait(
         &self,
-        peer: &Peer,
+        caller: Caller<'_>,
         session: &SessionId,
         after: u64,
         timeout_ms: u32,
@@ -684,7 +768,7 @@ impl Sessions {
         let deadline = Instant::now() + hold;
         let mut table = inner.lock();
         loop {
-            let Some(entry) = table.owned(session, peer) else {
+            let Some(entry) = table.owned(session, caller) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
             // Only the client that is shown the session speaks for it: a
@@ -718,13 +802,14 @@ impl Sessions {
     /// session goes on either way.
     fn attach(
         &self,
-        peer: &Peer,
+        caller: Caller<'_>,
         remote: SocketAddr,
         session: &SessionId,
         display: DisplayMode,
         offer: &serde_json::Value,
     ) -> Response {
         let inner = &self.inner;
+        let peer = caller.peer;
         if let Some(why) = unreasonable(display) {
             return refuse(ErrorCode::Unavailable, why);
         }
@@ -740,7 +825,7 @@ impl Sessions {
         let deadline = Instant::now() + inner.rules.attach_within + inner.rules.tick * 20;
         let mut table = inner.lock();
         {
-            let Some(entry) = table.owned(session, peer) else {
+            let Some(entry) = table.owned(session, caller) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
             match entry.info.state {
@@ -763,7 +848,7 @@ impl Sessions {
         }
         inner.changed.notify_all();
         loop {
-            let Some(entry) = table.owned(session, peer) else {
+            let Some(entry) = table.owned(session, caller) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
             if let Some(at) = entry.attached.iter().position(|(n, _)| *n == number) {
@@ -793,12 +878,12 @@ impl Sessions {
         }
     }
 
-    fn detach(&self, peer: &Peer, session: &SessionId, attachment: u64) -> Response {
+    fn detach(&self, caller: Caller<'_>, session: &SessionId, attachment: u64) -> Response {
         let inner = &self.inner;
         let deadline = Instant::now() + inner.rules.tick * 10;
         let mut table = inner.lock();
         loop {
-            let Some(entry) = table.owned(session, peer) else {
+            let Some(entry) = table.owned(session, caller) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
             // A window that has been replaced has nothing to leave any more.
@@ -920,12 +1005,13 @@ impl Sessions {
 }
 
 impl Entry {
-    fn is_for(&self, peer: &Peer) -> bool {
+    fn is_for(&self, caller: Caller<'_>) -> bool {
         policy::may_use(
             &self.owner.id,
             &self.owner.public_key,
             self.info.left_by.is_some(),
-            peer,
+            caller.peer,
+            caller.rights,
         )
     }
 
@@ -963,29 +1049,29 @@ impl Table {
         self.sessions
             .get_mut(&session.0)
             .filter(|entry| match asker {
-                Asker::Device(peer) => entry.is_for(peer),
+                Asker::Device(caller) => entry.is_for(caller),
                 Asker::Host => true,
             })
     }
 
-    fn owned(&mut self, session: &SessionId, peer: &Peer) -> Option<&mut Entry> {
-        self.get(session, Asker::Device(peer))
+    fn owned(&mut self, session: &SessionId, caller: Caller<'_>) -> Option<&mut Entry> {
+        self.get(session, Asker::Device(caller))
     }
 
     /// Why `peer` cannot start one more session, when it cannot: it has as
     /// many as one device may, or the host has as many as it takes. Nothing
     /// is ended to make room. The device is told which of the sessions it
     /// may use nobody is shown, so that a person can decide.
-    fn full_for(&self, peer: &Peer, rules: &Rules) -> Option<String> {
+    fn full_for(&self, caller: Caller<'_>, rules: &Rules) -> Option<String> {
         let live: Vec<&Entry> = self
             .sessions
             .values()
             .filter(|e| e.ended_at.is_none())
             .collect();
-        let own = live.iter().filter(|e| e.started_by(peer)).count();
+        let own = live.iter().filter(|e| e.started_by(caller.peer)).count();
         let mut idle: Vec<&&Entry> = live
             .iter()
-            .filter(|e| e.info.state == SessionState::Detached && e.is_for(peer))
+            .filter(|e| e.info.state == SessionState::Detached && e.is_for(caller))
             .collect();
         idle.sort_by_key(|e| e.number);
         let idle: Vec<String> = idle
@@ -1104,7 +1190,7 @@ impl Inner {
     /// What `device` may do right now: read from the list of paired
     /// devices.
     fn standing_of(&self, device: &Device) -> Standing {
-        standing(PeerStore::open(self.paths.peers()).ok().as_ref(), device)
+        standing(read_peers(&self.paths).as_ref(), device)
     }
 
     /// Notes what the device that started a session may do with it now.
@@ -1201,20 +1287,29 @@ impl Inner {
             at: Some(Instant::now()),
             epoch,
         };
-        let peers = PeerStore::open(self.paths.peers()).ok();
-        let owner = standing(peers.as_ref(), &job.owner);
+        let Some(peers) = read_peers(&self.paths) else {
+            // A list that cannot be read is not an unpairing. The session
+            // stays as it is, with its marks, and the list is read again
+            // when it is next due. Nobody new is shown anything meanwhile.
+            if let Some(attach) = round.attach.take() {
+                self.attach_went(id, attach.number, Err(CANNOT_READ.to_string()));
+            }
+            return round;
+        };
+        let peers = Some(&peers);
+        let owner = standing(peers, &job.owner);
         self.mark(job, owner);
         round.revoked = owner != Standing::Allowed;
         // A pairing that is removed, or a right that is taken away, stops
         // the picture and keeps it stopped. It does not end the
         // application.
         if let Some(attach) = &round.attach {
-            if standing(peers.as_ref(), &attach.device) != Standing::Allowed {
+            if standing(peers, &attach.device) != Standing::Allowed {
                 self.attach_went(id, attach.number, Err(NOT_ALLOWED.to_string()));
                 round.attach = None;
             }
         }
-        if subject.is_some_and(|device| standing(peers.as_ref(), &device) != Standing::Allowed) {
+        if subject.is_some_and(|device| standing(peers, &device) != Standing::Allowed) {
             round.leave = Some(NOT_ALLOWED.to_string());
         }
         round
@@ -1295,8 +1390,15 @@ impl Inner {
             // The application, on the display the runner made. Nothing is
             // started for a device that lost its rights while the runner
             // got ready.
-            if self.standing_of(&job.owner) != Standing::Allowed {
-                break 'session ending(EndReason::Stopped, NOT_STARTED);
+            match self.standing_of(&job.owner) {
+                Standing::Allowed => {}
+                Standing::Unknown => {
+                    let why = format!("the application was not started: {CANNOT_READ}");
+                    break 'session ending(EndReason::AppFailed, why);
+                }
+                Standing::Barred | Standing::Unpaired => {
+                    break 'session ending(EndReason::Stopped, NOT_STARTED)
+                }
             }
             let application = match self.launcher.launch(&job.plan, &env) {
                 Ok(application) => app.insert(application),

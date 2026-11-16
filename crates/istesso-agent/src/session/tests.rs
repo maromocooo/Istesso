@@ -1027,14 +1027,29 @@ fn a_session_left_by_an_unpaired_device_is_open_to_devices_with_the_rights() {
     };
     assert_eq!(session(as_tablet(asking)).answer, None);
 
-    // A device that may only look gets nothing, as with any session, and
-    // the laptop stays out.
-    for device in [&phone, &host.laptop] {
-        let (code, _) = refusal(host.ask(device, Request::SessionList));
-        assert_eq!(code, ErrorCode::Forbidden);
-        let (code, _) = refusal(host.ask(device, attach.clone()));
-        assert_eq!(code, ErrorCode::Forbidden);
+    // "Every device that has the rights", and no other. A paired device
+    // that may only look is refused whatever it asks, about this session
+    // as about one that does not exist, so it does not learn which is
+    // there. The laptop, unpaired, is refused likewise.
+    let nothing = SessionId("0000000000000000".to_string());
+    for (device, why) in [
+        (&phone, "may not use applications"),
+        (&host.laptop, "no longer paired"),
+    ] {
+        for about in [&id, &nothing] {
+            for request in host.everything_about(about) {
+                let (code, message) = refusal(host.ask(device, request));
+                assert_eq!(code, ErrorCode::Forbidden);
+                assert!(message.contains(why), "{message}");
+            }
+        }
     }
+    // None of that reached the application or its stream.
+    assert_eq!(host.since_running(), ["runner detach", "runner attach"]);
+    assert_eq!(
+        session(as_tablet(look.clone())).state,
+        SessionState::Running
+    );
 
     // The picture stops for the device that is shown the session when
     // that device loses a right, whoever started the session.
@@ -1057,6 +1072,16 @@ fn a_session_left_by_an_unpaired_device_is_open_to_devices_with_the_rights() {
         Some("laptop")
     );
     assert_eq!(host.list(&tablet).len(), 1);
+    // The same machine paired anew, with a key it did not have before, is
+    // a device like the tablet: it finds the session as one that a device
+    // called "laptop" left.
+    let renewed = pair(&host.paths, "laptop", Permission::defaults());
+    assert_ne!(renewed.id, host.laptop.id);
+    let listed = host.list(&renewed);
+    assert_eq!(
+        (listed.len(), listed[0].left_by.as_deref()),
+        (1, Some("laptop"))
+    );
     // Any of them can end it.
     session(as_tablet(Request::SessionStop {
         session: id.clone(),
@@ -1064,6 +1089,90 @@ fn a_session_left_by_an_unpaired_device_is_open_to_devices_with_the_rights() {
     }));
     let over = host.settles(&id, |s| s.info.state == SessionState::Ended);
     assert_eq!(over.info.end.unwrap().reason, EndReason::Stopped);
+}
+
+#[test]
+fn nobody_uses_a_session_without_the_rights_whoever_it_is_for() {
+    let host = host();
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    let full = Permission::defaults();
+    let (owner, key) = (&host.laptop.id, &host.laptop.public_key);
+    let may = |left: bool, peer: &Peer, rights: &[Permission]| {
+        policy::may_use(owner, key, left, peer, rights)
+    };
+    // The device that started it, and nobody else ...
+    assert!(may(false, &host.laptop, &full));
+    assert!(!may(false, &tablet, &full));
+    // ... until that device was unpaired: then every device that has what
+    // starting takes.
+    assert!(may(true, &tablet, &full));
+    assert!(may(true, &host.laptop, &full));
+    // Never without it: not half of it, not the device that started the
+    // session, and not for a session that was left.
+    for lacking in [
+        vec![],
+        vec![Permission::View],
+        vec![Permission::Control],
+        vec![Permission::View, Permission::Audio],
+    ] {
+        assert!(!may(false, &host.laptop, &lacking), "{lacking:?}");
+        assert!(!may(true, &host.laptop, &lacking), "{lacking:?}");
+        assert!(!may(true, &tablet, &lacking), "{lacking:?}");
+    }
+}
+
+#[test]
+fn a_list_of_paired_devices_that_cannot_be_read_is_not_an_unpairing() {
+    let host = host();
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    let id = host.running().id;
+    let list = host.paths.peers();
+    let good = std::fs::read(&list).unwrap();
+
+    for broken in ["missing", "half-written", "empty"] {
+        match broken {
+            "missing" => std::fs::remove_file(&list).unwrap(),
+            "half-written" => std::fs::write(&list, &good[..good.len() / 2]).unwrap(),
+            _ => std::fs::write(&list, "").unwrap(),
+        }
+        // Several rounds try to read it.
+        std::thread::sleep(Duration::from_millis(250));
+        // Nothing is concluded from that. The session is as it was, shown
+        // and without a mark, and its stream was told nothing.
+        let seen = host.sessions.host_look(&id).unwrap();
+        assert_eq!(
+            (seen.info.state, seen.revoked, &seen.info.left_by),
+            (SessionState::Running, false, &None),
+            "{broken}"
+        );
+        assert!(host.since_running().is_empty(), "{broken}");
+        // Nothing is allowed either, and nothing is widened: whoever asks
+        // is refused, the device that started the session included.
+        for device in [&host.laptop, &tablet] {
+            for request in host.everything_about(&id) {
+                let (code, message) = refusal(host.ask(device, request));
+                assert_eq!(code, ErrorCode::Unavailable, "{broken}");
+                assert!(
+                    message.contains("cannot read its list of paired devices"),
+                    "{message}"
+                );
+            }
+            let (code, _) = refusal(host.start_as(device, "paint.desktop"));
+            assert_eq!(code, ErrorCode::Unavailable, "{broken}");
+        }
+        // The list is back, and with it what was there before. No more.
+        std::fs::write(&list, &good).unwrap();
+        assert_eq!(host.look(&id).state, SessionState::Running);
+        assert!(host.list(&tablet).is_empty());
+    }
+    assert!(host.since_running().is_empty());
+    assert_eq!(host.sessions.host_look(&id).unwrap().info.left_by, None);
+
+    // A list that was read and does not hold the device is another matter.
+    host.unpair(&host.laptop);
+    let left = host.settles(&id, |s| s.info.left_by.is_some());
+    assert_eq!(left.info.state, SessionState::Detached);
+    assert_eq!(host.list(&tablet).len(), 1);
 }
 
 #[cfg(unix)]

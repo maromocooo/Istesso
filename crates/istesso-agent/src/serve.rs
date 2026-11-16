@@ -21,7 +21,7 @@ use crate::status::local_status;
 use crate::survey::{refresh_peers, SurveyOptions};
 
 // Streaming sessions (`docs/adr/0010-session-start.md`).
-use crate::session::Sessions;
+use crate::session::{Pairing, Sessions};
 
 /// Connections served at the same time; further ones are dropped.
 const MAX_CONNECTIONS: usize = 64;
@@ -328,23 +328,37 @@ impl Shared {
         while let Ok(Some(request)) = session.next_request() {
             // What the device may do is read now, not remembered from the
             // handshake: a conversation can stay open for as long as a
-            // window does. A device that was unpaired is not answered.
-            let peer = session.peer();
-            let Some(rights) = crate::session::rights(&self.paths, &peer.id, &peer.public_key)
-            else {
-                break;
+            // window does. A device that is not paired gets no answer, and
+            // neither does anyone while the list of paired devices cannot
+            // be read: the conversation ends, and the device can try again.
+            let now = || {
+                let peer = session.peer();
+                crate::session::pairing_now(&self.paths, &peer.id, &peer.public_key)
             };
-            let response = match request {
+            let response = if crate::session::is_session_request(&request) {
                 // Streaming sessions have their own table, and their own
-                // rules about who may ask.
-                request if crate::session::is_session_request(&request) => {
+                // rules about who may ask. An answer can be held back for
+                // seconds, so the list is read once more when it is ready.
+                let response =
                     self.sessions
                         .answer(&request, session.peer(), session.remote_addr(), || {
                             self.apps()
-                        })
+                        });
+                if !matches!(now(), Pairing::Paired(_)) {
+                    break;
                 }
-                request if rights.contains(&Permission::View) => self.answer(&request, &mut asked),
-                _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
+                response
+            } else {
+                match now() {
+                    Pairing::Paired(rights) if rights.contains(&Permission::View) => {
+                        self.answer(&request, &mut asked)
+                    }
+                    Pairing::Paired(_) => Response::error(
+                        ErrorCode::Forbidden,
+                        "this device may not look at the host",
+                    ),
+                    Pairing::Unpaired | Pairing::Unknown => break,
+                }
             };
             if session.respond(&response).is_err() {
                 break;
@@ -378,14 +392,15 @@ impl Shared {
 
     /// Ends the conversations of devices that are not in the list of
     /// paired devices any more, and says how many. A list that cannot be
-    /// read pairs nobody.
+    /// read is not an unpairing: nothing is ended for it. Whoever asks
+    /// something meanwhile is not answered.
     fn cut_unpaired(&self) -> usize {
-        let peers = PeerStore::open(self.paths.peers()).ok();
+        let Some(peers) = crate::session::read_peers(&self.paths) else {
+            return 0;
+        };
         let paired = |conversation: &Conversation| {
-            peers.as_ref().is_some_and(|peers| {
-                peers.peers().iter().any(|known| {
-                    known.id == conversation.id && known.public_key == conversation.public_key
-                })
+            peers.peers().iter().any(|known| {
+                known.id == conversation.id && known.public_key == conversation.public_key
             })
         };
         let mut cut = Vec::new();
@@ -561,20 +576,51 @@ mod tests {
         laptop_talks.ping().unwrap();
         tablet_talks.ping().unwrap();
         let open = || shared.open.lock().unwrap().len();
+        let settle_at = |count: usize| {
+            let since = Instant::now();
+            while open() != count {
+                assert!(since.elapsed() < PAIRINGS_READ_EVERY * 3, "{} open", open());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
         assert_eq!(open(), 2);
 
-        // Nobody tells the agent. It reads the list itself, and ends the
-        // laptop's conversation without the laptop having said a word.
+        // A list of paired devices that cannot be read is not an
+        // unpairing: no conversation is ended for it, however often the
+        // agent looks. But nobody is answered meanwhile. The one that asks
+        // loses its conversation, and can come back.
+        let list = paths.peers();
+        let good = std::fs::read(&list).unwrap();
+        let mut spare = connect(&tablet_identity).unwrap();
+        spare.ping().unwrap();
+        assert_eq!(open(), 3);
+        std::fs::remove_file(&list).unwrap();
+        std::thread::sleep(PAIRINGS_READ_EVERY + Duration::from_millis(300));
+        assert_eq!(open(), 3);
+        assert!(spare.ping().is_err());
+        std::fs::write(&list, &good).unwrap();
+        settle_at(2);
+        laptop_talks.ping().unwrap();
+        tablet_talks.ping().unwrap();
+
+        // The laptop is unpaired, and nobody tells the agent. What the
+        // laptop asks at that moment is not answered, not even with a
+        // refusal ...
+        let mut laptop_asks = connect(&laptop_identity).unwrap();
+        settle_at(3);
         let removed = PeerStore::open(paths.peers())
             .unwrap()
             .remove(&laptop.id)
             .unwrap();
         assert!(removed.is_some());
-        let unpaired = Instant::now();
-        while open() > 1 {
-            assert!(unpaired.elapsed() < PAIRINGS_READ_EVERY * 3, "still open");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let nothing = laptop_asks.call(&Request::SessionList);
+        assert!(
+            matches!(&nothing, Err(why) if !matches!(why, istesso_link::Error::Remote(_))),
+            "{nothing:?}"
+        );
+        // ... and the agent reads the list itself, and ends the other
+        // conversation without the laptop having said a word.
+        settle_at(1);
         assert!(laptop_talks.ping().is_err());
         // The other device is not touched, and the laptop does not get in
         // again.
