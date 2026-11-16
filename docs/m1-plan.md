@@ -18,7 +18,7 @@ M1 はこのプロジェクトの関門です。「リモートだと感じな�
 
 | 役 | 機材 | 接続 |
 |---|---|---|
-| ホスト | Ubuntu 24.04、RTX 4090（NVENC）、PipeWire、GStreamer。デスクトップは X11 のセッション | Wi-Fi 6。有線の口はあるが、いまはつないでいない |
+| ホスト | Ubuntu 24.04、RTX 4090（NVENC）、PipeWire、GStreamer。デスクトップは X11 のセッション | 有線（2.5 Gbps）。2026-11-16 の午前につないだ。それまでの計測は Wi-Fi 6。Wi-Fi も有効なままなので、計測では有線側のアドレスを使う |
 | クライアント | MacBook Air（M4、macOS 26）。外部ディスプレイ（85 Hz まで）で測る。内蔵ディスプレイは 60 Hz | Wi-Fi 6。有線にするにはアダプターが要る |
 
 ホストのデスクトップが X11 でも、配信するアプリは専用の仮想コンポジター（Wayland）の中で動かすので、方式としては独立しています。実機でそのとおりに動くかは手順 3 で確かめます。
@@ -147,7 +147,16 @@ Air の上でコーディングエージェントを動かし、Ubuntu へは SS
 - コーデックは H.265 から始める。AV1 は、両方の PC でハードウェアが使えることを確かめてから比べる。
 - **暗号化していない UDP は計測のためだけに使います。** 製品には残しません。
 
-追記（2026-11-16）：gst-wayland-display のいまの `stable` ブランチは、GStreamer 1.28 以上と libwayland 1.23 以上を要求します。Ubuntu 24.04 に入るのは 1.24 と 1.22 です。2026-06-24 より前のコミット（たとえば `c49af96`）は GStreamer 1.24 を前提にしていますが、この機材でビルドできるかはまだ確かめていません。古いコミットに固定するか、新しい GStreamer を別に用意するかは、この手順の最初に決めて ADR に残します。
+追記（2026-11-16）：gst-wayland-display のいまの `stable` ブランチは、GStreamer 1.28 以上と libwayland 1.23 以上を要求します。Ubuntu 24.04 に入るのは 1.24 と 1.22 です。
+
+ホストで試した結果：
+
+| コミット | 結果 |
+|---|---|
+| `1301f86`（2026-05-01） | ビルドでき、GStreamer 1.24.2 から `waylanddisplaysrc` として読み込める。出力は DMABuf か RGBx。プロパティは `render-node`、`keyboard`、`mouse` |
+| `c49af96`（2026-05-11） | ビルドはできるが、読み込めない。libwayland 1.23 の関数（`wl_client_set_max_buffer_size`）を使っている |
+
+まず `1301f86` に固定して進めます。ビルドに要る開発用のパッケージは導入済みです（`libgstreamer1.0-dev`、`libgstreamer-plugins-base1.0-dev`、`libgstreamer-plugins-bad1.0-dev`、`libwayland-dev`、`libxkbcommon-dev`、`libinput-dev`、`libudev-dev`、`libgbm-dev`、`libegl-dev`、`libssl-dev`）。映像を実際に取り出せるかは、まだ確かめていません。古いコミットを使い続けるか、新しい GStreamer を別に用意するかは、数値を取ったあとで ADR に残します。
 
 ### 手順 4：自前の実装に置き換える
 
