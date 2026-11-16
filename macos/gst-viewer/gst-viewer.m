@@ -894,6 +894,9 @@ int main(int argc, char *argv[]) {
             }
             width = display.size.width;
             height = display.size.height;
+            // While this is the active application the menu bar and the Dock stay away, so that
+            // the picture has the whole display. They come back when another application is.
+            NSApp.presentationOptions = NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar;
         }
         NSWindow *window = whole_display
             ? [[WholeDisplayWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
