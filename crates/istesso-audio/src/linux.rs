@@ -55,6 +55,10 @@ pub struct SinkStats {
     age_max_ns: AtomicI64,
     step_max_ns: AtomicU64,
     resumed: AtomicU64,
+    late_cycles: AtomicU64,
+    late_total_ns: AtomicU64,
+    late_max_ns: AtomicU64,
+    late_last_ns: AtomicU64,
 }
 
 impl Default for SinkStats {
@@ -71,6 +75,10 @@ impl Default for SinkStats {
             age_max_ns: AtomicI64::new(i64::MIN),
             step_max_ns: AtomicU64::new(0),
             resumed: AtomicU64::new(0),
+            late_cycles: AtomicU64::new(0),
+            late_total_ns: AtomicU64::new(0),
+            late_max_ns: AtomicU64::new(0),
+            late_last_ns: AtomicU64::new(0),
         }
     }
 }
@@ -99,6 +107,13 @@ pub struct SinkSnapshot {
     pub cycle_step_max_ms: f64,
     /// Times audio came again after a second or more without any.
     pub resumed: u64,
+    /// Cycles that began a millisecond or more later than the cycle before
+    /// them left room for, while audio flowed: how many, by how much in
+    /// all, the latest of them, and the last one.
+    pub late_cycles: u64,
+    pub late_total_ms: f64,
+    pub late_max_ms: f64,
+    pub late_last_ms: f64,
 }
 
 impl SinkStats {
@@ -122,6 +137,10 @@ impl SinkStats {
             cycle_age_max_ms: age(self.age_max_ns.load(Ordering::Relaxed)),
             cycle_step_max_ms: self.step_max_ns.load(Ordering::Relaxed) as f64 * 1e-6,
             resumed: self.resumed.load(Ordering::Relaxed),
+            late_cycles: self.late_cycles.load(Ordering::Relaxed),
+            late_total_ms: self.late_total_ns.load(Ordering::Relaxed) as f64 * 1e-6,
+            late_max_ms: self.late_max_ns.load(Ordering::Relaxed) as f64 * 1e-6,
+            late_last_ms: self.late_last_ns.load(Ordering::Relaxed) as f64 * 1e-6,
         }
     }
 }
@@ -142,10 +161,15 @@ struct Capture {
     channels: usize,
     /// Room for the largest piece the ring takes; filled anew every cycle.
     samples: Vec<f32>,
-    /// When the cycle before this one began.
+    /// When the cycle before this one began, and how long its audio lasts.
     last_began_ns: Option<u64>,
+    last_lasts_ns: u64,
     stats: Arc<SinkStats>,
 }
+
+/// A cycle that begins this much later than the one before left room for
+/// counts as late.
+const LATE_NS: u64 = 1_000_000;
 
 /// With no audio for this long, the next cycle counts as audio coming again,
 /// not as a cycle that was late.
@@ -159,6 +183,7 @@ impl Capture {
             channels,
             samples: Vec::with_capacity(MAX_PACKET_FRAMES * channels),
             last_began_ns: None,
+            last_lasts_ns: 0,
             stats,
         }
     }
@@ -199,9 +224,17 @@ impl Capture {
                 stats.resumed.fetch_add(1, Ordering::Relaxed);
             } else {
                 stats.step_max_ns.fetch_max(step, Ordering::Relaxed);
+                let late = step.saturating_sub(self.last_lasts_ns);
+                if late >= LATE_NS {
+                    stats.late_cycles.fetch_add(1, Ordering::Relaxed);
+                    stats.late_total_ns.fetch_add(late, Ordering::Relaxed);
+                    stats.late_max_ns.fetch_max(late, Ordering::Relaxed);
+                    stats.late_last_ns.store(late, Ordering::Relaxed);
+                }
             }
         }
         self.last_began_ns = Some(capture_ns);
+        self.last_lasts_ns = (frames as f64 / self.writer.rate() * 1e9) as u64;
 
         let rate = self.writer.rate();
         let mut fitted = true;
@@ -617,6 +650,10 @@ mod tests {
         let seen = stats.snapshot();
         assert!((seen.cycle_step_max_ms - 40.0).abs() < 1e-6, "{seen:?}");
         assert_eq!(seen.resumed, 0);
+        // One cycle began late: 40 ms after the last, which lasted 5.3 ms.
+        assert_eq!(seen.late_cycles, 1);
+        assert!((seen.late_max_ms - 34.667).abs() < 0.01, "{seen:?}");
+        assert!((seen.late_total_ms - seen.late_last_ms).abs() < 1e-9);
 
         // Nothing played for three seconds: that is a pause, not a stall.
         capture.take(&audio, 3_145 * ms, Some(0));

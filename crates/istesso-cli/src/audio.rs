@@ -601,9 +601,24 @@ fn serve(options: ServeOptions) -> Result<(), String> {
     // The tone ends by itself after `seconds`; a pipe ends when its writer
     // does. With a limit and a pipe that goes on, stop at the limit.
     let begin = Instant::now();
+    let mut late_cycles_said = 0u64;
     while !feeder.is_finished() {
         if seconds.is_some_and(|limit| begin.elapsed().as_secs_f64() >= limit + 0.5) {
             break;
+        }
+        // A capture cycle that began late is said at once, with the time,
+        // so that it can be laid beside what the exit saw.
+        if let Some(late) = capture_report.as_ref().map(|report| report()) {
+            let cycles = late["late_cycles"].as_u64().unwrap_or(0);
+            if cycles > late_cycles_said {
+                late_cycles_said = cycles;
+                eprintln!(
+                    "{:>8.1} s since the start: a capture cycle began {:.1} ms late ({} so far)",
+                    begin.elapsed().as_secs_f64(),
+                    late["late_last_ms"].as_f64().unwrap_or(0.0),
+                    cycles
+                );
+            }
         }
         if options.stop_file.as_ref().is_some_and(|file| file.exists()) {
             break;
@@ -779,7 +794,7 @@ mod mac {
         // the person whether this program may use the local network, and it
         // only asks while the program keeps trying.
         let give_up = Instant::now() + Duration::from_secs_f64(options.connect_for.max(0.0));
-        let offset = loop {
+        let mut offset = loop {
             match clock_offset(addr, &keys, &peers, expected.as_deref(), 16, wait) {
                 Ok(offset) => break offset,
                 Err(istesso_audio::Error::Io(err)) if Instant::now() < give_up => {
@@ -910,6 +925,13 @@ mod mac {
             .then(|| probe::ToneWatch::new(device.sample_rate, options.tone_hz, 60.0));
         let mut played_frames = 0u64;
         let mut frame = vec![0.0f32; channels];
+        // The two machines' clocks drift apart by milliseconds in minutes,
+        // so their difference is taken again once a minute while playing.
+        let first_offset = offset;
+        let mut offset_taken = Instant::now();
+        let mut offset_checks = 0u32;
+        let mut offset_failures = 0u32;
+        let mut offset_round_trip_max_ns = offset.round_trip_ns;
         let mut waits_ms: Vec<f64> = Vec::new();
         let mut latency_ms: Vec<f64> = Vec::new();
         let mut on_the_way_ms: Vec<f64> = Vec::new();
@@ -949,6 +971,18 @@ mod mac {
                     waits_ms.push(wait);
                     latency_ms.push(wait + on_the_way);
                     on_the_way_ms.push(on_the_way);
+                }
+            }
+            if offset_taken.elapsed() >= Duration::from_secs(60) {
+                offset_taken = Instant::now();
+                match clock_offset(addr, &keys, &peers, expected.as_deref(), 8, wait) {
+                    Ok(taken) => {
+                        offset = taken;
+                        offset_checks += 1;
+                        offset_round_trip_max_ns =
+                            offset_round_trip_max_ns.max(taken.round_trip_ns);
+                    }
+                    Err(_) => offset_failures += 1,
                 }
             }
             if said.elapsed() >= Duration::from_secs(1) {
@@ -998,6 +1032,25 @@ mod mac {
         }
 
         let tone = watch.map(probe::ToneWatch::finish);
+        // The first ten minutes against the last ten: lateness that piled
+        // up over the run would show as a difference. Taken before the
+        // lists are sorted for their spread.
+        let ends_of = |values: &[f64]| {
+            let ten_minutes =
+                (600.0 * stream_rate / f64::from(info.packet_frames.max(64))) as usize;
+            let part = ten_minutes.min(values.len() / 2);
+            let median = |part: &[f64]| {
+                let mut part = part.to_vec();
+                Spread::of(&mut part).map(|spread| spread.median)
+            };
+            serde_json::json!({
+                "packets_each": part,
+                "first_median": median(&values[..part]),
+                "last_median": median(&values[values.len() - part..]),
+            })
+        };
+        let latency_ends = ends_of(&latency_ms);
+        let wait_ends = ends_of(&waits_ms);
         let count = callbacks.count.load(Ordering::Relaxed).max(1);
         let device_latency_ms = f64::from(device.latency_frames + device.safety_offset_frames)
             / device.sample_rate
@@ -1021,7 +1074,18 @@ mod mac {
                 "stated_latency_ms": device_latency_ms,
             },
             "target_wait_ms": options.latency_ms,
-            "clock": offset,
+            // The difference of the two clocks: as first taken, as last
+            // taken, and how far it moved in between.
+            "clock": first_offset,
+            "clock_at_the_end": offset,
+            "clock_checks": {
+                "taken_again": offset_checks,
+                "failed": offset_failures,
+                "moved_ms": (offset.source_to_local_ns - first_offset.source_to_local_ns) as f64 * 1e-6,
+                "round_trip_max_ms": offset_round_trip_max_ns as f64 * 1e-6,
+            },
+            "capture_to_output_first_and_last_ten_minutes_ms": latency_ends,
+            "wait_first_and_last_ten_minutes_ms": wait_ends,
             "arrivals": arrivals.stats(),
             "playout": stats.snapshot(),
             "callbacks": {
