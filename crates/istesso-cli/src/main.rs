@@ -16,6 +16,8 @@ use istesso_proto::{
     Role, UnifiedApp,
 };
 
+mod open;
+
 #[derive(Parser)]
 #[command(
     name = "istesso",
@@ -65,6 +67,11 @@ enum Command {
         /// Report every conversation with a paired device
         #[arg(short, long)]
         verbose: bool,
+        /// Program that makes the picture of an application for another
+        /// device (default: $ISTESSO_SESSION_RUNNER). Without one, this
+        /// machine does not show its applications to other devices
+        #[arg(long, value_name = "PROGRAM")]
+        session_runner: Option<PathBuf>,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -77,6 +84,34 @@ enum Command {
     },
     /// Show this device's name and key fingerprint
     Id,
+    /// Open an application, wherever it is installed
+    ///
+    /// An application of this machine is started here. One that only
+    /// another device has is started there and shown in a window here; the
+    /// command then stays until the window is closed, the application
+    /// ends, or Ctrl-C.
+    #[command(name = open::COMMAND)]
+    Open {
+        /// Name of the application, as `istesso apps list --all` shows it
+        app: String,
+        /// Device to run it on (name or id), instead of the one chosen
+        /// automatically
+        #[arg(long, value_name = "DEVICE")]
+        host: Option<String>,
+        /// Program that shows the picture (default: $ISTESSO_VIEWER)
+        #[arg(long, value_name = "PROGRAM")]
+        viewer: Option<PathBuf>,
+        /// Size of the picture, in pixels
+        #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = open::parse_size)]
+        size: Option<(u32, u32)>,
+        /// Frames a second
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        fps: Option<u32>,
+        /// Where the window goes, in points from the top left of the main
+        /// display
+        #[arg(long, value_name = "X,Y", value_parser = open::parse_position, allow_hyphen_values = true)]
+        position: Option<(i32, i32)>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -212,13 +247,17 @@ fn run(cli: Cli) -> Result<(), String> {
             bind,
             no_discovery,
             verbose,
-        } => run_agent(AgentOptions {
-            bind,
-            port,
-            discovery: !no_discovery,
-            verbose,
-            ..AgentOptions::default()
-        }),
+            session_runner,
+        } => run_agent(
+            AgentOptions {
+                bind,
+                port,
+                discovery: !no_discovery,
+                verbose,
+                ..AgentOptions::default()
+            },
+            session_runner,
+        ),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
         Command::Id => {
             let paths = Paths::from_env();
@@ -229,6 +268,21 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("Cache        {}", paths.cache.display());
             Ok(())
         }
+        Command::Open {
+            app,
+            host,
+            viewer,
+            size,
+            fps,
+            position,
+        } => open::run(open::Options {
+            app,
+            host,
+            viewer,
+            size,
+            fps,
+            position,
+        }),
     }
 }
 
@@ -759,7 +813,7 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
 // agent / hosts
 // ---------------------------------------------------------------------------
 
-fn run_agent(options: AgentOptions) -> Result<(), String> {
+fn run_agent(options: AgentOptions, session_runner: Option<PathBuf>) -> Result<(), String> {
     let paths = Paths::from_env();
     // Everything that takes time happens before the port is opened: from
     // that moment on callers expect a prompt reaction.
@@ -768,9 +822,29 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     let paired = open_peers()?.peers().len();
 
     let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
+    // The program that makes the picture when a paired device asks for an
+    // application of this machine (ADR 0010).
+    let session_runner = session_runner.or_else(|| {
+        std::env::var_os("ISTESSO_SESSION_RUNNER")
+            .filter(|program| !program.is_empty())
+            .map(PathBuf::from)
+    });
+    let agent = match &session_runner {
+        Some(program) => agent.with_session_runner(program),
+        None => agent,
+    };
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
     println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
+    match &session_runner {
+        Some(program) => println!(
+            "Paired devices that may control this machine can start its applications; {} shows them.",
+            program.display()
+        ),
+        None => println!(
+            "No session runner is set (--session-runner): applications of this machine are not shown to other devices."
+        ),
+    }
     let reachable: Vec<String> = addresses
         .iter()
         .map(|address| with_port(address, addr.port()))
