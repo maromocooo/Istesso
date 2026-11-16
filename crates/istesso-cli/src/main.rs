@@ -124,6 +124,11 @@ enum MeasureAction {
         /// Log written by the test application on the host
         #[arg(long, value_name = "FILE", requires = "local_app")]
         relayed_app: Option<PathBuf>,
+        /// What the local window's median added latency usually is on this
+        /// machine, in milliseconds. A run that is 2 ms or more away from
+        /// it is flagged to be measured again
+        #[arg(long, value_name = "MS", requires = "local_app")]
+        local_usual: Option<f64>,
         /// Refresh rate of the display both windows were on, to count the
         /// difference in refreshes
         #[arg(long, value_name = "HZ")]
@@ -1050,6 +1055,7 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
             relayed,
             local_app,
             relayed_app,
+            local_usual,
             refresh_hz,
             json,
         } => {
@@ -1067,7 +1073,8 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
                 local_app.as_deref(),
                 relayed_app.as_deref(),
                 refresh_hz,
-            );
+            )
+            .with_local_usual(local_usual);
             if json {
                 print_json(&comparison)
             } else {
@@ -1192,6 +1199,17 @@ mod tests {
         };
         assert!(parse(&[]).is_ok());
         assert!(parse(&["--local-app", "local.jsonl", "--relayed-app", "host.jsonl"]).is_ok());
+        assert!(parse(&[
+            "--local-app",
+            "local.jsonl",
+            "--relayed-app",
+            "host.jsonl",
+            "--local-usual",
+            "17.3"
+        ])
+        .is_ok());
+        // What is usual for the local window means nothing without its application's log.
+        assert!(parse(&["--local-usual", "17.3"]).is_err());
         // Added latency of one window alone says nothing about the pass line.
         assert!(parse(&["--local-app", "local.jsonl"]).is_err());
         assert!(parse(&["--relayed-app", "host.jsonl"]).is_err());

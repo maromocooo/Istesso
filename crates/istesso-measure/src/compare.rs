@@ -24,7 +24,9 @@ use crate::stats::Summary;
 /// How much more added latency a relayed window may have than a local one.
 ///
 /// Decided on 2026-11-16 (ADR 0002). It applies with both machines on a
-/// cable and a display at 85 Hz.
+/// cable, a display at 85 Hz, a relayed picture of 3440 by 1440 and the
+/// moving text picture. The 99th percentile counts only in runs of
+/// [`VERDICT_SAMPLES`] inputs or more.
 pub const PASS_LINE: Gap = Gap {
     median_ms: 12.0,
     p95_ms: 24.0,
@@ -32,8 +34,14 @@ pub const PASS_LINE: Gap = Gap {
 };
 
 /// Inputs a run needs before its figures may decide the milestone. A routine
-/// measurement makes do with [`MIN_SAMPLES`].
+/// measurement makes do with [`MIN_SAMPLES`] and is read by its median and
+/// its 95th percentile: the 99th percentile of 500 inputs rests on five.
 pub const VERDICT_SAMPLES: usize = 2000;
+
+/// A run whose local window is this far or further from its usual median
+/// added latency is measured again: the figure the pass line is about moves
+/// with the local window as much as with the relayed one.
+pub const LOCAL_DRIFT_LIMIT_MS: f64 = 2.0;
 
 /// Added latency of the relayed window over the local one: median against
 /// median, 95th percentile against 95th, 99th against 99th.
@@ -76,6 +84,9 @@ pub struct Comparison {
     pub local_added: Option<Summary>,
     /// The figure the pass line is about. `None` unless both logs were given.
     pub gap: Option<Gap>,
+    /// What the local window's median added latency usually is on this
+    /// machine, when the caller says ([`Comparison::with_local_usual`]).
+    pub local_usual_ms: Option<f64>,
     /// Lines that repeat an input number in one of the applications' logs
     /// (see [`Report::repeated`]).
     pub repeated: usize,
@@ -180,6 +191,7 @@ impl Comparison {
             relayed_added,
             local_added,
             gap,
+            local_usual_ms: None,
             repeated,
             by_hand,
             later_by: Summary::of(&later_by),
@@ -188,6 +200,26 @@ impl Comparison {
             refresh_ms,
             refreshes: refreshes.into_iter().collect(),
         }
+    }
+
+    /// Says what the local window's median added latency usually is, so
+    /// that a run in which the local window itself was off can be told.
+    pub fn with_local_usual(mut self, usual_ms: Option<f64>) -> Comparison {
+        self.local_usual_ms = usual_ms.filter(|ms| ms.is_finite());
+        self
+    }
+
+    /// How far the local window's median added latency is from its usual
+    /// value, in milliseconds. `None` when either is not known.
+    pub fn local_off_by(&self) -> Option<f64> {
+        Some(self.local_added?.median_ms - self.local_usual_ms?)
+    }
+
+    /// Whether the local window was far enough from its usual value for the
+    /// run to be measured again.
+    pub fn measure_again(&self) -> bool {
+        self.local_off_by()
+            .is_some_and(|off| off.abs() >= LOCAL_DRIFT_LIMIT_MS)
     }
 
     /// Share of the paired inputs, in percent, for which the relayed window
@@ -230,6 +262,25 @@ impl Comparison {
         out.push_str(&header);
         out.push_str(&summary_row("relayed window", &self.relayed_added));
         out.push_str(&summary_row("local window", &self.local_added));
+        if let (Some(off), Some(usual), Some(local)) =
+            (self.local_off_by(), self.local_usual_ms, &self.local_added)
+        {
+            let side = if off < 0.0 { "below" } else { "above" };
+            let _ = write!(
+                out,
+                "The local window's median is {:.2} ms, {:.2} ms {side} its usual {usual:.2} ms",
+                local.median_ms,
+                off.abs()
+            );
+            if self.measure_again() {
+                let _ = writeln!(
+                    out,
+                    ": measure again ({LOCAL_DRIFT_LIMIT_MS:.0} ms or more off)."
+                );
+            } else {
+                out.push_str(".\n");
+            }
+        }
         out.push('\n');
         match &self.gap {
             Some(gap) => {
@@ -253,16 +304,29 @@ impl Comparison {
                     "{:<LABEL$}{:>9.2}{:>9.2}{:>9.2}",
                     "pass line", PASS_LINE.median_ms, PASS_LINE.p95_ms, PASS_LINE.p99_ms
                 );
+                let enough = self.paired >= VERDICT_SAMPLES;
                 let _ = writeln!(
                     out,
                     "{:<LABEL$}{:>9}{:>9}{:>9}",
                     "",
                     verdict(gap.median_ms, PASS_LINE.median_ms),
                     verdict(gap.p95_ms, PASS_LINE.p95_ms),
-                    verdict(gap.p99_ms, PASS_LINE.p99_ms)
+                    if enough {
+                        verdict(gap.p99_ms, PASS_LINE.p99_ms)
+                    } else {
+                        "-"
+                    }
                 );
+                if !enough {
+                    let _ = writeln!(
+                        out,
+                        "The 99th percentile is judged only in runs of {VERDICT_SAMPLES} inputs or more: \
+                         in a shorter run it rests on a handful of inputs."
+                    );
+                }
                 out.push_str(
-                    "The pass line applies with both machines on a cable and a display at 85 Hz (ADR 0002).\n",
+                    "The pass line applies with both machines on a cable, a display at 85 Hz, a relayed \
+                     picture of 3440x1440 and the moving text picture (ADR 0002).\n",
                 );
             }
             None => out.push_str(
@@ -487,6 +551,53 @@ mod tests {
     }
 
     #[test]
+    fn a_run_whose_local_window_is_off_is_measured_again() {
+        // The local window adds 17 ms here (20 ms round trips, 3 ms in the application).
+        let local: Vec<ClientSample> = (0..10).map(|i| shown(i, i * 300, 20)).collect();
+        let relayed: Vec<ClientSample> = (0..10).map(|i| shown(i, i * 300, 40)).collect();
+        let local_app: Vec<HostSample> = (0..10).map(|i| answered(i, 3)).collect();
+        let relayed_app: Vec<HostSample> = (0..10).map(|i| answered(i, 1)).collect();
+        let build =
+            || Comparison::build(&local, &relayed, Some(&local_app), Some(&relayed_app), None);
+
+        let unsaid = build();
+        assert_eq!(
+            (unsaid.local_off_by(), unsaid.measure_again()),
+            (None, false)
+        );
+        assert!(!unsaid.render().contains("usual"));
+
+        let usual = build().with_local_usual(Some(17.5));
+        assert_eq!(usual.local_off_by(), Some(-0.5));
+        assert!(!usual.measure_again());
+        assert!(usual.render().contains(
+            "The local window's median is 17.00 ms, 0.50 ms below its usual 17.50 ms.\n"
+        ));
+
+        // Two milliseconds off, either way, is the limit.
+        for (usually, side) in [(15.0, "above"), (19.0, "below"), (12.0, "above")] {
+            let off = build().with_local_usual(Some(usually));
+            assert!(off.measure_again(), "{usually}");
+            let text = off.render();
+            assert!(text.contains(side), "{text}");
+            assert!(
+                text.contains(": measure again (2 ms or more off)."),
+                "{text}"
+            );
+        }
+        assert!(!build().with_local_usual(Some(18.9)).measure_again());
+
+        // Without the local application's log there is nothing to compare.
+        let bare =
+            Comparison::build(&local, &relayed, None, None, None).with_local_usual(Some(17.0));
+        assert_eq!((bare.local_off_by(), bare.measure_again()), (None, false));
+        assert_eq!(
+            build().with_local_usual(Some(f64::NAN)).local_usual_ms,
+            None
+        );
+    }
+
+    #[test]
     fn inputs_made_by_hand_during_the_run_are_left_out() {
         // Somebody typed two keys into the local window before the probe
         // began. The application numbered them 0 and 1, like the probe's
@@ -539,10 +650,12 @@ mod tests {
             .lines()
             .find(|l| l.trim_start().starts_with("over") || l.trim_start().starts_with("within"))
             .unwrap();
+        // 600 inputs: the 99th percentile is shown and not judged.
         assert_eq!(
             verdicts.split_whitespace().collect::<Vec<_>>(),
-            ["over", "within", "within"]
+            ["over", "within", "-"]
         );
+        assert!(text.contains("The 99th percentile is judged only in runs of 2000 inputs or more"));
         assert!(text.contains(
             "600 inputs: enough for a routine measurement. A verdict needs 2000 or more."
         ));
@@ -564,7 +677,17 @@ mod tests {
             Some(&many_apps),
             None,
         );
-        assert!(many.render().contains("2000 inputs: enough for a verdict."));
+        let text = many.render();
+        assert!(text.contains("2000 inputs: enough for a verdict."));
         assert!(many.gap.unwrap().within(&PASS_LINE));
+        let verdicts = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("over") || l.trim_start().starts_with("within"))
+            .unwrap();
+        assert_eq!(
+            verdicts.split_whitespace().collect::<Vec<_>>(),
+            ["within", "within", "within"]
+        );
+        assert!(!text.contains("judged only in runs"));
     }
 }
