@@ -12,6 +12,15 @@
 //                  "udpsrc port=5004 caps=... ! rtph265depay ! h265parse ! avdec_h265 ! glimagesink sync=false"
 //   FRAME_LOG      optional: a file to write the way of every frame through the pipeline to
 //
+// Decoding with VideoToolbox. GStreamer's own VideoToolbox element holds frames back, so the
+// pipeline may instead end in an application sink called "vt" that hands over H.265 access
+// units:
+//                  "udpsrc name=net ... ! rtph265depay ! h265parse !
+//                   video/x-h265,stream-format=hvc1,alignment=au ! appsink name=vt sync=false"
+// This program then decodes them with VideoToolbox, one by one as they arrive, and gives each
+// decoded picture to the window's layer without copying it. This is what the own client of
+// step 4 will do; here it is measured with everything else left as it is.
+//
 // The frame log says where the time on the client goes. It has one JSON object per line, with
 // times in nanoseconds on the clock the screen probe uses (mach absolute time), so its lines can
 // be set against the probe's log directly. The pipeline names the elements to watch; any of the
@@ -24,12 +33,18 @@
 //                                a frame left the decoder; Y is the luma in its middle
 //   name=sink  the video sink    {"kind":"sink","pts":P,"t_ns":T}    the frame reached the sink
 //                                {"kind":"drawn","pts":P,"t_ns":T}   the sink drew it (glimagesink only)
+//   name=vt    VideoToolbox      the same three lines: "decoded" when VideoToolbox returns the
+//                                picture, "sink" at once after it, "drawn" when the picture has
+//                                been handed to the window's layer
 //
 // {"kind":"clock","mono_ns":T,"unix_ns":U} lines pair that clock with the time of day.
 //
 // Only for measurements: the own client of step 4 replaces it. GStreamer is linked dynamically.
 
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
+#import <VideoToolbox/VideoToolbox.h>
+#include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
 #include <gst/video/videooverlay.h>
@@ -159,6 +174,177 @@ static gboolean on_draw(GstElement *sink, gpointer context, GstSample *sample, g
     return FALSE;
 }
 
+// ---- Decoding with VideoToolbox ----
+
+static VTDecompressionSessionRef vt_session = NULL;
+static CMVideoFormatDescriptionRef vt_format = NULL;
+static GstCaps *vt_caps = NULL;
+static CALayer *vt_layer = nil;
+// Nothing can be decoded before the first key frame, nor after a frame that failed.
+static gboolean vt_needs_key_frame = TRUE;
+
+// Luma in the middle of a picture whose first plane is luma (420v and its relatives).
+static int middle_luma_of_picture(CVPixelBufferRef picture) {
+    int luma = -1;
+    if (CVPixelBufferLockBaseAddress(picture, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return luma;
+    }
+    if (CVPixelBufferIsPlanar(picture)) {
+        const uint8_t *plane = CVPixelBufferGetBaseAddressOfPlane(picture, 0);
+        size_t stride = CVPixelBufferGetBytesPerRowOfPlane(picture, 0);
+        size_t width = CVPixelBufferGetWidthOfPlane(picture, 0), height = CVPixelBufferGetHeightOfPlane(picture, 0);
+        if (plane != NULL) {
+            luma = plane[(height / 2) * stride + width / 2];
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(picture, kCVPixelBufferLock_ReadOnly);
+    return luma;
+}
+
+// VideoToolbox has decoded a frame. Called before the call that asked for it returns.
+static void on_picture(void *context, void *frame, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef picture,
+                       CMTime time, CMTime duration) {
+    guint64 decoded = now_ns();
+    unsigned long long pts = (unsigned long long)(uintptr_t)frame;
+    if (status != noErr || picture == NULL) {
+        return;
+    }
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"decoded\",\"pts\":%llu,\"t_ns\":%llu,\"luma\":%d}\n", pts,
+                (unsigned long long)decoded, middle_luma_of_picture(picture));
+        fprintf(frame_log, "{\"kind\":\"sink\",\"pts\":%llu,\"t_ns\":%llu}\n", pts, (unsigned long long)now_ns());
+    }
+    // The layer takes the decoder's own surface: nothing is copied or converted here.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    vt_layer.contents = (__bridge id)CVPixelBufferGetIOSurface(picture);
+    [CATransaction commit];
+    [CATransaction flush];
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"drawn\",\"pts\":%llu,\"t_ns\":%llu}\n", pts, (unsigned long long)now_ns());
+    }
+}
+
+// Sets VideoToolbox up for the stream the caps describe (H.265 with its parameter sets in "codec_data").
+static gboolean vt_configure(GstCaps *caps) {
+    if (vt_session != NULL) {
+        VTDecompressionSessionInvalidate(vt_session);
+        CFRelease(vt_session);
+        vt_session = NULL;
+    }
+    if (vt_format != NULL) {
+        CFRelease(vt_format);
+        vt_format = NULL;
+    }
+    gst_caps_replace(&vt_caps, caps);
+    vt_needs_key_frame = TRUE;
+
+    GstStructure *stream = gst_caps_get_structure(caps, 0);
+    int width = 0, height = 0;
+    const GValue *value = gst_structure_get_value(stream, "codec_data");
+    if (!gst_structure_get_int(stream, "width", &width) || !gst_structure_get_int(stream, "height", &height) || value == NULL) {
+        fprintf(stderr, "error: the stream does not say its size and parameter sets; ask h265parse for stream-format=hvc1\n");
+        return FALSE;
+    }
+    GstMapInfo sets;
+    if (!gst_buffer_map(gst_value_get_buffer(value), &sets, GST_MAP_READ)) {
+        return FALSE;
+    }
+    NSDictionary *extensions = @{
+        (__bridge NSString *)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms :
+            @{@"hvcC" : [NSData dataWithBytes:sets.data length:sets.size]}
+    };
+    gst_buffer_unmap(gst_value_get_buffer(value), &sets);
+    OSStatus status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_HEVC, width, height,
+                                                     (__bridge CFDictionaryRef)extensions, &vt_format);
+    if (status != noErr) {
+        fprintf(stderr, "error: VideoToolbox does not take the stream's parameter sets (%d)\n", (int)status);
+        return FALSE;
+    }
+    NSDictionary *decoder = @{(__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @YES};
+    // Pictures the window system can show as they are: 4:2:0 on a surface it shares with the decoder.
+    NSDictionary *pictures = @{
+        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{}
+    };
+    VTDecompressionOutputCallbackRecord callback = {on_picture, NULL};
+    status = VTDecompressionSessionCreate(kCFAllocatorDefault, vt_format, (__bridge CFDictionaryRef)decoder,
+                                          (__bridge CFDictionaryRef)pictures, &callback, &vt_session);
+    if (status != noErr) {
+        fprintf(stderr, "error: VideoToolbox cannot decode this stream (%d)\n", (int)status);
+        return FALSE;
+    }
+    VTSessionSetProperty(vt_session, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
+    return TRUE;
+}
+
+// One access unit has arrived: decode it now, on the thread that received it.
+static GstFlowReturn on_access_unit(GstAppSink *sink, gpointer user_data) {
+    GstSample *sample = gst_app_sink_pull_sample(sink);
+    if (sample == NULL) {
+        return GST_FLOW_OK;
+    }
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstCaps *caps = gst_sample_get_caps(sample);
+    if ((vt_caps == NULL || !gst_caps_is_equal(vt_caps, caps)) && !vt_configure(caps)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
+    }
+    GstMapInfo unit;
+    if ((vt_needs_key_frame && GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT)) ||
+        !gst_buffer_map(buffer, &unit, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+    CMBlockBufferRef block = NULL;
+    CMSampleBufferRef frame = NULL;
+    const size_t size = unit.size;
+    OSStatus status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, size, kCFAllocatorDefault, NULL, 0, size,
+                                                         kCMBlockBufferAssureMemoryNowFlag, &block);
+    if (status == noErr) {
+        status = CMBlockBufferReplaceDataBytes(unit.data, block, 0, size);
+    }
+    if (status == noErr) {
+        status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, vt_format, 1, 0, NULL, 1, &size, &frame);
+    }
+    gst_buffer_unmap(buffer, &unit);
+    if (status == noErr) {
+        // No flags: decoded here and now, and `on_picture` has run by the time this returns.
+        status = VTDecompressionSessionDecodeFrame(vt_session, frame, 0, (void *)(uintptr_t)GST_BUFFER_PTS(buffer), NULL);
+    }
+    vt_needs_key_frame = status != noErr;
+    if (frame != NULL) {
+        CFRelease(frame);
+    }
+    if (block != NULL) {
+        CFRelease(block);
+    }
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+// Whether the pipeline ends in an application sink called "vt". If so, its access units go to
+// VideoToolbox and the pictures to the layer of `view`.
+static gboolean use_videotoolbox(GstElement *pipeline, NSView *view) {
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "vt");
+    if (sink == NULL) {
+        return FALSE;
+    }
+    if (!GST_IS_APP_SINK(sink)) {
+        gst_object_unref(sink);
+        return FALSE;
+    }
+    view.wantsLayer = YES;
+    vt_layer = view.layer;
+    vt_layer.contentsGravity = kCAGravityResize;
+    vt_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    GstAppSinkCallbacks callbacks = {0};
+    callbacks.new_sample = on_access_unit;
+    gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, NULL, NULL);
+    gst_object_unref(sink);
+    return TRUE;
+}
+
 // Adds a probe for buffers to a pad of the element called `name`. Says so when there is none.
 static void watch(GstElement *pipeline, const char *name, const char *pad_name, GstPadProbeType type,
                   GstPadProbeCallback callback) {
@@ -175,7 +361,7 @@ static void watch(GstElement *pipeline, const char *name, const char *pad_name, 
     }
 }
 
-static gboolean start_frame_log(GstElement *pipeline, const char *path) {
+static gboolean start_frame_log(GstElement *pipeline, const char *path, gboolean videotoolbox) {
     frame_log = fopen(path, "wx");  // Never overwrite an earlier measurement.
     if (frame_log == NULL) {
         fprintf(stderr, "error: cannot create %s: %s\n", path, strerror(errno));
@@ -188,9 +374,12 @@ static gboolean start_frame_log(GstElement *pipeline, const char *path) {
     log_clock();
 
     watch(pipeline, "net", "src", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, on_arrival);
-    watch(pipeline, "dec", "src", GST_PAD_PROBE_TYPE_BUFFER, on_decoded);
-    watch(pipeline, "sink", "sink", GST_PAD_PROBE_TYPE_BUFFER, on_sink);
-    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+    if (!videotoolbox) {
+        // With VideoToolbox, `on_picture` writes these lines itself.
+        watch(pipeline, "dec", "src", GST_PAD_PROBE_TYPE_BUFFER, on_decoded);
+        watch(pipeline, "sink", "sink", GST_PAD_PROBE_TYPE_BUFFER, on_sink);
+    }
+    GstElement *sink = videotoolbox ? NULL : gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     if (sink != NULL) {
         if (g_signal_lookup("client-draw", G_OBJECT_TYPE(sink)) != 0) {
             g_signal_connect(sink, "client-draw", G_CALLBACK(on_draw), NULL);
@@ -276,7 +465,8 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "error: %s\n", error ? error->message : "cannot build the pipeline");
             return 1;
         }
-        if (argc == 8 && !start_frame_log(pipeline, argv[7])) {
+        gboolean videotoolbox = use_videotoolbox(pipeline, view);
+        if (argc == 8 && !start_frame_log(pipeline, argv[7], videotoolbox)) {
             return 1;
         }
         GstBus *bus = gst_element_get_bus(pipeline);

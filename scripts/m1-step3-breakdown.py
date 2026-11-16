@@ -177,25 +177,20 @@ def main():
     if not restamps:
         sys.exit("error: the host's frame log has no frame that reached the encoder")
     restamp = restamps.most_common(1)[0][0]
-    by_size = all(frame["luma"] < 0 for frame in out)
-    if by_size:
-        # The frames stayed on the GPU and their shade could not be read. A frame that carries a
-        # change is several times the size of one that repeats the picture before it.
-        sizes = sorted(e["bytes"] for e in encoded.values() if not e["key"])
-        usual = sizes[len(sizes) // 2]
-        big = lambda frame: (e := encoded.get(frame["pts"] + restamp)) is not None and not e["key"] and e["bytes"] > 2.5 * usual
-        out_changes = [i for i, frame in enumerate(out) if big(frame)]
-    else:
-        out_changes = changes(out)
+    out_by_pts = {frame["pts"]: frame for frame in out}
+    # Frames that stay on the GPU on the host cannot be looked at there: their shade is -1.
+    shades_known = any(frame["luma"] >= 0 for frame in out)
+    out_changes = changes(out) if shades_known else []
     out_change_times = [out[i]["t_ns"] for i in out_changes]
     # A frame goes to the network as several packets, each handed over on its own.
-    sent = {}
+    sent, sent_by_rtp = {}, {}
     for line in host_frames:
         if line.get("kind") == "sent":
-            known = sent.setdefault(line["pts"], {"rtp": line["rtp"], "first_ns": line["t_ns"], "last_ns": line["t_ns"], "packets": 0})
+            known = sent.setdefault(line["pts"], {"pts": line["pts"], "rtp": line["rtp"], "first_ns": line["t_ns"], "last_ns": line["t_ns"], "packets": 0})
             known["first_ns"] = min(known["first_ns"], line["t_ns"])
             known["last_ns"] = max(known["last_ns"], line["t_ns"])
             known["packets"] += line["packets"]
+            sent_by_rtp[line["rtp"]] = known
 
     # Client: frames by RTP timestamp, and the decoder's output in order.
     arrived = {}
@@ -209,6 +204,14 @@ def main():
                 known["last_ns"] = max(known["last_ns"], line["last_ns"])
                 known["packets"] += line["packets"]
                 known["bytes"] += line["bytes"]
+    # The viewer decodes a frame on the thread that received it, before it reads the next
+    # packet: in its log a decoded frame follows the line of the packets it came in.
+    last_rtp = None
+    for line in client_frames:
+        if line.get("kind") == "arrived":
+            last_rtp = line["rtp"]
+        elif line.get("kind") == "decoded":
+            line["rtp"] = last_rtp
     decoded = sorted((l for l in client_frames if l.get("kind") == "decoded"), key=lambda l: l["t_ns"])
     decoded_changes = changes(decoded)
     decoded_change_times = [decoded[i]["t_ns"] for i in decoded_changes]
@@ -239,27 +242,53 @@ def main():
     per_input = []
 
     order = sorted(i for i in inputs if i in probe)
-    for position, number in enumerate(order):
-        input_at, commit_at = inputs[number]
+
+    def from_the_host(position):
+        """The first frame out of the compositor with the new shade, and its way to the client."""
+        input_at = inputs[order[position]][0]
         following = inputs[order[position + 1]][0] if position + 1 < len(order) else None
         at = first_at_or_after(out_change_times, input_at)
         if at is None or (following is not None and out_change_times[at] >= following):
-            dropped["no frame after the commit"] += 1
-            continue
+            return "no frame after the commit"
         frame = out[out_changes[at]]
         enc, net = encoded.get(frame["pts"] + restamp), sent.get(frame["pts"] + restamp)
         if enc is None or net is None:
-            dropped["frame not found on the host's network side"] += 1
-            continue
+            return "frame not found on the host's network side"
         arr = arrived.get(net["rtp"])
         if arr is None:
-            dropped["frame did not arrive"] += 1
-            continue
+            return "frame did not arrive"
         at = first_at_or_after(decoded_change_times, arr["first_ns"])
         if at is None:
-            dropped["not decoded"] += 1
-            continue
+            return "not decoded"
+        return frame, enc, net, arr, decoded[decoded_changes[at]]
+
+    def from_the_client(position):
+        """The first frame the client decoded with the new shade, and where it came from."""
+        sent_at = probe[order[position]]["sent_ns"]
+        following = probe[order[position + 1]]["sent_ns"] if position + 1 < len(order) else None
+        at = first_at_or_after(decoded_change_times, sent_at)
+        if at is None or (following is not None and decoded_change_times[at] >= following):
+            return "not decoded"
         dec = decoded[decoded_changes[at]]
+        arr, net = arrived.get(dec.get("rtp")), sent_by_rtp.get(dec.get("rtp"))
+        if arr is None or net is None:
+            return "frame not found on the host's network side"
+        enc, frame = encoded.get(net["pts"]), out_by_pts.get(net["pts"] - restamp)
+        if enc is None or frame is None:
+            return "frame not found on the host's network side"
+        return frame, enc, net, arr, dec
+
+    same_frame = 0
+    for position, number in enumerate(order):
+        input_at, commit_at = inputs[number]
+        found = from_the_host(position) if shades_known else from_the_client(position)
+        if isinstance(found, str):
+            dropped[found] += 1
+            continue
+        frame, enc, net, arr, dec = found
+        if shades_known:
+            other = from_the_client(position)
+            same_frame += not isinstance(other, str) and other[0] is frame
         at = first_at_or_after(sink_times, dec["t_ns"])
         while at is not None and at < len(sink) and sink[at]["pts"] < dec["pts"]:
             at += 1
@@ -305,8 +334,11 @@ def main():
     if not totals:
         sys.exit("error: no input could be followed")
     print(f"Time of day against the monotonic clock moved by {host_line.spread_ms:.3f} ms on the host during the run")
-    if by_size:
-        print("The host's frames stayed on the GPU: the frame that carried an input is told by its size, not by its shade.")
+    if shades_known:
+        print(f"Followed back from the client's first frame with the new shade, {same_frame} of them lead to the same frame on the host.")
+    else:
+        print("The host's frames stayed on the GPU and could not be looked at there: every input is followed back from the "
+              "first frame that showed it on the client.")
     print()
     print("Relayed window, from sending the input to seeing it")
     print(HEADER)
