@@ -21,6 +21,7 @@
 | rubato、audioadapter-buffers | 音の時計のずれ補正（動かしながら比を変えられるリサンプラー）。sinc 補間だけを使う | MIT OR Apache-2.0 | <https://github.com/HEnquist/rubato> |
 | rtrb | 音のスレッドとの受け渡し（待たないリングバッファー） | MIT OR Apache-2.0 | <https://github.com/mgeier/rtrb> |
 | coreaudio-rs、objc2-core-audio | Mac の音の出力（Core Audio）。macOS でだけコンパイルされる | MIT OR Apache-2.0、Zlib OR Apache-2.0 OR MIT | <https://github.com/RustAudio/coreaudio-rs>、<https://github.com/madsmtm/objc2> |
+| pipewire（pipewire-rs）、libc | Linux の音の取り込み（PipeWire のクライアントとして、仮想の出力先を作る）。Linux で、機能 `pipewire` を有効にしたときだけコンパイルされる。ビルドに `libpipewire-0.3-dev` と `libclang-dev` が要る | MIT、MIT OR Apache-2.0 | <https://gitlab.freedesktop.org/pipewire/pipewire-rs> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。導入を軽くするため、コンポジターと仮想入力、配信プラグインだけを取り込みます。
 
@@ -77,4 +78,4 @@ cargo deny check
 
 2026-11-15 時点の依存 99 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、Unicode-3.0 のいずれかで利用できます（cargo-deny 0.20.2 でライセンス・禁止項目・取得元・既知の脆弱性を検査済み）。
 
-音（`istesso-audio`）のために足した依存を含めると、`m2-audio` ブランチでは 128 クレートです（2026-11-16、同じ版の cargo-deny で、同じ 4 項目を検査済み）。足した分は、MIT、Apache-2.0、Zlib のいずれかで利用できます。Roc Toolkit は、使いません（[ADR 0011](adr/0011-audio-transport.md)）。
+音（`istesso-audio`）のために足した依存を含めると、`m2-audio` ブランチでは、すべての機能を有効にした状態で 168 クレートです（2026-11-16、同じ版の cargo-deny で、`--all-features` を付けて同じ 4 項目を検査済み）。足した分は、どれも `deny.toml` の許可リストの中にあり、例外は足していません。Roc Toolkit は、使いません（[ADR 0011](adr/0011-audio-transport.md)）。

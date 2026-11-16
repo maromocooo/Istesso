@@ -130,7 +130,7 @@ B に移っても、取り込み、通信路、権限の確かめ方、再生、
 ## 採用にともなって直したもの
 
 - [ADR 0005](0005-audio-service.md)：「部品」の表を、上の表のとおりに直した。状態に、この文書で一部を変えたことを書いた。
-- [components.md](../components.md)：Roc Toolkit の行を「条件つきで使える」から外し、使わないことにした理由を書いた。`coreaudio-rs`、`rubato`、`rtrb` を「取り込める」に足した。`pipewire` は、取り込みのコードといっしょに足す。PipeWire の行の「Roc 用の送受信モジュールあり」を直した。
+- [components.md](../components.md)：Roc Toolkit の行を「条件つきで使える」から外し、使わないことにした理由を書いた。`pipewire`、`coreaudio-rs`、`rubato`、`rtrb` を「取り込める」に足した。PipeWire の行の「Roc 用の送受信モジュールあり」を直した。
 - [architecture.md](../architecture.md)：`istesso-audio` の行の内容と状況。
 - `deny.toml`：Roc を例に挙げたコメントを直した（MPL-2.0 の例外は、足していない）。
 - [ADR 0007](0007-control-channel.md)：音の配信が、同じ手順を別のポートで使うことを書き足した。手順そのものは変えていない。
