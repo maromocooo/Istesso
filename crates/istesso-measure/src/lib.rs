@@ -35,15 +35,15 @@ pub mod stats;
 
 pub use clock::Clock;
 pub use compare::{
-    Comparison, Gap, Standing, Steps, LATE_SHARE_LIMIT, LOCAL_DRIFT_LIMIT_MS, MEDIAN_BORDER_MS,
-    PASS_LINE, VERDICT_SAMPLES,
+    Beats, Comparison, Gap, Standing, Steps, BEATS_JUDGED_FROM, BEAT_PARTS, LATE_SHARE_LIMIT,
+    LOCAL_DRIFT_LIMIT_MS, MEDIAN_BORDER_MS, PASS_LINE, VERDICT_SAMPLES,
 };
 pub use flash::{classify, FlashAck, FlashInput, Rgb, Shade, DEFAULT_FLASH_PORT};
 pub use jitter::Jitter;
 pub use probe::{probe, Answer, ProbeSample, ProbeSummary};
 pub use record::{
-    client_samples, host_samples, read_log, sent_as_keys, ClientSample, Header, HostSample,
-    InputSource, LogError, LogWriter, Record, Side,
+    beat_shift_seed, client_samples, host_samples, read_log, sent_as_keys, ClientSample, Header,
+    HostSample, InputSource, LogError, LogWriter, Record, Side,
 };
 pub use report::{Report, MIN_SAMPLES};
 pub use stats::{percentile, table, Summary};

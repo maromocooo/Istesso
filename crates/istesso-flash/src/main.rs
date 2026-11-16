@@ -29,7 +29,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use istesso_measure::{
-    Clock, FlashAck, FlashInput, Header, HostSample, InputSource, LogWriter, Record, Shade, Side,
+    Clock, FlashAck, FlashInput, Header, HostSample, InputSource, Jitter, LogWriter, Record, Shade,
+    Side,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -119,6 +120,15 @@ struct Args {
     /// it a rate well above the display's
     #[arg(long)]
     when_told: bool,
+
+    /// After every frame that answered an input, put the next frame off by a
+    /// part of a frame interval chosen at random, the same sequence for the
+    /// same seed. The application's beat then meets the display's refresh in
+    /// every possible way over a run, and a measurement no longer depends on
+    /// how the two happened to fall (ADR 0002). Needs the moving text
+    /// answered with its next frame, and not `--when-told`
+    #[arg(long, value_name = "SEED", conflicts_with = "when_told")]
+    shift_beat: Option<u64>,
 
     /// When an input is answered. `next-frame` where the text moves, so that
     /// no more frames are drawn than `--fps` says, and `at-once` where
@@ -230,6 +240,9 @@ struct App {
     frame_period: Option<Duration>,
     /// When the next frame of moving text is due.
     next_frame: Option<Instant>,
+    /// By how much the beat is put off after a frame that answered an input
+    /// (`--shift-beat`).
+    shifts: Option<Jitter>,
     /// Why the application has to stop, if it does.
     failure: Option<String>,
 }
@@ -287,7 +300,9 @@ impl App {
                 .map(|millihertz| (millihertz + 500) / 1000)
                 .filter(|hertz| *hertz > 0);
             let fps = self.args.fps.or(refresh).unwrap_or(60);
-            self.frame_period = Some(Duration::from_secs(1) / fps);
+            let period = Duration::from_secs(1) / fps;
+            self.frame_period = Some(period);
+            self.shifts = self.args.shift_beat.map(|seed| beat_shifts(seed, period));
         }
         self.window = Some(window);
         Ok(())
@@ -520,11 +535,14 @@ impl ApplicationHandler<Outside> for App {
         let now = Instant::now();
         match self.next_frame {
             Some(due) if now >= due => {
+                let answers = !self.waiting.is_empty();
                 let drawn = self.next_frame();
                 self.check(event_loop, drawn);
-                // Keep the rhythm; after a stall, start again from now.
-                let next = due + period;
-                self.next_frame = Some(if next > now { next } else { now + period });
+                let shift = match &mut self.shifts {
+                    Some(shifts) if answers => shifts.next().unwrap_or_default(),
+                    _ => Duration::ZERO,
+                };
+                self.next_frame = Some(next_due(due, period, now, shift));
             }
             Some(_) => {}
             None => self.next_frame = Some(now + period),
@@ -618,11 +636,29 @@ fn listen(socket: UdpSocket, clock: Clock, event_loop: EventLoopProxy<Outside>) 
     });
 }
 
+/// When the frame after the one that was due at `due` is due: one period
+/// later, keeping the rhythm; after a stall, one period from now. `shift`
+/// puts it off further, which moves the whole beat from here on.
+fn next_due(due: Instant, period: Duration, now: Instant, shift: Duration) -> Instant {
+    let next = due + period;
+    (if next > now { next } else { now + period }) + shift
+}
+
+/// The shifts of `--shift-beat`: anywhere within one frame interval, evenly.
+fn beat_shifts(seed: u64, period: Duration) -> Jitter {
+    Jitter::new(
+        seed,
+        Duration::ZERO,
+        period.saturating_sub(Duration::from_nanos(1)),
+    )
+}
+
 fn open_log(
     path: &PathBuf,
     clock: &Clock,
     picture: Picture,
     draw: Draw,
+    beat_shift_seed: Option<u64>,
 ) -> Result<LogWriter<BufWriter<File>>, String> {
     // Never overwrite an earlier measurement.
     let file = OpenOptions::new()
@@ -643,6 +679,7 @@ fn open_log(
         clock_origin_unix_ns: Some(clock.origin_unix_ns()),
         picture: Some(picture.name().to_string()),
         draw: Some(draw.name().to_string()),
+        beat_shift_seed,
     }))
     .map_err(|e| format!("cannot write to {}: {e}", path.display()))?;
     Ok(log)
@@ -653,7 +690,7 @@ fn run(args: Args) -> Result<(), String> {
     let log = args
         .log
         .as_ref()
-        .map(|path| open_log(path, &clock, args.picture, args.draw))
+        .map(|path| open_log(path, &clock, args.picture, args.draw, args.shift_beat))
         .transpose()?;
 
     let event_loop = EventLoop::<Outside>::with_user_event()
@@ -690,6 +727,7 @@ fn run(args: Args) -> Result<(), String> {
         sheet: None,
         frame_period: None,
         next_frame: None,
+        shifts: None,
         failure: None,
     };
     event_loop
@@ -777,5 +815,62 @@ mod tests {
     fn the_command_line_is_consistent() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn the_beat_keeps_its_rhythm_and_a_shift_moves_it_from_there_on() {
+        let period = Duration::from_millis(10);
+        let due = Instant::now();
+        // In time: one period after the frame that was due.
+        let now = due + Duration::from_millis(1);
+        assert_eq!(next_due(due, period, now, Duration::ZERO), due + period);
+        // After a stall: one period from now, not a burst to catch up.
+        let late = due + Duration::from_millis(25);
+        assert_eq!(next_due(due, period, late, Duration::ZERO), late + period);
+        // A shift puts the next frame off, and with it every frame after it.
+        let shift = Duration::from_millis(4);
+        let shifted = next_due(due, period, now, shift);
+        assert_eq!(shifted, due + period + shift);
+        assert_eq!(
+            next_due(shifted, period, shifted, Duration::ZERO),
+            due + 2 * period + shift
+        );
+    }
+
+    #[test]
+    fn shifted_beats_fall_evenly_on_every_part_of_a_frame_interval() {
+        let period = Duration::from_secs(1) / 85;
+        let mut shifts = beat_shifts(1, period);
+        // Where the beat stands within a frame interval after each shift, in eighths.
+        let (mut phase, mut eighths) = (0u128, [0usize; 8]);
+        for _ in 0..8000 {
+            let shift = shifts.next().unwrap();
+            assert!(shift < period);
+            phase = (phase + shift.as_nanos()) % period.as_nanos();
+            eighths[(phase * 8 / period.as_nanos()) as usize] += 1;
+        }
+        // 1000 each on average; a tenth off would be more than three times what chance gives.
+        assert!(
+            eighths.iter().all(|count| (900..=1100).contains(count)),
+            "{eighths:?}"
+        );
+        // Another seed, another sequence; the same seed, the same.
+        let first: Vec<Duration> = beat_shifts(1, period).take(4).collect();
+        assert_eq!(first, beat_shifts(1, period).take(4).collect::<Vec<_>>());
+        assert_ne!(first, beat_shifts(2, period).take(4).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_beat_is_not_shifted_where_the_window_system_sets_it() {
+        assert!(Args::try_parse_from(["istesso-flash", "--shift-beat", "1"]).is_ok());
+        assert!(Args::try_parse_from([
+            "istesso-flash",
+            "--draw",
+            "gpu",
+            "--when-told",
+            "--shift-beat",
+            "1"
+        ])
+        .is_err());
     }
 }

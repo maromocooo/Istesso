@@ -1569,12 +1569,19 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
         } => {
             let local = istesso_measure::client_samples(&read_measurement_log(&local)?);
             let relayed = istesso_measure::client_samples(&read_measurement_log(&relayed)?);
-            let app_log = |path: Option<PathBuf>| -> Result<Option<Vec<_>>, String> {
-                path.map(|p| read_measurement_log(&p).map(|r| istesso_measure::host_samples(&r)))
-                    .transpose()
+            // An application's log: its samples, and whether it shifted its beat.
+            let app_log = |path: Option<PathBuf>| -> Result<(Option<Vec<_>>, Option<u64>), String> {
+                let Some(path) = path else {
+                    return Ok((None, None));
+                };
+                let records = read_measurement_log(&path)?;
+                Ok((
+                    Some(istesso_measure::host_samples(&records)),
+                    istesso_measure::beat_shift_seed(&records),
+                ))
             };
-            let local_app = app_log(local_app)?;
-            let mut relayed_app = app_log(relayed_app)?;
+            let (local_app, local_shift) = app_log(local_app)?;
+            let (mut relayed_app, relayed_shift) = app_log(relayed_app)?;
             if let (SentAs::Keys, Some(app)) = (relayed_inputs, relayed_app.as_mut()) {
                 *app = istesso_measure::sent_as_keys(app);
                 if !json {
@@ -1591,6 +1598,7 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
                 relayed_app.as_deref(),
                 refresh_hz,
             )
+            .with_beat_shifts(local_shift, relayed_shift)
             .with_local_usual(local_usual);
             if json {
                 print_json(&comparison)

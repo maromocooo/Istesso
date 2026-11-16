@@ -95,6 +95,92 @@ impl Steps {
     }
 }
 
+/// Into how many parts a refresh of the display is cut to say where the
+/// inputs of a run fell within it.
+pub const BEAT_PARTS: usize = 8;
+
+/// From how many inputs on it is said whether a run fell evenly on the parts
+/// of a refresh: with fewer, chance alone makes the parts uneven.
+pub const BEATS_JUDGED_FROM: usize = 400;
+
+/// Where the inputs of a run fell within one refresh of the display, for
+/// each window: its added latency, taken within one refresh and counted in
+/// [`BEAT_PARTS`] parts.
+///
+/// A window's added latency is a fixed stretch plus the wait for the
+/// display's next refresh, and that wait is set by how the application's
+/// beat and the display's refresh stand to each other. A run in which they
+/// stood one way throughout fills few of the parts and says how that one way
+/// performs; a run that fills all parts alike says how the build performs
+/// (ADR 0002). The test application's `--shift-beat` makes a run do that.
+///
+/// The two windows wait for the same refreshes, so what one input's
+/// difference between them comes to is set by how the two applications'
+/// beats stand to each other. `between` counts that: the relayed window's
+/// added latency minus the local window's, within one refresh. Each window
+/// on its own can fall evenly while the two keep one distance all run long.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Beats {
+    pub local: [usize; BEAT_PARTS],
+    pub relayed: [usize; BEAT_PARTS],
+    pub between: [usize; BEAT_PARTS],
+    /// The seed with which the local application shifted its beat after
+    /// every input, as its log says. `None` when it did not.
+    pub local_shift_seed: Option<u64>,
+    /// The same for the application behind the relayed window.
+    pub relayed_shift_seed: Option<u64>,
+}
+
+impl Beats {
+    /// From what each window added, input by input and in the same order.
+    fn of(local_added_ms: &[f64], relayed_added_ms: &[f64], refresh_ms: f64) -> Beats {
+        let between: Vec<f64> = relayed_added_ms
+            .iter()
+            .zip(local_added_ms)
+            .map(|(relayed, local)| relayed - local)
+            .collect();
+        let count = |added: &[f64]| {
+            let mut parts = [0usize; BEAT_PARTS];
+            for ms in added {
+                let within = ms.rem_euclid(refresh_ms) / refresh_ms;
+                let part = (within * BEAT_PARTS as f64) as usize;
+                parts[part.min(BEAT_PARTS - 1)] += 1;
+            }
+            parts
+        };
+        Beats {
+            local: count(local_added_ms),
+            relayed: count(relayed_added_ms),
+            between: count(&between),
+            local_shift_seed: None,
+            relayed_shift_seed: None,
+        }
+    }
+
+    /// Whether every part got between six and fourteen tenths of an even
+    /// share. `None` for a run too short to say.
+    pub fn even(parts: &[usize; BEAT_PARTS]) -> Option<bool> {
+        let inputs: usize = parts.iter().sum();
+        if inputs < BEATS_JUDGED_FROM {
+            return None;
+        }
+        let share = inputs as f64 / BEAT_PARTS as f64;
+        Some(
+            parts
+                .iter()
+                .all(|&count| (0.6 * share..=1.4 * share).contains(&(count as f64))),
+        )
+    }
+
+    /// Whether both applications shifted their beat and both windows' inputs
+    /// fell evenly: what a verdict needs. `None` for a run too short to say.
+    pub fn evened_out(&self) -> Option<bool> {
+        let even =
+            Self::even(&self.local)? && Self::even(&self.relayed)? && Self::even(&self.between)?;
+        Some(even && self.local_shift_seed.is_some() && self.relayed_shift_seed.is_some())
+    }
+}
+
 /// How one figure of a run stands against the pass line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Standing {
@@ -195,6 +281,9 @@ pub struct Comparison {
     /// How many inputs fall on which step of that difference. `None` unless
     /// the applications' logs and the display's refresh rate were given.
     pub steps: Option<Steps>,
+    /// Where the inputs fell within one refresh, for each window. `None`
+    /// under the same conditions.
+    pub beats: Option<Beats>,
     /// For reference: input sent, to the relayed window showing it.
     pub relayed: Option<Summary>,
     /// For reference: input sent, to the local window showing it.
@@ -322,6 +411,18 @@ impl Comparison {
             steps: refresh_ms
                 .filter(|_| !added_later_by.is_empty())
                 .map(|refresh| Steps::of(&added_later_by, refresh)),
+            beats: refresh_ms
+                .filter(|_| !added_later_by.is_empty())
+                .map(|refresh| {
+                    // Only inputs both applications logged, so that the two lists pair up.
+                    let (local, relayed): (Vec<f64>, Vec<f64>) = both
+                        .iter()
+                        .filter_map(|id| {
+                            Some((*local_added_by_id.get(id)?, *relayed_added_by_id.get(id)?))
+                        })
+                        .unzip();
+                    Beats::of(&local, &relayed, refresh)
+                }),
             added_later_by: Summary::of(&added_later_by),
             added_later_by_mean_ms,
             relayed: Summary::of(&relayed_trip),
@@ -329,6 +430,16 @@ impl Comparison {
             refresh_ms,
             refreshes: refreshes.into_iter().collect(),
         }
+    }
+
+    /// Says with which seeds the two test applications shifted their beat
+    /// after every input, as the headers of their logs say (`None`: not).
+    pub fn with_beat_shifts(mut self, local: Option<u64>, relayed: Option<u64>) -> Comparison {
+        if let Some(beats) = &mut self.beats {
+            beats.local_shift_seed = local;
+            beats.relayed_shift_seed = relayed;
+        }
+        self
     }
 
     /// Says what the local window's median added latency usually is, so
@@ -460,6 +571,40 @@ impl Comparison {
                         "The 99th percentile is judged only in runs of {VERDICT_SAMPLES} inputs or more: \
                          in a shorter run it rests on a handful of inputs."
                     );
+                }
+                if let Some(beats) = &self.beats {
+                    let line = |parts: &[usize; BEAT_PARTS]| {
+                        let counts: Vec<String> = parts.iter().map(|c| format!("{c:>5}")).collect();
+                        let even = match Beats::even(parts) {
+                            Some(true) => "evenly",
+                            Some(false) => "NOT evenly",
+                            None => "too few inputs to say",
+                        };
+                        format!("{}   {even}", counts.join(""))
+                    };
+                    let shifted = |seed: Option<u64>| match seed {
+                        Some(seed) => format!("shifted its beat after every input (seed {seed})"),
+                        None => "kept the beat it happened to have".to_string(),
+                    };
+                    let _ = writeln!(
+                        out,
+                        "Where the inputs fell within one refresh, in eighths of a refresh (each window's added \
+                         latency, and the relayed window's minus the local window's):\n\
+                         \x20 local window       {}\n\x20 relayed window     {}\n\x20 relayed minus local{}\n\
+                         The local application {}; the one behind the relayed window {}.",
+                        line(&beats.local),
+                        line(&beats.relayed),
+                        line(&beats.between),
+                        shifted(beats.local_shift_seed),
+                        shifted(beats.relayed_shift_seed),
+                    );
+                    if beats.evened_out() == Some(false) {
+                        out.push_str(
+                            "This run did not meet every way the applications' beats and the display's refresh can \
+                             fall alike: its figures hold for the ways it met. A verdict is measured with \
+                             --shift-beat on both applications (ADR 0002).\n",
+                        );
+                    }
                 }
                 match &self.steps {
                     Some(steps) => {
@@ -717,6 +862,50 @@ mod tests {
         let steps = c.steps.unwrap();
         assert_eq!((steps.same, steps.one_later, steps.later), (1, 3, 0));
         assert!(steps.within());
+        // Where the four inputs fell within a refresh: too few to say whether evenly.
+        let beats = c.beats.clone().unwrap();
+        assert_eq!(beats.local.iter().sum::<usize>(), 4);
+        assert_eq!(beats.relayed.iter().sum::<usize>(), 4);
+        assert_eq!(beats.between.iter().sum::<usize>(), 4);
+        assert_eq!(Beats::even(&beats.local), None);
+        assert_eq!(beats.evened_out(), None);
+        // A run that fills every eighth alike, and one that leaves some nearly empty.
+        let even = [250, 262, 241, 249, 255, 238, 251, 254];
+        let stuck = [700, 650, 400, 150, 40, 10, 20, 30];
+        assert_eq!(Beats::even(&even), Some(true));
+        assert_eq!(Beats::even(&stuck), Some(false));
+        // What a verdict needs: both windows even, and both applications shifting their beat.
+        let run = |local, relayed, between, seeds: (Option<u64>, Option<u64>)| Beats {
+            local,
+            relayed,
+            between,
+            local_shift_seed: seeds.0,
+            relayed_shift_seed: seeds.1,
+        };
+        let seeds = (Some(1), Some(2));
+        assert_eq!(run(even, even, even, seeds).evened_out(), Some(true));
+        assert_eq!(run(even, stuck, even, seeds).evened_out(), Some(false));
+        // Each window evenly, but the two at one distance all run long: not evened out.
+        assert_eq!(run(even, even, stuck, seeds).evened_out(), Some(false));
+        assert_eq!(
+            run(even, even, even, (Some(1), None)).evened_out(),
+            Some(false)
+        );
+        // Added latency counts within one refresh: 1.0, 12.8 and 24.5 ms at 85 Hz are
+        // 0.09, 0.09 and 0.08 of a refresh, all in the first eighth; 7.0 ms is in the fifth.
+        let counted = Beats::of(
+            &[1.0, 12.8, 24.5, 7.0],
+            &[2.0, 12.8, 36.0, 6.0],
+            1000.0 / 85.0,
+        );
+        assert_eq!(counted.local, [3, 0, 0, 0, 1, 0, 0, 0]);
+        // The differences: 1.0, 0.0, 11.5 and -1.0 ms; the last two are just under a whole refresh.
+        assert_eq!(counted.between, [2, 0, 0, 0, 0, 0, 0, 2]);
+        let seeded = c.clone().with_beat_shifts(Some(1), Some(2)).beats.unwrap();
+        assert_eq!(
+            (seeded.local_shift_seed, seeded.relayed_shift_seed),
+            (Some(1), Some(2))
+        );
         // More than a tenth of the inputs two refreshes or more late fails a verdict.
         let late = Steps {
             same: 10,

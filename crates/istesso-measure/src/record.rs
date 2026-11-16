@@ -54,6 +54,13 @@ pub struct Header {
     /// it does not apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw: Option<String>,
+    /// Set when the test application put its beat off by a random part of a
+    /// frame interval after every input it answered (`--shift-beat`): the
+    /// seed of those shifts. A run then falls evenly on every way the
+    /// application's beat and the display's refresh can meet, instead of on
+    /// the one way they happened to meet (ADR 0002). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beat_shift_seed: Option<u64>,
 }
 
 /// How an input reached the application on the host.
@@ -153,6 +160,15 @@ pub fn read_log<R: BufRead>(reader: R) -> Result<Vec<Record>, LogError> {
     Ok(records)
 }
 
+/// The seed with which the test application that wrote a log shifted its
+/// beat after every input. `None` when it did not, or does not say.
+pub fn beat_shift_seed(records: &[Record]) -> Option<u64> {
+    records.iter().find_map(|r| match r {
+        Record::Header(header) => header.beat_shift_seed,
+        _ => None,
+    })
+}
+
 /// The host samples of a log, in the order they were written.
 pub fn host_samples(records: &[Record]) -> Vec<HostSample> {
     records
@@ -238,6 +254,7 @@ mod tests {
             started_unix_ms: 1_794_000_000_000,
             clock_origin_unix_ns: Some(1_794_000_000_000_123_456),
             picture: Some("text".into()),
+            beat_shift_seed: None,
             draw: Some("gpu".into()),
         })
     }
