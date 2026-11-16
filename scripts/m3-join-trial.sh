@@ -143,12 +143,27 @@ type_into() { # the socket, the file on the host, the key codes
 }
 
 echo "== setting up =="
-# The editor keeps what was open, and what was typed and not saved, between its runs. Each
-# run of this trial gives it a new place for that, so that it starts with the one empty file.
-on_host 'run=$(date +%s); mkdir -p $D/data/applications $D/cache $D/logs $D/state && : > $D/scratch.txt &&
-    printf "[Desktop Entry]\nType=Application\nName='"$APP"'\nExec=env XDG_DATA_HOME=%s gnome-text-editor --standalone --ignore-session %s\n" $D/state/$run-1 $D/scratch.txt > $D/data/applications/istesso-join-editor.desktop &&
-    : > $D/scratch-2.txt &&
-    printf "[Desktop Entry]\nType=Application\nName='"$SECOND"'\nExec=env XDG_DATA_HOME=%s gnome-text-editor --standalone --ignore-session %s\n" $D/state/$run-2 $D/scratch-2.txt > $D/data/applications/istesso-join-second.desktop &&
+# An application that is started for a session runs as the same user, with that user's data:
+# that is what is wanted when a person opens their own editor, and it is what a test must not
+# do. The editor of this trial is therefore started with its data, configuration, state and
+# cache in a directory of the trial's own, new for every run; with its settings kept in memory
+# (they would otherwise be written by a service of the user's desktop session); without the
+# desktop's file services, which keep notes about files in the user's data; and with no way
+# to the sound server. The trial checks afterwards that nothing of the person's changed.
+apart() { # a directory of the trial's own on the host, the file to open: the Exec line
+    printf 'env XDG_DATA_HOME=%s/data XDG_CONFIG_HOME=%s/config XDG_STATE_HOME=%s/state XDG_CACHE_HOME=%s/cache GSETTINGS_BACKEND=memory GIO_USE_VFS=local PULSE_SERVER=unix:/nonexistent PIPEWIRE_REMOTE=istesso-none gnome-text-editor --standalone --ignore-session %s' "$1" "$1" "$1" "$1" "$2"
+}
+# What the person's own editor, settings and file notes look like from outside: names, sizes
+# and times of change, never what is in them. The same before and after means untouched.
+persons_state() {
+    on_host 'for place in ~/.local/share/org.gnome.TextEditor ~/.local/share/recently-used.xbel ~/.local/share/gvfs-metadata ~/.config/dconf ~/.local/state/wireplumber; do
+        find "$place" -maxdepth 2 -printf "%p %s %T@\n" 2>/dev/null; done | sort | md5sum | cut -d" " -f1'
+}
+persons_before=$(persons_state)
+run=$(date +%s)
+on_host 'mkdir -p $D/data/applications $D/cache $D/logs $D/app/'"$run"'-1 $D/app/'"$run"'-2 && : > $D/scratch.txt && : > $D/scratch-2.txt &&
+    printf "[Desktop Entry]\nType=Application\nName='"$APP"'\nExec=%s\n" "'"$(apart "\$D/app/$run-1" "\$D/scratch.txt")"'" > $D/data/applications/istesso-join-editor.desktop &&
+    printf "[Desktop Entry]\nType=Application\nName='"$SECOND"'\nExec=%s\n" "'"$(apart "\$D/app/$run-2" "\$D/scratch-2.txt")"'" > $D/data/applications/istesso-join-second.desktop &&
     { [ -z "'"${JOIN_REGISTRY:-}"'" ] || cp '"${JOIN_REGISTRY:-/dev/null}"' $D/registry.bin; }'
 start_agent() { # more of the agent's environment, if any
     on_host 'tmux kill-session -t join-agent 2>/dev/null; sleep 0.3; : > $D/agent.log
@@ -173,6 +188,7 @@ echo "== the application, its picture and typed text =="
 "$BIN" open "$APP" --viewer "$HERE/scripts/session-viewer.py" --size 960x540 --fps 60 --position "$POSITION" > "$WORK/open-1.txt" 2>&1 &
 cli=$!
 check "the application starts on the host and the session runs" wait_for "$WORK/open-1.txt" "is running on" 30
+check "the application runs with its data, configuration, state and cache in the trial's own directory" on_host 'pid=$(pgrep -u "$USER" -f "[g]nome-text-editor --standalone --ignore-session $D/scratch.txt" | head -1); [ -n "$pid" ] && [ "$(tr "\0" "\n" < /proc/$pid/environ | grep -c -E "^XDG_(DATA|CONFIG|STATE|CACHE)_HOME=$D/app/")" = 4 ]'
 check "the picture comes through the encrypted channel and is drawn" wait_for "$WORK/open-1.txt" "viewer: window for session" 10
 frames=$(sed -n 's/.*frames are written down in \([^;]*\);.*/\1/p' "$WORK/open-1.txt" | tail -1)
 input=$(sed -n 's/.*input goes to \(.*\)$/\1/p' "$WORK/open-1.txt" | tail -1)
@@ -289,6 +305,8 @@ for id in $(ISTESSO_CONFIG_DIR="$B" "$BIN" sessions 2> /dev/null | awk '/Istesso
 done
 
 echo "== cleaning up =="
+persons_after=$(persons_state)
+check "nothing changed in the person's own editor state, settings, file notes and sound state while the trial ran" [ "$persons_before" = "$persons_after" ]
 on_host 'tmux kill-session -t join-agent 2>/dev/null; sleep 0.5; pgrep -f "[s]ession-runner.py|[m]1-step3-host.py --to-channel '"${PORTS%%-*}"'" > /dev/null && echo "  something of the trial still runs on the host" || echo "  nothing of the trial runs on the host"'
 pgrep -f "[g]st-viewer .*$APP" > /dev/null && echo "  the trial's viewer still runs on this machine" || echo "  the trial's viewer does not run on this machine"
 echo "$failed checks failed"
