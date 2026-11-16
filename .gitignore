@@ -9,3 +9,5 @@
 /macos/gst-viewer/build/
 # Bundles handed over between machines; never part of the history.
 /handoff/
+# Left behind by running the scripts in scripts/
+__pycache__/

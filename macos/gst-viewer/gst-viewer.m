@@ -5,17 +5,221 @@
 // relayed picture has to sit next to a local window on a chosen display, so this program opens
 // the window itself and hands its view to the pipeline's video sink.
 //
-// Usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE
+// Usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE [FRAME_LOG]
 //   X Y            top left corner of the window, in points from the top left of the main display
 //   WIDTH HEIGHT   size of the picture area, in points
 //   PIPELINE       a gst-launch style description ending in a video sink, for example
 //                  "udpsrc port=5004 caps=... ! rtph265depay ! h265parse ! avdec_h265 ! glimagesink sync=false"
+//   FRAME_LOG      optional: a file to write the way of every frame through the pipeline to
+//
+// The frame log says where the time on the client goes. It has one JSON object per line, with
+// times in nanoseconds on the clock the screen probe uses (mach absolute time), so its lines can
+// be set against the probe's log directly. The pipeline names the elements to watch; any of the
+// three may be left out.
+//
+//   name=net   an RTP source     {"kind":"arrived","rtp":R,"first_ns":T,"last_ns":T,"packets":N,"bytes":N}
+//                                one line per RTP timestamp, written when the packet with the
+//                                marker bit arrives: first and last packet of the frame
+//   name=dec   the decoder       {"kind":"decoded","pts":P,"t_ns":T,"luma":Y}
+//                                a frame left the decoder; Y is the luma in its middle
+//   name=sink  the video sink    {"kind":"sink","pts":P,"t_ns":T}    the frame reached the sink
+//                                {"kind":"drawn","pts":P,"t_ns":T}   the sink drew it (glimagesink only)
+//
+// {"kind":"clock","mono_ns":T,"unix_ns":U} lines pair that clock with the time of day.
 //
 // Only for measurements: the own client of step 4 replaces it. GStreamer is linked dynamically.
 
 #import <Cocoa/Cocoa.h>
 #include <gst/gst.h>
+#include <gst/video/video.h>
 #include <gst/video/videooverlay.h>
+#include <time.h>
+
+static FILE *frame_log = NULL;
+
+// Nanoseconds of mach absolute time: the clock ScreenCaptureKit stamps frames with.
+static guint64 now_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void log_clock(void) {
+    guint64 before = now_ns();
+    struct timespec day;
+    clock_gettime(CLOCK_REALTIME, &day);
+    guint64 after = now_ns();
+    fprintf(frame_log, "{\"kind\":\"clock\",\"mono_ns\":%llu,\"unix_ns\":%llu}\n",
+            (unsigned long long)(before + (after - before) / 2),
+            (unsigned long long)day.tv_sec * 1000000000ULL + (unsigned long long)day.tv_nsec);
+}
+
+// The frame whose packets are arriving. Only touched on the streaming thread of the source.
+static struct {
+    gboolean open;
+    guint32 rtp;
+    guint64 first_ns, last_ns, bytes;
+    guint packets;
+} arriving;
+
+static void close_arriving(void) {
+    if (!arriving.open) {
+        return;
+    }
+    fprintf(frame_log, "{\"kind\":\"arrived\",\"rtp\":%u,\"first_ns\":%llu,\"last_ns\":%llu,\"packets\":%u,\"bytes\":%llu}\n",
+            arriving.rtp, (unsigned long long)arriving.first_ns, (unsigned long long)arriving.last_ns,
+            arriving.packets, (unsigned long long)arriving.bytes);
+    arriving.open = FALSE;
+}
+
+static gboolean on_packet(GstBuffer **buffer, guint index, gpointer user_data) {
+    guint64 t = *(guint64 *)user_data;
+    guint8 header[12];
+    if (gst_buffer_extract(*buffer, 0, header, sizeof header) != sizeof header) {
+        return TRUE;
+    }
+    guint32 rtp = ((guint32)header[4] << 24) | ((guint32)header[5] << 16) | ((guint32)header[6] << 8) | header[7];
+    if (arriving.open && arriving.rtp != rtp) {
+        close_arriving();  // The packet with the marker bit never came.
+    }
+    if (!arriving.open) {
+        arriving.open = TRUE;
+        arriving.rtp = rtp;
+        arriving.first_ns = t;
+        arriving.packets = 0;
+        arriving.bytes = 0;
+    }
+    arriving.last_ns = t;
+    arriving.packets += 1;
+    arriving.bytes += gst_buffer_get_size(*buffer);
+    if (header[1] & 0x80) {
+        close_arriving();
+    }
+    return TRUE;
+}
+
+static GstPadProbeReturn on_arrival(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    guint64 t = now_ns();
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        gst_buffer_list_foreach(GST_PAD_PROBE_INFO_BUFFER_LIST(info), on_packet, &t);
+    } else {
+        GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+        on_packet(&buffer, 0, &t);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+// Luma in the middle of a frame whose first plane holds one byte of luma per pixel
+// (I420, NV12 and their relatives). -1 when the frame cannot be read.
+static int middle_luma(GstPad *pad, GstBuffer *buffer) {
+    gsize offset;
+    GstVideoMeta *meta = gst_buffer_get_video_meta(buffer);
+    if (meta != NULL) {
+        offset = meta->offset[0] + (gsize)(meta->height / 2) * (gsize)meta->stride[0] + meta->width / 2;
+    } else {
+        GstCaps *caps = gst_pad_get_current_caps(pad);
+        GstVideoInfo video;
+        gboolean known = caps != NULL && gst_video_info_from_caps(&video, caps);
+        if (caps != NULL) {
+            gst_caps_unref(caps);
+        }
+        if (!known) {
+            return -1;
+        }
+        offset = GST_VIDEO_INFO_PLANE_OFFSET(&video, 0)
+            + (gsize)(GST_VIDEO_INFO_HEIGHT(&video) / 2) * (gsize)GST_VIDEO_INFO_PLANE_STRIDE(&video, 0)
+            + GST_VIDEO_INFO_WIDTH(&video) / 2;
+    }
+    guint8 luma;
+    return gst_buffer_extract(buffer, offset, &luma, 1) == 1 ? luma : -1;
+}
+
+static GstPadProbeReturn on_decoded(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    guint64 t = now_ns();
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    fprintf(frame_log, "{\"kind\":\"decoded\",\"pts\":%llu,\"t_ns\":%llu,\"luma\":%d}\n",
+            (unsigned long long)GST_BUFFER_PTS(buffer), (unsigned long long)t, middle_luma(pad, buffer));
+    return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn on_sink(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    guint64 t = now_ns();
+    fprintf(frame_log, "{\"kind\":\"sink\",\"pts\":%llu,\"t_ns\":%llu}\n",
+            (unsigned long long)GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info)), (unsigned long long)t);
+    return GST_PAD_PROBE_OK;
+}
+
+// glimagesink's "client-draw": emitted just before the sink draws a frame. Returning FALSE
+// leaves the drawing to the sink.
+static gboolean on_draw(GstElement *sink, gpointer context, GstSample *sample, gpointer user_data) {
+    guint64 t = now_ns();
+    GstBuffer *buffer = sample != NULL ? gst_sample_get_buffer(sample) : NULL;
+    if (buffer != NULL) {
+        fprintf(frame_log, "{\"kind\":\"drawn\",\"pts\":%llu,\"t_ns\":%llu}\n",
+                (unsigned long long)GST_BUFFER_PTS(buffer), (unsigned long long)t);
+    }
+    return FALSE;
+}
+
+// Adds a probe for buffers to a pad of the element called `name`. Says so when there is none.
+static void watch(GstElement *pipeline, const char *name, const char *pad_name, GstPadProbeType type,
+                  GstPadProbeCallback callback) {
+    GstElement *element = gst_bin_get_by_name(GST_BIN(pipeline), name);
+    GstPad *pad = element != NULL ? gst_element_get_static_pad(element, pad_name) : NULL;
+    if (pad == NULL) {
+        fprintf(stderr, "note: no element with name=%s in the pipeline; the frame log leaves it out\n", name);
+    } else {
+        gst_pad_add_probe(pad, type, callback, NULL, NULL);
+        gst_object_unref(pad);
+    }
+    if (element != NULL) {
+        gst_object_unref(element);
+    }
+}
+
+static gboolean start_frame_log(GstElement *pipeline, const char *path) {
+    frame_log = fopen(path, "wx");  // Never overwrite an earlier measurement.
+    if (frame_log == NULL) {
+        fprintf(stderr, "error: cannot create %s: %s\n", path, strerror(errno));
+        return FALSE;
+    }
+    struct timespec day;
+    clock_gettime(CLOCK_REALTIME, &day);
+    fprintf(frame_log, "{\"kind\":\"header\",\"side\":\"client\",\"tool\":\"gst-viewer\",\"version\":\"0.0.1\",\"started_unix_ms\":%llu}\n",
+            (unsigned long long)day.tv_sec * 1000ULL + (unsigned long long)day.tv_nsec / 1000000ULL);
+    log_clock();
+
+    watch(pipeline, "net", "src", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, on_arrival);
+    watch(pipeline, "dec", "src", GST_PAD_PROBE_TYPE_BUFFER, on_decoded);
+    watch(pipeline, "sink", "sink", GST_PAD_PROBE_TYPE_BUFFER, on_sink);
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+    if (sink != NULL) {
+        if (g_signal_lookup("client-draw", G_OBJECT_TYPE(sink)) != 0) {
+            g_signal_connect(sink, "client-draw", G_CALLBACK(on_draw), NULL);
+        }
+        gst_object_unref(sink);
+    }
+
+    // The log reaches the disk twice a second, and once more when the program is asked to stop.
+    static dispatch_source_t timer, stop[2];
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), NSEC_PER_SEC / 2, NSEC_PER_SEC / 20);
+    dispatch_source_set_event_handler(timer, ^{
+        log_clock();
+        fflush(frame_log);
+    });
+    dispatch_resume(timer);
+    int signals[2] = {SIGTERM, SIGINT};
+    for (int i = 0; i < 2; i++) {
+        signal(signals[i], SIG_IGN);
+        stop[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, signals[i], 0, dispatch_get_main_queue());
+        dispatch_source_set_event_handler(stop[i], ^{
+            log_clock();
+            fflush(frame_log);
+            exit(0);
+        });
+        dispatch_resume(stop[i]);
+    }
+    return TRUE;
+}
 
 static GstBusSyncReply on_message(GstBus *bus, GstMessage *message, gpointer user_data) {
     if (gst_is_video_overlay_prepare_window_handle_message(message)) {
@@ -39,8 +243,8 @@ static GstBusSyncReply on_message(GstBus *bus, GstMessage *message, gpointer use
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         gst_init(&argc, &argv);
-        if (argc != 7) {
-            fprintf(stderr, "usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE\n");
+        if (argc != 7 && argc != 8) {
+            fprintf(stderr, "usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE [FRAME_LOG]\n");
             return 2;
         }
         double x = atof(argv[1]), y = atof(argv[2]);
@@ -70,6 +274,9 @@ int main(int argc, char *argv[]) {
         GstElement *pipeline = gst_parse_launch(argv[6], &error);
         if (pipeline == NULL) {
             fprintf(stderr, "error: %s\n", error ? error->message : "cannot build the pipeline");
+            return 1;
+        }
+        if (argc == 8 && !start_frame_log(pipeline, argv[7])) {
             return 1;
         }
         GstBus *bus = gst_element_get_bus(pipeline);

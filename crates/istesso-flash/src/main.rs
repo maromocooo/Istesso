@@ -333,7 +333,7 @@ fn listen(socket: UdpSocket, clock: Clock, event_loop: EventLoopProxy<Outside>) 
     });
 }
 
-fn open_log(path: &PathBuf) -> Result<LogWriter<BufWriter<File>>, String> {
+fn open_log(path: &PathBuf, clock: &Clock) -> Result<LogWriter<BufWriter<File>>, String> {
     // Never overwrite an earlier measurement.
     let file = OpenOptions::new()
         .write(true)
@@ -350,6 +350,7 @@ fn open_log(path: &PathBuf) -> Result<LogWriter<BufWriter<File>>, String> {
         tool: env!("CARGO_PKG_NAME").to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_unix_ms,
+        clock_origin_unix_ns: Some(clock.origin_unix_ns()),
     }))
     .map_err(|e| format!("cannot write to {}: {e}", path.display()))?;
     Ok(log)
@@ -357,7 +358,11 @@ fn open_log(path: &PathBuf) -> Result<LogWriter<BufWriter<File>>, String> {
 
 fn run(args: Args) -> Result<(), String> {
     let clock = Clock::new();
-    let log = args.log.as_ref().map(open_log).transpose()?;
+    let log = args
+        .log
+        .as_ref()
+        .map(|path| open_log(path, &clock))
+        .transpose()?;
 
     let event_loop = EventLoop::<Outside>::with_user_event()
         .build()

@@ -22,6 +22,20 @@
 | 表示待ち | クライアント | 復号の終わりから、画面に出るまで（次の画面更新を待つ時間を含む） |
 | 転送（往復） | 両方 | 往復時間から上の3つとアプリの応答時間を引いた残り。`ping` の値と見比べる |
 
+### 合格ライン
+
+[ADR 0002](../adr/0002-latency-first.md) で決めています。手元で動かしたテストアプリの窓と、中継したテストアプリの窓を同じディスプレイに並べ、同じ入力を同時に与えて、それぞれの追加遅延を測ります（下の「画面での計測」）。比べるのは、**中継した窓の値から手元の窓の値を、同じ分位どうしで引いた差**です。
+
+| 分位 | 差（中継した窓 − 手元の窓） |
+|---|---|
+| 中央値 | 12 ms 以下 |
+| 95 パーセンタイル | 24 ms 以下 |
+| 99 パーセンタイル | 47 ms 以下 |
+
+- 条件は、2台とも有線、クライアントのディスプレイが 85 Hz。ほかの条件の値は、参考として記録する。
+- 判定に使う計測は 2,000 回以上、ふだんの計測は 500 回以上。
+- 入力ごとの差（同じ入力で、中継した窓が何 ms あとに出たか）と、それを画面更新の回数で数えた値は、参考として記録する。判定には使わない。
+
 ## 道具
 
 | 道具 | 役割 |
@@ -30,8 +44,10 @@
 | `istesso measure inputs` | テストアプリへ入力を送り、返事までの時間を測る。映像なしで、入力の経路だけを確かめる |
 | `istesso measure report` | 両側のログから、追加遅延と内訳を出す |
 | `istesso-screen-probe` | Mac の画面を読んで、手元の窓と中継した窓が同じ入力に反応した時刻を記録する（`macos/screen-probe`、[ADR 0008](../adr/0008-screen-recording-for-measurement.md)） |
-| `istesso measure compare` | 上の2つのログから、中継した窓が手元の窓よりどれだけ遅いかを出す |
-| `gst-viewer` | 手順 3 の受信側。GStreamer のパイプラインの映像を、指定した位置の窓に出す（`macos/gst-viewer`。`brew install gstreamer` のあと `macos/gst-viewer/build.sh`） |
+| `istesso measure compare` | 上の道具の2つのログと、2つのテストアプリのログから、それぞれの窓の追加遅延と、その差を出す。差を合格ラインと並べて表示する |
+| `gst-viewer` | 手順 3 の受信側。GStreamer のパイプラインの映像を、指定した位置の窓に出す（`macos/gst-viewer`。`brew install gstreamer` のあと `macos/gst-viewer/build.sh`）。フレームごとに、届いた時刻、復号した時刻、描いた時刻を書き出せる |
+| `scripts/m1-step3-host.py` | 手順 3 の送信側。パイプラインを動かし、フレームごとに、コンポジターを出た時刻、圧縮が終わった時刻、ネットワークへ渡した時刻を書き出す |
+| `scripts/m1-step3-breakdown.py` | 上の2つの記録と、テストアプリと `istesso-screen-probe` のログを突き合わせて、入力から表示までの内訳を出す（下の「内訳の計測」） |
 | `scripts/ping-stats.py` | `ping` の出力から、往復時間の分布と、跳ねの周期を出す |
 
 ### テストアプリ
@@ -51,7 +67,7 @@ target/release/istesso-flash --log host.jsonl
 1行に1つの JSON です。時刻は、書いた PC の時計で数えた、起動からのナノ秒です。2台の時計を比べることはありません。
 
 ```json
-{"kind":"header","side":"host","tool":"istesso-flash","version":"0.0.1","started_unix_ms":1794759850920}
+{"kind":"header","side":"host","tool":"istesso-flash","version":"0.0.1","started_unix_ms":1794759850920,"clock_origin_unix_ns":1794759850920684667}
 {"kind":"host","id":0,"source":"network","input_ns":260074349,"commit_ns":260359948}
 {"kind":"client","id":0,"sent_ns":1000000,"received_ns":9000000,"decoded_ns":11000000,"shown_ns":18000000}
 ```
@@ -62,6 +78,8 @@ target/release/istesso-flash --log host.jsonl
 | `client` | クライアント | `sent_ns`：入力を送り出した。`received_ns`：フレームを受信した。`decoded_ns`：復号が終わった。`shown_ns`：画面に出した |
 
 両側の行は `id` で対にします。ホスト名、ユーザー名、アドレスは書きません。
+
+`header` の `clock_origin_unix_ns` は、そのログの時計が 0 だったときの時刻（Unix 時刻、ナノ秒）です。**同じ PC** で同時に動いた 2 つのプログラムのログを、1本の時間軸に並べるために使います（例：ホストのテストアプリと、ホストのパイプライン）。相手のログには、その PC の単調時計と時刻の組（`{"kind":"clock","mono_ns":…,"unix_ns":…}`）を書いておき、原点を 1 度だけ単調時計に直します。そこから先は時刻を使いません。macOS では、時刻が単調時計に対して 100 万分の 19 ほどずれていくためです（3 分で約 3 ms）。2台の時計を比べるためのものではありません。
 
 ```sh
 istesso measure report --host host.jsonl --client client.jsonl
@@ -110,7 +128,7 @@ open -n -g "target/release/Istesso Flash.app" --args --listen 127.0.0.1:47811 --
 
 1. ホストでテストアプリを全画面で動かす（`--fullscreen --listen <アドレス>:47811 --log host.jsonl`）。配信ソフトで、その画面を Mac に窓で映す。
 2. Mac でテストアプリを `open` で起動する（`--listen 127.0.0.1:47811 --log local.jsonl --position=X,Y`）。中継の窓と同じディスプレイに、重ならないように置く。
-3. Mac で道具を動かす。500 回、200〜400 ms の間隔で、両方のテストアプリに同じ入力を送る。
+3. Mac で道具を動かす。200〜400 ms の間隔で、両方のテストアプリに同じ入力を送る。回数は、ふだんは 500 回（既定）、判定のときは 2,000 回（`--count 2000`。約 10 分かかる）。
 
    ```sh
    swift build -c release --package-path macos/screen-probe
@@ -119,30 +137,65 @@ open -n -g "target/release/Istesso Flash.app" --args --listen 127.0.0.1:47811 --
        --local-log probe-local.jsonl --relayed-log probe-relayed.jsonl
    ```
 
-4. 差と、追加遅延を出す。
+4. 2つの窓の追加遅延と、その差を出す。`host.jsonl` はホストから持ってくる。
 
    ```sh
-   istesso measure compare --local probe-local.jsonl --relayed probe-relayed.jsonl --refresh-hz 85
-   istesso measure report --host host.jsonl --client probe-relayed.jsonl
+   istesso measure compare --local probe-local.jsonl --relayed probe-relayed.jsonl \
+       --local-app local.jsonl --relayed-app host.jsonl --refresh-hz 85
    ```
+
+   はじめに出る「Relayed over local, percentile by percentile」が、合格ラインの指標です。分位ごとに、ラインに収まったか（`within`）、超えたか（`over`）も出ます。そのあとの「For reference」は、入力ごとの差と、画面更新の回数で数えた値です。内訳を見るときは、`istesso measure report --host host.jsonl --client probe-relayed.jsonl` を使います。
 
 気をつけること：
 
 - 2つの窓は同じディスプレイに置く。ディスプレイが違うと、ディスプレイの差を測ってしまう。道具は、違うディスプレイのときは測らずに止まる。
 - 道具が見るのは、それぞれの窓の中央。ほかの窓をかぶせない。中継側の窓は、既定では Moonlight の窓を探す。ほかの窓にするときは `--relayed-window` で指定する。
-- Mac が Wi-Fi なら、AWDL を止めておく（[記録](2026-11-16-wifi-path-awdl-off.md)）。
+- Mac が Wi-Fi なら、共有の機能を設定で切って、AWDL を止めておく（[切り方と確かめ方](2026-11-16-wifi-sharing-off.md)）。それでも、近くの機器に求められると AWDL は戻る。計測のあいだ AWDL が動かなかったことをカーネルのログで確かめ、動いていたら、そのあいだに送った入力を外して集計する。
+- 手元のテストアプリは、`open -n -g` で、前面に出さずに起動する。前面に出すと、そのとき人が打っていたキーをテストアプリが受け取り、色が切り替わる。受け取ってしまったキーは、`istesso measure compare` が数を表示して、計算から外す。
 - Moonlight は、マウスカーソルのあるディスプレイに窓を出す。起動のときだけ、カーソルを目的のディスプレイに置く。
 - 道具を変えたときは、手元のテストアプリを 2 つ並べて（ポートと `--title` を変える）、差が 0 になることを確かめる。
-- テストアプリは、計測のたびに起動し直す。入力の番号は毎回 0 から始まるので、1つのログに 2 回ぶんが入ると、2 回目が 1 回目の値と対になる。`istesso measure report` は、番号の重なりを見つけると警告する。
+- テストアプリは、計測のたびに起動し直す。入力の番号は毎回 0 から始まるので、1つのログに 2 回ぶんが入ると、2 回目が 1 回目の値と対になる。`istesso measure compare` と `istesso measure report` は、番号の重なりを見つけると警告する。
+- 合格ラインの指標は、手元の窓の値にも左右される。手元の窓の追加遅延がいつもの値（中央値で約 18 ms）から外れていたら、Mac がほかの処理で忙しくなかったかを確かめる。
 
 測れるのは、画面更新 1 回の刻みまでです。ディスプレイのパネルと入力機器の遅れ、配信ソフト自身の入力の経路は入りません（ADR 0008）。
+
+### 内訳の計測（手順 3 の経路。どこに時間がかかっているかを知りたいときに行う）
+
+「画面での計測」に、フレームごとの記録を足します。入力ごとに、その入力を最初に映したフレームを、コンポジターから画面まで追います。
+
+1. ホストで、`gst-launch-1.0` の代わりに `scripts/m1-step3-host.py --to <Mac のアドレス> --log host-frames.jsonl` でパイプラインを動かす（`GST_PLUGIN_PATH` は同じ）。
+2. Mac で、`gst-viewer` の最後の引数に記録の置き場所を足す。パイプラインには、見る要素に名前を付ける（`udpsrc name=net`、`avdec_h265 name=dec`、`glimagesink name=sink`）。
+3. 「画面での計測」のとおりに測る。同じ時間帯の `ping` と見比べたいときは、計測のあいだ `ping --apple-time -i 0.2 <ホスト>` も流す。
+4. 集計する。
+
+   ```sh
+   scripts/m1-step3-breakdown.py --probe-relayed probe-relayed.jsonl --host-app host.jsonl \
+       --host-frames host-frames.jsonl --client-frames client-frames.jsonl \
+       --probe-local probe-local.jsonl --local-app local.jsonl --ping ping.txt
+   ```
+
+区間は、足すと「入力を送ってから画面に出るまで」になるように切ってあります。見積もりは入りません。
+
+| 区間 | 時計 | 内容 |
+|---|---|---|
+| ネットワーク（行きと帰り） | 両方 | クライアントで測った「入力を送ってから、フレームの最初のパケットが届くまで」から、ホストで測った「入力が届いてから、パケットを渡すまで」を引いた残り。`ping` の往復時間と見比べる |
+| アプリ | ホスト | 入力が届いてから、フレームを確定するまで |
+| コンポジター | ホスト | フレームの確定から、その色のフレームがコンポジターを出るまで |
+| 圧縮、パケットにする | ホスト | コンポジターを出てから、ネットワークへ渡すまで |
+| フレームが届く、復号、描画 | クライアント | 最初のパケットから最後のパケットまで、復号が終わるまで、表示の要素が描くまで |
+| 窓の合成と表示 | クライアント | 描いてから、画面に出るまで |
+
+読むときの注意：
+
+- テストアプリの絵は、一面の灰色です。圧縮したフレームは 1 kB に満たず、パケット 2 個で届きます。ふつうのアプリの画面では、フレームが大きくなり、復号と転送にかかる時間が増えます。
+- 記録を取ること自体の影響は、取らない回と追加遅延を見比べて確かめます。
 
 ### ソフトウェアでの計測（常に行う）
 
 1. ホストでテストアプリを動かす。入力のたびに窓全体の色が切り替わる。
 2. クライアントから入力を送り、復号したフレームの色が変わった最初のフレームを「反応したフレーム」とする。
 3. 入力の間隔は 200〜400 ms の間でばらつかせる。一定の間隔だと、画面更新の周期と同期して偏った値になる。
-4. 500 回以上測り、中央値、95 パーセンタイル、99 パーセンタイル、最大値を出す。
+4. 500 回以上（判定のときは 2,000 回以上）測り、中央値、95 パーセンタイル、99 パーセンタイル、最大値を出す。
 
 ### カメラでの確認（節目ごとに行う）
 
@@ -181,10 +234,14 @@ open -n -g "target/release/Istesso Flash.app" --args --listen 127.0.0.1:47811 --
 
 | 指標 | 中央値 | 95% | 99% | 最大 |
 |---|---|---|---|---|
-| 追加遅延（ソフトウェア） | | | | |
+| 追加遅延の、手元の窓との差（合格ラインの指標） | | | | — |
+| 追加遅延（中継した窓） | | | | |
+| 追加遅延（手元の窓） | | | | |
 | 取り込みと圧縮 | | | | |
 | 復号 | | | | |
 | 表示待ち | | | | |
+
+参考：入力ごとの差（中央値、95%、99%、最大）と、更新 1 回ぶん、2 回ぶん、3 回ぶん以内に収まった割合。
 
 カメラでの計測：中継あり（平均 / 最大）、中継なし（平均 / 最大）、差。
 

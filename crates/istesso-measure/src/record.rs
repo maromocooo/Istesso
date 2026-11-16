@@ -38,6 +38,12 @@ pub struct Header {
     pub version: String,
     /// Wall-clock time at which the log was started, for the reader's orientation only.
     pub started_unix_ms: u64,
+    /// Time of day, in nanoseconds since the Unix epoch, at which the clock
+    /// of this log read zero ([`crate::Clock::origin_unix_ns`]). Lets logs
+    /// written on the same machine be put on one time line. Absent when the
+    /// writer does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_origin_unix_ns: Option<u64>,
 }
 
 /// How an input reached the application on the host.
@@ -169,7 +175,27 @@ mod tests {
             tool: "istesso-flash".into(),
             version: "0.0.1".into(),
             started_unix_ms: 1_794_000_000_000,
+            clock_origin_unix_ns: Some(1_794_000_000_000_123_456),
         })
+    }
+
+    #[test]
+    fn the_clock_origin_is_kept_and_may_be_missing() {
+        let mut bytes = Vec::new();
+        LogWriter::new(&mut bytes).write(&header()).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("\"clock_origin_unix_ns\":1794000000000123456"),
+            "{text}"
+        );
+        assert_eq!(read_log(text.as_bytes()).unwrap(), vec![header()]);
+
+        // Logs written before the field existed, and by tools that leave it out.
+        let old = "{\"kind\":\"header\",\"side\":\"client\",\"tool\":\"t\",\"version\":\"1\",\"started_unix_ms\":5}\n";
+        match &read_log(old.as_bytes()).unwrap()[0] {
+            Record::Header(h) => assert_eq!(h.clock_origin_unix_ns, None),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
