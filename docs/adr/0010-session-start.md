@@ -441,6 +441,7 @@ pub enum ErrorCode {
 ```text
 → {"v":1,"cmd":"start","session":"5b0c9e3a7f21d684","kind":"app_window","display":{"width":1720,"height":720,"fps":85},"peer":{"id":"1a2b-3c4d-5e6f-7a8b","address":"192.0.2.10"},"input_socket":"/run/user/1000/istesso/input-5b0c9e3a7f21d684.sock","offer":{"rtp_port":50004}}
 ← {"v":1,"event":"ready","env":{"WAYLAND_DISPLAY":"wayland-3"},"display":{"width":1720,"height":720,"fps":85},"answer":{"key_request_port":50005}}
+→ {"v":1,"cmd":"application","pid":4711}
 → {"v":1,"cmd":"detach"}
 → {"v":1,"cmd":"attach","peer":{"id":"1a2b-3c4d-5e6f-7a8b","address":"192.0.2.10"},"display":{"width":1280,"height":720,"fps":60},"offer":{"rtp_port":50010}}
 ← {"v":1,"event":"attached","display":{"width":1280,"height":720,"fps":60},"answer":{"key_request_port":50011}}
@@ -454,6 +455,7 @@ pub enum ErrorCode {
 |---|---|---|
 | `start` | エージェント → ランナー | 仮想ディスプレイを作り、最初のクライアントへ送り始める。セッションの ID、種類、望まれた `display`、相手の端末（ID と、制御チャンネルの接続元のアドレス）、入力を受け取るソケットの場所（`input_socket`）、クライアントのビューアーからの `offer` |
 | `ready` | ランナー → エージェント | アプリを受け入れられるようになり、`input_socket` にソケットを作り終えた。`env` は、アプリをこの仮想ディスプレイに出すための環境変数。`display` は、実際に出す大きさとフレームレート。`answer` は、クライアントのビューアーへの返事 |
+| `application` | エージェント → ランナー | アプリを起動した。そのプロセスの番号。アプリの窓を自分で探さなければならないランナー（Mac のホスト）のためのもので、アプリのほうからつなぎに来る仮想ディスプレイ（Wayland）のランナーは、読み飛ばしてよい |
 | `detach` | エージェント → ランナー | クライアントが離れた。送るのをやめる。仮想ディスプレイとアプリは、そのままにする |
 | `attach` | エージェント → ランナー | このクライアントへ送り始める。相手の端末、望まれた `display`、新しい `offer`。ほかのクライアントへ送っていたら、それはやめる |
 | `attached` | ランナー → エージェント | `attach` のとおりに送り始めた。実際の `display` と、新しい `answer` |
