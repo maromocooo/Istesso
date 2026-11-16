@@ -124,6 +124,9 @@ struct Shared {
     cursor_no: AtomicU64,
     /// How long a caller has for the handshake and its first message.
     hello_wait_ms: AtomicU64,
+    /// The picture is not offered: no caller is taken. Set while the session it belongs to
+    /// is shown to nobody ([`Host::offer`]).
+    withheld: AtomicBool,
     /// For tests: the viewers are not looked up while this is set.
     recheck_paused: AtomicBool,
     stop: AtomicBool,
@@ -292,6 +295,7 @@ impl Host {
             cursor: Mutex::new(None),
             cursor_no: AtomicU64::new(0),
             hello_wait_ms: AtomicU64::new(HELLO_WAIT.as_millis() as u64),
+            withheld: AtomicBool::new(false),
             recheck_paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             log,
@@ -383,6 +387,20 @@ impl Host {
             }
         }
         Ok(sent)
+    }
+
+    /// Offers the picture to paired devices (`true`, as a host does from the start), or
+    /// stops offering it (`false`): every viewer is cut off at once, and no caller is taken
+    /// until it is offered again. For a session that is shown to nobody for the time being:
+    /// whoever was watching is let go, and nobody else can come in its place.
+    pub fn offer(&self, offered: bool) {
+        let shared = &*self.shared;
+        shared.withheld.store(!offered, Ordering::SeqCst);
+        if !offered {
+            for watcher in shared.watchers().list.drain(..) {
+                shared.close(&watcher, &"the picture is no longer offered");
+            }
+        }
     }
 
     /// Says what the pointer's cursor looks like from now on. The viewers draw it themselves,
@@ -749,6 +767,10 @@ impl Shared {
     /// The first exchange with a caller; when it is a paired device that
     /// may look, the rest of this thread's life is that viewer's.
     fn serve(self: Arc<Self>, stream: TcpStream, pending: Place) -> Result<()> {
+        // While the picture is not offered, a caller is not even answered.
+        if self.withheld.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         // On some systems a connection takes over the listener's way of not
         // waiting; this one waits, until its deadline.
         stream.set_nonblocking(false)?;
@@ -850,7 +872,9 @@ impl Shared {
         self.close_earlier(&watcher.peer);
         {
             let mut watchers = self.watchers();
-            if self.stop.load(Ordering::SeqCst) {
+            // Looked at with the viewers in hand, as `offer` empties the list with them in
+            // hand: a caller that was on its way in when the offer ended does not get in.
+            if self.stop.load(Ordering::SeqCst) || self.withheld.load(Ordering::SeqCst) {
                 return Ok(());
             }
             (self.log)(format!("showing the picture to {}", watcher.peer.name));
