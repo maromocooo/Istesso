@@ -457,6 +457,8 @@ mod tests {
                         Request::Status => Response::Status {
                             status: HostStatus::default(),
                         },
+                        // Nothing else is asked of this stand-in.
+                        _ => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;

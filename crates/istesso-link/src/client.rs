@@ -76,14 +76,14 @@ impl Client {
     }
 
     /// Sends a request and waits for the answer. An error reported by the
-    /// other device comes back as [`Error::Remote`].
+    /// other device comes back as [`Error::Remote`], with its code.
     pub fn call(&mut self, request: &Request) -> Result<Response> {
         let bytes = serde_json::to_vec(request).map_err(|_| Error::Malformed)?;
         self.channel.send(&bytes)?;
         let answer = self.channel.recv()?;
         match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
             Response::Error { code, message } => {
-                Err(Error::Remote(format!("{message} ({code:?})")))
+                Err(Error::Remote(crate::RemoteError { code, message }))
             }
             response => Ok(response),
         }
@@ -113,6 +113,67 @@ impl Client {
     pub fn status(&mut self) -> Result<HostStatus> {
         match self.call(&Request::Status)? {
             Response::Status { status } => Ok(status),
+            _ => Err(Error::Malformed),
+        }
+    }
+}
+
+/// Streaming sessions (`docs/adr/0010-session-start.md`).
+impl Client {
+    /// The address the other device answered at.
+    pub fn remote_addr(&self) -> Result<SocketAddr> {
+        self.channel.stream().peer_addr().map_err(Error::from_io)
+    }
+
+    /// Asks the other device to start one of its applications and to stream
+    /// it to this one. The answer comes at once and says `starting`; follow
+    /// the session with [`Client::session_wait`].
+    pub fn session_start(
+        &mut self,
+        app: &str,
+        kind: istesso_proto::StreamKind,
+        display: istesso_proto::DisplayMode,
+        offer: serde_json::Value,
+    ) -> Result<istesso_proto::SessionInfo> {
+        self.session(&Request::SessionStart {
+            app: app.to_string(),
+            kind,
+            display,
+            offer,
+        })
+    }
+
+    /// Asks about a session and tells the host that this device is still
+    /// there. The host answers at once when the session changed after
+    /// revision `after`, and holds the answer back for up to `hold`
+    /// otherwise: give the conversation more time than that
+    /// ([`Client::set_timeout`]).
+    pub fn session_wait(
+        &mut self,
+        session: &istesso_proto::SessionId,
+        after: u64,
+        hold: Duration,
+    ) -> Result<istesso_proto::SessionInfo> {
+        self.session(&Request::SessionWait {
+            session: session.clone(),
+            after,
+            timeout_ms: u32::try_from(hold.as_millis()).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Asks the host to stop the application and the stream.
+    pub fn session_stop(
+        &mut self,
+        session: &istesso_proto::SessionId,
+    ) -> Result<istesso_proto::SessionInfo> {
+        self.session(&Request::SessionStop {
+            session: session.clone(),
+        })
+    }
+
+    fn session(&mut self, request: &Request) -> Result<istesso_proto::SessionInfo> {
+        match self.call(request)? {
+            Response::Session { session } => Ok(*session),
             _ => Err(Error::Malformed),
         }
     }

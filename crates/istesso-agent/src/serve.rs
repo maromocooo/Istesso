@@ -255,6 +255,13 @@ impl Shared {
                     status: local_status(),
                 }
             }
+            // Answered where the connection is, before this is reached.
+            Request::SessionStart { .. }
+            | Request::SessionWait { .. }
+            | Request::SessionStop { .. } => Response::error(
+                ErrorCode::Unsupported,
+                "sessions are not answered like a question about the host",
+            ),
         }
     }
 
