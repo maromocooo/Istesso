@@ -151,7 +151,9 @@ fn watch(mut args: Args) -> Result<(), Failure> {
         keys_seen += u64::from(frame.key_frame);
         bytes += frame.data.len() as u64;
         largest = largest.max(frame.data.len());
-        if last_seq.is_some_and(|last| frame.seq != last + 1) || frame.discontinuity {
+        // The first frame of a viewer that came while the stream ran says
+        // that frames went before it; that is no gap.
+        if last_seq.is_some_and(|last| frame.seq != last + 1 || frame.discontinuity) {
             jumps += 1;
         }
         if let Some(last) = last_first {
