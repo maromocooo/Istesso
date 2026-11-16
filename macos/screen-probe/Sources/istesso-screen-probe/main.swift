@@ -234,11 +234,49 @@ func openSocket(to target: String, option: String) throws -> Int32 {
     return descriptor
 }
 
-/// The datagram of `istesso_measure::FlashInput`: "IFI1" and the input's number.
-func sendInput(_ descriptor: Int32, id: UInt64) -> Bool {
+/// Sends the datagram of `istesso_measure::FlashInput`: "IFI1" and the input's number.
+///
+/// `nil` when it went out, otherwise what the system said (`errno`). A wireless interface
+/// that is busy for a moment refuses a datagram, so it is offered up to four times, a
+/// millisecond apart.
+func sendInput(_ descriptor: Int32, id: UInt64) -> Int32? {
     var bytes = [UInt8]("IFI1".utf8)
     withUnsafeBytes(of: id.bigEndian) { bytes.append(contentsOf: $0) }
-    return bytes.withUnsafeBytes { send(descriptor, $0.baseAddress, $0.count, 0) } == bytes.count
+    var refusal: Int32 = 0
+    for attempt in 0..<4 {
+        if attempt > 0 { usleep(1_000) }
+        if bytes.withUnsafeBytes({ send(descriptor, $0.baseAddress, $0.count, 0) }) == bytes.count {
+            return nil
+        }
+        refusal = errno
+    }
+    return refusal
+}
+
+/// Counts the inputs that could not be sent to one of the test applications. One that does
+/// not go out is one input lost; five in a row mean that nothing takes them.
+struct Unsent {
+    let option: String
+    var total = 0
+    var inARow = 0
+    var last: Int32 = 0
+
+    mutating func note(_ refusal: Int32?) throws {
+        guard let refusal else {
+            inARow = 0
+            return
+        }
+        total += 1
+        inARow += 1
+        last = refusal
+        if inARow >= 5 {
+            throw Failure("nothing takes inputs at the address given to \(option) (\(String(cString: strerror(refusal))))")
+        }
+    }
+
+    var summary: String? {
+        total == 0 ? nil : "\(total) inputs could not be sent to the address given to \(option) (last: \(String(cString: strerror(last))))"
+    }
 }
 
 // MARK: - Windows
@@ -541,6 +579,8 @@ func run() throws {
     let timeout = Double(options.timeoutMs) / 1000
     var shownLocal = 0
     var shownRelayed = 0
+    var unsentLocal = Unsent(option: "--local")
+    var unsentRelayed = Unsent(option: "--relayed")
 
     for id in 0..<UInt64(options.count) {
         guard let before = try watcher.settledShades(timeout: 3) else {
@@ -551,12 +591,8 @@ func run() throws {
         }
         let sentNs = clock.now()
         watcher.arm(expecting: before.map(\.toggled), atNs: sentNs)
-        guard sendInput(localSocket, id: id) else {
-            throw Failure("nothing takes inputs at the address given to --local")
-        }
-        guard sendInput(relayedSocket, id: id) else {
-            throw Failure("nothing takes inputs at the address given to --relayed")
-        }
+        try unsentLocal.note(sendInput(localSocket, id: id))
+        try unsentRelayed.note(sendInput(relayedSocket, id: id))
 
         let shown = watcher.collect(timeout: timeout)
         if let at = shown[0] {
@@ -581,6 +617,9 @@ func run() throws {
 
     print("Display: \(Int(display.frame.width))x\(Int(display.frame.height)) points at \(String(format: "%.2f", refreshHz)) Hz")
     print("Inputs: \(options.count) sent, \(shownLocal) shown by the local window, \(shownRelayed) by the relayed window (seed \(options.seed))")
+    for unsent in [unsentLocal, unsentRelayed] {
+        if let summary = unsent.summary { print(summary) }
+    }
     print("Frames looked at: \(watcher.frames)")
     print("Compare the logs with: istesso measure compare --local \(options.localLog) --relayed \(options.relayedLog) --refresh-hz \(String(format: "%.2f", refreshHz))")
 }
