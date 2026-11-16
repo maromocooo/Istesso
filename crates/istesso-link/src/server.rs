@@ -362,6 +362,7 @@ mod tests {
                             end,
                             left_by: None,
                             shown_on: None,
+                            paused: None,
                         }),
                     };
                     let response = match &request {

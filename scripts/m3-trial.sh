@@ -16,8 +16,8 @@
 #   M3_HOST_DIR='$HOME/.cache/istesso-m3-wip'       on the host
 #   M3_WORK=<directory>                             for the client's files; made if missing
 #
-#   scripts/m3-trial.sh [leave] [unsaved] [lost] [host] [nobody] [broken]
-#                                                   (all six when none is named)
+#   scripts/m3-trial.sh [leave] [unsaved] [lost] [host] [slots] [nobody] [broken]
+#                                                   (all seven when none is named)
 #
 # Every part takes well under a minute. The script ends with the number of checks that failed.
 # Taking a pairing away is not tried here, because that would change the list of paired
@@ -32,7 +32,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${M3_BIN:-$HERE/target/debug/istesso}
 WORK=${M3_WORK:-${TMPDIR:-/tmp}/istesso-m3-trial}
 VIEWER=$HERE/scripts/fake-viewer.sh
-[ $# -gt 0 ] || set -- leave unsaved lost host nobody broken
+[ $# -gt 0 ] || set -- leave unsaved lost host slots nobody broken
 
 mkdir -p "$WORK"
 export ISTESSO_CACHE_DIR="$WORK/cache"
@@ -64,10 +64,12 @@ nothing_listed() { sessions | grep -q "No application"; }
 sessions() { "$BIN" sessions 2>/dev/null; }
 session_of() { sessions | awk -v app="$1" 'index($0, app) { print $1; exit }'; }
 agent=none
-agent_as() {  # plain, broken or bare: has the trial agent run that way
+agent_as() {  # plain, scarce, broken or bare: has the trial agent run that way
     [ "$agent" = "$1" ] && return 0
     case $1 in
     plain) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run' ;;
+    # It has one encoder to give.
+    scarce) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run ISTESSO_ENCODER_SLOTS=1' ;;
     # Its runner gives up three seconds after it started.
     broken) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run ISTESSO_FAKE_RUNNER_FAIL_AFTER=3' ;;
     # What a machine offers that was switched on a moment ago and that nobody has logged in
@@ -221,6 +223,31 @@ for part in "$@"; do
         check "ended from the host, it is over" said "$WORK/host-force.txt" "Istesso M3 Unsaved was ended"
         check "the application is gone from the host" app_gone unsaved
         check "the device that started it has nothing listed any more" nothing_listed
+        ;;
+    slots)
+        echo "== more windows than the host can compress pictures for =="
+        check "the trial agent starts with one encoder to give" agent_as scarce
+        # The first window says after six seconds that the person turned to it.
+        ISTESSO_FAKE_VIEWER_TURN_AFTER=6 "$BIN" open "istesso m3 saved" --viewer "$VIEWER" > "$WORK/slots-1.txt" 2>&1 &
+        one=$!
+        check "the first application starts and is shown" wait_for "$WORK/slots-1.txt" "is running on" 20
+        "$BIN" open "istesso m3 unsaved" --viewer "$VIEWER" > "$WORK/slots-2.txt" 2>&1 &
+        two=$!
+        check "the second one is not refused: it starts and is shown" wait_for "$WORK/slots-2.txt" "is running on" 20
+        check "the first window is told that its picture is stopped, and why" wait_for "$WORK/slots-1.txt" "The picture of Istesso M3 Saved is stopped" 5
+        check "its viewer is told as well" wait_for "$WORK/slots-1.txt" "fake viewer: the picture is stopped (no_slot)" 5
+        check "the host's side of the stream gave the encoder back" on_host 'grep -q "the encoder is given back" $D/agent.log'
+        sessions > "$WORK/slots-list.txt"
+        check "the list says which window has no picture" said "$WORK/slots-list.txt" "Istesso M3 Saved.*picture stopped: no encoder is free"
+        check "both applications run on the host" app_runs saved
+        check "the person turns to the first window, and its picture is back" wait_for "$WORK/slots-1.txt" "The picture of Istesso M3 Saved is back" 10
+        check "the second window's picture is stopped in its place" wait_for "$WORK/slots-2.txt" "The picture of Istesso M3 Unsaved is stopped" 5
+        kill -INT $one $two
+        wait $one $two
+        for id in $(sessions | awk '/Istesso M3/ { print $1 }'); do
+            "$BIN" sessions stop "$id" --force > /dev/null 2>&1
+        done
+        check "both are ended afterwards" nothing_listed
         ;;
     nobody)
         echo "== a host nobody is logged in at: no runtime directory, no desktop =="

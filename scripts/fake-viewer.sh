@@ -15,6 +15,12 @@
 #                                              is asked, and may have a question first
 #   ISTESSO_FAKE_VIEWER_QUIT_AFTER=<seconds>   end that long after `show`, the way a viewer does
 #                                              that the person quits
+#   ISTESSO_FAKE_VIEWER_HIDE_AFTER=<seconds>   say `hidden` that long after `show`, the way a
+#                                              viewer does whose window is covered or minimised
+#   ISTESSO_FAKE_VIEWER_TURN_AFTER=<seconds>   say `visible` that long after `show`, the way a
+#                                              viewer does when the person turns to its window
+#
+# It writes down when it is told that the host stopped the picture, and when it is back.
 set -u
 
 IFS= read -r prepare || exit 1
@@ -50,7 +56,36 @@ if [ -n "${ISTESSO_FAKE_VIEWER_CLOSE_AFTER:-}" ]; then
     closer=$!
 fi
 
+hider=
+if [ -n "${ISTESSO_FAKE_VIEWER_HIDE_AFTER:-}" ]; then
+    (
+        sleep "$ISTESSO_FAKE_VIEWER_HIDE_AFTER"
+        echo "fake viewer: the window cannot be seen any more" >&2
+        echo '{"v":1,"event":"hidden"}'
+    ) &
+    hider=$!
+fi
+turner=
+if [ -n "${ISTESSO_FAKE_VIEWER_TURN_AFTER:-}" ]; then
+    (
+        sleep "$ISTESSO_FAKE_VIEWER_TURN_AFTER"
+        echo "fake viewer: the person turns to the window" >&2
+        echo '{"v":1,"event":"visible"}'
+    ) &
+    turner=$!
+fi
+
 # Until the command closes the input: that is how a viewer is told to close its window.
-cat > /dev/null
+while IFS= read -r line; do
+    case "$line" in
+    *'"cmd":"paused"'*)
+        reason=$(printf '%s' "$line" | sed -n 's/.*"reason":"\([a-z_]*\)".*/\1/p')
+        echo "fake viewer: the picture is stopped ($reason); the window keeps what it showed" >&2
+        ;;
+    *'"cmd":"resumed"'*) echo "fake viewer: the picture is back" >&2 ;;
+    esac
+done
 [ -n "$closer" ] && kill "$closer" 2>/dev/null
+[ -n "$hider" ] && kill "$hider" 2>/dev/null
+[ -n "$turner" ] && kill "$turner" 2>/dev/null
 echo "fake viewer: asked to close its window" >&2

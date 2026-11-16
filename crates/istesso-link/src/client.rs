@@ -213,6 +213,21 @@ impl Client {
         })
     }
 
+    /// Tells the other device whether this client's window for the session
+    /// can be seen.
+    pub fn session_show(
+        &mut self,
+        session: &istesso_proto::SessionId,
+        attachment: u64,
+        visible: bool,
+    ) -> Result<istesso_proto::SessionInfo> {
+        self.session(&Request::SessionShow {
+            session: session.clone(),
+            attachment,
+            visible,
+        })
+    }
+
     fn session(&mut self, request: &Request) -> Result<istesso_proto::SessionInfo> {
         match self.call(request)? {
             Response::Session { session } => Ok(*session),

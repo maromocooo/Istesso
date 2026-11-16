@@ -106,6 +106,22 @@ pub struct SessionEnd {
     pub message: String,
 }
 
+/// Why a session that a device is shown gets no picture for the moment.
+/// The application runs on, the client stays attached, and the host's side
+/// of the stream holds no encoder meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReason {
+    /// The client said that its window cannot be seen.
+    Hidden,
+    /// The host compresses as many pictures at once as it can, and other
+    /// windows were turned to more recently.
+    NoSlot,
+    /// A reason this version does not know.
+    #[serde(other)]
+    Unknown,
+}
+
 /// One session as its host reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -143,6 +159,10 @@ pub struct SessionInfo {
     /// finds another name here has been replaced by that device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shown_on: Option<String>,
+    /// Set while the session is `running` and its picture is stopped: the
+    /// session is there and holds no encoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<PauseReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +224,12 @@ pub enum RunnerCommand {
     /// Ask the application's windows to close, the way a window manager
     /// does. What the application makes of it is its own business.
     Close,
+    /// Stop making the picture and give the encoder back. The client stays
+    /// attached; the display and the application stay as they are.
+    Pause,
+    /// Make the picture again, for the client that is attached, beginning
+    /// with a frame that needs none before it.
+    Resume,
 }
 
 /// What a runner tells its agent.
@@ -281,6 +307,11 @@ pub enum ViewerCommand {
         #[serde(default)]
         answer: serde_json::Value,
     },
+    /// The host stopped the picture. The window keeps what it showed last
+    /// and says so.
+    Paused { reason: PauseReason },
+    /// The picture comes again.
+    Resumed,
 }
 
 /// What a viewer tells the command that started it.
@@ -300,6 +331,11 @@ pub enum ViewerEvent {
     Close,
     /// It cannot go on; it ends after this.
     Error { message: String },
+    /// The window cannot be seen: it is minimised, fully covered, or on
+    /// another desktop. Its picture is of no use for now.
+    Hidden,
+    /// The window can be seen again, or the person turned to it.
+    Visible,
 }
 
 #[derive(Serialize)]
@@ -400,6 +436,7 @@ mod tests {
             end: None,
             left_by: None,
             shown_on: None,
+            paused: None,
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
@@ -435,12 +472,53 @@ mod tests {
         assert!(!text.contains("left_by"), "{text}");
         info.left_by = Some("old laptop".to_string());
         info.shown_on = Some("tablet".to_string());
+        info.paused = Some(PauseReason::NoSlot);
         let text = serde_json::to_string(&info).unwrap();
         assert!(
-            text.ends_with(r#""message":""},"left_by":"old laptop","shown_on":"tablet"}"#),
+            text.ends_with(
+                r#""message":""},"left_by":"old laptop","shown_on":"tablet","paused":"no_slot"}"#
+            ),
             "{text}"
         );
         assert_eq!(serde_json::from_str::<SessionInfo>(&text).unwrap(), info);
+    }
+
+    #[test]
+    fn stopping_and_bringing_back_a_picture_are_lines_of_their_own() {
+        assert_eq!(
+            encode_line(&RunnerCommand::Pause),
+            r#"{"v":1,"cmd":"pause"}"#
+        );
+        assert_eq!(
+            encode_line(&RunnerCommand::Resume),
+            r#"{"v":1,"cmd":"resume"}"#
+        );
+        assert_eq!(
+            encode_line(&ViewerEvent::Hidden),
+            r#"{"v":1,"event":"hidden"}"#
+        );
+        assert_eq!(
+            decode_line::<ViewerEvent>(r#"{"v":1,"event":"visible"}"#),
+            Some(ViewerEvent::Visible)
+        );
+        let paused = ViewerCommand::Paused {
+            reason: PauseReason::Hidden,
+        };
+        assert_eq!(
+            encode_line(&paused),
+            r#"{"v":1,"cmd":"paused","reason":"hidden"}"#
+        );
+        assert_eq!(
+            encode_line(&ViewerCommand::Resumed),
+            r#"{"v":1,"cmd":"resumed"}"#
+        );
+        // A reason a newer host gives is read as one that is not known.
+        assert_eq!(
+            decode_line::<ViewerCommand>(r#"{"v":1,"cmd":"paused","reason":"cooling"}"#),
+            Some(ViewerCommand::Paused {
+                reason: PauseReason::Unknown
+            })
+        );
     }
 
     #[test]

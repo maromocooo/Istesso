@@ -13,7 +13,7 @@ use istesso_agent::session::local::{after_unpairing, sessions_here, stop_here};
 use istesso_agent::session::{HostSession, Rules};
 use istesso_agent::{survey, HostView, Paths, SurveyOptions};
 use istesso_link::ErrorCode;
-use istesso_proto::{HostState, SessionInfo, SessionState};
+use istesso_proto::{HostState, PauseReason, SessionInfo, SessionState};
 use serde::Serialize;
 
 use crate::open::{explain, COMMAND as OPEN};
@@ -81,10 +81,16 @@ pub fn state_words(state: SessionState) -> &'static str {
 /// A session's state, and whose it was when the device that opened it has
 /// been unpaired since.
 pub fn words(info: &SessionInfo) -> String {
-    let state = match (&info.shown_on, info.state) {
+    let mut state = match (&info.shown_on, info.state) {
         (Some(device), SessionState::Running) => format!("shown in a window on {device}"),
         _ => state_words(info.state).to_string(),
     };
+    // Open and attached, with no picture being made for now.
+    match info.paused {
+        Some(PauseReason::Hidden) => state.push_str(", picture stopped while it cannot be seen"),
+        Some(_) => state.push_str(", picture stopped: no encoder is free"),
+        None => {}
+    }
     match &info.left_by {
         Some(device) => format!("{state}; opened by {device}, which was unpaired"),
         None => state,
@@ -471,6 +477,7 @@ mod tests {
                 end: None,
                 left_by: None,
                 shown_on: None,
+                paused: None,
             },
         }
     }
@@ -523,6 +530,12 @@ mod tests {
         assert_eq!(words(&shown), "shown in a window");
         shown.shown_on = Some("tablet".to_string());
         assert_eq!(words(&shown), "shown in a window on tablet");
+        shown.paused = Some(PauseReason::NoSlot);
+        assert_eq!(
+            words(&shown),
+            "shown in a window on tablet, picture stopped: no encoder is free"
+        );
+        shown.paused = None;
         shown.state = SessionState::Detached;
         assert_eq!(words(&shown), "running, not shown");
 

@@ -58,6 +58,7 @@ pub fn quick_rules() -> Rules {
         remember_ended_for: Duration::from_secs(60),
         wait_at_most: Duration::from_millis(500),
         max_sessions: 8,
+        encoder_slots: 8,
         tick: Duration::from_millis(10),
         recheck_rights_every: Duration::from_millis(50),
     }
@@ -236,6 +237,8 @@ impl RunningStream for FakeStream {
             RunnerCommand::Application { .. } => {}
             RunnerCommand::Detach => self.journal.note("runner detach"),
             RunnerCommand::Close => self.journal.note("runner close"),
+            RunnerCommand::Pause => self.journal.note("runner pause"),
+            RunnerCommand::Resume => self.journal.note("runner resume"),
             RunnerCommand::Start { .. } => self.journal.note("runner start again"),
         }
         Ok(())
@@ -368,6 +371,16 @@ impl FakeViewer {
         self.told.lock().unwrap().clone()
     }
 
+    /// The window is covered, or the person turns to it again.
+    pub fn seen(&self, visible: bool) {
+        let event = if visible {
+            ViewerEvent::Visible
+        } else {
+            ViewerEvent::Hidden
+        };
+        self.said.lock().unwrap().push_back(ViewerSaid::Said(event));
+    }
+
     /// The person clicks the window's close button.
     pub fn ask_to_close(&self) {
         self.said
@@ -424,6 +437,10 @@ impl RunningViewer for FakeWindow {
                     }));
             }
             ViewerCommand::Show { .. } => self.journal.note("viewer show"),
+            ViewerCommand::Paused { reason } => {
+                self.journal.note(format!("viewer paused {reason:?}"))
+            }
+            ViewerCommand::Resumed => self.journal.note("viewer resumed"),
         }
         Ok(())
     }

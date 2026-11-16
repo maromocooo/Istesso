@@ -28,8 +28,8 @@ use istesso_link::{Client, LocalKeys, RemoteError};
 use istesso_pair::{Identity, PeerStore};
 use istesso_proto::session::address_text;
 use istesso_proto::{
-    DisplayMode, EndReason, SessionEnd, SessionId, SessionInfo, SessionPeer, SessionState,
-    StreamKind, ViewerCommand, ViewerEvent, ViewerWish,
+    DisplayMode, EndReason, PauseReason, SessionEnd, SessionId, SessionInfo, SessionPeer,
+    SessionState, StreamKind, ViewerCommand, ViewerEvent, ViewerWish,
 };
 
 use super::policy;
@@ -324,6 +324,11 @@ pub enum Progress<'a> {
     /// The person wanted to close the window, and the application was asked
     /// to close. The window stays for its answer.
     AskedToClose,
+    /// The host stopped the picture of this window. The application runs
+    /// on, and the window stays.
+    Paused(PauseReason),
+    /// The picture is back.
+    Resumed,
 }
 
 enum HostSaid {
@@ -391,6 +396,8 @@ pub fn open_window(
     };
     let mut shown = false;
     let mut leave = false;
+    // Why the host makes no picture for this window right now, if so.
+    let mut paused: Option<PauseReason> = None;
     let mut early: Option<Outcome> = None;
     if first.state == SessionState::Running {
         shown = true;
@@ -422,36 +429,52 @@ pub fn open_window(
             break outcome;
         }
         match reports.recv_timeout(rules.tick) {
-            Ok(HostSaid::Report(info)) => match info.state {
-                SessionState::Stopping | SessionState::Ended => {
-                    progress(Progress::Session(&info));
-                    break Outcome::Ended(info.end.unwrap_or(SessionEnd {
-                        reason: EndReason::Other,
-                        message: String::new(),
-                    }));
-                }
-                // A newer window has it. This one has nothing to leave.
-                _ if info.attachment != mine => {
-                    break Outcome::TakenOver {
-                        session: session.clone(),
-                        by: info.shown_on.clone(),
+            Ok(HostSaid::Report(info)) => {
+                match info.state {
+                    SessionState::Stopping | SessionState::Ended => {
+                        progress(Progress::Session(&info));
+                        break Outcome::Ended(info.end.unwrap_or(SessionEnd {
+                            reason: EndReason::Other,
+                            message: String::new(),
+                        }));
                     }
-                }
-                SessionState::Running if !shown => {
-                    shown = true;
-                    if let Err(why) = window.viewer.tell(&show(&info)) {
-                        leave = true;
-                        break Outcome::ViewerGone {
+                    // A newer window has it. This one has nothing to leave.
+                    _ if info.attachment != mine => {
+                        break Outcome::TakenOver {
                             session: session.clone(),
-                            ok: false,
-                            how: why,
-                        };
+                            by: info.shown_on.clone(),
+                        }
                     }
-                    progress(Progress::Session(&info));
+                    SessionState::Running if !shown => {
+                        shown = true;
+                        if let Err(why) = window.viewer.tell(&show(&info)) {
+                            leave = true;
+                            break Outcome::ViewerGone {
+                                session: session.clone(),
+                                ok: false,
+                                how: why,
+                            };
+                        }
+                        progress(Progress::Session(&info));
+                    }
+                    SessionState::Detached => break Outcome::Detached(session.clone()),
+                    _ => {}
                 }
-                SessionState::Detached => break Outcome::Detached(session.clone()),
-                _ => {}
-            },
+                // The window is told when its picture stops and when it
+                // comes back, so that it can say so instead of looking
+                // frozen.
+                if shown && info.state == SessionState::Running && info.paused != paused {
+                    paused = info.paused;
+                    let (line, news) = match paused {
+                        Some(reason) => {
+                            (ViewerCommand::Paused { reason }, Progress::Paused(reason))
+                        }
+                        None => (ViewerCommand::Resumed, Progress::Resumed),
+                    };
+                    let _ = window.viewer.tell(&line);
+                    progress(news);
+                }
+            }
             Ok(HostSaid::Lost(why)) => {
                 break Outcome::HostLost {
                     session: session.clone(),
@@ -486,6 +509,18 @@ pub fn open_window(
                 if asked.is_ok() {
                     progress(Progress::AskedToClose);
                 }
+            }
+            // The window cannot be seen, or can again: the host need not
+            // make a picture nobody looks at, and gives the encoder to a
+            // window that is looked at.
+            Some(ViewerSaid::Said(event @ (ViewerEvent::Hidden | ViewerEvent::Visible))) => {
+                let visible = event == ViewerEvent::Visible;
+                let _ = link().and_then(|mut client| {
+                    client
+                        .set_timeout(rules.answer_within)
+                        .and_then(|_| client.session_show(&session, mine, visible))
+                        .map_err(|e| e.to_string())
+                });
             }
             Some(ViewerSaid::Exited { ok, how }) => {
                 leave = true;

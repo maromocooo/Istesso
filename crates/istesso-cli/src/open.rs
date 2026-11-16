@@ -18,8 +18,8 @@ use istesso_agent::session::client::{
 use istesso_agent::{survey, HostView, Paths, SurveyOptions};
 use istesso_link::ErrorCode;
 use istesso_proto::{
-    AppEntry, AppInstance, Badge, EndReason, HostApps, HostState, Launch, SessionId, SessionState,
-    StreamKind, UnifiedApp, ViewerWish,
+    AppEntry, AppInstance, Badge, EndReason, HostApps, HostState, Launch, PauseReason, SessionId,
+    SessionState, StreamKind, UnifiedApp, ViewerWish,
 };
 
 use crate::sessions::{self, Running};
@@ -366,6 +366,8 @@ fn open_there(
     let interrupted = Arc::new(AtomicBool::new(false));
     stop_on_signals(&interrupted);
     let how_to_end = "Closing the window asks it to close; Ctrl-C leaves it running.";
+    // Whether the person was told that the picture is stopped.
+    let mut stopped = false;
     let mut progress = |progress: Progress<'_>| match progress {
         Progress::Session(info) => match info.state {
             SessionState::Starting => {
@@ -389,6 +391,21 @@ fn open_there(
         Progress::AskedToClose => eprintln!(
             "Asked {name} to close. The window stays until it has: it may ask whether to save."
         ),
+        // A window nobody can see says nothing about it.
+        Progress::Paused(PauseReason::Hidden) => {}
+        Progress::Paused(_) => {
+            stopped = true;
+            eprintln!(
+                "The picture of {name} is stopped: {host} makes as many pictures at once as \
+                 it can, and other windows were turned to after this one. {name} runs on. \
+                 Turn to its window to bring the picture back."
+            )
+        }
+        Progress::Resumed if stopped => {
+            stopped = false;
+            eprintln!("The picture of {name} is back.")
+        }
+        Progress::Resumed => {}
     };
     let outcome = open_window(
         link,
@@ -617,6 +634,7 @@ mod tests {
                 end: None,
                 left_by: None,
                 shown_on: None,
+                paused: None,
             },
         }
     }

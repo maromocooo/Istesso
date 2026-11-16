@@ -79,6 +79,17 @@ pub enum Request {
     /// Stop showing me this session. The application runs on. Does nothing
     /// when `attachment` is no longer the one that is shown it.
     SessionDetach { session: SessionId, attachment: u64 },
+    /// My window for this session can be seen, or cannot. A session whose
+    /// window cannot be seen needs no picture; the other device may stop
+    /// making it and give the encoder to another window. The attachment
+    /// stays. Said again with `visible` when the person turns to the
+    /// window. Does nothing when `attachment` is no longer the one that
+    /// is shown the session.
+    SessionShow {
+        session: SessionId,
+        attachment: u64,
+        visible: bool,
+    },
 }
 
 fn app_window() -> StreamKind {
@@ -323,6 +334,17 @@ mod tests {
             .unwrap(),
             r#"{"type":"session_detach","session":"5b0c9e3a7f21d684","attachment":1}"#
         );
+        let hidden = Request::SessionShow {
+            session: id.clone(),
+            attachment: 2,
+            visible: false,
+        };
+        let json = serde_json::to_string(&hidden).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session_show","session":"5b0c9e3a7f21d684","attachment":2,"visible":false}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), hidden);
 
         let listed = Response::Sessions {
             sessions: vec![SessionInfo {
@@ -341,6 +363,7 @@ mod tests {
                 end: None,
                 left_by: None,
                 shown_on: None,
+                paused: None,
             }],
         };
         let json = serde_json::to_string(&listed).unwrap();
@@ -370,6 +393,7 @@ mod tests {
                 end: None,
                 left_by: None,
                 shown_on: None,
+                paused: None,
             }),
         };
         let json = serde_json::to_string(&response).unwrap();

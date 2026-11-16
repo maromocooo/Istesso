@@ -236,6 +236,11 @@ impl Host {
                 session: id.clone(),
                 attachment: 1,
             },
+            Request::SessionShow {
+                session: id.clone(),
+                attachment: 1,
+                visible: true,
+            },
             Request::SessionStop {
                 session: id.clone(),
                 force: false,
@@ -1106,6 +1111,218 @@ fn a_list_of_paired_devices_that_cannot_be_read_is_not_an_unpairing() {
     let left = host.settles(&id, |s| s.info.left_by.is_some());
     assert_eq!(left.info.state, SessionState::Detached);
     assert_eq!(host.list(&tablet).len(), 1);
+}
+
+#[test]
+fn an_attachment_belongs_to_the_device_it_was_given_to() {
+    // The laptop is shown the session as attachment 1. The tablet may use
+    // every session, and the number is easy to guess.
+    let host = host_with(Rules {
+        client_lost_after: Duration::from_millis(400),
+        ..quick_rules()
+    });
+    let id = host.running().id;
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    let as_first = |device: &Peer, request: Request| session(host.ask(device, request));
+    let wait = Request::SessionWait {
+        session: id.clone(),
+        after: 0,
+        timeout_ms: 0,
+        attachment: 1,
+    };
+    let hide = Request::SessionShow {
+        session: id.clone(),
+        attachment: 1,
+        visible: false,
+    };
+    let leave = Request::SessionDetach {
+        session: id.clone(),
+        attachment: 1,
+    };
+
+    // Naming the laptop's number, the tablet is not told what the media
+    // path agreed on with the laptop, does not hide the laptop's window,
+    // and does not leave for it.
+    assert_eq!(as_first(&tablet, wait.clone()).answer, None);
+    assert_eq!(as_first(&tablet, hide.clone()).paused, None);
+    assert_eq!(
+        as_first(&tablet, leave.clone()).state,
+        SessionState::Running
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(host.since_running().is_empty());
+    // The laptop is told, with the same number.
+    assert!(as_first(&host.laptop, wait.clone()).answer.is_some());
+
+    // The tablet's questions do not stand in for the laptop's either: the
+    // laptop falls silent, the tablet keeps asking in its name, and the
+    // picture stops when the laptop has been gone for long enough.
+    let silent = Instant::now();
+    while silent.elapsed() < Duration::from_millis(900) {
+        if as_first(&tablet, wait.clone()).state == SessionState::Detached {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    assert_eq!(
+        host.sessions.host_look(&id).unwrap().info.state,
+        SessionState::Detached
+    );
+    assert_eq!(host.since_running(), ["runner detach"]);
+
+    // Its own questions keep it there for as long as it asks, and it can
+    // hide its own window and leave.
+    let back = session(host.attach(&id));
+    assert_eq!((back.state, back.attachment), (SessionState::Running, 2));
+    let mine = |request: fn(SessionId) -> Request| as_first(&host.laptop, request(id.clone()));
+    let asking = Instant::now();
+    while asking.elapsed() < Duration::from_millis(900) {
+        let seen = mine(|session| Request::SessionWait {
+            session,
+            after: 0,
+            timeout_ms: 0,
+            attachment: 2,
+        });
+        assert_eq!(seen.state, SessionState::Running);
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let hidden = mine(|session| Request::SessionShow {
+        session,
+        attachment: 2,
+        visible: false,
+    });
+    assert_eq!(hidden.paused, Some(PauseReason::Hidden));
+    mine(|session| Request::SessionDetach {
+        session,
+        attachment: 2,
+    });
+    host.settles(&id, |s| s.info.state == SessionState::Detached);
+}
+
+#[test]
+fn a_session_can_be_there_and_hold_no_encoder() {
+    let host = host();
+    let id = host.running().id;
+    let seen = |visible: bool, attachment: u64| {
+        session(host.ask(
+            &host.laptop,
+            Request::SessionShow {
+                session: id.clone(),
+                attachment,
+                visible,
+            },
+        ))
+    };
+
+    // The window cannot be seen: no picture is made for it. The session
+    // is as it was otherwise: running, attached, its application alive.
+    let hidden = seen(false, 1);
+    assert_eq!(
+        (hidden.state, hidden.paused, hidden.attachment),
+        (SessionState::Running, Some(PauseReason::Hidden), 1)
+    );
+    host.journal.wait_for("runner pause", 1);
+    // A window that was replaced has no say in it.
+    assert_eq!(seen(true, 7).paused, Some(PauseReason::Hidden));
+    // Its client still asks about it, so it is not taken for gone.
+    assert_eq!(host.look(&id).state, SessionState::Running);
+
+    // Seen again: the picture is made again. Nothing was agreed anew.
+    assert_eq!(seen(true, 1).paused, None);
+    host.journal.wait_for("runner resume", 1);
+    assert_eq!(host.since_running(), ["runner pause", "runner resume"]);
+
+    // Hidden, then left: a session nobody is shown has no picture to stop
+    // and none to bring back, and comes back with one when it is shown
+    // again.
+    seen(false, 1);
+    host.journal.wait_for("runner pause", 2);
+    assert_eq!(host.detach(&id, 1).paused, None);
+    std::thread::sleep(Duration::from_millis(100));
+    let back = session(host.attach(&id));
+    assert_eq!((back.state, back.paused), (SessionState::Running, None));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        host.since_running()[2..],
+        ["runner pause", "runner detach", "runner attach"]
+    );
+    assert_eq!(host.journal.count("app stop"), 0);
+}
+
+#[test]
+fn a_window_beyond_the_encoder_slots_is_opened_with_its_picture_stopped() {
+    let host = host_with(Rules {
+        encoder_slots: 2,
+        ..quick_rules()
+    });
+    let paused = |id: &SessionId| host.sessions.host_look(id).unwrap().info.paused;
+    let first = host.running().id;
+    let second = session(host.start_as(&host.laptop, "paint.desktop")).id;
+    host.follow_until(&second, SessionState::Running);
+    assert_eq!((paused(&first), paused(&second)), (None, None));
+
+    // A third window. It is not refused: it opens and gets its picture,
+    // and the window that was turned to longest ago gives its slot up. It
+    // stays open and attached, and says why it shows nothing new.
+    let third = session(host.start_as(&host.laptop, "editor.desktop")).id;
+    host.follow_until(&third, SessionState::Running);
+    host.journal.wait_for("runner pause", 1);
+    assert_eq!(
+        (paused(&first), paused(&second), paused(&third)),
+        (Some(PauseReason::NoSlot), None, None)
+    );
+    let listed = host.list(&host.laptop);
+    assert_eq!(listed.len(), 3);
+    assert_eq!(
+        (listed[0].state, listed[0].paused),
+        (SessionState::Running, Some(PauseReason::NoSlot))
+    );
+
+    // The person turns to the first window. It gets a slot, and the one
+    // that was turned to longest ago now is the second.
+    session(host.ask(
+        &host.laptop,
+        Request::SessionShow {
+            session: first.clone(),
+            attachment: 1,
+            visible: true,
+        },
+    ));
+    host.journal.wait_for("runner resume", 1);
+    host.journal.wait_for("runner pause", 2);
+    assert_eq!(
+        (paused(&first), paused(&second), paused(&third)),
+        (None, Some(PauseReason::NoSlot), None)
+    );
+
+    // A window that cannot be seen needs no slot, so the second gets it.
+    session(host.ask(
+        &host.laptop,
+        Request::SessionShow {
+            session: third.clone(),
+            attachment: 1,
+            visible: false,
+        },
+    ));
+    host.journal.wait_for("runner resume", 2);
+    assert_eq!(
+        (paused(&first), paused(&second), paused(&third)),
+        (None, None, Some(PauseReason::Hidden))
+    );
+    // Neither does a session nobody is shown, or one that is over.
+    session(host.ask(
+        &host.laptop,
+        Request::SessionShow {
+            session: third.clone(),
+            attachment: 1,
+            visible: true,
+        },
+    ));
+    host.settles(&second, |s| s.info.paused == Some(PauseReason::NoSlot));
+    host.detach(&third, 1);
+    host.settles(&second, |s| s.info.paused.is_none());
+    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(Rules::default().encoder_slots, 8);
 }
 
 /// Asks on another thread, as a device whose question the host holds back.

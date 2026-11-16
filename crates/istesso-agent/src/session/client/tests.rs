@@ -139,6 +139,8 @@ fn told(progress: Progress<'_>) -> String {
     match progress {
         Progress::Session(info) => format!("{:?}", info.state).to_lowercase(),
         Progress::AskedToClose => "asked to close".to_string(),
+        Progress::Paused(reason) => format!("paused {reason:?}").to_lowercase(),
+        Progress::Resumed => "resumed".to_string(),
     }
 }
 
@@ -298,6 +300,41 @@ fn a_window_opens_for_an_application_of_another_device() {
             "runner stop"
         ]
     );
+}
+
+#[test]
+fn a_window_that_cannot_be_seen_gives_its_encoder_back() {
+    let pair = pair();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let window = pair.open(interrupted.clone());
+    let id = pair.session().id;
+
+    // The window is covered. The host is told, stops making the picture,
+    // and the window is told in turn, so that it can say so.
+    pair.viewer.seen(false);
+    pair.journal.wait_for("runner pause", 1);
+    pair.journal.wait_for("viewer paused Hidden", 1);
+    let held = pair.session();
+    assert_eq!(
+        (held.state, held.paused, held.attachment),
+        (
+            SessionState::Running,
+            Some(istesso_proto::PauseReason::Hidden),
+            1
+        )
+    );
+    // The person turns to it: the picture comes back, with the same
+    // attachment and without the two sides agreeing anew.
+    pair.viewer.seen(true);
+    pair.journal.wait_for("runner resume", 1);
+    pair.journal.wait_for("viewer resumed", 1);
+    assert_eq!(pair.session().paused, None);
+    assert_eq!(pair.on_host()[2..], ["runner pause", "runner resume"]);
+
+    interrupted.store(true, Ordering::SeqCst);
+    let (outcome, heard) = window.join().unwrap();
+    assert_eq!(outcome, Ok(Outcome::Left(id)));
+    assert_eq!(heard, ["starting", "running", "paused hidden", "resumed"]);
 }
 
 #[test]
@@ -704,6 +741,7 @@ fn a_host_that_goes_away_closes_the_window() {
                 end: None,
                 left_by: None,
                 shown_on: None,
+                paused: None,
             }),
         };
         for answer in [

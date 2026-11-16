@@ -78,6 +78,12 @@ enum Command {
         /// else 64). A safety value; one more is refused with the reason
         #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..=1024))]
         max_sessions: Option<u32>,
+        /// How many pictures this machine compresses at the same time
+        /// (default: $ISTESSO_ENCODER_SLOTS, else 8). A window beyond that
+        /// is opened all the same, with its picture stopped until another
+        /// window gives its slot up
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..=1024))]
+        encoder_slots: Option<u32>,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -309,6 +315,7 @@ fn run(cli: Cli) -> Result<(), String> {
             verbose,
             session_runner,
             max_sessions,
+            encoder_slots,
         } => run_agent(
             AgentOptions {
                 bind,
@@ -319,6 +326,7 @@ fn run(cli: Cli) -> Result<(), String> {
             },
             session_runner,
             max_sessions,
+            encoder_slots,
         ),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
         Command::Id => {
@@ -900,10 +908,14 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
 // agent / hosts
 // ---------------------------------------------------------------------------
 
-/// How many sessions the agent keeps open: what was asked for, else what
-/// the environment says, else the default.
-fn session_limit(asked: Option<u32>, from_env: Option<&str>) -> Result<usize, String> {
-    let default = istesso_agent::session::policy::OPEN_SESSIONS;
+/// A number the agent goes by: what was asked for, else what the
+/// environment variable `name` says, else the default.
+fn setting(
+    asked: Option<u32>,
+    from_env: Option<&str>,
+    name: &str,
+    default: usize,
+) -> Result<usize, String> {
     match (
         asked,
         from_env.map(str::trim).filter(|text| !text.is_empty()),
@@ -913,7 +925,7 @@ fn session_limit(asked: Option<u32>, from_env: Option<&str>) -> Result<usize, St
         (None, Some(text)) => match text.parse::<usize>() {
             Ok(count) if (1..=1024).contains(&count) => Ok(count),
             _ => Err(format!(
-                "ISTESSO_MAX_SESSIONS is '{text}'; it has to be a number from 1 to 1024"
+                "{name} is '{text}'; it has to be a number from 1 to 1024"
             )),
         },
     }
@@ -923,10 +935,21 @@ fn run_agent(
     options: AgentOptions,
     session_runner: Option<PathBuf>,
     max_sessions: Option<u32>,
+    encoder_slots: Option<u32>,
 ) -> Result<(), String> {
-    let max_sessions = session_limit(
+    use istesso_agent::session::policy;
+    let from_env = |name: &str| std::env::var(name).ok();
+    let max_sessions = setting(
         max_sessions,
-        std::env::var("ISTESSO_MAX_SESSIONS").ok().as_deref(),
+        from_env("ISTESSO_MAX_SESSIONS").as_deref(),
+        "ISTESSO_MAX_SESSIONS",
+        policy::OPEN_SESSIONS,
+    )?;
+    let encoder_slots = setting(
+        encoder_slots,
+        from_env("ISTESSO_ENCODER_SLOTS").as_deref(),
+        "ISTESSO_ENCODER_SLOTS",
+        policy::ENCODER_SLOTS,
     )?;
     let paths = Paths::from_env();
     // Everything that takes time happens before the port is opened: from
@@ -948,6 +971,7 @@ fn run_agent(
             program,
             istesso_agent::session::Rules {
                 max_sessions,
+                encoder_slots,
                 ..Default::default()
             },
         ),
@@ -1143,6 +1167,7 @@ mod tests {
 
     #[test]
     fn the_number_of_open_sessions_is_a_setting() {
+        let session_limit = |asked, from_env| setting(asked, from_env, "ISTESSO_MAX_SESSIONS", 64);
         // Nothing said: the safety value.
         assert_eq!(session_limit(None, None), Ok(64));
         assert_eq!(session_limit(None, Some("  ")), Ok(64));
@@ -1154,6 +1179,8 @@ mod tests {
             let why = session_limit(None, Some(wrong)).unwrap_err();
             assert!(why.contains("ISTESSO_MAX_SESSIONS"), "{why}");
         }
+        let parsed = Cli::try_parse_from(["istesso", "agent", "--encoder-slots", "12"]);
+        assert!(parsed.is_ok());
         let parsed = Cli::try_parse_from(["istesso", "agent", "--max-sessions", "0"]);
         assert!(parsed.is_err());
     }

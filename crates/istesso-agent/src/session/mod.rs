@@ -46,8 +46,8 @@ use istesso_link::{ErrorCode, Request, Response};
 use istesso_pair::{Peer, PeerStore, Permission};
 use istesso_proto::session::address_text;
 use istesso_proto::{
-    AppEntry, DisplayMode, EndReason, RunnerCommand, RunnerEvent, SessionEnd, SessionId,
-    SessionInfo, SessionPeer, SessionState, StreamKind,
+    AppEntry, DisplayMode, EndReason, PauseReason, RunnerCommand, RunnerEvent, SessionEnd,
+    SessionId, SessionInfo, SessionPeer, SessionState, StreamKind,
 };
 use rand_core::{OsRng, RngCore};
 
@@ -86,6 +86,17 @@ pub mod policy {
     /// a host can compress at once, which is counted separately (ADR 0010,
     /// section 15).
     pub const OPEN_SESSIONS: usize = 64;
+
+    /// How many pictures a host compresses at the same time, unless it is
+    /// set otherwise (`istesso agent --encoder-slots`). This, not the
+    /// number of open sessions, is what runs out. NVIDIA's NVENC
+    /// Application Note gives a GeForce 8 sessions per system in the
+    /// editions for Video Codec SDK 12.2 and 13.0 and 12 in the edition
+    /// for 13.1; which holds depends on the driver and has not been tried
+    /// on a host yet, so the smaller number is the default. A session
+    /// that finds no slot is opened all the same, with its picture
+    /// stopped (ADR 0010, section 15).
+    pub const ENCODER_SLOTS: usize = 8;
 
     /// Whether a device may see, attach to and stop a session of this
     /// host. `rights` is what the list of paired devices gives the device
@@ -128,6 +139,9 @@ pub struct Rules {
     /// Sessions that may be open at the same time, shown to someone or
     /// not. See [`policy::OPEN_SESSIONS`].
     pub max_sessions: usize,
+    /// Pictures that are compressed at the same time. See
+    /// [`policy::ENCODER_SLOTS`].
+    pub encoder_slots: usize,
     /// How often a session is looked after.
     pub tick: Duration,
     /// How often the list of paired devices is read again for a session.
@@ -145,6 +159,7 @@ impl Default for Rules {
             remember_ended_for: Duration::from_secs(60),
             wait_at_most: Duration::from_secs(3),
             max_sessions: policy::OPEN_SESSIONS,
+            encoder_slots: policy::ENCODER_SLOTS,
             tick: Duration::from_millis(100),
             recheck_rights_every: Duration::from_secs(1),
         }
@@ -246,6 +261,12 @@ struct Entry {
     owner: Device,
     /// The device that is shown it, or was the last to be.
     viewer: Device,
+    /// That device said that its window cannot be seen.
+    hidden: bool,
+    /// When a client was last attached, or its person last turned to the
+    /// window: the windows that were turned to last keep their picture
+    /// when there are more of them than encoder slots.
+    touched: Instant,
     number: u64,
     /// When the client that is shown the session last asked about it.
     seen: Instant,
@@ -474,6 +495,7 @@ pub fn is_session_request(request: &Request) -> bool {
             | Request::SessionList
             | Request::SessionAttach { .. }
             | Request::SessionDetach { .. }
+            | Request::SessionShow { .. }
     )
 }
 
@@ -568,6 +590,11 @@ impl Sessions {
                 self.stop(Asker::Device(caller), session, *force)
             }
             Request::SessionList => self.list(caller),
+            Request::SessionShow {
+                session,
+                attachment,
+                visible,
+            } => self.show(caller, session, *attachment, *visible),
             _ => refuse(ErrorCode::Unsupported, "not a question about a session"),
         };
         // These two are held back, for seconds. They are answered only to
@@ -670,6 +697,7 @@ impl Sessions {
             end: None,
             left_by: None,
             shown_on: None,
+            paused: None,
         };
         {
             let mut table = inner.lock();
@@ -687,6 +715,8 @@ impl Sessions {
                     // The device that starts a session is the first to be
                     // shown it.
                     viewer: owner.clone(),
+                    hidden: false,
+                    touched: Instant::now(),
                     number,
                     seen: Instant::now(),
                     waiting: 0,
@@ -768,7 +798,7 @@ impl Sessions {
             };
             // Only the client that is shown the session speaks for it: a
             // question from anywhere else does not keep the picture going.
-            let shown = attachment != 0 && attachment == entry.info.attachment;
+            let shown = entry.shows(caller, attachment);
             if shown {
                 entry.seen = Instant::now();
             }
@@ -882,7 +912,7 @@ impl Sessions {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
             // A window that has been replaced has nothing to leave any more.
-            let shown = attachment == entry.info.attachment
+            let shown = entry.shows(caller, attachment)
                 && matches!(
                     entry.info.state,
                     SessionState::Starting | SessionState::Running
@@ -903,6 +933,40 @@ impl Sessions {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    /// The client that is shown the session says whether its window can
+    /// be seen. One that cannot needs no picture, and gives its encoder
+    /// slot to a window that can; one the person turned to goes to the
+    /// front of the line for a slot.
+    fn show(
+        &self,
+        caller: Caller<'_>,
+        session: &SessionId,
+        attachment: u64,
+        visible: bool,
+    ) -> Response {
+        let inner = &self.inner;
+        let mut table = inner.lock();
+        let Some(entry) = table.owned(session, caller) else {
+            return refuse(ErrorCode::NotFound, "no such session");
+        };
+        // A window that has been replaced has nothing to say about it.
+        let shown = entry.shows(caller, attachment);
+        if shown {
+            entry.hidden = !visible;
+            entry.seen = Instant::now();
+            if visible {
+                entry.touched = Instant::now();
+            }
+        }
+        table.allot(inner.rules.encoder_slots);
+        let report = table
+            .owned(session, caller)
+            .map(|entry| report_to(&entry.info, shown));
+        drop(table);
+        inner.changed.notify_all();
+        report.unwrap_or_else(|| refuse(ErrorCode::NotFound, "no such session"))
     }
 
     fn stop(&self, asker: Asker<'_>, session: &SessionId, force: bool) -> Response {
@@ -1004,6 +1068,22 @@ impl Entry {
         policy::may_use(caller.rights)
     }
 
+    /// Whether `caller` is the client that is shown the session as
+    /// attachment `attachment`.
+    ///
+    /// An attachment belongs to the device it was given to. Its number
+    /// counts up and is no secret, and every device with the rights may
+    /// use every session, so the number alone proves nothing: a second
+    /// device that names it must not keep the first one's picture going,
+    /// leave for it, hide its window or be told what the media path
+    /// agreed on with it.
+    fn shows(&self, caller: Caller<'_>, attachment: u64) -> bool {
+        attachment != 0
+            && attachment == self.info.attachment
+            && self.viewer.id == caller.peer.id
+            && self.viewer.public_key == caller.peer.public_key
+    }
+
     /// What the person at the host is told about it.
     fn for_host(&self) -> HostSession {
         let mut info = self.info.clone();
@@ -1039,6 +1119,42 @@ impl Table {
 
     fn owned(&mut self, session: &SessionId, caller: Caller<'_>) -> Option<&mut Entry> {
         self.get(session, Asker::Device(caller))
+    }
+
+    /// Decides which of the sessions that are shown to someone have their
+    /// picture made, when the host has `slots` encoders to give.
+    ///
+    /// A session nobody is shown holds none. Neither does one whose
+    /// window cannot be seen. Of the rest, the ones that were turned to
+    /// most recently get a slot each, and the others wait with their
+    /// picture stopped: they are open, attached and running, and say why
+    /// they show nothing new. No session is refused or ended for a slot.
+    fn allot(&mut self, slots: usize) {
+        fn set(entry: &mut Entry, paused: Option<PauseReason>) {
+            if entry.info.paused != paused {
+                entry.info.paused = paused;
+                entry.info.revision += 1;
+            }
+        }
+        let mut wanting: Vec<&mut Entry> = Vec::new();
+        for entry in self.sessions.values_mut() {
+            let shown = entry.ended_at.is_none()
+                && matches!(
+                    entry.info.state,
+                    SessionState::Starting | SessionState::Running
+                );
+            if !shown {
+                set(entry, None);
+            } else if entry.hidden {
+                set(entry, Some(PauseReason::Hidden));
+            } else {
+                wanting.push(entry);
+            }
+        }
+        wanting.sort_by(|a, b| b.touched.cmp(&a.touched).then(b.number.cmp(&a.number)));
+        for (place, entry) in wanting.into_iter().enumerate() {
+            set(entry, (place >= slots).then_some(PauseReason::NoSlot));
+        }
     }
 
     /// Why one more session cannot be started, when it cannot: the host
@@ -1101,6 +1217,11 @@ struct Round {
     attach: Option<Attach>,
     /// The client that is shown the session is to be left, and why.
     leave: Option<String>,
+    /// The session is shown to a client, and its picture is to be stopped
+    /// for now.
+    pause: bool,
+    /// The session is shown to a client.
+    running: bool,
     /// The device that started the session may not use it now.
     revoked: bool,
 }
@@ -1120,12 +1241,18 @@ impl Inner {
     /// Changes a session and wakes everyone who waits for it. The report's
     /// revision goes up.
     fn update(&self, id: &SessionId, change: impl FnOnce(&mut Entry)) {
-        if let Some(entry) = self.lock().sessions.get_mut(&id.0) {
-            change(entry);
-            entry.info.revision += 1;
-            if entry.info.state == SessionState::Ended {
-                entry.ended_at = Some(Instant::now());
+        {
+            let mut table = self.lock();
+            if let Some(entry) = table.sessions.get_mut(&id.0) {
+                change(entry);
+                entry.info.revision += 1;
+                if entry.info.state == SessionState::Ended {
+                    entry.ended_at = Some(Instant::now());
+                }
             }
+            // A session that came, went or changed hands changes which
+            // windows have an encoder.
+            table.allot(self.rules.encoder_slots);
         }
         self.changed.notify_all();
     }
@@ -1212,6 +1339,8 @@ impl Inner {
             round.close = orders.close;
             round.attach = orders.attach;
             round.revoked = entry.revoked;
+            round.running = entry.info.state == SessionState::Running && attaching.is_none();
+            round.pause = round.running && entry.info.paused.is_some();
             let showing = matches!(
                 entry.info.state,
                 SessionState::Starting | SessionState::Running
@@ -1393,6 +1522,9 @@ impl Inner {
             // The attach order that the runner has been told and has not
             // answered yet, and since when.
             let mut attaching: Option<(u64, Instant, Device)> = None;
+            // Whether the runner was told to stop making the picture for
+            // the client that is attached.
+            let mut paused = false;
             loop {
                 if let Some(how) = application.poll() {
                     let why = format!("the application ended ({how})");
@@ -1430,10 +1562,14 @@ impl Inner {
                             entry.info.answer = Some(answer);
                             entry.info.shown_on = Some(device.name.clone());
                             entry.viewer = device;
+                            entry.hidden = false;
+                            entry.touched = Instant::now();
                             entry.seen = Instant::now();
                             entry.attached.push((number, Ok(())));
                         });
                         (self.log)(format!("session {id}: shown to a client again"));
+                        // A runner that attaches a client makes its picture.
+                        paused = false;
                         continue;
                     }
                     Some(StreamEvent::Said(RunnerEvent::Detached { message })) => {
@@ -1500,6 +1636,20 @@ impl Inner {
                     if let Some((number, ..)) = attaching.take() {
                         self.attach_went(id, number, Err(why));
                     }
+                } else if !round.running {
+                    // Nobody is attached: there is no picture to stop.
+                    paused = false;
+                } else if round.pause != paused {
+                    // The session stays as it is, attached and running. It
+                    // only holds no encoder for now, or holds one again.
+                    paused = round.pause;
+                    let (line, what) = if paused {
+                        (RunnerCommand::Pause, "its picture is stopped for now")
+                    } else {
+                        (RunnerCommand::Resume, "its picture is made again")
+                    };
+                    let _ = running.tell(&line);
+                    (self.log)(format!("session {id}: {what}"));
                 }
                 self.pause();
             }

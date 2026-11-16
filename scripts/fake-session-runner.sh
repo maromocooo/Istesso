@@ -64,6 +64,12 @@ while IFS= read -r line; do
         echo "fake runner: picture for $address again, $display" >&2
         printf '{"v":1,"event":"attached","display":%s,"answer":{"fake":true,"attach":%s}}\n' "$display" "$attachment"
         ;;
+    *'"cmd":"pause"'*)
+        echo "fake runner: no picture is made for now; the encoder is given back" >&2
+        ;;
+    *'"cmd":"resume"'*)
+        echo "fake runner: the picture is made again" >&2
+        ;;
     *'"cmd":"close"'*)
         if [ -n "$application" ]; then
             echo "fake runner: asking the application to close" >&2
