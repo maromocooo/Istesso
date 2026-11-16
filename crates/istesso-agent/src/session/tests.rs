@@ -1200,6 +1200,39 @@ fn an_attachment_belongs_to_the_device_it_was_given_to() {
 }
 
 #[test]
+fn input_for_a_session_is_taken_from_the_device_that_is_shown_it() {
+    let host = host();
+    let id = host.running().id;
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    // The laptop is shown the session: its input goes to the session's own
+    // socket. The tablet may use the session, and is not shown it.
+    assert_eq!(
+        host.sessions.input_socket_of(&id, &host.laptop),
+        Some(host.paths.session_input_socket(&id))
+    );
+    assert_eq!(host.sessions.input_socket_of(&id, &tablet), None);
+    // Nobody is shown it: nobody's input is taken.
+    host.detach(&id, 1);
+    host.settles(&id, |s| s.info.state == SessionState::Detached);
+    assert!(!host.sessions.shown_to(&id, &host.laptop));
+    // The tablet attaches: now it is the tablet's, and not the laptop's.
+    session(host.ask_from(
+        &tablet,
+        "192.0.2.88:50000",
+        Request::SessionAttach {
+            session: id.clone(),
+            display: mode(),
+            offer: serde_json::Value::Null,
+        },
+    ));
+    assert!(host.sessions.shown_to(&id, &tablet));
+    assert!(!host.sessions.shown_to(&id, &host.laptop));
+    assert!(!host
+        .sessions
+        .shown_to(&SessionId("0000000000000000".into()), &tablet));
+}
+
+#[test]
 fn a_session_can_be_there_and_hold_no_encoder() {
     let host = host();
     let id = host.running().id;

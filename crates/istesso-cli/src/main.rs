@@ -198,6 +198,12 @@ enum InputAction {
         /// never what the input was; the file can be read by its owner only
         #[arg(long, value_name = "PATH")]
         timings: Option<PathBuf>,
+        /// The streaming session the input is for (its id from `istesso
+        /// sessions`). This device has to be the one that is shown it.
+        /// Without it the input goes to the one application the device
+        /// takes input for
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
     },
 }
 
@@ -542,12 +548,14 @@ fn run(cli: Cli) -> Result<(), String> {
                 address,
                 keep_trying,
                 timings,
+                session,
             } => relay_input(
                 &to,
                 &socket,
                 address.as_deref(),
                 Duration::from_secs(keep_trying),
                 timings.as_deref(),
+                session.as_deref(),
             ),
         },
         Command::Open {
@@ -659,6 +667,7 @@ fn relay_input(
     address: Option<&str>,
     keep_trying: Duration,
     timings: Option<&std::path::Path>,
+    session: Option<&str>,
 ) -> Result<(), String> {
     use std::io::ErrorKind;
     use std::os::unix::net::UnixDatagram;
@@ -692,7 +701,10 @@ fn relay_input(
     };
     client
         .set_timeout(Duration::from_secs(5))
-        .and_then(|_| client.open_input())
+        .and_then(|_| {
+            let session = session.map(|id| istesso_proto::SessionId(id.to_string()));
+            client.open_input_for(session.as_ref())
+        })
         .map_err(|e| format!("the device does not take input from here: {e}"))?;
     // A socket left by an earlier run is in the way of a new one.
     match std::fs::remove_file(socket) {
@@ -756,6 +768,7 @@ fn relay_input(
     _address: Option<&str>,
     _keep_trying: Duration,
     _timings: Option<&std::path::Path>,
+    _session: Option<&str>,
 ) -> Result<(), String> {
     Err("relaying input is not available on this system yet".into())
 }

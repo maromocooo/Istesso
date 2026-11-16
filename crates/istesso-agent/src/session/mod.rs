@@ -1004,6 +1004,29 @@ impl Sessions {
         }
     }
 
+    /// Whether `peer` is the device that is shown `session` at this moment.
+    /// Keyboard and pointer input for a session is taken from that device
+    /// and from no other.
+    pub fn shown_to(&self, session: &SessionId, peer: &Peer) -> bool {
+        self.inner
+            .lock()
+            .sessions
+            .get(&session.0)
+            .is_some_and(|entry| {
+                entry.ended_at.is_none()
+                    && entry.info.state == SessionState::Running
+                    && entry.viewer.id == peer.id
+                    && entry.viewer.public_key == peer.public_key
+            })
+    }
+
+    /// Where the runner of `session` takes input, when `peer` is the device
+    /// that is shown the session.
+    pub fn input_socket_of(&self, session: &SessionId, peer: &Peer) -> Option<std::path::PathBuf> {
+        self.shown_to(session, peer)
+            .then(|| self.inner.paths.session_input_socket(session))
+    }
+
     /// Somebody changed the list of paired devices: every session reads it
     /// now instead of when its turn comes.
     pub fn pairings_changed(&self) {

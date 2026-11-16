@@ -389,6 +389,8 @@ impl Shared {
 
         let mut asked: Vec<&'static str> = Vec::new();
         let mut input: Option<InputSink> = None;
+        // The session the input is for, when the device named one.
+        let mut input_for: Option<istesso_proto::SessionId> = None;
         let mut checked = Instant::now();
         while let Ok(Some(request)) = session.next_request() {
             // What the device may do is read now, not remembered from the
@@ -404,6 +406,15 @@ impl Shared {
                 Request::Input { events } => {
                     // Passed on and not answered. Input that was not asked for first, or
                     // that nothing takes any more, is dropped.
+                    // Input for a session is the input of the device that
+                    // is shown it. The moment it no longer is, nothing more
+                    // is passed on.
+                    if let Some(id) = &input_for {
+                        if !self.sessions.shown_to(id, session.peer()) {
+                            input = None;
+                            input_for = None;
+                        }
+                    }
                     let Some(sink) = &input else { continue };
                     let in_hand = crate::PassLog::mark();
                     // The device sends something at least every two seconds, so this is
@@ -427,17 +438,29 @@ impl Shared {
                 }
                 // The right to control is the one the list of paired devices
                 // gives now, like every other right in this loop.
-                Request::InputOpen => match now() {
+                Request::InputOpen { session: wanted } => match now() {
                     Pairing::Paired(rights) if rights.contains(&Permission::Control) => {
-                        match InputSink::open(&self.paths.input_socket()) {
-                            Ok(sink) => {
+                        // A session has a socket of its own, and takes input
+                        // from the device that is shown it. Without a
+                        // session it is the host's one socket, as before.
+                        let socket = match &wanted {
+                            None => Some(self.paths.input_socket()),
+                            Some(id) => self.sessions.input_socket_of(id, session.peer()),
+                        };
+                        match socket.map(|path| InputSink::open(&path)) {
+                            Some(Ok(sink)) => {
                                 input = Some(sink);
+                                input_for = wanted;
                                 asked.push("input");
                                 Response::InputOpen
                             }
-                            Err(_) => Response::error(
+                            Some(Err(_)) => Response::error(
                                 ErrorCode::Internal,
                                 "nothing on this host takes input at the moment",
+                            ),
+                            None => Response::error(
+                                ErrorCode::Forbidden,
+                                "this device is not the one that is shown that session",
                             ),
                         }
                     }
@@ -557,7 +580,7 @@ impl Shared {
                 }
             }
             // Handled where the connection is, before this is reached.
-            Request::InputOpen | Request::Input { .. } => Response::error(
+            Request::InputOpen { .. } | Request::Input { .. } => Response::error(
                 ErrorCode::Unsupported,
                 "input is not answered like a question",
             ),

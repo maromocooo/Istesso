@@ -24,8 +24,14 @@ pub enum Request {
     Status,
     /// May I send you what a person does with keyboard and pointer, for the
     /// application you are showing me? Answered with [`Response::InputOpen`];
-    /// needs the permission to control.
-    InputOpen,
+    /// needs the permission to control. With `session`, the input is for
+    /// that streaming session: the caller has to be the device that is
+    /// shown it, and the input stops when it no longer is. Without, it goes
+    /// to whatever takes input on the host, which is one application.
+    InputOpen {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
+    },
     /// Keyboard and pointer input, after [`Request::InputOpen`] was granted
     /// on this connection. Never answered: what a person types must not
     /// wait for a round trip. An empty list keeps the connection open.
@@ -210,8 +216,20 @@ mod tests {
             }
         );
         assert_eq!(
-            serde_json::to_string(&Request::InputOpen).unwrap(),
+            serde_json::to_string(&Request::InputOpen { session: None }).unwrap(),
             r#"{"type":"input_open"}"#
+        );
+        // An older device says it without a session, and is understood.
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"type":"input_open"}"#).unwrap(),
+            Request::InputOpen { session: None }
+        );
+        let for_session = Request::InputOpen {
+            session: Some(SessionId("5b0c9e3a7f21d684".to_string())),
+        };
+        assert_eq!(
+            serde_json::to_string(&for_session).unwrap(),
+            r#"{"type":"input_open","session":"5b0c9e3a7f21d684"}"#
         );
     }
 

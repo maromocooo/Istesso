@@ -120,7 +120,16 @@ impl Client {
     /// Asks whether the other device takes keyboard and pointer input from
     /// this one. After `Ok`, [`Client::send_input`] may be used.
     pub fn open_input(&mut self) -> Result<()> {
-        match self.call(&Request::InputOpen)? {
+        self.open_input_for(None)
+    }
+
+    /// The same for one streaming session of the other device: this device
+    /// has to be the one that is shown it.
+    pub fn open_input_for(&mut self, session: Option<&istesso_proto::SessionId>) -> Result<()> {
+        let request = Request::InputOpen {
+            session: session.cloned(),
+        };
+        match self.call(&request)? {
             Response::InputOpen => Ok(()),
             _ => Err(Error::Malformed),
         }
