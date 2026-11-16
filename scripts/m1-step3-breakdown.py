@@ -265,6 +265,7 @@ def main():
     parser.add_argument("--probe-local")
     parser.add_argument("--local-app")
     parser.add_argument("--ping")
+    parser.add_argument("--per-input", metavar="FILE", help="also write every followed input's stretches to this file, a line each")
     parser.add_argument("--relay-timings", metavar="FILE", help="what `istesso input relay --timings` wrote on the client")
     parser.add_argument("--agent-timings", metavar="FILE", help="what `istesso agent --input-timings` wrote on the host")
     parser.add_argument(
@@ -465,6 +466,11 @@ def main():
         keyframes += enc["key"]
         per_input.append((number, values, totals[-1], enc["key"], enc["bytes"]))
 
+    if args.per_input:
+        with open(args.per_input, "w", encoding="utf-8") as file:
+            for number, values, total, key, size in per_input:
+                file.write(json.dumps({"id": number, "total": round(total, 4), "bytes": size, "key": bool(key),
+                                       **{name: round(value, 4) for name, value in values.items()}}) + "\n")
     print(f"Inputs: {len(order)} in both the probe's and the host application's log, {len(totals)} followed all the way")
     for reason, count in dropped.items():
         if count:
