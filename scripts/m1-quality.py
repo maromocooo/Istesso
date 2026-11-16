@@ -35,7 +35,7 @@ gi.require_version("GstVideo", "1.0")
 from gi.repository import GLib, Gst, GstVideo  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from m1_encoder import COLOURS, RAW_FORMATS, encoder, rate_buffer  # noqa: E402
+from m1_encoder import BITRATE, CHROMA, COLOURS, GOP, RAW_FORMATS, encoder, rate_buffer  # noqa: E402
 
 
 def write_png(path, width, height, bgrx, zoom):
@@ -237,9 +237,9 @@ def main():
         help="frames at the start that the figures leave out. After its first key frame the encoder keeps mending the "
         "picture until the text that was in it has moved out of the window, six seconds at the usual speed",
     )
-    parser.add_argument("--bitrate", default="30000", metavar="KBIT[,KBIT...]")
-    parser.add_argument("--chroma", default="420", metavar="420|444[,...]", help="how much colour the stream keeps: every fourth sample or all")
-    parser.add_argument("--gop", default="170", metavar="FRAMES[,FRAMES...]", help="frames from one key frame to the next; -1 for none but the first")
+    parser.add_argument("--bitrate", default=str(BITRATE), metavar="KBIT[,KBIT...]")
+    parser.add_argument("--chroma", default=CHROMA, metavar="420|444[,...]", help="how much colour the stream keeps: every fourth sample or all")
+    parser.add_argument("--gop", default=str(GOP), metavar="FRAMES[,FRAMES...]", help="frames from one key frame to the next; -1 for none but the first")
     parser.add_argument("--vbv", default="frame", metavar="frame|default|KBIT", help="the encoder's rate-control buffer: one frame's worth of the bit rate unless given")
     parser.add_argument("--preset", default="p1")
     parser.add_argument("--colour", choices=sorted(COLOURS), default="srgb", help="what the stream says about its colours (scripts/m1_encoder.py)")

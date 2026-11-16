@@ -21,7 +21,7 @@
 | glutin、glutin-winit、glow | テストアプリが GPU で描くときの OpenGL（`--draw gpu`）。`istesso` 本体には入らない | Apache-2.0、MIT、MIT OR Apache-2.0 OR Zlib | <https://github.com/rust-windowing/glutin>、<https://github.com/grovesNL/glow> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
 
-Wolf は、アプリを Docker コンテナで起動する部分を使いません。導入を軽くするため、コンポジターと仮想入力、配信プラグインだけを取り込みます。
+Wolf は、アプリを Docker コンテナで起動する部分を使いません。使うのは、コンポジターの本体（gst-wayland-display の `wayland-display-core`）です。元のコミットに小さな修正を重ね、修正は元のプロジェクトに提案できる形に保ちます（[ADR 0009](adr/0009-host-compositor.md)）。入力はコンポジターに直接渡すので、仮想入力（inputtino）は、ゲームパッドが要るようになるまで使いません。
 
 ## 条件つきで使える
 

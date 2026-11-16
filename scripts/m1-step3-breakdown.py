@@ -142,6 +142,59 @@ def first_at_or_after(times, moment):
     return at if at < len(times) else None
 
 
+def key_frames(host_frames, client_frames, out, decoded):
+    """Says how many key frames there were and why, and what missing packets cost.
+
+    A stream with key frames only when asked for lives on the client asking: at the start,
+    and whenever packets are missing. What is counted here goes into the record next to the
+    latency (ADR 0002): how often a key frame was asked for after the first, and how long the
+    window showed its last good picture each time.
+    """
+    made = [l for l in host_frames if l.get("kind") == "encoded" and l.get("key")]
+    answered = [l for l in host_frames if l.get("kind") == "key_request" and l.get("made")]
+    thrown = [l for l in host_frames if l.get("kind") == "lost"]
+    by_client = sum(1 for l in answered if l.get("by", "client") == "client")
+    by_script = len(answered) - by_client
+    sizes = [l["bytes"] for l in host_frames if l.get("kind") == "encoded"]
+    span = (out[-1]["t_ns"] - out[0]["t_ns"]) / 1e9 if len(out) > 1 else 0
+    times = [l["t_ns"] for l in out]
+    most = max((bisect.bisect_left(times, t + 1_000_000_000) - i for i, t in enumerate(times)), default=0)
+    print()
+    print("Stream")
+    if span > 0:
+        print(f"  {(len(out) - 1) / span:.1f} frames a second left the compositor, at most {most} in any one second; {sum(sizes) * 8 / span / 1e6:.1f} Mbit/s")
+    print(f"  key frames made: {len(made)} ({by_client} because the client asked, {by_script} because the measuring script asked, "
+          f"{max(0, len(made) - by_client - by_script)} by the encoder itself, the first among them)")
+    if thrown:
+        print(f"  frames thrown away on purpose: {len(thrown)}")
+    decoder = next((l for l in client_frames if l.get("kind") == "decoder"), None)
+    if decoder is not None:
+        print(f"  decoder: {'hardware' if decoder.get('hardware') else 'SOFTWARE'}, pictures {decoder.get('pictures')}, "
+              f"the stream calls its colours {decoder.get('stream_colours', '-')}")
+    asked = [l for l in client_frames if l.get("kind") == "key_request"]
+    gaps = [l["t_ns"] for l in client_frames if l.get("kind") == "gap"]
+    if not decoded:
+        return
+    first = decoded[0]["t_ns"]
+    later = [l for l in asked if l["t_ns"] > first]
+    print(f"  the client decoded {len(decoded)} pictures, {sum(1 for l in decoded if l.get('key'))} of them key frames")
+    print(f"  the client asked for a key frame {len(asked) - len(later)} times before its first picture and {len(later)} times after it"
+          f"{'' if all(l.get('sent', 1) for l in asked) else '; ' + str(sum(1 for l in asked if not l.get('sent', 1))) + ' of the requests could not be sent'}")
+    print(f"  packets were found missing {len(gaps)} times")
+    waits, frozen = [], []
+    picture_times = [l["t_ns"] for l in decoded]
+    for gap in gaps:
+        after = bisect.bisect_right(picture_times, gap)
+        if after == 0 or after >= len(picture_times):
+            continue
+        waits.append((picture_times[after] - gap) / 1e6)
+        frozen.append((picture_times[after] - picture_times[after - 1]) / 1e6)
+    for label, values in (("from finding packets missing to the next picture", waits), ("the window kept its last good picture for", frozen)):
+        if values:
+            values.sort()
+            print(f"  {label}: median {values[len(values) // 2]:.1f} ms, longest {values[-1]:.1f} ms ({len(values)} times)")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--probe-relayed", required=True)
@@ -379,6 +432,8 @@ def main():
     for start in range(min(counts), max(counts) + 1):
         count = counts.get(start, 0)
         print(f"  {start:>4} to {start + 1:<4}{count:>5}  {'#' * -(-40 * count // most)}")
+
+    key_frames(host_frames, client_frames, out, decoded)
 
     # The local window, when its logs are given.
     if args.probe_local and args.local_app:

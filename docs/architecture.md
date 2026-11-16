@@ -57,7 +57,7 @@ OS ごとの違いは、次の4つの口の裏に閉じ込めます。Windows �
 | 口 | macOS | Linux | Windows（将来） |
 |---|---|---|---|
 | 取り込みと圧縮 | ScreenCaptureKit + VideoToolbox | 仮想コンポジター + NVENC | Windows.Graphics.Capture + Media Foundation |
-| 入力 | CGEvent | 仮想入力デバイス（uinput） | SendInput、仮想ゲームパッド |
+| 入力 | CGEvent | 仮想コンポジターに直接渡す（[ADR 0009](adr/0009-host-compositor.md)）。仮想入力デバイス（uinput）は、ゲームパッドが要るようになったら考える | SendInput、仮想ゲームパッド |
 | アプリ管理 | `.app`、Homebrew | `.desktop`、apt | スタートメニュー、winget |
 | 起床 | 差し替え式（Wake-on-LAN など） | 同左 | 同左 |
 

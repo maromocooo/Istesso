@@ -31,7 +31,14 @@ def rate_buffer(text, bitrate, fps):
     return int(text)
 
 
-def encoder(bitrate, fps, gop=170, vbv=None, chroma="420", preset="p1", colour="srgb"):
+# What was decided on 2026-11-16 (ADR 0002): all of the colour, key frames only when asked for,
+# at most 30 Mbit/s. 4:2:0 stays there to choose.
+CHROMA = "444"
+GOP = -1
+BITRATE = 30000
+
+
+def encoder(bitrate=BITRATE, fps=85, gop=GOP, vbv=None, chroma=CHROMA, preset="p1", colour="srgb"):
     """The pipeline from frames in CUDA memory to an H.265 stream; the encoder is called "enc".
 
     bitrate and vbv are in kbit (a second), gop in frames (-1: no key frames but the first and

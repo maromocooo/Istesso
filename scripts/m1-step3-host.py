@@ -38,7 +38,7 @@ gi.require_version("GstVideo", "1.0")
 from gi.repository import GLib, Gst, GstVideo  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from m1_encoder import COLOURS, RAW_FORMATS, encoder, rate_buffer  # noqa: E402
+from m1_encoder import BITRATE, CHROMA, COLOURS, GOP, RAW_FORMATS, encoder, rate_buffer  # noqa: E402
 
 
 def main():
@@ -48,16 +48,19 @@ def main():
     parser.add_argument("--render-node", metavar="PATH", help="DRM render node for the compositor, for example /dev/dri/renderD129")
     parser.add_argument("--size", default="1720x720", metavar="WxH")
     parser.add_argument("--fps", type=int, default=85)
-    parser.add_argument("--bitrate", type=int, default=30000, metavar="KBIT")
-    parser.add_argument("--gop", type=int, default=170, metavar="FRAMES", help="frames from one key frame to the next; -1 for none but the first and those asked for")
+    parser.add_argument("--bitrate", type=int, default=BITRATE, metavar="KBIT")
+    parser.add_argument(
+        "--gop", type=int, default=GOP, metavar="FRAMES", help="frames from one key frame to the next; -1, as decided, for none but the first and those asked for"
+    )
     parser.add_argument(
         "--vbv",
         metavar="frame|KBIT",
+        default="frame",
         help="size of the encoder's rate-control buffer. `frame`, the bit rate divided by the frame rate, holds "
-        "every frame, key frames too, to about the size of an average one; without it a key frame of a busy "
+        "every frame, key frames too, to about the size of an average one; with `default` a key frame of a busy "
         "picture can be twenty times that and arrive in hundreds of packets",
     )
-    parser.add_argument("--chroma", choices=sorted(RAW_FORMATS), default="420", help="how much colour the stream keeps: every fourth sample or all")
+    parser.add_argument("--chroma", choices=sorted(RAW_FORMATS), default=CHROMA, help="how much colour the stream keeps: all of it, as decided, or every fourth sample")
     parser.add_argument("--preset", default="p1")
     parser.add_argument(
         "--colour",
@@ -68,7 +71,8 @@ def main():
     )
     parser.add_argument(
         "--key-requests",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="make a key frame when the client reports a lost picture, on the port after the stream's. Anyone on "
         "the network can send such a report: for measurements only",
     )
