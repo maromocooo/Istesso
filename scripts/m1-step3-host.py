@@ -69,7 +69,10 @@ input, and is told things in lines of JSON on standard output, each with the key
               --to-channel the picture is offered again. Answered with {"istesso":"resumed",
               "opened_ms":T,"encoded_ms":T,"written_ms":T,"key":1} once the first frame is out
               (from reading the word to: the encoder being there, the first frame leaving it,
-              that frame handed on)
+              that frame handed on). When the graphics card opens no encoder, because all of
+              its sessions are taken, the answer is {"istesso":"refused","word":"resume",
+              "reason":"..."}: the picture stays stopped, the compositor and the application
+              go on, and `resume` can be said again later
 
     close     ask the application to close its windows, as the close button of a window
               manager does (xdg_toplevel.close to every toplevel). An application with nothing
@@ -565,6 +568,11 @@ def main():
                 on_cursor(structure)
             elif structure is not None and structure.get_name() == "wayland.windows":
                 on_windows(structure.get_uint("count")[1])
+        elif message.type == Gst.MessageType.ERROR and time.monotonic_ns() - picture.get("refused_ns", -(10**12)) < 2_000_000_000:
+            # The encoder that could not be opened says so here as well. It has been taken out
+            # again, and the pipeline goes on without a picture.
+            error, detail = message.parse_error()
+            print(f"note: {error.message}", file=sys.stderr)
         elif message.type == Gst.MessageType.ERROR:
             error, detail = message.parse_error()
             print(f"error: {error.message}", file=sys.stderr)
@@ -607,9 +615,11 @@ def main():
         # resumed: nothing is rendered meanwhile, and the applications are told to draw on a beat
         # of their own. On the fixed beat the applications are told to draw by the frames, so
         # there the frames go on being made and are thrown away here.
+        # The frame in hand is kept: it is the first to go into the encoder that is opened on
+        # the way back.
+        picture["held"] = info.get_buffer()
         if picture["state"] == "stopping":
             picture["state"] = "stopped"
-            picture["held_pts"] = info.get_buffer().pts
             GLib.idle_add(close_encoder)
         if picture["state"] in ("resuming", "running"):
             return Gst.PadProbeReturn.REMOVE
@@ -668,10 +678,26 @@ def main():
         enc.sync_state_with_parent()
         picture["opened_ns"] = time.monotonic_ns()
         picture["state"] = "resuming"
+        # The frame that was in hand when the picture stopped goes into the new encoder first,
+        # from here and not from the compositor's thread: if the graphics card opens no encoder
+        # (all of its sessions are taken), that is found out here, and the compositor never
+        # learns of it. It and the application go on, and the picture stays stopped.
+        held = picture.get("held")
+        result = compositor_pad.get_peer().chain(held) if held is not None else Gst.FlowReturn.OK
+        if result != Gst.FlowReturn.OK:
+            picture["refused_ns"] = time.monotonic_ns()
+            picture.pop("first", None)
+            enc.set_locked_state(True)
+            enc.set_state(Gst.State.NULL)
+            pipeline.remove(enc)
+            picture["state"] = "paused"
+            log.write('{"kind":"picture","t_ns":%d,"state":"refused","reason":"%s"}\n' % (picture["refused_ns"], result.value_nick))
+            say("refused", word="resume", reason="no encoder could be opened (%s); the picture stays stopped" % result.value_nick)
+            return
         if pacing == "on-commit":
-            # The frame in the compositor's hand is from before the stop. A second watch on the
-            # same pad sees it once the first lets it go, and throws it away: the first frame
-            # after the stop is one the compositor makes now.
+            # The compositor's thread still holds that same frame. A second watch on the pad
+            # sees it once the first lets it go, and throws it away: it has been encoded.
+            picture["held_pts"] = held.pts if held is not None else None
             compositor_pad.add_probe(Gst.PadProbeType.BUFFER, on_held_frame)
             compositor_pad.remove_probe(picture["probe"])
 
