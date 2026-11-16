@@ -241,3 +241,64 @@ impl Drop for Output {
         self.stop();
     }
 }
+
+/// Gives the calling thread real-time scheduling, the kind the sound card's
+/// own thread has. Returns whether the system agreed. No privilege is
+/// needed.
+///
+/// A thread that hands audio on belongs to the audio path as much as the
+/// sound card's thread does: when it is held up for 20 ms, 20 ms of audio
+/// are late. Threads without this are held up now and then, most of all in
+/// a program that has no window in front.
+///
+/// `period` is how often the thread has work, `computation` how long the
+/// work takes at most, `constraint` how long after it could run the work
+/// must be done. A thread that takes longer than it said loses the
+/// scheduling again.
+pub fn make_this_thread_real_time(
+    period: std::time::Duration,
+    computation: std::time::Duration,
+    constraint: std::time::Duration,
+) -> bool {
+    // The system counts in ticks of its own clock, the one sound cards stamp
+    // their buffers with.
+    // SAFETY: a conversion of a number; nothing is read or written.
+    let ticks = |time: std::time::Duration| unsafe {
+        objc2_core_audio::AudioConvertNanosToHostTime(time.as_nanos() as u64) as u32
+    };
+    let mut policy = libc::thread_time_constraint_policy_data_t {
+        period: ticks(period),
+        computation: ticks(computation),
+        constraint: ticks(constraint),
+        preemptible: 1,
+    };
+    // SAFETY: the policy outlives the call, and the count given is its size.
+    let result = unsafe {
+        libc::thread_policy_set(
+            libc::pthread_mach_thread_np(libc::pthread_self()),
+            libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+            (&mut policy as *mut libc::thread_time_constraint_policy_data_t).cast(),
+            libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        )
+    };
+    result == 0
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use std::time::Duration;
+
+    #[test]
+    fn a_thread_can_be_given_real_time_scheduling() {
+        let agreed = std::thread::spawn(|| {
+            super::make_this_thread_real_time(
+                Duration::from_micros(5333),
+                Duration::from_micros(1500),
+                Duration::from_millis(3),
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(agreed);
+    }
+}

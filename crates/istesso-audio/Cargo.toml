@@ -20,6 +20,8 @@ rtrb.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs.workspace = true
 objc2-core-audio.workspace = true
+# For giving the receiving thread the scheduling the sound card's thread has.
+libc.workspace = true
 
 # Capturing on Linux needs PipeWire's development files at build time
 # (libpipewire-0.3-dev, libclang-dev). It is off by default so that the

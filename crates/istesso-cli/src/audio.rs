@@ -682,7 +682,19 @@ mod mac {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_pump = stop.clone();
         let keep_ledger = options.ledger.is_some();
+        // One packet's time, for the scheduling of the thread that receives.
+        let packet_time =
+            Duration::from_secs_f64(f64::from(info.packet_frames.max(64)) / stream_rate);
         let pumping = std::thread::spawn(move || {
+            // The receiving thread is part of the audio path: scheduled as
+            // the sound card's thread is, so that it is not held up.
+            if !istesso_audio::mac::make_this_thread_real_time(
+                packet_time,
+                Duration::from_micros(1500),
+                Duration::from_millis(3),
+            ) {
+                eprintln!("the receiving thread could not be given real-time scheduling");
+            }
             let mut arrivals = Arrivals::new(keep_ledger);
             subscription.set_timeout(Duration::from_secs(3));
             let result = pump(&mut subscription, &mut queue_in, &mut arrivals, &stop_pump);
@@ -711,6 +723,34 @@ mod mac {
             lead_max_us: AtomicI64::new(i64::MIN),
             ..Callbacks::default()
         });
+        // A thread that only sleeps 5 ms at a time and notes how much later
+        // than asked it was woken. When packets arrive late, this says
+        // whether the whole process was being held up at that moment.
+        let held_up_max_us = Arc::new(AtomicU64::new(0));
+        let held_up_times = Arc::new(AtomicU64::new(0));
+        {
+            let (max_us, times, stop) =
+                (held_up_max_us.clone(), held_up_times.clone(), stop.clone());
+            let started = Instant::now();
+            std::thread::spawn(move || {
+                let step = Duration::from_millis(5);
+                while !stop.load(Ordering::Relaxed) {
+                    let due = Instant::now() + step;
+                    std::thread::sleep(step);
+                    let late = Instant::now().saturating_duration_since(due);
+                    max_us.fetch_max(late.as_micros() as u64, Ordering::Relaxed);
+                    if late >= Duration::from_millis(10) {
+                        times.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "{:>7.1} s since the start: this process was held up for {:.1} ms",
+                            started.elapsed().as_secs_f64(),
+                            late.as_secs_f64() * 1e3
+                        );
+                    }
+                }
+            });
+        }
+
         let seen = callbacks.clone();
         output
             .start(channels, move |frames, out, now_ns| {
@@ -869,6 +909,12 @@ mod mac {
                 "lead_mean_ms": callbacks.lead_sum_us.load(Ordering::Relaxed) as f64 * 1e-3
                     / count as f64,
                 "lead_max_ms": callbacks.lead_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
+            },
+            // How much later than asked a thread of this process that only
+            // sleeps was woken: the longest, and how often by 10 ms or more.
+            "held_up": {
+                "longest_ms": held_up_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
+                "times_10_ms_or_more": held_up_times.load(Ordering::Relaxed),
             },
             // From the capture of a packet's first frame on the source to
             // the packet's arrival here. Its highest value less its lowest
