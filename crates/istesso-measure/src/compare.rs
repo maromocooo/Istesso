@@ -135,6 +135,12 @@ pub struct Comparison {
     pub by_hand: usize,
     /// For reference: relayed minus local, input by input.
     pub later_by: Option<Summary>,
+    /// For reference: the relayed window's added latency minus the local
+    /// window's, input by input, and the mean of that. Not what the pass
+    /// line is about: these differences come in steps of one refresh of
+    /// the display, and their median says on which step most inputs fall.
+    pub added_later_by: Option<Summary>,
+    pub added_later_by_mean_ms: Option<f64>,
     /// For reference: input sent, to the relayed window showing it.
     pub relayed: Option<Summary>,
     /// For reference: input sent, to the local window showing it.
@@ -223,6 +229,31 @@ impl Comparison {
         let repeated =
             local_report.map_or(0, |r| r.repeated) + relayed_report.map_or(0, |r| r.repeated);
 
+        // The same, input by input: what each window added to its own application's response.
+        let added_by_id = |app: Option<&[HostSample]>, by_id: &BTreeMap<u64, &ClientSample>| {
+            let mut added: BTreeMap<u64, f64> = BTreeMap::new();
+            for sample in app.unwrap_or_default() {
+                let Some(client) = by_id.get(&sample.id) else {
+                    continue;
+                };
+                if sample.source != InputSource::Network || added.contains_key(&sample.id) {
+                    continue;
+                }
+                let trip = client.shown_ns as f64 - client.sent_ns as f64;
+                let response = sample.commit_ns as f64 - sample.input_ns as f64;
+                added.insert(sample.id, (trip - response) / 1e6);
+            }
+            added
+        };
+        let local_added_by_id = added_by_id(local_app, &local_by_id);
+        let relayed_added_by_id = added_by_id(relayed_app, &relayed_by_id);
+        let added_later_by: Vec<f64> = both
+            .iter()
+            .filter_map(|id| Some(relayed_added_by_id.get(id)? - local_added_by_id.get(id)?))
+            .collect();
+        let added_later_by_mean_ms = (!added_later_by.is_empty())
+            .then(|| added_later_by.iter().sum::<f64>() / added_later_by.len() as f64);
+
         Comparison {
             paired: both.len(),
             local_only: local_by_id.len() - both.len(),
@@ -234,6 +265,8 @@ impl Comparison {
             repeated,
             by_hand,
             later_by: Summary::of(&later_by),
+            added_later_by: Summary::of(&added_later_by),
+            added_later_by_mean_ms,
             relayed: Summary::of(&relayed_trip),
             local: Summary::of(&local_trip),
             refresh_ms,
@@ -416,11 +449,25 @@ impl Comparison {
         out.push_str("\nFor reference, input by input\n");
         out.push_str(&header);
         out.push_str(&summary_row("relayed window later by", &self.later_by));
+        if self.added_later_by.is_some() {
+            out.push_str(&summary_row(
+                "relayed adds more than local by",
+                &self.added_later_by,
+            ));
+        }
         out.push_str(&summary_row(
             "relayed window (input to shown)",
             &self.relayed,
         ));
         out.push_str(&summary_row("local window (input to shown)", &self.local));
+        if let Some(mean) = self.added_later_by_mean_ms {
+            let _ = writeln!(
+                out,
+                "\"Relayed adds more than local by\" is the difference in added latency taken input by input \
+                 (mean {mean:.2} ms). It comes in steps of one refresh of the display: its median says on \
+                 which step most inputs fall. The pass line is about the figures further up."
+            );
+        }
         if let Some(refresh) = self.refresh_ms {
             let _ = writeln!(
                 out,
@@ -556,6 +603,32 @@ mod tests {
         ] {
             assert!(!over.within(&PASS_LINE), "{over:?}");
         }
+    }
+
+    /// Taken input by input the difference comes in steps of one refresh, and its median
+    /// says on which step most inputs fall. That is another figure than the pass line's.
+    #[test]
+    fn the_difference_is_also_taken_input_by_input_for_reference() {
+        // Four inputs. The local window adds 20 ms each time; the relayed one adds 21 ms
+        // once and 32 ms three times: one refresh later for most inputs.
+        let local: Vec<_> = (0..4).map(|id| shown(id, id * 300, 30)).collect();
+        let local_app: Vec<_> = (0..4).map(|id| answered(id, 10)).collect();
+        let relayed = vec![
+            shown(0, 0, 27),
+            shown(1, 300, 38),
+            shown(2, 600, 38),
+            shown(3, 900, 38),
+        ];
+        let relayed_app: Vec<_> = (0..4).map(|id| answered(id, 6)).collect();
+        let c = Comparison::build(&local, &relayed, Some(&local_app), Some(&relayed_app), None);
+        let by_input = c.added_later_by.unwrap();
+        assert_eq!(by_input.count, 4);
+        assert_eq!(by_input.median_ms, 12.0);
+        assert_eq!(by_input.max_ms, 12.0);
+        assert_eq!(c.added_later_by_mean_ms, Some(9.25));
+        // Without the applications' logs there is no added latency to take a difference of.
+        let c = Comparison::build(&local, &relayed, None, None, None);
+        assert!(c.added_later_by.is_none() && c.added_later_by_mean_ms.is_none());
     }
 
     #[test]
