@@ -329,24 +329,32 @@ func windowsOnScreen() -> [WindowInfo] {
 }
 
 /// The point to watch for one side: the middle of the selected window. Fails when another
-/// ordinary window lies over that point, because then the wrong picture would be measured.
+/// window lies over that point, because then the wrong picture would be measured.
+///
+/// The selected window may be an ordinary one or one that is kept above the ordinary ones (a
+/// measurement window is kept on top so that nothing comes to lie over it while the person goes
+/// on working). What can lie over it is a window of its own level or of a level below, further
+/// to the front: the menu bar, the Dock and what the system draws over everything are left out.
 func watchPoint(_ selector: WindowSelector, among windows: [WindowInfo], side: String) throws -> CGPoint {
-    let ordinary = windows.filter { $0.layer == 0 }
+    let floating = Int(CGWindowLevelForKey(.floatingWindow))
+    let selectable = windows.filter { (0...floating).contains($0.layer) }
     let candidates: [WindowInfo]
     switch selector {
     case .point(let point):
         return point
     case .title(let title):
-        candidates = ordinary.filter { $0.title == title }
+        candidates = selectable.filter { $0.title == title }
     case .owner(let owner):
-        candidates = ordinary.filter { $0.owner == owner }
+        candidates = selectable.filter { $0.owner == owner }
     }
     guard let target = candidates.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
     else {
         throw Failure("no window on screen for the \(side) side")
     }
     let middle = CGPoint(x: target.frame.midX, y: target.frame.midY)
-    if let front = ordinary.first(where: { $0.frame.contains(middle) }), front.number != target.number {
+    // The list runs front to back, so the first window that holds the point is the one seen there.
+    let seen = windows.first { (0...target.layer).contains($0.layer) && $0.frame.contains(middle) }
+    if let front = seen, front.number != target.number {
         throw Failure("the middle of the \(side) window is covered by a window of \(front.owner)")
     }
     return middle
@@ -599,6 +607,7 @@ func run() throws {
     var shownRelayed = 0
     var unsentLocal = Unsent(option: "--local")
     var unsentRelayed = Unsent(option: "--relayed")
+    var missedInARow = 0
 
     for id in 0..<UInt64(options.count) {
         guard let before = try watcher.settledShades(timeout: 3) else {
@@ -622,8 +631,18 @@ func run() throws {
             shownRelayed += 1
         }
         if shown.contains(where: { $0 == nil }) {
+            // A window that stops reacting has usually come to lie under another one: say so
+            // and stop, instead of waiting out the rest of the inputs one timeout at a time.
+            missedInARow += 1
+            if missedInARow == 5 {
+                let windows = windowsOnScreen()
+                _ = try watchPoint(options.localWindow, among: windows, side: "local")
+                _ = try watchPoint(options.relayedWindow, among: windows, side: "relayed")
+            }
             // Let a reaction that is merely late pass, so it is not taken for the next one.
             Thread.sleep(forTimeInterval: 1.0)
+        } else {
+            missedInARow = 0
         }
 
         let next = sentNs + jitter.next()
