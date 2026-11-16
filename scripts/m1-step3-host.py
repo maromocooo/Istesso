@@ -40,12 +40,21 @@ def main():
     parser.add_argument("--bitrate", type=int, default=30000, metavar="KBIT")
     parser.add_argument("--gop", type=int, default=170, metavar="FRAMES")
     parser.add_argument(
-        "--gpu-frames",
-        action="store_true",
-        help="keep every frame on the GPU from the compositor to the encoder (DMABuf, OpenGL, CUDA) "
-        "instead of passing it through main memory. Not usable yet: with gst-wayland-display at 1301f86 "
-        "the pipeline runs but the picture stays at its first frame "
-        "(docs/measurements/2026-11-16-step3-gpu-frames.md)",
+        "--vbv",
+        type=int,
+        metavar="KBIT",
+        help="size of the encoder's rate-control buffer. The bit rate divided by the frame rate holds every "
+        "frame, key frames too, to about the size of an average one; without it a key frame of a busy "
+        "picture can be twenty times that and arrive in hundreds of packets",
+    )
+    parser.add_argument(
+        "--frames",
+        choices=["memory", "cuda", "dmabuf"],
+        default="memory",
+        help="how a frame gets from the compositor to the encoder. memory: through main memory, and "
+        "up to the GPU again. cuda: as CUDA memory, never leaving the GPU; the compositor plugin has to "
+        "be built with its cuda feature. dmabuf: as DMABuf through OpenGL; with gst-wayland-display at "
+        "1301f86 the picture stays at its first frame (docs/measurements/2026-11-16-step3-gpu-frames.md)",
     )
     args = parser.parse_args()
 
@@ -53,21 +62,22 @@ def main():
     width, _, height = args.size.partition("x")
     width, height = int(width), int(height)
     node = f" render-node={args.render_node}" if args.render_node else ""
-    if args.gpu_frames:
+    size = f"width={width},height={height},framerate={args.fps}/1"
+    vbv = f" vbv-buffer-size={args.vbv}" if args.vbv else ""
+    if args.frames == "cuda":
+        frames = f"video/x-raw(memory:CUDAMemory),{size} ! "
+    elif args.frames == "dmabuf":
         # OpenGL without a window system: the host need not have a desktop session.
         os.environ.setdefault("GST_GL_PLATFORM", "egl")
         os.environ.setdefault("GST_GL_WINDOW", "surfaceless")
-        frames = (
-            f"video/x-raw(memory:DMABuf),width={width},height={height},framerate={args.fps}/1 ! "
-            "glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA ! "
-        )
+        frames = f"video/x-raw(memory:DMABuf),{size} ! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA ! cudaupload ! "
     else:
-        frames = f"video/x-raw,width={width},height={height},framerate={args.fps}/1 ! "
+        frames = f"video/x-raw,{size} ! cudaupload ! "
     description = (
         f"waylanddisplaysrc name=compositor{node} ! {frames}"
-        "cudaupload ! cudaconvert ! video/x-raw(memory:CUDAMemory),format=NV12 ! "
+        "cudaconvert ! video/x-raw(memory:CUDAMemory),format=NV12 ! "
         "nvcudah265enc name=enc preset=p1 tune=ultra-low-latency zero-reorder-delay=true b-frames=0 "
-        f"rate-control=cbr bitrate={args.bitrate} gop-size={args.gop} ! "
+        f"rate-control=cbr bitrate={args.bitrate} gop-size={args.gop}{vbv} ! "
         "h265parse config-interval=-1 ! rtph265pay config-interval=-1 mtu=1200 ! "
         f"udpsink name=net host={address} port={int(port or 5004)} sync=false async=false"
     )
@@ -88,7 +98,7 @@ def main():
     def on_frame(pad, info):
         now = time.monotonic_ns()
         buffer = info.get_buffer()
-        if args.gpu_frames:
+        if args.frames != "memory":
             log.write('{"kind":"frame_out","pts":%d,"t_ns":%d,"luma":-1}\n' % (buffer.pts, now))
             return Gst.PadProbeReturn.OK
         if not middle:
