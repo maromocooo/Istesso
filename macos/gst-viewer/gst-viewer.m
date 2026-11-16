@@ -627,61 +627,12 @@ static void send_input(const char *format, ...) {
     }
 }
 
-// Linux's number for a key (linux/input-event-codes.h), by macOS's number for the same place on
-// the keyboard. 0 where there is no such key.
-static const unsigned short linux_key[128] = {
-    [0x00] = 30,  [0x01] = 31,  [0x02] = 32,  [0x03] = 33,  [0x04] = 35,  [0x05] = 34,  [0x06] = 44,  [0x07] = 45,
-    [0x08] = 46,  [0x09] = 47,  [0x0A] = 86,  [0x0B] = 48,  [0x0C] = 16,  [0x0D] = 17,  [0x0E] = 18,  [0x0F] = 19,
-    [0x10] = 21,  [0x11] = 20,  [0x12] = 2,   [0x13] = 3,   [0x14] = 4,   [0x15] = 5,   [0x16] = 7,   [0x17] = 6,
-    [0x18] = 13,  [0x19] = 10,  [0x1A] = 8,   [0x1B] = 12,  [0x1C] = 9,   [0x1D] = 11,  [0x1E] = 27,  [0x1F] = 24,
-    [0x20] = 22,  [0x21] = 26,  [0x22] = 23,  [0x23] = 25,  [0x24] = 28,  [0x25] = 38,  [0x26] = 36,  [0x27] = 40,
-    [0x28] = 37,  [0x29] = 39,  [0x2A] = 43,  [0x2B] = 51,  [0x2C] = 53,  [0x2D] = 49,  [0x2E] = 50,  [0x2F] = 52,
-    [0x30] = 15,  [0x31] = 57,  [0x32] = 41,  [0x33] = 14,  [0x35] = 1,   [0x36] = 126, [0x37] = 125, [0x38] = 42,
-    [0x39] = 58,  [0x3A] = 56,  [0x3B] = 29,  [0x3C] = 54,  [0x3D] = 100, [0x3E] = 97,  [0x40] = 187, [0x41] = 83,
-    [0x43] = 55,  [0x45] = 78,  [0x47] = 69,  [0x4B] = 98,  [0x4C] = 96,  [0x4E] = 74,  [0x4F] = 188, [0x50] = 189,
-    [0x51] = 117, [0x52] = 82,  [0x53] = 79,  [0x54] = 80,  [0x55] = 81,  [0x56] = 75,  [0x57] = 76,  [0x58] = 77,
-    [0x59] = 71,  [0x5A] = 190, [0x5B] = 72,  [0x5C] = 73,  [0x5D] = 124, [0x5E] = 89,  [0x5F] = 95,  [0x60] = 63,
-    [0x61] = 64,  [0x62] = 65,  [0x63] = 61,  [0x64] = 66,  [0x65] = 67,  [0x66] = 123, [0x67] = 87,  [0x68] = 122,
-    [0x69] = 183, [0x6A] = 186, [0x6B] = 184, [0x6D] = 68,  [0x6F] = 88,  [0x71] = 185, [0x72] = 110, [0x73] = 102,
-    [0x74] = 104, [0x75] = 111, [0x76] = 62,  [0x77] = 107, [0x78] = 60,  [0x79] = 109, [0x7A] = 59,  [0x7B] = 105,
-    [0x7C] = 106, [0x7D] = 108, [0x7E] = 103,
-};
+// Which keys go to the other side for what happens on the keyboard: keys.h, tested by keys-test.c.
+#include "keys.h"
 
 // Whether the Command keys go to the other side as Control (the default) or as the Super
-// ("Windows") keys. What Command does on a Mac (copy, paste, save, close a tab) is done with
-// Control in applications on Linux, so a person's hands keep working as they are used to.
-// ISTESSO_COMMAND_KEY=super in the environment sends Super instead.
+// ("Windows") keys. ISTESSO_COMMAND_KEY=super in the environment sends Super.
 static BOOL command_is_control = YES;
-
-// Linux's number for the key at this place of the Mac's keyboard, as it is sent.
-static unsigned key_to_send(unsigned short key) {
-    if (key >= 128) {
-        return 0;
-    }
-    if (command_is_control && key == 0x37) {
-        return 29; // left Command as left Control
-    }
-    if (command_is_control && key == 0x36) {
-        return 97; // right Command as right Control
-    }
-    return linux_key[key];
-}
-
-// Which bit of an event's modifier flags says that a modifier key is down, by the key's number
-// on macOS. 0 for keys that are not modifiers.
-static unsigned long modifier_bit(unsigned short key) {
-    switch (key) {
-        case 0x38: return NX_DEVICELSHIFTKEYMASK;
-        case 0x3C: return NX_DEVICERSHIFTKEYMASK;
-        case 0x3B: return NX_DEVICELCTLKEYMASK;
-        case 0x3E: return NX_DEVICERCTLKEYMASK;
-        case 0x3A: return NX_DEVICELALTKEYMASK;
-        case 0x3D: return NX_DEVICERALTKEYMASK;
-        case 0x37: return NX_DEVICELCMDKEYMASK;
-        case 0x36: return NX_DEVICERCMDKEYMASK;
-        default: return 0;
-    }
-}
 
 // The view the picture is shown in, when input is passed on: it takes the keyboard and the
 // pointer and writes what happens to the socket.
@@ -689,7 +640,7 @@ static unsigned long modifier_bit(unsigned short key) {
 @end
 
 @implementation InputView {
-    BOOL _down[256];     // keys that are down, by Linux's number
+    Keys _keys;          // keys that are down on the other side
     double _scroll[2];   // parts of a pixel not yet passed on
 }
 
@@ -718,38 +669,28 @@ static unsigned long modifier_bit(unsigned short key) {
                                              object:self.window];
 }
 
-- (void)key:(unsigned)code pressed:(BOOL)pressed {
-    if (code == 0 || code >= 256 || _down[code] == pressed) {
-        return;
+- (void)send:(const KeyChange *)changes count:(size_t)count {
+    for (size_t i = 0; i < count; i++) {
+        send_input("{\"kind\":\"key\",\"code\":%u,\"pressed\":%s}", changes[i].code, changes[i].pressed ? "true" : "false");
     }
-    _down[code] = pressed;
-    send_input("{\"kind\":\"key\",\"code\":%u,\"pressed\":%s}", code, pressed ? "true" : "false");
 }
 
 // The window is no longer the one that is typed into: no key stays down on the other side.
 - (void)letGo {
-    for (unsigned code = 1; code < 256; code++) {
-        [self key:code pressed:NO];
-    }
+    KeyChange changes[256];
+    [self send:changes count:keys_let_go(&_keys, changes)];
 }
 
 - (void)keyDown:(NSEvent *)event {
-    if (event.keyCode >= 128) {
-        return;
-    }
-    unsigned code = key_to_send(event.keyCode);
-    if (event.modifierFlags & NSEventModifierFlagCommand) {
-        // macOS does not say when a key comes up again while Command is held: press and let go.
-        [self key:code pressed:YES];
-        [self key:code pressed:NO];
-    } else if (!event.isARepeat) {
-        // The application on the other side repeats a held key itself.
-        [self key:code pressed:YES];
-    }
+    KeyChange changes[KEYS_MOST];
+    _keys.command_is_control = command_is_control;
+    [self send:changes count:keys_key_down(&_keys, event.keyCode, event.modifierFlags, event.isARepeat, changes)];
 }
 
 - (void)keyUp:(NSEvent *)event {
-    [self key:key_to_send(event.keyCode) pressed:NO];
+    KeyChange changes[KEYS_MOST];
+    _keys.command_is_control = command_is_control;
+    [self send:changes count:keys_key_up(&_keys, event.keyCode, changes)];
 }
 
 // Keys with Command come here first; they all go to the other side.
@@ -762,18 +703,9 @@ static unsigned long modifier_bit(unsigned short key) {
 }
 
 - (void)flagsChanged:(NSEvent *)event {
-    if (event.keyCode >= 128) {
-        return;
-    }
-    unsigned code = key_to_send(event.keyCode);
-    unsigned long bit = modifier_bit(event.keyCode);
-    if (bit != 0) {
-        [self key:code pressed:(event.modifierFlags & bit) != 0];
-    } else if (event.keyCode == 0x39) {
-        // Caps Lock reports each switch once.
-        [self key:code pressed:YES];
-        [self key:code pressed:NO];
-    }
+    KeyChange changes[KEYS_MOST];
+    _keys.command_is_control = command_is_control;
+    [self send:changes count:keys_flags_changed(&_keys, event.keyCode, event.modifierFlags, changes)];
 }
 
 - (void)pointer:(NSEvent *)event {

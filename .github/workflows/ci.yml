@@ -28,6 +28,9 @@ jobs:
       - name: Build the screen probe
         if: runner.os == 'macOS'
         run: swift build --package-path macos/screen-probe
+      - name: Test which keys the viewer passes on
+        if: runner.os == 'macOS'
+        run: cc -Wall -Wextra -o keys-test macos/gst-viewer/keys-test.c && ./keys-test
 
   licenses:
     runs-on: ubuntu-latest
