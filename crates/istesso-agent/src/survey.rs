@@ -737,7 +737,10 @@ mod tests {
         let ubuntu = Device::new("ubuntu");
         let addr = ubuntu.start_agent();
         assert!(local_agent_running(addr.port()));
-        assert!(!local_agent_running(dead_address().port()));
+        // Nothing listens where a listener was closed a moment ago, unless
+        // another test was handed that very port in between. Then the next
+        // port will do.
+        assert!((0..10).any(|_| !local_agent_running(dead_address().port())));
     }
 
     #[test]
