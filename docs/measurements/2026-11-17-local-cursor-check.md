@@ -68,34 +68,15 @@
 
 ## 朝に見ること（数分）
 
-Mac のポインターを使うので、人が行います。人が試している窓（`scripts/try.sh`）は、いったん止めます（同じ入力の経路を使うため）。`<ホスト>` は、ホストの有線のアドレスです。
+Mac のポインターを使うので、人が行います。**コマンド 1 つで起動できるようにしました**（`scripts/try.sh` の `TRY=channel`。くわしくは、[あとから開く窓の記録](2026-11-17-dialog-windows.md)の「朝に見ること」）。
 
-1. Mac で、試している窓を止める。
-
-   ```sh
-   scripts/try.sh stop
-   ```
-
-2. ホストで、カーソルを伝える設定のパイプラインと、アプリを起動する（`tmux` の中で。プラグインは、2 つの修正を当ててビルドしたもの）。今夜のビルドは、ホストの `~/.cache/istesso-media-wip/` にある：リポジトリーの写しが `src/`（`istesso-media` の共有ライブラリーも、ここでビルドしてある。ここから起動すれば、`--media-lib` は要らない）、プラグインが `gwd-cursor/target/release`、レジストリーのファイルが `run/registry-cursor.bin`。
+1. Mac のターミナルで、このブランチの作業ツリーに入って、次を実行する。いま試している窓は、止まります（保存していないものがあれば、先に保存する）。
 
    ```sh
-   export GST_PLUGIN_PATH=<2 つの修正を当てた gst-wayland-display>/target/release GST_REGISTRY=<自分のレジストリーのファイル>
-   python3 -u scripts/m1-step3-host.py --to-channel 47803 --cursor --size 1720x720 --fps 85 --frames cuda \
-       --render-node /dev/dri/renderD129 --log -
-   # 別の窓で。<ソケット> は、上のログの socket_name
-   env -u DISPLAY WAYLAND_DISPLAY=<ソケット> GDK_BACKEND=wayland gnome-text-editor --standalone <適当なファイル>
+   TRY=channel scripts/try.sh gnome-text-editor --standalone
    ```
 
-3. Mac のターミナルで、入力の中継と、ビューアーを起動する（ターミナルから起動するので、新しい許可は要らない）。
-
-   ```sh
-   target/release/istesso input relay --to <ホストの名前> --socket ~/Library/Caches/istesso/cursor-check.sock \
-       --address <ホスト> --keep-trying 30 &
-   ISTESSO_CHANNEL=<ホスト>:47803 macos/gst-viewer/build/gst-viewer 100 100 860 360 "Istesso" - - 0 \
-       ~/Library/Caches/istesso/cursor-check.sock
-   ```
-
-4. 見るもの：
+2. 見るもの：
 
    | すること | こうなるはず |
    |---|---|
@@ -106,7 +87,7 @@ Mac のポインターを使うので、人が行います。人が試してい�
    | ほかのアプリの窓をクリックしてから、ポインターをビューアーの上に戻す | Mac のカーソルのまま（窓が、打ち込む先になっていないあいだは、手元のカーソルを出さない） |
    | 文字を打つ | アプリがポインターを隠したら、何も出ない。動かすと、また出る |
 
-5. 終わったら、ビューアーを閉じ、中継を止め（`kill %1`）、ホストのパイプラインとアプリを止めて、`scripts/try.sh <アプリ>` で、試している窓を戻す。
+3. 終わったら、`scripts/try.sh stop`。
 
 気づいたことがあれば、どの行で、どう違ったかを知らせてください。
 
