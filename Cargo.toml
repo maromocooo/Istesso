@@ -50,7 +50,8 @@ coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "HostTime", "AudioHardware"] }
 # PipeWire (Linux only, and only with the `pipewire` feature of istesso-audio): the capture.
 # libc for the clock PipeWire stamps its cycles with.
-pipewire = "0.10"
+# v0_3_49: a stream is told how many frames to produce.
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 libc = "0.2"
 
 [profile.release]

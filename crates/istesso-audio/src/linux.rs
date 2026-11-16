@@ -389,6 +389,145 @@ pub fn run_sink(
     }
 }
 
+/// Writes the next frames of `tone` into `bytes` as 32-bit floats,
+/// little-endian, every channel the same: `wanted` frames, or as many as
+/// fit when nothing particular is wanted. Returns the frames written.
+fn fill_tone(
+    tone: &mut crate::probe::Tone,
+    frame: &mut [f32],
+    bytes: &mut [u8],
+    wanted: usize,
+) -> usize {
+    let frame_bytes = 4 * frame.len();
+    let room = bytes.len() / frame_bytes;
+    let frames = if wanted == 0 { room } else { wanted.min(room) };
+    for raw in bytes[..frames * frame_bytes].chunks_exact_mut(frame_bytes) {
+        tone.fill(frame, frame.len());
+        for (sample, out) in frame.iter().zip(raw.chunks_exact_mut(4)) {
+            out.copy_from_slice(&sample.to_le_bytes());
+        }
+    }
+    frames
+}
+
+/// A test tool: puts a node into PipeWire that produces a steady tone and
+/// is connected to nothing. Whoever runs the test links it to the sink
+/// under test by hand (`pw-link`); the session manager is not asked to
+/// connect it anywhere, so the tone cannot reach a sound card by itself.
+/// Runs on the calling thread until `stop` is set.
+///
+/// The node presents itself as a source that is last in line, not as an
+/// application's stream: a stream would be connected by the session
+/// manager's rules.
+pub fn run_test_tone(
+    options: &SinkOptions,
+    rate: u32,
+    channels: u32,
+    tone: crate::probe::Tone,
+    stop: Arc<AtomicBool>,
+    log: Arc<dyn Fn(String) + Send + Sync>,
+) -> Result<()> {
+    let device = |err: pw::Error| Error::Device(format!("PipeWire: {err}"));
+    pw::init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(device)?;
+    let realtime = pw::properties::properties! {
+        *pw::keys::CONFIG_NAME => REALTIME_CLIENT_CONFIG,
+    };
+    let context = pw::context::ContextRc::new(&mainloop, Some(realtime))
+        .or_else(|_| pw::context::ContextRc::new(&mainloop, None))
+        .map_err(device)?;
+    let core = context.connect_rc(None).map_err(device)?;
+
+    let mut props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CLASS => "Audio/Source",
+        *pw::keys::NODE_NAME => options.node_name.as_str(),
+        *pw::keys::NODE_DESCRIPTION => options.description.as_str(),
+        *pw::keys::NODE_VIRTUAL => "true",
+        *pw::keys::PRIORITY_SESSION => "0",
+    };
+    if let Some(quantum) = options.quantum {
+        props.insert(*pw::keys::NODE_LATENCY, format!("{quantum}/{rate}"));
+    }
+    for (key, value) in &options.properties {
+        props.insert(key.as_str(), value.as_str());
+    }
+
+    let stream = pw::stream::StreamBox::new(&core, &options.node_name, props).map_err(device)?;
+    let failure = Rc::new(RefCell::new(None::<String>));
+    let failed = failure.clone();
+    let failing_loop = mainloop.downgrade();
+    let frame = vec![0.0f32; channels as usize];
+    let _listener = stream
+        .add_local_listener_with_user_data((tone, frame))
+        .state_changed(move |_, _, _, new| {
+            if let pw::stream::StreamState::Error(reason) = new {
+                *failed.borrow_mut() = Some(reason);
+                if let Some(mainloop) = failing_loop.upgrade() {
+                    mainloop.quit();
+                }
+            }
+        })
+        .process(|stream, (tone, frame)| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let wanted = buffer.requested() as usize;
+            let stride = 4 * frame.len();
+            let Some(data) = buffer.datas_mut().first_mut() else {
+                return;
+            };
+            let frames = match data.data() {
+                Some(bytes) => fill_tone(tone, frame, bytes, wanted),
+                None => 0,
+            };
+            let chunk = data.chunk_mut();
+            *chunk.offset_mut() = 0;
+            *chunk.stride_mut() = stride as i32;
+            *chunk.size_mut() = (stride * frames) as u32;
+        })
+        .register()
+        .map_err(device)?;
+
+    let format = format(rate, channels)?;
+    let pod = spa::pod::Pod::from_bytes(&format)
+        .ok_or_else(|| Error::Device("PipeWire: cannot describe the format".into()))?;
+    stream
+        .connect(
+            spa::utils::Direction::Output,
+            None,
+            pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+            &mut [pod],
+        )
+        .map_err(device)?;
+    log(format!(
+        "a test tone waits in the node {}; it is connected to nothing",
+        options.node_name
+    ));
+
+    let stopping_loop = mainloop.downgrade();
+    let timer = mainloop.loop_().add_timer(move |_| {
+        if stop.load(Ordering::Relaxed) {
+            if let Some(mainloop) = stopping_loop.upgrade() {
+                mainloop.quit();
+            }
+        }
+    });
+    let every = Duration::from_millis(50);
+    timer
+        .update_timer(Some(every), Some(every))
+        .into_result()
+        .map_err(|err| Error::Device(format!("PipeWire: {err:?}")))?;
+
+    mainloop.run();
+    let _ = stream.disconnect();
+    let reason = failure.borrow_mut().take();
+    match reason {
+        Some(reason) => Err(Error::Device(format!("PipeWire: {reason}"))),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +542,28 @@ mod tests {
         let (writer, packets) = capture_ring(2, 48_000.0, 1.0, 0.5, 0.02);
         let stats = Arc::new(SinkStats::default());
         (Capture::new(writer, stats.clone()), packets, stats)
+    }
+
+    #[test]
+    fn the_test_tone_is_written_as_many_frames_as_are_wanted() {
+        let mut tone = crate::probe::Tone::new(997.0, 0.001, 48_000.0);
+        let mut frame = [0.0f32; 2];
+        let mut bytes = vec![0xffu8; 8 * 300];
+        assert_eq!(fill_tone(&mut tone, &mut frame, &mut bytes, 256), 256);
+        // What was written is the tone, the same on both channels, and what
+        // was not wanted is left alone.
+        let mut expected = vec![0.0f32; 512];
+        crate::probe::Tone::new(997.0, 0.001, 48_000.0).fill(&mut expected, 2);
+        let written: Vec<f32> = bytes[..8 * 256]
+            .chunks_exact(4)
+            .map(|raw| f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+            .collect();
+        assert_eq!(written, expected);
+        assert!(bytes[8 * 256..].iter().all(|byte| *byte == 0xff));
+        // Nothing particular wanted: as much as fits. More than fits: no
+        // more than fits.
+        assert_eq!(fill_tone(&mut tone, &mut frame, &mut bytes, 0), 300);
+        assert_eq!(fill_tone(&mut tone, &mut frame, &mut bytes, 1000), 300);
     }
 
     #[test]

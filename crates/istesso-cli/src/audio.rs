@@ -77,6 +77,35 @@ pub enum AudioAction {
         #[arg(long)]
         stop_file: Option<PathBuf>,
     },
+    /// A test tool: put a quiet tone into the sound system of this machine,
+    /// connected to nothing (Linux, PipeWire)
+    ///
+    /// The tone reaches an output only when it is linked to one by hand,
+    /// e.g. `pw-link istesso-audio-test-tone:capture_FL <output>:playback_FL`.
+    TestTone {
+        /// The name programs address the tone's node by
+        #[arg(long, default_value = "istesso-audio-test-tone")]
+        node_name: String,
+        /// Pitch of the tone in Hz
+        #[arg(long, default_value_t = 997.0)]
+        tone_hz: f64,
+        /// Level of the tone in dB relative to full scale
+        #[arg(long, default_value_t = -60.0, allow_negative_numbers = true)]
+        tone_db: f64,
+        /// Frames per cycle to ask the sound system for
+        #[arg(long, default_value_t = 256)]
+        quantum: u32,
+        /// Stop after this many seconds (default: run until interrupted)
+        #[arg(long)]
+        seconds: Option<f64>,
+        /// A further property of the node, as `key=value`; may be given
+        /// several times
+        #[arg(long)]
+        node_property: Vec<String>,
+        /// Stop once this file exists
+        #[arg(long)]
+        stop_file: Option<PathBuf>,
+    },
     /// Play the sound of a paired host on this machine
     ///
     /// For now the output device is handed silence, so nothing is heard:
@@ -255,6 +284,23 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             stop_file,
             keep_awake,
         }),
+        AudioAction::TestTone {
+            node_name,
+            tone_hz,
+            tone_db,
+            quantum,
+            seconds,
+            node_property,
+            stop_file,
+        } => test_tone(ToneOptions {
+            node_name,
+            tone_hz,
+            tone_db,
+            quantum,
+            seconds,
+            node_properties: node_property,
+            stop_file,
+        }),
         AudioAction::Outputs { json } => outputs(json),
         AudioAction::Check {
             file,
@@ -393,6 +439,83 @@ fn pipewire_feeder(
     }
     Err(
         "this build cannot capture from PipeWire: build it on Linux with `--features pipewire`"
+            .to_string(),
+    )
+}
+
+struct ToneOptions {
+    node_name: String,
+    tone_hz: f64,
+    tone_db: f64,
+    quantum: u32,
+    seconds: Option<f64>,
+    node_properties: Vec<String>,
+    stop_file: Option<PathBuf>,
+}
+
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+fn test_tone(options: ToneOptions) -> Result<(), String> {
+    use istesso_audio::linux::{run_test_tone, SinkOptions};
+
+    if !(16..=8192).contains(&options.quantum) {
+        return Err("a cycle holds between 16 and 8192 frames".to_string());
+    }
+    let node = SinkOptions {
+        node_name: options.node_name.clone(),
+        description: "Istesso audio test tone".to_string(),
+        quantum: Some(options.quantum),
+        properties: options
+            .node_properties
+            .iter()
+            .map(|text| parse_property(text))
+            .collect::<Result<_, _>>()?,
+    };
+    let amplitude = 10f64.powf(options.tone_db.min(0.0) / 20.0) as f32;
+    let tone = Tone::new(options.tone_hz, amplitude, f64::from(STREAM_RATE));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let player = std::thread::spawn(move || {
+        run_test_tone(
+            &node,
+            STREAM_RATE,
+            u32::from(CHANNELS),
+            tone,
+            stopping,
+            Arc::new(|line| eprintln!("{line}")),
+        )
+    });
+    let begin = Instant::now();
+    while !player.is_finished() {
+        let over = options
+            .seconds
+            .is_some_and(|limit| begin.elapsed().as_secs_f64() >= limit);
+        if over || options.stop_file.as_ref().is_some_and(|file| file.exists()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop.store(true, Ordering::Relaxed);
+    match player.join() {
+        Ok(result) => result.map_err(|err| err.to_string()),
+        Err(_) => Err("the thread that plays the tone stopped unexpectedly".to_string()),
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+fn test_tone(options: ToneOptions) -> Result<(), String> {
+    let _ = (
+        options.node_name,
+        options.tone_hz,
+        options.tone_db,
+        options.quantum,
+        options.seconds,
+        options.stop_file,
+    );
+    for text in &options.node_properties {
+        parse_property(text)?;
+    }
+    Err(
+        "this build has no PipeWire test tone: build it on Linux with `--features pipewire`"
             .to_string(),
     )
 }
