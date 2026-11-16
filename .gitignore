@@ -11,3 +11,6 @@
 /handoff/
 # Left behind by running the scripts in scripts/
 __pycache__/
+
+# Notes handed to the agent from other tools; not part of the project
+/Claude outputs/
