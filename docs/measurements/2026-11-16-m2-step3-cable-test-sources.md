@@ -38,7 +38,29 @@
 - ファイルには手を付けていません。音の作業の場所の外にあり、セッションマネージャーが動いたまま書き直しても、上書きされるためです。消すかどうかは、人が決めます。
 - この形は、数値も製品の経路を表しません。取り込んだ時刻が、パイプを通ったあとの時刻になるためです。上流で止まっても、出口からは遅れに見えず、再開の位置がずれます。60 秒の 1 回では、補正が −307〜+106 ppm の範囲で振れました。
 
-その 1 回の値（待ち時間の目標 60 ms、60 秒）：受け取った 11283 パケットは、送ったものとすべて同じ。届く間隔は、中央値 5.36 ms、95 パーセンタイル 7.46 ms、99 パーセンタイル 11.29 ms、最大 63.9 ms。途切れ 1 回（21 ms）。
+### 残った 8 行
+
+2026-11-16 に、**消さない**と決まりました。害がなく、動いている WirePlumber の状態のファイルを書き換えるほうが危ないためです。
+
+- ファイル：`~/.local/state/wireplumber/restore-stream`
+- 行（そのまま。2026-11-16 の時点で、ファイルの 6〜9 行めと 26〜29 行め）：
+
+```text
+Audio/Sink:node.name:istesso-m2-test:channelMap=FL;FR;
+Audio/Sink:node.name:istesso-m2-test:channelVolumes=1.0;1.0;
+Audio/Sink:node.name:istesso-m2-test:mute=false
+Audio/Sink:node.name:istesso-m2-test:volume=1.0
+Input/Audio:application.name:gst-launch-1.0:channelMap=FL;FR;
+Input/Audio:application.name:gst-launch-1.0:channelVolumes=1.0;1.0;
+Input/Audio:application.name:gst-launch-1.0:mute=false
+Input/Audio:application.name:gst-launch-1.0:volume=1.0
+```
+
+これからは、ホストの設定や状態に跡が残りうる試し方をするときは、先に知らせてから行います。
+
+### その 1 回の値
+
+待ち時間の目標 60 ms、60 秒：受け取った 11283 パケットは、送ったものとすべて同じ。届く間隔は、中央値 5.36 ms、95 パーセンタイル 7.46 ms、99 パーセンタイル 11.29 ms、最大 63.9 ms。途切れ 1 回（21 ms）。
 
 **本物の取り込みでも、同じことが起きるはずです。** こちらのプロセスが作る仮想の出力先も、セッションマネージャーが名前で覚えます。出力先の音量を覚えるのは、セッションマネージャーのふつうの動きですが、覚えさせない指定（`state.restore-props`）が効くかどうかを、取り込みを書くときに確かめます。
 
