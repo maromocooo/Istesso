@@ -16,6 +16,8 @@ use istesso_proto::{
     Role, UnifiedApp,
 };
 
+mod audio;
+
 #[derive(Parser)]
 #[command(
     name = "istesso",
@@ -77,6 +79,11 @@ enum Command {
     },
     /// Show this device's name and key fingerprint
     Id,
+    /// Send the sound of one machine to another (first tests)
+    Audio {
+        #[command(subcommand)]
+        action: audio::AudioAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -288,6 +295,7 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("Cache        {}", paths.cache.display());
             Ok(())
         }
+        Command::Audio { action } => audio::run(action),
     }
 }
 
