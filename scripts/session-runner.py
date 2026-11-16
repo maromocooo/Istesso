@@ -34,6 +34,7 @@ What it cannot do yet, because the pipeline cannot. Each is said on standard err
   the picture goes to whichever paired device connects, not only to `peer.address`
 """
 
+import fcntl
 import json
 import os
 import re
@@ -55,17 +56,29 @@ def note(text):
     print(text, file=sys.stderr, flush=True)
 
 
-def free_port(first, last):
-    """The first port of the range that nothing listens on."""
+def free_port(first, last, directory):
+    """The first port of the range that nothing listens on and no other runner has taken.
+
+    Two sessions that start at the same moment would both find the same port free: the pipeline
+    binds it seconds later. A runner therefore holds a lock on a file named after the port for
+    as long as it lives. Returns the port and the lock, which has to be kept.
+    """
     for port in range(first, last + 1):
+        lock = open(os.path.join(directory, f"port-{port}.lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            continue
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("::", port))
             except OSError:
+                lock.close()
                 continue
-            return port
-    return None
+        return port, lock
+    return None, None
 
 
 def nvidia_render_node():
@@ -100,7 +113,7 @@ def main():
     logs = os.environ.get("ISTESSO_RUNNER_LOGS") or os.path.dirname(input_socket)
     os.makedirs(logs, mode=0o700, exist_ok=True)
     first, _, last = os.environ.get("ISTESSO_RUNNER_PORTS", "47850-47899").partition("-")
-    port = free_port(int(first), int(last or first))
+    port, _port_lock = free_port(int(first), int(last or first), logs)
     if port is None:
         say("error", message="no port is free for the picture")
         return 1

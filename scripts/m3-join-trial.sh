@@ -33,6 +33,7 @@ BIN=$HERE/target/release/istesso
 WORK=${JOIN_WORK:-${TMPDIR:-/tmp}/istesso-join-trial}
 POSITION=${JOIN_POSITION:-1210,780}
 APP="Istesso Join Editor"
+SECOND="Istesso Join Second"
 mkdir -p "$WORK"
 # The viewer keeps its input socket in a directory of its own under the system's temporary
 # one: the path of a socket may only be so long.
@@ -111,6 +112,8 @@ PY
 echo "== setting up =="
 on_host 'mkdir -p $D/data/applications $D/cache $D/logs && : > $D/scratch.txt &&
     printf "[Desktop Entry]\nType=Application\nName='"$APP"'\nExec=gnome-text-editor --standalone --ignore-session %s\n" $D/scratch.txt > $D/data/applications/istesso-join-editor.desktop &&
+    : > $D/scratch-2.txt &&
+    printf "[Desktop Entry]\nType=Application\nName='"$SECOND"'\nExec=gnome-text-editor --standalone --ignore-session %s\n" $D/scratch-2.txt > $D/data/applications/istesso-join-second.desktop &&
     { [ -z "'"${JOIN_REGISTRY:-}"'" ] || cp '"${JOIN_REGISTRY:-/dev/null}"' $D/registry.bin; }'
 start_agent() {
     on_host 'tmux kill-session -t join-agent 2>/dev/null; sleep 0.3; : > $D/agent.log
@@ -170,12 +173,48 @@ check "a capture of the window is taken (after coming back)" capture window-3-ba
 kill -INT $cli
 wait $cli
 
-echo "== cleaning up =="
-for id in $(sessions | awk -v app="$APP" 'index($0, app) { print $1 }'); do
-    "$BIN" sessions stop "$id" --force > /dev/null 2>&1
-done
+end_all() {
+    for id in $(sessions | awk '/Istesso Join/ { print $1 }'); do
+        "$BIN" sessions stop "$id" --force > /dev/null 2>&1
+    done
+}
 nothing() { sessions | grep -q "No application"; }
+end_all
 check "the application is ended and nothing is listed" nothing
+
+echo "== two applications at once, each with its own input =="
+on_host ': > $D/scratch.txt; : > $D/scratch-2.txt'
+second_position="$((${POSITION%,*} - 500)),${POSITION#*,}"
+"$BIN" open "$APP" --viewer "$HERE/scripts/session-viewer.py" --size 960x540 --fps 60 --position "$POSITION" > "$WORK/two-1.txt" 2>&1 &
+one=$!
+"$BIN" open "$SECOND" --viewer "$HERE/scripts/session-viewer.py" --size 960x540 --fps 60 --position "$second_position" > "$WORK/two-2.txt" 2>&1 &
+two=$!
+check "the first is shown and takes input" wait_for "$WORK/two-1.txt" "go to the host over the control channel, for this session" 40
+check "the second is shown and takes input" wait_for "$WORK/two-2.txt" "go to the host over the control channel, for this session" 40
+frames=$(sed -n 's/.*frames are written down in \([^;]*\);.*/\1/p' "$WORK/two-1.txt" | tail -1)
+check "the first one's picture is drawn" drawn
+frames=$(sed -n 's/.*frames are written down in \([^;]*\);.*/\1/p' "$WORK/two-2.txt" | tail -1)
+check "the second one's picture is drawn" drawn
+input_one=$(sed -n 's/.*input goes to \(.*\)$/\1/p' "$WORK/two-1.txt" | tail -1)
+input_two=$(sed -n 's/.*input goes to \(.*\)$/\1/p' "$WORK/two-2.txt" | tail -1)
+sleep 2
+# o n e into the first window, t w o into the second, each saved with Control-S.
+click "$input_one" 480 320
+keys "$input_one" 24 49 18
+click "$input_two" 480 320
+keys "$input_two" 20 17 24
+sleep 0.5
+keys "$input_one" +29 31
+keys "$input_two" +29 31
+sleep 1.5
+check "what was typed into the first window is in the first application's file, and only there" on_host '[ "$(cat $D/scratch.txt)" = one ]'
+check "what was typed into the second window is in the second application's file, and only there" on_host '[ "$(cat $D/scratch-2.txt)" = two ]'
+kill -INT $one $two
+wait $one $two
+
+echo "== cleaning up =="
+end_all
+check "both are ended and nothing is listed" nothing
 on_host 'tmux kill-session -t join-agent 2>/dev/null; sleep 0.5; pgrep -f "[s]ession-runner.py|[m]1-step3-host.py --to-channel '"${PORTS%%-*}"'" > /dev/null && echo "  something of the trial still runs on the host" || echo "  nothing of the trial runs on the host"'
 pgrep -f "[g]st-viewer .*$APP" > /dev/null && echo "  the trial's viewer still runs on this machine" || echo "  the trial's viewer does not run on this machine"
 echo "$failed checks failed"
