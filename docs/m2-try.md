@@ -62,23 +62,8 @@ istesso audio serve --source pipewire --bind <ホストの有線のアドレス>
 ## 5. ホスト：テストの音を流す（別の端末で）
 
 ```sh
-# 997 Hz、−60 dBFS、100 秒の正弦波を作る（1 回だけ）
-python3 - <<'EOF'
-import array, math, wave
-rate, hz, peak = 48000, 997, 0.001 * (2**31 - 1)
-second = array.array('i', [0]) * (rate * 2)
-for n in range(rate):
-    second[2 * n] = second[2 * n + 1] = int(round(peak * math.sin(2 * math.pi * hz * n / rate)))
-with wave.open('tone.wav', 'wb') as out:
-    out.setnchannels(2); out.setsampwidth(4); out.setframerate(rate)
-    for _ in range(100):
-        out.writeframes(second.tobytes())
-EOF
-
-# どこにも自動ではつながない形で再生を始める（つなぐまで、音は流れない）
-pw-cat --playback --target 0 --latency 256 \
-    -P '{ media.class = "Audio/Source" device.routes = 1 priority.session = 0 node.name = "istesso-audio-test-tone" node.description = "Istesso audio test tone" node.virtual = true }' \
-    tone.wav &
+# 997 Hz、−60 dBFS の正弦波を作るノードを置く。どこにも自動ではつながらない（つなぐまで、音は流れない）
+istesso audio test-tone --seconds 98 --node-property device.routes=1 &
 
 # 仮想の出力先に、手でつなぐ
 pw-link istesso-audio-test-tone:capture_FL istesso-audio-test:playback_FL
@@ -156,7 +141,7 @@ istesso audio compare sent.txt received.txt
 
 ## 8. ホスト：後の状態を確かめる
 
-`serve` と `pw-cat` が終わってから、確かめます。
+`serve` と `test-tone` が終わってから、確かめます。
 
 ```sh
 wpctl status | diff before.txt - && echo "audio state unchanged"

@@ -209,6 +209,7 @@ ADR 0011 のとおりです。音のためだけの仕組みは作らず、`iste
 | `istesso audio check <ファイル>` | どちらでも | 録った正弦波を調べる：大きさ、音程、音の谷、波形の飛び |
 | `istesso audio compare <送った側> <受けた側>` | どちらでも | 両端で `--ledger` に書いたパケットごとの指紋を突き合わせる |
 | `istesso audio simulate` | どちらでも | 時計を模擬して再生の部分を回し、結果を JSON で出す |
+| `istesso audio test-tone` | 音源（テスト用） | テストの正弦波（既定は 997 Hz、−60 dBFS）を作るノードを、PipeWire に置く。どこにも自動ではつながらない。`pw-link` で、仮想の出力先に手でつなぐ。Linux で、機能 `pipewire` を有効にしてビルドしたとき |
 | `istesso peers allow <端末> <権限>`、`istesso peers deny …` | 音源 | 権限を与える、取り消す。`istesso peers list` は権限も表示する |
 
 依存（どれも `deny.toml` の許可リストに収まる。例外は足していない）：
@@ -330,12 +331,18 @@ istesso peers list        # 権限も表示する
 **動かし方。** どちらの側も、SSH のログインにも、作業中のセッションにも頼らない形で起動します。
 
 ```sh
-# ホスト。tmux の中で動かすので、SSH が切れても止まらない。
-tmux new-session -d -s m2-audio-8h \
-  'istesso audio serve --source pipewire --bind <有線のアドレス> --port 47822 --seconds 29100 \
-     --ledger sent.txt --stop-file stop --node-name istesso-audio-test \
-     --node-description "Istesso audio test" --node-property device.routes=1 > serve.json 2> serve.log'
-# 8 時間 6 分ぶんの正弦波のファイルを pw-cat で流し、仮想の出力先に手でつなぐ（短いテストと同じ）。
+# ホスト。tmux の中で動かすので、SSH が切れても止まらない。作業用の場所で、次の 4 つを順に実行するスクリプトを動かす。
+tmux new-session -d -s m2-audio-run 'bash <スクリプト>'
+#   1. 音源
+istesso audio serve --source pipewire --bind <有線のアドレス> --port 47822 --seconds 28890 \
+    --ledger sent.txt --stop-file stop --node-name istesso-audio-test \
+    --node-description "Istesso audio test" --node-property device.routes=1 > serve.json 2> serve.log &
+#   2. テストの正弦波（プログラムが作る。どこにも自動ではつながらない）
+istesso audio test-tone --seconds 28880 --node-property device.routes=1 --stop-file stop &
+#   3. 仮想の出力先に、手でつなぐ
+pw-link istesso-audio-test-tone:capture_FL istesso-audio-test:playback_FL
+pw-link istesso-audio-test-tone:capture_FR istesso-audio-test:playback_FR
+#   4. 2 つが終わるのを待ち、前後の音の設定を比べる
 
 # Mac。テスト用の .app として起動する。端末やセッションの子ではないので、それらが終わっても止まらない。
 open -n -g IstessoAudioTest.app --env ISTESSO_CONFIG_DIR=<作業用の場所> --stderr play.log --args \
@@ -344,9 +351,11 @@ open -n -g IstessoAudioTest.app --env ISTESSO_CONFIG_DIR=<作業用の場所> --
 ```
 
 - `--keep-awake` は、再生のあいだ、Mac が自分から眠るのを止めます。ふたを閉じたときと、電池が切れたときは止められないので、Mac は開いたまま、電源につないでおきます。
-- 途中でやめるとき：Mac では、`--stop-file` に指定したファイルを作ります（`touch stop`）。そこまでの結果が書き出されます。ホストでも、同じファイルを作るか、`tmux kill-session -t m2-audio-8h` を実行します。
+- 途中でやめるとき：Mac では、`--stop-file` に指定したファイルを作ります（`touch stop`）。そこまでの結果が書き出されます。ホストでも、同じ名前のファイルを作ります（`tmux kill-session -t m2-audio-run` でも止まりますが、送った側の記録は書き出されません）。
+- 映像の計測が始まったとき（合図のファイルが busy になったとき）は、同じやり方で両方を止めます。
 - Mac が眠ったとき、有線の接続が切れたとき：再生は終わり、確認は不合格になります。切れたあとのつなぎ直しは、まだ作っていません。いつ切れたかは、1 秒ごとの記録でわかります。
-- 待ち時間の目標は 40 ms（既定の値）を勧めます。短い計測では、いちばん遅れたパケットの遅れは 5 ms 以内で、使える分（約 12 ms）に収まっていました。8 時間のあいだに、それより長い停止があれば、途切れとして数えられ、いちばん長い遅れが記録に残ります。余裕を見て始めるなら、60 ms（遅れてよい分は約 32 ms）です。
+- 待ち時間の目標：10 分の予行（[記録](measurements/2026-11-16-m2-step5-rehearsal.md)）では、40 ms で途切れなかったが、ホストの取り込みが 1 度 5 ms 遅れたときに、余裕は 4 ms しか残らなかった。ホストの優先度を変えないまま 8 時間を通すなら、60 ms（遅れてよい分は約 32 ms）を勧める。40 ms で通すなら、先に、ホストの優先度の効果を確かめる。
+- 8 時間の確認の前に、2 台の時計の差を、動かしているあいだに測り直すようにする（いまは始めに 1 度だけ測るので、長い計測では、遅延の値がずれていく）。
 
 **記録するもの。**
 
