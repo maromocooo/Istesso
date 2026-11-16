@@ -20,8 +20,10 @@ impl Session {
     /// Runs the handshake on a freshly accepted connection.
     ///
     /// Fails with [`Error::UnknownPeer`] when the caller is not in `peers`;
-    /// the caller is told that it is not trusted. `timeout` bounds each wait
-    /// for the other device, during the handshake and afterwards.
+    /// the caller is told that it is not trusted. The whole handshake has to
+    /// be over within `timeout`, however slowly the caller sends: until then
+    /// it could be anyone. Afterwards `timeout` bounds each wait for the
+    /// other device.
     pub fn accept(
         stream: TcpStream,
         keys: &LocalKeys,
@@ -29,14 +31,10 @@ impl Session {
         timeout: Duration,
     ) -> Result<Self> {
         let remote = stream.peer_addr().map_err(Error::from_io)?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|_| stream.set_write_timeout(Some(timeout)))
-            .and_then(|_| stream.set_nodelay(true))
-            .map_err(Error::from_io)?;
+        stream.set_nodelay(true).map_err(Error::from_io)?;
 
         let mut found: Option<Peer> = None;
-        let channel = Channel::respond(stream, keys, |key| {
+        let channel = Channel::respond_within(stream, keys, timeout, timeout, |key| {
             found = peers.find_by_key(key).cloned();
             found.is_some()
         })?;
@@ -158,6 +156,52 @@ mod tests {
         drop(client);
 
         assert_eq!(host.join().unwrap().unwrap(), "MacBook Air");
+    }
+
+    /// Someone who is not paired, or is nobody at all, must not be able to
+    /// keep a connection open by sending a byte now and then: the handshake
+    /// as a whole has a time limit, not each wait within it.
+    #[test]
+    fn a_caller_that_sends_a_byte_at_a_time_is_cut_off_when_the_time_is_up() {
+        use std::io::Write;
+        use std::time::Instant;
+
+        let studio = Identity::generate();
+        let studio_trusts = TempStore::trusting(&[]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let slow = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            // The version, then the length of the largest handshake message,
+            // then its bytes one by one, each well inside the wait.
+            if stream.write_all(b"ISC1").is_err() || stream.write_all(&[0x02, 0x00]).is_err() {
+                return;
+            }
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(40));
+                if stream.write_all(&[0]).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let keys = LocalKeys::new(&studio).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let began = Instant::now();
+        let result = Session::accept(
+            stream,
+            &keys,
+            &studio_trusts.store,
+            Duration::from_millis(300),
+        );
+        let took = began.elapsed();
+        assert!(matches!(result, Err(Error::Timeout)), "{:?}", result.err());
+        assert!(
+            took < Duration::from_millis(900),
+            "the caller was heard for {took:?}"
+        );
+        slow.join().unwrap();
     }
 
     #[test]
