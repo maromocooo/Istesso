@@ -183,6 +183,12 @@ enum MeasureAction {
         /// difference in refreshes
         #[arg(long, value_name = "HZ")]
         refresh_hz: Option<f64>,
+        /// Also show the run cut into this many parts of equal length, in
+        /// the order the inputs were sent: both windows answer every input
+        /// at the same moment, and the parts show whether either of them
+        /// drifted while the run lasted
+        #[arg(long, value_name = "COUNT", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=100), requires = "relayed_app")]
+        parts: u64,
         /// Print the comparison as JSON
         #[arg(long)]
         json: bool,
@@ -422,6 +428,73 @@ fn run(cli: Cli) -> Result<(), String> {
             ),
         },
     }
+}
+
+/// The comparison of a run, cut into parts of equal length in the order the
+/// inputs were sent. Every input goes to both windows at the same moment, so
+/// each part compares the two windows over the same stretch of time.
+fn in_parts(
+    local: &[istesso_measure::ClientSample],
+    relayed: &[istesso_measure::ClientSample],
+    local_app: Option<&[istesso_measure::HostSample]>,
+    relayed_app: Option<&[istesso_measure::HostSample]>,
+    parts: u64,
+) -> String {
+    use std::fmt::Write;
+
+    let inputs = local
+        .iter()
+        .chain(relayed)
+        .map(|sample| sample.id + 1)
+        .max()
+        .unwrap_or(0);
+    let mut out = String::from(
+        "\nThe run in parts, in the order the inputs were sent (added latency, milliseconds)\n",
+    );
+    let _ = writeln!(
+        out,
+        "{:<16}{:>8}{:>14}{:>16}{:>12}{:>9}",
+        "inputs", "shown", "local median", "relayed median", "difference", "95%"
+    );
+    for part in 0..parts {
+        let (from, to) = (inputs * part / parts, inputs * (part + 1) / parts);
+        let within = |samples: &[istesso_measure::ClientSample]| -> Vec<_> {
+            samples
+                .iter()
+                .filter(|sample| (from..to).contains(&sample.id))
+                .cloned()
+                .collect()
+        };
+        let comparison = Comparison::build(
+            &within(local),
+            &within(relayed),
+            local_app,
+            relayed_app,
+            None,
+        );
+        let label = format!("{from} to {}", to.saturating_sub(1));
+        match (
+            &comparison.local_added,
+            &comparison.relayed_added,
+            &comparison.gap,
+        ) {
+            (Some(local), Some(relayed), Some(gap)) => {
+                let _ = writeln!(
+                    out,
+                    "{label:<16}{:>8}{:>14.2}{:>16.2}{:>12.2}{:>9.2}",
+                    comparison.paired,
+                    local.median_ms,
+                    relayed.median_ms,
+                    gap.median_ms,
+                    gap.p95_ms
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "{label:<16}{:>8}  (too few inputs)", comparison.paired);
+            }
+        }
+    }
+    out
 }
 
 /// Takes input events from a local socket and sends them to a paired device.
@@ -1464,6 +1537,7 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
             relayed_inputs,
             local_usual,
             refresh_hz,
+            parts,
             json,
         } => {
             let local = istesso_measure::client_samples(&read_measurement_log(&local)?);
@@ -1495,6 +1569,18 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
                 print_json(&comparison)
             } else {
                 print!("{}", comparison.render());
+                if parts > 1 {
+                    print!(
+                        "{}",
+                        in_parts(
+                            &local,
+                            &relayed,
+                            local_app.as_deref(),
+                            relayed_app.as_deref(),
+                            parts
+                        )
+                    );
+                }
                 Ok(())
             }
         }

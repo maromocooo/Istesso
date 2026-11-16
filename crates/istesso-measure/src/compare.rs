@@ -38,6 +38,31 @@ pub const PASS_LINE: Gap = Gap {
 /// its 95th percentile: the 99th percentile of 500 inputs rests on five.
 pub const VERDICT_SAMPLES: usize = 2000;
 
+/// A median this close to the pass line, on either side, is recorded as on
+/// the border: neither passed nor failed. 2,000 inputs leave the median of
+/// the difference uncertain by about this much, and how such a result is
+/// read was settled before it was measured (ADR 0002, 2026-11-16).
+pub const MEDIAN_BORDER_MS: f64 = 0.4;
+
+/// How one figure of a run stands against the pass line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    Within,
+    /// For the median only: too close to the line to call.
+    Border,
+    Over,
+}
+
+impl Standing {
+    fn label(self) -> &'static str {
+        match self {
+            Standing::Within => "within",
+            Standing::Border => "border",
+            Standing::Over => "over",
+        }
+    }
+}
+
 /// A run whose local window is this far or further from its usual median
 /// added latency is measured again: the figure the pass line is about moves
 /// with the local window as much as with the relayed one.
@@ -64,6 +89,20 @@ impl Gap {
     /// Whether every one of the three figures is at or below the line's.
     pub fn within(&self, line: &Gap) -> bool {
         self.median_ms <= line.median_ms && self.p95_ms <= line.p95_ms && self.p99_ms <= line.p99_ms
+    }
+
+    /// How the median stands against the line's: on the border when it is
+    /// within [`MEDIAN_BORDER_MS`] of it on either side.
+    pub fn median_standing(&self, line: &Gap) -> Standing {
+        // A hundredth of a microsecond of slack: the border's ends, 11.6 and 12.4 for a line
+        // of 12, are part of it, and neither is a binary fraction.
+        if (self.median_ms - line.median_ms).abs() <= MEDIAN_BORDER_MS + 1e-8 {
+            Standing::Border
+        } else if self.median_ms <= line.median_ms {
+            Standing::Within
+        } else {
+            Standing::Over
+        }
     }
 }
 
@@ -286,6 +325,7 @@ impl Comparison {
             Some(gap) => {
                 let verdict =
                     |value: f64, limit: f64| if value <= limit { "within" } else { "over" };
+                let median = gap.median_standing(&PASS_LINE);
                 out.push_str(
                     "Relayed over local, percentile by percentile (what the pass line is about)\n",
                 );
@@ -309,7 +349,7 @@ impl Comparison {
                     out,
                     "{:<LABEL$}{:>9}{:>9}{:>9}",
                     "",
-                    verdict(gap.median_ms, PASS_LINE.median_ms),
+                    median.label(),
                     verdict(gap.p95_ms, PASS_LINE.p95_ms),
                     if enough {
                         verdict(gap.p99_ms, PASS_LINE.p99_ms)
@@ -317,6 +357,13 @@ impl Comparison {
                         "-"
                     }
                 );
+                if median == Standing::Border {
+                    let _ = writeln!(
+                        out,
+                        "The median is within {MEDIAN_BORDER_MS} ms of the line: it is recorded as on the border, \
+                         neither passed nor failed. That much is the uncertainty of {VERDICT_SAMPLES} inputs."
+                    );
+                }
                 if !enough {
                     let _ = writeln!(
                         out,
@@ -472,6 +519,27 @@ mod tests {
             p99_ms: 47.0,
         };
         assert!(on_the_line.within(&PASS_LINE));
+        // The median alone has a border of 0.4 ms on either side of its line.
+        let median = |median_ms| Gap {
+            median_ms,
+            p95_ms: 1.0,
+            p99_ms: 1.0,
+        };
+        for (value, standing) in [
+            (11.14, Standing::Within),
+            (11.59, Standing::Within),
+            (11.6, Standing::Border),
+            (12.0, Standing::Border),
+            (12.4, Standing::Border),
+            (12.41, Standing::Over),
+            (23.0, Standing::Over),
+        ] {
+            assert_eq!(
+                median(value).median_standing(&PASS_LINE),
+                standing,
+                "{value}"
+            );
+        }
         for over in [
             Gap {
                 median_ms: 12.1,
