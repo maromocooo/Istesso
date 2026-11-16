@@ -5,8 +5,8 @@
 # Run on the client, from a checkout of this branch that has been built (cargo build -p
 # istesso-cli). The host needs the same checkout, built, in $M3_HOST_DIR/src. The two machines
 # have to be paired. Nothing of either machine's own setup is changed: the host gets a second
-# agent on its own port, with its own cache and its own list of two test applications, and the
-# client uses its own cache.
+# agent on its own port, with its own cache, its own sockets and its own list of two test
+# applications, and the client uses its own cache. The host is taken to be a Linux machine.
 #
 #   M3_SSH=<ssh destination of the host>            required
 #   M3_ADDRESS=<address the client reaches it at>   required; an IPv6 address in brackets, a
@@ -16,9 +16,12 @@
 #   M3_HOST_DIR='$HOME/.cache/istesso-m3-wip'       on the host
 #   M3_WORK=<directory>                             for the client's files; made if missing
 #
-#   scripts/m3-trial.sh [leave] [unsaved] [lost] [broken]     (all four when none is named)
+#   scripts/m3-trial.sh [leave] [unsaved] [lost] [host] [nobody] [broken]
+#                                                   (all six when none is named)
 #
 # Every part takes well under a minute. The script ends with the number of checks that failed.
+# Taking a pairing away is not tried here, because that would change the list of paired
+# devices of a real machine; the automated tests do it with lists of their own.
 set -u
 
 : "${M3_SSH:?set M3_SSH to the ssh destination of the host}"
@@ -29,7 +32,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${M3_BIN:-$HERE/target/debug/istesso}
 WORK=${M3_WORK:-${TMPDIR:-/tmp}/istesso-m3-trial}
 VIEWER=$HERE/scripts/fake-viewer.sh
-[ $# -gt 0 ] || set -- leave unsaved lost broken
+[ $# -gt 0 ] || set -- leave unsaved lost host nobody broken
 
 mkdir -p "$WORK"
 export ISTESSO_CACHE_DIR="$WORK/cache"
@@ -53,20 +56,40 @@ wait_for() {  # file, text, seconds
         sleep 0.2
     done
 }
-app_runs() {  # name of the note the application writes on the host
-    on_host 'pid=$(sed -n "1s/^started \([0-9]*\).*/\1/p" $D/notes/'"$1"' 2>/dev/null); [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null'
+app_runs() {  # name of the note the application writes on the host; the one started last counts
+    on_host 'pid=$(sed -n "s/^started \([0-9]*\).*/\1/p" $D/notes/'"$1"' 2>/dev/null | tail -1); [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null'
 }
 app_gone() { ! app_runs "$1"; }
 nothing_listed() { sessions | grep -q "No application"; }
 sessions() { "$BIN" sessions 2>/dev/null; }
 session_of() { sessions | awk -v app="$1" 'index($0, app) { print $1; exit }'; }
-start_agent() {  # extra environment for the agent, if any
+agent=none
+agent_as() {  # plain, broken or bare: has the trial agent run that way
+    [ "$agent" = "$1" ] && return 0
+    case $1 in
+    plain) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run' ;;
+    # Its runner gives up three seconds after it started.
+    broken) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run ISTESSO_FAKE_RUNNER_FAIL_AFTER=3' ;;
+    # What a machine offers that was switched on a moment ago and that nobody has logged in
+    # at: no runtime directory, no display, no session bus.
+    bare) how='env -i HOME=$HOME PATH=/usr/bin:/bin XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache' ;;
+    *) return 1 ;;
+    esac
     on_host 'cd $D && { [ -f agent.pid ] && kill "$(cat agent.pid)" 2>/dev/null; sleep 0.3; : > agent.log; : > notes/saved; : > notes/unsaved;
-        XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache '"$*"' nohup src/target/debug/istesso agent --port '"$PORT"' --bind :: \
+        '"$how"' nohup src/target/debug/istesso agent --port '"$PORT"' --bind :: \
             --no-discovery --session-runner $D/src/scripts/fake-session-runner.sh > agent.log 2>&1 < /dev/null &
         echo $! > agent.pid
         for _ in 1 2 3 4 5 6 7 8 9 10; do grep -q "Answering paired devices" agent.log && break; sleep 0.3; done
-        grep -q "Answering paired devices" agent.log; }'
+        grep -q "Answering paired devices" agent.log; }' && agent=$1
+}
+host_cli() {  # plain or bare, then a command: runs it on the host, as the person there would from a login
+    case $1 in
+    plain) where='ISTESSO_RUNTIME_DIR=$D/run' ;;
+    # Left to find the agent by itself.
+    *) where= ;;
+    esac
+    shift
+    on_host 'ISTESSO_CACHE_DIR=$D/cache '"$where"' $D/src/target/debug/istesso '"$*"
 }
 
 echo "== setting up =="
@@ -75,7 +98,7 @@ echo "== setting up =="
 on_host 'mkdir -p $D/data/applications $D/cache $D/notes && cd $D &&
     printf "[Desktop Entry]\nType=Application\nName=Istesso M3 Saved\nExec=%s --note %s 600\n" $D/src/scripts/fake-application.sh $D/notes/saved > data/applications/istesso-m3-saved.desktop &&
     printf "[Desktop Entry]\nType=Application\nName=Istesso M3 Unsaved\nExec=%s --unsaved --note %s 600\n" $D/src/scripts/fake-application.sh $D/notes/unsaved > data/applications/istesso-m3-unsaved.desktop'
-check "the host's trial agent answers on port $PORT" start_agent
+check "the host's trial agent answers on port $PORT" agent_as plain
 HOST_ID=$(on_host '$D/src/target/debug/istesso id' | awk '/^Fingerprint/ { print $2 }')
 "$BIN" peers address "$HOST_ID" "$M3_ADDRESS:$PORT" > /dev/null
 # Which way the packets go: asked of this machine's routing table.
@@ -113,6 +136,7 @@ for part in "$@"; do
     case $part in
     leave)
         echo "== leaving a window and coming back to it; closing it =="
+        agent_as plain
         "$BIN" open "istesso m3 saved" --viewer "$VIEWER" > "$WORK/leave-1.txt" 2>&1 &
         cli=$!
         check "the application starts and is shown" wait_for "$WORK/leave-1.txt" "is running on" 20
@@ -137,6 +161,7 @@ for part in "$@"; do
         ;;
     unsaved)
         echo "== an application with unsaved work =="
+        agent_as plain
         ISTESSO_FAKE_VIEWER_CLOSE_AFTER=1 "$BIN" open "istesso m3 unsaved" --viewer "$VIEWER" > "$WORK/unsaved-1.txt" 2>&1 &
         cli=$!
         check "the application starts and is shown" wait_for "$WORK/unsaved-1.txt" "is running on" 20
@@ -159,6 +184,7 @@ for part in "$@"; do
         ;;
     lost)
         echo "== a client that vanishes (takes 20 seconds) =="
+        agent_as plain
         "$BIN" open "istesso m3 saved" --viewer "$VIEWER" > "$WORK/lost-1.txt" 2>&1 &
         cli=$!
         check "the application starts and is shown" wait_for "$WORK/lost-1.txt" "is running on" 20
@@ -176,9 +202,45 @@ for part in "$@"; do
         "$BIN" sessions stop "$id" > "$WORK/lost-stop.txt" 2>&1
         check "asked to close, it ends" said "$WORK/lost-stop.txt" "Istesso M3 Saved ended on"
         ;;
+    host)
+        echo "== the person at the host sees and ends what a device started =="
+        agent_as plain
+        "$BIN" open "istesso m3 unsaved" --viewer "$VIEWER" > "$WORK/host-1.txt" 2>&1 &
+        cli=$!
+        check "the application starts and is shown" wait_for "$WORK/host-1.txt" "is running on" 20
+        kill -INT $cli
+        wait $cli
+        host_cli plain sessions --local > "$WORK/host-list.txt" 2>&1
+        check "on the host, the list of every session has it" said "$WORK/host-list.txt" "Istesso M3 Unsaved.*running, not shown"
+        check "the socket that list is asked on is the user's alone" on_host '[ "$(ls -ld $D/run | cut -c1-10)" = drwx------ ] && [ "$(ls -l $D/run/agent.sock | cut -c1-10)" = srw------- ]'
+        id=$(awk '/Istesso M3 Unsaved/ { print $1; exit }' "$WORK/host-list.txt")
+        host_cli plain sessions stop "$id" --local > "$WORK/host-stop.txt" 2>&1
+        check "asked to close from the host, the application with unsaved work stays" said "$WORK/host-stop.txt" "is still running"
+        check "the application is still running on the host" app_runs unsaved
+        host_cli plain sessions stop "$id" --local --force > "$WORK/host-force.txt" 2>&1
+        check "ended from the host, it is over" said "$WORK/host-force.txt" "Istesso M3 Unsaved was ended"
+        check "the application is gone from the host" app_gone unsaved
+        check "the device that started it has nothing listed any more" nothing_listed
+        ;;
+    nobody)
+        echo "== a host nobody is logged in at: no runtime directory, no desktop =="
+        check "the trial agent starts in an empty environment" agent_as bare
+        "$BIN" open "istesso m3 saved" --viewer "$VIEWER" > "$WORK/nobody-1.txt" 2>&1 &
+        cli=$!
+        check "the application starts and is shown" wait_for "$WORK/nobody-1.txt" "is running on" 20
+        check "it runs without a runtime directory, a display or a session bus" on_host 'pid=$(sed -n "s/^started \([0-9]*\).*/\1/p" $D/notes/saved | tail -1); [ -n "$pid" ] && ! tr "\0" "\n" < /proc/$pid/environ | grep -q -E "^(XDG_RUNTIME_DIR|DISPLAY|WAYLAND_DISPLAY|DBUS_SESSION_BUS_ADDRESS)="'
+        check "the agent put its socket next to its cache" on_host '[ -S $D/cache/run/agent.sock ]'
+        host_cli bare sessions --local > "$WORK/nobody-list.txt" 2>&1
+        check "asked from a login, which has a runtime directory, the agent is found" said "$WORK/nobody-list.txt" "Istesso M3 Saved.*shown in a window"
+        kill -INT $cli
+        wait $cli
+        id=$(session_of "Istesso M3 Saved")
+        "$BIN" sessions stop "$id" > "$WORK/nobody-stop.txt" 2>&1
+        check "asked to close, the application ends" said "$WORK/nobody-stop.txt" "Istesso M3 Saved ended on"
+        ;;
     broken)
         echo "== the host's side of the stream breaks =="
-        check "the trial agent starts again, with a runner that fails after 3 seconds" start_agent ISTESSO_FAKE_RUNNER_FAIL_AFTER=3
+        check "the trial agent starts again, with a runner that fails after 3 seconds" agent_as broken
         "$BIN" open "istesso m3 saved" --viewer "$VIEWER" > "$WORK/broken-1.txt" 2>&1
         check "the command ends with an error" [ $? -ne 0 ]
         check "it says that the host's side of the stream ended" said "$WORK/broken-1.txt" "the host's side of the stream ended"
