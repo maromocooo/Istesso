@@ -176,6 +176,14 @@ def main():
     missing = [l for l in client if l.get("kind") == "gap"]
     if not channel:
         print(f"  client: packets were found missing {len(missing)} times")
+    told = [l for l in host if l.get("kind") == "cursor"]
+    if header.get("cursor") == "told" or told:
+        # The cursor is left out of the picture and told to the viewer, which draws it itself.
+        shapes = collections.Counter(l.get("shape") for l in told)
+        drawn = [l for l in client if l.get("kind") == "cursor"]
+        print(f"  cursor: the compositor reported it {len(told)} times ({', '.join(f'{n} {shape}' for shape, n in sorted(shapes.items()))}), "
+              f"{sum(1 for l in told if not l.get('accepted', 1))} of them refused by the library; the viewer was told {len(drawn)} times "
+              f"(it is told the latest only, at most once in a frame's interval)")
     events = [l for l in client if l.get("kind") == "stream"]
     decoded_times = [f["decoded"] for f in pictures]
     for event in events:
