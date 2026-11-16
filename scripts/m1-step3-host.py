@@ -9,6 +9,12 @@ and writes one line per frame at three places:
     encoded     the encoded frame left the encoder; with its size
     sent        its packets were handed to the network; with their RTP timestamp
 
+With --key-requests it makes a key frame whenever the client reports a lost picture (an RTCP
+picture loss indication, RFC 4585, sent to the port after the stream's), and writes a
+"key_request" line. With --gop -1 these are then the only key frames after the first. The
+signal USR1 asks for one as well: for a client that started after the first key frame had
+gone by and cannot ask for itself.
+
 Times are nanoseconds on this machine's monotonic clock. "clock" lines pair that clock with
 the time of day, so that the log of the test application, which says at what time of day its
 own clock read zero, can be put on the same time line. scripts/m1-step3-breakdown.py joins the
@@ -21,13 +27,18 @@ its Python bindings, the NVIDIA elements and gst-wayland-display (GST_PLUGIN_PAT
 import argparse
 import os
 import signal
+import socket
 import sys
 import time
 
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib, Gst  # noqa: E402
+gi.require_version("GstVideo", "1.0")
+from gi.repository import GLib, Gst, GstVideo  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from m1_encoder import COLOURS, RAW_FORMATS, encoder, rate_buffer  # noqa: E402
 
 
 def main():
@@ -38,15 +49,30 @@ def main():
     parser.add_argument("--size", default="1720x720", metavar="WxH")
     parser.add_argument("--fps", type=int, default=85)
     parser.add_argument("--bitrate", type=int, default=30000, metavar="KBIT")
-    parser.add_argument("--gop", type=int, default=170, metavar="FRAMES")
+    parser.add_argument("--gop", type=int, default=170, metavar="FRAMES", help="frames from one key frame to the next; -1 for none but the first and those asked for")
     parser.add_argument(
         "--vbv",
-        type=int,
-        metavar="KBIT",
-        help="size of the encoder's rate-control buffer. The bit rate divided by the frame rate holds every "
-        "frame, key frames too, to about the size of an average one; without it a key frame of a busy "
+        metavar="frame|KBIT",
+        help="size of the encoder's rate-control buffer. `frame`, the bit rate divided by the frame rate, holds "
+        "every frame, key frames too, to about the size of an average one; without it a key frame of a busy "
         "picture can be twenty times that and arrive in hundreds of packets",
     )
+    parser.add_argument("--chroma", choices=sorted(RAW_FORMATS), default="420", help="how much colour the stream keeps: every fourth sample or all")
+    parser.add_argument("--preset", default="p1")
+    parser.add_argument(
+        "--colour",
+        choices=sorted(COLOURS),
+        default="srgb",
+        help="what the stream says about its colours: srgb, or default for what GStreamer picks when nothing is said "
+        "(BT.709 video; the measurements before 2026-11-16 17:00 were made that way)",
+    )
+    parser.add_argument(
+        "--key-requests",
+        action="store_true",
+        help="make a key frame when the client reports a lost picture, on the port after the stream's. Anyone on "
+        "the network can send such a report: for measurements only",
+    )
+    parser.add_argument("--lose", type=float, metavar="SECONDS", help="throw one frame's packets away every so many seconds, to see the client ask for a key frame")
     parser.add_argument(
         "--frames",
         choices=["memory", "cuda", "dmabuf"],
@@ -63,7 +89,7 @@ def main():
     width, height = int(width), int(height)
     node = f" render-node={args.render_node}" if args.render_node else ""
     size = f"width={width},height={height},framerate={args.fps}/1"
-    vbv = f" vbv-buffer-size={args.vbv}" if args.vbv else ""
+    vbv = rate_buffer(args.vbv, args.bitrate, args.fps)
     if args.frames == "cuda":
         frames = f"video/x-raw(memory:CUDAMemory),{size} ! "
     elif args.frames == "dmabuf":
@@ -75,17 +101,19 @@ def main():
         frames = f"video/x-raw,{size} ! cudaupload ! "
     description = (
         f"waylanddisplaysrc name=compositor{node} ! {frames}"
-        "cudaconvert ! video/x-raw(memory:CUDAMemory),format=NV12 ! "
-        "nvcudah265enc name=enc preset=p1 tune=ultra-low-latency zero-reorder-delay=true b-frames=0 "
-        f"rate-control=cbr bitrate={args.bitrate} gop-size={args.gop}{vbv} ! "
-        "h265parse config-interval=-1 ! rtph265pay config-interval=-1 mtu=1200 ! "
+        f"{encoder(args.bitrate, args.fps, args.gop, vbv, args.chroma, args.preset, args.colour)} ! "
+        "rtph265pay config-interval=-1 mtu=1200 ! "
         f"udpsink name=net host={address} port={int(port or 5004)} sync=false async=false"
     )
 
     Gst.init(None)
     pipeline = Gst.parse_launch(description)
     log = open(args.log, "x", buffering=1 << 20)
-    log.write('{"kind":"header","side":"host","tool":"m1-step3-host","version":"1","started_unix_ms":%d}\n' % (time.time_ns() // 1_000_000))
+    log.write(
+        '{"kind":"header","side":"host","tool":"m1-step3-host","version":"2","started_unix_ms":%d,'
+        '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s"}\n'
+        % (time.time_ns() // 1_000_000, width, height, args.fps, args.bitrate, args.gop, vbv or 0, args.chroma, args.colour, args.preset, args.frames)
+    )
 
     def clock_line():
         before = time.monotonic_ns()
@@ -120,6 +148,8 @@ def main():
         log.write('{"kind":"encoded","pts":%d,"t_ns":%d,"bytes":%d,"key":%d}\n' % (buffer.pts, now, buffer.get_size(), key))
         return Gst.PadProbeReturn.OK
 
+    lost = {"at": time.monotonic_ns()}
+
     def on_send(pad, info):
         now = time.monotonic_ns()
         if info.type & Gst.PadProbeType.BUFFER_LIST:
@@ -128,8 +158,41 @@ def main():
         else:
             first, count = info.get_buffer(), 1
         header = first.extract_dup(0, 12)
-        log.write('{"kind":"sent","pts":%d,"t_ns":%d,"rtp":%d,"packets":%d}\n' % (first.pts, now, int.from_bytes(header[4:8], "big"), count))
+        rtp = int.from_bytes(header[4:8], "big")
+        if args.lose and now - lost["at"] >= args.lose * 1e9:
+            lost["at"] = now
+            log.write('{"kind":"lost","pts":%d,"t_ns":%d,"rtp":%d,"packets":%d}\n' % (first.pts, now, rtp, count))
+            return Gst.PadProbeReturn.DROP
+        log.write('{"kind":"sent","pts":%d,"t_ns":%d,"rtp":%d,"packets":%d}\n' % (first.pts, now, rtp, count))
         return Gst.PadProbeReturn.OK
+
+    asked = {"at": 0, "count": 0}
+
+    def key_frame(by):
+        now = time.monotonic_ns()
+        # One key frame answers every report of the same loss.
+        made = now - asked["at"] >= 50_000_000
+        if made:
+            asked["at"] = now
+            asked["count"] += 1
+            pipeline.get_by_name("enc").get_static_pad("src").send_event(
+                GstVideo.video_event_new_upstream_force_key_unit(Gst.CLOCK_TIME_NONE, True, asked["count"])
+            )
+        log.write('{"kind":"key_request","t_ns":%d,"made":%d,"by":"%s"}\n' % (now, 1 if made else 0, by))
+
+    def on_report(fd, condition):
+        try:
+            report = requests.recv(64)
+        except OSError:
+            return True
+        # A picture loss indication: version 2, feedback type 1, payload-specific feedback (206).
+        if len(report) >= 12 and report[0] & 0xDF == 0x81 and report[1] == 206:
+            key_frame("client")
+        return True
+
+    def on_signal():
+        key_frame("signal")
+        return True
 
     def watch(name, pad_name, kinds, callback):
         pipeline.get_by_name(name).get_static_pad(pad_name).add_probe(kinds, callback)
@@ -166,8 +229,14 @@ def main():
         return False
 
     GLib.timeout_add(1000, every_second)
+    if args.key_requests:
+        requests = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        requests.bind(("", int(port or 5004) + 1))
+        requests.setblocking(False)
+        GLib.io_add_watch(requests.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_report)
     for number in (signal.SIGINT, signal.SIGTERM):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, number, stop)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, on_signal)
 
     clock_line()
     if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:

@@ -16,16 +16,19 @@
 //! This crate holds what every tool involved has to share: the clock
 //! ([`clock`]), the log format ([`record`]), the statistics ([`stats`]), the
 //! calculation ([`report`]), the spacing of inputs ([`jitter`]), the
-//! conventions of the test application ([`flash`]), a first measurement
-//! that needs no video ([`probe`]) and the comparison of a relayed window
-//! with a local one ([`compare`]). It depends on neither a window system nor
-//! a media library.
+//! conventions of the test application ([`flash`]) and its pictures
+//! ([`picture`]), a first measurement that needs no video ([`probe`]), the
+//! comparison of a relayed window with a local one ([`compare`]) and of a
+//! relayed picture with the one that was sent ([`quality`]). It depends on
+//! neither a window system nor a media library.
 
 pub mod clock;
 pub mod compare;
 pub mod flash;
 pub mod jitter;
+pub mod picture;
 pub mod probe;
+pub mod quality;
 pub mod record;
 pub mod report;
 pub mod stats;

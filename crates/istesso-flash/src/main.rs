@@ -87,6 +87,12 @@ struct Args {
     #[arg(long, value_name = "POINTS", default_value_t = 240)]
     scroll: u32,
 
+    /// Width of the text's strokes in pixels. Two points unless given, text
+    /// of an everyday size; 1 is the hardest case for a relay that thins
+    /// out colour
+    #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u32).range(1..=16))]
+    stroke: Option<u32>,
+
     /// How often the moving text is redrawn, in frames per second. The
     /// refresh rate of the display when not given, or 60 where the display
     /// does not say
@@ -280,9 +286,12 @@ impl App {
         let mut fresh = false;
         let mut offset = 0;
         if self.args.picture == Picture::Text {
-            // A font pixel is two points wide: text of an everyday size.
+            // A font pixel is two points wide unless asked otherwise: text of an everyday size.
             let factor = window.scale_factor();
-            let scale = (2.0 * factor).round().max(1.0) as usize;
+            let scale = match self.args.stroke {
+                Some(pixels) => pixels as usize,
+                None => (2.0 * factor).round().max(1.0) as usize,
+            };
             if !self
                 .sheet
                 .as_ref()
@@ -689,6 +698,7 @@ mod tests {
         let args = Args::try_parse_from(["istesso-flash"]).unwrap();
         assert_eq!(args.picture, Picture::Text);
         assert_eq!((args.scroll, args.fps), (240, None));
+        assert_eq!(args.stroke, None);
         assert_eq!((args.draw, args.answer), (Draw::Cpu, None));
         let args = Args::try_parse_from(["istesso-flash", "--draw", "gpu", "--answer", "at-once"])
             .unwrap();
@@ -699,6 +709,9 @@ mod tests {
         assert_eq!(args.picture, Picture::Grey);
         let args = Args::try_parse_from(["istesso-flash", "--scroll", "0", "--fps", "85"]).unwrap();
         assert_eq!((args.scroll, args.fps), (0, Some(85)));
+        let args = Args::try_parse_from(["istesso-flash", "--stroke", "1"]).unwrap();
+        assert_eq!(args.stroke, Some(1));
+        assert!(Args::try_parse_from(["istesso-flash", "--stroke", "0"]).is_err());
         for wrong in [
             vec!["istesso-flash", "--picture", "video"],
             vec!["istesso-flash", "--fps", "0"],

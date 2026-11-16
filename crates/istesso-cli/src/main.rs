@@ -137,6 +137,38 @@ enum MeasureAction {
         #[arg(long)]
         json: bool,
     },
+    /// Write the frames the test application shows, as raw video
+    ///
+    /// The moving text of `istesso-flash`, frame after frame, as raw video
+    /// on standard output: four bytes a pixel (blue, green, red, unused).
+    /// Put an encoder and a decoder behind it and hand the result to
+    /// `istesso measure quality`.
+    Frames {
+        #[command(flatten)]
+        film: FilmArgs,
+        /// How many frames to write
+        #[arg(long, default_value_t = 255)]
+        count: u64,
+    },
+    /// Say how much of the test application's frames came through a codec
+    ///
+    /// Reads raw video (four bytes a pixel: blue, green, red, unused) from
+    /// standard input: what an encoder and a decoder made of the frames
+    /// of `istesso measure frames`. Makes those frames again, with the
+    /// same options, and compares frame by frame: the structural
+    /// similarity (SSIM) of the brightness and of the two colour
+    /// differences, and the signal-to-noise ratio of the brightness.
+    Quality {
+        #[command(flatten)]
+        film: FilmArgs,
+        /// Leave the first so many frames out of the figures: an encoder
+        /// needs a moment to settle after it starts
+        #[arg(long, value_name = "FRAMES", default_value_t = 0)]
+        skip: usize,
+        /// Print the result as JSON, with the figures of every frame
+        #[arg(long)]
+        json: bool,
+    },
     /// Send synthetic inputs to the test application and time its answers
     ///
     /// Measures the path of an input without any video: to the host,
@@ -1037,6 +1069,148 @@ fn render_hosts(views: &[HostView], now: u64) -> String {
 // measure
 // ---------------------------------------------------------------------------
 
+/// Which frames of the test application's moving text are meant.
+#[derive(clap::Args)]
+struct FilmArgs {
+    /// Size of a frame in pixels
+    #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = parse_frame_size)]
+    size: (usize, usize),
+    /// Frames a second the text is drawn at
+    #[arg(long, default_value_t = 85, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    fps: u32,
+    /// How fast the text moves, in rows a second
+    #[arg(long, default_value_t = 240)]
+    scroll: u32,
+    /// Size of a font pixel in pixels of the frame: 2 is what the test
+    /// application shows on a display that is not scaled, 1 gives letters
+    /// with strokes one pixel wide
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=16))]
+    scale: u32,
+    /// The shade in the middle switches every so many frames, as it does
+    /// when inputs arrive. 0 leaves it as it is
+    #[arg(long, value_name = "FRAMES", default_value_t = 36)]
+    toggle_every: u64,
+}
+
+impl FilmArgs {
+    fn film(&self) -> istesso_measure::quality::Film {
+        istesso_measure::quality::Film::new(
+            self.size.0,
+            self.size.1,
+            self.scale as usize,
+            self.fps,
+            self.scroll,
+            self.toggle_every,
+        )
+    }
+}
+
+fn parse_frame_size(text: &str) -> Result<(usize, usize), String> {
+    let parsed = text.split_once(['x', 'X']).and_then(|(width, height)| {
+        Some((width.parse::<usize>().ok()?, height.parse::<usize>().ok()?))
+    });
+    match parsed {
+        // Eight pixels each way is the smallest picture the comparison can look at.
+        Some((width, height)) if (8..=16384).contains(&width) && (8..=16384).contains(&height) => {
+            Ok((width, height))
+        }
+        _ => Err(format!(
+            "expected WIDTHxHEIGHT, for example 3440x1440, not {text:?}"
+        )),
+    }
+}
+
+/// Writes `count` frames of the film to standard output.
+fn write_frames(film: &istesso_measure::quality::Film, count: u64) -> Result<(), String> {
+    use std::io::{IsTerminal, Write};
+    let stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        return Err(
+            "this writes raw video: send it into a pipe or a file, not to the terminal".into(),
+        );
+    }
+    let mut out = stdout.lock();
+    let mut frame = vec![0u8; film.frame_len()];
+    for number in 0..count {
+        film.paint(number, &mut frame);
+        match out.write_all(&frame) {
+            Ok(()) => {}
+            // Whoever reads has had enough.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) => return Err(format!("cannot write a frame: {e}")),
+        }
+    }
+    out.flush()
+        .map_err(|e| format!("cannot write a frame: {e}"))
+}
+
+/// Reads frames from standard input and compares each with the film's frame
+/// of the same number. A few frames at a time are compared side by side.
+fn read_quality(
+    film: &istesso_measure::quality::Film,
+    width: usize,
+    height: usize,
+    skip: usize,
+) -> Result<istesso_measure::quality::Quality, String> {
+    use istesso_measure::quality::{FrameQuality, Quality};
+    use std::io::Read;
+    let mut input = std::io::stdin().lock();
+    let batch = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let mut per_frame = Vec::new();
+    let mut ended = false;
+    while !ended {
+        let mut received = Vec::with_capacity(batch);
+        while received.len() < batch {
+            let mut frame = vec![0u8; film.frame_len()];
+            let mut filled = 0;
+            while filled < frame.len() {
+                match input.read(&mut frame[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(format!("cannot read a frame: {e}")),
+                }
+            }
+            if filled < frame.len() {
+                if filled > 0 {
+                    return Err(format!(
+                        "the video ends in the middle of a frame ({filled} of {} bytes): is the size right?",
+                        frame.len()
+                    ));
+                }
+                ended = true;
+                break;
+            }
+            received.push(frame);
+        }
+        let first = per_frame.len() as u64;
+        let compared: Vec<FrameQuality> = std::thread::scope(|scope| {
+            let workers: Vec<_> = received
+                .iter()
+                .enumerate()
+                .map(|(i, frame)| {
+                    scope.spawn(move || {
+                        let mut sent = vec![0u8; film.frame_len()];
+                        film.paint(first + i as u64, &mut sent);
+                        FrameQuality::of(&sent, frame, width, height)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("comparing a frame does not panic"))
+                .collect()
+        });
+        per_frame.extend(compared);
+    }
+    if per_frame.is_empty() {
+        return Err("no video on standard input".into());
+    }
+    Ok(Quality::of(per_frame, skip, width, height))
+}
+
 fn run_measure(action: MeasureAction) -> Result<(), String> {
     match action {
         MeasureAction::Report { host, client, json } => {
@@ -1079,6 +1253,16 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
                 print_json(&comparison)
             } else {
                 print!("{}", comparison.render());
+                Ok(())
+            }
+        }
+        MeasureAction::Frames { film, count } => write_frames(&film.film(), count),
+        MeasureAction::Quality { film, skip, json } => {
+            let quality = read_quality(&film.film(), film.size.0, film.size.1, skip)?;
+            if json {
+                print_json(&quality)
+            } else {
+                print!("{}", quality.render());
                 Ok(())
             }
         }
@@ -1180,6 +1364,36 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn frame_sizes_are_width_by_height() {
+        assert_eq!(parse_frame_size("3440x1440"), Ok((3440, 1440)));
+        assert_eq!(parse_frame_size("8X8"), Ok((8, 8)));
+        for wrong in [
+            "", "3440", "3440x", "x1440", "7x8", "8x7", "0x0", "20000x8", "a×b",
+        ] {
+            assert!(parse_frame_size(wrong).is_err(), "{wrong:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn frames_and_quality_take_the_same_description_of_the_film() {
+        for command in ["frames", "quality"] {
+            let parsed = Cli::try_parse_from([
+                "istesso",
+                "measure",
+                command,
+                "--size",
+                "1720x720",
+                "--scale",
+                "1",
+                "--toggle-every",
+                "0",
+            ]);
+            assert!(parsed.is_ok(), "{command}");
+            assert!(Cli::try_parse_from(["istesso", "measure", command]).is_err());
+        }
     }
 
     #[test]
