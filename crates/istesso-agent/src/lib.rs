@@ -18,7 +18,7 @@ pub mod survey;
 
 pub use paths::Paths;
 pub use serve::{Agent, AgentOptions};
-pub use survey::{survey, HostView, SurveyOptions};
+pub use survey::{connect_peer, survey, HostView, SurveyOptions};
 
 #[cfg(test)]
 pub(crate) mod testing {

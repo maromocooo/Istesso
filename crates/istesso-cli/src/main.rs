@@ -13,8 +13,8 @@ use istesso_agent::{cache, survey, Agent, AgentOptions, HostView, Paths, SurveyO
 use istesso_measure::{Clock, Comparison, Jitter, ProbeSummary, Report};
 use istesso_pair::{tcp, Identity, PairCode, Peer, PeerStore};
 use istesso_proto::{
-    AppEntry, AppInstance, Badge, HostApps, HostManifest, HostRef, HostState, Launch, NetKind,
-    Role, UnifiedApp,
+    AppEntry, AppInstance, Badge, HostApps, HostManifest, HostRef, HostState, InputEvent, Launch,
+    NetKind, Role, UnifiedApp,
 };
 
 #[derive(Parser)]
@@ -82,6 +82,32 @@ enum Command {
     Measure {
         #[command(subcommand)]
         action: MeasureAction,
+    },
+    /// Pass keyboard and pointer input on to a paired device
+    Input {
+        #[command(subcommand)]
+        action: InputAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum InputAction {
+    /// Take input from a local socket and send it to a paired device
+    ///
+    /// The program that shows the device's application in a window writes
+    /// what the person does there to the socket: one event per datagram,
+    /// as JSON, for example {"kind":"key","code":30,"pressed":true}. This
+    /// command sends the events over the control channel, to the device
+    /// only, encrypted. The device has to run `istesso agent`, to show an
+    /// application that takes input, and to have given this device the
+    /// right to control it (it has by default after pairing).
+    Relay {
+        /// The paired device: its name or the beginning of its id
+        #[arg(long)]
+        to: String,
+        /// The socket to listen on; one left by an earlier run is replaced
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
     },
 }
 
@@ -358,7 +384,77 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Measure { action } => run_measure(action),
+        Command::Input { action } => match action {
+            InputAction::Relay { to, socket } => relay_input(&to, &socket),
+        },
     }
+}
+
+/// Takes input events from a local socket and sends them to a paired device.
+#[cfg(unix)]
+fn relay_input(to: &str, socket: &std::path::Path) -> Result<(), String> {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixDatagram;
+
+    let mut client = istesso_agent::connect_peer(&Paths::from_env(), to, Duration::from_secs(3))?;
+    client
+        .set_timeout(Duration::from_secs(5))
+        .and_then(|_| client.open_input())
+        .map_err(|e| format!("the device does not take input from here: {e}"))?;
+    // A socket left by an earlier run is in the way of a new one.
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot replace {}: {e}", socket.display())),
+    }
+    let listener = UnixDatagram::bind(socket)
+        .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
+    let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
+    println!(
+        "Input written to {} goes to the paired device.",
+        socket.display()
+    );
+
+    let mut buffer = [0u8; 2048];
+    let take = |events: &mut Vec<InputEvent>, datagram: &[u8]| {
+        let Ok(event) = serde_json::from_slice::<InputEvent>(datagram) else {
+            return;
+        };
+        // Of pointer positions in a row only the last one matters.
+        match (events.last_mut(), &event) {
+            (Some(last @ InputEvent::PointerAt { .. }), InputEvent::PointerAt { .. }) => {
+                *last = event;
+            }
+            _ => events.push(event),
+        }
+    };
+    loop {
+        let mut events = Vec::new();
+        // Wait for something to happen, but not for long: an empty message every two
+        // seconds tells the device that this end is still there.
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(failed)?;
+        match listener.recv(&mut buffer) {
+            Ok(length) => take(&mut events, &buffer[..length]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) => return Err(failed(e)),
+        }
+        // Whatever else has arrived meanwhile goes into the same message.
+        listener.set_nonblocking(true).map_err(failed)?;
+        while let Ok(length) = listener.recv(&mut buffer) {
+            take(&mut events, &buffer[..length]);
+        }
+        listener.set_nonblocking(false).map_err(failed)?;
+        client
+            .send_input(&events)
+            .map_err(|e| format!("the conversation with the device ended: {e}"))?;
+    }
+}
+
+#[cfg(not(unix))]
+fn relay_input(_to: &str, _socket: &std::path::Path) -> Result<(), String> {
+    Err("relaying input is not available on this system yet".into())
 }
 
 // ---------------------------------------------------------------------------

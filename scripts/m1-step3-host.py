@@ -20,11 +20,16 @@ the time of day, so that the log of the test application, which says at what tim
 own clock read zero, can be put on the same time line. scripts/m1-step3-breakdown.py joins the
 logs.
 
+With --input it also takes keyboard and pointer input for the application: `istesso agent`
+on this machine receives it from a paired device over the control channel and hands it over
+through a socket in the user's runtime directory, one JSON event per datagram.
+
 The stream is not encrypted: for measurements on a trusted network only. Needs GStreamer with
 its Python bindings, the NVIDIA elements and gst-wayland-display (GST_PLUGIN_PATH).
 """
 
 import argparse
+import json
 import os
 import signal
 import socket
@@ -77,6 +82,13 @@ def main():
         "the network can send such a report: for measurements only",
     )
     parser.add_argument("--lose", type=float, metavar="SECONDS", help="throw one frame's packets away every so many seconds, to see the client ask for a key frame")
+    parser.add_argument(
+        "--input",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pass keyboard and pointer input from `istesso agent` on to the application (the socket is "
+        "$XDG_RUNTIME_DIR/istesso/input.sock)",
+    )
     parser.add_argument(
         "--frames",
         choices=["memory", "cuda", "dmabuf"],
@@ -198,6 +210,38 @@ def main():
         key_frame("signal")
         return True
 
+    taken = {"count": 0}
+
+    def on_input(fd, condition):
+        # One event per datagram, as `istesso agent` passes them on (istesso_proto::InputEvent).
+        # The compositor takes them as events that travel up the pipeline from its source pad.
+        while True:
+            try:
+                event = json.loads(inputs.recv(2048))
+            except BlockingIOError:
+                return True
+            except (OSError, ValueError):
+                continue
+            kind = event.get("kind") if isinstance(event, dict) else None
+            try:
+                if kind == "key":
+                    text = "KeyboardKey, key=(uint)%d, pressed=(boolean)%s" % (int(event["code"]), "true" if event["pressed"] else "false")
+                elif kind == "pointer_at":
+                    text = "MouseMoveAbsolute, pointer_x=(double)%.1f, pointer_y=(double)%.1f" % (float(event["x"]), float(event["y"]))
+                elif kind == "button":
+                    text = "MouseButton, button=(uint)%d, pressed=(boolean)%s" % (int(event["code"]), "true" if event["pressed"] else "false")
+                elif kind == "scroll":
+                    text = "MouseAxis, x=(double)%.1f, y=(double)%.1f" % (float(event["dx"]), float(event["dy"]))
+                else:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            structure = Gst.Structure.new_from_string(text)
+            if isinstance(structure, tuple):
+                structure = structure[0]
+            source_pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+            taken["count"] += 1
+
     def watch(name, pad_name, kinds, callback):
         pipeline.get_by_name(name).get_static_pad(pad_name).add_probe(kinds, callback)
 
@@ -233,6 +277,17 @@ def main():
         return False
 
     GLib.timeout_add(1000, every_second)
+    if args.input:
+        source_pad = pipeline.get_by_name("compositor").get_static_pad("src")
+        directory = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache"), "istesso")
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        path = os.path.join(directory, "input.sock")
+        if os.path.exists(path):
+            os.unlink(path)  # left by an earlier run
+        inputs = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        inputs.bind(path)
+        inputs.setblocking(False)
+        GLib.io_add_watch(inputs.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_input)
     if args.key_requests:
         requests = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         requests.bind(("", int(port or 5004) + 1))
@@ -250,6 +305,8 @@ def main():
     loop.run()
     pipeline.set_state(Gst.State.NULL)
     clock_line()
+    if args.input:
+        log.write('{"kind":"input","events":%d}\n' % taken["count"])
     log.close()
     return 1 if failed else 0
 

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use istesso_link::{ErrorCode, LocalKeys, Request, Response, Session, DEFAULT_PORT};
 use istesso_pair::{Identity, PeerStore, Permission};
-use istesso_proto::{AppEntry, HostManifest};
+use istesso_proto::{AppEntry, HostManifest, InputEvent};
 
 use crate::cache;
 use crate::discovery::Discovery;
@@ -180,6 +180,40 @@ impl Agent {
     }
 }
 
+/// Where a paired device's keyboard and pointer input goes on this machine:
+/// to the program that shows it an application, through the socket that
+/// program listens on ([`Paths::input_socket`]).
+struct InputSink {
+    #[cfg(unix)]
+    socket: std::os::unix::net::UnixDatagram,
+}
+
+impl InputSink {
+    #[cfg(unix)]
+    fn open(path: &std::path::Path) -> std::io::Result<InputSink> {
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        socket.connect(path)?;
+        socket.set_nonblocking(true)?;
+        Ok(InputSink { socket })
+    }
+
+    #[cfg(not(unix))]
+    fn open(_path: &std::path::Path) -> std::io::Result<InputSink> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// One event, one datagram. A program that has gone away, or does not
+    /// keep up, loses input; the conversation goes on.
+    fn send(&self, event: &InputEvent) {
+        #[cfg(unix)]
+        if let Ok(bytes) = serde_json::to_vec(event) {
+            let _ = self.socket.send(&bytes);
+        }
+        #[cfg(not(unix))]
+        let _ = event;
+    }
+}
+
 impl Shared {
     fn handle(&self, stream: TcpStream) {
         // Read the list of paired devices for every caller: a pairing that
@@ -217,11 +251,33 @@ impl Shared {
             cache::suggest_address(&self.paths, &session.peer().id, &session.peer().name, &hint);
 
         let mut asked: Vec<&'static str> = Vec::new();
+        let mut input: Option<InputSink> = None;
         while let Ok(Some(request)) = session.next_request() {
-            let response = if session.allows(Permission::View) {
-                self.answer(&request, &mut asked)
-            } else {
-                Response::error(ErrorCode::Forbidden, "this device may not look at the host")
+            let response = match request {
+                Request::Input { events } => {
+                    // Passed on and not answered. Input that was not asked for first, or
+                    // that nothing takes any more, is dropped.
+                    if let Some(sink) = &input {
+                        events.iter().for_each(|event| sink.send(event));
+                    }
+                    continue;
+                }
+                Request::InputOpen if !session.allows(Permission::Control) => {
+                    Response::error(ErrorCode::Forbidden, "this device may not control the host")
+                }
+                Request::InputOpen => match InputSink::open(&self.paths.input_socket()) {
+                    Ok(sink) => {
+                        input = Some(sink);
+                        asked.push("input");
+                        Response::InputOpen
+                    }
+                    Err(_) => Response::error(
+                        ErrorCode::Internal,
+                        "nothing on this host takes input at the moment",
+                    ),
+                },
+                request if session.allows(Permission::View) => self.answer(&request, &mut asked),
+                _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
             if session.respond(&response).is_err() {
                 break;
@@ -255,6 +311,11 @@ impl Shared {
                     status: local_status(),
                 }
             }
+            // Handled where the connection is, before this is reached.
+            Request::InputOpen | Request::Input { .. } => Response::error(
+                ErrorCode::Unsupported,
+                "input is not answered like a question",
+            ),
         }
     }
 
@@ -336,6 +397,39 @@ mod tests {
         agent.shared.refresh_manifest();
         assert_ne!(agent.shared.manifest().name, "planted for this test");
         assert!(paths.local_manifest().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_reaches_whoever_listens_one_event_a_datagram() {
+        use std::os::unix::net::UnixDatagram;
+        let dir = TempDir::new("in");
+        let path = dir.paths().config.join("i.sock");
+        // Nobody listens: there is nothing to open.
+        assert!(InputSink::open(&path).is_err());
+
+        let listener = UnixDatagram::bind(&path).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sink = InputSink::open(&path).unwrap();
+        sink.send(&InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        sink.send(&InputEvent::PointerAt { x: 3, y: 4 });
+        let mut buffer = [0u8; 256];
+        let length = listener.recv(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..length],
+            br#"{"kind":"key","code":30,"pressed":true}"#
+        );
+        let length = listener.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], br#"{"kind":"pointer_at","x":3,"y":4}"#);
+
+        // The listener goes away: input is lost, nothing else happens.
+        drop(listener);
+        sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
     }
 
     #[test]

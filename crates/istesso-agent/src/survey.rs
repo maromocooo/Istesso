@@ -149,6 +149,29 @@ pub fn refresh_peers(paths: &Paths, options: &SurveyOptions) -> Result<Vec<HostV
     Ok(views.collect())
 }
 
+/// Opens a conversation with one paired device, named as for
+/// `istesso peers` (its name, or the beginning of its id). The addresses
+/// tried are those remembered for it; `istesso hosts` finds them.
+pub fn connect_peer(paths: &Paths, who: &str, timeout: Duration) -> Result<Client, String> {
+    let identity = Identity::load_or_create(&paths.identity()).map_err(|e| e.to_string())?;
+    let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| e.to_string())?);
+    let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| e.to_string())?);
+    let peer = peers
+        .find(who)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no paired device matches {who:?}"))?
+        .clone();
+    let candidates = cache::load(paths, &peer.id)
+        .map(|snapshot| snapshot.addresses)
+        .unwrap_or_default();
+    if candidates.is_empty() {
+        return Err("no address is known for this device yet: run `istesso hosts` once".into());
+    }
+    connect_any(candidates, keys, peers, &peer.id, timeout)
+        .map(|(client, _)| client)
+        .map_err(|e| e.to_string())
+}
+
 /// True when something accepts connections on the agent port of this
 /// machine.
 pub fn local_agent_running(port: u16) -> bool {
@@ -457,6 +480,7 @@ mod tests {
                         Request::Status => Response::Status {
                             status: HostStatus::default(),
                         },
+                        Request::InputOpen | Request::Input { .. } => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;
