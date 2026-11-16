@@ -37,6 +37,26 @@ mdns-sd = { version = "0.21", default-features = false }
 unicode-width = "0.2"
 zeroize = "1"
 
+# Audio (istesso-audio), kept as one block at the end of this table.
+istesso-audio = { path = "crates/istesso-audio" }
+# A resampler whose ratio can be moved while it runs. Only the sinc resampler is used, so the FFT
+# one and its dependencies stay out.
+rubato = { version = "4.0", default-features = false }
+audioadapter-buffers = "4.0"
+# Hands samples to and from the threads of the sound system without waiting.
+rtrb = "0.4"
+# Core Audio (macOS only): the output unit, and the clock its time stamps are in.
+coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_unit", "core_audio"] }
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "HostTime", "AudioHardware"] }
+
 [profile.release]
 lto = "thin"
 strip = true
+
+# The audio path does arithmetic on every sample. Unoptimised, the resampler cannot keep up with a
+# sound card, and the simulated-clock tests of the drift correction take minutes, not seconds.
+[profile.dev.package.istesso-audio]
+opt-level = 2
+
+[profile.dev.package.rubato]
+opt-level = 3
