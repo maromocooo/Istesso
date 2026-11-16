@@ -1,0 +1,1024 @@
+Leave the cursor out of the picture and tell the application what it looks like, so that
+whoever shows the picture somewhere else can draw the cursor itself, where its own pointer is.
+Off unless asked for.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch in this
+directory. The lines of context are from that project and from that patch.
+
+It is kept small and in a shape that can be proposed to that project
+(docs/adr/0009-host-compositor.md): the element `waylanddisplaysrc` gets a property,
+`cursor-messages`, that is off by default, and with it off nothing changes. The rules are in
+one new file with its tests, wayland-display-core/src/comp/cursor.rs, which also says why.
+
+What the mode does:
+
+- The cursor is not drawn into the frames. Moving the pointer then no longer changes the
+  picture, and in the "render on commit" mode no longer makes a frame go out.
+- Whenever the cursor changes, the element posts an application message on its bus, as it
+  does for its environment (`wayland.src`). The structure is called `wayland.cursor` and has
+  a `kind`:
+    "hidden"   the client under the pointer has hidden it
+    "named"    a cursor there is no image of, with its `name` ("default" before any client
+               has set one, and for an image that cannot be read)
+    "image"    with `width`, `height`, `hotspot-x`, `hotspot-y` (in pixels of the image),
+               `scale` (pixels of the image to one of the picture) and `image`, a buffer of
+               four bytes a pixel: red, green, blue, alpha, the colours multiplied by alpha
+  The first message comes when the property is set, with the cursor as it is then. A cursor
+  that is set again without having changed is not told again.
+- The image comes from a client and is treated as untrusted: it is read only from a
+  shared-memory buffer in one of the two formats every client has (ARGB8888, XRGB8888), only
+  when offset, stride and size fit the buffer's real length, only up to 256 pixels a side, and
+  only with its hot spot inside it. Anything else is told as "named", "default".
+- The core has `WaylandDisplay::set_cursor_sink` for callers that do not go through the
+  element.
+
+Tests (`cargo test -p wayland-display-core`): seven of the rules for reading an image and
+telling a change, and seven with a real Wayland client that sets a cursor, changes it, hides
+it, hands in one that is too large, and whose frames are looked at with and without the mode.
+
+Known limits:
+
+- A cursor whose image is a buffer on the GPU is told without its image.
+- The image is copied and compared on every commit to the cursor's surface. An animated
+  cursor makes a message per step.
+- Nothing is exposed through the C bindings yet.
+
+Apply and build, in a checkout that has the first patch applied:
+
+    git apply <this file>
+    cargo build --release -p gst-plugin-wayland-display -p wayland-display-core --features cuda
+
+diff --git a/wayland-display-core/src/comp/cursor.rs b/wayland-display-core/src/comp/cursor.rs
+new file mode 100644
+index 0000000..163e9ba
+--- /dev/null
++++ b/wayland-display-core/src/comp/cursor.rs
+@@ -0,0 +1,379 @@
++//! The cursor, told to whoever shows the picture instead of drawn into it.
++//!
++//! A picture that travels takes time to arrive, and a cursor that is part of it trails the
++//! hand by that time. Whoever shows the picture knows where its own pointer is at once, and
++//! can draw the cursor there itself, if it is told what the cursor looks like. With a sink
++//! set ([`CursorReport::set_sink`]) the compositor leaves the cursor out of its frames and
++//! tells the sink whenever the cursor changes: that a client has hidden it, that it has an
++//! image (size, hot spot, pixels), or that it is one the compositor has no image of. With no
++//! sink, which is how it starts, the cursor is drawn into the frames as before.
++//!
++//! The image comes from a client, and is treated as something a stranger handed in: it is
++//! read only when the buffer is as long as its own description says it has to be, and only up
++//! to [`MAX_SIDE`] pixels a side. Anything else is told as a cursor without an image.
++
++use smithay::backend::renderer::utils::with_renderer_surface_state;
++use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
++use smithay::reexports::wayland_server::Resource;
++use smithay::reexports::wayland_server::protocol::{wl_shm, wl_surface::WlSurface};
++use smithay::wayland::compositor::{SurfaceAttributes, with_states};
++use smithay::wayland::shm::with_buffer_contents;
++
++/// Most pixels a cursor's image may have along one side. Themes go up to 256.
++pub const MAX_SIDE: i32 = 256;
++/// Most buffer pixels to one pixel of the surface.
++const MAX_SCALE: i32 = 8;
++
++/// What the pointer's cursor is.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Cursor {
++    /// The client under the pointer has hidden it.
++    Hidden,
++    /// A cursor there is no image of: the one a pointer has before a client sets its own
++    /// ("default"), or an image that could not be read. Whoever shows the picture uses a
++    /// cursor of its own.
++    Named(String),
++    Image(CursorImage),
++}
++
++/// A cursor's image, as a client drew it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CursorImage {
++    /// Size in pixels of the image.
++    pub width: u32,
++    pub height: u32,
++    /// The pixel of the image that lies on the pointer's position, in pixels of the image.
++    pub hotspot_x: u32,
++    pub hotspot_y: u32,
++    /// Pixels of the image to one pixel of the picture.
++    pub scale: u32,
++    /// Four bytes a pixel, red, green, blue, alpha, the colours multiplied by alpha, rows
++    /// from the top, no padding.
++    pub rgba: Vec<u8>,
++}
++
++/// Receives the cursor whenever it changes. Called on the compositor's thread.
++pub type CursorSink = Box<dyn Fn(&Cursor) + Send>;
++
++/// Tells a sink about the cursor, and only when it is not what the sink was told last.
++#[derive(Default)]
++pub struct CursorReport {
++    sink: Option<CursorSink>,
++    last: Option<Cursor>,
++}
++
++impl CursorReport {
++    /// With a sink, the cursor is left out of the frames and told to the sink; with `None` it
++    /// is drawn into the frames again. A new sink is told the cursor as it is.
++    pub fn set_sink(&mut self, sink: Option<CursorSink>) {
++        self.sink = sink;
++        self.last = None;
++    }
++
++    /// Whether the cursor is told to a sink, and so not part of the frames.
++    pub fn outside_picture(&self) -> bool {
++        self.sink.is_some()
++    }
++
++    /// Tells the sink what the cursor is, unless that is what it was told last.
++    pub fn tell(&mut self, cursor: Cursor) {
++        let Some(sink) = &self.sink else {
++            return;
++        };
++        if self.last.as_ref() != Some(&cursor) {
++            sink(&cursor);
++            self.last = Some(cursor);
++        }
++    }
++}
++
++/// What a seat's cursor is, for a sink.
++pub fn describe(status: &CursorImageStatus) -> Cursor {
++    match status {
++        CursorImageStatus::Hidden => Cursor::Hidden,
++        CursorImageStatus::Named(icon) => Cursor::Named(icon.name().to_string()),
++        CursorImageStatus::Surface(surface) => {
++            from_surface(surface).unwrap_or_else(|| Cursor::Named("default".into()))
++        }
++    }
++}
++
++/// The image a client has attached to its cursor surface. `None` when there is none yet, or
++/// none that can be read: a buffer on the GPU, a format other than the two every client has,
++/// or numbers that do not fit together.
++fn from_surface(surface: &WlSurface) -> Option<Cursor> {
++    if !surface.is_alive() {
++        return None;
++    }
++    let (hotspot, scale) = with_states(surface, |states| {
++        let hotspot = states
++            .data_map
++            .get::<CursorImageSurfaceData>()
++            .map(|data| data.lock().unwrap().hotspot)
++            .unwrap_or_default();
++        let scale = states
++            .cached_state
++            .get::<SurfaceAttributes>()
++            .current()
++            .buffer_scale;
++        (hotspot, scale)
++    });
++    let buffer = with_renderer_surface_state(surface, |state| state.buffer().cloned())??;
++    with_buffer_contents(&buffer, |pool, len, data| {
++        // SAFETY: the pool is mapped, `len` bytes long, for as long as this closure runs.
++        let pool = unsafe { std::slice::from_raw_parts(pool, len) };
++        image_from_pixels(
++            pool,
++            Layout {
++                offset: data.offset,
++                width: data.width,
++                height: data.height,
++                stride: data.stride,
++                alpha: match data.format {
++                    wl_shm::Format::Argb8888 => Some(true),
++                    wl_shm::Format::Xrgb8888 => Some(false),
++                    _ => None,
++                },
++            },
++            (hotspot.x, hotspot.y),
++            scale,
++        )
++    })
++    .ok()?
++    .map(Cursor::Image)
++}
++
++/// How a client says its pixels lie in its memory: none of it is to be believed unchecked.
++#[derive(Debug, Clone, Copy)]
++pub(crate) struct Layout {
++    pub offset: i32,
++    pub width: i32,
++    pub height: i32,
++    pub stride: i32,
++    /// Whether the fourth byte of a pixel is its alpha (`Some(true)`), is to be ignored
++    /// (`Some(false)`), or the pixels are in a format this does not read (`None`).
++    pub alpha: Option<bool>,
++}
++
++/// Reads a cursor's image out of a client's memory. The pixels are four bytes each, blue,
++/// green, red and alpha or padding (the two formats every Wayland client can use). `hotspot`
++/// is in pixels of the surface, `scale` the buffer's pixels to one of the surface's.
++pub(crate) fn image_from_pixels(
++    pool: &[u8],
++    layout: Layout,
++    hotspot: (i32, i32),
++    scale: i32,
++) -> Option<CursorImage> {
++    let alpha = layout.alpha?;
++    if !(1..=MAX_SIDE).contains(&layout.width) || !(1..=MAX_SIDE).contains(&layout.height) {
++        return None;
++    }
++    if !(1..=MAX_SCALE).contains(&scale) || layout.offset < 0 {
++        return None;
++    }
++    let (width, height) = (layout.width as usize, layout.height as usize);
++    let (offset, stride) = (layout.offset as usize, usize::try_from(layout.stride).ok()?);
++    if stride < width * 4 {
++        return None;
++    }
++    // The last row need not be a whole stride long.
++    let end = offset
++        .checked_add(stride.checked_mul(height - 1)?)?
++        .checked_add(width * 4)?;
++    if end > pool.len() {
++        return None;
++    }
++    // The hot spot lies inside the image.
++    let hotspot_x = u32::try_from(hotspot.0.checked_mul(scale)?).ok()?;
++    let hotspot_y = u32::try_from(hotspot.1.checked_mul(scale)?).ok()?;
++    if hotspot_x >= layout.width as u32 || hotspot_y >= layout.height as u32 {
++        return None;
++    }
++    let mut rgba = Vec::with_capacity(width * height * 4);
++    for row in 0..height {
++        let begin = offset + row * stride;
++        for pixel in pool[begin..begin + width * 4].chunks_exact(4) {
++            rgba.extend_from_slice(&[
++                pixel[2],
++                pixel[1],
++                pixel[0],
++                if alpha { pixel[3] } else { 255 },
++            ]);
++        }
++    }
++    Some(CursorImage {
++        width: layout.width as u32,
++        height: layout.height as u32,
++        hotspot_x,
++        hotspot_y,
++        scale: scale as u32,
++        rgba,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::{Arc, Mutex};
++
++    fn layout(width: i32, height: i32) -> Layout {
++        Layout {
++            offset: 0,
++            width,
++            height,
++            stride: width.saturating_mul(4),
++            alpha: Some(true),
++        }
++    }
++
++    #[test]
++    fn pixels_are_read_row_by_row_and_turned_from_bgra_to_rgba() {
++        // Two rows of two pixels, behind eight bytes of something else, each row followed by
++        // four bytes of padding.
++        let mut pool = vec![0xEE; 8];
++        pool.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 0xEE, 0xEE, 0xEE, 0xEE]);
++        pool.extend_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
++        let image = image_from_pixels(
++            &pool,
++            Layout {
++                offset: 8,
++                width: 2,
++                height: 2,
++                stride: 12,
++                alpha: Some(true),
++            },
++            (1, 0),
++            1,
++        )
++        .unwrap();
++        assert_eq!((image.width, image.height, image.scale), (2, 2, 1));
++        assert_eq!((image.hotspot_x, image.hotspot_y), (1, 0));
++        assert_eq!(
++            image.rgba,
++            [3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16]
++        );
++    }
++
++    #[test]
++    fn a_format_without_alpha_is_opaque() {
++        let pool = [1, 2, 3, 0];
++        let image = image_from_pixels(
++            &pool,
++            Layout {
++                alpha: Some(false),
++                ..layout(1, 1)
++            },
++            (0, 0),
++            1,
++        )
++        .unwrap();
++        assert_eq!(image.rgba, [3, 2, 1, 255]);
++    }
++
++    #[test]
++    fn the_hot_spot_is_given_in_pixels_of_the_image() {
++        let pool = vec![0; 64 * 64 * 4];
++        let image = image_from_pixels(&pool, layout(64, 64), (5, 7), 2).unwrap();
++        assert_eq!((image.hotspot_x, image.hotspot_y, image.scale), (10, 14, 2));
++    }
++
++    #[test]
++    fn an_image_that_does_not_fit_its_own_description_is_not_read() {
++        let pool = vec![0; 16 * 16 * 4];
++        assert!(image_from_pixels(&pool, layout(16, 16), (0, 0), 1).is_some());
++        // One byte short of what the description needs.
++        assert!(image_from_pixels(&pool[..pool.len() - 1], layout(16, 16), (0, 0), 1).is_none());
++        // Begins so late that it runs over the end, or before the beginning.
++        for offset in [4, -4, i32::MAX] {
++            let moved = Layout {
++                offset,
++                ..layout(16, 16)
++            };
++            assert!(image_from_pixels(&pool, moved, (0, 0), 1).is_none());
++        }
++        // Rows shorter than their pixels, and rows so long that the image runs over the end.
++        for stride in [16 * 4 - 1, 16 * 4 + 4, 0, -64, i32::MAX] {
++            let rows = Layout {
++                stride,
++                ..layout(16, 16)
++            };
++            assert!(image_from_pixels(&pool, rows, (0, 0), 1).is_none());
++        }
++    }
++
++    #[test]
++    fn an_image_of_no_size_or_of_too_large_a_size_is_not_read() {
++        let pool = vec![0; 257 * 257 * 4];
++        assert!(image_from_pixels(&pool, layout(256, 256), (0, 0), 1).is_some());
++        for (width, height) in [
++            (0, 16),
++            (16, 0),
++            (-1, 16),
++            (257, 16),
++            (16, 257),
++            (i32::MAX, 2),
++        ] {
++            assert!(
++                image_from_pixels(&pool, layout(width, height), (0, 0), 1).is_none(),
++                "{width}x{height}"
++            );
++        }
++    }
++
++    #[test]
++    fn a_hot_spot_outside_the_image_a_strange_scale_or_format_are_not_accepted() {
++        let pool = vec![0; 16 * 16 * 4];
++        for hotspot in [(16, 0), (0, 16), (-1, 0), (0, -1), (i32::MAX, 0)] {
++            assert!(image_from_pixels(&pool, layout(16, 16), hotspot, 1).is_none());
++        }
++        // Inside the surface, outside the image once the scale is applied.
++        assert!(image_from_pixels(&pool, layout(16, 16), (8, 8), 2).is_none());
++        for scale in [0, -1, 9] {
++            assert!(image_from_pixels(&pool, layout(16, 16), (0, 0), scale).is_none());
++        }
++        let unknown = Layout {
++            alpha: None,
++            ..layout(16, 16)
++        };
++        assert!(image_from_pixels(&pool, unknown, (0, 0), 1).is_none());
++    }
++
++    #[test]
++    fn a_sink_is_told_a_change_once_and_a_new_sink_is_told_what_is() {
++        let told = Arc::new(Mutex::new(Vec::new()));
++        let sink = |told: &Arc<Mutex<Vec<Cursor>>>| -> CursorSink {
++            let told = told.clone();
++            Box::new(move |cursor| told.lock().unwrap().push(cursor.clone()))
++        };
++        let mut report = CursorReport::default();
++        // Nobody to tell: the cursor stays in the picture.
++        report.tell(Cursor::Hidden);
++        assert!(!report.outside_picture());
++
++        report.set_sink(Some(sink(&told)));
++        assert!(report.outside_picture());
++        report.tell(Cursor::Named("default".into()));
++        report.tell(Cursor::Named("default".into()));
++        report.tell(Cursor::Hidden);
++        report.tell(Cursor::Hidden);
++        report.tell(Cursor::Named("default".into()));
++        assert_eq!(
++            *told.lock().unwrap(),
++            [
++                Cursor::Named("default".into()),
++                Cursor::Hidden,
++                Cursor::Named("default".into())
++            ]
++        );
++        // Another sink has not heard any of it.
++        let other = Arc::new(Mutex::new(Vec::new()));
++        report.set_sink(Some(sink(&other)));
++        report.tell(Cursor::Named("default".into()));
++        assert_eq!(*other.lock().unwrap(), [Cursor::Named("default".into())]);
++
++        report.set_sink(None);
++        report.tell(Cursor::Hidden);
++        assert!(!report.outside_picture());
++        assert_eq!(other.lock().unwrap().len(), 1);
++    }
++}
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 9af5853..6a6a964 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -69,6 +69,7 @@ use std::{
+ };
+ use tracing::debug;
+ 
++pub(crate) mod cursor;
+ mod focus;
+ mod input;
+ pub(crate) mod pacing;
+@@ -128,6 +129,8 @@ pub struct State {
+     last_pointer_movement: Instant,
+     cursor_element: MemoryRenderBuffer,
+     pub cursor_state: CursorImageStatus,
++    /// Who is told about the cursor instead of the cursor being drawn into the frames.
++    pub(crate) cursor_report: cursor::CursorReport,
+     surpressed_keys: HashSet<u32>,
+     pub pending_windows: Vec<Window>,
+     input_context: Libinput,
+@@ -250,6 +253,7 @@ impl State {
+             last_pointer_movement: Instant::now(),
+             cursor_element,
+             cursor_state: CursorImageStatus::default_named(),
++            cursor_report: cursor::CursorReport::default(),
+             cursor_event_count: 0,
+             surpressed_keys: HashSet::new(),
+             pending_windows: Vec::new(),
+@@ -438,6 +442,25 @@ pub(crate) fn schedule_waiting_frame(state: &mut State, wait: Duration) {
+     }
+ }
+ 
++impl State {
++    /// Tells whoever draws the cursor outside the picture what the cursor is now, if that is
++    /// news. Called when a client sets its cursor, and when it commits to the surface that
++    /// is the cursor.
++    pub(crate) fn tell_cursor(&mut self) {
++        if self.cursor_report.outside_picture() {
++            let cursor = cursor::describe(&self.cursor_state);
++            self.cursor_report.tell(cursor);
++        }
++    }
++
++    /// Leaves the cursor out of the frames and tells `sink` about it instead, or, with
++    /// `None`, draws it into the frames again.
++    pub(crate) fn set_cursor_sink(&mut self, sink: Option<cursor::CursorSink>) {
++        self.cursor_report.set_sink(sink);
++        self.tell_cursor();
++    }
++}
++
+ /// Something that is part of the picture has changed: a client has committed, or the pointer
+ /// has moved. In the "render on commit" mode a frame that is waiting goes out now, or as soon
+ /// as the frame rate allows.
+@@ -447,6 +470,13 @@ pub(crate) fn picture_changed(state: &mut State) {
+     }
+ }
+ 
++/// The pointer has moved. That changes the picture only while the cursor is drawn into it.
++fn pointer_moved(state: &mut State) {
++    if !state.cursor_report.outside_picture() {
++        picture_changed(state);
++    }
++}
++
+ /// A client has committed. In the "render on commit" mode its picture goes out, and the
+ /// clients are told to draw their next frame on a beat of their own (see [`pacing`]): now, or
+ /// when a frame interval has passed since they were last told.
+@@ -671,6 +701,12 @@ pub(crate) fn init(
+                         };
+                     }
+                 }
++                Event::Msg(Command::CursorSink(sink)) => {
++                    tracing::info!(outside = sink.is_some(), "Cursor outside the picture.");
++                    state.set_cursor_sink(sink);
++                    // The picture has changed: the cursor has left it, or come back.
++                    picture_changed(state);
++                }
+                 Event::Msg(Command::RenderOnCommit(enabled)) => {
+                     tracing::info!(enabled, "Render on commit.");
+                     state.pacing.report();
+@@ -706,12 +742,12 @@ pub(crate) fn init(
+                         position,
+                         position,
+                     );
+-                    picture_changed(state);
++                    pointer_moved(state);
+                 }
+                 Event::Msg(Command::PointerMotionAbsolute(position)) => {
+                     let time: Duration = state.clock.now().into();
+                     state.pointer_motion_absolute(time.as_millis() as u32, position);
+-                    picture_changed(state);
++                    pointer_moved(state);
+                 }
+                 Event::Msg(Command::PointerButton(btn_code, btn_state)) => {
+                     let time: Duration = state.clock.now().into();
+diff --git a/wayland-display-core/src/comp/rendering.rs b/wayland-display-core/src/comp/rendering.rs
+index 237ba7c..22619ab 100644
+--- a/wayland-display-core/src/comp/rendering.rs
++++ b/wayland-display-core/src/comp/rendering.rs
+@@ -33,9 +33,12 @@ impl State {
+         assert!(self.video_info.is_some());
+         assert!(self.output_buffer.is_some());
+ 
+-        let elements =
+-            if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
+-                match &self.cursor_state {
++        // A cursor that somebody else draws is not part of the picture.
++        let elements = if self.cursor_report.outside_picture() {
++            vec![]
++        } else if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5)
++        {
++            match &self.cursor_state {
+                 CursorImageStatus::Named(_cursor_icon) => vec![CursorElement::Memory(
+                     // TODO: icon?
+                     MemoryRenderBufferRenderElement::from_buffer(
+@@ -61,9 +64,9 @@ impl State {
+                 }
+                 CursorImageStatus::Hidden => vec![],
+             }
+-            } else {
+-                vec![]
+-            };
++        } else {
++            vec![]
++        };
+ 
+         let mut output_buffer = self.output_buffer.clone().expect("Output buffer not set");
+ 
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index 738f0cf..3374561 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -23,6 +23,7 @@ mod tests;
+ pub mod utils;
+ pub(crate) mod wayland;
+ 
++pub use crate::comp::cursor::{Cursor, CursorImage, CursorSink};
+ pub use crate::utils::video_info::GstVideoInfo;
+ 
+ pub enum Command {
+@@ -49,6 +50,9 @@ pub enum Command {
+     /// Render a frame as soon as the picture has changed instead of on the beat of the frame
+     /// rate, and never more frames in one second than the frame rate. Off unless asked for.
+     RenderOnCommit(bool),
++    /// Leave the cursor out of the frames and tell the sink whenever it changes; with `None`,
++    /// draw it into the frames again. Drawn into the frames unless asked for.
++    CursorSink(Option<CursorSink>),
+     Quit,
+ }
+ 
+@@ -257,6 +261,15 @@ impl WaylandDisplay {
+         let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
+     }
+ 
++    /// Leaves the cursor out of the frames and tells `sink` what it is, now and whenever it
++    /// changes: hidden, an image with its hot spot, or one there is no image of. For whoever
++    /// shows the picture somewhere else and draws the cursor there itself, where its own
++    /// pointer is. With `None` the cursor is drawn into the frames again, as it is unless
++    /// asked for. The sink is called on the compositor's thread.
++    pub fn set_cursor_sink(&self, sink: Option<CursorSink>) {
++        let _ = self.command_tx.send(Command::CursorSink(sink));
++    }
++
+     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
+         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+         if let Err(err) = self
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index db59847..fb41b4b 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -57,6 +57,10 @@ struct State {
+ 
+     pointer: Option<wl_pointer::WlPointer>,
+     pointer_confined: bool,
++    /// The serial of the last time the pointer entered a surface: a cursor is set with it.
++    pointer_entered: u32,
++    shm: Option<wl_shm::WlShm>,
++    cursor_surface: Option<wl_surface::WlSurface>,
+     keyboard: Option<wl_keyboard::WlKeyboard>,
+     windows: Vec<Window>,
+     pub mouse_events: Vec<MouseEvents>,
+@@ -116,6 +120,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
+                         (),
+                     );
+                     state.buffer = Some(buffer.clone());
++                    state.shm = Some(shm);
+                 }
+                 "wl_seat" => {
+                     state.seat =
+@@ -187,6 +192,9 @@ impl WaylandClient {
+ 
+             pointer: None,
+             pointer_confined: false,
++            pointer_entered: 0,
++            shm: None,
++            cursor_surface: None,
+             keyboard: None,
+             windows: Vec::new(),
+             mouse_events: Vec::new(),
+@@ -248,6 +256,56 @@ impl WaylandClient {
+         window.ack_last_and_commit();
+     }
+ 
++    /// Gives the pointer a cursor of one colour (blue, green, red, alpha), as a client does
++    /// when the pointer has entered its window: an image on a surface of its own, and the
++    /// point of it that lies on the pointer's position. The same surface is used every time.
++    pub fn set_cursor(&mut self, (width, height): (i32, i32), hotspot: (i32, i32), bgra: [u8; 4]) {
++        use std::io::Write;
++        let state = &mut self.state;
++        let mut file = tempfile::tempfile().unwrap();
++        file.write_all(&bgra.repeat((width * height) as usize))
++            .unwrap();
++        file.flush().unwrap();
++        let pool = state.shm.as_ref().unwrap().create_pool(
++            file.as_fd(),
++            width * height * 4,
++            &state.qh,
++            (),
++        );
++        let buffer = pool.create_buffer(
++            0,
++            width,
++            height,
++            width * 4,
++            wl_shm::Format::Argb8888,
++            &state.qh,
++            (),
++        );
++        if state.cursor_surface.is_none() {
++            let compositor = state.compositor.as_ref().unwrap();
++            state.cursor_surface = Some(compositor.create_surface(&state.qh, ()));
++        }
++        let surface = state.cursor_surface.as_ref().unwrap();
++        surface.attach(Some(&buffer), 0, 0);
++        surface.commit();
++        state.pointer.as_ref().unwrap().set_cursor(
++            state.pointer_entered,
++            Some(surface),
++            hotspot.0,
++            hotspot.1,
++        );
++    }
++
++    /// Hides the pointer, as a client does that draws its own or wants none.
++    pub fn hide_cursor(&mut self) {
++        let state = &self.state;
++        state
++            .pointer
++            .as_ref()
++            .unwrap()
++            .set_cursor(state.pointer_entered, None, 0, 0);
++    }
++
+     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
+         self.state.mouse_events.as_mut()
+     }
+@@ -566,6 +624,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
+         _: &QueueHandle<Self>,
+     ) {
+         tracing::debug!("{:?}", event);
++        if let wl_pointer::Event::Enter { serial, .. } = &event {
++            state.pointer_entered = *serial;
++        }
+         state.mouse_events.push(MouseEvents::Pointer(event));
+     }
+ }
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index 9c45339..53fab8d 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -1,6 +1,7 @@
+ pub(crate) mod client;
+ mod device;
+ mod fixture;
++mod test_cursor;
+ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
+diff --git a/wayland-display-core/src/tests/test_cursor.rs b/wayland-display-core/src/tests/test_cursor.rs
+new file mode 100644
+index 0000000..0ded101
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_cursor.rs
+@@ -0,0 +1,173 @@
++//! Integration tests for the cursor that is told to a sink instead of drawn into the frames
++//! (see `comp::cursor`). A real Wayland client sets the cursor, so that a failure here says
++//! that what clients do no longer reaches the sink.
++
++use crate::comp::cursor::{Cursor, CursorSink};
++use crate::tests::fixture::Fixture;
++use smithay::utils::Point;
++use std::sync::{Arc, Mutex};
++use test_log::test;
++
++type Told = Arc<Mutex<Vec<Cursor>>>;
++
++/// A window under the pointer, and somebody who is told about the cursor.
++fn fixture() -> (Fixture, Told) {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    let told = listen(&mut f);
++    (f, told)
++}
++
++fn listen(f: &mut Fixture) -> Told {
++    let told = Told::default();
++    let sink: CursorSink = {
++        let told = told.clone();
++        Box::new(move |cursor| told.lock().unwrap().push(cursor.clone()))
++    };
++    f.server.set_cursor_sink(Some(sink));
++    told
++}
++
++fn last(told: &Told) -> Cursor {
++    told.lock().unwrap().last().cloned().expect("nothing told")
++}
++
++/// The part of a frame around the middle of the picture, where the tests keep the pointer.
++fn middle_of_a_frame(f: &mut Fixture) -> Vec<u8> {
++    let (frame, _) = f.server.create_frame().expect("no frame");
++    let frame = frame.map_readable().expect("frame cannot be read");
++    let (width, bytes) = (320, frame.as_slice());
++    assert_eq!(bytes.len(), 320 * 240 * 4);
++    (120..184)
++        .flat_map(|row| bytes[(row * width + 160) * 4..(row * width + 224) * 4].to_vec())
++        .collect()
++}
++
++#[test]
++fn a_new_listener_is_told_the_cursor_as_it_is() {
++    let (_f, told) = fixture();
++    // No client has set a cursor: it is the one a pointer starts with, and there is no
++    // image of it to pass on.
++    assert_eq!(*told.lock().unwrap(), [Cursor::Named("default".into())]);
++}
++
++#[test]
++fn a_cursor_a_client_sets_is_told_with_its_image_and_hot_spot() {
++    let (mut f, told) = fixture();
++    // Blue 10, green 20, red 30, alpha 40, as the client's memory holds it.
++    f.client.set_cursor((24, 16), (3, 5), [10, 20, 30, 40]);
++    f.round_trip();
++    let Cursor::Image(image) = last(&told) else {
++        panic!("not an image: {:?}", last(&told));
++    };
++    assert_eq!((image.width, image.height, image.scale), (24, 16, 1));
++    assert_eq!((image.hotspot_x, image.hotspot_y), (3, 5));
++    assert_eq!(image.rgba.len(), 24 * 16 * 4);
++    assert!(image.rgba.chunks(4).all(|pixel| pixel == [30, 20, 10, 40]));
++}
++
++#[test]
++fn a_new_image_is_told_and_the_same_cursor_is_not_told_twice() {
++    let (mut f, told) = fixture();
++    f.client.set_cursor((16, 16), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    let after_the_first = told.lock().unwrap().len();
++    assert!(matches!(last(&told), Cursor::Image(_)));
++
++    // The same picture again, as an application does that sets its cursor on every motion.
++    f.client.set_cursor((16, 16), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    assert_eq!(told.lock().unwrap().len(), after_the_first);
++
++    // Another picture on the same surface: the text cursor instead of the arrow.
++    f.client.set_cursor((16, 16), (8, 8), [255, 0, 0, 255]);
++    f.round_trip();
++    let Cursor::Image(image) = last(&told) else {
++        panic!("not an image: {:?}", last(&told));
++    };
++    assert_eq!((image.hotspot_x, image.hotspot_y), (8, 8));
++    assert_eq!(&image.rgba[..4], [0, 0, 255, 255]);
++    assert!(told.lock().unwrap().len() > after_the_first);
++}
++
++#[test]
++fn a_cursor_a_client_hides_is_told_as_hidden() {
++    let (mut f, told) = fixture();
++    f.client.set_cursor((16, 16), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    f.client.hide_cursor();
++    f.round_trip();
++    assert_eq!(last(&told), Cursor::Hidden);
++    f.client.set_cursor((16, 16), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    assert!(matches!(last(&told), Cursor::Image(_)));
++}
++
++#[test]
++fn an_image_that_is_too_large_or_has_its_hot_spot_outside_is_told_without_an_image() {
++    let (mut f, told) = fixture();
++    f.client.set_cursor((300, 300), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    assert_eq!(last(&told), Cursor::Named("default".into()));
++    f.client.set_cursor((16, 16), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    assert!(matches!(last(&told), Cursor::Image(_)));
++    f.client.set_cursor((16, 16), (16, 3), [0, 0, 255, 255]);
++    f.round_trip();
++    assert_eq!(last(&told), Cursor::Named("default".into()));
++}
++
++#[test]
++fn nobody_is_told_unless_somebody_asked() {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    f.client.set_cursor((16, 16), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    // Somebody who starts to listen later is told what the cursor is by then.
++    let told = listen(&mut f);
++    assert_eq!(told.lock().unwrap().len(), 1);
++    assert!(matches!(last(&told), Cursor::Image(_)));
++    // And is told nothing more once it has stopped listening.
++    f.server.set_cursor_sink(None);
++    f.client.hide_cursor();
++    f.round_trip();
++    assert_eq!(told.lock().unwrap().len(), 1);
++}
++
++#[test]
++fn the_cursor_is_in_the_frames_only_while_nobody_is_told_about_it() {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    // A cursor that cannot be overlooked: opaque white, with its corner on the pointer.
++    f.client.set_cursor((32, 32), (0, 0), [255, 255, 255, 255]);
++    f.round_trip();
++
++    let with_the_cursor = middle_of_a_frame(&mut f);
++    assert!(with_the_cursor[..4] == [255, 255, 255, 255]);
++
++    let _told = listen(&mut f);
++    let without = middle_of_a_frame(&mut f);
++    assert_ne!(with_the_cursor, without);
++    assert!(without[..4] != [255, 255, 255, 255]);
++    // Where the pointer is no longer matters to the picture.
++    f.server
++        .pointer_motion_absolute(0, Point::from((170.0, 130.0)));
++    f.round_trip();
++    assert_eq!(middle_of_a_frame(&mut f), without);
++
++    // Nobody listens any more: the cursor is back in the frames, where the pointer is now.
++    f.server.set_cursor_sink(None);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    assert_eq!(middle_of_a_frame(&mut f), with_the_cursor);
++}
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index 681fef1..bedad8f 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -2,6 +2,7 @@ use smithay::{
+     backend::renderer::utils::on_commit_buffer_handler,
+     delegate_compositor, delegate_single_pixel_buffer,
+     desktop::PopupKind,
++    input::pointer::CursorImageStatus,
+     reexports::{
+         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
+         wayland_server::{
+@@ -35,6 +36,10 @@ impl CompositorHandler for State {
+ 
+     fn commit(&mut self, surface: &WlSurface) {
+         on_commit_buffer_handler::<Self>(surface);
++        if matches!(&self.cursor_state, CursorImageStatus::Surface(cursor) if cursor == surface) {
++            // The cursor has a new image.
++            self.tell_cursor();
++        }
+         crate::comp::client_committed(self);
+ 
+         if let Some(window) = self
+diff --git a/wayland-display-core/src/wayland/handlers/seat.rs b/wayland-display-core/src/wayland/handlers/seat.rs
+index bdfc4b8..9bd9383 100644
+--- a/wayland-display-core/src/wayland/handlers/seat.rs
++++ b/wayland-display-core/src/wayland/handlers/seat.rs
+@@ -30,6 +30,7 @@ impl SeatHandler for State {
+ 
+     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+         self.cursor_state = image;
++        self.tell_cursor();
+     }
+ }
+ 
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 5318698..ed80dca 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -54,6 +54,7 @@ pub struct Settings {
+     input_devices: Vec<String>,
+     disable_intel_workaround: bool,
+     render_on_commit: bool,
++    cursor_messages: bool,
+     #[cfg(feature = "cuda")]
+     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
+     #[cfg(feature = "cuda")]
+@@ -64,6 +65,42 @@ pub struct State {
+     display: WaylandDisplay,
+ }
+ 
++/// Posts what the cursor is as an application message on the element's bus, as the element
++/// posts its environment (`wayland.src`). The structure `wayland.cursor` has a `kind`:
++/// "hidden"; "named", with a `name`, for a cursor there is no image of; or "image", with
++/// `width`, `height`, `hotspot-x`, `hotspot-y` (pixels of the image), `scale` (pixels of the
++/// image to one of the picture) and `image`, a buffer of four bytes a pixel: red, green,
++/// blue, alpha, the colours multiplied by alpha.
++fn cursor_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddisplaycore::CursorSink {
++    use waylanddisplaycore::Cursor;
++    Box::new(move |cursor| {
++        let Some(element) = element.upgrade() else {
++            return;
++        };
++        let structure = Structure::builder("wayland.cursor");
++        let structure = match cursor {
++            Cursor::Hidden => structure.field("kind", "hidden"),
++            Cursor::Named(name) => structure
++                .field("kind", "named")
++                .field("name", name.as_str()),
++            Cursor::Image(image) => structure
++                .field("kind", "image")
++                .field("width", image.width)
++                .field("height", image.height)
++                .field("hotspot-x", image.hotspot_x)
++                .field("hotspot-y", image.hotspot_y)
++                .field("scale", image.scale)
++                .field("image", gst::Buffer::from_slice(image.rgba.clone())),
++        };
++        let message = Application::builder(structure.build())
++            .src(&element)
++            .build();
++        if let Err(err) = element.post_message(message) {
++            gst::warning!(CAT, "Failed to post the cursor to the bus: {}", err);
++        }
++    })
++}
++
+ #[glib::object_subclass]
+ impl ObjectSubclass for WaylandDisplaySrc {
+     const NAME: &'static str = "GstWaylandDisplaySrc";
+@@ -282,6 +319,13 @@ impl ObjectImpl for WaylandDisplaySrc {
+                     )
+                     .default_value(false)
+                     .build(),
++                glib::ParamSpecBoolean::builder("cursor-messages")
++                    .nick("Cursor messages")
++                    .blurb(
++                        "Leave the cursor out of the picture and post an application message, wayland.cursor, whenever the cursor changes, for whoever shows the picture and draws the cursor itself",
++                    )
++                    .default_value(false)
++                    .build(),
+             ]
+         });
+ 
+@@ -351,6 +395,13 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 // Taken in by the compositor when it runs; it may be changed while it does.
+                 let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
+             }
++            "cursor-messages" => {
++                let enabled = value.get::<bool>().expect("Type checked upstream");
++                self.settings.lock().unwrap().cursor_messages = enabled;
++                let sink = enabled.then(|| cursor_sink(self.obj().downgrade()));
++                // Taken in by the compositor when it runs; it may be changed while it does.
++                let _ = self.command_tx.send(Command::CursorSink(sink));
++            }
+             _ => unreachable!(),
+         }
+     }
+@@ -389,6 +440,10 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 let settings = self.settings.lock().unwrap();
+                 settings.render_on_commit.to_value()
+             }
++            "cursor-messages" => {
++                let settings = self.settings.lock().unwrap();
++                settings.cursor_messages.to_value()
++            }
+             _ => unreachable!(),
+         }
+     }
