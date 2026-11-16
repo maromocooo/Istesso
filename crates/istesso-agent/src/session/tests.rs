@@ -3,6 +3,7 @@
 
 use istesso_pair::{Hello, Identity};
 
+use super::local::HostSession;
 use super::testing::{app, quick_rules, FakeLauncher, FakeRunner, Journal, OnAttach};
 use super::*;
 use crate::testing::TempDir;
@@ -32,7 +33,11 @@ fn pair(paths: &Paths, name: &str, permissions: Vec<Permission>) -> Peer {
 }
 
 fn host_with(rules: Rules) -> Host {
-    let dir = TempDir::new("session");
+    host_named("session", rules)
+}
+
+fn host_named(tag: &str, rules: Rules) -> Host {
+    let dir = TempDir::new(tag);
     let paths = dir.paths();
     let journal = Journal::default();
     let runner = Arc::new(FakeRunner::new(&journal));
@@ -186,6 +191,60 @@ impl Host {
     /// What was done to applications and streams after the session ran.
     fn since_running(&self) -> Vec<String> {
         self.journal.all().split_off(2)
+    }
+
+    /// Looks at the session the way the person at the host does, without
+    /// asking as any device, until it is as `what` says.
+    fn settles(&self, id: &SessionId, what: impl Fn(&HostSession) -> bool) -> HostSession {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = self.sessions.host_look(id).expect("the session is known");
+            if what(&seen) {
+                return seen;
+            }
+            assert!(Instant::now() < deadline, "still {seen:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn unpair(&self, peer: &Peer) {
+        let mut peers = PeerStore::open(self.paths.peers()).unwrap();
+        assert!(peers.remove(&peer.id).unwrap().is_some());
+    }
+
+    fn pair_again(&self, peer: &Peer) {
+        let mut peers = PeerStore::open(self.paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+    }
+
+    /// Every request about a session, as `peer` would make it.
+    fn everything_about(&self, id: &SessionId) -> Vec<Request> {
+        vec![
+            Request::SessionList,
+            Request::SessionWait {
+                session: id.clone(),
+                after: 0,
+                timeout_ms: 0,
+                attachment: 0,
+            },
+            Request::SessionAttach {
+                session: id.clone(),
+                display: mode(),
+                offer: serde_json::json!({"port": 50010}),
+            },
+            Request::SessionDetach {
+                session: id.clone(),
+                attachment: 1,
+            },
+            Request::SessionStop {
+                session: id.clone(),
+                force: false,
+            },
+            Request::SessionStop {
+                session: id.clone(),
+                force: true,
+            },
+        ]
     }
 }
 
@@ -676,49 +735,316 @@ fn taking_the_right_away_stops_the_picture_not_the_application() {
     // The laptop may still look, but no longer control.
     let mut record = host.laptop.clone();
     record.permissions = vec![Permission::View];
-    PeerStore::open(host.paths.peers())
-        .unwrap()
-        .add(record)
-        .unwrap();
-    let info = host.follow_until(&id, SessionState::Detached);
-    assert_eq!(info.end, None);
+    host.pair_again(&record);
+    let seen = host.settles(&id, |s| s.info.state == SessionState::Detached);
+    assert!(seen.revoked);
+    assert_eq!(seen.info.end, None);
     assert_eq!(host.since_running(), ["runner detach"]);
-    // It still sees its session, and may ask it to close or end it ...
-    assert_eq!(host.list(&host.laptop).len(), 1);
-    // ... but it is not shown it again, and starts nothing new.
-    let (code, _) = refusal(host.attach(&id));
-    assert_eq!(code, ErrorCode::Forbidden);
-    let (code, _) = refusal(host.start_as(&host.laptop, "editor.desktop"));
-    assert_eq!(code, ErrorCode::Forbidden);
-
-    // The pairing is removed: the device gets nothing at all, and the
-    // application is still not ended.
-    PeerStore::open(host.paths.peers())
-        .unwrap()
-        .remove(&host.laptop.id)
-        .unwrap();
-    for request in [
-        Request::SessionList,
-        Request::SessionWait {
-            session: id.clone(),
-            after: 0,
-            timeout_ms: 0,
-            attachment: 0,
-        },
-        Request::SessionStop {
-            session: id.clone(),
-            force: true,
-        },
-    ] {
+    // What starting takes, everything about the session takes: the laptop
+    // is not shown it again, and does not list, follow or end it either.
+    for request in host.everything_about(&id) {
         let (code, message) = refusal(host.ask(&host.laptop, request));
         assert_eq!(code, ErrorCode::Forbidden);
-        assert!(message.contains("no longer paired"), "{message}");
+        assert!(message.contains("may not use applications"), "{message}");
     }
+    let (code, message) = refusal(host.start_as(&host.laptop, "editor.desktop"));
+    assert_eq!(code, ErrorCode::Forbidden);
+    assert!(message.contains("may not start"), "{message}");
+    // None of that reached the application or the stream.
+    assert_eq!(host.since_running(), ["runner detach"]);
     assert_eq!(
         host.sessions.look(&id).unwrap().state,
         SessionState::Detached
     );
+}
+
+#[test]
+fn a_session_nobody_is_shown_is_closed_to_a_device_that_was_unpaired() {
+    let host = host();
+    let id = host.running().id;
+    assert_eq!(host.detach(&id, 1).state, SessionState::Detached);
     assert_eq!(host.since_running(), ["runner detach"]);
+    assert!(!host.sessions.host_look(&id).unwrap().revoked);
+
+    // Nobody asks anything: the session's own round finds out.
+    let unpaired = Instant::now();
+    host.unpair(&host.laptop);
+    let seen = host.settles(&id, |s| s.revoked);
+    assert!(unpaired.elapsed() < Duration::from_secs(2));
+    assert_eq!(seen.info.state, SessionState::Detached);
+    assert_eq!(
+        (seen.started_by.name.as_str(), &seen.started_by.id),
+        ("laptop", &host.laptop.id)
+    );
+
+    // The device gets nothing: not the list, not the picture, and no way
+    // to end the application.
+    for request in host.everything_about(&id) {
+        let (code, message) = refusal(host.ask(&host.laptop, request));
+        assert_eq!(code, ErrorCode::Forbidden);
+        assert!(message.contains("no longer paired"), "{message}");
+    }
+    // The application runs on, with its place in the table.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(host.since_running(), ["runner detach"]);
+    let seen = host.sessions.host_look(&id).unwrap();
+    assert_eq!(
+        (seen.info.state, &seen.info.end),
+        (SessionState::Detached, &None)
+    );
+
+    // The person at the host sees it, whoever started it, and can ask it
+    // to close ...
+    let all = host.sessions.host_list();
+    assert_eq!(all.len(), 1);
+    assert_eq!((&all[0].info.id, all[0].revoked), (&id, true));
+    assert_eq!(all[0].app_name, "Editor");
+    let asked = host.sessions.host_stop(&id, false).unwrap();
+    assert_eq!(asked.info.state, SessionState::Detached);
+    host.journal.wait_for("runner close", 1);
+    assert_eq!(host.journal.count("app stop"), 0);
+    // ... or end it.
+    host.sessions.host_stop(&id, true).unwrap();
+    let over = host.settles(&id, |s| s.info.state == SessionState::Ended);
+    assert_eq!(over.info.end.unwrap().reason, EndReason::Stopped);
+    assert_eq!(
+        host.since_running(),
+        ["runner detach", "runner close", "app stop", "runner stop"]
+    );
+    assert!(host.sessions.host_list().is_empty());
+    assert_eq!(
+        host.sessions
+            .host_stop(&SessionId("0000000000000000".into()), true)
+            .unwrap_err()
+            .0,
+        ErrorCode::NotFound
+    );
+}
+
+#[test]
+fn unpairing_stops_the_picture_and_pairing_again_gives_the_session_back() {
+    let host = host();
+    let id = host.running().id;
+    // What the media path agreed on is not part of what the host's person
+    // is told.
+    let shown = host.sessions.host_look(&id).unwrap();
+    assert_eq!(
+        (shown.info.state, &shown.info.answer),
+        (SessionState::Running, &None)
+    );
+    assert!(host.sessions.look(&id).unwrap().answer.is_some());
+
+    host.unpair(&host.laptop);
+    let seen = host.settles(&id, |s| s.info.state == SessionState::Detached);
+    assert!(seen.revoked);
+    assert_eq!(host.since_running(), ["runner detach"]);
+
+    // The same device, paired again, finds its application as it left it.
+    host.pair_again(&host.laptop);
+    host.settles(&id, |s| !s.revoked);
+    assert_eq!(host.list(&host.laptop).len(), 1);
+    let back = session(host.attach(&id));
+    assert_eq!((back.state, back.attachment), (SessionState::Running, 2));
+    assert_eq!(host.since_running(), ["runner detach", "runner attach"]);
+}
+
+#[test]
+fn nothing_is_started_for_a_device_that_was_unpaired_meanwhile() {
+    // While the runner is still getting ready ...
+    let host = host();
+    host.runner.instead_of_ready(Vec::new());
+    let id = host.start().id;
+    host.unpair(&host.laptop);
+    let over = host.settles(&id, |s| s.info.state == SessionState::Ended);
+    let end = over.info.end.unwrap();
+    assert_eq!(end.reason, EndReason::Stopped);
+    assert!(end.message.contains("may no longer start"), "{end:?}");
+    assert_eq!(host.journal.all(), ["runner start", "runner stop"]);
+
+    // ... or at the moment it is.
+    let host = host_with(Rules {
+        recheck_rights_every: Duration::from_secs(3600),
+        ..quick_rules()
+    });
+    host.runner.instead_of_ready(Vec::new());
+    let id = host.start().id;
+    host.journal.wait_for("runner start", 1);
+    // The round has read the rights once, and will not again for an hour.
+    std::thread::sleep(Duration::from_millis(100));
+    host.unpair(&host.laptop);
+    host.runner.say(StreamEvent::Said(RunnerEvent::Ready {
+        env: BTreeMap::new(),
+        display: mode(),
+        answer: serde_json::Value::Null,
+    }));
+    host.settles(&id, |s| s.info.state == SessionState::Ended);
+    assert_eq!(host.journal.all(), ["runner start", "runner stop"]);
+}
+
+#[test]
+fn a_device_may_have_only_so_many_sessions() {
+    let host = host_with(Rules {
+        max_sessions: 3,
+        max_sessions_per_device: 2,
+        ..quick_rules()
+    });
+    let first = host.running().id;
+    let second = session(host.start_as(&host.laptop, "paint.desktop")).id;
+    host.follow_until(&second, SessionState::Running);
+
+    // The laptop has as many as one device may. The host has a place left.
+    let (code, message) = refusal(host.start_as(&host.laptop, "editor.desktop"));
+    assert_eq!(code, ErrorCode::Unavailable);
+    assert_eq!(
+        message,
+        "this device already has 2 sessions on this host, as many as one device may have"
+    );
+    // Which of them nobody is shown is said, and nothing is ended.
+    host.detach(&second, 1);
+    let (_, message) = refusal(host.start_as(&host.laptop, "editor.desktop"));
+    assert_eq!(
+        message,
+        format!(
+            "this device already has 2 sessions on this host, as many as one device may have; \
+             nobody is shown: Paint ({second})"
+        )
+    );
+    assert_eq!(host.journal.count("app stop"), 0);
+
+    // The place that is left is for another device.
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    let third = session(host.start_as(&tablet, "editor.desktop")).id;
+    host.settles(&third, |s| s.info.state == SessionState::Running);
+
+    // A device that is unpaired keeps its places until the person at the
+    // host ends its applications. Another device is told where they went.
+    host.unpair(&host.laptop);
+    host.settles(&first, |s| s.revoked);
+    host.settles(&second, |s| s.revoked);
+    let (code, message) = refusal(host.start_as(&tablet, "paint.desktop"));
+    assert_eq!(code, ErrorCode::Unavailable);
+    assert_eq!(
+        message,
+        "this host already runs 3 sessions, as many as it takes; 2 were started by devices \
+         that may no longer use them: `istesso sessions --local` on the host lists them"
+    );
+    assert_eq!(host.journal.count("app stop"), 0);
+    host.sessions.host_stop(&first, true).unwrap();
+    host.settles(&first, |s| s.info.state == SessionState::Ended);
+    session(host.start_as(&tablet, "paint.desktop"));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_person_at_the_host_asks_on_a_socket_only_they_can_reach() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::local::{listen, serve, sessions_here, stop_here, HostLink};
+
+    let mode_of = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let open_to_all = |path: &std::path::Path| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+
+    // A short name: the path of a socket may only be so long.
+    let host = host_named("s", quick_rules());
+    let socket = host.paths.agent_socket();
+    let dir = socket.parent().unwrap();
+    // No agent: said, not guessed.
+    let none = sessions_here(&host.paths).unwrap_err();
+    assert!(none.contains("no istesso agent"), "{none}");
+
+    // A directory that others could enter is closed before the socket is
+    // opened in it.
+    std::fs::create_dir_all(dir).unwrap();
+    open_to_all(dir);
+    let listener = listen(&host.paths).unwrap();
+    assert_eq!(mode_of(dir), 0o700);
+    assert_eq!(mode_of(&socket), 0o600);
+    // One agent answers there, not two.
+    let second = listen(&host.paths).unwrap_err();
+    assert_eq!(second.kind(), std::io::ErrorKind::AddrInUse, "{second}");
+    let sessions = host.sessions.clone();
+    std::thread::spawn(move || serve(listener, sessions));
+
+    assert_eq!(sessions_here(&host.paths).unwrap(), []);
+    let id = host.running().id;
+    let listed = sessions_here(&host.paths).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (&listed[0].info.id, listed[0].started_by.name.as_str()),
+        (&id, "laptop")
+    );
+    assert_eq!(listed[0], host.sessions.host_look(&id).unwrap());
+
+    // Asked to close, the application may stay; ended, it is over.
+    let asked = stop_here(&host.paths, &id, false, Duration::from_millis(100)).unwrap();
+    assert_eq!(asked.info.state, SessionState::Running);
+    assert_eq!(host.since_running(), ["runner close"]);
+    let over = stop_here(&host.paths, &id, true, Duration::from_secs(5)).unwrap();
+    assert_eq!(over.info.state, SessionState::Ended);
+    assert_eq!(over.info.end.unwrap().reason, EndReason::Stopped);
+    let unknown = SessionId("0000000000000000".into());
+    let refused = stop_here(&host.paths, &unknown, true, Duration::ZERO).unwrap_err();
+    assert_eq!(refused, "no such session");
+
+    // Something that is not a request gets an answer that says so, and
+    // the conversation goes on.
+    {
+        use std::io::{BufRead, BufReader, Write};
+        let mut raw = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let mut lines = BufReader::new(raw.try_clone().unwrap());
+        let mut say = |line: &str| {
+            writeln!(raw, "{line}").unwrap();
+            let mut answer = String::new();
+            lines.read_line(&mut answer).unwrap();
+            answer
+        };
+        let answer = say(r#"{"v":1,"ask":"shutdown"}"#);
+        assert!(answer.contains(r#""code":"unsupported""#), "{answer}");
+        let answer = say(r#"{"v":1,"ask":"sessions"}"#);
+        assert_eq!(
+            answer,
+            "{\"v\":1,\"answer\":\"sessions\",\"sessions\":[]}\n"
+        );
+    }
+
+    // The asking side does not believe a socket in a directory that
+    // somebody else could have put it in.
+    open_to_all(dir);
+    let Err(doubt) = HostLink::open(&host.paths) else {
+        panic!("asked through a directory that is open to others");
+    };
+    assert!(doubt.contains("can be entered by other users"), "{doubt}");
+
+    // A socket that an agent left behind is replaced.
+    let other = host_named("s", quick_rules());
+    let left = other.paths.agent_socket();
+    std::fs::create_dir_all(left.parent().unwrap()).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&left).unwrap());
+    assert!(left.exists());
+    // (A program that another test starts at this very moment holds the
+    // closed listener open until it has started, so once may not do.)
+    let replaced = (0..100).any(|_| {
+        listen(&other.paths).is_ok() || {
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+    assert!(replaced);
+    // Something else of that name is not touched.
+    let third = host_named("s", quick_rules());
+    let taken = third.paths.agent_socket();
+    std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+    std::fs::write(&taken, "not a socket").unwrap();
+    assert!(listen(&third.paths).is_err());
+    assert_eq!(std::fs::read_to_string(&taken).unwrap(), "not a socket");
 }
 
 #[test]

@@ -64,6 +64,8 @@ struct Pair {
     runner: Arc<FakeRunner>,
     launcher: Arc<FakeLauncher>,
     viewer: Arc<FakeViewer>,
+    /// The host's table, as the person at the host sees it.
+    sessions: Sessions,
 }
 
 /// What the window's thread hands back: how it ended, and what the person
@@ -95,7 +97,7 @@ fn pair_on(bind: std::net::IpAddr, rights: Vec<Permission>, rules: Rules) -> Opt
     );
     let agent = Agent::bind(host.paths(), &options, Arc::new(|_| {}))
         .ok()?
-        .with_sessions(sessions, vec![app("editor.desktop", "Editor")]);
+        .with_sessions(sessions.clone(), vec![app("editor.desktop", "Editor")]);
     let addr = agent.local_addr().unwrap();
     std::thread::spawn(move || agent.run());
     Some(Pair {
@@ -106,6 +108,7 @@ fn pair_on(bind: std::net::IpAddr, rights: Vec<Permission>, rules: Rules) -> Opt
         journal,
         runner,
         launcher,
+        sessions,
     })
 }
 
@@ -481,15 +484,32 @@ fn a_host_that_stops_showing_the_session_closes_the_window() {
         .add(record)
         .unwrap();
     let (outcome, _) = window.join().unwrap();
-    assert_eq!(outcome, Ok(Outcome::Detached(id)));
-    // The application runs on; the laptop still sees it, and may not be
-    // shown it again.
-    assert_eq!(pair.session().state, SessionState::Detached);
+    // The window closes. Whether the laptop hears of it as the session's
+    // last report or as a refusal depends on which reaches it first.
+    assert!(
+        matches!(
+            &outcome,
+            Ok(Outcome::Detached(session) | Outcome::HostLost { session, .. }) if *session == id
+        ),
+        "{outcome:?}"
+    );
+    // The application runs on, with the person at the host. The laptop
+    // does not see it any more, and is not shown it again.
+    let kept = pair.sessions.host_look(&id).unwrap();
+    assert_eq!(
+        (kept.info.state, kept.revoked),
+        (SessionState::Detached, true)
+    );
     assert_eq!(pair.on_host()[2..], ["runner detach"]);
+    let listed = sessions_on(&pair.link(), &quick_client());
+    assert!(
+        matches!(&listed, Err(OpenError::Refused(refusal)) if refusal.code == ErrorCode::Forbidden),
+        "{listed:?}"
+    );
     let refused = open_window(
         pair.link(),
         pair.viewer.as_ref(),
-        &pair.opening(Some(pair.session().id)),
+        &pair.opening(Some(id)),
         &AtomicBool::new(false),
         &quick_client(),
         &mut |_| {},

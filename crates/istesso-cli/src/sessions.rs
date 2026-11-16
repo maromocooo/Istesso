@@ -1,11 +1,16 @@
 //! `istesso sessions`: the applications of other devices that run for this
 //! one, shown in a window or not, and how to end one
 //! (`docs/adr/0010-session-start.md`).
+//!
+//! With `--local` it is the other way round: the applications of this
+//! machine that run for other devices, whichever device started them. That
+//! is for the person at the host, and is asked of the agent that runs here.
 
 use std::time::Duration;
 
 use istesso_agent::session::client::{link_to, sessions_on, stop_session, ClientRules, OpenError};
-use istesso_agent::session::Rules;
+use istesso_agent::session::local::{sessions_here, stop_here};
+use istesso_agent::session::{HostSession, Rules};
 use istesso_agent::{survey, HostView, Paths, SurveyOptions};
 use istesso_link::ErrorCode;
 use istesso_proto::{HostState, SessionInfo, SessionState};
@@ -70,29 +75,36 @@ pub fn state_words(state: SessionState) -> &'static str {
     }
 }
 
-/// The session the person means: by its id, or by the beginning of it.
-pub fn pick<'a>(
-    running: impl Iterator<Item = &'a Running>,
-    asked: &str,
-) -> Result<&'a Running, String> {
+/// Which of `ids` the person means: an id, or the beginning of one.
+/// `where_` says where the sessions run and `lister` how to list them, for
+/// the error.
+fn pick_among(ids: &[&str], asked: &str, where_: &str, lister: &str) -> Result<usize, String> {
     let asked = asked.trim().to_lowercase();
-    let all: Vec<&Running> = running.collect();
-    if let Some(exact) = all.iter().copied().find(|r| r.info.id.0 == asked) {
+    if let Some(exact) = ids.iter().position(|id| *id == asked) {
         return Ok(exact);
     }
-    let begins: Vec<&Running> = all
-        .into_iter()
-        .filter(|r| asked.len() >= 4 && r.info.id.0.starts_with(&asked))
+    let begins: Vec<usize> = (0..ids.len())
+        .filter(|at| asked.len() >= 4 && ids[*at].starts_with(&asked))
         .collect();
     match begins.as_slice() {
         &[one] => Ok(one),
         [] => Err(format!(
-            "no session '{asked}' runs for this device; `istesso sessions` lists them"
+            "no session '{asked}' runs {where_}; `{lister}` lists them"
         )),
         _ => Err(format!(
             "'{asked}' is the beginning of several sessions; give more of the id"
         )),
     }
+}
+
+/// The session the person means: by its id, or by the beginning of it.
+pub fn pick<'a>(
+    running: impl Iterator<Item = &'a Running>,
+    asked: &str,
+) -> Result<&'a Running, String> {
+    let all: Vec<&Running> = running.collect();
+    let ids: Vec<&str> = all.iter().map(|r| r.info.id.0.as_str()).collect();
+    pick_among(&ids, asked, "for this device", "istesso sessions").map(|at| all[at])
 }
 
 /// How wide a column is: as wide as its widest text, within reason.
@@ -200,6 +212,103 @@ pub fn stop(session: &str, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The person at the host
+// ---------------------------------------------------------------------------
+
+/// What `istesso sessions --local` says about a session's state.
+fn local_state_words(session: &HostSession) -> String {
+    let state = state_words(session.info.state);
+    if session.revoked {
+        format!("{state}; {} may no longer use it", session.started_by.name)
+    } else {
+        state.to_string()
+    }
+}
+
+/// The table `istesso sessions --local` prints.
+pub fn render_local(sessions: &[HostSession]) -> String {
+    let app = column("APPLICATION", sessions.iter().map(|s| s.app_name.as_str()));
+    let by = column(
+        "STARTED BY",
+        sessions.iter().map(|s| s.started_by.name.as_str()),
+    );
+    let mut out = format!(
+        "{} {} {} STATE\n",
+        crate::pad("SESSION", 16),
+        crate::pad("APPLICATION", app),
+        crate::pad("STARTED BY", by)
+    );
+    for session in sessions {
+        out.push_str(&format!(
+            "{} {} {} {}\n",
+            session.info.id,
+            crate::pad(&session.app_name, app),
+            crate::pad(&session.started_by.name, by),
+            local_state_words(session)
+        ));
+    }
+    out
+}
+
+/// `istesso sessions --local`: what runs on this machine for other
+/// devices.
+pub fn list_local(json: bool) -> Result<(), String> {
+    let sessions = sessions_here(&Paths::from_env())?;
+    if json {
+        crate::print_json(&sessions)?;
+    } else if sessions.is_empty() {
+        println!("No application of this machine runs for another device.");
+    } else {
+        print!("{}", render_local(&sessions));
+        println!(
+            "\n`istesso sessions stop <session> --local` asks one to close; with --force it \
+             is ended."
+        );
+    }
+    Ok(())
+}
+
+/// `istesso sessions stop --local`: the person at the host asks an
+/// application to close, or ends it, whichever device started it.
+pub fn stop_local(session: &str, force: bool) -> Result<(), String> {
+    let paths = Paths::from_env();
+    let sessions = sessions_here(&paths)?;
+    let ids: Vec<&str> = sessions.iter().map(|s| s.info.id.0.as_str()).collect();
+    let found =
+        &sessions[pick_among(&ids, session, "on this machine", "istesso sessions --local")?];
+    let (name, id) = (&found.app_name, &found.info.id);
+    if force {
+        let grace = Rules::default().app_stop_grace;
+        eprintln!(
+            "Ending {name} by force. It has {} seconds to end by itself.",
+            grace.as_secs()
+        );
+        let last = stop_here(&paths, id, true, grace + Duration::from_secs(5))?;
+        if last.info.state != SessionState::Ended {
+            return Err(format!("{name} has not ended yet"));
+        }
+        println!("{name} was ended.");
+    } else {
+        eprintln!("Asking {name} to close...");
+        let last = stop_here(&paths, id, false, Duration::from_secs(5))?;
+        println!("{}", after_asking_here(&last, name));
+    }
+    Ok(())
+}
+
+/// What became of an application of this machine that was asked to close.
+fn after_asking_here(last: &HostSession, name: &str) -> String {
+    if last.info.state == SessionState::Ended {
+        return format!("{name} ended.");
+    }
+    format!(
+        "{name} is still running: it may be asking whether to save, which a device that is \
+         shown it can answer. `istesso sessions stop {} --local --force` ends it.",
+        last.info.id
+    )
+}
+
 /// What became of an application that was asked to close.
 fn after_asking(last: &SessionInfo, name: &str, host: &str) -> String {
     if last.state == SessionState::Ended {
@@ -269,6 +378,10 @@ mod tests {
         assert_eq!(pick("5b0c9").unwrap(), "Blender");
         // Too short to mean anything, the beginning of two, or of none.
         assert!(pick("9f8").unwrap_err().contains("no session"));
+        assert_eq!(
+            pick("9f8").unwrap_err(),
+            "no session '9f8' runs for this device; `istesso sessions` lists them"
+        );
         assert!(pick("5b0c").unwrap_err().contains("several"));
         assert!(pick("0000").unwrap_err().contains("no session '0000'"));
     }
@@ -294,6 +407,70 @@ mod tests {
         assert_eq!(column(lines[0], "DEVICE"), column(lines[1], "ubuntu"));
         assert_eq!(column(lines[1], "ubuntu"), column(lines[2], "ubuntu"));
         assert_eq!(column(lines[2], "ubuntu"), column(lines[3], "studio"));
+    }
+
+    fn here(app: &str, id: &str, by: &str, state: SessionState, revoked: bool) -> HostSession {
+        HostSession {
+            info: running_on("this", app, id, state).info,
+            app_name: app.to_string(),
+            started_by: istesso_agent::session::StartedBy {
+                id: format!("id-{by}"),
+                name: by.to_string(),
+            },
+            revoked,
+        }
+    }
+
+    #[test]
+    fn the_person_at_the_host_sees_who_started_what() {
+        let sessions = [
+            here(
+                "Blender",
+                "5b0c9e3a7f21d684",
+                "laptop",
+                SessionState::Running,
+                false,
+            ),
+            here(
+                "Editor",
+                "9f8e7d6c5b4a3921",
+                "old tablet",
+                SessionState::Detached,
+                true,
+            ),
+        ];
+        let text = render_local(&sessions);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[0], "SESSION          APPLICATION STARTED BY STATE");
+        assert_eq!(
+            lines[1],
+            "5b0c9e3a7f21d684 Blender     laptop     shown in a window"
+        );
+        // A session its device can no longer use says so: only from here
+        // can it be ended.
+        assert_eq!(
+            lines[2],
+            "9f8e7d6c5b4a3921 Editor      old tablet running, not shown; old tablet may no \
+             longer use it"
+        );
+
+        let ids: Vec<&str> = sessions.iter().map(|s| s.info.id.0.as_str()).collect();
+        let pick = |asked| pick_among(&ids, asked, "on this machine", "istesso sessions --local");
+        assert_eq!(pick("9f8e"), Ok(1));
+        assert_eq!(
+            pick("0000").unwrap_err(),
+            "no session '0000' runs on this machine; `istesso sessions --local` lists them"
+        );
+
+        let still = after_asking_here(&sessions[1], "Editor");
+        assert!(
+            still.contains("`istesso sessions stop 9f8e7d6c5b4a3921 --local --force`"),
+            "{still}"
+        );
+        let mut over = sessions[0].clone();
+        over.info.state = SessionState::Ended;
+        assert_eq!(after_asking_here(&over, "Blender"), "Blender ended.");
     }
 
     #[test]

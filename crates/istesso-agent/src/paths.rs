@@ -29,6 +29,8 @@ pub struct Environment {
     pub config_override: Option<PathBuf>,
     /// `ISTESSO_CACHE_DIR`
     pub cache_override: Option<PathBuf>,
+    /// `ISTESSO_RUNTIME_DIR`
+    pub runtime_override: Option<PathBuf>,
     pub xdg_config_home: Option<PathBuf>,
     pub xdg_cache_home: Option<PathBuf>,
     pub xdg_runtime_dir: Option<PathBuf>,
@@ -46,6 +48,7 @@ impl Environment {
         Environment {
             config_override: var("ISTESSO_CONFIG_DIR"),
             cache_override: var("ISTESSO_CACHE_DIR"),
+            runtime_override: var("ISTESSO_RUNTIME_DIR"),
             xdg_config_home: var("XDG_CONFIG_HOME"),
             xdg_cache_home: var("XDG_CACHE_HOME"),
             xdg_runtime_dir: var("XDG_RUNTIME_DIR"),
@@ -84,13 +87,19 @@ impl Paths {
                 .unwrap_or_else(|| home.join(".cache"))
                 .join(APP_DIR),
         };
-        let runtime = match (&env.config_override, &env.xdg_runtime_dir) {
+        let runtime = match (
+            &env.runtime_override,
+            &env.config_override,
+            &env.xdg_runtime_dir,
+        ) {
+            // A second agent of the same user needs sockets of its own.
+            (Some(dir), _, _) => dir.clone(),
             // Everything in one place, as for the cache.
-            (Some(config), _) => config.join("run"),
-            (None, Some(dir)) => dir.join(APP_DIR),
+            (None, Some(config), _) => config.join("run"),
+            (None, None, Some(dir)) => dir.join(APP_DIR),
             // No such directory on this system (macOS): next to the cache,
             // which is the user's alone as well.
-            (None, None) => cache.join("run"),
+            (None, None, None) => cache.join("run"),
         };
         Paths {
             config,
@@ -140,6 +149,13 @@ impl Paths {
     /// made up itself; the name is built from nothing else.
     pub fn session_input_socket(&self, session: &SessionId) -> PathBuf {
         self.runtime.join(format!("input-{session}.sock"))
+    }
+
+    /// Where the agent answers the person at this machine: a socket that
+    /// only this user can reach, because the directory it is in is theirs
+    /// alone (ADR 0010).
+    pub fn agent_socket(&self) -> PathBuf {
+        self.runtime.join("agent.sock")
     }
 }
 
@@ -198,6 +214,19 @@ mod tests {
         });
         assert_eq!(paths.runtime, PathBuf::from("/custom/run"));
         assert_eq!(paths, Paths::at("/custom"));
+        assert_eq!(
+            paths.agent_socket(),
+            PathBuf::from("/custom/run/agent.sock")
+        );
+        // A second agent of the same user is given a place of its own.
+        let paths = Paths::resolve(&Environment {
+            runtime_override: Some(PathBuf::from("/second/run")),
+            config_override: Some(PathBuf::from("/custom")),
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(paths.runtime, PathBuf::from("/second/run"));
+        assert_eq!(paths.config, PathBuf::from("/custom"));
     }
 
     #[test]

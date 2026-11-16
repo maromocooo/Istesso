@@ -127,6 +127,11 @@ enum Command {
     /// List the applications of other devices that run for this one, or
     /// stop one
     Sessions {
+        /// The applications of this machine that run for other devices
+        /// instead, whichever device started them: for the person at the
+        /// host. Asks the agent that runs on this machine.
+        #[arg(long, global = true)]
+        local: bool,
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
@@ -326,10 +331,17 @@ fn run(cli: Cli) -> Result<(), String> {
             fps,
             position,
         }),
-        Command::Sessions { action } => match action {
-            None => sessions::list(false),
-            Some(SessionsAction::List { json }) => sessions::list(json),
-            Some(SessionsAction::Stop { session, force }) => sessions::stop(&session, force),
+        Command::Sessions { local, action } => match (action, local) {
+            (None, false) => sessions::list(false),
+            (None, true) => sessions::list_local(false),
+            (Some(SessionsAction::List { json }), false) => sessions::list(json),
+            (Some(SessionsAction::List { json }), true) => sessions::list_local(json),
+            (Some(SessionsAction::Stop { session, force }), false) => {
+                sessions::stop(&session, force)
+            }
+            (Some(SessionsAction::Stop { session, force }), true) => {
+                sessions::stop_local(&session, force)
+            }
         },
     }
 }
@@ -886,7 +898,8 @@ fn run_agent(options: AgentOptions, session_runner: Option<PathBuf>) -> Result<(
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
     match &session_runner {
         Some(program) => println!(
-            "Paired devices that may control this machine can start its applications; {} shows them.",
+            "Paired devices that may control this machine can start its applications; {} shows them. \
+             `istesso sessions --local` lists what they started.",
             program.display()
         ),
         None => println!(

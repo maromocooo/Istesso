@@ -187,6 +187,20 @@ impl Agent {
             None
         };
 
+        // The person at this machine asks about the sessions on a socket
+        // of their own (ADR 0010). The agent answers paired devices
+        // without it.
+        #[cfg(unix)]
+        match crate::session::local::listen(&self.shared.paths) {
+            Ok(listener) => {
+                let sessions = self.shared.sessions.clone();
+                std::thread::spawn(move || crate::session::local::serve(listener, sessions));
+            }
+            Err(why) => (self.shared.log)(format!(
+                "`istesso sessions --local` will not work on this machine: {why}"
+            )),
+        }
+
         if let Some(interval) = self.options.refresh_peers {
             let shared = self.shared.clone();
             std::thread::spawn(move || {

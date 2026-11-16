@@ -12,6 +12,13 @@
 //! a client attaches again. How the picture and the input travel is not
 //! known here.
 //!
+//! A session belongs to the device that started it. When that device is
+//! unpaired, or loses a right that starting takes, the session is closed to
+//! it: nothing is shown to it and it cannot ask about the session any more.
+//! The application is not ended for that. It stays with the person at the
+//! host, who sees every session of the machine and can end each one
+//! ([`local`]).
+//!
 //! * [`Sessions`] is the table: it answers the session requests and keeps
 //!   one supervising thread per session.
 //! * [`Runner`] and [`Launcher`] are the two things a session is made of.
@@ -20,6 +27,7 @@
 //! * [`client`] is the other end: what a device does to open a window.
 
 pub mod client;
+pub mod local;
 mod process;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -44,6 +52,7 @@ use rand_core::{OsRng, RngCore};
 use crate::paths::Paths;
 use crate::serve::Log;
 
+pub use local::{HostAnswer, HostRequest, HostSession, StartedBy};
 pub use process::{app_environment, CommandRunner, DesktopLauncher};
 
 /// The rules a person decided, or has yet to decide (ADR 0010). Each is
@@ -62,6 +71,13 @@ pub mod policy {
     /// on. A client gives a host that does not answer the same time before
     /// it closes its window.
     pub const CLIENT_LOST_AFTER: Duration = Duration::from_secs(15);
+
+    /// How many sessions one device may have on a host at the same time,
+    /// of the eight a host takes. Fewer than all of them, so that a device
+    /// cannot hold every place: with six, two are always left for another
+    /// device. Sessions nobody is shown count, and so do the sessions of a
+    /// device that was unpaired, until the person at the host ends them.
+    pub const SESSIONS_PER_DEVICE: usize = 6;
 
     /// Whether `peer` may see, attach to and stop a session that the device
     /// with this id and key started. For now only that device itself; the
@@ -98,6 +114,8 @@ pub struct Rules {
     pub wait_at_most: Duration,
     /// Sessions that may run at the same time, shown to someone or not.
     pub max_sessions: usize,
+    /// See [`policy::SESSIONS_PER_DEVICE`].
+    pub max_sessions_per_device: usize,
     /// How often a session is looked after.
     pub tick: Duration,
     /// How often the list of paired devices is read again for a session.
@@ -115,6 +133,7 @@ impl Default for Rules {
             remember_ended_for: Duration::from_secs(60),
             wait_at_most: Duration::from_secs(3),
             max_sessions: 8,
+            max_sessions_per_device: policy::SESSIONS_PER_DEVICE,
             tick: Duration::from_millis(100),
             recheck_rights_every: Duration::from_secs(1),
         }
@@ -220,6 +239,9 @@ struct Entry {
     /// How the `attach` orders went, by their number, until the device that
     /// gave them has been told.
     attached: Vec<(u64, Result<(), String>)>,
+    /// The device that started it is no longer paired, or lacks a right
+    /// that starting takes. As the supervisor last found it.
+    revoked: bool,
     ended_at: Option<Instant>,
 }
 
@@ -228,7 +250,25 @@ struct Entry {
 struct Owner {
     id: String,
     public_key: String,
+    /// What it was called when it started the session. It may not be in
+    /// the list of paired devices any more.
+    name: String,
 }
+
+/// Who asks about a session.
+#[derive(Clone, Copy)]
+enum Asker<'a> {
+    /// A paired device, on the control channel.
+    Device(&'a Peer),
+    /// The person at this machine ([`local`]).
+    Host,
+}
+
+/// Why a device that lost its rights is not shown a session.
+const NOT_ALLOWED: &str = "its device may no longer use applications of this host";
+/// Why an application is not started for such a device.
+const NOT_STARTED: &str =
+    "the device that asked for it may no longer start applications on this host";
 
 #[derive(Default)]
 struct Orders {
@@ -372,6 +412,21 @@ impl Sessions {
                 "this device is no longer paired with the host",
             );
         };
+        // What starting takes, everything about a session takes. A device
+        // that lost a right is not shown its sessions, and does not follow,
+        // list or end them either: they are with the person at the host.
+        if !may_start(&rights) {
+            let what = match request {
+                Request::SessionStart { .. } => {
+                    "this device may not start applications on the host"
+                }
+                _ => {
+                    "this device may not use applications of the host: \
+                     that takes the right to look and to control"
+                }
+            };
+            return refuse(ErrorCode::Forbidden, what);
+        }
         match request {
             Request::SessionStart {
                 app,
@@ -379,12 +434,6 @@ impl Sessions {
                 display,
                 offer,
             } => {
-                if !may_start(&rights) {
-                    return refuse(
-                        ErrorCode::Forbidden,
-                        "this device may not start applications on the host",
-                    );
-                }
                 let asked = Asked {
                     app,
                     kind: *kind,
@@ -397,15 +446,7 @@ impl Sessions {
                 session,
                 display,
                 offer,
-            } => {
-                if !may_start(&rights) {
-                    return refuse(
-                        ErrorCode::Forbidden,
-                        "this device may not be shown applications of the host",
-                    );
-                }
-                self.attach(peer, remote, session, *display, offer)
-            }
+            } => self.attach(peer, remote, session, *display, offer),
             Request::SessionWait {
                 session,
                 after,
@@ -416,7 +457,9 @@ impl Sessions {
                 session,
                 attachment,
             } => self.detach(peer, session, *attachment),
-            Request::SessionStop { session, force } => self.stop(peer, session, *force),
+            Request::SessionStop { session, force } => {
+                self.stop(Asker::Device(peer), session, *force)
+            }
             Request::SessionList => self.list(peer),
             _ => refuse(ErrorCode::Unsupported, "not a question about a session"),
         }
@@ -462,6 +505,11 @@ impl Sessions {
 
         let id = SessionId(format!("{:016x}", OsRng.next_u64()));
         let input_socket = inner.paths.session_input_socket(&id);
+        let owner = Owner {
+            id: peer.id.clone(),
+            public_key: peer.public_key.clone(),
+            name: peer.name.clone(),
+        };
         let info = SessionInfo {
             id: id.clone(),
             app: app.id.clone(),
@@ -476,34 +524,8 @@ impl Sessions {
         };
         {
             let mut table = inner.lock();
-            let live = table
-                .sessions
-                .values()
-                .filter(|e| e.ended_at.is_none())
-                .count();
-            if live >= inner.rules.max_sessions {
-                // Nothing is ended to make room. The device is told which
-                // of its own sessions nobody is shown, so that a person can
-                // decide.
-                let mut idle: Vec<&Entry> = table
-                    .sessions
-                    .values()
-                    .filter(|e| e.info.state == SessionState::Detached && e.is_for(peer))
-                    .collect();
-                idle.sort_by_key(|e| e.number);
-                let idle: Vec<String> = idle
-                    .iter()
-                    .map(|e| format!("{} ({})", e.app_name, e.info.id))
-                    .collect();
-                let hint = if idle.is_empty() {
-                    String::new()
-                } else {
-                    format!("; of yours, nobody is shown: {}", idle.join(", "))
-                };
-                return refuse(
-                    ErrorCode::Unavailable,
-                    format!("this host already runs {live} sessions, as many as it takes{hint}"),
-                );
+            if let Some(full) = table.full_for(peer, &inner.rules) {
+                return refuse(ErrorCode::Unavailable, full);
             }
             table.started += 1;
             let number = table.started;
@@ -512,15 +534,13 @@ impl Sessions {
                 Entry {
                     info: info.clone(),
                     app_name: app.name.clone(),
-                    owner: Owner {
-                        id: peer.id.clone(),
-                        public_key: peer.public_key.clone(),
-                    },
+                    owner: owner.clone(),
                     number,
                     seen: Instant::now(),
                     waiting: 0,
                     orders: Orders::default(),
                     attached: Vec::new(),
+                    revoked: false,
                     ended_at: None,
                 },
             );
@@ -532,6 +552,7 @@ impl Sessions {
 
         let job = Job {
             id,
+            owner,
             app_name: app.name,
             runner,
             plan,
@@ -721,12 +742,12 @@ impl Sessions {
         }
     }
 
-    fn stop(&self, peer: &Peer, session: &SessionId, force: bool) -> Response {
+    fn stop(&self, asker: Asker<'_>, session: &SessionId, force: bool) -> Response {
         let inner = &self.inner;
         let deadline = Instant::now() + inner.rules.tick * 10;
         let mut table = inner.lock();
         loop {
-            let Some(entry) = table.owned(session, peer) else {
+            let Some(entry) = table.get(session, asker) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
             let over = matches!(
@@ -756,6 +777,47 @@ impl Sessions {
         }
     }
 
+    /// Every session of this host that is not over, whichever device
+    /// started it, in the order they were started. For the person at this
+    /// machine.
+    pub fn host_list(&self) -> Vec<HostSession> {
+        self.inner.forget_old();
+        let table = self.inner.lock();
+        let mut all: Vec<&Entry> = table
+            .sessions
+            .values()
+            .filter(|e| e.ended_at.is_none())
+            .collect();
+        all.sort_by_key(|e| e.number);
+        all.into_iter().map(Entry::for_host).collect()
+    }
+
+    /// One session, whichever device started it; also for a while after it
+    /// is over.
+    pub fn host_look(&self, session: &SessionId) -> Option<HostSession> {
+        self.inner
+            .lock()
+            .get(session, Asker::Host)
+            .map(|entry| entry.for_host())
+    }
+
+    /// Asks a session's application to close, or with `force` ends it: what
+    /// the device that started it can do, done by the person at this
+    /// machine.
+    pub fn host_stop(
+        &self,
+        session: &SessionId,
+        force: bool,
+    ) -> Result<HostSession, (ErrorCode, String)> {
+        self.inner.forget_old();
+        match self.stop(Asker::Host, session, force) {
+            Response::Error { code, message } => Err((code, message)),
+            _ => self
+                .host_look(session)
+                .ok_or_else(|| (ErrorCode::NotFound, "no such session".to_string())),
+        }
+    }
+
     /// The report of a session, whoever asks. For tests.
     #[cfg(test)]
     pub(crate) fn look(&self, session: &SessionId) -> Option<SessionInfo> {
@@ -771,18 +833,101 @@ impl Entry {
     fn is_for(&self, peer: &Peer) -> bool {
         policy::may_use(&self.owner.id, &self.owner.public_key, peer)
     }
+
+    /// Whether `peer` is the device that started it, whoever else may use
+    /// it.
+    fn started_by(&self, peer: &Peer) -> bool {
+        self.owner.id == peer.id && self.owner.public_key == peer.public_key
+    }
+
+    /// What the person at the host is told about it.
+    fn for_host(&self) -> HostSession {
+        let mut info = self.info.clone();
+        // What the media path agreed on is for the client that is shown
+        // the session. It has no place in a list.
+        info.answer = None;
+        HostSession {
+            info,
+            app_name: self.app_name.clone(),
+            started_by: StartedBy {
+                id: self.owner.id.clone(),
+                name: self.owner.name.clone(),
+            },
+            revoked: self.revoked,
+        }
+    }
 }
 
 impl Table {
-    /// The session `session`, when `peer` may use it. A session that is not
-    /// for `peer` is not there for it, like one that never was.
-    fn owned(&mut self, session: &SessionId, peer: &Peer) -> Option<&mut Entry> {
+    /// The session `session`, when `asker` may use it. A session that is
+    /// not for a device is not there for it, like one that never was.
+    fn get(&mut self, session: &SessionId, asker: Asker<'_>) -> Option<&mut Entry> {
         if !session.is_well_formed() {
             return None;
         }
         self.sessions
             .get_mut(&session.0)
-            .filter(|entry| entry.is_for(peer))
+            .filter(|entry| match asker {
+                Asker::Device(peer) => entry.is_for(peer),
+                Asker::Host => true,
+            })
+    }
+
+    fn owned(&mut self, session: &SessionId, peer: &Peer) -> Option<&mut Entry> {
+        self.get(session, Asker::Device(peer))
+    }
+
+    /// Why `peer` cannot start one more session, when it cannot: it has as
+    /// many as one device may, or the host has as many as it takes. Nothing
+    /// is ended to make room. The device is told which of its sessions
+    /// nobody is shown, so that a person can decide.
+    fn full_for(&self, peer: &Peer, rules: &Rules) -> Option<String> {
+        let live: Vec<&Entry> = self
+            .sessions
+            .values()
+            .filter(|e| e.ended_at.is_none())
+            .collect();
+        let own = live.iter().filter(|e| e.started_by(peer)).count();
+        let mut idle: Vec<&&Entry> = live
+            .iter()
+            .filter(|e| e.info.state == SessionState::Detached && e.is_for(peer))
+            .collect();
+        idle.sort_by_key(|e| e.number);
+        let idle: Vec<String> = idle
+            .iter()
+            .map(|e| format!("{} ({})", e.app_name, e.info.id))
+            .collect();
+
+        if own >= rules.max_sessions_per_device {
+            let hint = if idle.is_empty() {
+                String::new()
+            } else {
+                format!("; nobody is shown: {}", idle.join(", "))
+            };
+            return Some(format!(
+                "this device already has {own} sessions on this host, as many as one device \
+                 may have{hint}"
+            ));
+        }
+        if live.len() >= rules.max_sessions {
+            let mut why = format!(
+                "this host already runs {} sessions, as many as it takes",
+                live.len()
+            );
+            if !idle.is_empty() {
+                why.push_str(&format!("; of yours, nobody is shown: {}", idle.join(", ")));
+            }
+            // Places that only the person at the host can free.
+            let closed = live.iter().filter(|e| e.revoked).count();
+            if closed > 0 {
+                why.push_str(&format!(
+                    "; {closed} were started by devices that may no longer use them: \
+                     `istesso sessions --local` on the host lists them"
+                ));
+            }
+            return Some(why);
+        }
+        None
     }
 }
 
@@ -793,6 +938,7 @@ impl Table {
 /// What the supervising thread of a session is given.
 struct Job {
     id: SessionId,
+    owner: Owner,
     app_name: String,
     runner: Arc<dyn Runner>,
     plan: LaunchPlan,
@@ -808,6 +954,8 @@ struct Round {
     attach: Option<Attach>,
     /// The client that is shown the session is to be left, and why.
     leave: Option<String>,
+    /// The device that started the session may not use it now.
+    revoked: bool,
 }
 
 impl Inner {
@@ -852,13 +1000,40 @@ impl Inner {
         self.changed.notify_all();
     }
 
-    /// Takes what the session's owner asked for since the last round, and
-    /// looks whether the client that is shown the session is still there
-    /// and still allowed. `attaching` is set while a client is being
-    /// attached: the one before it no longer counts.
-    fn round(&self, id: &SessionId, rights_read: &mut Option<Instant>, attaching: bool) -> Round {
+    /// Whether the device that started a session may still use one: read
+    /// from the list of paired devices now.
+    fn allowed(&self, owner: &Owner) -> bool {
+        rights(&self.paths, &owner.id, &owner.public_key).is_some_and(|rights| may_start(&rights))
+    }
+
+    /// Notes that the device that started a session lost the right to use
+    /// it, or has it back. The person at the host is the one who sees this.
+    fn mark(&self, job: &Job, revoked: bool) {
+        if let Some(entry) = self.lock().sessions.get_mut(&job.id.0) {
+            entry.revoked = revoked;
+        }
+        self.changed.notify_all();
+        let (id, name) = (&job.id, &job.owner.name);
+        (self.log)(if revoked {
+            format!(
+                "session {id}: {name} may no longer use it; {} keeps running, and \
+                 `istesso sessions --local` on this machine lists it",
+                job.app_name
+            )
+        } else {
+            format!("session {id}: {name} may use it again")
+        });
+    }
+
+    /// Takes what was asked for since the last round, looks whether the
+    /// client that is shown the session is still there, and reads again
+    /// what the device that started the session may do. `attaching` is set
+    /// while a client is being attached: the one before it no longer
+    /// counts.
+    fn round(&self, job: &Job, rights_read: &mut Option<Instant>, attaching: bool) -> Round {
+        let id = &job.id;
         let mut round = Round::default();
-        let (owner, shown) = {
+        let showing = {
             let mut table = self.lock();
             let Some(entry) = table.sessions.get_mut(&id.0) else {
                 return round;
@@ -867,12 +1042,12 @@ impl Inner {
             round.force = orders.force;
             round.close = orders.close;
             round.attach = orders.attach;
-            let shown = matches!(
+            round.revoked = entry.revoked;
+            let showing = matches!(
                 entry.info.state,
                 SessionState::Starting | SessionState::Running
-            ) && !attaching
-                && round.attach.is_none();
-            if shown {
+            );
+            if showing && !attaching && round.attach.is_none() {
                 let lost_after = self.rules.client_lost_after;
                 if orders.detach {
                     round.leave = Some("its client left".to_string());
@@ -883,18 +1058,30 @@ impl Inner {
                     ));
                 }
             }
-            (entry.owner.clone(), shown)
+            showing || attaching
         };
-        // A pairing that is removed, or a right that is taken away, stops
-        // the picture soon. It does not end the application.
-        let due = rights_read.is_none_or(|at| at.elapsed() >= self.rules.recheck_rights_every);
-        if shown && round.leave.is_none() && due {
+        // The rights are read for every session, shown or not: a session
+        // nobody is shown still holds a place and can be attached to. They
+        // are read every so often, and always before a client is attached.
+        let due = round.attach.is_some()
+            || rights_read.is_none_or(|at| at.elapsed() >= self.rules.recheck_rights_every);
+        if due {
             *rights_read = Some(Instant::now());
-            let allowed = rights(&self.paths, &owner.id, &owner.public_key)
-                .is_some_and(|rights| may_start(&rights));
-            if !allowed {
-                round.leave =
-                    Some("its device is no longer allowed to be shown applications".to_string());
+            let revoked = !self.allowed(&job.owner);
+            if revoked != round.revoked {
+                self.mark(job, revoked);
+            }
+            round.revoked = revoked;
+        }
+        if round.revoked {
+            // A pairing that is removed, or a right that is taken away,
+            // stops the picture and keeps it stopped. It does not end the
+            // application.
+            if let Some(attach) = round.attach.take() {
+                self.attach_went(id, attach.number, Err(NOT_ALLOWED.to_string()));
+            }
+            if showing {
+                round.leave = Some(NOT_ALLOWED.to_string());
             }
         }
         round
@@ -954,9 +1141,13 @@ impl Inner {
                     );
                     break 'session ending(EndReason::StreamFailed, why);
                 }
-                let round = self.round(id, &mut rights_read, false);
+                let round = self.round(&job, &mut rights_read, false);
                 if round.force {
                     break 'session ending(EndReason::Stopped, "");
+                }
+                if round.revoked {
+                    // No application runs yet, so no work is lost.
+                    break 'session ending(EndReason::Stopped, NOT_STARTED);
                 }
                 left_early = left_early.or(round.leave);
                 self.pause();
@@ -968,7 +1159,12 @@ impl Inner {
                 );
             }
 
-            // The application, on the display the runner made.
+            // The application, on the display the runner made. Nothing is
+            // started for a device that lost its rights while the runner
+            // got ready.
+            if !self.allowed(&job.owner) {
+                break 'session ending(EndReason::Stopped, NOT_STARTED);
+            }
             let application = match self.launcher.launch(&job.plan, &env) {
                 Ok(application) => app.insert(application),
                 Err(why) => {
@@ -1063,7 +1259,7 @@ impl Inner {
                     }
                 }
 
-                let round = self.round(id, &mut rights_read, attaching.is_some());
+                let round = self.round(&job, &mut rights_read, attaching.is_some());
                 if round.force {
                     break 'session ending(EndReason::Stopped, "");
                 }
@@ -1091,6 +1287,11 @@ impl Inner {
                 } else if let Some(why) = round.leave {
                     let _ = running.tell(&RunnerCommand::Detach);
                     self.detached(id, &why);
+                    // A client that was being attached is not shown it
+                    // either.
+                    if let Some((number, _)) = attaching.take() {
+                        self.attach_went(id, number, Err(why));
+                    }
                 }
                 self.pause();
             }
