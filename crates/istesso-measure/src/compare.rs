@@ -44,6 +44,57 @@ pub const VERDICT_SAMPLES: usize = 2000;
 /// read was settled before it was measured (ADR 0002, 2026-11-16).
 pub const MEDIAN_BORDER_MS: f64 = 0.4;
 
+/// More inputs than this share appearing two refreshes of the display or more
+/// later than in the local window fail a verdict, whatever the percentiles
+/// say: getting much worse now and then must not go unnoticed (ADR 0002,
+/// decided 2026-11-16 after the provisional verdict, where it was 3.2 %).
+pub const LATE_SHARE_LIMIT: f64 = 0.10;
+
+/// Where the inputs of a run fall when the relayed window's added latency is
+/// held against the local window's input by input: the differences come in
+/// steps of one refresh of the display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Steps {
+    /// In the same refresh as the local window, or earlier.
+    pub same: usize,
+    /// One refresh later.
+    pub one_later: usize,
+    /// Two refreshes later, or more.
+    pub later: usize,
+}
+
+impl Steps {
+    fn of(differences_ms: &[f64], refresh_ms: f64) -> Steps {
+        let mut steps = Steps {
+            same: 0,
+            one_later: 0,
+            later: 0,
+        };
+        for difference in differences_ms {
+            match (difference / refresh_ms).round() as i64 {
+                ..=0 => steps.same += 1,
+                1 => steps.one_later += 1,
+                _ => steps.later += 1,
+            }
+        }
+        steps
+    }
+
+    pub fn inputs(&self) -> usize {
+        self.same + self.one_later + self.later
+    }
+
+    /// The share of inputs two refreshes or more late.
+    pub fn late_share(&self) -> f64 {
+        self.later as f64 / self.inputs().max(1) as f64
+    }
+
+    /// Whether no more inputs are two refreshes or more late than a verdict allows.
+    pub fn within(&self) -> bool {
+        self.late_share() <= LATE_SHARE_LIMIT
+    }
+}
+
 /// How one figure of a run stands against the pass line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Standing {
@@ -141,6 +192,9 @@ pub struct Comparison {
     /// the display, and their median says on which step most inputs fall.
     pub added_later_by: Option<Summary>,
     pub added_later_by_mean_ms: Option<f64>,
+    /// How many inputs fall on which step of that difference. `None` unless
+    /// the applications' logs and the display's refresh rate were given.
+    pub steps: Option<Steps>,
     /// For reference: input sent, to the relayed window showing it.
     pub relayed: Option<Summary>,
     /// For reference: input sent, to the local window showing it.
@@ -265,6 +319,9 @@ impl Comparison {
             repeated,
             by_hand,
             later_by: Summary::of(&later_by),
+            steps: refresh_ms
+                .filter(|_| !added_later_by.is_empty())
+                .map(|refresh| Steps::of(&added_later_by, refresh)),
             added_later_by: Summary::of(&added_later_by),
             added_later_by_mean_ms,
             relayed: Summary::of(&relayed_trip),
@@ -403,6 +460,25 @@ impl Comparison {
                         "The 99th percentile is judged only in runs of {VERDICT_SAMPLES} inputs or more: \
                          in a shorter run it rests on a handful of inputs."
                     );
+                }
+                match &self.steps {
+                    Some(steps) => {
+                        let share = |count: usize| 100.0 * count as f64 / steps.inputs().max(1) as f64;
+                        let _ = writeln!(
+                            out,
+                            "Input by input: {:.1}% in the same refresh as the local window, {:.1}% one refresh \
+                             later, {:.1}% two or more later. More than {:.0}% two or more later fails a verdict: {}.",
+                            share(steps.same),
+                            share(steps.one_later),
+                            share(steps.later),
+                            100.0 * LATE_SHARE_LIMIT,
+                            if steps.within() { "within" } else { "over" }
+                        );
+                    }
+                    None => out.push_str(
+                        "Give the display's refresh rate (--refresh-hz) to count the inputs that appear two \
+                         refreshes or more later than in the local window: a verdict allows a tenth of them.\n",
+                    ),
                 }
                 out.push_str(
                     "The pass line applies with both machines on a cable, a display at 85 Hz, a relayed \
@@ -626,6 +702,35 @@ mod tests {
         assert_eq!(by_input.median_ms, 12.0);
         assert_eq!(by_input.max_ms, 12.0);
         assert_eq!(c.added_later_by_mean_ms, Some(9.25));
+        assert!(
+            c.steps.is_none(),
+            "without the refresh rate the steps cannot be told apart"
+        );
+        // With it: one input in the same refresh, three one refresh later, none later still.
+        let c = Comparison::build(
+            &local,
+            &relayed,
+            Some(&local_app),
+            Some(&relayed_app),
+            Some(85.0),
+        );
+        let steps = c.steps.unwrap();
+        assert_eq!((steps.same, steps.one_later, steps.later), (1, 3, 0));
+        assert!(steps.within());
+        // More than a tenth of the inputs two refreshes or more late fails a verdict.
+        let late = Steps {
+            same: 10,
+            one_later: 79,
+            later: 11,
+        };
+        assert!(!late.within());
+        // Exactly a tenth is still allowed.
+        assert!(Steps {
+            same: 11,
+            later: 10,
+            ..late
+        }
+        .within());
         // Without the applications' logs there is no added latency to take a difference of.
         let c = Comparison::build(&local, &relayed, None, None, None);
         assert!(c.added_later_by.is_none() && c.added_later_by_mean_ms.is_none());

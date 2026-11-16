@@ -35,7 +35,8 @@ pub mod stats;
 
 pub use clock::Clock;
 pub use compare::{
-    Comparison, Gap, Standing, LOCAL_DRIFT_LIMIT_MS, MEDIAN_BORDER_MS, PASS_LINE, VERDICT_SAMPLES,
+    Comparison, Gap, Standing, Steps, LATE_SHARE_LIMIT, LOCAL_DRIFT_LIMIT_MS, MEDIAN_BORDER_MS,
+    PASS_LINE, VERDICT_SAMPLES,
 };
 pub use flash::{classify, FlashAck, FlashInput, Rgb, Shade, DEFAULT_FLASH_PORT};
 pub use jitter::Jitter;
