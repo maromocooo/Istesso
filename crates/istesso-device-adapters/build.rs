@@ -1,7 +1,7 @@
 //! Makes the list of adapters from the directories under `adapters/`.
 //!
-//! Adding an adapter means adding a directory. Nothing in the core names an
-//! adapter, so nothing in the core changes (ADR 0012).
+//! Adding an adapter means adding a directory. Nothing else names an adapter,
+//! so nothing else changes (ADR 0012).
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ fn main() {
     }
     code.push_str("\n/// Every adapter that was built in, with the name of its directory.\n");
     code.push_str(
-        "pub fn entries() -> Vec<(&'static str, istesso_device_api::AdapterEntry)> {\n    vec![\n",
+        "pub fn entries() -> alloc::vec::Vec<(&'static str, istesso_device_api::AdapterEntry)> {\n    alloc::vec![\n",
     );
     for name in &names {
         writeln!(code, "        ({name:?}, {name}::entry()),").expect("writing to a string");

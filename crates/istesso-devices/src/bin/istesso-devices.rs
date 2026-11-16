@@ -91,10 +91,8 @@ fn adapters() -> Result<ExitCode, String> {
 }
 
 fn udev_rules(group: &str) -> Result<ExitCode, String> {
-    if !udev::valid_group(group) {
-        return Err(format!("`{group}` is not a group name"));
-    }
-    print!("{}", udev::rules(&registry::entries(), group));
+    registry::check()?;
+    print!("{}", udev::rules(&registry::entries(), group)?);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -111,6 +109,7 @@ mod real {
     use istesso_devices::{registry, software};
 
     pub fn find() -> Result<ExitCode, String> {
+        registry::check()?;
         let hid = Hid::new()?;
         let found = hid.find(&registry::entries());
         if found.is_empty() {
@@ -173,6 +172,7 @@ mod real {
             }
         }
 
+        registry::check()?;
         let hid = Hid::new()?;
         let found = hid.find(&registry::entries());
         let Some(device) = found.first() else {

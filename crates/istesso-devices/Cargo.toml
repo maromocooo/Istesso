@@ -14,5 +14,10 @@ hid = ["dep:hidapi"]
 
 [dependencies]
 istesso-device-api.workspace = true
+istesso-device-adapters.workspace = true
 image.workspace = true
 hidapi = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Reads the adapters' sources as tokens, for a check that helps review.
+proc-macro2.workspace = true

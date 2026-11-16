@@ -1,17 +1,13 @@
 //! The adapters that were built in.
 //!
-//! The list is made by `build.rs` from the directories under `adapters/`.
-//! Nothing here names an adapter.
+//! They live in the crate `istesso-device-adapters`, which collects them from
+//! its directories. Nothing here names an adapter.
 
 use istesso_device_api::{AdapterEntry, UsbId};
 
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/adapters.rs"));
-}
-
 /// Every adapter, with the name of its directory.
 pub fn entries() -> Vec<(&'static str, AdapterEntry)> {
-    generated::entries()
+    istesso_device_adapters::entries()
 }
 
 /// The adapter for a device, if there is one.
@@ -29,15 +25,15 @@ pub fn by_name(name: &str) -> Option<AdapterEntry> {
         .map(|(_, entry)| entry)
 }
 
-/// What is wrong with the declarations, if anything: a device claimed by two
-/// adapters, a write without a command byte, an adapter without a device.
+/// What is wrong with the declarations, if anything: a string with characters
+/// that do not belong in a name, a device claimed by two adapters, a write
+/// without a command byte, an adapter without a device.
 pub fn check() -> Result<(), String> {
     let all = entries();
     for (index, (name, entry)) in all.iter().enumerate() {
         let declaration = entry.declaration;
-        if declaration.name.trim().is_empty() {
-            return Err(format!("adapter `{name}` has no name to show"));
-        }
+        crate::declared::check(declaration)
+            .map_err(|error| format!("adapter `{name}`: {error}"))?;
         if declaration.devices.is_empty() {
             return Err(format!("adapter `{name}` names no device"));
         }

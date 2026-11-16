@@ -1,19 +1,30 @@
-//! Checks that hold for every adapter under `adapters/`, whoever wrote it.
+//! Checks that hold for every adapter, whoever wrote it.
 //!
-//! An adapter is code the author may not be able to run. These checks are
-//! what stands in for running it: the fence around what its source may name,
-//! and the replay of the recordings that came with it.
+//! What an adapter can name is limited by the compiler: the adapters are a
+//! crate of their own without a standard library, whose only dependency is
+//! the interface crate (see `istesso-device-adapters`). That is the boundary.
+//!
+//! The scan of the sources below is **not** a boundary. It is a help for the
+//! reviewer: it points at the few words the compiler still allows and that an
+//! adapter has no reason to use (`extern crate std;` above all). An adapter
+//! is compiled-in code and is trusted like the rest of the program; nothing
+//! here is a sandbox.
+//!
+//! The other check is the replay of the recordings that come with an
+//! adapter.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use istesso_devices::{record, registry};
+use proc_macro2::{TokenStream, TokenTree};
 
 fn adapters_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../istesso-device-adapters/adapters")
 }
 
-/// The directories under `adapters/`.
+/// The directories of the adapters.
 fn adapter_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = fs::read_dir(adapters_dir())
         .expect("the adapters directory")
@@ -49,122 +60,94 @@ fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
     files
 }
 
-/// The crates the framework itself may use. An adapter may name none of them.
-fn framework_dependencies() -> Vec<String> {
-    let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-        .expect("Cargo.toml");
-    let mut inside = false;
-    let mut names = Vec::new();
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            inside = line.contains("dependencies");
-            continue;
-        }
-        if !inside {
-            continue;
-        }
-        if let Some((name, _)) = line.split_once(['=', '.']) {
-            let name = name.trim().replace('-', "_");
-            if !name.is_empty() && name != "istesso_device_api" {
-                names.push(name);
+/// Words an adapter has no reason to use, and why a reviewer should look.
+const WORDS: &[(&str, &str)] = &[
+    (
+        "extern",
+        "`extern crate std;` would bring the standard library back",
+    ),
+    (
+        "unsafe",
+        "an adapter has no unsafe code (the compiler refuses it as well)",
+    ),
+    ("include", "an adapter is its own source and nothing else"),
+    ("include_str", "an adapter reads no files"),
+    ("include_bytes", "an adapter reads no files"),
+    ("env", "an adapter reads no environment"),
+    ("option_env", "an adapter reads no environment"),
+    ("path", "`#[path]` would pull in a file from elsewhere"),
+    (
+        "std",
+        "the adapters' crate has no standard library; use `core` and `alloc`",
+    ),
+];
+
+fn collect(tokens: TokenStream, found: &mut Vec<String>) {
+    for token in tokens {
+        match token {
+            TokenTree::Ident(ident) => {
+                let word = ident.to_string();
+                if let Some((_, why)) = WORDS.iter().find(|(w, _)| *w == word) {
+                    found.push(format!("`{word}`: {why}"));
+                }
             }
+            TokenTree::Group(group) => collect(group.stream(), found),
+            TokenTree::Punct(_) | TokenTree::Literal(_) => {}
         }
     }
-    names
 }
 
-/// What an adapter's source must not contain, and why.
-fn fence() -> Vec<(String, &'static str)> {
-    let mut fence: Vec<(String, &'static str)> = vec![
-        ("unsafe".into(), "an adapter has no unsafe code"),
-        (
-            "std::".into(),
-            "an adapter uses `core::` and the interface crate, not the standard library",
-        ),
-        ("extern ".into(), "an adapter links nothing"),
-        (
-            "include!".into(),
-            "an adapter is its own source and nothing else",
-        ),
-        ("include_str!".into(), "an adapter reads no files"),
-        ("include_bytes!".into(), "an adapter reads no files"),
-        ("env!".into(), "an adapter reads no environment"),
-        (
-            "crate::".into(),
-            "an adapter does not reach into the framework",
-        ),
-        (
-            "super::".into(),
-            "an adapter does not reach into the framework",
-        ),
-        ("#[path".into(), "an adapter is one directory"),
-        (
-            "macro_rules!".into(),
-            "macros would hide what the code names",
-        ),
-    ];
-    for dependency in framework_dependencies() {
-        fence.push((
-            format!("{dependency}::"),
-            "an adapter depends on the interface crate only",
-        ));
+/// The words of [`WORDS`] that appear in `source` as code. Comments and
+/// string literals do not count, spacing does not matter, and the inside of
+/// macros is looked at too.
+fn words_to_look_at(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    match TokenStream::from_str(source) {
+        Ok(tokens) => collect(tokens, &mut found),
+        Err(error) => found.push(format!("the source could not be read as Rust: {error}")),
     }
-    fence
-}
-
-/// The source without its `//` comments, so that prose may use any word.
-fn code_only(source: &str) -> String {
-    source
-        .lines()
-        .map(|line| line.split("//").next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn broken_fences(source: &str) -> Vec<String> {
-    let code = code_only(source);
-    fence()
-        .into_iter()
-        .filter(|(needle, _)| code.contains(needle.as_str()))
-        .map(|(needle, why)| format!("`{needle}`: {why}"))
-        .collect()
+    found.sort();
+    found.dedup();
+    found
 }
 
 #[test]
-fn the_fence_finds_what_it_is_there_for() {
+fn the_scan_points_at_the_words_it_is_there_for() {
+    let fine = "use alloc::vec;\n// std::fs is not for adapters\nfn f() -> core::fmt::Result { let _ = \"extern crate std\"; Ok(()) }";
     assert!(
-        broken_fences("use istesso_device_api::*;\nfn f() -> core::fmt::Result { Ok(()) }")
-            .is_empty()
-    );
-    assert!(
-        broken_fences("// std::fs is not for adapters\nfn f() {}").is_empty(),
-        "comments are prose"
+        words_to_look_at(fine).is_empty(),
+        "comments and strings are not code"
     );
     for bad in [
-        "fn f() { std::fs::read(\"/etc/passwd\").ok(); }",
-        "fn f() { unsafe { core::hint::unreachable_unchecked() } }",
-        "use crate::transport::Transport;",
-        "use super::generated;",
-        "fn f() { image::open(\"x\").ok(); }",
+        "extern crate std;",
+        "extern   crate\n std as s;",
+        "/* a */ extern /* b */ crate std;",
+        "macro_rules! m { () => { extern crate std; } }",
+        "use ::std::fs;",
+        "use std as s;",
+        "#[path = \"../../../../istesso-devices/src/transport.rs\"] mod t;",
         "const KEY: &str = include_str!(\"../../../../secret\");",
+        "const HOME: &str = env!(\"HOME\");",
+        "fn f() { unsafe { core::hint::unreachable_unchecked() } }",
     ] {
-        assert!(!broken_fences(bad).is_empty(), "should be stopped: {bad}");
+        assert!(
+            !words_to_look_at(bad).is_empty(),
+            "should be pointed at: {bad}"
+        );
     }
-    assert!(framework_dependencies().contains(&"image".to_string()));
 }
 
 #[test]
-fn adapters_stay_inside_the_fence() {
+fn no_adapter_uses_a_word_a_reviewer_should_look_at() {
     for dir in adapter_dirs() {
         for file in files_with_extension(&dir, "rs") {
             let source = fs::read_to_string(&file).expect("adapter source");
-            let broken = broken_fences(&source);
+            let found = words_to_look_at(&source);
             assert!(
-                broken.is_empty(),
+                found.is_empty(),
                 "{}:\n  {}",
                 file.display(),
-                broken.join("\n  ")
+                found.join("\n  ")
             );
         }
     }

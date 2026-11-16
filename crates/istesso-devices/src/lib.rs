@@ -6,11 +6,13 @@
 //! pictures into the form the device wants, and recording an exchange so that
 //! it can be replayed without the device.
 //!
-//! The conversation itself is an adapter. Adapters live in `adapters/`, one
-//! directory each, and see nothing but `istesso-device-api`.
+//! The conversation itself is an adapter. Adapters live in the crate
+//! `istesso-device-adapters`, one directory each, and see nothing but
+//! `istesso-device-api`.
 
 #![forbid(unsafe_code)]
 
+pub mod declared;
 pub mod guard;
 #[cfg(feature = "hid")]
 pub mod hid;

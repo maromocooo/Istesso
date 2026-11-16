@@ -12,11 +12,20 @@
 //! keys. Listing devices, knowing which PC a device is plugged into, carrying
 //! notices between machines, rights and switching belong to the framework.
 //!
+//! The crate needs no standard library, so that the crate of the adapters
+//! can do without one too.
+//!
 //! The interface is not frozen. Until a second, different kind of device has
 //! been put through it, [`API_VERSION`] stays at 0 and anything here may
 //! change.
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::string::String;
 
 /// Version of this interface. 0 means "not frozen".
 pub const API_VERSION: u32 = 0;

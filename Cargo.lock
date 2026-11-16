@@ -520,6 +520,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "istesso-device-adapters"
+version = "0.0.1"
+dependencies = [
+ "istesso-device-api",
+]
+
+[[package]]
 name = "istesso-device-api"
 version = "0.0.1"
 
@@ -529,7 +536,9 @@ version = "0.0.1"
 dependencies = [
  "hidapi",
  "image",
+ "istesso-device-adapters",
  "istesso-device-api",
+ "proc-macro2",
 ]
 
 [[package]]

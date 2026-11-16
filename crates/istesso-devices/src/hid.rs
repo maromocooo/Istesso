@@ -17,8 +17,9 @@ pub struct Found {
     pub adapter: &'static str,
     pub entry: AdapterEntry,
     pub id: UsbId,
-    /// The name the device gives itself.
-    pub product: String,
+    /// The name from the adapter's declaration. What the device calls itself
+    /// is not used: it is text from outside, and it would be shown as it is.
+    pub product: &'static str,
     path: CString,
 }
 
@@ -61,10 +62,7 @@ impl Hid {
                 adapter,
                 entry: *entry,
                 id,
-                product: info
-                    .product_string()
-                    .unwrap_or(entry.declaration.name)
-                    .to_string(),
+                product: entry.declaration.name,
                 path,
             });
         }

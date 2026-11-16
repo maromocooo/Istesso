@@ -18,6 +18,7 @@ istesso-pair = { path = "crates/istesso-pair" }
 istesso-link = { path = "crates/istesso-link" }
 istesso-agent = { path = "crates/istesso-agent" }
 istesso-device-api = { path = "crates/istesso-device-api" }
+istesso-device-adapters = { path = "crates/istesso-device-adapters" }
 
 # Third-party crates. Every dependency must pass the licence allowlist in deny.toml.
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +44,8 @@ image = { version = "=0.25.6", default-features = false, features = ["jpeg"] }
 # No default features: the default Linux backend needs the system's libudev,
 # and the libusb backends would bring in LGPL code.
 hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev"] }
+# Only in tests of the device framework. Already in the tree through serde and clap.
+proc-macro2 = "1"
 
 [profile.release]
 lto = "thin"
