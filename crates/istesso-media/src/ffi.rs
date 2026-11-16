@@ -91,7 +91,9 @@ impl From<IstessoMediaStreamInfo> for StreamInfo {
 pub struct IstessoMediaSent {
     pub seq: u64,
     pub viewers: u32,
+    pub queued: u32,
     pub messages: u32,
+    pub reserved: u32,
 }
 
 /// One frame, as `istesso_media_client_next` hands it over.
@@ -281,7 +283,9 @@ pub unsafe extern "C" fn istesso_media_host_send(
                     *sent = IstessoMediaSent {
                         seq: result.seq,
                         viewers: result.viewers,
+                        queued: result.queued,
                         messages: result.messages,
+                        reserved: 0,
                     }
                 };
             }
@@ -534,7 +538,7 @@ mod tests {
     #[test]
     fn the_structures_are_laid_out_as_the_header_says() {
         assert_eq!(std::mem::size_of::<IstessoMediaStreamInfo>(), 24);
-        assert_eq!(std::mem::size_of::<IstessoMediaSent>(), 16);
+        assert_eq!(std::mem::size_of::<IstessoMediaSent>(), 24);
         assert_eq!(std::mem::size_of::<IstessoMediaFrame>(), 72);
         assert_eq!(std::mem::offset_of!(IstessoMediaFrame, first_ns), 40);
         assert_eq!(std::mem::offset_of!(IstessoMediaFrame, key_frame), 56);
@@ -605,6 +609,7 @@ mod tests {
             );
             assert_eq!(result, 0, "{}", last_error());
             assert_eq!((sent.seq, sent.viewers, sent.messages), (0, 1, 3));
+            assert!(sent.queued <= 1);
 
             let mut frame = std::mem::zeroed::<IstessoMediaFrame>();
             assert_eq!(istesso_media_client_next(client, 5000, &mut frame), 1);

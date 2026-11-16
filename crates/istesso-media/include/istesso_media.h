@@ -41,8 +41,11 @@ typedef struct IstessoMediaStreamInfo {
 /* What became of a frame handed to istesso_media_host_send(). */
 typedef struct IstessoMediaSent {
     uint64_t seq;      /* the frame's sequence number */
-    uint32_t viewers;  /* devices it was written to; one that waits for a key frame gets nothing before it */
+    uint32_t viewers;  /* devices it went to; one that waits for a key frame gets nothing before it */
+    uint32_t queued;   /* of those, the ones whose connection did not take all of it at once: the
+                          rest is on its way and is finished, or given up, within 0.2 s */
     uint32_t messages; /* messages of the encrypted channel it took, for each of them */
+    uint32_t reserved;
 } IstessoMediaSent;
 
 /* One frame, as istesso_media_client_next() hands it over. */
@@ -62,7 +65,7 @@ typedef struct IstessoMediaFrame {
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(IstessoMediaStreamInfo) == 24, "IstessoMediaStreamInfo differs from src/ffi.rs");
-_Static_assert(sizeof(IstessoMediaSent) == 16, "IstessoMediaSent differs from src/ffi.rs");
+_Static_assert(sizeof(IstessoMediaSent) == 24, "IstessoMediaSent differs from src/ffi.rs");
 _Static_assert(sizeof(void *) != 8 || sizeof(IstessoMediaFrame) == 72, "IstessoMediaFrame differs from src/ffi.rs");
 #endif
 
@@ -84,8 +87,10 @@ IstessoMediaHost *istesso_media_host_listen(const char *config_dir, const char *
 uint16_t istesso_media_host_port(const IstessoMediaHost *host);
 
 /*
- * Sends one encoded frame to every viewer that can decode it and returns when it has been
- * written to their connections. A viewer that does not take it within 0.2 s is cut off.
+ * Sends one encoded frame to every viewer that can decode it. Never waits for a viewer: the
+ * frame is put on each connection as far as the connection takes it at once, which on a local
+ * network is all of it. The rest is finished behind the caller's back, and a viewer that has
+ * not taken a whole frame within 0.2 s is cut off; until then it is sent nothing more.
  * `pts_ns` and `encoded_ns` travel with the frame. `sent` may be NULL. 0, or -1 on failure
  * (a frame of more than 8 MiB). With nobody watching it does nothing, and that is no failure.
  */
@@ -96,7 +101,7 @@ int32_t istesso_media_host_send(const IstessoMediaHost *host, const uint8_t *dat
 /*
  * 1 when a key frame is needed: a viewer has connected, has asked for one, or was held back.
  * 1 once for each time; the caller tells the encoder. Call it regularly, also while no frame
- * is produced: a viewer's request is read here.
+ * is produced.
  */
 int32_t istesso_media_host_key_frame_wanted(const IstessoMediaHost *host);
 

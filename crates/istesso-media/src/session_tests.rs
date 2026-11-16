@@ -110,14 +110,30 @@ impl Pair {
     /// A device that has asked for the picture and been answered, and that
     /// is driven by hand from there on.
     fn raw_watching(&self) -> Channel<TcpStream> {
-        let mut channel = self.raw(&self.air).unwrap();
+        self.raw_watching_as(&self.air)
+    }
+
+    fn raw_watching_as(&self, identity: &Identity) -> Channel<TcpStream> {
+        let before = self.host.viewers();
+        let mut channel = self.raw(identity).unwrap();
         channel
             .send(&serde_json::to_vec(&Ask::Watch { version: 1 }).unwrap())
             .unwrap();
         let reply: Reply = serde_json::from_slice(&channel.recv().unwrap()).unwrap();
         assert!(matches!(reply, Reply::Stream { .. }));
-        self.until(|| self.host.viewers() == 1);
+        self.until(|| self.host.viewers() == before + 1);
         channel
+    }
+
+    /// Pairs another device with the host, and tells the devices' side of
+    /// the tests nothing: they all trust the host already.
+    fn another_device(&self, name: &str) -> Identity {
+        let device = Identity::generate();
+        self.studio_peers
+            .open()
+            .add(crate::testing::peer(name, &device))
+            .unwrap();
+        device
     }
 }
 
@@ -455,10 +471,9 @@ fn nothing_is_sent_while_the_list_has_not_been_looked_at_for_a_second() {
     // The viewer is still connected; it is only not sent anything.
     assert_eq!(pair.host.viewers(), 1);
     assert_eq!(pair.host.send_frame(b"key", 2, 2, true).unwrap().viewers, 0);
-    // Having missed frames, it will need a key frame.
-    assert!(pair.host.key_frame_wanted());
 
-    // The look-ups go on again: the stream does, from a key frame.
+    // The look-ups go on again: the stream does, from a key frame, which
+    // the viewer needs now that it has missed frames.
     pair.host.pause_recheck(false);
     pair.until(|| {
         pair.host.send_frame(b"delta", 3, 3, false).is_ok() && pair.host.key_frame_wanted()
@@ -638,7 +653,7 @@ fn the_host_shows_its_picture_to_a_few_devices_and_no_more() {
     // One of them leaves: there is a place again.
     viewers.pop();
     pair.until(|| pair.host.viewers() == crate::host::MAX_STREAMS - 1);
-    assert!(pair.connect_as(&devices[crate::host::MAX_STREAMS]).is_ok());
+    pair.until(|| pair.connect_as(&devices[crate::host::MAX_STREAMS]).is_ok());
 }
 
 #[test]
@@ -762,23 +777,224 @@ fn a_viewer_that_begins_a_request_and_does_not_finish_it_is_cut_off() {
     assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 0);
 }
 
+/// A viewer that receives on a thread of its own and writes down when each
+/// frame came.
+struct Receiving {
+    arrivals: Arc<Mutex<Vec<Instant>>>,
+    over: Arc<Mutex<Option<String>>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn receive(mut viewer: Viewer) -> Receiving {
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let over = Arc::new(Mutex::new(None));
+    let thread = {
+        let (arrivals, over) = (arrivals.clone(), over.clone());
+        std::thread::spawn(move || loop {
+            match viewer.next_frame(Duration::from_millis(50)) {
+                Ok(Some(_)) => arrivals.lock().unwrap().push(Instant::now()),
+                Ok(None) if Arc::strong_count(&arrivals) == 1 => return,
+                Ok(None) => {}
+                Err(err) => {
+                    *over.lock().unwrap() = Some(err.to_string());
+                    return;
+                }
+            }
+        })
+    };
+    Receiving {
+        arrivals,
+        over,
+        thread,
+    }
+}
+
+impl Receiving {
+    fn count(&self) -> usize {
+        self.arrivals.lock().unwrap().len()
+    }
+
+    fn last(&self) -> Option<Instant> {
+        self.arrivals.lock().unwrap().last().copied()
+    }
+
+    fn is_over(&self) -> bool {
+        self.over.lock().unwrap().is_some()
+    }
+
+    /// Stops receiving and returns when the frames came.
+    fn finish(self) -> Vec<Instant> {
+        let Receiving {
+            arrivals, thread, ..
+        } = self;
+        let times = arrivals.lock().unwrap().clone();
+        drop(arrivals);
+        thread.join().unwrap();
+        times
+    }
+}
+
+/// Takes what is sent a byte at a time: slowly, but never so
+/// slowly that any single wait for it would run out.
+fn trickle(channel: &Channel<TcpStream>) {
+    let mut stream = channel.stream().try_clone().unwrap();
+    std::thread::spawn(move || {
+        let began = Instant::now();
+        let mut byte = [0u8; 1];
+        // Not for ever, for the sake of the tests that run after this one.
+        while began.elapsed() < Duration::from_secs(30) && stream.read_exact(&mut byte).is_ok() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+}
+
 #[test]
-fn a_viewer_that_takes_nothing_is_cut_off_and_holds_the_frames_up_only_briefly() {
+fn a_viewer_that_takes_nothing_is_cut_off_and_holds_no_frame_up() {
     let pair = pair();
     // Connected, and never reading.
     let _channel = pair.raw_watching();
-    let frame = picture(1 << 20, 1);
-    let mut longest = Duration::ZERO;
-    let mut sent = 0;
+    let frame = picture(1 << 18, 1);
+    let began = Instant::now();
+    let (mut longest, mut full_at, mut sent) = (Duration::ZERO, None, 0);
     while pair.host.viewers() > 0 {
-        assert!(sent < 4096, "the connection took four gigabytes");
-        let began = Instant::now();
-        pair.host.send_frame(&frame, 0, 0, sent == 0).unwrap();
-        longest = longest.max(began.elapsed());
-        sent += 1;
+        assert!(began.elapsed() < Duration::from_secs(20), "still a viewer");
+        let sending = Instant::now();
+        let result = pair.host.send_frame(&frame, 0, 0, true).unwrap();
+        longest = longest.max(sending.elapsed());
+        if result.queued > 0 {
+            // Its connection is full: the rest of this frame has until the
+            // deadline, and nothing more is sealed for it meanwhile.
+            assert!(full_at.is_none(), "a second frame was begun");
+            full_at = Some(Instant::now());
+        }
+        sent += result.viewers;
+        std::thread::sleep(Duration::from_millis(2));
     }
-    // The write that found the connection full waited its short time, once.
-    assert!(longest >= Duration::from_millis(150), "{longest:?}");
-    assert!(longest < Duration::from_millis(1000), "{longest:?}");
+    // No frame waited for the viewer; the viewer was given its time, once.
+    assert!(longest < Duration::from_millis(100), "{longest:?}");
+    let given = full_at.expect("the connection never filled").elapsed();
+    assert!(given >= Duration::from_millis(180), "{given:?}");
+    assert!(given < Duration::from_millis(700), "{given:?}");
+    assert!(sent >= 1);
     assert!(pair.said("stopped showing the picture to air"));
+}
+
+#[test]
+fn a_viewer_that_takes_a_byte_at_a_time_is_cut_off_and_costs_the_others_nothing() {
+    let pair = pair();
+    let book = pair.another_device("book");
+    let good = receive(pair.connect_as(&book).unwrap());
+    pair.until(|| pair.host.viewers() == 1);
+    let slow = pair.raw_watching();
+    trickle(&slow);
+
+    // A frame every ten milliseconds, each one a key frame, so that both
+    // viewers can be sent every one of them.
+    let frame = picture(1 << 16, 2);
+    let began = Instant::now();
+    let (mut longest, mut full_at, mut gone_after, mut frames) = (Duration::ZERO, None, None, 0);
+    while began.elapsed() < Duration::from_secs(20) {
+        let sending = Instant::now();
+        let result = pair.host.send_frame(&frame, 0, 0, true).unwrap();
+        longest = longest.max(sending.elapsed());
+        frames += 1;
+        if result.queued > 0 && full_at.is_none() {
+            full_at = Some(Instant::now());
+        }
+        if let (Some(full), None, 1) = (full_at, gone_after, pair.host.viewers()) {
+            gone_after = Some(full.elapsed());
+        }
+        // A little longer, to see the other viewer carry on undisturbed.
+        if gone_after
+            .is_some_and(|after| full_at.unwrap().elapsed() > after + Duration::from_millis(300))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The slow viewer took a little all the time, and still had only the
+    // one deadline for its frame.
+    let gone_after = gone_after.expect("the slow viewer was never cut off");
+    assert!(gone_after >= Duration::from_millis(150), "{gone_after:?}");
+    assert!(gone_after < Duration::from_millis(700), "{gone_after:?}");
+    // No frame waited for it ...
+    assert!(longest < Duration::from_millis(100), "{longest:?}");
+    // ... and the other viewer got every frame, evenly.
+    pair.until(|| good.count() == frames);
+    assert!(!good.is_over());
+    let arrivals = good.finish();
+    let widest = arrivals
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .max()
+        .unwrap();
+    assert!(widest < Duration::from_millis(150), "{widest:?}");
+}
+
+#[test]
+fn removing_the_pairing_stops_a_stream_while_another_viewer_takes_nothing() {
+    let pair = pair();
+    let book = pair.another_device("book");
+    let good = receive(pair.connect().unwrap());
+    pair.until(|| pair.host.viewers() == 1);
+    // Connected, and never reading.
+    let _slow = pair.raw_watching_as(&book);
+
+    let frame = picture(1 << 18, 3);
+    let began = Instant::now();
+    let mut removed = None;
+    while !good.is_over() {
+        assert!(began.elapsed() < Duration::from_secs(20), "still running");
+        let result = pair.host.send_frame(&frame, 0, 0, true).unwrap();
+        if result.queued > 0 && removed.is_none() {
+            // The slow viewer's connection is full and its frame is being
+            // waited for, right now: the pairing of the other is removed.
+            assert_eq!(pair.host.viewers(), 2);
+            pair.studio_peers.remove("air");
+            removed = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let removed = removed.expect("the slow viewer's connection never filled");
+    let last = good.last().expect("no frame arrived");
+    // Looked up every quarter of a second: well inside the second allowed.
+    assert!(
+        last.saturating_duration_since(removed) < Duration::from_millis(600),
+        "{:?}",
+        last.saturating_duration_since(removed)
+    );
+    assert!(pair.said("stopped showing the picture to air: it is no longer paired"));
+    good.finish();
+}
+
+#[test]
+fn a_viewer_that_lost_its_right_gets_nothing_more_however_many_devices_connect() {
+    let pair = pair();
+    let book = pair.another_device("book");
+    let air = receive(pair.connect().unwrap());
+    pair.until(|| pair.host.viewers() == 1);
+    pair.until(|| pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers == 1);
+    pair.until(|| air.count() >= 1);
+
+    // The thread that looks the viewers up is stuck, which is what the
+    // limit on the age of a look-up is for; and the right is taken away.
+    pair.host.pause_recheck(true);
+    pair.studio_peers.allow("air", &[Permission::Control]);
+    let taken = Instant::now();
+    // Another device connects again and again. The list is read for each
+    // of its calls: that says something about that device, and nothing
+    // about the one that is already being sent to.
+    let mut admitted = 0;
+    while taken.elapsed() < Duration::from_millis(2500) {
+        if let Ok(viewer) = pair.connect_as(&book) {
+            admitted += 1;
+            drop(viewer);
+        }
+        pair.host.send_frame(b"key", 1, 1, true).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(admitted >= 10, "only {admitted} calls were taken");
+    let last = air.last().unwrap().saturating_duration_since(taken);
+    assert!(last < Duration::from_millis(1100), "{last:?}");
+    air.finish();
 }

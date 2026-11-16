@@ -9,14 +9,29 @@
 //! running. When the list of paired devices cannot be read, nothing is
 //! sent.
 //!
-//! Frames are written to the connections on the thread that hands them
-//! over, with nothing queued in between. The list of paired devices is read
-//! on another thread, so that reading a file never holds up a frame.
+//! Who waits for whom:
+//!
+//! * The thread that hands a frame over never waits for a viewer. The frame
+//!   is sealed for each viewer and put on its connection as far as the
+//!   connection takes it at that moment, which on a local network is all of
+//!   it. What a connection does not take is left to that viewer's own
+//!   thread, with one deadline for the whole frame; until it has gone, the
+//!   viewer is sent nothing more, and then begins again with a key frame.
+//!   A viewer that takes its frames slowly, or not at all, costs the others
+//!   nothing.
+//! * Every viewer has a thread of its own that reads what the viewer says,
+//!   finishes what the connection did not take at once, and says that the
+//!   picture stands still when it does.
+//! * The list of paired devices is read on yet another thread, which holds
+//!   the list of viewers only to strike viewers off it: no reading of a
+//!   file and no writing to a viewer ever stands between a pairing being
+//!   removed and its stream ending.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -24,7 +39,7 @@ use istesso_link::{Channel, Error as LinkError, LocalKeys};
 use istesso_pair::{Identity, Peer, PeerStore, Permission};
 
 use crate::clock;
-use crate::timed::{wait_for, Ready, Timed};
+use crate::timed::{wait_for, Ready, Timed, Wake};
 use crate::wire::{self, Ask, ErrorCode, Header, Kind, Reply, StreamInfo};
 use crate::{Error, Log, Result};
 
@@ -39,21 +54,21 @@ pub(crate) const MAX_STREAMS: usize = 4;
 /// How long a caller has for the handshake and its first message, all of it
 /// together. On a local network both take a few milliseconds.
 const HELLO_WAIT: Duration = Duration::from_secs(3);
-/// How long a single write to a viewer may take. A viewer that takes nothing
-/// for this long is gone; the frames wait for nobody longer than this.
+/// How long a viewer has to take a frame, all of it together, from the
+/// moment its connection would not take the whole of it at once. A viewer
+/// that has not taken it by then is gone, however steadily it takes a
+/// little.
 const SEND_WAIT: Duration = Duration::from_millis(200);
 /// How long reading one message of a viewer may take, all of it together,
 /// once its first bytes are there. They are a few dozen bytes and arrive in
 /// one piece; a viewer that sends them a byte at a time is dropped.
 const ASK_WAIT: Duration = Duration::from_millis(50);
-/// Messages read from one viewer before the next frame goes out.
-const ASKS_AT_ONCE: usize = 4;
 /// How often the viewers are looked up again in the list of paired devices
 /// while they are sent to.
 const RECHECK: Duration = Duration::from_millis(250);
-/// How old the last look at the list of paired devices may be for a frame
-/// to be sent. Older than this, and nothing goes out until the list has
-/// been read again.
+/// How long ago a viewer may last have been found in the list of paired
+/// devices, with the right to look, for a frame to be sent to it. Longer
+/// ago than this, and it gets nothing until it has been found again.
 const STALE: Duration = Duration::from_secs(1);
 /// With no frame for this long, the host says that it has nothing new to
 /// show, and repeats it this often.
@@ -61,6 +76,8 @@ const IDLE_EVERY: Duration = Duration::from_millis(500);
 /// A viewer that still waits for a key frame after this long makes the host
 /// ask for one again.
 const KEY_AGAIN: Duration = Duration::from_millis(500);
+/// How often a viewer's thread looks up when nothing happens.
+const TICK: Duration = Duration::from_millis(100);
 
 /// A host that shows its picture to paired devices.
 pub struct Host {
@@ -74,9 +91,13 @@ pub struct Host {
 pub struct Sent {
     /// The frame's sequence number.
     pub seq: u64,
-    /// Viewers the frame was written to. A viewer that waits for a key
-    /// frame is not sent the frames before it.
+    /// Viewers the frame went to. A viewer that waits for a key frame is
+    /// not sent the frames before it.
     pub viewers: u32,
+    /// Of those, the viewers whose connection did not take all of the frame
+    /// at once: the rest of it is on its way, and has left this thread's
+    /// hands.
+    pub queued: u32,
     /// Messages of the encrypted channel the frame took, for each viewer.
     pub messages: u32,
 }
@@ -93,9 +114,6 @@ struct Shared {
     seq: AtomicU64,
     /// Somebody needs a key frame, and the encoder has not been told yet.
     key_wanted: AtomicBool,
-    /// When the list of paired devices was last read and the viewers were
-    /// checked against it, on [`clock::now_ns`].
-    last_read_ns: AtomicU64,
     /// How long a caller has for the handshake and its first message.
     hello_wait_ms: AtomicU64,
     /// For tests: the viewers are not looked up while this is set.
@@ -104,23 +122,53 @@ struct Shared {
     log: Log,
 }
 
+/// The viewers, and what is being sent to them. Held only for moments:
+/// never while a file is read, and never while a connection is waited for.
 struct Watchers {
-    list: Vec<Watcher>,
+    list: Vec<Arc<Watcher>>,
     /// The packet being sent, kept to spare an allocation per frame.
     packet: Vec<u8>,
 }
 
 /// One device that is being shown the picture.
 struct Watcher {
-    channel: Channel<Timed>,
     peer: Peer,
+    /// When this device was last found in a list of paired devices that
+    /// had just been read, with the right to look, on [`clock::now_ns`].
+    /// Only a look-up of this very device moves it.
+    confirmed_ns: AtomicU64,
+    /// The stream is over; nothing more is sent, and the viewer's thread
+    /// ends.
+    closed: AtomicBool,
+    /// A frame was not sent to this viewer since the last one it got.
+    missed: AtomicBool,
+    /// Part of what was sealed for the viewer waits for its connection to
+    /// take it (`Line::unsent_since`, readable without the connection).
+    unsent: AtomicBool,
+    /// The viewer's thread has the connection for something that may take
+    /// long: finishing a frame, or reading what the viewer says.
+    busy: AtomicBool,
+    /// When something was last sent, on [`clock::now_ns`].
+    last_sent_ns: AtomicU64,
+    /// Makes the viewer's thread look up.
+    wake: Wake,
+    /// The connection, for waiting on it without holding `line`.
+    fd: RawFd,
+    line: Mutex<Line>,
+    _place: Place,
+}
+
+/// A viewer's connection and where its stream stands.
+struct Line {
+    channel: Channel<Timed>,
     /// Since when the viewer has been waiting for a key frame: it cannot
     /// decode anything else. `None` once it has one.
     awaiting_key: Option<Instant>,
     /// Frames were held back from this viewer since the last one it got.
     skipped: bool,
-    last_sent: Instant,
-    _place: Place,
+    /// Since when a part of what was sealed for the viewer has been waiting
+    /// for the connection to take it.
+    unsent_since: Option<Instant>,
 }
 
 /// One of a limited number of places, given back when dropped.
@@ -143,6 +191,15 @@ impl Drop for Place {
     }
 }
 
+/// A connection by its number, for waiting on it.
+struct Fd(RawFd);
+
+impl AsRawFd for Fd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
 /// Whether the device is, at this moment, still paired and still allowed to
 /// look at this host, going by a list that has just been read: not by what
 /// was true when the stream began.
@@ -153,6 +210,28 @@ fn may_still_view(peers: &PeerStore, peer: &Peer) -> bool {
             && known.permissions.contains(&Permission::View)
     })
 }
+
+/// A write to a connection whose other end has gone must fail, not end the
+/// program. Rust's own programs see to that; this library is also loaded
+/// into programs that do not.
+#[cfg(target_vendor = "apple")]
+fn no_signal_on_a_closed_connection(stream: &TcpStream) {
+    let on: libc::c_int = 1;
+    // SAFETY: the option's value is one integer, and its size is given.
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+}
+
+/// Elsewhere every single write says so itself.
+#[cfg(not(target_vendor = "apple"))]
+fn no_signal_on_a_closed_connection(_stream: &TcpStream) {}
 
 impl Host {
     /// Starts listening on `addr`. `peers_path` is the list of paired
@@ -183,7 +262,6 @@ impl Host {
             serving: Arc::new(AtomicUsize::new(0)),
             seq: AtomicU64::new(0),
             key_wanted: AtomicBool::new(false),
-            last_read_ns: AtomicU64::new(0),
             hello_wait_ms: AtomicU64::new(HELLO_WAIT.as_millis() as u64),
             recheck_paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -220,11 +298,14 @@ impl Host {
 
     /// Devices that are being shown the picture now.
     pub fn viewers(&self) -> usize {
-        self.shared.watchers().list.len()
+        let watchers = self.shared.watchers();
+        let open = |watcher: &&Arc<Watcher>| !watcher.closed.load(Ordering::SeqCst);
+        watchers.list.iter().filter(open).count()
     }
 
-    /// Sends one encoded frame to every viewer that can decode it, and
-    /// returns when it has been written to their connections.
+    /// Sends one encoded frame to every viewer that can decode it. Never
+    /// waits for a viewer: what a connection does not take at once is
+    /// finished by that viewer's own thread ([`Sent::queued`]).
     ///
     /// `pts_ns` is the frame's presentation time stamp and `encoded_ns` the
     /// moment the encoder had finished it, on this machine's clock; both
@@ -245,11 +326,9 @@ impl Host {
         let mut sent = Sent {
             seq,
             viewers: 0,
+            queued: 0,
             messages: wire::channel_messages(frame.len()),
         };
-        // Read before the lock is taken: a list that goes stale while this
-        // frame waits for the lock is found stale by the next one.
-        let fresh = shared.pairing_is_fresh();
         let mut watchers = shared.watchers();
         let Watchers { list, packet } = &mut *watchers;
         if list.is_empty() {
@@ -264,40 +343,16 @@ impl Host {
             encoded_ns,
         };
         wire::encode(&header, frame, packet);
-        list.retain_mut(|watcher| {
-            if let Err(err) = shared.read_asks(watcher) {
-                shared.gone(watcher, &err);
-                return false;
-            }
-            if !fresh {
-                // Nobody has looked at the list of paired devices for too
-                // long: whether this device may still look is not known.
-                shared.hold_back(watcher);
-                return true;
-            }
-            if let (Some(since), false) = (watcher.awaiting_key, key_frame) {
-                watcher.skipped = true;
-                if since.elapsed() >= KEY_AGAIN {
-                    watcher.awaiting_key = Some(Instant::now());
-                    shared.key_wanted.store(true, Ordering::SeqCst);
-                }
-                return true;
-            }
-            wire::set_discontinuity(packet, watcher.skipped);
-            match watcher.channel.send(packet) {
-                Ok(()) => {
-                    watcher.awaiting_key = None;
-                    watcher.skipped = false;
-                    watcher.last_sent = Instant::now();
+        for watcher in list.iter() {
+            match shared.offer(watcher, packet, key_frame) {
+                Offered::No => {}
+                Offered::Written => sent.viewers += 1,
+                Offered::Queued => {
                     sent.viewers += 1;
-                    true
-                }
-                Err(err) => {
-                    shared.gone(watcher, &err.into());
-                    false
+                    sent.queued += 1;
                 }
             }
-        });
+        }
         Ok(sent)
     }
 
@@ -305,16 +360,7 @@ impl Host {
     /// one, or was held back. True once for each time it is needed; the
     /// caller tells the encoder.
     pub fn key_frame_wanted(&self) -> bool {
-        let shared = &*self.shared;
-        // A viewer's request is noticed here too, not only when the next
-        // frame goes out: while the picture stands still there is none.
-        shared.watchers().list.retain_mut(|watcher| {
-            shared
-                .read_asks(watcher)
-                .map_err(|err| shared.gone(watcher, &err))
-                .is_ok()
-        });
-        shared.key_wanted.swap(false, Ordering::SeqCst)
+        self.shared.key_wanted.swap(false, Ordering::SeqCst)
     }
 
     /// Changes how long a caller has for the handshake and its first
@@ -342,18 +388,19 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        // Every viewer's thread says that the stream is over, and ends.
+        for watcher in self.shared.watchers().list.drain(..) {
+            watcher.wake.wake();
+        }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
-        let mut watchers = self.shared.watchers();
-        let Watchers { list, packet } = &mut *watchers;
-        let seq = self.shared.seq.load(Ordering::SeqCst);
-        wire::encode(&Header::without_frame(Kind::End, seq), &[], packet);
-        for watcher in list.iter_mut() {
-            // Best effort: the viewer may be gone already.
-            let _ = watcher.channel.send(packet);
+        let began = Instant::now();
+        while self.shared.serving.load(Ordering::SeqCst) > 0
+            && began.elapsed() < Duration::from_secs(1)
+        {
+            std::thread::sleep(Duration::from_millis(2));
         }
-        list.clear();
     }
 }
 
@@ -372,59 +419,128 @@ fn refuse(channel: &mut Channel<Timed>, code: ErrorCode, message: &str) -> Resul
     )
 }
 
+/// What became of a frame for one viewer.
+enum Offered {
+    /// Not sent: the viewer cannot have it, or cannot use it.
+    No,
+    /// Sealed and all of it on the wire.
+    Written,
+    /// Sealed, and part of it left for the viewer's thread to finish.
+    Queued,
+}
+
+impl Watcher {
+    fn line(&self) -> MutexGuard<'_, Line> {
+        self.line.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether this device was found in the list of paired devices, with
+    /// the right to look, recently enough for a frame to be sent to it.
+    fn confirmed_lately(&self) -> bool {
+        let confirmed = self.confirmed_ns.load(Ordering::SeqCst);
+        clock::now_ns().saturating_sub(confirmed) <= STALE.as_nanos() as u64
+    }
+
+    /// The connection, for a moment. `None` while the viewer's thread has
+    /// it for something that may take long: the frames wait for nobody.
+    fn line_for_a_frame(&self) -> Option<MutexGuard<'_, Line>> {
+        for _ in 0..200 {
+            match self.line.try_lock() {
+                Ok(line) => return Some(line),
+                Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) if self.busy.load(Ordering::SeqCst) => return None,
+                // The viewer's thread is saying that the picture stands
+                // still, which takes microseconds.
+                Err(TryLockError::WouldBlock) => std::thread::yield_now(),
+            }
+        }
+        None
+    }
+}
+
 impl Shared {
     fn watchers(&self) -> MutexGuard<'_, Watchers> {
         self.watchers.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether the viewers were checked against the list of paired devices
-    /// recently enough for a frame to be sent.
-    fn pairing_is_fresh(&self) -> bool {
-        let read = self.last_read_ns.load(Ordering::SeqCst);
-        read != 0 && clock::now_ns().saturating_sub(read) <= STALE.as_nanos() as u64
-    }
-
-    fn gone(&self, watcher: &Watcher, why: &Error) {
-        (self.log)(format!(
-            "stopped showing the picture to {}: {why}",
-            watcher.peer.name
-        ));
-    }
-
-    /// The viewer is not sent this frame. It cannot decode the ones after
-    /// it either, until a key frame comes.
-    fn hold_back(&self, watcher: &mut Watcher) {
-        watcher.skipped = true;
-        if watcher.awaiting_key.is_none() {
-            watcher.awaiting_key = Some(Instant::now());
-            self.key_wanted.store(true, Ordering::SeqCst);
+    /// Ends a viewer's stream: nothing more is sent to it, and its thread
+    /// closes the connection.
+    fn close(&self, watcher: &Watcher, why: &dyn std::fmt::Display) {
+        if !watcher.closed.swap(true, Ordering::SeqCst) {
+            (self.log)(format!(
+                "stopped showing the picture to {}: {why}",
+                watcher.peer.name
+            ));
+            watcher.wake.wake();
         }
     }
 
-    /// Reads what the viewer has sent, without waiting for anything that is
-    /// not there yet.
-    fn read_asks(&self, watcher: &mut Watcher) -> Result<()> {
-        for _ in 0..ASKS_AT_ONCE {
-            let timed = watcher.channel.stream();
-            if wait_for(timed.stream(), None, Duration::ZERO)? != Ready::Connection {
-                break;
-            }
-            // Something has come (or the viewer has hung up). The rest of
-            // the message has to be there within a short time, all of it
-            // together: the frames wait behind this read.
-            timed.limit(Instant::now() + ASK_WAIT);
-            let message = watcher.channel.recv();
-            watcher.channel.stream().lift(ASK_WAIT, SEND_WAIT)?;
-            let message = message?;
-            if message.len() > wire::MAX_ASK_BYTES {
-                return Err(Error::Malformed);
-            }
-            // What this version does not know is passed over.
-            if let Ok(Ask::KeyFrame) = serde_json::from_slice::<Ask>(&message) {
+    /// Seals one frame for one viewer and puts it on its connection as far
+    /// as the connection takes it now. Waits for nothing.
+    fn offer(&self, watcher: &Watcher, packet: &mut [u8], key_frame: bool) -> Offered {
+        if watcher.closed.load(Ordering::SeqCst) {
+            return Offered::No;
+        }
+        // Whether this device may still look is known only as of its own
+        // last look-up. Too long ago, and it is sent nothing.
+        if !watcher.confirmed_lately() {
+            watcher.missed.store(true, Ordering::SeqCst);
+            return Offered::No;
+        }
+        let Some(mut line) = watcher.line_for_a_frame() else {
+            watcher.missed.store(true, Ordering::SeqCst);
+            return Offered::No;
+        };
+        if line.unsent_since.is_some() {
+            // The connection has not even taken the frame before this one.
+            watcher.missed.store(true, Ordering::SeqCst);
+            return Offered::No;
+        }
+        if watcher.missed.swap(false, Ordering::SeqCst) {
+            // It was not sent a frame, and cannot decode the ones after it
+            // until a key frame comes.
+            line.skipped = true;
+            if line.awaiting_key.is_none() {
+                line.awaiting_key = Some(Instant::now());
                 self.key_wanted.store(true, Ordering::SeqCst);
             }
         }
-        Ok(())
+        if let (Some(since), false) = (line.awaiting_key, key_frame) {
+            line.skipped = true;
+            if since.elapsed() >= KEY_AGAIN {
+                line.awaiting_key = Some(Instant::now());
+                self.key_wanted.store(true, Ordering::SeqCst);
+            }
+            return Offered::No;
+        }
+        wire::set_discontinuity(packet, line.skipped);
+        // Sealing writes into memory; only `push` touches the connection.
+        let pushed = line
+            .channel
+            .send(packet)
+            .map_err(Error::from)
+            .and_then(|()| Ok(line.channel.stream().push()?));
+        match pushed {
+            Ok(all) => {
+                line.awaiting_key = None;
+                line.skipped = false;
+                watcher
+                    .last_sent_ns
+                    .store(clock::now_ns(), Ordering::SeqCst);
+                if all {
+                    return Offered::Written;
+                }
+                line.unsent_since = Some(Instant::now());
+                watcher.unsent.store(true, Ordering::SeqCst);
+                watcher.wake.wake();
+                Offered::Queued
+            }
+            Err(err) => {
+                drop(line);
+                self.close(watcher, &err);
+                Offered::No
+            }
+        }
     }
 
     /// Takes callers until the host is closed. Every caller gets a thread
@@ -449,7 +565,7 @@ impl Shared {
             };
             let shared = self.clone();
             std::thread::spawn(move || {
-                if let Err(err) = shared.serve(stream, pending) {
+                if let Err(err) = shared.clone().serve(stream, pending) {
                     // Connections that die during the handshake are port
                     // scans and the like; only what somebody can act on is
                     // shown.
@@ -468,12 +584,16 @@ impl Shared {
         }
     }
 
-    fn serve(&self, stream: TcpStream, pending: Place) -> Result<()> {
+    /// The first exchange with a caller; when it is a paired device that
+    /// may look, the rest of this thread's life is that viewer's.
+    fn serve(self: Arc<Self>, stream: TcpStream, pending: Place) -> Result<()> {
         // On some systems a connection takes over the listener's way of not
-        // waiting; this one waits, with the times set below.
+        // waiting; this one waits, until its deadline.
         stream.set_nonblocking(false)?;
         // A frame leaves when it is written, not when more has piled up.
         stream.set_nodelay(true)?;
+        no_signal_on_a_closed_connection(&stream);
+        let fd = stream.as_raw_fd();
         // Whoever calls has this long to show who it is and to say what it
         // wants, all of it together, however slowly the bytes come.
         let hello_wait = Duration::from_millis(self.hello_wait_ms.load(Ordering::Relaxed));
@@ -513,8 +633,16 @@ impl Shared {
         // A paired device that may look, and has said what it wants: it
         // moves from the callers to the viewers. One device has one stream.
         drop(pending);
-        self.close_earlier(&peer);
-        let Some(place) = Place::take(&self.serving, MAX_STREAMS) else {
+        let came_back = self.close_earlier(&peer);
+        let mut place = Place::take(&self.serving, MAX_STREAMS);
+        // The place of its earlier connection is free a moment after that
+        // connection was told to close.
+        let began = Instant::now();
+        while place.is_none() && came_back && began.elapsed() < ASK_WAIT * 4 {
+            std::thread::sleep(Duration::from_millis(2));
+            place = Place::take(&self.serving, MAX_STREAMS);
+        }
+        let Some(place) = place else {
             return refuse(
                 &mut channel,
                 ErrorCode::Busy,
@@ -528,46 +656,183 @@ impl Shared {
                 info: self.info,
             },
         )?;
-        // No deadline for a stream; a single write that takes too long ends
-        // it.
-        channel.stream().lift(ASK_WAIT, SEND_WAIT)?;
+        // No deadline for a stream, and from here on nothing waits for this
+        // connection unless it is told how long.
+        channel.stream().hold()?;
 
-        self.close_earlier(&peer);
-        let mut watchers = self.watchers();
-        if self.stop.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        (self.log)(format!("showing the picture to {}", peer.name));
-        watchers.list.push(Watcher {
-            channel,
+        let watcher = Arc::new(Watcher {
             peer,
-            awaiting_key: Some(Instant::now()),
-            skipped: false,
-            last_sent: Instant::now(),
+            // What was read for this caller says something about this
+            // caller, and about nobody else.
+            confirmed_ns: AtomicU64::new(read_at),
+            closed: AtomicBool::new(false),
+            missed: AtomicBool::new(false),
+            unsent: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            last_sent_ns: AtomicU64::new(clock::now_ns()),
+            wake: Wake::new()?,
+            fd,
+            line: Mutex::new(Line {
+                channel,
+                awaiting_key: Some(Instant::now()),
+                skipped: false,
+                unsent_since: None,
+            }),
             _place: place,
         });
-        // The list was read for this caller a moment ago; with the first
-        // viewer the regular look-ups begin.
-        self.last_read_ns.fetch_max(read_at, Ordering::SeqCst);
+        self.close_earlier(&watcher.peer);
+        {
+            let mut watchers = self.watchers();
+            if self.stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            (self.log)(format!("showing the picture to {}", watcher.peer.name));
+            watchers.list.push(watcher.clone());
+        }
         // A viewer can only begin with a key frame, and is not made to ask.
         self.key_wanted.store(true, Ordering::SeqCst);
+        self.attend(&watcher);
+        self.watchers()
+            .list
+            .retain(|other| !Arc::ptr_eq(other, &watcher));
         Ok(())
     }
 
     /// Closes the connection a device already has, when it connects again:
     /// a viewer that was stopped and started must not find its place taken
     /// by what it left behind.
-    fn close_earlier(&self, peer: &Peer) {
+    fn close_earlier(&self, peer: &Peer) -> bool {
+        let mut closed = false;
         self.watchers().list.retain(|watcher| {
             let same = watcher.peer.id == peer.id;
             if same {
-                (self.log)(format!(
-                    "{} connected again; its earlier connection is closed",
-                    peer.name
-                ));
+                closed = true;
+                self.close(
+                    watcher,
+                    &"it connected again; its earlier connection is closed",
+                );
             }
             !same
         });
+        closed
+    }
+
+    /// A viewer's thread, for as long as its stream lasts: reads what the
+    /// viewer says, finishes what its connection did not take at once, and
+    /// says that the picture stands still when it does.
+    fn attend(&self, watcher: &Watcher) {
+        let mut packet = Vec::new();
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                // Best effort: the viewer may be gone already.
+                let mut line = watcher.line();
+                if line.unsent_since.is_none() {
+                    let seq = self.seq.load(Ordering::SeqCst);
+                    wire::encode(&Header::without_frame(Kind::End, seq), &[], &mut packet);
+                    if line.channel.send(&packet).is_ok() {
+                        let _ = line.channel.stream().push_by(Instant::now() + ASK_WAIT);
+                    }
+                }
+                return;
+            }
+            if watcher.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Err(err) = self.finish_what_was_begun(watcher) {
+                return self.close(watcher, &err);
+            }
+            match wait_for(&Fd(watcher.fd), Some(&watcher.wake), TICK) {
+                Ok(Ready::Woken) => {
+                    watcher.wake.clear();
+                    continue;
+                }
+                Ok(Ready::Connection) => {
+                    if let Err(err) = self.read_ask(watcher) {
+                        return self.close(watcher, &err);
+                    }
+                }
+                Ok(Ready::Neither) => {}
+                Err(err) => return self.close(watcher, &err),
+            }
+            let quiet = clock::now_ns().saturating_sub(watcher.last_sent_ns.load(Ordering::SeqCst))
+                >= IDLE_EVERY.as_nanos() as u64;
+            if quiet {
+                // A picture that stands still is not a broken connection.
+                let mut line = watcher.line();
+                if line.unsent_since.is_none() {
+                    let seq = self.seq.load(Ordering::SeqCst);
+                    wire::encode(&Header::without_frame(Kind::Idle, seq), &[], &mut packet);
+                    let pushed = line
+                        .channel
+                        .send(&packet)
+                        .map_err(Error::from)
+                        .and_then(|()| Ok(line.channel.stream().push()?));
+                    match pushed {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            line.unsent_since = Some(Instant::now());
+                            watcher.unsent.store(true, Ordering::SeqCst);
+                        }
+                        Err(err) => {
+                            drop(line);
+                            return self.close(watcher, &err);
+                        }
+                    }
+                    watcher
+                        .last_sent_ns
+                        .store(clock::now_ns(), Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// Puts the rest of what was sealed for the viewer on the wire: all of
+    /// it within [`SEND_WAIT`] of when the connection first would not take
+    /// it, however little the viewer takes at a time.
+    fn finish_what_was_begun(&self, watcher: &Watcher) -> Result<()> {
+        // Nearly always there is nothing to finish, and then the connection
+        // is not touched: a frame that comes at this moment must find it
+        // free.
+        if !watcher.unsent.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Said before the connection is taken, so that a frame that comes
+        // meanwhile does not wait for it.
+        watcher.busy.store(true, Ordering::SeqCst);
+        let mut line = watcher.line();
+        let result = match line.unsent_since {
+            Some(since) => line.channel.stream().push_by(since + SEND_WAIT),
+            None => Ok(()),
+        };
+        if result.is_ok() {
+            line.unsent_since = None;
+            watcher.unsent.store(false, Ordering::SeqCst);
+        }
+        drop(line);
+        watcher.busy.store(false, Ordering::SeqCst);
+        Ok(result?)
+    }
+
+    /// Reads one message of the viewer, whose first bytes are there (or
+    /// the viewer has hung up). The rest has to be there within a short
+    /// time, all of it together.
+    fn read_ask(&self, watcher: &Watcher) -> Result<()> {
+        watcher.busy.store(true, Ordering::SeqCst);
+        let mut line = watcher.line();
+        line.channel.stream().limit(Instant::now() + ASK_WAIT);
+        let message = line.channel.recv();
+        line.channel.stream().unlimit();
+        drop(line);
+        watcher.busy.store(false, Ordering::SeqCst);
+        let message = message?;
+        if message.len() > wire::MAX_ASK_BYTES {
+            return Err(Error::Malformed);
+        }
+        // What this version does not know is passed over.
+        if let Ok(Ask::KeyFrame) = serde_json::from_slice::<Ask>(&message) {
+            self.key_wanted.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Looks every viewer up in the list of paired devices once every
@@ -585,48 +850,32 @@ impl Shared {
             if self.recheck_paused.load(Ordering::SeqCst) || self.watchers().list.is_empty() {
                 continue;
             }
-            // The file is read with the lock let go: frames go out meanwhile.
+            // The file is read with the viewers let go: frames go out
+            // meanwhile.
             let peers = PeerStore::open(&self.peers_path);
             let read_at = clock::now_ns();
             let mut watchers = self.watchers();
-            let Watchers { list, packet } = &mut *watchers;
             let Ok(peers) = peers else {
-                if !list.is_empty() {
-                    (self.log)(
-                        "the list of paired devices cannot be read: nothing is sent, and every \
-                         viewer is cut off"
-                            .into(),
+                for watcher in watchers.list.drain(..) {
+                    self.close(
+                        &watcher,
+                        &"the list of paired devices cannot be read, and then nothing is sent",
                     );
                 }
-                list.clear();
                 continue;
             };
-            let seq = self.seq.load(Ordering::SeqCst);
-            list.retain_mut(|watcher| {
-                if !may_still_view(&peers, &watcher.peer) {
-                    (self.log)(format!(
-                        "stopped showing the picture to {}: it is no longer paired, or may no \
-                         longer look at this host",
-                        watcher.peer.name
-                    ));
-                    return false;
+            watchers.list.retain(|watcher| {
+                if may_still_view(&peers, &watcher.peer) {
+                    // This device, in a list read just now.
+                    watcher.confirmed_ns.fetch_max(read_at, Ordering::SeqCst);
+                    return true;
                 }
-                if let Err(err) = self.read_asks(watcher) {
-                    self.gone(watcher, &err);
-                    return false;
-                }
-                if watcher.last_sent.elapsed() >= IDLE_EVERY {
-                    // A picture that stands still is not a broken connection.
-                    wire::encode(&Header::without_frame(Kind::Idle, seq), &[], packet);
-                    if let Err(err) = watcher.channel.send(packet) {
-                        self.gone(watcher, &err.into());
-                        return false;
-                    }
-                    watcher.last_sent = Instant::now();
-                }
-                true
+                self.close(
+                    watcher,
+                    &"it is no longer paired, or may no longer look at this host",
+                );
+                false
             });
-            self.last_read_ns.fetch_max(read_at, Ordering::SeqCst);
         }
     }
 }
