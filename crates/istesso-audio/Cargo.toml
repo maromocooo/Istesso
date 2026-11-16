@@ -20,3 +20,13 @@ rtrb.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs.workspace = true
 objc2-core-audio.workspace = true
+
+# Capturing on Linux needs PipeWire's development files at build time
+# (libpipewire-0.3-dev, libclang-dev). It is off by default so that the
+# workspace builds and tests on machines without them.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+[features]
+pipewire = ["dep:pipewire", "dep:libc"]

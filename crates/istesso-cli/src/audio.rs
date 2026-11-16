@@ -1,9 +1,10 @@
 //! `istesso audio`: the sound of one machine, played on another.
 //!
-//! What is here so far is what the first tests need. A source is a test
-//! tone or raw audio read from a pipe; capturing from the sound system is
-//! not built in yet. An exit plays into the real output device but hands it
-//! silence: what it would have played is kept for checking instead.
+//! What is here so far is what the first tests need. A source is what
+//! applications play into a sink made for it (Linux, when built with the
+//! `pipewire` feature), a test tone, or raw audio read from a pipe. An exit
+//! plays into the real output device but hands it silence: what it would
+//! have played is kept for checking instead.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -25,11 +26,12 @@ const CHANNELS: u16 = 2;
 
 #[derive(Subcommand)]
 pub enum AudioAction {
-    /// Offer sound to paired devices that may have it (test sources only)
+    /// Offer sound to paired devices that may have it
     ///
-    /// The sound is a test tone, or raw audio read from standard input
-    /// (32-bit floats, little-endian, two channels, 48 kHz). Only paired
-    /// devices that were given the `audio` right are sent anything:
+    /// The sound is what applications play into an output made for it
+    /// (`--source pipewire`), a test tone, or raw audio read from standard
+    /// input (32-bit floats, little-endian, two channels, 48 kHz). Only
+    /// paired devices that were given the `audio` right are sent anything:
     /// `istesso peers allow <device> audio`.
     Serve {
         /// TCP port to listen on
@@ -57,6 +59,20 @@ pub enum AudioAction {
         /// `istesso audio compare`
         #[arg(long)]
         ledger: Option<PathBuf>,
+        /// With `--source pipewire`: the name programs address the output by
+        #[arg(long, default_value = "istesso-audio")]
+        node_name: String,
+        /// With `--source pipewire`: the name people see in a list of outputs
+        #[arg(long, default_value = "Istesso")]
+        node_description: String,
+        /// With `--source pipewire`: frames per cycle to ask the sound
+        /// system for (default: ask for nothing)
+        #[arg(long)]
+        quantum: Option<u32>,
+        /// With `--source pipewire`: a further property of the output, as
+        /// `key=value`; may be given several times
+        #[arg(long)]
+        node_property: Vec<String>,
     },
     /// Play the sound of a paired host on this machine
     ///
@@ -96,6 +112,10 @@ pub enum AudioAction {
         /// output)
         #[arg(long)]
         report: Option<PathBuf>,
+        /// Keep trying to reach the source for this many seconds before
+        /// giving up
+        #[arg(long, default_value_t = 0.0)]
+        connect_for: f64,
     },
     /// List the devices sound can come out of on this machine
     Outputs {
@@ -165,6 +185,8 @@ pub enum SourceArg {
     Tone,
     /// Raw audio from standard input
     Stdin,
+    /// What applications play into an output made for it (Linux, PipeWire)
+    Pipewire,
 }
 
 pub fn run(action: AudioAction) -> Result<(), String> {
@@ -178,6 +200,10 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             packet_frames,
             seconds,
             ledger,
+            node_name,
+            node_description,
+            quantum,
+            node_property,
         } => serve(ServeOptions {
             addr: SocketAddr::new(bind, port),
             source,
@@ -186,6 +212,10 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             packet_frames,
             seconds,
             ledger,
+            node_name,
+            node_description,
+            quantum,
+            node_properties: node_property,
         }),
         AudioAction::Play {
             address,
@@ -197,6 +227,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             tone_hz,
             ledger,
             report,
+            connect_for,
         } => play(PlayOptions {
             address,
             peer,
@@ -207,6 +238,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             tone_hz,
             ledger,
             report,
+            connect_for,
         }),
         AudioAction::Outputs { json } => outputs(json),
         AudioAction::Check {
@@ -269,6 +301,84 @@ struct ServeOptions {
     packet_frames: usize,
     seconds: Option<f64>,
     ledger: Option<PathBuf>,
+    node_name: String,
+    node_description: String,
+    quantum: Option<u32>,
+    node_properties: Vec<String>,
+}
+
+/// A thread that feeds audio into the capture ring.
+type Feeder = std::thread::JoinHandle<std::io::Result<()>>;
+/// What a source that captures has to say about itself at the end.
+type CaptureReport = Box<dyn Fn() -> serde_json::Value>;
+
+fn parse_property(text: &str) -> Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((key, value)) if !key.trim().is_empty() => {
+            Ok((key.trim().to_string(), value.trim().to_string()))
+        }
+        _ => Err(format!("'{text}' is not a property; write it as key=value")),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+fn pipewire_feeder(
+    options: &ServeOptions,
+    capture: istesso_audio::source::CaptureWriter,
+    stop: Arc<AtomicBool>,
+) -> Result<(Feeder, CaptureReport), String> {
+    use istesso_audio::linux::{run_sink, SinkOptions, SinkStats};
+
+    if options
+        .quantum
+        .is_some_and(|frames| !(16..=8192).contains(&frames))
+    {
+        return Err("a cycle holds between 16 and 8192 frames".to_string());
+    }
+    let sink = SinkOptions {
+        node_name: options.node_name.clone(),
+        description: options.node_description.clone(),
+        quantum: options.quantum,
+        properties: options
+            .node_properties
+            .iter()
+            .map(|text| parse_property(text))
+            .collect::<Result<_, _>>()?,
+    };
+    let stats = Arc::new(SinkStats::default());
+    let seen = stats.clone();
+    let feeder = std::thread::spawn(move || {
+        run_sink(
+            &sink,
+            capture,
+            stop,
+            seen,
+            Arc::new(|line| eprintln!("{line}")),
+        )
+        .map_err(|err| std::io::Error::other(err.to_string()))
+    });
+    let report = move || serde_json::to_value(stats.snapshot()).unwrap_or_default();
+    Ok((feeder, Box::new(report)))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+fn pipewire_feeder(
+    options: &ServeOptions,
+    _capture: istesso_audio::source::CaptureWriter,
+    _stop: Arc<AtomicBool>,
+) -> Result<(Feeder, CaptureReport), String> {
+    let _ = (
+        &options.node_name,
+        &options.node_description,
+        options.quantum,
+    );
+    for text in &options.node_properties {
+        parse_property(text)?;
+    }
+    Err(
+        "this build cannot capture from PipeWire: build it on Linux with `--features pipewire`"
+            .to_string(),
+    )
 }
 
 fn serve(options: ServeOptions) -> Result<(), String> {
@@ -316,6 +426,7 @@ fn serve(options: ServeOptions) -> Result<(), String> {
         match options.source {
             SourceArg::Tone => "a test tone",
             SourceArg::Stdin => "the audio on standard input",
+            SourceArg::Pipewire => "what applications play into the output made for it",
         },
         addr.port()
     );
@@ -328,7 +439,8 @@ fn serve(options: ServeOptions) -> Result<(), String> {
     let feeding = stop.clone();
     let packet_frames = options.packet_frames;
     let seconds = options.seconds;
-    let feeder = match options.source {
+    let mut capture_report: Option<CaptureReport> = None;
+    let feeder: Feeder = match options.source {
         SourceArg::Tone => {
             let amplitude = 10f64.powf(options.tone_db.min(0.0) / 20.0) as f32;
             let mut tone = Tone::new(options.tone_hz, amplitude, f64::from(STREAM_RATE));
@@ -341,6 +453,11 @@ fn serve(options: ServeOptions) -> Result<(), String> {
             let input = std::io::stdin().lock();
             feed_reader(&mut capture, input, packet_frames, &feeding)
         }),
+        SourceArg::Pipewire => {
+            let (feeder, report) = pipewire_feeder(&options, capture, feeding)?;
+            capture_report = Some(report);
+            feeder
+        }
     };
     // The tone ends by itself after `seconds`; a pipe ends when its writer
     // does. With a limit and a pipe that goes on, stop at the limit.
@@ -355,7 +472,7 @@ fn serve(options: ServeOptions) -> Result<(), String> {
     if feeder.is_finished() {
         match feeder.join() {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => eprintln!("reading the audio failed: {err}"),
+            Ok(Err(err)) => eprintln!("the source of the audio failed: {err}"),
             Err(_) => eprintln!("the thread that feeds the audio stopped unexpectedly"),
         }
     }
@@ -370,7 +487,11 @@ fn serve(options: ServeOptions) -> Result<(), String> {
         ledger::write(&entries, std::io::BufWriter::new(file))
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
-    super::print_json(&handle.stats())
+    let mut report = serde_json::to_value(handle.stats()).map_err(|e| e.to_string())?;
+    if let (Some(capture), Some(fields)) = (capture_report, report.as_object_mut()) {
+        fields.insert("capture".to_string(), capture());
+    }
+    super::print_json(&report)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +508,7 @@ struct PlayOptions {
     tone_hz: f64,
     ledger: Option<PathBuf>,
     report: Option<PathBuf>,
+    connect_for: f64,
 }
 
 fn resolve(address: &str) -> Result<SocketAddr, String> {
@@ -410,6 +532,7 @@ fn play(options: PlayOptions) -> Result<(), String> {
         options.tone_hz,
         options.ledger,
         options.report,
+        options.connect_for,
     );
     Err("playing is only built for macOS so far".to_string())
 }
@@ -492,18 +615,46 @@ mod mac {
         };
         let wait = Duration::from_secs(3);
 
-        // How the two clocks relate, for stating the latency.
-        let offset = clock_offset(addr, &keys, &peers, expected.as_deref(), 16, wait)
-            .map_err(|e| e.to_string())?;
+        // How the two clocks relate, for stating the latency. This is the
+        // first time the source is reached. The system may still be asking
+        // the person whether this program may use the local network, and it
+        // only asks while the program keeps trying.
+        let give_up = Instant::now() + Duration::from_secs_f64(options.connect_for.max(0.0));
+        let offset = loop {
+            match clock_offset(addr, &keys, &peers, expected.as_deref(), 16, wait) {
+                Ok(offset) => break offset,
+                Err(istesso_audio::Error::Io(err)) if Instant::now() < give_up => {
+                    eprintln!("cannot reach the source yet ({err}); trying again");
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        };
         let mut subscription =
             subscribe(addr, &keys, &peers, expected.as_deref(), wait).map_err(|e| e.to_string())?;
         let info = subscription.info().clone();
         let channels = usize::from(info.channels);
         let connection = subscription.connection().map_err(|e| e.to_string())?;
+        let stream_rate = f64::from(info.sample_rate);
+
+        // The network side: packets into the queue. It runs from the moment
+        // the source begins to send. Opening the device can take a second
+        // or two; packets left in the connection for that long would make
+        // the source's sending wait, and the source would let audio go.
+        // Room for four seconds of audio between the network and the device.
+        let (mut queue_in, queue_out) = queue(channels, (stream_rate * 4.0) as usize);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_pump = stop.clone();
+        let keep_ledger = options.ledger.is_some();
+        let pumping = std::thread::spawn(move || {
+            let mut arrivals = Arrivals::new(keep_ledger);
+            subscription.set_timeout(Duration::from_secs(3));
+            let result = pump(&mut subscription, &mut queue_in, &mut arrivals, &stop_pump);
+            (result, arrivals)
+        });
 
         let mut output = Output::open(options.output.as_deref()).map_err(|e| e.to_string())?;
         let device = output.device().clone();
-        let stream_rate = f64::from(info.sample_rate);
         let cfg = PlayoutConfig::new(
             channels,
             stream_rate,
@@ -511,8 +662,6 @@ mod mac {
             options.latency_ms * 1e-3,
         );
         let resampler = Sinc::new(stream_rate, device.sample_rate, channels, 64, 1.01)?;
-        // Room for four seconds of audio between the network and the device.
-        let (mut queue_in, queue_out) = queue(channels, (stream_rate * 4.0) as usize);
         let stats = Arc::new(PlayoutStats::default());
         let (waits_in, mut waits_out) = RingBuffer::<WaitEvent>::new(1 << 16);
         let mut playout = Playout::new(cfg, queue_out, resampler, stats.clone(), Some(waits_in));
@@ -526,19 +675,6 @@ mod mac {
             lead_max_us: AtomicI64::new(i64::MIN),
             ..Callbacks::default()
         });
-        // The network side: packets into the queue. It runs before the
-        // device does, so that nothing piles up in the connection while the
-        // device starts.
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_pump = stop.clone();
-        let keep_ledger = options.ledger.is_some();
-        let pumping = std::thread::spawn(move || {
-            let mut arrivals = Arrivals::new(keep_ledger);
-            subscription.set_timeout(Duration::from_secs(3));
-            let result = pump(&mut subscription, &mut queue_in, &mut arrivals, &stop_pump);
-            (result, arrivals)
-        });
-
         let seen = callbacks.clone();
         output
             .start(channels, move |frames, out, now_ns| {
@@ -583,7 +719,7 @@ mod mac {
                 if record_out.pop_entire_slice(&mut frame).is_err() {
                     break;
                 }
-                if first_channel.len() < keep_frames {
+                if options.tone_hz > 0.0 && first_channel.len() < keep_frames {
                     first_channel.push(frame[0]);
                 }
                 if let Some(file) = &mut record_file {
@@ -748,6 +884,20 @@ mod tests {
         assert!(parse_stall("600:0").is_err());
         assert!(parse_stall("-1:1").is_err());
         assert!(parse_stall("a:b").is_err());
+    }
+
+    #[test]
+    fn properties_are_written_as_key_and_value() {
+        assert_eq!(
+            parse_property("device.routes=1"),
+            Ok(("device.routes".to_string(), "1".to_string()))
+        );
+        assert_eq!(
+            parse_property(" node.group = a=b "),
+            Ok(("node.group".to_string(), "a=b".to_string()))
+        );
+        assert!(parse_property("device.routes").is_err());
+        assert!(parse_property("=1").is_err());
     }
 
     #[test]

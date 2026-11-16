@@ -145,6 +145,16 @@ impl CaptureWriter {
     pub fn position(&self) -> u64 {
         self.position
     }
+
+    /// Channels per frame.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Frames per second of the audio handed over.
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
 }
 
 impl Packetizer {

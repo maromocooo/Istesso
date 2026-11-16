@@ -26,6 +26,8 @@
 //!   own, for running hours of audio through the playout in a test.
 //!
 //! * `mac`: playing through Core Audio, on macOS.
+//! * `linux`: capturing through a sink of our own in PipeWire, on Linux,
+//!   when built with the `pipewire` feature.
 //!
 //! Capturing and playing need a real machine; everything else here does
 //! not, and is tested without one.
@@ -42,6 +44,8 @@ pub mod sim;
 pub mod source;
 pub mod wire;
 
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod mac;
 

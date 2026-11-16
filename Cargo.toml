@@ -48,6 +48,10 @@ rtrb = "0.4"
 # Core Audio (macOS only): the output unit, and the clock its time stamps are in.
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_unit", "core_audio"] }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "HostTime", "AudioHardware"] }
+# PipeWire (Linux only, and only with the `pipewire` feature of istesso-audio): the capture.
+# libc for the clock PipeWire stamps its cycles with.
+pipewire = "0.10"
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

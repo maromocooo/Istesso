@@ -31,3 +31,20 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # The Linux capture sits behind a cargo feature because it needs
+  # PipeWire's development files to build. This job turns it on; no other
+  # job installs anything.
+  pipewire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: PipeWire's development files
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --features istesso-cli/pipewire -- -D warnings
+      - name: Test
+        run: cargo test --workspace --features istesso-cli/pipewire

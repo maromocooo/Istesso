@@ -23,3 +23,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 istesso-audio.workspace = true
+
+[features]
+# `istesso audio serve --source pipewire`; see istesso-audio.
+pipewire = ["istesso-audio/pipewire"]
