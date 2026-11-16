@@ -342,4 +342,153 @@ mod tests {
         // The client says nothing; the host gives up on its own.
         assert!(matches!(host.join().unwrap(), Ok(None)));
     }
+
+    #[test]
+    fn a_refusal_keeps_its_code() {
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = serve(listener, studio, studio_trusts);
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let mut client = Client::connect(addr, &keys, &air_trusts.store, None, TIMEOUT).unwrap();
+        match client.manifest() {
+            Err(Error::Remote(refusal)) => {
+                // Callers decide by the code; people read the message.
+                assert_eq!(refusal.code, ErrorCode::Forbidden);
+                assert_eq!(refusal.message, "not in this test");
+                assert_eq!(refusal.to_string(), "not in this test (Forbidden)");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        drop(client);
+        host.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn session_calls_come_back_as_reports() {
+        use istesso_proto::{
+            DisplayMode, EndReason, SessionEnd, SessionId, SessionInfo, SessionState, StreamKind,
+        };
+
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+        let id = SessionId("5b0c9e3a7f21d684".to_string());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A host that knows one session and says what it was asked.
+        let host = {
+            let id = id.clone();
+            thread::spawn(move || {
+                let keys = LocalKeys::new(&studio).unwrap();
+                let (stream, _) = listener.accept().unwrap();
+                let mut session =
+                    Session::accept(stream, &keys, &studio_trusts.store, TIMEOUT).unwrap();
+                let mut asked = Vec::new();
+                while let Some(request) = session.next_request().unwrap() {
+                    let report = |state, revision, end| Response::Session {
+                        session: Box::new(SessionInfo {
+                            id: id.clone(),
+                            app: "editor.desktop".into(),
+                            kind: StreamKind::AppWindow,
+                            state,
+                            revision,
+                            attachment: 1,
+                            display: None,
+                            answer: None,
+                            end,
+                            left_by: None,
+                            shown_on: None,
+                            paused: None,
+                        }),
+                    };
+                    let response = match &request {
+                        Request::SessionStart { .. } => report(SessionState::Starting, 1, None),
+                        Request::SessionWait { session, .. } if *session == id => {
+                            report(SessionState::Running, 2, None)
+                        }
+                        Request::SessionStop { session, .. } if *session == id => report(
+                            SessionState::Stopping,
+                            3,
+                            Some(SessionEnd {
+                                reason: EndReason::Stopped,
+                                message: String::new(),
+                            }),
+                        ),
+                        _ => Response::error(ErrorCode::NotFound, "no such session"),
+                    };
+                    asked.push(request);
+                    session.respond(&response).unwrap();
+                }
+                asked
+            })
+        };
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let mut client = Client::connect(addr, &keys, &air_trusts.store, None, TIMEOUT).unwrap();
+        assert!(client.remote_addr().unwrap().ip().is_loopback());
+        let display = DisplayMode {
+            width: 1280,
+            height: 720,
+            fps: 60,
+        };
+        let started = client
+            .session_start(
+                "editor.desktop",
+                StreamKind::AppWindow,
+                display,
+                serde_json::json!({"port": 1}),
+            )
+            .unwrap();
+        assert_eq!(started.id, id);
+        assert_eq!(started.state, SessionState::Starting);
+        let running = client
+            .session_wait(&id, started.revision, Duration::from_millis(1500), 1)
+            .unwrap();
+        assert_eq!(running.state, SessionState::Running);
+        let stopping = client.session_stop(&id, true).unwrap();
+        assert_eq!(stopping.end.unwrap().reason, EndReason::Stopped);
+        // Somebody else's session, or none: a refusal the caller can tell
+        // from other failures.
+        let other = SessionId("0000000000000000".to_string());
+        match client.session_stop(&other, false) {
+            Err(Error::Remote(refusal)) => assert_eq!(refusal.code, ErrorCode::NotFound),
+            other => panic!("unexpected: {other:?}"),
+        }
+        drop(client);
+
+        let asked = host.join().unwrap();
+        assert_eq!(
+            asked[0],
+            Request::SessionStart {
+                app: "editor.desktop".into(),
+                kind: StreamKind::AppWindow,
+                display,
+                offer: serde_json::json!({"port": 1}),
+            }
+        );
+        assert_eq!(
+            asked[1],
+            Request::SessionWait {
+                session: id.clone(),
+                after: 1,
+                timeout_ms: 1500,
+                attachment: 1,
+            }
+        );
+        assert_eq!(
+            asked[2],
+            Request::SessionStop {
+                session: id,
+                force: true
+            }
+        );
+    }
 }
