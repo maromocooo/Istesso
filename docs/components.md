@@ -30,15 +30,16 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 |---|---|---|---|
 | GStreamer | Linux ホストの映像パイプライン | LGPL | 動的リンクで使う |
 | FFmpeg | 予備のコーデック経路 | LGPL（既定の構成） | `--enable-gpl` と `--enable-nonfree` を付けない。x264 / x265 を使わない。動的リンク |
-| Roc Toolkit | 音の配信（時計のずれ補正、欠落の補完） | MPL-2.0 | ライブラリとして使う。Roc 自体を変更した場合はその変更を公開する。`deny.toml` に個別登録 |
 | NVENC | NVIDIA のエンコーダー | ヘッダーは MIT、本体はドライバー | SDK 本体をリポジトリに入れない |
+
+Roc Toolkit（MPL-2.0）は、音の配信に使う予定でしたが、使わないことにしました（[ADR 0011](adr/0011-audio-transport.md)）。認証と暗号化を持たないこと、Mac に入れる手段がソースからのビルドしかないこと、Ubuntu の版では失われたパケットの復元が使えないことが理由です。音の配信は、自前のクレート（`istesso-audio`）で行います。
 
 ## OS の機能（呼び出すだけ）
 
 | 機能 | 用途 |
 |---|---|
 | ScreenCaptureKit、VideoToolbox、Core Audio のタップ（macOS 14.2 以降） | Mac ホストの取り込み、圧縮、アプリ音声の取得 |
-| PipeWire | Linux の音声。Roc 用の送受信モジュールあり |
+| PipeWire | Linux の音声。クライアントとして仮想の出力先を作り、そこに流れた音を取り込む（[ADR 0011](adr/0011-audio-transport.md)） |
 | Linux カーネルの USB/IP | Linux が受け側の USB 付け替え |
 | Jetpack Compose for XR | AURA クライアント（ベータ） |
 
@@ -76,4 +77,4 @@ cargo deny check
 
 2026-11-15 時点の依存 99 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、Unicode-3.0 のいずれかで利用できます（cargo-deny 0.20.2 でライセンス・禁止項目・取得元・既知の脆弱性を検査済み）。
 
-音（`istesso-audio`）のために足した依存を含めると、`m2-audio` ブランチでは 128 クレートです（2026-11-16、同じ版の cargo-deny で、同じ 4 項目を検査済み）。足した分は、MIT、Apache-2.0、Zlib のいずれかで利用できます。Roc Toolkit は、[ADR 0011](adr/0011-audio-transport.md) の提案が採用されれば、使いません。
+音（`istesso-audio`）のために足した依存を含めると、`m2-audio` ブランチでは 128 クレートです（2026-11-16、同じ版の cargo-deny で、同じ 4 項目を検査済み）。足した分は、MIT、Apache-2.0、Zlib のいずれかで利用できます。Roc Toolkit は、使いません（[ADR 0011](adr/0011-audio-transport.md)）。

@@ -1,6 +1,6 @@
 # ADR 0005：オーディオは独立した常駐サービスにする
 
-- 状態：採用
+- 状態：採用（配信の部品は、2026-11-16 に [ADR 0011](0011-audio-transport.md) で替えた。ほかの決定は、そのまま）
 - 日付：2026-11-15
 
 ## 背景
@@ -26,10 +26,15 @@ DAC が挿さっている PC でプレーヤーやブラウザを動かす場合
 
 | 役割 | 部品 |
 |---|---|
-| 配信（ずれ補正、欠落の補完） | Roc Toolkit（MPL-2.0。条件つきで採用） |
-| Linux の取り込みと再生 | PipeWire（Roc 用のモジュールあり） |
+| 配信 | `istesso-audio`（自前）と、`istesso-link` の通信路。映像と入力の経路と同じ仕組みで運ぶ |
+| 時計のずれ補正 | rubato のリサンプラー（MIT OR Apache-2.0）と、自前の制御 |
+| 欠落の補完 | TCP の再送と、受信バッファー。途切れたときは、フェードして数える |
+| Linux の取り込み | PipeWire のクライアントとして、仮想の出力先を作る（`pipewire` クレート、MIT） |
+| Linux の再生 | PipeWire |
 | Mac の取り込み | Core Audio のタップ（macOS 14.2 以降。仮想ドライバー不要） |
-| Mac の再生 | Core Audio |
+| Mac の再生 | Core Audio（`coreaudio-rs`、MIT OR Apache-2.0） |
+
+2026-11-16 までは、配信とずれ補正と欠落の補完に Roc Toolkit を、Linux の取り込みに PipeWire の Roc 用のモジュールを挙げていました。替えた理由と、替えたあとの中身は、[ADR 0011](0011-audio-transport.md) にあります。
 
 ## 受け入れ条件
 
