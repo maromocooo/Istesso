@@ -1313,3 +1313,135 @@ fn a_viewer_that_takes_nothing_is_not_sent_cursor_after_cursor() {
     }
     pair.until(|| pair.said("stopped showing the picture to air"));
 }
+
+#[test]
+fn a_frame_does_not_wait_for_a_viewer_whose_own_thread_holds_its_connection() {
+    let pair = pair();
+    let book = pair.another_device("book");
+    let good = receive(pair.connect_as(&book).unwrap());
+    pair.until(|| pair.host.viewers() == 1);
+    let held = receive(pair.connect().unwrap());
+    pair.until(|| pair.host.viewers() == 2);
+    assert!(pair.host.key_frame_wanted());
+
+    // A frame every five milliseconds, each a key frame so that both can take every one.
+    // After a while the thread of one viewer takes that viewer's connection for fifty
+    // milliseconds without having said that it would be long, which no code does.
+    let began = Instant::now();
+    let (mut longest, mut frames, mut missed, mut asked) = (Duration::ZERO, 0, 0, false);
+    let mut handed = Vec::new();
+    while began.elapsed() < Duration::from_millis(400) {
+        if !asked && began.elapsed() >= Duration::from_millis(100) {
+            pair.host.hold_the_line_of("air", Duration::from_millis(50));
+            asked = true;
+        }
+        let sending = Instant::now();
+        handed.push(sending);
+        let sent = pair.host.send_frame(b"key", 0, 0, true).unwrap();
+        longest = longest.max(sending.elapsed());
+        frames += 1;
+        missed += usize::from(sent.viewers < 2);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // No frame waited for the connection that was held: each gave it a fraction of a
+    // millisecond and went on.
+    assert!(longest < Duration::from_millis(20), "{longest:?}");
+    // The viewer whose connection was held missed frames meanwhile, and only that one.
+    assert!(missed >= 2, "{missed} frames went past the held viewer");
+    pair.until(|| good.count() == frames);
+    pair.until(|| held.count() == frames - missed);
+    // The other viewer got its frames as far apart as they were handed over (this
+    // test's own pauses, which a busy machine stretches), and no further.
+    let widest = |times: &[Instant]| {
+        times
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap()
+    };
+    let (arrived, sent) = (widest(&good.finish()), widest(&handed));
+    assert!(
+        arrived < sent + Duration::from_millis(20),
+        "{arrived:?} apart, handed over {sent:?} apart"
+    );
+    // Having missed frames, it began again with a key frame, which the host asked for.
+    assert!(pair.host.key_frame_wanted());
+    held.finish();
+}
+
+#[test]
+fn a_viewer_that_lost_its_right_is_not_told_the_cursor_either() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let cursor = |pixels: &[u8]| -> Result<(), Error> {
+        pair.host.set_cursor(&Cursor::Image(CursorImage {
+            width: 16,
+            height: 16,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            scale: 1,
+            rgba: pixels,
+        }))
+    };
+    cursor(&pixels).unwrap();
+    assert_eq!(events(&mut viewer, 1).0, "c");
+
+    // The thread that looks the viewers up is stuck, and the right is taken away. The
+    // application goes on changing its cursor; no frame goes out.
+    pair.host.pause_recheck(true);
+    pair.studio_peers.allow("air", &[Permission::Control]);
+    let taken = Instant::now();
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let receiving = {
+        let told = told.clone();
+        std::thread::spawn(move || loop {
+            match viewer.next(Duration::from_millis(50)) {
+                Ok(Some(Event::Cursor(_))) => told.lock().unwrap().push(Instant::now()),
+                Ok(_) if Arc::strong_count(&told) == 1 => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        })
+    };
+    let mut number = 0u32;
+    while taken.elapsed() < Duration::from_millis(2500) {
+        number += 1;
+        pixels[..4].copy_from_slice(&number.to_le_bytes());
+        cursor(&pixels).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let times = told.lock().unwrap().clone();
+    drop(told);
+    receiving.join().unwrap();
+    // It was told for as long as its last look-up was good for, and not after.
+    let last = times
+        .last()
+        .expect("never told")
+        .saturating_duration_since(taken);
+    assert!(last > Duration::from_millis(300), "{last:?}");
+    assert!(last < Duration::from_millis(1100), "{last:?}");
+}
+
+#[test]
+fn nobody_is_told_the_cursor_while_the_list_of_paired_devices_cannot_be_read() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    pair.host.set_cursor(&Cursor::Named("before")).unwrap();
+    assert_eq!(events(&mut viewer, 1).1[0], b"before");
+
+    std::fs::write(pair.studio_peers.path(), "{ not a list").unwrap();
+    pair.until(|| pair.host.viewers() == 0);
+    // The cursor changes; there is nobody it may be told to, and nobody gets in.
+    pair.host.set_cursor(&Cursor::Named("after")).unwrap();
+    assert!(pair.connect().is_err());
+    let over = loop {
+        match viewer.next(SOON) {
+            Ok(Some(Event::Cursor(cursor))) => assert_ne!(cursor, Cursor::Named("after")),
+            Ok(Some(Event::Frame(_))) => panic!("a frame"),
+            Ok(None) => panic!("the viewer was left waiting"),
+            Err(err) => break err,
+        }
+    };
+    assert!(matches!(over, Error::Link(LinkError::Closed)), "{over}");
+}

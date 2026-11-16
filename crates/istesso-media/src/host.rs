@@ -78,6 +78,9 @@ const IDLE_EVERY: Duration = Duration::from_millis(500);
 const KEY_AGAIN: Duration = Duration::from_millis(500);
 /// How often a viewer's thread looks up when nothing happens.
 const TICK: Duration = Duration::from_millis(100);
+/// How long a frame waits for a viewer's connection while that viewer's own thread has it
+/// for a moment. Longer than this, and the frame is not sent to that viewer.
+const LINE_WAIT: Duration = Duration::from_micros(300);
 
 /// A host that shows its picture to paired devices.
 pub struct Host {
@@ -152,7 +155,23 @@ struct Watcher {
     unsent: AtomicBool,
     /// The viewer's thread has the connection for something that may take
     /// long: finishing a frame, or reading what the viewer says.
+    ///
+    /// The order is the same at every such place, and has to be: this is set BEFORE the
+    /// connection (`line`) is taken, and cleared after it has been let go. A frame that
+    /// finds the connection taken looks here and, when this is set, goes on without this
+    /// viewer at once. The viewer's thread also takes the connection without setting
+    /// this, for work that cannot wait on anything (sealing a small packet into memory
+    /// and offering it to a connection that never waits); a frame gives that at most
+    /// [`LINE_WAIT`], so that nothing rests on the work really being that short.
     busy: AtomicBool,
+    /// When a frame last went to this viewer, on [`clock::now_ns`]. While frames go,
+    /// what else the viewer is to be told goes behind a frame, on the frames' thread, and
+    /// its own thread leaves the connection alone.
+    last_frame_ns: AtomicU64,
+    /// For tests: the viewer's thread takes the connection for this many milliseconds
+    /// without saying that it will be long.
+    #[cfg(test)]
+    hold_ms: AtomicU64,
     /// When something was last sent, on [`clock::now_ns`].
     last_sent_ns: AtomicU64,
     /// Which cursor this viewer was told last (its number), and when.
@@ -415,6 +434,21 @@ impl Host {
         self.shared.recheck_paused.store(paused, Ordering::SeqCst);
     }
 
+    /// Makes the thread of the viewer called `name` take that viewer's connection for
+    /// `time` without saying that it will be long: what must never happen, to see what a
+    /// frame does if it happens all the same.
+    #[cfg(test)]
+    pub(crate) fn hold_the_line_of(&self, name: &str, time: Duration) {
+        for watcher in self.shared.watchers().list.iter() {
+            if watcher.peer.name == name {
+                watcher
+                    .hold_ms
+                    .store(time.as_millis() as u64, Ordering::SeqCst);
+                watcher.wake.wake();
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         self.shared.pending.load(Ordering::SeqCst)
@@ -455,6 +489,17 @@ fn refuse(channel: &mut Channel<Timed>, code: ErrorCode, message: &str) -> Resul
     )
 }
 
+/// What became of a packet that was to be sealed for one viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sealed {
+    /// Not sealed: the viewer may not be sent anything at the moment.
+    Nothing,
+    /// Sealed, and all of it on the wire.
+    Whole,
+    /// Sealed, and part of it left for the viewer's thread to finish.
+    Part,
+}
+
 /// What became of a frame for one viewer.
 enum Offered {
     /// Not sent: the viewer cannot have it, or cannot use it.
@@ -480,16 +525,22 @@ impl Watcher {
     /// The connection, for a moment. `None` while the viewer's thread has
     /// it for something that may take long: the frames wait for nobody.
     fn line_for_a_frame(&self) -> Option<MutexGuard<'_, Line>> {
-        match self.line.try_lock() {
-            Ok(line) => Some(line),
-            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
-            Err(TryLockError::WouldBlock) if self.busy.load(Ordering::SeqCst) => None,
-            // Only the viewer's own thread can have it, and it has not said that it
-            // will be long: it is saying that the picture stands still, or what the
-            // cursor is. That is sealing a small packet and handing it to the
-            // connection without waiting, some microseconds; the frame waits them
-            // out rather than be lost.
-            Err(TryLockError::WouldBlock) => Some(self.line()),
+        let began = Instant::now();
+        loop {
+            match self.line.try_lock() {
+                Ok(line) => return Some(line),
+                Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                // The viewer's own thread has it, for something that may take long.
+                Err(TryLockError::WouldBlock) if self.busy.load(Ordering::SeqCst) => return None,
+                // The viewer's own thread has it and has not said so: it is sealing a
+                // small packet. That takes microseconds, and the frame waits them out
+                // rather than be lost. It does not wait longer than that, whatever the
+                // other thread is doing.
+                Err(TryLockError::WouldBlock) if began.elapsed() < LINE_WAIT => {
+                    std::hint::spin_loop()
+                }
+                Err(TryLockError::WouldBlock) => return None,
+            }
         }
     }
 }
@@ -509,6 +560,29 @@ impl Shared {
             ));
             watcher.wake.wake();
         }
+    }
+
+    /// Seals one packet for one viewer and puts it on its connection as far as the
+    /// connection takes it now. Waits for nothing.
+    ///
+    /// The one place anything is sealed for a viewer once its stream runs: a frame, what
+    /// the cursor is, that the picture stands still, that the stream is over. So it is
+    /// also the one gate. Nothing is sealed for a viewer whose stream has been closed, or
+    /// that was not found in the list of paired devices, with the right to look, within
+    /// the last second: such a viewer gets `Sealed::Nothing`, whatever the packet is.
+    fn seal(&self, watcher: &Watcher, line: &mut Line, packet: &[u8]) -> Result<Sealed> {
+        if watcher.closed.load(Ordering::SeqCst) || !watcher.confirmed_lately() {
+            return Ok(Sealed::Nothing);
+        }
+        // Sealing writes into memory; only `push` touches the connection.
+        line.channel.send(packet)?;
+        if line.channel.stream().push()? {
+            return Ok(Sealed::Whole);
+        }
+        line.unsent_since = Some(Instant::now());
+        watcher.unsent.store(true, Ordering::SeqCst);
+        watcher.wake.wake();
+        Ok(Sealed::Part)
     }
 
     /// Seals one frame for one viewer and puts it on its connection as far
@@ -550,40 +624,35 @@ impl Shared {
             return Offered::No;
         }
         wire::set_discontinuity(packet, line.skipped);
-        // Sealing writes into memory; only `push` touches the connection.
-        let pushed = line
-            .channel
-            .send(packet)
-            .map_err(Error::from)
-            .and_then(|()| Ok(line.channel.stream().push()?));
-        match pushed {
-            Ok(all) => {
-                line.awaiting_key = None;
-                line.skipped = false;
-                watcher
-                    .last_sent_ns
-                    .store(clock::now_ns(), Ordering::SeqCst);
-                if all {
-                    // The cursor goes behind the frame, never in front of it.
-                    if self.cursor_due(watcher) == Some(Duration::ZERO) {
-                        if let Err(err) = self.tell_cursor(watcher, &mut line) {
-                            drop(line);
-                            self.close(watcher, &err);
-                        }
-                    }
-                    return Offered::Written;
-                }
-                line.unsent_since = Some(Instant::now());
-                watcher.unsent.store(true, Ordering::SeqCst);
-                watcher.wake.wake();
-                Offered::Queued
+        let sealed = match self.seal(watcher, &mut line, packet) {
+            Ok(Sealed::Nothing) => {
+                // No longer confirmed, between the look above and here.
+                watcher.missed.store(true, Ordering::SeqCst);
+                return Offered::No;
             }
+            Ok(sealed) => sealed,
             Err(err) => {
                 drop(line);
                 self.close(watcher, &err);
-                Offered::No
+                return Offered::No;
+            }
+        };
+        line.awaiting_key = None;
+        line.skipped = false;
+        let at = clock::now_ns();
+        watcher.last_sent_ns.store(at, Ordering::SeqCst);
+        watcher.last_frame_ns.store(at, Ordering::SeqCst);
+        if sealed == Sealed::Part {
+            return Offered::Queued;
+        }
+        // The cursor goes behind the frame, never in front of it.
+        if self.cursor_due(watcher) == Some(Duration::ZERO) {
+            if let Err(err) = self.tell_cursor(watcher, &mut line) {
+                drop(line);
+                self.close(watcher, &err);
             }
         }
+        Offered::Written
     }
 
     /// How long until this viewer may be told what the cursor is: not at all (`None`) when
@@ -594,9 +663,22 @@ impl Shared {
         if watcher.cursor_told.load(Ordering::SeqCst) == self.cursor_no.load(Ordering::SeqCst) {
             return None;
         }
-        let interval = 1_000_000_000 / u64::from(self.info.fps.clamp(1, 1000));
         let since = clock::now_ns().saturating_sub(watcher.cursor_told_ns.load(Ordering::SeqCst));
-        Some(Duration::from_nanos(interval.saturating_sub(since)))
+        Some(Duration::from_nanos(
+            self.frame_interval_ns().saturating_sub(since),
+        ))
+    }
+
+    /// How far apart frames are at the frame rate the viewers were told.
+    fn frame_interval_ns(&self) -> u64 {
+        1_000_000_000 / u64::from(self.info.fps.clamp(1, 1000))
+    }
+
+    /// Whether frames are going to this viewer at the moment: one went within the last
+    /// three frame intervals.
+    fn frames_are_going(&self, watcher: &Watcher) -> bool {
+        let since = clock::now_ns().saturating_sub(watcher.last_frame_ns.load(Ordering::SeqCst));
+        since < 3 * self.frame_interval_ns()
     }
 
     /// Seals the latest cursor for one viewer and puts it on its connection, behind
@@ -611,11 +693,10 @@ impl Shared {
         let Some((number, packet)) = now else {
             return Ok(());
         };
-        line.channel.send(&packet)?;
-        if !line.channel.stream().push()? {
-            line.unsent_since = Some(Instant::now());
-            watcher.unsent.store(true, Ordering::SeqCst);
-            watcher.wake.wake();
+        // A viewer that may not be sent frames is not told the cursor either: it stays
+        // due, and is told once the viewer has been confirmed again.
+        if self.seal(watcher, line, &packet)? == Sealed::Nothing {
+            return Ok(());
         }
         let at = clock::now_ns();
         watcher.cursor_told.store(number, Ordering::SeqCst);
@@ -750,6 +831,9 @@ impl Shared {
             missed: AtomicBool::new(false),
             unsent: AtomicBool::new(false),
             busy: AtomicBool::new(false),
+            last_frame_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            hold_ms: AtomicU64::new(0),
             last_sent_ns: AtomicU64::new(clock::now_ns()),
             cursor_told: AtomicU64::new(0),
             cursor_told_ns: AtomicU64::new(0),
@@ -807,19 +891,31 @@ impl Shared {
         let mut packet = Vec::new();
         loop {
             if self.stop.load(Ordering::SeqCst) {
-                // Best effort: the viewer may be gone already.
+                // Best effort: the viewer may be gone already. This may wait for the
+                // connection, so it is said first, as everywhere.
+                watcher.busy.store(true, Ordering::SeqCst);
                 let mut line = watcher.line();
                 if line.unsent_since.is_none() {
                     let seq = self.seq.load(Ordering::SeqCst);
                     wire::encode(&Header::without_frame(Kind::End, seq), &[], &mut packet);
-                    if line.channel.send(&packet).is_ok() {
+                    if let Ok(Sealed::Part) = self.seal(watcher, &mut line, &packet) {
                         let _ = line.channel.stream().push_by(Instant::now() + ASK_WAIT);
                     }
                 }
+                drop(line);
+                watcher.busy.store(false, Ordering::SeqCst);
                 return;
             }
             if watcher.closed.load(Ordering::SeqCst) {
                 return;
+            }
+            #[cfg(test)]
+            {
+                let hold = watcher.hold_ms.swap(0, Ordering::SeqCst);
+                if hold > 0 {
+                    let _line = watcher.line();
+                    std::thread::sleep(Duration::from_millis(hold));
+                }
             }
             if let Err(err) = self.finish_what_was_begun(watcher) {
                 return self.close(watcher, &err);
@@ -828,6 +924,12 @@ impl Shared {
             // be told again; otherwise this thread looks up when it may.
             let mut tick = TICK;
             match self.cursor_due(watcher) {
+                // While frames go to this viewer the cursor goes behind the next of
+                // them, on their thread: this thread keeps off the connection, so that
+                // no frame finds it taken.
+                Some(_) if self.frames_are_going(watcher) => {
+                    tick = tick.min(Duration::from_nanos(self.frame_interval_ns()));
+                }
                 Some(Duration::ZERO) => {
                     let mut line = watcher.line();
                     // Looked at again now that the connection is in hand: a frame may
@@ -864,21 +966,9 @@ impl Shared {
                 if line.unsent_since.is_none() {
                     let seq = self.seq.load(Ordering::SeqCst);
                     wire::encode(&Header::without_frame(Kind::Idle, seq), &[], &mut packet);
-                    let pushed = line
-                        .channel
-                        .send(&packet)
-                        .map_err(Error::from)
-                        .and_then(|()| Ok(line.channel.stream().push()?));
-                    match pushed {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            line.unsent_since = Some(Instant::now());
-                            watcher.unsent.store(true, Ordering::SeqCst);
-                        }
-                        Err(err) => {
-                            drop(line);
-                            return self.close(watcher, &err);
-                        }
+                    if let Err(err) = self.seal(watcher, &mut line, &packet) {
+                        drop(line);
+                        return self.close(watcher, &err);
                     }
                     watcher
                         .last_sent_ns
