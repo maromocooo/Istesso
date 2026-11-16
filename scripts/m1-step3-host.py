@@ -49,7 +49,7 @@ from m1_encoder import BITRATE, CHROMA, COLOURS, GOP, RAW_FORMATS, encoder, rate
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--to", required=True, metavar="ADDR[:PORT]", help="where to send the stream (port 5004 unless given); an IPv6 address goes in brackets")
-    parser.add_argument("--log", required=True, metavar="FILE", help="the frame log to write; an existing file is not overwritten")
+    parser.add_argument("--log", required=True, metavar="FILE", help="the frame log to write; an existing file is not overwritten. `-` for none: when the pipeline only shows something and nothing is measured")
     parser.add_argument("--render-node", metavar="PATH", help="DRM render node for the compositor, for example /dev/dri/renderD129")
     parser.add_argument("--size", default="1720x720", metavar="WxH")
     parser.add_argument("--fps", type=int, default=85)
@@ -146,7 +146,7 @@ def main():
         pacing = "as-built"
         if args.render_on_commit:
             print("note: this compositor plugin has no render-on-commit property; it paces frames the way it was built", file=sys.stderr)
-    log = open(args.log, "x", buffering=1 << 20)
+    log = open(os.devnull, "w") if args.log == "-" else open(args.log, "x", buffering=1 << 20)
     log.write(
         '{"kind":"header","side":"host","tool":"m1-step3-host","version":"2","started_unix_ms":%d,'
         '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s","pacing":"%s"}\n'
