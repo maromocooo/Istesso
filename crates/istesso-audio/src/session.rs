@@ -43,6 +43,9 @@ const MAX_SERVING: usize = 8;
 const HELLO_WAIT: Duration = Duration::from_secs(3);
 /// How long a conversation about the time may last.
 const TIME_TALK: Duration = Duration::from_secs(30);
+/// Packets in ten hours at 256 frames each: the room set aside for lists
+/// that get a line per packet.
+pub const NIGHT_OF_PACKETS: usize = 6_750_000;
 /// How long a source lets a single write to a listener take. A listener
 /// that takes nothing for this long is gone.
 const SEND_WAIT: Duration = Duration::from_secs(5);
@@ -216,8 +219,48 @@ struct Shared {
     /// How long a caller has for the handshake and its first message.
     hello_wait_ms: AtomicU64,
     sent: Option<Arc<Mutex<Vec<Entry>>>>,
+    times: SendTimes,
     stop: AtomicBool,
     log: Log,
+}
+
+/// How promptly audio left the source. When packets reach an exit late,
+/// this says whether they were late already when they left.
+#[derive(Debug, Default)]
+struct SendTimes {
+    packets: AtomicU64,
+    /// From a packet's capture to the sending thread taking it up.
+    taken_up_late_max_ns: AtomicU64,
+    /// How long handing one packet to the connection took.
+    send_max_ns: AtomicU64,
+    /// From one packet being taken up to the next, while audio flows.
+    gap_max_ns: AtomicU64,
+    /// How long looking a listener up in the peer store took.
+    lookup_max_ns: AtomicU64,
+}
+
+/// Sets a flag when it goes out of scope.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// [`SendTimes`] at one moment: the longest of each.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct SendSnapshot {
+    pub packets: u64,
+    /// From a packet's capture to the sending thread taking it up.
+    pub taken_up_late_max_ms: f64,
+    /// How long handing one packet to the connection took.
+    pub send_max_ms: f64,
+    /// From one packet being taken up to the next, while audio flowed.
+    pub gap_max_ms: f64,
+    /// How long looking a listener up in the peer store took. This happens
+    /// beside the sending, not in it.
+    pub lookup_max_ms: f64,
 }
 
 impl Source {
@@ -248,6 +291,7 @@ impl Source {
                 serving: AtomicUsize::new(0),
                 hello_wait_ms: AtomicU64::new(HELLO_WAIT.as_millis() as u64),
                 sent,
+                times: SendTimes::default(),
                 stop: AtomicBool::new(false),
                 log,
             }),
@@ -329,6 +373,19 @@ impl Stopper {
     /// What the source's side has sent and let go so far.
     pub fn stats(&self) -> crate::source::SourceStats {
         self.0.packetizer().stats()
+    }
+
+    /// How promptly audio has left the source so far.
+    pub fn sending(&self) -> SendSnapshot {
+        let times = &self.0.times;
+        let ms = |value: &AtomicU64| value.load(Ordering::Relaxed) as f64 * 1e-6;
+        SendSnapshot {
+            packets: times.packets.load(Ordering::Relaxed),
+            taken_up_late_max_ms: ms(&times.taken_up_late_max_ns),
+            send_max_ms: ms(&times.send_max_ns),
+            gap_max_ms: ms(&times.gap_max_ns),
+            lookup_max_ms: ms(&times.lookup_max_ns),
+        }
     }
 }
 
@@ -455,16 +512,53 @@ impl Shared {
         // now on, not what piled up before it came.
         self.streams.fetch_add(1, Ordering::SeqCst);
         self.packetizer().flush();
-        let result = self.send_packets(&mut channel, peer, number);
+        // The pairing is looked up again while the stream runs, on a thread
+        // of its own: reading a file must not hold up the audio.
+        let allowed = AtomicBool::new(true);
+        let over = AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| self.watch_pairing(peer, &allowed, &over));
+            // Set however the sending ends, so that the look-up ends too.
+            let _over = SetOnDrop(&over);
+            self.send_packets(&mut channel, peer, number, &allowed)
+        });
         self.streams.fetch_sub(1, Ordering::SeqCst);
         result
     }
 
-    fn send_packets(&self, channel: &mut Channel<Timed>, peer: &Peer, number: u64) -> Result<()> {
-        let mut packet = Vec::new();
+    /// Looks the listener up in the peer store once every [`RECHECK`], until
+    /// the stream is `over`. Clears `allowed` when the device is no longer
+    /// paired, has another key, or has lost the right to the sound.
+    fn watch_pairing(&self, peer: &Peer, allowed: &AtomicBool, over: &AtomicBool) {
         let mut checked = Instant::now();
+        while !over.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+            if checked.elapsed() < RECHECK {
+                continue;
+            }
+            checked = Instant::now();
+            let still = may_still_hear(&self.peers_path, peer);
+            self.times
+                .lookup_max_ns
+                .fetch_max(checked.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if !still {
+                allowed.store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+
+    fn send_packets(
+        &self,
+        channel: &mut Channel<Timed>,
+        peer: &Peer,
+        number: u64,
+        allowed: &AtomicBool,
+    ) -> Result<()> {
+        let mut packet = Vec::new();
         let mut last_audio = Instant::now();
         let mut last_idle: Option<Instant> = None;
+        let mut last_taken_up: Option<u64> = None;
         let why = loop {
             if self.stop.load(Ordering::SeqCst) {
                 break "the source is stopping";
@@ -472,18 +566,15 @@ impl Shared {
             if self.listener_no.load(Ordering::SeqCst) != number {
                 break "another device asked for the sound";
             }
-            if checked.elapsed() >= RECHECK {
-                checked = Instant::now();
-                if !may_still_hear(&self.peers_path, peer) {
-                    break "it is no longer allowed to have this host's sound";
-                }
+            if !allowed.load(Ordering::SeqCst) {
+                break "it is no longer allowed to have this host's sound";
             }
             // The packetizer is held only while a packet is put together,
             // never while it is sent: a listener that takes nothing must
             // not keep the next one waiting.
             let entry = self.packetizer().next_packet().map(|(header, samples)| {
                 wire::encode(&header, samples, &mut packet);
-                Entry {
+                let entry = Entry {
                     seq: header.seq,
                     position: header.position,
                     frames: (samples.len() / usize::from(self.info.channels)) as u32,
@@ -492,14 +583,30 @@ impl Shared {
                     } else {
                         0
                     },
-                }
+                };
+                (entry, header.capture_ns)
             });
             match entry {
-                Some(entry) => {
+                Some((entry, capture_ns)) => {
+                    let taken_up = clock::now_ns();
                     if let Some(sent) = &self.sent {
                         sent.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
                     }
                     channel.send(&packet)?;
+                    let times = &self.times;
+                    times.packets.fetch_add(1, Ordering::Relaxed);
+                    times
+                        .taken_up_late_max_ns
+                        .fetch_max(taken_up.saturating_sub(capture_ns), Ordering::Relaxed);
+                    times
+                        .send_max_ns
+                        .fetch_max(clock::now_ns().saturating_sub(taken_up), Ordering::Relaxed);
+                    if let Some(before) = last_taken_up {
+                        times
+                            .gap_max_ns
+                            .fetch_max(taken_up.saturating_sub(before), Ordering::Relaxed);
+                    }
+                    last_taken_up = Some(taken_up);
                     last_audio = Instant::now();
                     last_idle = None;
                 }
@@ -510,6 +617,8 @@ impl Shared {
                         wire::encode(&header, &[], &mut packet);
                         channel.send(&packet)?;
                         last_idle = Some(Instant::now());
+                        // A pause in the audio is not a gap in the sending.
+                        last_taken_up = None;
                     }
                     std::thread::sleep(POLL);
                 }
@@ -751,8 +860,11 @@ impl Arrivals {
     /// `keep_ledger` keeps a line for every audio packet, for comparing
     /// with what the source sent.
     pub fn new(keep_ledger: bool) -> Self {
+        // Room for a night's packets from the start: a list that has to
+        // move while it grows would hold up the thread that receives.
         Arrivals {
-            received: keep_ledger.then(Vec::new),
+            intervals_us: Vec::with_capacity(NIGHT_OF_PACKETS),
+            received: keep_ledger.then(|| Vec::with_capacity(NIGHT_OF_PACKETS)),
             ..Arrivals::default()
         }
     }
@@ -1165,6 +1277,48 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(begin.elapsed() < Duration::from_millis(1800));
+        // And the device cannot come back: neither for the sound nor for
+        // the time of day.
+        let result = subscribe(addr, &exit.keys(), &exit.peers(), Some(&host_id), WAIT);
+        assert!(matches!(result, Err(Error::Link(LinkError::NotTrusted))));
+        let result = clock_offset(addr, &exit.keys(), &exit.peers(), Some(&host_id), 1, WAIT);
+        assert!(matches!(result, Err(Error::Link(LinkError::NotTrusted))));
+    }
+
+    #[test]
+    fn removing_the_pairing_ends_a_quiet_stream_as_well() {
+        // Nothing plays on the source: only the notes that say so travel.
+        // The pairing is looked up all the same.
+        let (host, exit, host_id, exit_id) = paired();
+        let (addr, _capture, _, lines) = start_source(&host);
+        let mut subscription =
+            subscribe(addr, &exit.keys(), &exit.peers(), Some(&host_id), WAIT).unwrap();
+        subscription.set_timeout(WAIT);
+
+        let mut samples = Vec::new();
+        let begin = Instant::now();
+        let mut removed: Option<Instant> = None;
+        let ended = loop {
+            let (header, frames) = subscription.next_packet(&mut samples).unwrap();
+            if header.kind == Kind::End {
+                break Instant::now();
+            }
+            assert_eq!((header.kind, frames), (Kind::Idle, 0));
+            if removed.is_none() {
+                host.peers().remove(&exit_id).unwrap().unwrap();
+                removed = Some(Instant::now());
+            }
+            assert!(begin.elapsed() < WAIT, "the stream was not stopped");
+        };
+        let took = ended.duration_since(removed.unwrap());
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        let result = subscribe(addr, &exit.keys(), &exit.peers(), Some(&host_id), WAIT);
+        assert!(matches!(result, Err(Error::Link(LinkError::NotTrusted))));
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|line| line.contains("no longer allowed")),
+            "{lines:?}"
+        );
     }
 
     #[test]

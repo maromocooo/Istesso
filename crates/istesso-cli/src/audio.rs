@@ -16,7 +16,7 @@ use clap::{Subcommand, ValueEnum};
 
 use istesso_agent::Paths;
 use istesso_audio::probe::Tone;
-use istesso_audio::session::{Source, StreamInfo};
+use istesso_audio::session::{self, Source, StreamInfo};
 use istesso_audio::source::{capture_ring, feed_reader, feed_tone};
 use istesso_audio::{ledger, probe, sim, wire};
 
@@ -73,6 +73,9 @@ pub enum AudioAction {
         /// `key=value`; may be given several times
         #[arg(long)]
         node_property: Vec<String>,
+        /// Stop, as at the end of `--seconds`, once this file exists
+        #[arg(long)]
+        stop_file: Option<PathBuf>,
     },
     /// Play the sound of a paired host on this machine
     ///
@@ -116,6 +119,12 @@ pub enum AudioAction {
         /// giving up
         #[arg(long, default_value_t = 0.0)]
         connect_for: f64,
+        /// Stop, and write the measurements, once this file exists
+        #[arg(long)]
+        stop_file: Option<PathBuf>,
+        /// Keep this machine from going to sleep while playing
+        #[arg(long)]
+        keep_awake: bool,
     },
     /// List the devices sound can come out of on this machine
     Outputs {
@@ -204,6 +213,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             node_description,
             quantum,
             node_property,
+            stop_file,
         } => serve(ServeOptions {
             addr: SocketAddr::new(bind, port),
             source,
@@ -216,6 +226,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             node_description,
             quantum,
             node_properties: node_property,
+            stop_file,
         }),
         AudioAction::Play {
             address,
@@ -228,6 +239,8 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             ledger,
             report,
             connect_for,
+            stop_file,
+            keep_awake,
         } => play(PlayOptions {
             address,
             peer,
@@ -239,6 +252,8 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             ledger,
             report,
             connect_for,
+            stop_file,
+            keep_awake,
         }),
         AudioAction::Outputs { json } => outputs(json),
         AudioAction::Check {
@@ -305,6 +320,7 @@ struct ServeOptions {
     node_description: String,
     quantum: Option<u32>,
     node_properties: Vec<String>,
+    stop_file: Option<PathBuf>,
 }
 
 /// A thread that feeds audio into the capture ring.
@@ -408,7 +424,7 @@ fn serve(options: ServeOptions) -> Result<(), String> {
     let sent = options
         .ledger
         .as_ref()
-        .map(|_| Arc::new(Mutex::new(Vec::new())));
+        .map(|_| Arc::new(Mutex::new(Vec::with_capacity(session::NIGHT_OF_PACKETS))));
     let source = Source::bind(
         options.addr,
         &identity,
@@ -466,6 +482,9 @@ fn serve(options: ServeOptions) -> Result<(), String> {
         if seconds.is_some_and(|limit| begin.elapsed().as_secs_f64() >= limit + 0.5) {
             break;
         }
+        if options.stop_file.as_ref().is_some_and(|file| file.exists()) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     stop.store(true, Ordering::Relaxed);
@@ -488,8 +507,12 @@ fn serve(options: ServeOptions) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     let mut report = serde_json::to_value(handle.stats()).map_err(|e| e.to_string())?;
-    if let (Some(capture), Some(fields)) = (capture_report, report.as_object_mut()) {
-        fields.insert("capture".to_string(), capture());
+    if let Some(fields) = report.as_object_mut() {
+        let sending = serde_json::to_value(handle.sending()).map_err(|e| e.to_string())?;
+        fields.insert("sending".to_string(), sending);
+        if let Some(capture) = capture_report {
+            fields.insert("capture".to_string(), capture());
+        }
     }
     super::print_json(&report)
 }
@@ -509,6 +532,8 @@ struct PlayOptions {
     ledger: Option<PathBuf>,
     report: Option<PathBuf>,
     connect_for: f64,
+    stop_file: Option<PathBuf>,
+    keep_awake: bool,
 }
 
 fn resolve(address: &str) -> Result<SocketAddr, String> {
@@ -533,6 +558,8 @@ fn play(options: PlayOptions) -> Result<(), String> {
         options.ledger,
         options.report,
         options.connect_for,
+        options.stop_file,
+        options.keep_awake,
     );
     Err("playing is only built for macOS so far".to_string())
 }
@@ -614,6 +641,15 @@ mod mac {
             None => None,
         };
         let wait = Duration::from_secs(3);
+        // Playing keeps the machine awake (ADR 0005). For now the system's
+        // own tool holds it awake for as long as this process lives.
+        let _awake = options.keep_awake.then(|| {
+            std::process::Command::new("/usr/bin/caffeinate")
+                .args(["-i", "-w", &std::process::id().to_string()])
+                .spawn()
+                .map_err(|err| eprintln!("cannot keep this machine awake: {err}"))
+                .ok()
+        });
 
         // How the two clocks relate, for stating the latency. This is the
         // first time the source is reached. The system may still be asking
@@ -705,13 +741,15 @@ mod mac {
             )),
             None => None,
         };
-        // The first channel, for looking at the tone afterwards. Half an
-        // hour at most.
-        let keep_frames = (device.sample_rate * 1800.0) as usize;
-        let mut first_channel: Vec<f32> = Vec::new();
+        // The first channel is looked at for the tone as it goes by, a
+        // minute at a time, so that a run may last for hours.
+        let mut watch = (options.tone_hz > 0.0)
+            .then(|| probe::ToneWatch::new(device.sample_rate, options.tone_hz, 60.0));
+        let mut played_frames = 0u64;
         let mut frame = vec![0.0f32; channels];
         let mut waits_ms: Vec<f64> = Vec::new();
         let mut latency_ms: Vec<f64> = Vec::new();
+        let mut on_the_way_ms: Vec<f64> = Vec::new();
         let begin = Instant::now();
         let mut said = Instant::now();
         loop {
@@ -719,8 +757,18 @@ mod mac {
                 if record_out.pop_entire_slice(&mut frame).is_err() {
                     break;
                 }
-                if options.tone_hz > 0.0 && first_channel.len() < keep_frames {
-                    first_channel.push(frame[0]);
+                played_frames += 1;
+                if let Some(piece) = watch.as_mut().and_then(|watch| watch.push(frame[0])) {
+                    eprintln!(
+                        "{:>5.0} s  tone  level {} dBFS  pitch {:+.1} to {:+.1} ppm  clicks {}",
+                        begin.elapsed().as_secs_f64(),
+                        piece
+                            .level_dbfs
+                            .map_or("none".to_string(), |level| format!("{level:.2}")),
+                        piece.pitch_ppm_min,
+                        piece.pitch_ppm_max,
+                        piece.clicks
+                    );
                 }
                 if let Some(file) = &mut record_file {
                     for sample in &frame {
@@ -737,6 +785,7 @@ mod mac {
                 if waits_ms.len() < 20_000_000 {
                     waits_ms.push(wait);
                     latency_ms.push(wait + on_the_way);
+                    on_the_way_ms.push(on_the_way);
                 }
             }
             if said.elapsed() >= Duration::from_secs(1) {
@@ -751,6 +800,9 @@ mod mac {
                     now.underruns,
                     now.skips
                 );
+                if options.stop_file.as_ref().is_some_and(|file| file.exists()) {
+                    break;
+                }
             }
             if pumping.is_finished() {
                 break;
@@ -782,9 +834,7 @@ mod mac {
                 .map_err(|e| format!("{}: {e}", path.display()))?;
         }
 
-        let tone = (options.tone_hz > 0.0)
-            .then(|| probe::analyze_tone(&first_channel, device.sample_rate, options.tone_hz))
-            .flatten();
+        let tone = watch.map(probe::ToneWatch::finish);
         let count = callbacks.count.load(Ordering::Relaxed).max(1);
         let device_latency_ms = f64::from(device.latency_frames + device.safety_offset_frames)
             / device.sample_rate
@@ -820,13 +870,17 @@ mod mac {
                     / count as f64,
                 "lead_max_ms": callbacks.lead_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
             },
+            // From the capture of a packet's first frame on the source to
+            // the packet's arrival here. Its highest value less its lowest
+            // is how late the latest packet was.
+            "capture_to_arrival_ms": Spread::of(&mut on_the_way_ms),
             // From a packet's arrival to its first frame being handed over.
             "wait_ms": Spread::of(&mut waits_ms),
             // From the capture of that frame on the source to the same
             // moment; the output's own latency comes on top.
             "capture_to_output_ms": Spread::of(&mut latency_ms),
             "would_have_played": {
-                "frames": first_channel.len(),
+                "frames": played_frames,
                 "tone": tone,
             },
         });

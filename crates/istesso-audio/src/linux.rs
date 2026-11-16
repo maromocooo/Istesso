@@ -53,6 +53,8 @@ pub struct SinkStats {
     unstamped: AtomicU64,
     age_min_ns: AtomicI64,
     age_max_ns: AtomicI64,
+    step_max_ns: AtomicU64,
+    resumed: AtomicU64,
 }
 
 impl Default for SinkStats {
@@ -67,6 +69,8 @@ impl Default for SinkStats {
             unstamped: AtomicU64::new(0),
             age_min_ns: AtomicI64::new(i64::MAX),
             age_max_ns: AtomicI64::new(i64::MIN),
+            step_max_ns: AtomicU64::new(0),
+            resumed: AtomicU64::new(0),
         }
     }
 }
@@ -90,6 +94,11 @@ pub struct SinkSnapshot {
     /// How long after a cycle began this thread was given its audio.
     pub cycle_age_min_ms: Option<f64>,
     pub cycle_age_max_ms: Option<f64>,
+    /// The longest time from the beginning of one cycle to the beginning of
+    /// the next, while audio flowed. A graph that stalls shows here.
+    pub cycle_step_max_ms: f64,
+    /// Times audio came again after a second or more without any.
+    pub resumed: u64,
 }
 
 impl SinkStats {
@@ -111,9 +120,17 @@ impl SinkStats {
             cycles_without_time: self.unstamped.load(Ordering::Relaxed),
             cycle_age_min_ms: age(self.age_min_ns.load(Ordering::Relaxed)),
             cycle_age_max_ms: age(self.age_max_ns.load(Ordering::Relaxed)),
+            cycle_step_max_ms: self.step_max_ns.load(Ordering::Relaxed) as f64 * 1e-6,
+            resumed: self.resumed.load(Ordering::Relaxed),
         }
     }
 }
+
+/// The configuration PipeWire ships for clients whose processing thread
+/// should run with real-time priority. In PipeWire 1.0 the configuration a
+/// client gets by default does not ask for it. Later versions ask by
+/// default and may not ship this file; then the default is used.
+const REALTIME_CLIENT_CONFIG: &str = "client-rt.conf";
 
 /// An age of a cycle that can be believed: not in the future, and less than
 /// a second.
@@ -125,8 +142,14 @@ struct Capture {
     channels: usize,
     /// Room for the largest piece the ring takes; filled anew every cycle.
     samples: Vec<f32>,
+    /// When the cycle before this one began.
+    last_began_ns: Option<u64>,
     stats: Arc<SinkStats>,
 }
+
+/// With no audio for this long, the next cycle counts as audio coming again,
+/// not as a cycle that was late.
+const PAUSE_NS: u64 = 1_000_000_000;
 
 impl Capture {
     fn new(writer: CaptureWriter, stats: Arc<SinkStats>) -> Self {
@@ -135,6 +158,7 @@ impl Capture {
             writer,
             channels,
             samples: Vec::with_capacity(MAX_PACKET_FRAMES * channels),
+            last_began_ns: None,
             stats,
         }
     }
@@ -169,6 +193,15 @@ impl Capture {
                 now_ns
             }
         };
+        if let Some(before) = self.last_began_ns {
+            let step = capture_ns.saturating_sub(before);
+            if step >= PAUSE_NS {
+                stats.resumed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.step_max_ns.fetch_max(step, Ordering::Relaxed);
+            }
+        }
+        self.last_began_ns = Some(capture_ns);
 
         let rate = self.writer.rate();
         let mut fitted = true;
@@ -251,7 +284,12 @@ pub fn run_sink(
 
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(device)?;
-    let context = pw::context::ContextRc::new(&mainloop, None).map_err(device)?;
+    let realtime = pw::properties::properties! {
+        *pw::keys::CONFIG_NAME => REALTIME_CLIENT_CONFIG,
+    };
+    let context = pw::context::ContextRc::new(&mainloop, Some(realtime))
+        .or_else(|_| pw::context::ContextRc::new(&mainloop, None))
+        .map_err(device)?;
     let core = context.connect_rc(None).map_err(device)?;
 
     let mut props = pw::properties::properties! {
@@ -404,6 +442,26 @@ mod tests {
         let seen = stats.snapshot();
         assert_eq!(seen.cycles_without_time, 3);
         assert_eq!(seen.cycle_age_min_ms, None);
+    }
+
+    #[test]
+    fn a_cycle_that_begins_late_shows_and_a_pause_does_not() {
+        let (mut capture, _packets, stats) = capture();
+        let audio = bytes(&[0.25; 512]);
+        let ms = 1_000_000u64;
+        // Cycles 5.3 ms apart, then one that begins 40 ms after the last.
+        capture.take(&audio, 100 * ms, Some(0));
+        capture.take(&audio, 105 * ms + 333_333, Some(0));
+        capture.take(&audio, 145 * ms + 333_333, Some(0));
+        let seen = stats.snapshot();
+        assert!((seen.cycle_step_max_ms - 40.0).abs() < 1e-6, "{seen:?}");
+        assert_eq!(seen.resumed, 0);
+
+        // Nothing played for three seconds: that is a pause, not a stall.
+        capture.take(&audio, 3_145 * ms, Some(0));
+        let seen = stats.snapshot();
+        assert!((seen.cycle_step_max_ms - 40.0).abs() < 1e-6, "{seen:?}");
+        assert_eq!(seen.resumed, 1);
     }
 
     #[test]

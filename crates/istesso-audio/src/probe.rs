@@ -248,6 +248,223 @@ pub fn analyze_tone(samples: &[f32], rate: f64, freq_hz: f64) -> Option<ToneRepo
     })
 }
 
+/// What a long recording of the test tone showed, looked at as it was made.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToneSummary {
+    pub seconds: f64,
+    /// Pieces the recording was looked at in, and how many of them held no
+    /// tone at all.
+    pub pieces: usize,
+    pub pieces_without_tone: usize,
+    /// Lowest and highest level of the tone over the pieces, in dB relative
+    /// to full scale. `None` when no piece held the tone.
+    pub level_dbfs_min: Option<f64>,
+    pub level_dbfs_max: Option<f64>,
+    /// How far the pitch was from the nominal one, in parts per million.
+    pub pitch_ppm_mean: f64,
+    pub pitch_ppm_min: f64,
+    pub pitch_ppm_max: f64,
+    /// The worst piece's residual: everything that is not the tone,
+    /// relative to the tone, in dB.
+    pub residual_db: f64,
+    /// Stretches where the level fell to less than half, once the tone had
+    /// begun. A stretch that lasts until the recording ends is the end of
+    /// the tone, not a dropout.
+    pub dropouts: usize,
+    pub dropout_ms: f64,
+    /// Places where the waveform jumps. Pieces overlap a little, so a jump
+    /// near the border of two pieces may be counted in both.
+    pub clicks: usize,
+}
+
+/// Looks at a recording of the test tone while it is being made, so that
+/// hours of it need not be kept.
+///
+/// Pitch, purity and jumps are read off pieces of the recording
+/// ([`analyze_tone`]); the pieces overlap so that nothing falls between
+/// them. Dropouts are found in the level of the last few milliseconds as
+/// the samples go by, which knows no pieces.
+pub struct ToneWatch {
+    rate: f64,
+    freq_hz: f64,
+    piece_frames: usize,
+    overlap_frames: usize,
+    piece: Vec<f32>,
+    frames: u64,
+    /// The last 5 ms, looked at every 2.5 ms.
+    recent: Vec<f32>,
+    recent_at: usize,
+    until_look: usize,
+    /// The frame at which the tone was first there.
+    onset: Option<u64>,
+    /// The level the tone has (root mean square), once it is known.
+    reference: f64,
+    settled: bool,
+    quiet: bool,
+    quiet_looks: usize,
+    open_looks: usize,
+    pitch_sum: f64,
+    pitch_weight: f64,
+    summary: ToneSummary,
+}
+
+/// Below this level (root mean square) there is no tone.
+const NO_TONE: f64 = 7e-6;
+
+impl ToneWatch {
+    /// Looks at the recording in pieces of `piece_s` seconds.
+    pub fn new(rate: f64, freq_hz: f64, piece_s: f64) -> Self {
+        let piece_frames = ((piece_s * rate) as usize).max((rate * 1.0) as usize);
+        let hop = ((rate * 0.0025) as usize).max(1);
+        ToneWatch {
+            rate,
+            freq_hz,
+            piece_frames,
+            overlap_frames: ((rate * 1.0) as usize).min(piece_frames / 4),
+            piece: Vec::with_capacity(piece_frames),
+            frames: 0,
+            recent: vec![0.0; 2 * hop],
+            recent_at: 0,
+            until_look: hop,
+            onset: None,
+            reference: 0.0,
+            settled: false,
+            quiet: false,
+            quiet_looks: 0,
+            open_looks: 0,
+            pitch_sum: 0.0,
+            pitch_weight: 0.0,
+            summary: ToneSummary {
+                seconds: 0.0,
+                pieces: 0,
+                pieces_without_tone: 0,
+                level_dbfs_min: None,
+                level_dbfs_max: None,
+                pitch_ppm_mean: 0.0,
+                pitch_ppm_min: 0.0,
+                pitch_ppm_max: 0.0,
+                residual_db: f64::NEG_INFINITY,
+                dropouts: 0,
+                dropout_ms: 0.0,
+                clicks: 0,
+            },
+        }
+    }
+
+    /// Takes the next sample. When that completes a piece, what the piece
+    /// showed is returned.
+    pub fn push(&mut self, sample: f32) -> Option<ToneReport> {
+        self.frames += 1;
+        self.piece.push(sample);
+        self.recent[self.recent_at] = sample;
+        self.recent_at = (self.recent_at + 1) % self.recent.len();
+        self.until_look -= 1;
+        if self.until_look == 0 {
+            self.until_look = self.recent.len() / 2;
+            self.look();
+        }
+        if self.piece.len() < self.piece_frames {
+            return None;
+        }
+        let report = analyze_tone(&self.piece, self.rate, self.freq_hz);
+        // The end of this piece is the beginning of the next.
+        let keep_from = self.piece.len() - self.overlap_frames;
+        self.piece.drain(..keep_from);
+        if let Some(report) = &report {
+            self.fold(report);
+        }
+        report
+    }
+
+    /// The level of the last 5 ms against the level the tone has.
+    fn look(&mut self) {
+        if self.frames < self.recent.len() as u64 {
+            return;
+        }
+        let power: f64 = self.recent.iter().map(|s| f64::from(*s).powi(2)).sum();
+        let level = (power / self.recent.len() as f64).sqrt();
+        match self.onset {
+            None => {
+                if level > NO_TONE {
+                    self.onset = Some(self.frames);
+                    self.reference = level;
+                }
+            }
+            // The tone fades in; half a second later its level is known.
+            Some(onset) if !self.settled => {
+                self.reference = self.reference.max(level);
+                self.settled = self.frames - onset >= (self.rate * 0.5) as u64;
+            }
+            Some(_) => {
+                if level < 0.5 * self.reference {
+                    if !self.quiet {
+                        self.summary.dropouts += 1;
+                        self.open_looks = 0;
+                    }
+                    self.quiet = true;
+                    self.quiet_looks += 1;
+                    self.open_looks += 1;
+                } else {
+                    self.quiet = false;
+                }
+            }
+        }
+    }
+
+    fn fold(&mut self, report: &ToneReport) {
+        let summary = &mut self.summary;
+        summary.pieces += 1;
+        let Some(level) = report.level_dbfs else {
+            summary.pieces_without_tone += 1;
+            return;
+        };
+        let first = summary.level_dbfs_min.is_none();
+        summary.level_dbfs_min = Some(summary.level_dbfs_min.map_or(level, |low| low.min(level)));
+        summary.level_dbfs_max = Some(summary.level_dbfs_max.map_or(level, |high| high.max(level)));
+        if first {
+            summary.pitch_ppm_min = report.pitch_ppm_min;
+            summary.pitch_ppm_max = report.pitch_ppm_max;
+        } else {
+            summary.pitch_ppm_min = summary.pitch_ppm_min.min(report.pitch_ppm_min);
+            summary.pitch_ppm_max = summary.pitch_ppm_max.max(report.pitch_ppm_max);
+        }
+        summary.residual_db = summary.residual_db.max(report.residual_db);
+        summary.clicks += report.clicks;
+        self.pitch_sum += report.pitch_ppm_mean * report.seconds;
+        self.pitch_weight += report.seconds;
+        // The level the pieces find is steadier than the one found at the
+        // tone's beginning.
+        if self.settled {
+            self.reference = 10f64.powf(level / 20.0) / std::f64::consts::SQRT_2;
+        }
+    }
+
+    /// Looks at what is left of the recording and returns the whole.
+    pub fn finish(mut self) -> ToneSummary {
+        // Only when something came after the last whole piece.
+        if self.summary.pieces == 0 || self.piece.len() > self.overlap_frames {
+            if let Some(report) = analyze_tone(&self.piece, self.rate, self.freq_hz) {
+                self.fold(&report);
+            }
+        }
+        if self.quiet {
+            self.summary.dropouts -= 1;
+            self.quiet_looks -= self.open_looks;
+        }
+        let hop = self.recent.len() / 2;
+        let mut summary = self.summary;
+        summary.seconds = self.frames as f64 / self.rate;
+        summary.dropout_ms = self.quiet_looks as f64 * hop as f64 / self.rate * 1e3;
+        if self.pitch_weight > 0.0 {
+            summary.pitch_ppm_mean = self.pitch_sum / self.pitch_weight;
+        }
+        if summary.residual_db == f64::NEG_INFINITY {
+            summary.residual_db = 0.0;
+        }
+        summary
+    }
+}
+
 /// The spread of a set of measurements.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Spread {
@@ -393,6 +610,111 @@ mod tests {
         let report = analyze_tone(&vec![0.0; 48_000], RATE, 997.0).unwrap();
         assert_eq!(report.level_dbfs, None);
         assert!(analyze_tone(&[0.0; 100], RATE, 997.0).is_none());
+    }
+
+    fn watch(samples: &[f32], piece_s: f64) -> (ToneSummary, usize) {
+        let mut watch = ToneWatch::new(RATE, 997.0, piece_s);
+        let pieces = samples.iter().filter_map(|s| watch.push(*s)).count();
+        (watch.finish(), pieces)
+    }
+
+    #[test]
+    fn a_long_clean_tone_is_clean_piece_by_piece() {
+        // Silence before the tone begins and a fade into it, as when a
+        // playout starts.
+        let mut samples = vec![0.0f32; 9_600];
+        let mut played = tone(997.0, 0.001, 9.8);
+        for (i, sample) in played[..144].iter_mut().enumerate() {
+            *sample *= i as f32 / 144.0;
+        }
+        samples.extend(played);
+        let (summary, pieces) = watch(&samples, 2.0);
+        // Pieces of two seconds that overlap by half a second: six whole
+        // ones, and the second that is left at the end.
+        assert_eq!(pieces, 6);
+        assert_eq!(summary.pieces, 7, "{summary:?}");
+        assert_eq!(summary.pieces_without_tone, 0);
+        assert!((summary.seconds - 10.0).abs() < 1e-9);
+        assert!(
+            (summary.level_dbfs_min.unwrap() + 60.0).abs() < 0.05,
+            "{summary:?}"
+        );
+        assert!(
+            (summary.level_dbfs_max.unwrap() + 60.0).abs() < 0.05,
+            "{summary:?}"
+        );
+        assert!(summary.pitch_ppm_mean.abs() < 0.05, "{summary:?}");
+        assert!(
+            summary.pitch_ppm_max - summary.pitch_ppm_min < 0.2,
+            "{summary:?}"
+        );
+        assert!(summary.residual_db < -80.0, "{summary:?}");
+        assert_eq!((summary.dropouts, summary.clicks), (0, 0), "{summary:?}");
+    }
+
+    #[test]
+    fn a_gap_across_the_border_of_two_pieces_is_one_dropout() {
+        let mut samples = tone(997.0, 0.25, 7.0);
+        // 100 ms of silence around the end of the first piece, soft edges.
+        let (from, to) = (93_600, 98_400);
+        for (i, sample) in samples[from..to].iter_mut().enumerate() {
+            let edge = (i.min(to - from - 1 - i) as f32 / 144.0).min(1.0);
+            *sample *= 1.0 - edge;
+        }
+        let (summary, _) = watch(&samples, 2.0);
+        assert_eq!(summary.dropouts, 1, "{summary:?}");
+        assert!((summary.dropout_ms - 100.0).abs() < 8.0, "{summary:?}");
+        assert_eq!(summary.clicks, 0, "{summary:?}");
+    }
+
+    #[test]
+    fn a_short_dip_is_found_and_a_tone_that_ends_is_not_a_dropout() {
+        let mut samples = tone(997.0, 0.25, 5.0);
+        // 7.5 ms, as an underrun with its fades leaves.
+        for (i, sample) in samples[120_000..120_360].iter_mut().enumerate() {
+            let edge = (i.min(359 - i) as f32 / 144.0).min(1.0);
+            *sample *= 1.0 - edge;
+        }
+        // The tone ends half a second before the recording does.
+        samples.extend(vec![0.0f32; 24_000]);
+        let (summary, _) = watch(&samples, 2.0);
+        assert_eq!(summary.dropouts, 1, "{summary:?}");
+        assert!(
+            summary.dropout_ms > 2.0 && summary.dropout_ms < 12.0,
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn a_jump_is_counted() {
+        // A hundred samples are missing 3.3 s in: the wave carries on out
+        // of step. That place lies in two pieces.
+        let mut samples = tone(997.0, 0.25, 3.3);
+        let rest = tone(997.0, 0.25, 8.0);
+        samples.extend_from_slice(&rest[158_500..]);
+        let (summary, _) = watch(&samples, 2.0);
+        assert!((1..=2).contains(&summary.clicks), "{summary:?}");
+        assert_eq!(summary.dropouts, 0, "{summary:?}");
+    }
+
+    #[test]
+    fn the_pitch_is_followed_across_pieces() {
+        let played = tone(997.0 * (1.0 + 80e-6), 0.25, 6.0);
+        let (summary, _) = watch(&played, 2.0);
+        assert!((summary.pitch_ppm_mean - 80.0).abs() < 0.1, "{summary:?}");
+        assert!(
+            summary.pitch_ppm_min > 79.5 && summary.pitch_ppm_max < 80.5,
+            "{summary:?}"
+        );
+        assert_eq!((summary.dropouts, summary.clicks), (0, 0), "{summary:?}");
+    }
+
+    #[test]
+    fn a_recording_without_the_tone_has_no_level() {
+        let (summary, _) = watch(&vec![0.0f32; 144_000], 2.0);
+        assert_eq!(summary.level_dbfs_min, None);
+        assert_eq!(summary.pieces_without_tone, summary.pieces);
+        assert_eq!((summary.dropouts, summary.clicks), (0, 0));
     }
 
     #[test]
