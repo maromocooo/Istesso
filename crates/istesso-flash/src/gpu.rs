@@ -118,10 +118,12 @@ fn colour(rgb: Rgb) -> [f32; 3] {
 }
 
 impl Gpu {
-    /// Opens the window together with a surface the GPU can draw to.
+    /// Opens the window together with a surface the GPU can draw to. With `when_told` a
+    /// frame is handed over only when the window system asks for the next one.
     pub fn open(
         event_loop: &ActiveEventLoop,
         attributes: WindowAttributes,
+        when_told: bool,
     ) -> Result<(Window, Gpu), String> {
         let failed = |what: &str, error: &dyn std::fmt::Display| format!("cannot {what}: {error}");
         let (window, config) = DisplayBuilder::new()
@@ -159,9 +161,17 @@ impl Gpu {
         let context = context
             .make_current(&surface)
             .map_err(|e| failed("use the OpenGL context", &e))?;
-        // A frame goes out when it is drawn, not on the display's next refresh. Where the
-        // window system does not allow that, it stays as it is.
-        let _ = surface.set_swap_interval(&context, SwapInterval::DontWait);
+        if when_told {
+            // Handing a frame over waits until the window system asks for the next one, as
+            // with most applications. The measurement depends on it: no falling back.
+            surface
+                .set_swap_interval(&context, SwapInterval::Wait(NonZeroU32::MIN))
+                .map_err(|e| failed("wait for the window system before each frame", &e))?;
+        } else {
+            // A frame goes out when it is drawn, not on the display's next refresh. Where
+            // the window system does not allow that, it stays as it is.
+            let _ = surface.set_swap_interval(&context, SwapInterval::DontWait);
+        }
 
         // SAFETY: the context made current above is the one the functions are loaded for.
         let gl = unsafe {

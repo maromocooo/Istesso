@@ -90,6 +90,14 @@ def main():
         "$XDG_RUNTIME_DIR/istesso/input.sock)",
     )
     parser.add_argument(
+        "--render-on-commit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="have the compositor render a frame as soon as an application has committed, never more frames in one "
+        "second than --fps, instead of on a fixed beat. Needs the compositor plugin with the patch in scripts/patches; "
+        "without the patch there is only the fixed beat",
+    )
+    parser.add_argument(
         "--frames",
         choices=["memory", "cuda", "dmabuf"],
         default="memory",
@@ -129,11 +137,20 @@ def main():
 
     Gst.init(None)
     pipeline = Gst.parse_launch(description)
+    compositor = pipeline.get_by_name("compositor")
+    if compositor.find_property("render-on-commit") is not None:
+        compositor.set_property("render-on-commit", args.render_on_commit)
+        pacing = "on-commit" if args.render_on_commit else "beat"
+    else:
+        # The plugin as it comes, or the first patch, which had no switch and always rendered on a commit.
+        pacing = "as-built"
+        if args.render_on_commit:
+            print("note: this compositor plugin has no render-on-commit property; it paces frames the way it was built", file=sys.stderr)
     log = open(args.log, "x", buffering=1 << 20)
     log.write(
         '{"kind":"header","side":"host","tool":"m1-step3-host","version":"2","started_unix_ms":%d,'
-        '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s"}\n'
-        % (time.time_ns() // 1_000_000, width, height, args.fps, args.bitrate, args.gop, vbv or 0, args.chroma, args.colour, args.preset, args.frames)
+        '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s","pacing":"%s"}\n'
+        % (time.time_ns() // 1_000_000, width, height, args.fps, args.bitrate, args.gop, vbv or 0, args.chroma, args.colour, args.preset, args.frames, pacing)
     )
 
     def clock_line():

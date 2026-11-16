@@ -112,6 +112,14 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Draw::Cpu)]
     draw: Draw,
 
+    /// Draw the next frame only when the window system asks for it, as most
+    /// applications do, instead of keeping a rhythm of their own: handing a
+    /// frame over waits for that. Needs `--draw gpu`. `--fps` then says how
+    /// fast the application would draw if it were asked often enough; give
+    /// it a rate well above the display's
+    #[arg(long)]
+    when_told: bool,
+
     /// When an input is answered. `next-frame` where the text moves, so that
     /// no more frames are drawn than `--fps` says, and `at-once` where
     /// nothing moves, unless given
@@ -246,11 +254,14 @@ impl App {
         }
         let window = match self.args.draw {
             Draw::Gpu => {
-                let (window, gpu) = gpu::Gpu::open(event_loop, attributes)?;
+                let (window, gpu) = gpu::Gpu::open(event_loop, attributes, self.args.when_told)?;
                 self.gpu = Some(gpu);
                 Rc::new(window)
             }
             Draw::Cpu => {
+                if self.args.when_told {
+                    return Err("--when-told needs --draw gpu".into());
+                }
                 let window = Rc::new(
                     event_loop
                         .create_window(attributes)
