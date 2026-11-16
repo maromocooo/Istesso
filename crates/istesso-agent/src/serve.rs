@@ -20,6 +20,9 @@ use crate::paths::Paths;
 use crate::status::local_status;
 use crate::survey::{refresh_peers, SurveyOptions};
 
+// Streaming sessions (`docs/adr/0010-session-start.md`).
+use crate::session::Sessions;
+
 /// Connections served at the same time; further ones are dropped.
 const MAX_CONNECTIONS: usize = 64;
 /// How long the agent waits for a caller's next message.
@@ -76,6 +79,8 @@ struct Shared {
     connections: AtomicUsize,
     verbose: bool,
     log: Log,
+    /// The applications of this machine that are shown to other devices.
+    sessions: Sessions,
 }
 
 impl Agent {
@@ -93,6 +98,8 @@ impl Agent {
             listener,
             options: options.clone(),
             shared: Arc::new(Shared {
+                // Without a runner, until `with_session_runner` names one.
+                sessions: Sessions::new(paths.clone(), log.clone()),
                 paths,
                 keys,
                 fingerprint: identity.fingerprint(),
@@ -112,6 +119,40 @@ impl Agent {
     /// Fingerprint of this device's identity key.
     pub fn fingerprint(&self) -> &str {
         &self.shared.fingerprint
+    }
+
+    /// Names the program that makes the host's side of a stream (the
+    /// session runner of ADR 0010). With it, paired devices that may look
+    /// and control can start this machine's applications and be shown
+    /// them; without it, they are told that this host cannot.
+    pub fn with_session_runner(self, program: impl Into<std::path::PathBuf>) -> Self {
+        use crate::session::{CommandRunner, DesktopLauncher, Rules};
+        let (paths, log) = (self.shared.paths.clone(), self.shared.log.clone());
+        let runner = Arc::new(CommandRunner::new(program, log.clone()));
+        let launcher = Arc::new(DesktopLauncher);
+        self.replace_sessions(Sessions::with(
+            paths,
+            log,
+            Some(runner),
+            launcher,
+            Rules::default(),
+        ))
+    }
+
+    fn replace_sessions(mut self, sessions: Sessions) -> Self {
+        // Nothing else holds the shared state before `run`.
+        if let Some(shared) = Arc::get_mut(&mut self.shared) {
+            shared.sessions = sessions;
+        }
+        self
+    }
+
+    /// An agent with the given sessions and the given list of
+    /// applications, for tests that start nothing real.
+    #[cfg(test)]
+    pub(crate) fn with_sessions(self, sessions: Sessions, apps: Vec<AppEntry>) -> Self {
+        *self.shared.apps.lock().unwrap() = Some((Instant::now(), apps));
+        self.replace_sessions(sessions)
     }
 
     /// Serves paired devices until the process ends.
@@ -218,10 +259,19 @@ impl Shared {
 
         let mut asked: Vec<&'static str> = Vec::new();
         while let Ok(Some(request)) = session.next_request() {
-            let response = if session.allows(Permission::View) {
-                self.answer(&request, &mut asked)
-            } else {
-                Response::error(ErrorCode::Forbidden, "this device may not look at the host")
+            let response = match request {
+                // Streaming sessions have their own table, and their own
+                // rules about who may ask.
+                request @ (Request::SessionStart { .. }
+                | Request::SessionWait { .. }
+                | Request::SessionStop { .. }) => {
+                    self.sessions
+                        .answer(&request, session.peer(), session.remote_addr(), || {
+                            self.apps()
+                        })
+                }
+                request if session.allows(Permission::View) => self.answer(&request, &mut asked),
+                _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
             if session.respond(&response).is_err() {
                 break;

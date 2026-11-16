@@ -3,9 +3,13 @@
 //! * the configuration directory holds what must not be lost: the device
 //!   identity and the list of paired devices;
 //! * the cache directory holds what can be rebuilt: the last known state of
-//!   the other devices.
+//!   the other devices;
+//! * the runtime directory holds what only means something while a program
+//!   runs: sockets.
 
 use std::path::PathBuf;
+
+use istesso_proto::SessionId;
 
 /// Directory name used below the platform's standard locations.
 const APP_DIR: &str = "istesso";
@@ -14,6 +18,8 @@ const APP_DIR: &str = "istesso";
 pub struct Paths {
     pub config: PathBuf,
     pub cache: PathBuf,
+    /// Only the user can reach it, and it is emptied when they log out.
+    pub runtime: PathBuf,
 }
 
 /// The settings that decide the locations.
@@ -25,6 +31,7 @@ pub struct Environment {
     pub cache_override: Option<PathBuf>,
     pub xdg_config_home: Option<PathBuf>,
     pub xdg_cache_home: Option<PathBuf>,
+    pub xdg_runtime_dir: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub macos: bool,
 }
@@ -41,6 +48,7 @@ impl Environment {
             cache_override: var("ISTESSO_CACHE_DIR"),
             xdg_config_home: var("XDG_CONFIG_HOME"),
             xdg_cache_home: var("XDG_CACHE_HOME"),
+            xdg_runtime_dir: var("XDG_RUNTIME_DIR"),
             home: var("HOME"),
             macos: cfg!(target_os = "macos"),
         }
@@ -76,14 +84,31 @@ impl Paths {
                 .unwrap_or_else(|| home.join(".cache"))
                 .join(APP_DIR),
         };
-        Paths { config, cache }
+        let runtime = match (&env.config_override, &env.xdg_runtime_dir) {
+            // Everything in one place, as for the cache.
+            (Some(config), _) => config.join("run"),
+            (None, Some(dir)) => dir.join(APP_DIR),
+            // No such directory on this system (macOS): next to the cache,
+            // which is the user's alone as well.
+            (None, None) => cache.join("run"),
+        };
+        Paths {
+            config,
+            cache,
+            runtime,
+        }
     }
 
     /// Everything below one directory.
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         let config = dir.into();
         let cache = config.join("cache");
-        Paths { config, cache }
+        let runtime = config.join("run");
+        Paths {
+            config,
+            cache,
+            runtime,
+        }
     }
 
     pub fn identity(&self) -> PathBuf {
@@ -107,6 +132,14 @@ impl Paths {
     /// The result of the last full inspection of this machine.
     pub fn local_manifest(&self) -> PathBuf {
         self.cache.join("local-manifest.json")
+    }
+
+    /// Where the runner of one streaming session takes the keyboard and
+    /// pointer input of the device that is shown the session: a datagram
+    /// socket the runner creates (ADR 0010). The agent only passes ids it
+    /// made up itself; the name is built from nothing else.
+    pub fn session_input_socket(&self, session: &SessionId) -> PathBuf {
+        self.runtime.join(format!("input-{session}.sock"))
     }
 }
 
@@ -134,6 +167,37 @@ mod tests {
         });
         assert_eq!(paths.config, PathBuf::from("/xdg/config/istesso"));
         assert_eq!(paths.cache, PathBuf::from("/xdg/cache/istesso"));
+    }
+
+    #[test]
+    fn sockets_go_where_only_the_user_can_reach() {
+        // The runtime directory of the login session, where there is one.
+        let paths = Paths::resolve(&Environment {
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(paths.runtime, PathBuf::from("/run/user/1000/istesso"));
+        assert_eq!(
+            paths.session_input_socket(&SessionId("5b0c9e3a7f21d684".into())),
+            PathBuf::from("/run/user/1000/istesso/input-5b0c9e3a7f21d684.sock")
+        );
+        // Next to the cache where there is none.
+        let paths = Paths::resolve(&Environment {
+            macos: true,
+            ..env()
+        });
+        assert_eq!(
+            paths.runtime,
+            PathBuf::from("/home/u/Library/Caches/istesso/run")
+        );
+        // Someone who moved the configuration gets everything in one place.
+        let paths = Paths::resolve(&Environment {
+            config_override: Some(PathBuf::from("/custom")),
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(paths.runtime, PathBuf::from("/custom/run"));
+        assert_eq!(paths, Paths::at("/custom"));
     }
 
     #[test]

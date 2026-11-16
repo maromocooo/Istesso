@@ -8,11 +8,14 @@
 //!   network.
 //! * [`cache`] is that memory, [`status`] measures the local load and
 //!   [`paths`] says where files live.
+//! * [`session`] starts an application of this machine for another device,
+//!   and opens a window for an application of another device.
 
 pub mod cache;
 pub mod discovery;
 pub mod paths;
 pub mod serve;
+pub mod session;
 pub mod status;
 pub mod survey;
 

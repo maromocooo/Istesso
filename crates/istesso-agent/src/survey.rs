@@ -276,7 +276,7 @@ fn port_of(address: &str) -> u16 {
 
 /// Tries all candidate addresses at once and returns the first conversation
 /// that opens, together with the address that worked.
-fn connect_any(
+pub(crate) fn connect_any(
     candidates: Vec<String>,
     keys: Arc<LocalKeys>,
     peers: Arc<PeerStore>,

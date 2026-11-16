@@ -32,6 +32,9 @@ sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 # Noise protocol for the control channel. Only the primitives we use are enabled.
 snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-sha2", "use-getrandom"] }
+# Signals for the programs a streaming session starts (ending a whole process
+# group), without unsafe code.
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
 if-addrs = "0.15"
 mdns-sd = { version = "0.21", default-features = false }
 unicode-width = "0.2"
