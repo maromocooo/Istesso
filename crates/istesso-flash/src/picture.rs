@@ -38,7 +38,8 @@ pub fn pixel(colour: Rgb) -> u32 {
 }
 
 // The colours of an editor with a dark theme.
-const PAPER: Rgb = Rgb::new(0x1E, 0x20, 0x26);
+/// What the text is written on, and the rim around the square with the shade.
+pub const PAPER: Rgb = Rgb::new(0x1E, 0x20, 0x26);
 const PLAIN: Rgb = Rgb::new(0xC8, 0xCC, 0xD4);
 const KEYWORD: Rgb = Rgb::new(0xC6, 0x78, 0xDD);
 const NUMBER: Rgb = Rgb::new(0xD1, 0x9A, 0x66);
@@ -328,6 +329,16 @@ impl Sheet {
         self.height
     }
 
+    /// Pixels in a row.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// The whole sheet, row after row, in softbuffer's pixel layout.
+    pub fn pixels(&self) -> &[u32] {
+        &self.pixels
+    }
+
     fn row(&self, number: usize) -> &[u32] {
         &self.pixels[number * self.width..(number + 1) * self.width]
     }
@@ -373,6 +384,14 @@ pub fn square(width: usize, height: usize) -> (usize, usize, usize) {
     ((width - side) / 2, (height - side) / 2, side)
 }
 
+/// How wide the rim of paper around the shade is, for a square of this side.
+///
+/// It keeps the text away from the shade, so that what a codec does to the
+/// letters does not reach the middle.
+pub fn rim(side: usize) -> usize {
+    side / 8
+}
+
 /// Paints one frame of the text picture: the rows of the sheet from `offset`
 /// on, and over them the square with the shade.
 ///
@@ -389,10 +408,8 @@ pub fn paint_text(
     for (y, row) in frame.chunks_exact_mut(width).take(height).enumerate() {
         row.copy_from_slice(sheet.row((y + offset) % sheet.height));
     }
-    // A rim in the colour of the paper keeps the text away from the shade, so
-    // that what a codec does to the letters does not reach the middle.
     let (left, top, side) = square(width, height);
-    let rim = side / 8;
+    let rim = rim(side);
     fill(frame, width, left, top, side, side, pixel(PAPER));
     fill(
         frame,
@@ -582,7 +599,7 @@ mod tests {
             5,
             Shade::Light,
         );
-        let rim = side / 8;
+        let rim = rim(side);
         for step in 0..side {
             for inset in [0, rim - 1] {
                 for (x, y) in [

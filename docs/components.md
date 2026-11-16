@@ -18,6 +18,7 @@
 | snow | 制御チャンネルの Noise プロトコル（ADR 0007）。使う部品だけを有効にしている | Apache-2.0 OR MIT | <https://github.com/mcginty/snow> |
 | mdns-sd | LAN 内の発見（mDNS / DNS-SD） | Apache-2.0 OR MIT | <https://github.com/keepsimple1/mdns-sd> |
 | winit、softbuffer | テストアプリ（`istesso-flash`）の窓と描画。`istesso` 本体には入らない | Apache-2.0、MIT OR Apache-2.0 | <https://github.com/rust-windowing/winit>、<https://github.com/rust-windowing/softbuffer> |
+| glutin、glutin-winit、glow | テストアプリが GPU で描くときの OpenGL（`--draw gpu`）。`istesso` 本体には入らない | Apache-2.0、MIT、MIT OR Apache-2.0 OR Zlib | <https://github.com/rust-windowing/glutin>、<https://github.com/grovesNL/glow> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。導入を軽くするため、コンポジターと仮想入力、配信プラグインだけを取り込みます。
@@ -72,4 +73,4 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 cargo deny check
 ```
 
-2026-11-16 時点の依存 258 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、ISC、Unicode-3.0 のいずれかで利用できます（cargo-deny 0.20.2 でライセンス・禁止項目・取得元・既知の脆弱性を検査済み）。このうち 159 は、テストアプリが使う winit と softbuffer が連れてくるものです。Android や Web 向けなど、対象の OS ではコンパイルされないものも数に入っています。
+2026-11-16 時点の依存 268 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、ISC、Unicode-3.0 のいずれかで利用できます（cargo-deny 0.20.2 でライセンス・禁止項目・取得元・既知の脆弱性を検査済み）。このうち 169 は、テストアプリが使う winit、softbuffer、glutin、glow が連れてくるものです。Android や Web 向けなど、対象の OS ではコンパイルされないものも数に入っています。

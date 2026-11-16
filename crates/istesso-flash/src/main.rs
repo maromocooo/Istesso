@@ -38,9 +38,38 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+mod gpu;
 mod picture;
 
 use picture::{Picture, Sheet};
+
+/// How the picture gets into the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Draw {
+    /// Painted on the CPU and handed to the window system in shared memory
+    Cpu,
+    /// Drawn with OpenGL: the window system gets a buffer that is on the GPU already
+    Gpu,
+}
+
+impl Draw {
+    /// The name written into a log.
+    fn name(self) -> &'static str {
+        match self {
+            Draw::Cpu => "cpu",
+            Draw::Gpu => "gpu",
+        }
+    }
+}
+
+/// When an input is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Answer {
+    /// With a frame of its own, the moment the input arrives
+    AtOnce,
+    /// With the next frame of the moving text
+    NextFrame,
+}
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +92,19 @@ struct Args {
     /// does not say
     #[arg(long, value_name = "HZ", value_parser = clap::value_parser!(u32).range(1..=1000))]
     fps: Option<u32>,
+
+    /// How the picture is drawn. An application that draws with the GPU hands
+    /// the window system a buffer that is on the GPU already, as most
+    /// applications do; one that paints on the CPU hands over pixels that a
+    /// compositor has to upload first
+    #[arg(long, value_enum, default_value_t = Draw::Cpu)]
+    draw: Draw,
+
+    /// When an input is answered. `next-frame` where the text moves, so that
+    /// no more frames are drawn than `--fps` says, and `at-once` where
+    /// nothing moves, unless given
+    #[arg(long, value_enum)]
+    answer: Option<Answer>,
 
     /// Write one line per input to this file: when the input arrived and when
     /// the frame that shows it was committed. The file must not exist yet
@@ -130,6 +172,14 @@ enum Outside {
 
 type Surface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
 
+/// An input that waits for the next frame of the moving text.
+struct Waiting {
+    source: InputSource,
+    id: u64,
+    input_ns: u64,
+    answer_to: Option<SocketAddr>,
+}
+
 struct App {
     args: Args,
     clock: Clock,
@@ -141,7 +191,13 @@ struct App {
     log: Option<LogWriter<BufWriter<File>>>,
     /// Sends the answers to synthetic inputs.
     socket: Option<UdpSocket>,
+    /// Inputs to be answered with the next frame.
+    waiting: Vec<Waiting>,
+    /// What draws with the GPU. Declared before the window it draws to, so
+    /// that it is dropped first.
+    gpu: Option<gpu::Gpu>,
     window: Option<Rc<Window>>,
+    /// What paints on the CPU.
     surface: Option<Surface>,
     /// The text, painted for the window's present size.
     sheet: Option<Sheet>,
@@ -166,20 +222,31 @@ impl App {
         if self.args.fullscreen {
             attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
-        let window = Rc::new(
-            event_loop
-                .create_window(attributes)
-                .map_err(|e| format!("cannot open a window: {e}"))?,
-        );
+        let window = match self.args.draw {
+            Draw::Gpu => {
+                let (window, gpu) = gpu::Gpu::open(event_loop, attributes)?;
+                self.gpu = Some(gpu);
+                Rc::new(window)
+            }
+            Draw::Cpu => {
+                let window = Rc::new(
+                    event_loop
+                        .create_window(attributes)
+                        .map_err(|e| format!("cannot open a window: {e}"))?,
+                );
+                let context = softbuffer::Context::new(window.clone())
+                    .map_err(|e| format!("cannot draw on this display: {e}"))?;
+                let surface = softbuffer::Surface::new(&context, window.clone())
+                    .map_err(|e| format!("cannot draw into the window: {e}"))?;
+                self.surface = Some(surface);
+                window
+            }
+        };
         if let Some((x, y)) = self.args.position {
             // Asked for again once the window exists: at creation macOS moves a window that
             // was placed on another display than the one in use back onto that one.
             window.set_outer_position(LogicalPosition::new(f64::from(x), f64::from(y)));
         }
-        let context = softbuffer::Context::new(window.clone())
-            .map_err(|e| format!("cannot draw on this display: {e}"))?;
-        let surface = softbuffer::Surface::new(&context, window.clone())
-            .map_err(|e| format!("cannot draw into the window: {e}"))?;
         if self.args.picture == Picture::Text && self.args.scroll > 0 {
             let refresh = window
                 .current_monitor()
@@ -190,7 +257,6 @@ impl App {
             self.frame_period = Some(Duration::from_secs(1) / fps);
         }
         self.window = Some(window);
-        self.surface = Some(surface);
         Ok(())
     }
 
@@ -199,7 +265,7 @@ impl App {
     /// `false` when there is nothing to draw into: the window is not open
     /// yet, or it is minimised.
     fn draw(&mut self) -> Result<bool, String> {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
+        let Some(window) = &self.window else {
             return Ok(false);
         };
         let size = window.inner_size();
@@ -208,32 +274,92 @@ impl App {
         else {
             return Ok(false);
         };
+        let (across, down) = (size.width as usize, size.height as usize);
+
+        // The text for a window of this size, and how far it has moved.
+        let mut fresh = false;
+        let mut offset = 0;
+        if self.args.picture == Picture::Text {
+            // A font pixel is two points wide: text of an everyday size.
+            let factor = window.scale_factor();
+            let scale = (2.0 * factor).round().max(1.0) as usize;
+            if !self
+                .sheet
+                .as_ref()
+                .is_some_and(|sheet| sheet.fits(across, down, scale))
+            {
+                self.sheet = Some(Sheet::new(across, down, scale));
+                fresh = true;
+            }
+            let rows = self.sheet.as_ref().map_or(1, Sheet::height);
+            let speed = (f64::from(self.args.scroll) * factor).round() as u32;
+            offset = picture::scrolled(self.clock.now_ns(), speed, rows);
+        }
+
+        if let Some(gpu) = &mut self.gpu {
+            if let (true, Some(sheet)) = (fresh, &self.sheet) {
+                gpu.upload(sheet);
+            }
+            let rows = self.sheet.as_ref().map_or(1, Sheet::height);
+            gpu.draw(
+                size.width,
+                size.height,
+                self.args.picture,
+                rows,
+                offset,
+                self.shade,
+            )?;
+            return Ok(true);
+        }
+        let Some(surface) = &mut self.surface else {
+            return Ok(false);
+        };
         let failed = |e: softbuffer::SoftBufferError| format!("cannot draw a frame: {e}");
         surface.resize(width, height).map_err(failed)?;
         let mut buffer = surface.buffer_mut().map_err(failed)?;
-        match self.args.picture {
-            Picture::Grey => buffer.fill(picture::pixel(self.shade.rgb())),
-            Picture::Text => {
-                let (across, down) = (size.width as usize, size.height as usize);
-                // A font pixel is two points wide: text of an everyday size.
-                let factor = window.scale_factor();
-                let scale = (2.0 * factor).round().max(1.0) as usize;
-                if !self
-                    .sheet
-                    .as_ref()
-                    .is_some_and(|sheet| sheet.fits(across, down, scale))
-                {
-                    self.sheet = Some(Sheet::new(across, down, scale));
-                }
-                if let Some(sheet) = &self.sheet {
-                    let speed = (f64::from(self.args.scroll) * factor).round() as u32;
-                    let offset = picture::scrolled(self.clock.now_ns(), speed, sheet.height());
-                    picture::paint_text(&mut buffer, across, down, sheet, offset, self.shade);
-                }
+        match &self.sheet {
+            Some(sheet) if self.args.picture == Picture::Text => {
+                picture::paint_text(&mut buffer, across, down, sheet, offset, self.shade);
             }
+            _ => buffer.fill(picture::pixel(self.shade.rgb())),
         }
         buffer.present().map_err(failed)?;
         Ok(true)
+    }
+
+    /// Whether an input gets a frame of its own. Where the text moves it
+    /// waits for the next frame instead, unless asked otherwise: then no more
+    /// frames are drawn than `--fps` says, as with an application that draws
+    /// once per refresh of its display.
+    fn answers_at_once(&self) -> bool {
+        self.frame_period.is_none() || self.args.answer == Some(Answer::AtOnce)
+    }
+
+    /// Draws the next frame of the moving text, and with it the answer to
+    /// every input that has been waiting for it.
+    fn next_frame(&mut self) -> Result<(), String> {
+        let waiting = std::mem::take(&mut self.waiting);
+        for _ in &waiting {
+            self.shade = self.shade.toggled();
+        }
+        if !self.draw()? {
+            // Nothing could be shown: the inputs are dropped, as in `flash`.
+            for _ in &waiting {
+                self.shade = self.shade.toggled();
+            }
+            return Ok(());
+        }
+        let commit_ns = self.clock.now_ns();
+        for input in waiting {
+            self.record(
+                input.source,
+                input.id,
+                input.input_ns,
+                commit_ns,
+                input.answer_to,
+            )?;
+        }
+        Ok(())
     }
 
     /// Reacts to one input: switches the shade, commits the frame, and
@@ -249,15 +375,36 @@ impl App {
         input_ns: u64,
         answer_to: Option<SocketAddr>,
     ) -> Result<bool, String> {
+        if !self.answers_at_once() {
+            self.waiting.push(Waiting {
+                source,
+                id,
+                input_ns,
+                answer_to,
+            });
+            return Ok(true);
+        }
         self.shade = self.shade.toggled();
         if !self.draw()? {
             self.shade = self.shade.toggled();
             return Ok(false);
         }
         let commit_ns = self.clock.now_ns();
+        self.record(source, id, input_ns, commit_ns, answer_to)?;
+        Ok(true)
+    }
 
-        // Everything below happens after the frame is out, so that recording
-        // does not delay what is being measured.
+    /// Answers a synthetic input and writes the input into the log. Called
+    /// after the frame is out, so that recording does not delay what is
+    /// being measured.
+    fn record(
+        &mut self,
+        source: InputSource,
+        id: u64,
+        input_ns: u64,
+        commit_ns: u64,
+        answer_to: Option<SocketAddr>,
+    ) -> Result<(), String> {
         if let (Some(socket), Some(address)) = (&self.socket, answer_to) {
             let answer = FlashAck {
                 id,
@@ -277,7 +424,7 @@ impl App {
             }))
             .map_err(|e| format!("cannot write the log: {e}"))?;
         }
-        Ok(true)
+        Ok(())
     }
 
     fn flash_by_hand(&mut self, source: InputSource, input_ns: u64) -> Result<(), String> {
@@ -306,15 +453,15 @@ impl ApplicationHandler<Outside> for App {
     }
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
-        // The text moves on its own, at a steady rate. An input does not wait
-        // for it: `flash` paints a frame of its own the moment it arrives.
+        // The text moves on its own, at a steady rate, and inputs are answered
+        // with its next frame (or at once, with a frame of their own: `flash`).
         let Some(period) = self.frame_period else {
             return;
         };
         let now = Instant::now();
         match self.next_frame {
             Some(due) if now >= due => {
-                let drawn = self.draw().map(|_| ());
+                let drawn = self.next_frame();
                 self.check(event_loop, drawn);
                 // Keep the rhythm; after a stall, start again from now.
                 let next = due + period;
@@ -416,6 +563,7 @@ fn open_log(
     path: &PathBuf,
     clock: &Clock,
     picture: Picture,
+    draw: Draw,
 ) -> Result<LogWriter<BufWriter<File>>, String> {
     // Never overwrite an earlier measurement.
     let file = OpenOptions::new()
@@ -435,6 +583,7 @@ fn open_log(
         started_unix_ms,
         clock_origin_unix_ns: Some(clock.origin_unix_ns()),
         picture: Some(picture.name().to_string()),
+        draw: Some(draw.name().to_string()),
     }))
     .map_err(|e| format!("cannot write to {}: {e}", path.display()))?;
     Ok(log)
@@ -445,7 +594,7 @@ fn run(args: Args) -> Result<(), String> {
     let log = args
         .log
         .as_ref()
-        .map(|path| open_log(path, &clock, args.picture))
+        .map(|path| open_log(path, &clock, args.picture, args.draw))
         .transpose()?;
 
     let event_loop = EventLoop::<Outside>::with_user_event()
@@ -475,6 +624,8 @@ fn run(args: Args) -> Result<(), String> {
         last_synthetic: None,
         log,
         socket,
+        waiting: Vec::new(),
+        gpu: None,
         window: None,
         surface: None,
         sheet: None,
@@ -538,6 +689,12 @@ mod tests {
         let args = Args::try_parse_from(["istesso-flash"]).unwrap();
         assert_eq!(args.picture, Picture::Text);
         assert_eq!((args.scroll, args.fps), (240, None));
+        assert_eq!((args.draw, args.answer), (Draw::Cpu, None));
+        let args = Args::try_parse_from(["istesso-flash", "--draw", "gpu", "--answer", "at-once"])
+            .unwrap();
+        assert_eq!((args.draw, args.answer), (Draw::Gpu, Some(Answer::AtOnce)));
+        let args = Args::try_parse_from(["istesso-flash", "--answer", "next-frame"]).unwrap();
+        assert_eq!(args.answer, Some(Answer::NextFrame));
         let args = Args::try_parse_from(["istesso-flash", "--picture", "grey"]).unwrap();
         assert_eq!(args.picture, Picture::Grey);
         let args = Args::try_parse_from(["istesso-flash", "--scroll", "0", "--fps", "85"]).unwrap();
