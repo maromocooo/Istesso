@@ -7,10 +7,13 @@
 //!     how long from a frame's first bytes to having it whole. With --keep
 //!     the frames are written to FILE as they came. With --ask-every a key
 //!     frame is asked for every so many seconds.
-//! picture replay FILE --bind ADDR [--config DIR] [--fps N]
+//! picture replay FILE --bind ADDR [--config DIR] [--fps N] [--cursor image|hidden|named]
 //!     Shows a stream kept by `watch` to paired devices, again and again,
 //!     N frames a second (85 unless given): a host without a compositor and
-//!     an encoder, for trying a viewer on one machine.
+//!     an encoder, for trying a viewer on one machine. With --cursor it also
+//!     says what the cursor is: a made-up image (a magenta triangle of 64
+//!     pixels with a white edge, its tip the hot spot), hidden, or one
+//!     without an image.
 //! picture pair DIR
 //!     Makes DIR/host and DIR/device, two configuration directories of
 //!     devices that are paired with each other, for `--config`: a host and
@@ -29,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use istesso_agent::Paths;
 use istesso_link::LocalKeys;
-use istesso_media::wire::{self, StreamInfo};
+use istesso_media::wire::{self, Cursor, CursorImage, StreamInfo};
 use istesso_media::{Host, Viewer};
 use istesso_pair::{Hello, Identity, Peer, PeerStore};
 
@@ -201,6 +204,7 @@ fn replay(mut args: Args) -> Result<(), Failure> {
         .option("--bind")
         .ok_or("where to listen? --bind ADDR:PORT")?;
     let fps: f64 = args.option("--fps").map_or(Ok(85.0), |s| s.parse())?;
+    let cursor = args.option("--cursor");
     let path = args.0.first().ok_or("which file?")?;
     let mut file = BufReader::new(std::fs::File::open(path)?);
     let (mut magic, mut info) = (String::new(), String::new());
@@ -225,6 +229,33 @@ fn replay(mut args: Args) -> Result<(), Failure> {
     let log = Arc::new(|line: String| eprintln!("istesso-media: {line}"));
     let addr = bind.to_socket_addrs()?.next().ok_or("that is no address")?;
     let host = Host::listen(addr, &identity(&paths)?, paths.peers(), info, log)?;
+    // A cursor that cannot be mistaken for anything on the screen: a triangle with its
+    // tip at the top left, where the hot spot is.
+    let mut triangle = vec![0u8; 64 * 64 * 4];
+    for (i, pixel) in triangle.chunks_exact_mut(4).enumerate() {
+        let (x, y) = (i % 64, i / 64);
+        if x <= y && y < 60 {
+            let edge = x == 0 || x + 2 > y || y > 57;
+            pixel.copy_from_slice(if edge {
+                &[255, 255, 255, 255]
+            } else {
+                &[255, 0, 255, 255]
+            });
+        }
+    }
+    match cursor.as_deref() {
+        None => {}
+        Some("hidden") => host.set_cursor(&Cursor::Hidden)?,
+        Some("named") => host.set_cursor(&Cursor::Named("default"))?,
+        Some(_) => host.set_cursor(&Cursor::Image(CursorImage {
+            width: 64,
+            height: 64,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            scale: 1,
+            rgba: &triangle,
+        }))?,
+    }
     println!(
         "showing {} frames, {fps} a second, on port {}",
         frames.len(),
