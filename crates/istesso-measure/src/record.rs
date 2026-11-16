@@ -164,6 +164,29 @@ pub fn host_samples(records: &[Record]) -> Vec<HostSample> {
         .collect()
 }
 
+/// The inputs a measuring client sent through the host's input path, where
+/// they arrive at the test application as key presses.
+///
+/// A key press carries no number. The application numbers what arrives by
+/// hand in the order it arrives, and counts clicks in the same series, so
+/// its numbers are not the client's. They are restored here: the first key
+/// press is the client's input 0, the second its input 1, and so on. The
+/// result is marked as sent by the client, as if each had carried its
+/// number. This only holds while nobody else presses a key in that
+/// application: compare how many came out with how many were sent.
+pub fn sent_as_keys(samples: &[HostSample]) -> Vec<HostSample> {
+    samples
+        .iter()
+        .filter(|sample| sample.source == InputSource::Key)
+        .zip(0u64..)
+        .map(|(sample, id)| HostSample {
+            id,
+            source: InputSource::Network,
+            ..sample.clone()
+        })
+        .collect()
+}
+
 /// The client samples of a log, in the order they were written.
 pub fn client_samples(records: &[Record]) -> Vec<ClientSample> {
     records
@@ -178,6 +201,34 @@ pub fn client_samples(records: &[Record]) -> Vec<ClientSample> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_presses_get_the_numbers_of_the_inputs_that_were_sent() {
+        let sample = |id, source, input_ns| HostSample {
+            id,
+            source,
+            input_ns,
+            commit_ns: input_ns + 5,
+            sent_ns: None,
+        };
+        // A click to give the application the keyboard, then the client's keys; the
+        // application numbered them 0 to 3 as they came.
+        let log = [
+            sample(0, InputSource::Pointer, 10),
+            sample(1, InputSource::Key, 20),
+            sample(2, InputSource::Key, 30),
+            sample(3, InputSource::Key, 40),
+        ];
+        let sent = sent_as_keys(&log);
+        assert_eq!(sent.len(), 3);
+        assert_eq!(
+            sent.iter().map(|s| (s.id, s.input_ns)).collect::<Vec<_>>(),
+            [(0, 20), (1, 30), (2, 40)]
+        );
+        assert!(sent.iter().all(|s| s.source == InputSource::Network));
+        // Inputs that carried their own number are not key presses.
+        assert!(sent_as_keys(&[sample(7, InputSource::Network, 1)]).is_empty());
+    }
 
     fn header() -> Record {
         Record::Header(Header {

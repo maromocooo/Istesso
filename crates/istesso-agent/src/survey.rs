@@ -153,6 +153,20 @@ pub fn refresh_peers(paths: &Paths, options: &SurveyOptions) -> Result<Vec<HostV
 /// `istesso peers` (its name, or the beginning of its id). The addresses
 /// tried are those remembered for it; `istesso hosts` finds them.
 pub fn connect_peer(paths: &Paths, who: &str, timeout: Duration) -> Result<Client, String> {
+    connect_peer_at(paths, who, None, timeout)
+}
+
+/// As [`connect_peer`]. With `address`, the device is tried at that address
+/// only (the agent's usual port unless one is given): for when the way the
+/// conversation takes matters, a measurement over a cable say, and the
+/// device is remembered at more than one address. It still has to be the
+/// paired device that answers there.
+pub fn connect_peer_at(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    timeout: Duration,
+) -> Result<Client, String> {
     let identity = Identity::load_or_create(&paths.identity()).map_err(|e| e.to_string())?;
     let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| e.to_string())?);
     let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| e.to_string())?);
@@ -161,9 +175,21 @@ pub fn connect_peer(paths: &Paths, who: &str, timeout: Duration) -> Result<Clien
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no paired device matches {who:?}"))?
         .clone();
-    let candidates = cache::load(paths, &peer.id)
-        .map(|snapshot| snapshot.addresses)
-        .unwrap_or_default();
+    let candidates = match address {
+        Some(address) if address.parse::<std::net::IpAddr>().is_ok() => {
+            // A bare address: IPv6 goes into brackets where a port follows.
+            let host = if address.contains(':') {
+                format!("[{address}]")
+            } else {
+                address.to_string()
+            };
+            vec![format!("{host}:{DEFAULT_PORT}")]
+        }
+        Some(address) => vec![address.to_string()],
+        None => cache::load(paths, &peer.id)
+            .map(|snapshot| snapshot.addresses)
+            .unwrap_or_default(),
+    };
     if candidates.is_empty() {
         return Err("no address is known for this device yet: run `istesso hosts` once".into());
     }

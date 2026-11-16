@@ -108,7 +108,25 @@ enum InputAction {
         /// The socket to listen on; one left by an earlier run is replaced
         #[arg(long, value_name = "PATH")]
         socket: PathBuf,
+        /// Reach the device at this address only, instead of at whichever
+        /// of its remembered addresses answers first: for when the way the
+        /// input takes matters, as in a measurement over a cable
+        #[arg(long, value_name = "ADDRESS[:PORT]")]
+        address: Option<String>,
+        /// Keep trying to reach the device for this many seconds instead of
+        /// giving up at once. Started as an application for the first
+        /// time, the program may not use the local network until the
+        /// person has answered the system's question
+        #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+        keep_trying: u64,
     },
+}
+
+/// How a measuring client's inputs reached the test application on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SentAs {
+    Network,
+    Keys,
 }
 
 #[derive(Subcommand)]
@@ -155,6 +173,12 @@ enum MeasureAction {
         /// it is flagged to be measured again
         #[arg(long, value_name = "MS", requires = "local_app")]
         local_usual: Option<f64>,
+        /// How the probe's inputs reached the test application on the host:
+        /// `network`, straight to the application with their number, or
+        /// `keys`, through the host's input path as key presses (the probe's
+        /// `--relayed-keys`): control channel, compositor, keyboard
+        #[arg(long, value_enum, default_value_t = SentAs::Network, requires = "relayed_app")]
+        relayed_inputs: SentAs,
         /// Refresh rate of the display both windows were on, to count the
         /// difference in refreshes
         #[arg(long, value_name = "HZ")]
@@ -385,18 +409,52 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Measure { action } => run_measure(action),
         Command::Input { action } => match action {
-            InputAction::Relay { to, socket } => relay_input(&to, &socket),
+            InputAction::Relay {
+                to,
+                socket,
+                address,
+                keep_trying,
+            } => relay_input(
+                &to,
+                &socket,
+                address.as_deref(),
+                Duration::from_secs(keep_trying),
+            ),
         },
     }
 }
 
 /// Takes input events from a local socket and sends them to a paired device.
 #[cfg(unix)]
-fn relay_input(to: &str, socket: &std::path::Path) -> Result<(), String> {
+fn relay_input(
+    to: &str,
+    socket: &std::path::Path,
+    address: Option<&str>,
+    keep_trying: Duration,
+) -> Result<(), String> {
     use std::io::ErrorKind;
     use std::os::unix::net::UnixDatagram;
 
-    let mut client = istesso_agent::connect_peer(&Paths::from_env(), to, Duration::from_secs(3))?;
+    let began = std::time::Instant::now();
+    let mut said = false;
+    let mut client = loop {
+        match istesso_agent::connect_peer_at(
+            &Paths::from_env(),
+            to,
+            address,
+            Duration::from_secs(3),
+        ) {
+            Ok(client) => break client,
+            Err(why) if began.elapsed() < keep_trying => {
+                if !said {
+                    eprintln!("cannot reach the device yet ({why}); trying again");
+                    said = true;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(why) => return Err(why),
+        }
+    };
     client
         .set_timeout(Duration::from_secs(5))
         .and_then(|_| client.open_input())
@@ -453,7 +511,12 @@ fn relay_input(to: &str, socket: &std::path::Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn relay_input(_to: &str, _socket: &std::path::Path) -> Result<(), String> {
+fn relay_input(
+    _to: &str,
+    _socket: &std::path::Path,
+    _address: Option<&str>,
+    _keep_trying: Duration,
+) -> Result<(), String> {
     Err("relaying input is not available on this system yet".into())
 }
 
@@ -1398,6 +1461,7 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
             relayed,
             local_app,
             relayed_app,
+            relayed_inputs,
             local_usual,
             refresh_hz,
             json,
@@ -1409,7 +1473,16 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
                     .transpose()
             };
             let local_app = app_log(local_app)?;
-            let relayed_app = app_log(relayed_app)?;
+            let mut relayed_app = app_log(relayed_app)?;
+            if let (SentAs::Keys, Some(app)) = (relayed_inputs, relayed_app.as_mut()) {
+                *app = istesso_measure::sent_as_keys(app);
+                if !json {
+                    println!(
+                        "The inputs reached the application on the host as key presses, through its input path: {} in its log.",
+                        app.len()
+                    );
+                }
+            }
             let comparison = Comparison::build(
                 &local,
                 &relayed,

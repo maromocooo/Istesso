@@ -136,6 +136,7 @@ struct Options {
     var maxMs = 400
     var timeoutMs = 1500
     var relayedInterface: String? = nil
+    var relayedKeys: String? = nil
     var seed = UInt64(Date().timeIntervalSince1970 * 1000)
 
     static let usage = """
@@ -147,6 +148,9 @@ struct Options {
 
       --local ADDRESS:PORT       where the test application on this Mac takes inputs
       --relayed ADDRESS:PORT     where the test application on the host takes inputs
+      --relayed-keys PATH        instead of --relayed: write key presses to this socket, where
+                                 `istesso input relay` takes them. They reach the application the
+                                 way a person's do: control channel, compositor, keyboard
       --local-log FILE           log for the local window (must not exist)
       --relayed-log FILE         log for the relayed window (must not exist)
       --local-window SELECTOR    window of the local test application
@@ -193,6 +197,7 @@ struct Options {
             case "--max-ms": options.maxMs = try number(name)
             case "--timeout-ms": options.timeoutMs = try number(name)
             case "--relayed-interface": options.relayedInterface = try value(name)
+            case "--relayed-keys": options.relayedKeys = try value(name)
             case "--seed":
                 guard let seed = UInt64(try value(name)) else { throw Failure("--seed needs a number") }
                 options.seed = seed
@@ -204,10 +209,13 @@ struct Options {
             }
             index += 1
         }
-        for (name, given) in [("--local", options.local), ("--relayed", options.relayed),
+        for (name, given) in [("--local", options.local),
                               ("--local-log", options.localLog), ("--relayed-log", options.relayedLog)]
         where given.isEmpty {
             throw Failure("\(name) is required\n\n\(usage)")
+        }
+        if options.relayed.isEmpty == (options.relayedKeys == nil) {
+            throw Failure("give either --relayed or --relayed-keys\n\n\(usage)")
         }
         return options
     }
@@ -269,6 +277,48 @@ func sendInput(_ descriptor: Int32, id: UInt64) -> Int32? {
         refusal = errno
     }
     return refusal
+}
+
+/// Opens a socket to the place where `istesso input relay` takes input events: a datagram
+/// socket in the file system. What is written there travels the way a person's key presses
+/// do: over the control channel to the host, into the compositor, and from there to the
+/// application as a key.
+func openKeySocket(at path: String) throws -> Int32 {
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let capacity = MemoryLayout.size(ofValue: address.sun_path)
+    guard path.utf8.count < capacity else {
+        throw Failure("the path given to --relayed-keys is too long")
+    }
+    withUnsafeMutableBytes(of: &address.sun_path) { raw in
+        raw.copyBytes(from: path.utf8)
+    }
+    let descriptor = socket(AF_UNIX, SOCK_DGRAM, 0)
+    guard descriptor >= 0 else { throw Failure("cannot open a socket for --relayed-keys") }
+    let connected = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard connected == 0 else {
+        close(descriptor)
+        throw Failure("nothing takes input at the path given to --relayed-keys (is `istesso input relay` running?)")
+    }
+    return descriptor
+}
+
+/// Sends one key press and its release as `istesso_proto::InputEvent`s, one per datagram.
+/// The test application answers the press; the release keeps the key from repeating.
+/// `nil` when both went out, otherwise what the system said (`errno`).
+func sendKey(_ descriptor: Int32) -> Int32? {
+    // The space bar, by its place on the keyboard (Linux key code 57).
+    for event in [#"{"kind":"key","code":57,"pressed":true}"#, #"{"kind":"key","code":57,"pressed":false}"#] {
+        let bytes = [UInt8](event.utf8)
+        if bytes.withUnsafeBytes({ send(descriptor, $0.baseAddress, $0.count, 0) }) != bytes.count {
+            return errno
+        }
+    }
+    return nil
 }
 
 /// Counts the inputs that could not be sent to one of the test applications. One that does
@@ -593,7 +643,8 @@ func run() throws {
     defer { try? waitUntilDone("stop") { stream.stopCapture(completionHandler: $0) } }
 
     let localSocket = try openSocket(to: options.local, option: "--local")
-    let relayedSocket = try openSocket(to: options.relayed, option: "--relayed", interface: options.relayedInterface)
+    let relayedSocket = try options.relayedKeys.map(openKeySocket(at:))
+        ?? openSocket(to: options.relayed, option: "--relayed", interface: options.relayedInterface)
     defer {
         close(localSocket)
         close(relayedSocket)
@@ -606,7 +657,7 @@ func run() throws {
     var shownLocal = 0
     var shownRelayed = 0
     var unsentLocal = Unsent(option: "--local")
-    var unsentRelayed = Unsent(option: "--relayed")
+    var unsentRelayed = Unsent(option: options.relayedKeys == nil ? "--relayed" : "--relayed-keys")
     var missedInARow = 0
 
     for id in 0..<UInt64(options.count) {
@@ -619,7 +670,7 @@ func run() throws {
         let sentNs = clock.now()
         watcher.arm(expecting: before.map(\.toggled), atNs: sentNs)
         try unsentLocal.note(sendInput(localSocket, id: id))
-        try unsentRelayed.note(sendInput(relayedSocket, id: id))
+        try unsentRelayed.note(options.relayedKeys == nil ? sendInput(relayedSocket, id: id) : sendKey(relayedSocket))
 
         let shown = watcher.collect(timeout: timeout)
         if let at = shown[0] {

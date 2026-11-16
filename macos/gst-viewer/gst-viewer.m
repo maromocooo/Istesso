@@ -20,6 +20,8 @@
 //                  keyboard and mouse to this local socket (see below)
 // With ISTESSO_ON_TOP set in the environment the window stays above the others: a measuring tool
 // that watches the middle of the window sees nothing once another window lies over it.
+// The Command keys are passed on as Control, where applications on Linux expect what Command
+// does on a Mac; with ISTESSO_COMMAND_KEY=super they are passed on as the Super keys.
 //
 // Decoding with VideoToolbox. GStreamer's own VideoToolbox element holds frames back, so the
 // pipeline may instead end in an application sink called "vt" that hands over H.265 access
@@ -645,6 +647,26 @@ static const unsigned short linux_key[128] = {
     [0x7C] = 106, [0x7D] = 108, [0x7E] = 103,
 };
 
+// Whether the Command keys go to the other side as Control (the default) or as the Super
+// ("Windows") keys. What Command does on a Mac (copy, paste, save, close a tab) is done with
+// Control in applications on Linux, so a person's hands keep working as they are used to.
+// ISTESSO_COMMAND_KEY=super in the environment sends Super instead.
+static BOOL command_is_control = YES;
+
+// Linux's number for the key at this place of the Mac's keyboard, as it is sent.
+static unsigned key_to_send(unsigned short key) {
+    if (key >= 128) {
+        return 0;
+    }
+    if (command_is_control && key == 0x37) {
+        return 29; // left Command as left Control
+    }
+    if (command_is_control && key == 0x36) {
+        return 97; // right Command as right Control
+    }
+    return linux_key[key];
+}
+
 // Which bit of an event's modifier flags says that a modifier key is down, by the key's number
 // on macOS. 0 for keys that are not modifiers.
 static unsigned long modifier_bit(unsigned short key) {
@@ -715,7 +737,7 @@ static unsigned long modifier_bit(unsigned short key) {
     if (event.keyCode >= 128) {
         return;
     }
-    unsigned code = linux_key[event.keyCode];
+    unsigned code = key_to_send(event.keyCode);
     if (event.modifierFlags & NSEventModifierFlagCommand) {
         // macOS does not say when a key comes up again while Command is held: press and let go.
         [self key:code pressed:YES];
@@ -727,9 +749,7 @@ static unsigned long modifier_bit(unsigned short key) {
 }
 
 - (void)keyUp:(NSEvent *)event {
-    if (event.keyCode < 128) {
-        [self key:linux_key[event.keyCode] pressed:NO];
-    }
+    [self key:key_to_send(event.keyCode) pressed:NO];
 }
 
 // Keys with Command come here first; they all go to the other side.
@@ -745,7 +765,7 @@ static unsigned long modifier_bit(unsigned short key) {
     if (event.keyCode >= 128) {
         return;
     }
-    unsigned code = linux_key[event.keyCode];
+    unsigned code = key_to_send(event.keyCode);
     unsigned long bit = modifier_bit(event.keyCode);
     if (bit != 0) {
         [self key:code pressed:(event.modifierFlags & bit) != 0];
@@ -911,6 +931,8 @@ int main(int argc, char *argv[]) {
         if (getenv("ISTESSO_ON_TOP") != NULL) {
             window.level = NSFloatingWindowLevel;
         }
+        const char *command_key = getenv("ISTESSO_COMMAND_KEY");
+        command_is_control = command_key == NULL || strcmp(command_key, "super") != 0;
         NSView *view = input_socket >= 0 ? [[InputView alloc] initWithFrame:NSMakeRect(0, 0, width, height)]
                                          : [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         window.contentView = view;

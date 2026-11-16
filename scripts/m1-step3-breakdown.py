@@ -122,6 +122,17 @@ def network_inputs(app_log):
     return lines
 
 
+def key_inputs(app_log):
+    """The inputs a measuring client sent through the host's input path, as key presses.
+
+    A key press carries no number: the first one in the log is the client's input 0, the second
+    its input 1 (`istesso_measure::sent_as_keys`). Only right while nobody else presses a key in
+    the application.
+    """
+    keys = [line for line in app_log if line.get("kind") == "host" and line.get("source") == "key"]
+    return [dict(line, id=number) for number, line in enumerate(keys)]
+
+
 def shades(frames):
     """True for the frames that show the brighter of the two shades."""
     lumas = [f["luma"] for f in frames if f["luma"] >= 0]
@@ -204,6 +215,13 @@ def main():
     parser.add_argument("--probe-local")
     parser.add_argument("--local-app")
     parser.add_argument("--ping")
+    parser.add_argument(
+        "--relayed-inputs",
+        choices=["network", "keys"],
+        default="network",
+        help="how the probe's inputs reached the application on the host: straight to it, or as key presses "
+        "through the control channel and the compositor (the probe's --relayed-keys)",
+    )
     args = parser.parse_args()
 
     probe = {c["id"]: c for c in read(args.probe_relayed) if c.get("kind") == "client"}
@@ -214,7 +232,8 @@ def main():
     # Host: the test application's clock onto the pipeline's.
     host_line = Timeline([l for l in host_frames if l.get("kind") == "clock"], "the host's frame log")
     host_origin = host_line.mono(origin_of(host_app, "the host's application log"))
-    inputs = {line["id"]: (host_origin + line["input_ns"], host_origin + line["commit_ns"]) for line in network_inputs(host_app)}
+    sent_inputs = key_inputs(host_app) if args.relayed_inputs == "keys" else network_inputs(host_app)
+    inputs = {line["id"]: (host_origin + line["input_ns"], host_origin + line["commit_ns"]) for line in sent_inputs}
 
     out = sorted((l for l in host_frames if l.get("kind") == "frame_out"), key=lambda l: l["t_ns"])
     encoded = {l["pts"]: l for l in host_frames if l.get("kind") == "encoded"}
@@ -277,7 +296,12 @@ def main():
     drawn_times = [l["t_ns"] for l in drawn]
 
     names = [
-        ("network, both legs (input out, first packet back)", "network"),
+        (
+            "input path and network (key out to application, first packet back)"
+            if args.relayed_inputs == "keys"
+            else "network, both legs (input out, first packet back)",
+            "network",
+        ),
         ("application: input to commit", "app"),
         ("compositor: commit to frame out", "compositor"),
         ("upload, convert, encode: frame out to encoded", "encode"),
@@ -415,6 +439,21 @@ def main():
     print(f"Frames that carried an input: {sum(sizes) / len(sizes) / 1000:.1f} kB and {sum(packets) / len(packets):.0f} packets on average, "
           f"{keyframes} of them key frames; the host handed the packets over within {summary(handing)['median']:.2f} ms at the median "
           f"({summary(handing)['max']:.2f} at most)")
+
+    if args.relayed_inputs == "keys":
+        # The host's share of the input path: from the key press being handed to the compositor
+        # to the application having it. Both are on the host's clock, and both in order.
+        handed = [l["t_ns"] for l in host_frames if l.get("kind") == "key_in"]
+        if len(handed) == len(sent_inputs):
+            inside = [(host_origin + line["input_ns"] - at) / 1e6 for line, at in zip(sent_inputs, handed)]
+            print()
+            print("Of the first row, on the host: a key press handed to the compositor, to the application having it")
+            print(HEADER)
+            print(row("compositor and application: key in to input", inside))
+        else:
+            print()
+            print(f"The host's pipeline took {len(handed)} key presses and the application {len(sent_inputs)}: "
+                  "the two are not put side by side")
 
     # The compositor on its own.
     gaps = [(out[i]["t_ns"] - out[i - 1]["t_ns"]) / 1e6 for i in range(1, len(out))]

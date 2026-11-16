@@ -261,6 +261,10 @@ def main():
             structure = Gst.Structure.new_from_string(text)
             if isinstance(structure, tuple):
                 structure = structure[0]
+            if kind == "key" and event["pressed"]:
+                # When a key press was handed to the compositor: the stretch from here to the
+                # application having it is the compositor's share of the input path.
+                log.write('{"kind":"key_in","t_ns":%d}\n' % time.monotonic_ns())
             source_pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
             taken["count"] += 1
 
