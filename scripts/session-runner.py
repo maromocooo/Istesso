@@ -22,19 +22,22 @@ What it needs, from the environment:
                             the input socket)
   ISTESSO_RUNNER_LAYOUT     what is printed on the keys, as the host names it (default: us)
 
+What the pipeline is told, in the words it takes on its standard input (scripts/m1-step3-host.py):
+
+  start           `admit ID PUBLIC_KEY`: the picture is for the device that started the session
+  attach          `admit ID PUBLIC_KEY`, then `resume`: for that device alone, with an encoder
+  detach          `admit nobody`, then `detach`: for nobody, and the encoder is given back
+  pause, resume   `pause`, `resume`: the encoder is closed and opened; the client stays
+
+A `start` or `attach` without the device's public key admits nobody: a device is known by its
+id and its key together. The address in `peer` is not used for this.
+
 What it cannot do yet, because the pipeline cannot. Each is said on standard error when asked:
 
-  detach          the picture is for nobody from then on (the pipeline is told, and cuts the
-                  viewer), but the pipeline goes on making it: the encoder stays open
-  pause, resume   the encoder is not closed and opened
   close           the compositor has no way yet to ask a window to close (xdg_toplevel.close)
   empty           it does not know when the last window is gone; the agent sees the
                   application end instead
-
-Who is shown the picture: the one device the agent names in `start` and in `attach`, by its id
-and its public key. The pipeline is told on its standard input (--control) and admits nobody
-else; a `start` or `attach` without the key admits nobody. The address in `peer` is not used
-for this: the device is known by its key.
+  attach          the size of the picture stays the one the session was started with
 """
 
 import fcntl
@@ -125,7 +128,7 @@ def main():
         sys.executable, "-u", os.path.join(HERE, "scripts", "m1-step3-host.py"),
         "--to-channel", str(port), "--cursor",
         "--size", f"{display['width']}x{display['height']}", "--fps", str(display["fps"]),
-        "--frames", "cuda", "--input-socket", input_socket, "--log", "-", "--control",
+        "--frames", "cuda", "--input-socket", input_socket, "--log", "-", "--admit", "nobody",
     ]  # fmt: skip
     node = nvidia_render_node()
     if node:
@@ -164,6 +167,8 @@ def main():
                     found["socket"] = name.group(1)
                 if plain == "playing":
                     found["playing"] = True
+                if plain.startswith('{"istesso"'):
+                    note(f"pipeline: {plain}")
 
     threading.Thread(target=read_pipeline, daemon=True).start()
     deadline = time.monotonic() + 14
@@ -177,18 +182,24 @@ def main():
             return 1
         time.sleep(0.05)
 
-    def tell_pipeline(told):
-        """Passes a line on to the pipeline: it keeps the picture to the device that is named."""
+    def tell_pipeline(*words):
+        """Passes words on to the pipeline, one a line."""
         try:
-            pipeline.stdin.write(json.dumps(told, separators=(",", ":")) + "\n")
+            pipeline.stdin.write("".join(word + "\n" for word in words))
             pipeline.stdin.flush()
         except OSError:
             pass
 
+    def admit(peer):
+        """The word that keeps the picture to one device, or to nobody when the device is not fully named."""
+        device, key = (peer or {}).get("id"), (peer or {}).get("public_key")
+        if device and key and " " not in device and " " not in key:
+            return f"admit {device} {key}"
+        note("the device was named without its public key: the picture is for nobody")
+        return "admit nobody"
+
     # The device that started the session is the first to be shown it.
-    tell_pipeline({"v": 1, "cmd": "attach", "peer": start.get("peer") or {}})
-    if not (start.get("peer") or {}).get("public_key"):
-        note("start named no public key for the device: the picture is for nobody until an attach does")
+    tell_pipeline(admit(start.get("peer")))
     answer = {"transport": "channel", "channel_port": port}
     # The application finds the compositor by these two alone, also where the agent runs
     # without a runtime directory in its own environment.
@@ -223,34 +234,27 @@ def main():
             if command == "attach":
                 # A viewer that connects to the same port is sent the picture, beginning with
                 # a key frame. The size stays the one the session was started with.
-                tell_pipeline({"v": 1, "cmd": "attach", "peer": told.get("peer") or {}})
+                tell_pipeline(admit(told.get("peer")), "resume")
                 say("attached", display=display, answer=answer)
                 note("attach: the picture is for that device alone now, on the same port, in the size the session started with")
             elif command == "detach":
-                tell_pipeline({"v": 1, "cmd": "detach"})
-                note("detach: the picture is for nobody now. NOT done yet: closing the encoder")
+                tell_pipeline("admit nobody", "detach")
+                note("detach: the picture is for nobody now, and the encoder is given back")
             elif command in ("pause", "resume"):
-                note(f"{command}: NOT obeyed yet. The pipeline cannot close and open its encoder")
+                tell_pipeline(command)
             elif command == "close":
                 note("close: NOT obeyed yet. The compositor cannot ask a window to close")
         time.sleep(0.05)
 
-    # Standard input was closed: the session is over. Nobody is shown the picture, and the
-    # pipeline stops when its own input is closed.
-    tell_pipeline({"v": 1, "cmd": "detach"})
+    # Standard input was closed: the session is over. Nobody is shown the picture any more,
+    # and the pipeline is stopped.
+    tell_pipeline("admit nobody")
+    pipeline.send_signal(signal.SIGINT)
     try:
-        pipeline.stdin.close()
-    except OSError:
-        pass
-    try:
-        pipeline.wait(timeout=1.0)
+        pipeline.wait(timeout=1.5)
     except subprocess.TimeoutExpired:
-        pipeline.send_signal(signal.SIGINT)
-        try:
-            pipeline.wait(timeout=0.8)
-        except subprocess.TimeoutExpired:
-            pipeline.kill()
-            pipeline.wait()
+        pipeline.kill()
+        pipeline.wait()
     note(f"session {session}: stopped")
     return 0
 

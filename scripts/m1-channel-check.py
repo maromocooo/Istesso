@@ -109,7 +109,9 @@ def main():
     went = sum(1 for f in sent.values() if f["viewers"] > 0)
     print()
     print("Frames")
-    print(f"  host: {len(encoded)} encoded, {sum(1 for l in encoded.values() if l.get('key'))} of them key frames; {len(sent)} handed on, "
+    # Counted by line: an encoder that was opened again stamps its frames from the start again.
+    made = [l for l in host if l.get("kind") == "encoded"]
+    print(f"  host: {len(made)} encoded, {sum(1 for l in made if l.get('key'))} of them key frames; {len(sent)} handed on, "
           f"{went} of them to a viewer" + (f"; {sum(1 for f in sent.values() if f['queued'])} not taken by the connection at once" if channel else ""))
     print(f"  client: {len(frames)} arrived in {span:.1f} s, {sum(1 for f in frames if 'to_decoder' in f)} handed to the decoder, "
           f"{len(pictures)} decoded ({sum(1 for f in pictures if f.get('key'))} key frames), {sum(1 for f in frames if 'drawn' in f)} drawn")
@@ -184,6 +186,24 @@ def main():
         print(f"  cursor: the compositor reported it {len(told)} times ({', '.join(f'{n} {shape}' for shape, n in sorted(shapes.items()))}), "
               f"{sum(1 for l in told if not l.get('accepted', 1))} of them refused by the library; the viewer was told {len(drawn)} times "
               f"(it is told the latest only, at most once in a frame's interval)")
+    stops = [l for l in host if l.get("kind") == "picture"]
+    if stops:
+        # The picture was stopped and resumed (the encoder given back and opened again).
+        print(f"  host: the picture was stopped {sum(1 for l in stops if l['state'] == 'paused')} times and resumed "
+              f"{sum(1 for l in stops if l['state'] == 'resumed')} times")
+        for line in stops:
+            if line["state"] == "paused":
+                print(f"    stopped{'' if line.get('offered', 1) else ' and no longer offered'}: encoder closed {line['took_ms']:.1f} ms after the word")
+            else:
+                print(f"    resumed: an encoder there after {line['opened_ms']:.1f} ms, its first frame out after {line['encoded_ms']:.1f} ms "
+                      f"({'a key frame' if line.get('key') else 'NOT a key frame'}), handed on after {line['written_ms']:.1f} ms")
+        keys = [f for f in pictures if f.get("key")]
+        for frame in keys[1:]:
+            drawn = f", in the window {ms(frame['first_ns'], frame['drawn']):.1f} ms after" if "drawn" in frame else ""
+            before = max((f["decoded"] for f in pictures if f["decoded"] < frame["decoded"]), default=None)
+            still = f"; the picture had stood still for {ms(before, frame['decoded']) / 1000:.2f} s" if before else ""
+            print(f"    client: a key frame of {frame['bytes'] / 1000:.1f} kB, whole {ms(frame['first_ns'], frame['last_ns']):.1f} ms after its first bytes, "
+                  f"decoded {ms(frame['first_ns'], frame['decoded']):.1f} ms after{drawn}{still}")
     events = [l for l in client if l.get("kind") == "stream"]
     decoded_times = [f["decoded"] for f in pictures]
     for event in events:

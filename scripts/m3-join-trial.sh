@@ -195,11 +195,13 @@ sessions > "$WORK/list.txt"
 check "the session is listed as running, not shown" said "$WORK/list.txt" "$APP.*running, not shown"
 check "after leaving, the viewer connecting to the picture's port by itself is sent nothing" no_picture left "$(picture_port)" 3
 id=$(awk -v app="$APP" 'index($0, app) { print $1; exit }' "$WORK/list.txt")
+check "after leaving, the pipeline gave its encoder back" on_host 'grep -q "\"istesso\":\"paused\",\"offered\":false" $D/logs/pipeline-'"$id"'.log'
 "$BIN" open "$APP" --viewer "$HERE/scripts/session-viewer.py" --size 960x540 --fps 60 --position "$POSITION" > "$WORK/open-2.txt" 2>&1 &
 cli=$!
 check "the same command comes back to the same session" wait_for "$WORK/open-2.txt" "again (session $id" 30
 frames=$(sed -n 's/.*frames are written down in \([^;]*\);.*/\1/p' "$WORK/open-2.txt" | tail -1)
 check "the picture is drawn again" drawn
+check "coming back, the pipeline opened an encoder again and began with a key frame" on_host 'grep -q "\"istesso\":\"resumed\".*\"key\":1" $D/logs/pipeline-'"$id"'.log'
 sleep 2
 check "a capture of the window is taken (after coming back)" capture window-3-back
 kill -INT $cli

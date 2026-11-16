@@ -1601,3 +1601,36 @@ fn nobody_is_told_the_cursor_while_the_list_of_paired_devices_cannot_be_read() {
     };
     assert!(matches!(over, Error::Link(LinkError::Closed)), "{over}");
 }
+
+#[test]
+fn a_picture_that_is_no_longer_offered_reaches_nobody_until_it_is_offered_again() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"key");
+
+    // The session is shown to nobody for now: the viewer is let go at once ...
+    let began = Instant::now();
+    pair.host.offer(false);
+    assert_eq!(pair.host.viewers(), 0);
+    assert!(began.elapsed() < Duration::from_millis(100));
+    assert_eq!(pair.host.send_frame(b"key", 1, 1, true).unwrap().viewers, 0);
+    assert!(matches!(
+        take(&mut viewer),
+        Err(Error::Link(LinkError::Closed))
+    ));
+    // ... and nobody gets in, paired or not; a caller is not even answered.
+    assert!(pair.connect().is_err());
+    assert_eq!(pair.host.viewers(), 0);
+    pair.until(|| pair.host.pending() == 0);
+
+    // Offered again, the paired device is taken again and begins with a key frame.
+    pair.host.offer(true);
+    let mut viewer = pair.watching();
+    assert!(pair.host.key_frame_wanted());
+    assert_eq!(
+        pair.host.send_frame(b"again", 2, 2, true).unwrap().viewers,
+        1
+    );
+    assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"again");
+}
