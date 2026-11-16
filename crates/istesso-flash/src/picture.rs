@@ -10,6 +10,8 @@ pub enum Picture {
     Text,
     /// The whole window in the shade: the easiest picture there is
     Grey,
+    /// Something like a photograph in motion, with grain: hard on a relay
+    Hard,
 }
 
 impl Picture {
@@ -18,6 +20,7 @@ impl Picture {
         match self {
             Picture::Text => "text",
             Picture::Grey => "grey",
+            Picture::Hard => "hard",
         }
     }
 }

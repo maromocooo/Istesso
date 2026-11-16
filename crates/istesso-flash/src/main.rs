@@ -93,6 +93,12 @@ struct Args {
     #[arg(long, value_name = "PIXELS", value_parser = clap::value_parser!(u32).range(1..=16))]
     stroke: Option<u32>,
 
+    /// Put a stamp in the top left corner of a moving picture that says how
+    /// far it has moved. A frame caught on a screen then says which frame
+    /// it is (`istesso measure quality --stamped`)
+    #[arg(long)]
+    stamp: bool,
+
     /// How often the moving text is redrawn, in frames per second. The
     /// refresh rate of the display when not given, or 60 where the display
     /// does not say
@@ -253,7 +259,7 @@ impl App {
             // was placed on another display than the one in use back onto that one.
             window.set_outer_position(LogicalPosition::new(f64::from(x), f64::from(y)));
         }
-        if self.args.picture == Picture::Text && self.args.scroll > 0 {
+        if self.args.picture != Picture::Grey && self.args.scroll > 0 {
             let refresh = window
                 .current_monitor()
                 .and_then(|monitor| monitor.refresh_rate_millihertz())
@@ -282,28 +288,43 @@ impl App {
         };
         let (across, down) = (size.width as usize, size.height as usize);
 
-        // The text for a window of this size, and how far it has moved.
+        // The sheet for a window of this size, and how far the picture has moved.
         let mut fresh = false;
-        let mut offset = 0;
-        if self.args.picture == Picture::Text {
-            // A font pixel is two points wide unless asked otherwise: text of an everyday size.
-            let factor = window.scale_factor();
-            let scale = match self.args.stroke {
-                Some(pixels) => pixels as usize,
-                None => (2.0 * factor).round().max(1.0) as usize,
-            };
-            if !self
-                .sheet
-                .as_ref()
-                .is_some_and(|sheet| sheet.fits(across, down, scale))
-            {
-                self.sheet = Some(Sheet::new(across, down, scale));
-                fresh = true;
+        let mut moved = 0;
+        let factor = window.scale_factor();
+        match self.args.picture {
+            Picture::Text => {
+                // A font pixel is two points wide unless asked otherwise: text of an everyday size.
+                let scale = match self.args.stroke {
+                    Some(pixels) => pixels as usize,
+                    None => (2.0 * factor).round().max(1.0) as usize,
+                };
+                if !self
+                    .sheet
+                    .as_ref()
+                    .is_some_and(|sheet| sheet.fits(across, down, scale))
+                {
+                    self.sheet = Some(Sheet::new(across, down, scale));
+                    fresh = true;
+                }
             }
-            let rows = self.sheet.as_ref().map_or(1, Sheet::height);
-            let speed = (f64::from(self.args.scroll) * factor).round() as u32;
-            offset = picture::scrolled(self.clock.now_ns(), speed, rows);
+            Picture::Hard => {
+                if !self
+                    .sheet
+                    .as_ref()
+                    .is_some_and(|sheet| sheet.fits_photo(across, down))
+                {
+                    self.sheet = Some(Sheet::photo(across, down));
+                    fresh = true;
+                }
+            }
+            Picture::Grey => {}
         }
+        if self.args.picture != Picture::Grey {
+            let speed = (f64::from(self.args.scroll) * factor).round() as u32;
+            moved = picture::moved(self.clock.now_ns(), speed);
+        }
+        let stamp = self.args.stamp && self.args.picture != Picture::Grey;
 
         if let Some(gpu) = &mut self.gpu {
             if let (true, Some(sheet)) = (fresh, &self.sheet) {
@@ -315,8 +336,9 @@ impl App {
                 size.height,
                 self.args.picture,
                 rows,
-                offset,
+                moved,
                 self.shade,
+                stamp,
             )?;
             return Ok(true);
         }
@@ -326,11 +348,18 @@ impl App {
         let failed = |e: softbuffer::SoftBufferError| format!("cannot draw a frame: {e}");
         surface.resize(width, height).map_err(failed)?;
         let mut buffer = surface.buffer_mut().map_err(failed)?;
-        match &self.sheet {
-            Some(sheet) if self.args.picture == Picture::Text => {
+        match (&self.sheet, self.args.picture) {
+            (Some(sheet), Picture::Text) => {
+                let offset = (moved % sheet.height() as u64) as usize;
                 picture::paint_text(&mut buffer, across, down, sheet, offset, self.shade);
             }
+            (Some(sheet), Picture::Hard) => {
+                picture::paint_hard(&mut buffer, across, down, sheet, moved, self.shade);
+            }
             _ => buffer.fill(picture::pixel(self.shade.rgb())),
+        }
+        if stamp {
+            picture::paint_stamp(&mut buffer, across, down, moved);
         }
         buffer.present().map_err(failed)?;
         Ok(true)
@@ -710,7 +739,9 @@ mod tests {
         let args = Args::try_parse_from(["istesso-flash", "--scroll", "0", "--fps", "85"]).unwrap();
         assert_eq!((args.scroll, args.fps), (0, Some(85)));
         let args = Args::try_parse_from(["istesso-flash", "--stroke", "1"]).unwrap();
-        assert_eq!(args.stroke, Some(1));
+        assert_eq!((args.stroke, args.stamp), (Some(1), false));
+        let args = Args::try_parse_from(["istesso-flash", "--picture", "hard", "--stamp"]).unwrap();
+        assert_eq!((args.picture, args.stamp), (Picture::Hard, true));
         assert!(Args::try_parse_from(["istesso-flash", "--stroke", "0"]).is_err());
         for wrong in [
             vec!["istesso-flash", "--picture", "video"],

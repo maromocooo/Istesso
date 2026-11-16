@@ -165,6 +165,11 @@ enum MeasureAction {
         /// needs a moment to settle after it starts
         #[arg(long, value_name = "FRAMES", default_value_t = 0)]
         skip: usize,
+        /// The frames are not the film's in their order but whatever a
+        /// test application with `--stamp` showed: each is compared with
+        /// the frame its stamp says it is. For frames caught on a screen
+        #[arg(long)]
+        stamped: bool,
         /// Print the result as JSON, with the figures of every frame
         #[arg(long)]
         json: bool,
@@ -1090,18 +1095,40 @@ struct FilmArgs {
     /// when inputs arrive. 0 leaves it as it is
     #[arg(long, value_name = "FRAMES", default_value_t = 36)]
     toggle_every: u64,
+    /// Which of the test application's moving pictures
+    #[arg(long, value_enum, default_value_t = FilmPicture::Text)]
+    picture: FilmPicture,
+    /// The frames carry a stamp in their top left corner that says how far
+    /// the picture has moved (`istesso-flash --stamp`)
+    #[arg(long)]
+    stamp: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FilmPicture {
+    /// Scrolling text: what measurements are judged with
+    Text,
+    /// Something like a photograph in motion, with grain: hard on an encoder
+    Hard,
 }
 
 impl FilmArgs {
     fn film(&self) -> istesso_measure::quality::Film {
-        istesso_measure::quality::Film::new(
+        let mut film = istesso_measure::quality::Film::new(
             self.size.0,
             self.size.1,
             self.scale as usize,
             self.fps,
             self.scroll,
             self.toggle_every,
-        )
+        );
+        if self.picture == FilmPicture::Hard {
+            film = film.hard();
+        }
+        if self.stamp {
+            film = film.stamped();
+        }
+        film
     }
 }
 
@@ -1130,14 +1157,35 @@ fn write_frames(film: &istesso_measure::quality::Film, count: u64) -> Result<(),
         );
     }
     let mut out = stdout.lock();
-    let mut frame = vec![0u8; film.frame_len()];
-    for number in 0..count {
-        film.paint(number, &mut frame);
-        match out.write_all(&frame) {
-            Ok(()) => {}
-            // Whoever reads has had enough.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-            Err(e) => return Err(format!("cannot write a frame: {e}")),
+    // A few frames are painted side by side and written in their order.
+    let batch = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8) as u64;
+    let mut number = 0;
+    while number < count {
+        let frames: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let painters: Vec<_> = (number..count.min(number + batch))
+                .map(|number| {
+                    scope.spawn(move || {
+                        let mut frame = vec![0u8; film.frame_len()];
+                        film.paint(number, &mut frame);
+                        frame
+                    })
+                })
+                .collect();
+            painters
+                .into_iter()
+                .map(|painter| painter.join().expect("painting a frame does not panic"))
+                .collect()
+        });
+        number += frames.len() as u64;
+        for frame in &frames {
+            match out.write_all(frame) {
+                Ok(()) => {}
+                // Whoever reads has had enough.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(e) => return Err(format!("cannot write a frame: {e}")),
+            }
         }
     }
     out.flush()
@@ -1151,6 +1199,7 @@ fn read_quality(
     width: usize,
     height: usize,
     skip: usize,
+    stamped: bool,
 ) -> Result<istesso_measure::quality::Quality, String> {
     use istesso_measure::quality::{FrameQuality, Quality};
     use std::io::Read;
@@ -1159,6 +1208,7 @@ fn read_quality(
         .map_or(4, |n| n.get())
         .min(8);
     let mut per_frame = Vec::new();
+    let mut unreadable = 0;
     let mut ended = false;
     while !ended {
         let mut received = Vec::with_capacity(batch);
@@ -1183,17 +1233,32 @@ fn read_quality(
                 ended = true;
                 break;
             }
-            received.push(frame);
+            // A stamped frame says which frame it is; the others come in the film's order.
+            let moment = if stamped {
+                match film.read(&frame) {
+                    Some(moment) => Some(moment),
+                    None => {
+                        unreadable += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            received.push((frame, moment));
         }
         let first = per_frame.len() as u64;
         let compared: Vec<FrameQuality> = std::thread::scope(|scope| {
             let workers: Vec<_> = received
                 .iter()
                 .enumerate()
-                .map(|(i, frame)| {
+                .map(|(i, (frame, moment))| {
                     scope.spawn(move || {
                         let mut sent = vec![0u8; film.frame_len()];
-                        film.paint(first + i as u64, &mut sent);
+                        match moment {
+                            Some((rows, shade)) => film.paint_at(*rows, *shade, &mut sent),
+                            None => film.paint(first + i as u64, &mut sent),
+                        }
                         FrameQuality::of(&sent, frame, width, height)
                     })
                 })
@@ -1206,9 +1271,17 @@ fn read_quality(
         per_frame.extend(compared);
     }
     if per_frame.is_empty() {
-        return Err("no video on standard input".into());
+        return Err(if unreadable > 0 {
+            format!(
+                "none of the {unreadable} frames carries a stamp that can be read: are the size and the picture right?"
+            )
+        } else {
+            "no video on standard input".into()
+        });
     }
-    Ok(Quality::of(per_frame, skip, width, height))
+    let mut quality = Quality::of(per_frame, skip, width, height);
+    quality.unreadable = unreadable;
+    Ok(quality)
 }
 
 fn run_measure(action: MeasureAction) -> Result<(), String> {
@@ -1257,8 +1330,18 @@ fn run_measure(action: MeasureAction) -> Result<(), String> {
             }
         }
         MeasureAction::Frames { film, count } => write_frames(&film.film(), count),
-        MeasureAction::Quality { film, skip, json } => {
-            let quality = read_quality(&film.film(), film.size.0, film.size.1, skip)?;
+        MeasureAction::Quality {
+            film,
+            skip,
+            stamped,
+            json,
+        } => {
+            let pictures = if stamped {
+                film.film().stamped()
+            } else {
+                film.film()
+            };
+            let quality = read_quality(&pictures, film.size.0, film.size.1, skip, stamped)?;
             if json {
                 print_json(&quality)
             } else {

@@ -42,31 +42,59 @@ void main() {
 }
 ";
 
-/// What `picture::paint_text` and a grey fill do, one pixel at a time.
+/// What `picture::paint_text`, `picture::paint_hard`, `picture::paint_stamp`
+/// and a grey fill do, one pixel at a time. The hard picture is summed in
+/// whole numbers, as on the CPU, so that both come out the same to the bit.
 const FRAGMENT_SHADER: &str = "
 uniform sampler2D sheet;
-uniform ivec4 window;  // width, height, rows of the sheet, rows the text has moved
+uniform ivec4 window;  // width, height, rows of the sheet, unused
 uniform ivec4 square;  // left, top, side, rim
 uniform vec3 shade;
 uniform vec3 paper;
-uniform int text;      // 1: scrolling text, 0: the whole window in the shade
+uniform int mode;      // 0: the whole window in the shade, 1: scrolling text, 2: the hard picture
+uniform uint moved;    // rows the picture has moved
+uniform int stamped;   // 1: with the stamp
+uniform uint code;     // what the 32 cells of the stamp after its two markers show
 out vec4 colour;
+
+// The sheet's pixels are 0x00RRGGBB, stored low byte first.
+ivec3 texel(ivec2 at) {
+    return ivec3(texelFetch(sheet, at, 0).bgr * 255.0 + 0.5);
+}
 
 void main() {
     // Counted from the top left, as the CPU paints.
     ivec2 at = ivec2(int(gl_FragCoord.x), window.y - 1 - int(gl_FragCoord.y));
+    ivec2 on_stamp = at - ivec2(8, 8);
     ivec2 from_square = at - square.xy;
     bool on_square = from_square.x >= 0 && from_square.y >= 0
         && from_square.x < square.z && from_square.y < square.z;
     bool on_shade = from_square.x >= square.w && from_square.y >= square.w
         && from_square.x < square.z - square.w && from_square.y < square.z - square.w;
-    if (text == 0 || on_shade) {
+    if (stamped == 1 && on_stamp.x >= 0 && on_stamp.y >= 0 && on_stamp.x < 34 * 12 && on_stamp.y < 12) {
+        int cell = on_stamp.x / 12;
+        bool light = cell == 0 || (cell >= 2 && ((code >> uint(33 - cell)) & 1u) == 1u);
+        colour = vec4(vec3(light ? 240.0 : 16.0) / 255.0, 1.0);
+    } else if (mode == 0 || on_shade) {
         colour = vec4(shade, 1.0);
     } else if (on_square) {
         colour = vec4(paper, 1.0);
+    } else if (mode == 1) {
+        colour = vec4(texelFetch(sheet, ivec2(at.x, (at.y + int(moved % uint(window.z))) % window.z), 0).bgr, 1.0);
     } else {
-        // The sheet's pixels are 0x00RRGGBB, stored low byte first.
-        colour = vec4(texelFetch(sheet, ivec2(at.x, (at.y + window.w) % window.z), 0).bgr, 1.0);
+        int across = window.x;
+        int down = window.z;
+        int up = int(moved % uint(down));
+        int back = int(((moved * 2u) / 5u) % uint(down));
+        int along = int((moved / 2u) % uint(across));
+        ivec3 first = texel(ivec2(at.x, (at.y + up) % down));
+        ivec3 second = texel(ivec2((at.x + across / 2 + along) % across, (at.y + down - back + down / 3) % down));
+        uint h = uint(at.x) * 374761393u + uint(at.y) * 668265263u + moved * 2246822519u;
+        h = (h ^ (h >> 13)) * 1274126177u;
+        h ^= h >> 16;
+        int grain = int(h % 5u) - 2;
+        ivec3 mixed = clamp((3 * first + second + 2) / 4 + grain, 0, 255);
+        colour = vec4(vec3(mixed) / 255.0, 1.0);
     }
 }
 ";
@@ -218,16 +246,19 @@ impl Gpu {
 
     /// Paints the picture as it is now and hands the frame to the window system.
     ///
-    /// `sheet_height` and `offset` are those of the sheet last uploaded; they are not
-    /// looked at for the grey picture.
+    /// `sheet_height` is that of the sheet last uploaded and `moved` how many rows the
+    /// picture has moved; neither is looked at for the grey picture. `stamp` puts the
+    /// stamp that says how far the picture has moved into the corner.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         width: u32,
         height: u32,
         what: Picture,
         sheet_height: usize,
-        offset: usize,
+        moved: u64,
         shade: Shade,
+        stamp: bool,
     ) -> Result<(), String> {
         if self.size != (width, height) {
             if let (Some(across), Some(down)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
@@ -249,7 +280,7 @@ impl Gpu {
                 width as i32,
                 height as i32,
                 sheet_height.max(1) as i32,
-                offset as i32,
+                0,
             );
             gl.uniform_4_i32(
                 at("square").as_ref(),
@@ -260,7 +291,17 @@ impl Gpu {
             );
             gl.uniform_3_f32(at("shade").as_ref(), red, green, blue);
             gl.uniform_3_f32(at("paper").as_ref(), paper_red, paper_green, paper_blue);
-            gl.uniform_1_i32(at("text").as_ref(), i32::from(what == Picture::Text));
+            let mode = match what {
+                Picture::Grey => 0,
+                Picture::Text => 1,
+                Picture::Hard => 2,
+            };
+            gl.uniform_1_i32(at("mode").as_ref(), mode);
+            // The low 32 bits, which is what the CPU counts the hard picture with too.
+            gl.uniform_1_u32(at("moved").as_ref(), moved as u32);
+            let stamped = stamp && picture::stamp_fits(width as usize, height as usize);
+            gl.uniform_1_i32(at("stamped").as_ref(), i32::from(stamped));
+            gl.uniform_1_u32(at("code").as_ref(), picture::stamp_code(moved));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
         }
         self.surface

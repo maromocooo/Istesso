@@ -135,6 +135,7 @@ struct Options {
     var minMs = 200
     var maxMs = 400
     var timeoutMs = 1500
+    var relayedInterface: String? = nil
     var seed = UInt64(Date().timeIntervalSince1970 * 1000)
 
     static let usage = """
@@ -154,6 +155,9 @@ struct Options {
       --count N                  number of inputs (default: 500)
       --min-ms N, --max-ms N     interval between inputs (default: 200 to 400)
       --timeout-ms N             how long to wait for a window to react (default: 1500)
+      --relayed-interface NAME   send the host's inputs out of this network interface (en8, say),
+                                 whichever one the system would choose: for measuring on a cable
+                                 while Wi-Fi is still on
       --seed N                   seed of the intervals; the same seed repeats the same run
 
     A SELECTOR is title:TEXT (the window's title), owner:APPLICATION (the largest window of
@@ -188,6 +192,7 @@ struct Options {
             case "--min-ms": options.minMs = try number(name)
             case "--max-ms": options.maxMs = try number(name)
             case "--timeout-ms": options.timeoutMs = try number(name)
+            case "--relayed-interface": options.relayedInterface = try value(name)
             case "--seed":
                 guard let seed = UInt64(try value(name)) else { throw Failure("--seed needs a number") }
                 options.seed = seed
@@ -212,7 +217,7 @@ struct Options {
 
 /// Opens a UDP socket to a test application. Errors name the option, never the address:
 /// what this program prints ends up in measurement records.
-func openSocket(to target: String, option: String) throws -> Int32 {
+func openSocket(to target: String, option: String, interface: String? = nil) throws -> Int32 {
     guard let colon = target.lastIndex(of: ":") else {
         throw Failure("\(option) needs ADDRESS:PORT")
     }
@@ -227,6 +232,19 @@ func openSocket(to target: String, option: String) throws -> Int32 {
     defer { freeaddrinfo(list) }
     let descriptor = socket(first.pointee.ai_family, first.pointee.ai_socktype, first.pointee.ai_protocol)
     guard descriptor >= 0 else { throw Failure("cannot open a socket for \(option)") }
+    if let interface {
+        // Bound to the interface before it is connected: the datagrams then leave by it even
+        // where another interface comes first in the system's order.
+        var index = if_nametoindex(interface)
+        let level = first.pointee.ai_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+        let name = first.pointee.ai_family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
+        guard index != 0,
+              setsockopt(descriptor, level, name, &index, socklen_t(MemoryLayout<UInt32>.size)) == 0
+        else {
+            close(descriptor)
+            throw Failure("cannot use the network interface \(interface) for \(option)")
+        }
+    }
     guard connect(descriptor, first.pointee.ai_addr, first.pointee.ai_addrlen) == 0 else {
         close(descriptor)
         throw Failure("cannot reach the address given to \(option)")
@@ -567,7 +585,7 @@ func run() throws {
     defer { try? waitUntilDone("stop") { stream.stopCapture(completionHandler: $0) } }
 
     let localSocket = try openSocket(to: options.local, option: "--local")
-    let relayedSocket = try openSocket(to: options.relayed, option: "--relayed")
+    let relayedSocket = try openSocket(to: options.relayed, option: "--relayed", interface: options.relayedInterface)
     defer {
         close(localSocket)
         close(relayedSocket)

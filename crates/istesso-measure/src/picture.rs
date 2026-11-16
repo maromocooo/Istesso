@@ -11,6 +11,15 @@
 //! to carry. A square in the middle shows the current shade; that is where
 //! the measuring tools look.
 //!
+//! The hard picture is for seeing what a relay does when the picture is not
+//! kind to it: something like a photograph, two layers of it moving across
+//! each other, with a grain that is new in every frame. No part of a frame
+//! can be made by moving a part of the one before.
+//!
+//! Either moving picture can carry a stamp: a row of cells in its top left
+//! corner that says how far the picture has moved. A frame caught on a
+//! screen then says itself which frame it is.
+//!
 //! The pictures are made here, not in the application, because a tool that
 //! judges what a relay did to a frame has to make the very same frame again
 //! to compare with ([`crate::quality`]).
@@ -309,6 +318,40 @@ impl Sheet {
         (self.width, self.window_height, self.scale) == (width, window_height, scale.max(1))
     }
 
+    /// The sheet of the hard picture: something like a photograph, as wide as
+    /// the window and twice as tall. Its right edge goes on at its left one
+    /// and its bottom at its top, so it can be moved round and round.
+    pub fn photo(width: usize, window_height: usize) -> Sheet {
+        let height = 2 * window_height.max(1);
+        let size = (width, height);
+        let mut pixels = vec![0u32; width * height];
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |count| count.get())
+            .min(8);
+        let rows_each = height.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (part, rows) in pixels.chunks_mut(rows_each * width.max(1)).enumerate() {
+                scope.spawn(move || {
+                    for (i, pixel) in rows.iter_mut().enumerate() {
+                        *pixel = photo_pixel(i % width, part * rows_each + i / width, size);
+                    }
+                });
+            }
+        });
+        Sheet {
+            width,
+            window_height,
+            scale: 0,
+            height,
+            pixels,
+        }
+    }
+
+    /// Whether this sheet is the hard picture's for a window of this size.
+    pub fn fits_photo(&self, width: usize, window_height: usize) -> bool {
+        (self.width, self.window_height, self.scale) == (width, window_height, 0)
+    }
+
     /// Rows in the sheet.
     pub fn height(&self) -> usize {
         self.height
@@ -352,11 +395,174 @@ fn stamp(
     }
 }
 
+/// Mixes three numbers into one, the same on every machine.
+fn mix(seed: u32, x: u32, y: u32) -> u32 {
+    let mut h = seed ^ x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77);
+    h = (h ^ (h >> 15)).wrapping_mul(0x2C1B_3C6D);
+    h = (h ^ (h >> 12)).wrapping_mul(0x297A_2D39);
+    h ^ (h >> 15)
+}
+
+/// Smooth noise between 0 and 1 that repeats after `period` cells each way.
+/// Only additions, multiplications and rounding down: the same on every
+/// machine.
+fn noise(seed: u32, x: f32, y: f32, period: (u32, u32)) -> f32 {
+    let (left, top) = (x.floor(), y.floor());
+    let (fx, fy) = (x - left, y - top);
+    let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let at = |dx: u32, dy: u32| {
+        let value = mix(
+            seed,
+            (left as u32 + dx) % period.0,
+            (top as u32 + dy) % period.1,
+        );
+        (value >> 8) as f32 / 16_777_216.0
+    };
+    let upper = at(0, 0) + (at(1, 0) - at(0, 0)) * sx;
+    let lower = at(0, 1) + (at(1, 1) - at(0, 1)) * sx;
+    upper + (lower - upper) * sy
+}
+
+/// Several layers of noise, each twice as fine and half as strong as the
+/// one before, as in a photograph: between 0 and 1.
+fn layers(seed: u32, x: usize, y: usize, size: (usize, usize), cell: usize, count: u32) -> f32 {
+    let (mut total, mut weight, mut strength) = (0.0, 0.0, 1.0);
+    for layer in 0..count {
+        let cell = (cell >> layer).max(1);
+        let period = ((size.0 / cell).max(1) as u32, (size.1 / cell).max(1) as u32);
+        total += strength
+            * noise(
+                seed.wrapping_add(layer.wrapping_mul(0x632B_E5AB)),
+                x as f32 * period.0 as f32 / size.0 as f32,
+                y as f32 * period.1 as f32 / size.1 as f32,
+                period,
+            );
+        weight += strength;
+        strength *= 0.5;
+    }
+    total / weight
+}
+
+/// One pixel of the hard picture's sheet: soft areas of sky, leaves, sand
+/// and rock, light and dark in patches of every size, darker things with
+/// hard edges in front, and a fine grit.
+fn photo_pixel(x: usize, y: usize, size: (usize, usize)) -> u32 {
+    const PALETTE: [[f32; 3]; 4] = [
+        [120.0, 170.0, 225.0],
+        [70.0, 125.0, 60.0],
+        [205.0, 180.0, 140.0],
+        [110.0, 100.0, 95.0],
+    ];
+    let light = layers(0x51A7_E001, x, y, size, 256, 6);
+    let place = layers(0x51A7_E002, x, y, size, 512, 3);
+    let thing = layers(0x51A7_E003, x, y, size, 96, 2);
+    let grit = layers(0x51A7_E004, x, y, size, 3, 1);
+    let spot = ((place - 0.5) * 2.4 + 0.5).clamp(0.0, 0.999) * 3.0;
+    let (from, part) = (spot.floor() as usize, spot - spot.floor());
+    let mut shade = 0.35 + 0.95 * ((light - 0.5) * 2.2 + 0.5).clamp(0.0, 1.0) + (grit - 0.5) * 0.12;
+    if thing > 0.6 {
+        shade *= 0.45;
+    }
+    let channel = |i: usize| {
+        let colour = PALETTE[from][i] + (PALETTE[from + 1][i] - PALETTE[from][i]) * part;
+        (colour * shade).clamp(0.0, 255.0) as u32
+    };
+    channel(0) << 16 | channel(1) << 8 | channel(2)
+}
+
+/// How many rows a picture has moved after `elapsed_ns` at `speed` rows per
+/// second, since it started.
+pub fn moved(elapsed_ns: u64, speed: u32) -> u64 {
+    (u128::from(elapsed_ns) * u128::from(speed) / 1_000_000_000) as u64
+}
+
 /// How many rows the text has moved after `elapsed_ns` at `speed` rows per
 /// second, counted round the sheet.
 pub fn scrolled(elapsed_ns: u64, speed: u32, sheet_height: usize) -> usize {
-    let rows = u128::from(elapsed_ns) * u128::from(speed) / 1_000_000_000;
-    (rows % sheet_height.max(1) as u128) as usize
+    (moved(elapsed_ns, speed) % sheet_height.max(1) as u64) as usize
+}
+
+/// Side of a cell of the stamp, and where the stamp begins, in pixels.
+pub const STAMP_CELL: usize = 12;
+pub const STAMP_LEFT: usize = 8;
+pub const STAMP_TOP: usize = 8;
+/// Two cells that say "this is a stamp" (light, dark), 24 for the number and
+/// 8 that have to fit the number.
+pub const STAMP_CELLS: usize = 34;
+const STAMP_LIGHT: u32 = 0x00F0_F0F0;
+const STAMP_DARK: u32 = 0x0010_1010;
+
+/// What the 32 cells after the two markers show, first cell in the highest
+/// bit: the low 24 bits of `rows`, and 8 bits made from them. A stamp that
+/// was read wrong, or caught between two frames, does not fit.
+pub fn stamp_code(rows: u64) -> u32 {
+    let value = (rows & 0x00FF_FFFF) as u32;
+    let check = ((value >> 16) ^ (value >> 8) ^ value ^ 0x5A) & 0xFF;
+    value << 8 | check
+}
+
+/// Whether a picture of this size has room for the stamp.
+pub fn stamp_fits(width: usize, height: usize) -> bool {
+    width >= 2 * STAMP_LEFT + STAMP_CELLS * STAMP_CELL && height >= 2 * STAMP_TOP + STAMP_CELL
+}
+
+/// Paints the stamp for a picture that has moved `rows` rows. Cells are a
+/// good deal larger than what an encoder smears, and only light or dark, so
+/// that they can be read off a relayed picture whatever happened to its
+/// colours. A picture too small for it gets none.
+pub fn paint_stamp(frame: &mut [u32], width: usize, height: usize, rows: u64) {
+    if !stamp_fits(width, height) {
+        return;
+    }
+    let code = stamp_code(rows);
+    for cell in 0..STAMP_CELLS {
+        let light = match cell {
+            0 => true,
+            1 => false,
+            _ => code >> (33 - cell) & 1 == 1,
+        };
+        fill(
+            frame,
+            width,
+            STAMP_LEFT + cell * STAMP_CELL,
+            STAMP_TOP,
+            STAMP_CELL,
+            STAMP_CELL,
+            if light { STAMP_LIGHT } else { STAMP_DARK },
+        );
+    }
+}
+
+/// Reads the stamp of a picture given as four bytes a pixel (blue, green,
+/// red, unused): how many rows it had moved, as far as 24 bits say. `None`
+/// when there is no stamp or it cannot be read.
+pub fn read_stamp(frame: &[u8], width: usize, height: usize) -> Option<u64> {
+    if !stamp_fits(width, height) || frame.len() < width * height * 4 {
+        return None;
+    }
+    let mut code = 0u32;
+    for cell in 0..STAMP_CELLS {
+        // The middle of the cell: what is smeared at its edges stays out.
+        let mut sum = 0u32;
+        for y in STAMP_TOP + 3..STAMP_TOP + STAMP_CELL - 3 {
+            for x in STAMP_LEFT + cell * STAMP_CELL + 3..STAMP_LEFT + (cell + 1) * STAMP_CELL - 3 {
+                let at = (y * width + x) * 4;
+                sum += (u32::from(frame[at])
+                    + 2 * u32::from(frame[at + 1])
+                    + u32::from(frame[at + 2]))
+                    / 4;
+            }
+        }
+        let light = sum / 36 >= 128;
+        match cell {
+            0 if !light => return None,
+            1 if light => return None,
+            0 | 1 => {}
+            _ => code = code << 1 | u32::from(light),
+        }
+    }
+    let rows = u64::from(code >> 8);
+    (stamp_code(rows) == code).then_some(rows)
 }
 
 /// Where the square that shows the shade is: left, top and side, in pixels.
@@ -393,6 +599,11 @@ pub fn paint_text(
     for (y, row) in frame.chunks_exact_mut(width).take(height).enumerate() {
         row.copy_from_slice(sheet.row((y + offset) % sheet.height));
     }
+    paint_square(frame, width, height, shade);
+}
+
+/// The square in the middle: a rim of paper, and the shade inside it.
+fn paint_square(frame: &mut [u32], width: usize, height: usize, shade: Shade) {
     let (left, top, side) = square(width, height);
     let rim = rim(side);
     fill(frame, width, left, top, side, side, pixel(PAPER));
@@ -405,6 +616,56 @@ pub fn paint_text(
         side - 2 * rim,
         pixel(shade.rgb()),
     );
+}
+
+/// Paints one frame of the hard picture after it has moved `rows` rows, and
+/// over it the square with the shade.
+///
+/// Two layers of the sheet lie on each other, three parts of one to one of
+/// the other. The first moves up, as the text does; the second moves down
+/// and sideways, slower. Over both lies a grain that is new in every frame.
+/// The sheet has to be [`Sheet::photo`] for a frame of this size.
+pub fn paint_hard(
+    frame: &mut [u32],
+    width: usize,
+    height: usize,
+    sheet: &Sheet,
+    rows: u64,
+    shade: Shade,
+) {
+    // Counted in 32 bits, as the program that draws on the GPU counts.
+    let moved = rows as u32;
+    let (across, down) = (sheet.width, sheet.height);
+    let up = (moved % down as u32) as usize;
+    let back = ((moved.wrapping_mul(2) / 5) % down as u32) as usize;
+    let along = ((moved / 2) % across as u32) as usize;
+    for (y, row) in frame.chunks_exact_mut(width).take(height).enumerate() {
+        let first = sheet.row((y + up) % down);
+        let second = sheet.row((y + down - back + down / 3) % down);
+        for (x, pixel) in row.iter_mut().enumerate() {
+            let other = second[(x + across / 2 + along) % across];
+            *pixel = hard_pixel(first[x], other, x as u32, y as u32, moved);
+        }
+    }
+    paint_square(frame, width, height, shade);
+}
+
+/// One pixel of the hard picture, from the pixels of the two layers under
+/// it, where it is and how far the picture has moved. Whole numbers only:
+/// the shader that draws the picture on the GPU does the same sums.
+pub fn hard_pixel(first: u32, second: u32, x: u32, y: u32, moved: u32) -> u32 {
+    let mut h = x
+        .wrapping_mul(374_761_393)
+        .wrapping_add(y.wrapping_mul(668_265_263))
+        .wrapping_add(moved.wrapping_mul(2_246_822_519));
+    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    h ^= h >> 16;
+    let grain = (h % 5) as i32 - 2;
+    let channel = |shift: u32| {
+        let mixed = (3 * (first >> shift & 0xFF) + (second >> shift & 0xFF) + 2) / 4;
+        (mixed as i32 + grain).clamp(0, 255) as u32
+    };
+    channel(16) << 16 | channel(8) << 8 | channel(0)
 }
 
 fn fill(
@@ -426,6 +687,149 @@ mod tests {
     use super::*;
     use crate::flash::classify;
     use std::collections::BTreeSet;
+
+    fn bytes(frame: &[u32]) -> Vec<u8> {
+        frame.iter().flat_map(|pixel| pixel.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn a_stamp_says_how_far_the_picture_has_moved() {
+        let (width, height) = (640, 200);
+        for rows in [0u64, 1, 2, 255, 256, 4097, 0x00AB_CDEF, 0x00FF_FFFF] {
+            let mut frame = vec![pixel(PAPER); width * height];
+            paint_stamp(&mut frame, width, height, rows);
+            assert_eq!(
+                read_stamp(&bytes(&frame), width, height),
+                Some(rows),
+                "{rows}"
+            );
+        }
+        // Only 24 bits are written: after that the count starts again.
+        let mut frame = vec![pixel(PAPER); width * height];
+        paint_stamp(&mut frame, width, height, 0x0100_0005);
+        assert_eq!(read_stamp(&bytes(&frame), width, height), Some(5));
+    }
+
+    #[test]
+    fn a_stamp_is_read_through_blur_and_noise_and_refused_when_it_does_not_fit() {
+        let (width, height) = (640, 200);
+        let mut frame = vec![pixel(PAPER); width * height];
+        paint_stamp(&mut frame, width, height, 123_456);
+        let sharp = bytes(&frame);
+        // Smeared over five pixels each way and lifted a little, as a key frame squeezed hard is.
+        let mut blurred = sharp.clone();
+        for y in 2..height - 2 {
+            for x in 2..width - 2 {
+                for channel in 0..3 {
+                    let mut sum = 0u32;
+                    for dy in 0..5 {
+                        for dx in 0..5 {
+                            sum +=
+                                u32::from(sharp[((y + dy - 2) * width + x + dx - 2) * 4 + channel]);
+                        }
+                    }
+                    blurred[(y * width + x) * 4 + channel] = (sum / 25 + 6).min(255) as u8;
+                }
+            }
+        }
+        assert_eq!(read_stamp(&blurred, width, height), Some(123_456));
+
+        // No stamp at all: the first cell is not light.
+        let plain = bytes(&vec![pixel(PAPER); width * height]);
+        assert_eq!(read_stamp(&plain, width, height), None);
+        // One cell of the number turned over: the last eight cells no longer fit it.
+        let mut wrong = sharp.clone();
+        let cell = 10;
+        for y in STAMP_TOP..STAMP_TOP + STAMP_CELL {
+            for x in STAMP_LEFT + cell * STAMP_CELL..STAMP_LEFT + (cell + 1) * STAMP_CELL {
+                for channel in 0..3 {
+                    wrong[(y * width + x) * 4 + channel] ^= 0xE0;
+                }
+            }
+        }
+        assert_eq!(read_stamp(&wrong, width, height), None);
+        // A picture too small for a stamp gets none and gives none.
+        let mut small = vec![pixel(PAPER); 300 * 100];
+        paint_stamp(&mut small, 300, 100, 77);
+        assert!(small.iter().all(|p| *p == pixel(PAPER)));
+        assert_eq!(read_stamp(&bytes(&small), 300, 100), None);
+    }
+
+    #[test]
+    fn the_hard_picture_is_the_same_every_time_and_never_stands_still() {
+        let (width, height) = (320, 200);
+        let sheet = Sheet::photo(width, height);
+        assert!(sheet.fits_photo(width, height) && !sheet.fits(width, height, 2));
+        assert_eq!(sheet.height(), 400);
+        assert_eq!(Sheet::photo(width, height).pixels(), sheet.pixels());
+        // Something like a photograph: many colours, light and dark.
+        let colours: BTreeSet<u32> = sheet.pixels().iter().copied().collect();
+        assert!(colours.len() > 2000, "{} colours", colours.len());
+        let greens: Vec<u32> = sheet.pixels().iter().map(|p| (p >> 8) & 0xFF).collect();
+        let (darkest, lightest) = (greens.iter().min().unwrap(), greens.iter().max().unwrap());
+        assert!(lightest - darkest > 100, "{darkest} to {lightest}");
+
+        let paint = |rows: u64, shade: Shade| {
+            let mut frame = vec![0u32; width * height];
+            paint_hard(&mut frame, width, height, &sheet, rows, shade);
+            frame
+        };
+        assert_eq!(paint(700, Shade::Dark), paint(700, Shade::Dark));
+        // From one row to the next nearly every pixel changes, and not by moving along.
+        let (before, after) = (paint(700, Shade::Dark), paint(701, Shade::Dark));
+        let changed = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+        assert!(
+            changed > width * height * 7 / 10,
+            "{changed} pixels changed"
+        );
+        let shifted = before[width..]
+            .iter()
+            .zip(&after[..width * (height - 1)])
+            .filter(|(a, b)| a == b)
+            .count();
+        assert!(
+            shifted < width * height / 2,
+            "{shifted} pixels only moved up"
+        );
+        // The middle shows the shade, as in the other pictures.
+        let middle = |frame: &[u32]| {
+            let p = frame[(height / 2) * width + width / 2];
+            Rgb::new((p >> 16) as u8, (p >> 8) as u8, p as u8)
+        };
+        assert_eq!(
+            classify(middle(&paint(700, Shade::Dark))),
+            Some(Shade::Dark)
+        );
+        assert_eq!(
+            classify(middle(&paint(700, Shade::Light))),
+            Some(Shade::Light)
+        );
+    }
+
+    #[test]
+    fn the_grain_of_the_hard_picture_stays_within_two_levels() {
+        for (x, y, moved) in [(0u32, 0u32, 0u32), (17, 4, 9), (3439, 1439, 4_000_000_000)] {
+            let out = hard_pixel(0x0080_8080, 0x0080_8080, x, y, moved);
+            for shift in [16, 8, 0] {
+                let value = (out >> shift & 0xFF) as i32;
+                assert!((126..=130).contains(&value), "{value}");
+            }
+        }
+        // Three parts of the first layer to one of the second, and never out of range.
+        let dark = hard_pixel(0, 0, 5, 5, 5);
+        let light = hard_pixel(0x00FF_FFFF, 0x00FF_FFFF, 5, 5, 5);
+        assert!(dark & 0xFF <= 2 && light & 0xFF >= 253);
+        let mixed = hard_pixel(0x0000_00C8, 0x0000_0000, 1, 2, 3) & 0xFF;
+        assert!((148..=152).contains(&mixed), "{mixed}");
+    }
+
+    #[test]
+    fn moved_counts_on_where_scrolled_starts_again() {
+        assert_eq!(moved(1_000_000_000, 240), 240);
+        assert_eq!(moved(60_000_000_000, 240), 14_400);
+        assert_eq!(scrolled(60_000_000_000, 240, 1000), 400);
+        assert_eq!(moved(5_000_000_000, 0), 0);
+    }
 
     fn frame(sheet: &Sheet, width: usize, height: usize, offset: usize, shade: Shade) -> Vec<u32> {
         let mut frame = vec![0; width * height];

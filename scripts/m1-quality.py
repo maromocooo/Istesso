@@ -65,7 +65,7 @@ def spread(values):
 def one_run(args, width, height, bitrate, chroma, gop):
     """Runs one combination of settings and returns what was measured."""
     vbv = rate_buffer(args.vbv, bitrate, args.fps)
-    film = ["--size", f"{width}x{height}", "--fps", str(args.fps), "--scale", str(args.scale), "--scroll", str(args.scroll)]
+    film = ["--size", f"{width}x{height}", "--fps", str(args.fps), "--scale", str(args.scale), "--scroll", str(args.scroll), "--picture", args.picture]
     raw = f"video/x-raw(memory:CUDAMemory),format={RAW_FORMATS[chroma]}{COLOURS[args.colour]}"
     if args.no_codec:
         # Only what turning the picture into brightness and colour samples and back costs.
@@ -227,7 +227,8 @@ def main():
     parser.add_argument("--size", default="3440x1440", metavar="WxH")
     parser.add_argument("--fps", type=int, default=85)
     parser.add_argument("--scale", type=int, default=2, help="size of a font pixel: 2 is the test application's picture, 1 has strokes one pixel wide")
-    parser.add_argument("--scroll", type=int, default=240, help="rows a second the text moves")
+    parser.add_argument("--scroll", type=int, default=240, help="rows a second the picture moves")
+    parser.add_argument("--picture", choices=["text", "hard"], default="text", help="the moving text, or the hard picture: something like a photograph in motion")
     parser.add_argument("--count", type=int, default=1700, metavar="FRAMES", help="frames to put through: 20 seconds unless given")
     parser.add_argument(
         "--skip",
@@ -266,7 +267,8 @@ def main():
             parser.error(f"--chroma takes 420 or 444, not {chroma}")
 
     Gst.init(None)
-    print(f"{width}x{height} at {args.fps} frames a second, font pixel {args.scale}, {args.count} frames, the first {args.skip} left out")
+    what = f"font pixel {args.scale}" if args.picture == "text" else "the hard picture"
+    print(f"{width}x{height} at {args.fps} frames a second, {what}, {args.count} frames, the first {args.skip} left out")
     if not args.no_codec:
         print("encoder: " + encoder("BITRATE", args.fps, "GOP", "BUFFER", "420", args.preset, args.colour).replace("format=NV12", "format=NV12|Y444"))
     print(f"{'colour':<7}{'kbit/s':>8}{'gop':>5}{'buffer':>8}{'Mbit/s':>8}{'largest':>9}  {'SSIM brightness':<24}{'SSIM colour':<24}{'PSNR dB':>8}")

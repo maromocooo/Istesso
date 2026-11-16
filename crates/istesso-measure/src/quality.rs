@@ -18,13 +18,13 @@
 
 use serde::Serialize;
 
-use crate::flash::Shade;
-use crate::picture::{paint_text, scrolled, Sheet};
+use crate::flash::{classify, Rgb, Shade};
+use crate::picture::{moved, paint_hard, paint_stamp, paint_text, read_stamp, square, Sheet};
 use crate::stats::percentile;
 
-/// The frames the test application shows with its moving text, as a tool can
-/// make them again: frame `k` is the picture at `k` frame intervals after
-/// the start.
+/// The frames the test application shows with a moving picture, as a tool
+/// can make them again: frame `k` is the picture at `k` frame intervals
+/// after the start.
 pub struct Film {
     sheet: Sheet,
     width: usize,
@@ -32,6 +32,8 @@ pub struct Film {
     fps: u32,
     scroll: u32,
     toggle_every: u64,
+    hard: bool,
+    stamp: bool,
 }
 
 impl Film {
@@ -54,7 +56,23 @@ impl Film {
             fps: fps.max(1),
             scroll,
             toggle_every,
+            hard: false,
+            stamp: false,
         }
+    }
+
+    /// The same film with the hard picture in place of the text.
+    pub fn hard(mut self) -> Film {
+        self.sheet = Sheet::photo(self.width, self.height);
+        self.hard = true;
+        self
+    }
+
+    /// The same film with a stamp on every frame that says how far the
+    /// picture has moved ([`crate::picture::paint_stamp`]).
+    pub fn stamped(mut self) -> Film {
+        self.stamp = true;
+        self
     }
 
     /// Bytes in a frame: four per pixel, blue, green, red and one unused
@@ -65,22 +83,56 @@ impl Film {
 
     /// Paints frame `number` into `frame`, which holds [`Film::frame_len`] bytes.
     pub fn paint(&self, number: u64, frame: &mut [u8]) {
-        let elapsed_ns = number * 1_000_000_000 / u64::from(self.fps);
-        let offset = scrolled(elapsed_ns, self.scroll, self.sheet.height());
+        let rows = moved(number * 1_000_000_000 / u64::from(self.fps), self.scroll);
         let light = self.toggle_every > 0 && (number / self.toggle_every) % 2 == 1;
         let shade = if light { Shade::Light } else { Shade::Dark };
-        let mut pixels = vec![0u32; self.width * self.height];
-        paint_text(
-            &mut pixels,
-            self.width,
-            self.height,
-            &self.sheet,
-            offset,
-            shade,
-        );
+        self.paint_at(rows, shade, frame);
+    }
+
+    /// Paints the picture as it is when it has moved `rows` rows and its
+    /// middle shows `shade`: any frame the test application can show, not
+    /// only those of [`Film::paint`].
+    pub fn paint_at(&self, rows: u64, shade: Shade, frame: &mut [u8]) {
+        let (width, height) = (self.width, self.height);
+        let mut pixels = vec![0u32; width * height];
+        if self.hard {
+            paint_hard(&mut pixels, width, height, &self.sheet, rows, shade);
+        } else {
+            let offset = (rows % self.sheet.height() as u64) as usize;
+            paint_text(&mut pixels, width, height, &self.sheet, offset, shade);
+        }
+        if self.stamp {
+            paint_stamp(&mut pixels, width, height, rows);
+        }
         for (bytes, pixel) in frame.chunks_exact_mut(4).zip(&pixels) {
             bytes.copy_from_slice(&pixel.to_le_bytes());
         }
+    }
+
+    /// Reads off a frame which moment of the film it shows: how far the
+    /// picture had moved, by its stamp, and the shade in its middle. With
+    /// that, [`Film::paint_at`] makes the frame as it was sent. `None` for a
+    /// frame without a stamp that can be read.
+    pub fn read(&self, frame: &[u8]) -> Option<(u64, Shade)> {
+        let rows = read_stamp(frame, self.width, self.height)?;
+        // The shade, from nine places in the square: a mouse pointer that a compositor
+        // draws over the middle covers one or two of them, not most.
+        let (left, top, side) = square(self.width, self.height);
+        let mut lumas = Vec::with_capacity(9);
+        for down in [3, 4, 5] {
+            for across in [3, 4, 5] {
+                let at = ((top + side * down / 8) * self.width + left + side * across / 8) * 4;
+                lumas.push(Rgb::new(frame[at + 2], frame[at + 1], frame[at]).luma());
+            }
+        }
+        lumas.sort_unstable();
+        let usual = Rgb::new(lumas[4], lumas[4], lumas[4]);
+        let shade = classify(usual).unwrap_or(if lumas[4] >= 128 {
+            Shade::Light
+        } else {
+            Shade::Dark
+        });
+        Some((rows, shade))
     }
 }
 
@@ -250,6 +302,9 @@ pub struct Quality {
     pub worst_frame: Option<usize>,
     /// Every frame, in order, the skipped ones too.
     pub per_frame: Vec<FrameQuality>,
+    /// Frames that were left out altogether because they did not say which
+    /// frame they were ([`Film::read`]).
+    pub unreadable: usize,
 }
 
 impl Quality {
@@ -276,6 +331,7 @@ impl Quality {
             psnr_luma: Spread::of(&column(|f| f.psnr_luma.min(100.0))),
             worst_frame,
             per_frame,
+            unreadable: 0,
         }
     }
 
@@ -289,6 +345,12 @@ impl Quality {
             out.push_str(&format!(" (the first {} left out)", self.skipped));
         }
         out.push('\n');
+        if self.unreadable > 0 {
+            out.push_str(&format!(
+                "Frames whose stamp could not be read: {} (not compared)\n",
+                self.unreadable
+            ));
+        }
         out.push_str(&format!(
             "{:<34}{:>9}{:>9}{:>9}{:>9}\n",
             "", "mean", "median", "5%", "min"
@@ -376,6 +438,43 @@ mod tests {
             classify(middle(&frame(&still, 500), 320, 200)),
             Some(Shade::Dark)
         );
+    }
+
+    #[test]
+    fn a_stamped_frame_says_which_frame_it_is() {
+        let film = Film::new(640, 200, 2, 85, 240, 36).stamped();
+        for number in [0u64, 35, 36, 500, 100_000] {
+            let shown = frame(&film, number);
+            let (rows, shade) = film.read(&shown).expect("the stamp is there");
+            assert_eq!(rows, number * 240 / 85);
+            let mut again = vec![0; film.frame_len()];
+            film.paint_at(rows, shade, &mut again);
+            assert_eq!(again, shown, "frame {number}");
+        }
+        // Without a stamp a frame says nothing.
+        let plain = Film::new(640, 200, 2, 85, 240, 36);
+        assert_eq!(film.read(&frame(&plain, 7)), None);
+        // A light mouse pointer over the middle of a dark square does not change the shade read.
+        let mut pointed = frame(&film, 5);
+        for y in 95..110 {
+            for x in 316..326 {
+                pointed[(y * 640 + x) * 4..(y * 640 + x) * 4 + 3].fill(0xFF);
+            }
+        }
+        assert_eq!(film.read(&pointed), Some((5 * 240 / 85, Shade::Dark)));
+    }
+
+    #[test]
+    fn the_hard_film_moves_and_can_be_stamped_too() {
+        let film = Film::new(640, 200, 2, 85, 240, 36).hard().stamped();
+        assert_ne!(frame(&film, 7), frame(&film, 8));
+        assert_eq!(frame(&film, 7), frame(&film, 7));
+        let shown = frame(&film, 40);
+        let (rows, shade) = film.read(&shown).expect("the stamp is there");
+        assert_eq!((rows, shade), (40 * 240 / 85, Shade::Light));
+        let mut again = vec![0; film.frame_len()];
+        film.paint_at(rows, shade, &mut again);
+        assert_eq!(again, shown);
     }
 
     #[test]
