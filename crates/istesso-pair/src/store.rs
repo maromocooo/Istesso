@@ -28,10 +28,30 @@ pub enum Permission {
 }
 
 impl Permission {
+    /// Every permission, in the order they are stored and shown.
+    pub const ALL: [Permission; 5] = [
+        Permission::View,
+        Permission::Control,
+        Permission::InstallApps,
+        Permission::Usb,
+        Permission::Audio,
+    ];
+
     /// Rights a newly paired device starts with. Installing software and
     /// attaching hardware have to be granted separately.
     pub fn defaults() -> Vec<Permission> {
         vec![Permission::View, Permission::Control]
+    }
+
+    /// The name used in the peer store and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Permission::View => "view",
+            Permission::Control => "control",
+            Permission::InstallApps => "install_apps",
+            Permission::Usb => "usb",
+            Permission::Audio => "audio",
+        }
     }
 }
 
@@ -129,6 +149,37 @@ impl PeerStore {
     /// The peer with this id or (unambiguous) name.
     pub fn find(&self, selector: &str) -> Result<Option<&Peer>> {
         Ok(self.position(selector)?.map(|index| &self.peers[index]))
+    }
+
+    /// Grants (`allowed = true`) or withdraws one permission of the peer with
+    /// this id or (unambiguous) name. Returns the updated record, or `None`
+    /// when no peer matches.
+    ///
+    /// Nothing is sent to the device: only this machine's record of it
+    /// changes. The change is honoured from the device's next connection on;
+    /// a service that keeps a connection open for long has to read the store
+    /// again while it runs.
+    pub fn set_permission(
+        &mut self,
+        selector: &str,
+        permission: Permission,
+        allowed: bool,
+    ) -> Result<Option<Peer>> {
+        let Some(index) = self.position(selector)? else {
+            return Ok(None);
+        };
+        let permissions = &mut self.peers[index].permissions;
+        let had = permissions.contains(&permission);
+        if allowed && !had {
+            permissions.push(permission);
+            permissions.sort_by_key(|p| Permission::ALL.iter().position(|known| known == p));
+        } else if !allowed && had {
+            permissions.retain(|p| *p != permission);
+        }
+        if allowed != had {
+            self.save()?;
+        }
+        Ok(Some(self.peers[index].clone()))
     }
 
     fn position(&self, selector: &str) -> Result<Option<usize>> {
@@ -259,6 +310,120 @@ mod tests {
         assert_eq!(store.find(&id).unwrap().unwrap().id, id);
         assert!(store.find("nobody").unwrap().is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn permissions_are_granted_and_withdrawn_one_at_a_time() {
+        let path = temp_store("permissions");
+        let air = hello("MacBook Air", 1);
+        let id = fingerprint(&air.public_key);
+        {
+            let mut store = PeerStore::open(&path).unwrap();
+            store.add(Peer::from_hello(&air)).unwrap();
+            store.add(Peer::from_hello(&hello("ubuntu", 2))).unwrap();
+
+            // A new device may look and control, nothing else.
+            assert_eq!(
+                store.find(&id).unwrap().unwrap().permissions,
+                Permission::defaults()
+            );
+
+            // Granted by name; the others keep what they had.
+            let peer = store
+                .set_permission("macbook air", Permission::Audio, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                peer.permissions,
+                vec![Permission::View, Permission::Control, Permission::Audio]
+            );
+            assert_eq!(
+                store.find("ubuntu").unwrap().unwrap().permissions,
+                Permission::defaults()
+            );
+
+            // Granting twice changes nothing, and the order does not depend
+            // on the order of the grants.
+            store.set_permission(&id, Permission::Audio, true).unwrap();
+            let peer = store
+                .set_permission(&id, Permission::InstallApps, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                peer.permissions,
+                vec![
+                    Permission::View,
+                    Permission::Control,
+                    Permission::InstallApps,
+                    Permission::Audio
+                ]
+            );
+        }
+
+        // The grant is on disk, not only in memory.
+        let mut store = PeerStore::open(&path).unwrap();
+        assert!(store
+            .find(&id)
+            .unwrap()
+            .unwrap()
+            .permissions
+            .contains(&Permission::Audio));
+
+        // Withdrawn by id; withdrawing what was never granted is not an error.
+        let peer = store
+            .set_permission(&id, Permission::Audio, false)
+            .unwrap()
+            .unwrap();
+        assert!(!peer.permissions.contains(&Permission::Audio));
+        let peer = store
+            .set_permission(&id, Permission::Usb, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            peer.permissions,
+            vec![
+                Permission::View,
+                Permission::Control,
+                Permission::InstallApps
+            ]
+        );
+        let store = PeerStore::open(&path).unwrap();
+        assert!(!store
+            .find(&id)
+            .unwrap()
+            .unwrap()
+            .permissions
+            .contains(&Permission::Audio));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn permissions_of_unknown_or_ambiguous_devices_are_not_touched() {
+        let path = temp_store("permissions-selector");
+        let mut store = PeerStore::open(&path).unwrap();
+        store.add(Peer::from_hello(&hello("mac", 1))).unwrap();
+        store.add(Peer::from_hello(&hello("mac", 2))).unwrap();
+        assert!(store
+            .set_permission("nobody", Permission::Audio, true)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store.set_permission("mac", Permission::Audio, true),
+            Err(Error::InvalidName(_))
+        ));
+        assert!(store
+            .peers()
+            .iter()
+            .all(|peer| peer.permissions == Permission::defaults()));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn permission_names_match_the_stored_form() {
+        for permission in Permission::ALL {
+            let json = serde_json::to_string(&permission).unwrap();
+            assert_eq!(json, format!("\"{}\"", permission.name()));
+        }
     }
 
     #[test]
