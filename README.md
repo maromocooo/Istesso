@@ -71,6 +71,7 @@ istesso apps list --all
 - [docs/components.md](docs/components.md)：部品の採否とライセンス
 - [docs/milestones.md](docs/milestones.md)：進め方
 - [docs/m1-plan.md](docs/m1-plan.md)：次の関門（遅延の検証）の手順
+- [docs/wifi.md](docs/wifi.md)：Wi-Fi で使うときの手引き
 - [docs/adr/](docs/adr/)：決定の記録
 
 ## 開発
