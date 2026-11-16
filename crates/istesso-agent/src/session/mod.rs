@@ -1288,11 +1288,17 @@ impl Inner {
             epoch,
         };
         let Some(peers) = read_peers(&self.paths) else {
-            // A list that cannot be read is not an unpairing. The session
-            // stays as it is, with its marks, and the list is read again
-            // when it is next due. Nobody new is shown anything meanwhile.
+            // A list that cannot be read is not an unpairing: the session
+            // keeps its application and its marks, and is open to nobody
+            // it was not open to. But nothing is allowed while nothing is
+            // known. Nobody new is shown the session, and the picture that
+            // is being sent stops. The list is read again when it is next
+            // due.
             if let Some(attach) = round.attach.take() {
                 self.attach_went(id, attach.number, Err(CANNOT_READ.to_string()));
+            }
+            if subject.is_some() {
+                round.leave = Some(CANNOT_READ.to_string());
             }
             return round;
         };

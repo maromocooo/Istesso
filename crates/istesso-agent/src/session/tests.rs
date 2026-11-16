@@ -1135,19 +1135,22 @@ fn a_list_of_paired_devices_that_cannot_be_read_is_not_an_unpairing() {
             "half-written" => std::fs::write(&list, &good[..good.len() / 2]).unwrap(),
             _ => std::fs::write(&list, "").unwrap(),
         }
-        // Several rounds try to read it.
-        std::thread::sleep(Duration::from_millis(250));
-        // Nothing is concluded from that. The session is as it was, shown
-        // and without a mark, and its stream was told nothing.
-        let seen = host.sessions.host_look(&id).unwrap();
+        // Nothing is known now, so nothing is allowed: the picture that
+        // was being sent stops within a round or two.
+        let broke = Instant::now();
+        let seen = host.settles(&id, |s| s.info.state == SessionState::Detached);
+        assert!(broke.elapsed() < Duration::from_secs(2), "{broken}");
+        // Nothing is concluded either. The session has no mark, and its
+        // application runs on.
         assert_eq!(
-            (seen.info.state, seen.revoked, &seen.info.left_by),
-            (SessionState::Running, false, &None),
+            (seen.revoked, &seen.info.left_by),
+            (false, &None),
             "{broken}"
         );
-        assert!(host.since_running().is_empty(), "{broken}");
-        // Nothing is allowed either, and nothing is widened: whoever asks
-        // is refused, the device that started the session included.
+        assert_eq!(host.journal.count("app stop"), 0, "{broken}");
+        // Whoever asks is refused, the device that started the session
+        // included, whatever it asks: to start, to list, to follow, to be
+        // shown, to leave, to stop. Nothing is widened.
         for device in [&host.laptop, &tablet] {
             for request in host.everything_about(&id) {
                 let (code, message) = refusal(host.ask(device, request));
@@ -1160,12 +1163,30 @@ fn a_list_of_paired_devices_that_cannot_be_read_is_not_an_unpairing() {
             let (code, _) = refusal(host.start_as(device, "paint.desktop"));
             assert_eq!(code, ErrorCode::Unavailable, "{broken}");
         }
-        // The list is back, and with it what was there before. No more.
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            host.sessions.host_look(&id).unwrap().info.state,
+            SessionState::Detached,
+            "{broken}"
+        );
+        // The list is back. The session is there for the device that
+        // started it and for nobody else, and can be shown again.
         std::fs::write(&list, &good).unwrap();
-        assert_eq!(host.look(&id).state, SessionState::Running);
+        assert_eq!(host.look(&id).state, SessionState::Detached);
         assert!(host.list(&tablet).is_empty());
+        assert_eq!(session(host.attach(&id)).state, SessionState::Running);
     }
-    assert!(host.since_running().is_empty());
+    // The stream was told to stop three times and to send again three
+    // times. The application was never touched.
+    assert_eq!(
+        (
+            host.journal.count("runner detach"),
+            host.journal.count("runner attach"),
+            host.journal.count("app stop"),
+            host.journal.count("runner stop")
+        ),
+        (3, 3, 0, 0)
+    );
     assert_eq!(host.sessions.host_look(&id).unwrap().info.left_by, None);
 
     // A list that was read and does not hold the device is another matter.

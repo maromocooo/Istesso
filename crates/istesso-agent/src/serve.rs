@@ -592,12 +592,23 @@ mod tests {
         let list = paths.peers();
         let good = std::fs::read(&list).unwrap();
         let mut spare = connect(&tablet_identity).unwrap();
+        let mut spare_asks = connect(&tablet_identity).unwrap();
         spare.ping().unwrap();
-        assert_eq!(open(), 3);
+        spare_asks.ping().unwrap();
+        assert_eq!(open(), 4);
         std::fs::remove_file(&list).unwrap();
         std::thread::sleep(PAIRINGS_READ_EVERY + Duration::from_millis(300));
-        assert_eq!(open(), 3);
+        assert_eq!(open(), 4);
         assert!(spare.ping().is_err());
+        // A question about sessions gets no answer either, not even the
+        // table's refusal.
+        let nothing = spare_asks.call(&Request::SessionList);
+        assert!(
+            matches!(&nothing, Err(why) if !matches!(why, istesso_link::Error::Remote(_))),
+            "{nothing:?}"
+        );
+        // And nobody gets in.
+        assert!(connect(&tablet_identity).is_err());
         std::fs::write(&list, &good).unwrap();
         settle_at(2);
         laptop_talks.ping().unwrap();
