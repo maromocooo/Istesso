@@ -164,8 +164,6 @@ def main():
     inputs = {line["id"]: (host_origin + line["input_ns"], host_origin + line["commit_ns"]) for line in network_inputs(host_app)}
 
     out = sorted((l for l in host_frames if l.get("kind") == "frame_out"), key=lambda l: l["t_ns"])
-    out_changes = changes(out)
-    out_change_times = [out[i]["t_ns"] for i in out_changes]
     encoded = {l["pts"]: l for l in host_frames if l.get("kind") == "encoded"}
     # The encoder restamps its frames by a constant. The log has a frame's lines in the order
     # compositor, encoder, network, so the constant is what most neighbours differ by.
@@ -179,6 +177,17 @@ def main():
     if not restamps:
         sys.exit("error: the host's frame log has no frame that reached the encoder")
     restamp = restamps.most_common(1)[0][0]
+    by_size = all(frame["luma"] < 0 for frame in out)
+    if by_size:
+        # The frames stayed on the GPU and their shade could not be read. A frame that carries a
+        # change is several times the size of one that repeats the picture before it.
+        sizes = sorted(e["bytes"] for e in encoded.values() if not e["key"])
+        usual = sizes[len(sizes) // 2]
+        big = lambda frame: (e := encoded.get(frame["pts"] + restamp)) is not None and not e["key"] and e["bytes"] > 2.5 * usual
+        out_changes = [i for i, frame in enumerate(out) if big(frame)]
+    else:
+        out_changes = changes(out)
+    out_change_times = [out[i]["t_ns"] for i in out_changes]
     # A frame goes to the network as several packets, each handed over on its own.
     sent = {}
     for line in host_frames:
@@ -296,6 +305,8 @@ def main():
     if not totals:
         sys.exit("error: no input could be followed")
     print(f"Time of day against the monotonic clock moved by {host_line.spread_ms:.3f} ms on the host during the run")
+    if by_size:
+        print("The host's frames stayed on the GPU: the frame that carried an input is told by its size, not by its shade.")
     print()
     print("Relayed window, from sending the input to seeing it")
     print(HEADER)
