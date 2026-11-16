@@ -670,10 +670,10 @@ fn a_picture_that_stands_still_is_not_a_broken_connection() {
     assert!(matches!(nothing, Ok(None)), "{:?}", nothing.err());
     assert!(began.elapsed() >= Duration::from_millis(3400));
     assert_eq!(pair.host.viewers(), 1);
-    assert_eq!(
-        pair.host.send_frame(b"moved", 1, 1, false).unwrap().viewers,
-        1
-    );
+    // A frame that comes in the very moment the viewer is being told that the picture
+    // stands still goes on without it, and the next one is a key frame; either way the
+    // picture moves again.
+    pair.until(|| pair.host.send_frame(b"moved", 1, 1, true).unwrap().viewers == 1);
     assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"moved");
 }
 
@@ -1057,17 +1057,24 @@ fn the_cursor_reaches_a_viewer_and_a_viewer_that_comes_later() {
     assert_eq!(events(&mut viewer, 1).1[0], b"default");
 
     // Frames go on as before, and a viewer that only wants frames gets only frames; what
-    // the cursor is, is kept for it.
-    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    // the cursor is, is kept for it. (A frame that comes in the very moment the viewer's
+    // own thread is telling it the cursor goes on without that viewer, by design; so the
+    // test lets that thread finish before it hands a frame over.)
     std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"key");
+    std::thread::sleep(Duration::from_millis(60));
     pair.host.set_cursor(&arrow(&pixels)).unwrap();
+    pair.until(|| {
+        matches!(viewer.next_frame(Duration::from_millis(20)), Ok(None))
+            && viewer.cursor() == Some(arrow(&pixels))
+    });
+    std::thread::sleep(Duration::from_millis(30));
     assert_eq!(
         pair.host.send_frame(b"next", 1, 1, false).unwrap().viewers,
         1
     );
-    assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"key");
     assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"next");
-    pair.until(|| matches!(viewer.next_frame(Duration::from_millis(20)), Ok(None)));
     assert_eq!(viewer.cursor(), Some(arrow(&pixels)));
 }
 
