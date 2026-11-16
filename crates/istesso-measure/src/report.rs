@@ -24,6 +24,10 @@ pub struct Report {
     pub client_only: usize,
     /// Paired inputs left out because a timestamp runs backwards.
     pub invalid: usize,
+    /// Lines whose input number had already occurred in the same log. The
+    /// first one counts. More than zero usually means that one log holds two
+    /// runs, and then the second run is paired with the first run's samples.
+    pub repeated: usize,
     /// Round trip minus the application's response time. The figure that decides.
     pub added: Option<Summary>,
     /// Client's clock: input sent, to the frame that shows it put on screen.
@@ -53,6 +57,7 @@ impl Report {
         let mut seen = BTreeSet::new();
         let mut client_only = 0;
         let mut invalid = 0;
+        let mut repeated = host.len() - host_by_id.len();
         let mut added = Vec::new();
         let mut round_trip = Vec::new();
         let mut app_response = Vec::new();
@@ -63,6 +68,7 @@ impl Report {
 
         for c in client {
             if !seen.insert(c.id) {
+                repeated += 1;
                 continue;
             }
             let Some(h) = host_by_id.get(&c.id) else {
@@ -102,6 +108,7 @@ impl Report {
             host_only,
             client_only,
             invalid,
+            repeated,
             added: Summary::of(&added),
             round_trip: Summary::of(&round_trip),
             app_response: Summary::of(&app_response),
@@ -130,6 +137,15 @@ impl Report {
             ("display wait (client)", self.display_wait),
             ("transfer, both ways", self.transfer),
         ]));
+        if self.repeated > 0 {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "{} lines repeat an input number already used in the same log; the first one counted. \
+                 A log has to hold one run: restart the test application between runs.",
+                self.repeated
+            );
+        }
         if self.paired < MIN_SAMPLES {
             let _ = writeln!(out);
             let _ = writeln!(
@@ -238,6 +254,16 @@ mod tests {
         let report = Report::build(&hosts, &clients);
         assert_eq!(report.paired, 1);
         assert_eq!(report.added.unwrap().median_ms, 8.0);
+        // One repeated line on each side, and the reader is told.
+        assert_eq!(report.repeated, 2);
+        assert!(report.render().contains("2 lines repeat an input number"));
+    }
+
+    #[test]
+    fn a_clean_run_reports_no_repeats() {
+        let report = Report::build(&[host(0, 0, 1), host(1, 300, 1)], &[client(0, 0, 9)]);
+        assert_eq!(report.repeated, 0);
+        assert!(!report.render().contains("repeat"));
     }
 
     #[test]
