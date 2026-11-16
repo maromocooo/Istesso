@@ -105,6 +105,27 @@ typedef struct IstessoMediaClient IstessoMediaClient;
 IstessoMediaHost *istesso_media_host_listen(const char *config_dir, const char *bind,
                                             const IstessoMediaStreamInfo *info);
 
+/*
+ * The same, for the picture of a streaming session: nobody is shown it until
+ * istesso_media_host_admit() names a device.
+ */
+IstessoMediaHost *istesso_media_host_listen_closed(const char *config_dir, const char *bind,
+                                                   const IstessoMediaStreamInfo *info);
+
+/*
+ * Says which one paired device is shown the picture from now on: the one with this id and
+ * this public key, both as the list of paired devices has them (`istesso peers list --json`).
+ * Both NULL: nobody. Any other viewer is cut off before this returns, and whoever else
+ * connects is refused. Being paired and allowed to look is still checked underneath, at every
+ * connection and while the stream runs. 0, or -1 when only one of the two was given or a text
+ * could not be read; then nobody is admitted.
+ */
+int32_t istesso_media_host_admit(const IstessoMediaHost *host, const char *device_id,
+                                 const char *public_key);
+
+/* Back to every paired device that may look and connects: what a host does that was never told. */
+int32_t istesso_media_host_admit_paired(const IstessoMediaHost *host);
+
 /* The port the host listens on (of use after asking for port 0). */
 uint16_t istesso_media_host_port(const IstessoMediaHost *host);
 
@@ -134,6 +155,13 @@ int32_t istesso_media_host_key_frame_wanted(const IstessoMediaHost *host);
  * that may not travel (see IstessoMediaCursor); it then reaches nobody.
  */
 int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const IstessoMediaCursor *cursor);
+
+/*
+ * Offers the picture to paired devices (1, as from the start) or stops offering it (0): every
+ * viewer is cut off at once and no caller is taken, or even answered, until it is offered again.
+ * For a session that is shown to nobody for the time being.
+ */
+void istesso_media_host_offer(const IstessoMediaHost *host, int32_t offered);
 
 /* Devices that are being shown the picture now. */
 uint32_t istesso_media_host_viewers(const IstessoMediaHost *host);

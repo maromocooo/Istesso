@@ -38,7 +38,7 @@ pub mod viewer;
 pub mod wire;
 
 #[cfg(unix)]
-pub use host::Host;
+pub use host::{Admit, Host};
 #[cfg(unix)]
 pub use viewer::{Asker, Event, Frame, Viewer};
 pub use wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, DEFAULT_PORT};

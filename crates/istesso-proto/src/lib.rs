@@ -11,6 +11,12 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub mod session;
+pub use session::{
+    DisplayMode, EndReason, PauseReason, RunnerCommand, RunnerEvent, SessionEnd, SessionId,
+    SessionInfo, SessionPeer, SessionState, ViewerCommand, ViewerEvent, ViewerWish,
+};
+
 /// Version of the wire vocabulary. Bump on incompatible changes.
 pub const PROTOCOL_VERSION: u32 = 1;
 

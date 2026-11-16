@@ -30,6 +30,21 @@ pub use server::Session;
 /// Port the agent listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 47801;
 
+/// What the other device answered instead of doing what it was asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteError {
+    /// What kind of refusal it is; callers decide by this.
+    pub code: ErrorCode,
+    /// One line for a person.
+    pub message: String,
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({:?})", self.message, self.code)
+    }
+}
+
 /// Everything that can go wrong on the control channel.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -59,7 +74,7 @@ pub enum Error {
     #[error("the encrypted channel failed: {0}")]
     Crypto(String),
     #[error("the other device reported: {0}")]
-    Remote(String),
+    Remote(RemoteError),
     #[error("I/O error: {0}")]
     Io(std::io::Error),
 }

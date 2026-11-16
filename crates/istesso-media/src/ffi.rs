@@ -22,7 +22,7 @@ use istesso_link::LocalKeys;
 use istesso_pair::{Identity, PeerStore};
 
 use crate::wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, WireError};
-use crate::{clock, realtime, Asker, Error, Event, Host, Result, Viewer};
+use crate::{clock, realtime, Admit, Asker, Error, Event, Host, Result, Viewer};
 
 /// What a host tells its viewers about the picture.
 #[repr(C)]
@@ -198,17 +198,46 @@ fn listen(
     config_dir: Option<String>,
     bind: Option<String>,
     info: IstessoMediaStreamInfo,
+    admit: Admit,
 ) -> Result<Host> {
     let paths = paths(config_dir);
     let bind = bind.ok_or_else(|| Error::Refused("no address to listen on was given".into()))?;
     let log = Arc::new(|line: String| eprintln!("istesso-media: {line}"));
-    Host::listen(
+    Host::listen_admitting(
         address(&bind)?,
         &identity(&paths)?,
         paths.peers(),
         info.into(),
         log,
+        admit,
     )
+}
+
+/// What the two listening functions share.
+///
+/// # Safety
+/// As for `istesso_media_host_listen`.
+unsafe fn listen_from_c(
+    config_dir: *const c_char,
+    bind: *const c_char,
+    info: *const IstessoMediaStreamInfo,
+    admit: Admit,
+) -> *mut IstessoMediaHost {
+    if info.is_null() {
+        remember("no stream description was given");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller's promises about the three pointers.
+    let result = unsafe { text(config_dir) }
+        .and_then(|dir| Ok((dir, unsafe { text(bind) }?)))
+        .and_then(|(dir, bind)| listen(dir, bind, unsafe { *info }, admit));
+    match result {
+        Ok(host) => Box::into_raw(Box::new(IstessoMediaHost { host })),
+        Err(err) => {
+            remember(err);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 fn connect(
@@ -244,21 +273,66 @@ pub unsafe extern "C" fn istesso_media_host_listen(
     bind: *const c_char,
     info: *const IstessoMediaStreamInfo,
 ) -> *mut IstessoMediaHost {
-    if info.is_null() {
-        remember("no stream description was given");
-        return std::ptr::null_mut();
-    }
-    // SAFETY: the caller's promises about the three pointers.
-    let result = unsafe { text(config_dir) }
-        .and_then(|dir| Ok((dir, unsafe { text(bind) }?)))
-        .and_then(|(dir, bind)| listen(dir, bind, unsafe { *info }));
-    match result {
-        Ok(host) => Box::into_raw(Box::new(IstessoMediaHost { host })),
+    // SAFETY: the caller's promises, passed on.
+    unsafe { listen_from_c(config_dir, bind, info, Admit::Paired) }
+}
+
+/// # Safety
+/// As `istesso_media_host_listen`.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_listen_closed(
+    config_dir: *const c_char,
+    bind: *const c_char,
+    info: *const IstessoMediaStreamInfo,
+) -> *mut IstessoMediaHost {
+    // SAFETY: the caller's promises, passed on.
+    unsafe { listen_from_c(config_dir, bind, info, Admit::Nobody) }
+}
+
+/// # Safety
+/// `host` as below; the two texts are C strings or null.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_admit(
+    host: *const IstessoMediaHost,
+    device_id: *const c_char,
+    public_key: *const c_char,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let Some(host) = (unsafe { host.as_ref() }) else {
+        remember("no host was given");
+        return -1;
+    };
+    // SAFETY: C strings or null by the caller's promise.
+    let who = unsafe { text(device_id) }.and_then(|id| Ok((id, unsafe { text(public_key) }?)));
+    match who {
+        Ok((None, None)) => host.host.admit(Admit::Nobody),
+        Ok((Some(id), Some(public_key))) => host.host.admit(Admit::Only { id, public_key }),
+        Ok(_) => {
+            // Half a device admits nobody, and says so.
+            host.host.admit(Admit::Nobody);
+            remember("a device is named by its id and its public key, both");
+            return -1;
+        }
         Err(err) => {
+            host.host.admit(Admit::Nobody);
             remember(err);
-            std::ptr::null_mut()
+            return -1;
         }
     }
+    0
+}
+
+/// # Safety
+/// `host` as below.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_admit_paired(host: *const IstessoMediaHost) -> i32 {
+    // SAFETY: the caller's promise.
+    let Some(host) = (unsafe { host.as_ref() }) else {
+        remember("no host was given");
+        return -1;
+    };
+    host.host.admit(Admit::Paired);
+    0
 }
 
 /// # Safety
@@ -379,6 +453,16 @@ pub unsafe extern "C" fn istesso_media_host_set_cursor(
 pub unsafe extern "C" fn istesso_media_host_key_frame_wanted(host: *const IstessoMediaHost) -> i32 {
     // SAFETY: the caller's promise.
     unsafe { host.as_ref() }.map_or(0, |host| i32::from(host.host.key_frame_wanted()))
+}
+
+/// # Safety
+/// `host` as above.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_offer(host: *const IstessoMediaHost, offered: i32) {
+    // SAFETY: the caller's promise.
+    if let Some(host) = unsafe { host.as_ref() } {
+        host.host.offer(offered != 0);
+    }
 }
 
 /// # Safety
@@ -877,6 +961,32 @@ mod tests {
             assert!(frame.first_ns >= before && frame.whole_ns >= frame.first_ns);
             // Nothing more for now.
             assert_eq!(istesso_media_client_next(client, 30, &mut frame), 0);
+
+            // Not offered for a moment: nobody watches, and the port takes no caller.
+            istesso_media_host_offer(host, 0);
+            assert_eq!(istesso_media_host_viewers(host), 0);
+            assert_eq!(istesso_media_client_next(client, 5000, &mut frame), -1);
+            istesso_media_client_close(client);
+            let refused = istesso_media_client_connect(
+                c(&dirs.device()).as_ptr(),
+                addr.as_ptr(),
+                name.as_ptr(),
+                1000,
+            );
+            assert!(refused.is_null());
+            istesso_media_host_offer(host, 1);
+            let client = istesso_media_client_connect(
+                c(&dirs.device()).as_ptr(),
+                addr.as_ptr(),
+                name.as_ptr(),
+                5000,
+            );
+            assert!(!client.is_null(), "{}", last_error());
+            let began = Instant::now();
+            while istesso_media_host_viewers(host) == 0 {
+                assert!(began.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
 
             istesso_media_client_ask_key_frame(client);
             assert_eq!(istesso_media_client_next(client, 30, &mut frame), 0);

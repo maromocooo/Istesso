@@ -55,6 +55,30 @@ every cursor the compositor reports:
 
 The unencrypted stream of --to never carries the cursor: there it stays in the picture.
 
+Whoever started this program can tell it things while it runs, one word a line on standard
+input, and is told things in lines of JSON on standard output, each with the key "istesso"
+(docs/adr/0015-media-transport.md, "止める、戻す、閉じる"):
+
+    pause     stop making the picture and give the encoder back: the element that holds the
+              NVENC session is closed and taken out of the pipeline. The compositor and the
+              application go on; viewers stay connected and are told that the picture stands
+              still. Answered with {"istesso":"paused","offered":true,"took_ms":T}
+    detach    the same, and with --to-channel every viewer is cut off and no caller is taken
+              until `resume`. Answered with {"istesso":"paused","offered":false,"took_ms":T}
+    admit ID PUBLIC_KEY, admit nobody
+              with --to-channel: the one paired device that is shown the picture from now on,
+              by its id and its public key, or nobody. Any other viewer is cut off at once and
+              any other caller refused. Answered with {"istesso":"admitted","device":ID} or
+              {"istesso":"admitted","device":null}. A pipeline started with --admit nobody
+              shows its picture to nobody before the first `admit`
+    resume    open an encoder again and go on; the first frame is a key frame. With
+              --to-channel the picture is offered again. Answered with {"istesso":"resumed",
+              "opened_ms":T,"encoded_ms":T,"written_ms":T,"key":1} once the first frame is out
+              (from reading the word to: the encoder being there, the first frame leaving it,
+              that frame handed on)
+
+The frame log gets a "picture" line for each, with the same times.
+
 Needs GStreamer with its Python bindings, the NVIDIA elements and gst-wayland-display
 (GST_PLUGIN_PATH); with --to-channel also the shared library built by
 `cargo build --release -p istesso-media`.
@@ -122,9 +146,17 @@ def open_channel(args, bind, width, height):
     media.istesso_media_host_close.argtypes = [ctypes.c_void_p]
     media.istesso_media_last_error.restype = ctypes.c_char_p
     media.istesso_media_last_error.argtypes = []
+    listen = media.istesso_media_host_listen
+    media.istesso_media_host_admit.restype = ctypes.c_int32
+    media.istesso_media_host_admit.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+    if args.admit == "nobody":
+        # The picture of a session: for nobody until its runner names a device.
+        listen = media.istesso_media_host_listen_closed
+        listen.restype = ctypes.c_void_p
+        listen.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(MediaStreamInfo)]
     # H.265 (1), with all of its colour or a quarter of it, said to be sRGB (1) or nothing said (0).
     info = MediaStreamInfo(1, width, height, args.fps, int(args.chroma), 1 if args.colour == "srgb" else 0)
-    host = media.istesso_media_host_listen(args.config_dir.encode() if args.config_dir else None, bind.encode(), ctypes.byref(info))
+    host = listen(args.config_dir.encode() if args.config_dir else None, bind.encode(), ctypes.byref(info))
     if not host:
         print(f"error: cannot listen for paired devices: {media.istesso_media_last_error().decode()}", file=sys.stderr)
         return media, None
@@ -196,6 +228,14 @@ def main():
         metavar="PATH",
         help="with --input: the socket to take the input on, for a pipeline that runs next to another one "
         "($XDG_RUNTIME_DIR/istesso/input.sock, where `istesso agent` hands input over, unless given)",
+    )
+    parser.add_argument(
+        "--admit",
+        choices=["paired", "nobody"],
+        default="paired",
+        help="with --to-channel: who is shown the picture at the start. paired: every paired device that may look and "
+        "connects, as a measuring pipeline wants it. nobody: the picture of a streaming session, which is for the one "
+        "device its runner names with `admit` on standard input",
     )
     parser.add_argument(
         "--cursor",
@@ -337,7 +377,20 @@ def main():
         log.write('{"kind":"encoded","pts":%d,"t_ns":%d,"bytes":%d,"key":%d}\n' % (buffer.pts, now, buffer.get_size(), key))
         if channel:
             encoded_at[buffer.pts] = now
+        if picture["state"] == "resuming":
+            picture["state"] = "running"
+            picture["first"] = {"pts": buffer.pts, "encoded_ns": now, "key": key}
+            if not channel:
+                first_frame_out(now)
         return Gst.PadProbeReturn.OK
+
+    def first_frame_out(written):
+        # The first frame after the picture was resumed has left: how long it all took.
+        first = picture.pop("first")
+        asked_at = picture["asked_ns"]
+        times = ((picture["opened_ns"] - asked_at) / 1e6, (first["encoded_ns"] - asked_at) / 1e6, (written - asked_at) / 1e6)
+        log.write('{"kind":"picture","t_ns":%d,"state":"resumed","opened_ms":%.3f,"encoded_ms":%.3f,"written_ms":%.3f,"key":%d}\n' % ((written,) + times + (first["key"],)))
+        say("resumed", opened_ms=round(times[0], 1), encoded_ms=round(times[1], 1), written_ms=round(times[2], 1), key=first["key"])
 
     sent = MediaSent()
 
@@ -364,6 +417,8 @@ def main():
             '{"kind":"sent","pts":%d,"t_ns":%d,"rtp":%d,"packets":%d,"written_ns":%d,"viewers":%d,"queued":%d,"bytes":%d}\n'
             % (buffer.pts, handed, sent.seq, sent.messages, written, sent.viewers, sent.queued, len(data))
         )
+        if "first" in picture and picture["first"]["pts"] == buffer.pts:
+            first_frame_out(written)
         return Gst.FlowReturn.OK
 
     def on_wanted():
@@ -392,11 +447,14 @@ def main():
         return Gst.PadProbeReturn.OK
 
     asked = {"at": 0, "count": 0}
+    # Whether the picture is being made: "running", on its way to "paused", or on its way back.
+    picture = {"state": "running", "offered": True, "again": False, "asked_ns": 0, "opened_ns": 0}
 
     def key_frame(by):
         now = time.monotonic_ns()
-        # One key frame answers every report of the same loss.
-        made = now - asked["at"] >= 50_000_000
+        # One key frame answers every report of the same loss. While the picture is stopped
+        # there is no encoder to ask; it begins with a key frame when it comes back.
+        made = now - asked["at"] >= 50_000_000 and picture["state"] == "running"
         if made:
             asked["at"] = now
             asked["count"] += 1
@@ -521,6 +579,141 @@ def main():
     def stop():
         loop.quit()
         return False
+
+    # ---- Stopping the picture and resuming it, without ending the application ----
+    #
+    # The encoder is the scarce thing: a graphics card opens only a few at once for the whole
+    # machine. A picture that nobody looks at gives its encoder back. The frames are stopped
+    # where they leave the compositor, the encoder element is closed and removed, and on the
+    # way back a new one is put in its place, which begins with a key frame.
+
+    encoder_words = next(part for part in description.split(" ! ") if part.startswith("nvcudah265enc")).split()
+    compositor_pad = compositor.get_static_pad("src")
+
+    def say(event, **fields):
+        print(json.dumps({"istesso": event, **fields}, separators=(",", ":")), flush=True)
+
+    def on_stopped(pad, info):
+        # On the compositor's thread, with a frame in hand. In the mode that renders when an
+        # application commits, the thread stays here with that one frame until the picture is
+        # resumed: nothing is rendered meanwhile, and the applications are told to draw on a beat
+        # of their own. On the fixed beat the applications are told to draw by the frames, so
+        # there the frames go on being made and are thrown away here.
+        if picture["state"] == "stopping":
+            picture["state"] = "stopped"
+            picture["held_pts"] = info.get_buffer().pts
+            GLib.idle_add(close_encoder)
+        if picture["state"] in ("resuming", "running"):
+            return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK if pacing == "on-commit" else Gst.PadProbeReturn.DROP
+
+    def close_encoder():
+        enc = pipeline.get_by_name("enc")
+        picture["before"] = enc.get_static_pad("sink").get_peer()
+        picture["after"] = enc.get_static_pad("src").get_peer()
+        # Closing the element closes its session with the card.
+        enc.set_locked_state(True)
+        enc.set_state(Gst.State.NULL)
+        pipeline.remove(enc)
+        now = time.monotonic_ns()
+        took = (now - picture["asked_ns"]) / 1e6
+        picture["state"] = "paused"
+        log.write('{"kind":"picture","t_ns":%d,"state":"paused","offered":%d,"took_ms":%.3f}\n' % (now, 1 if picture["offered"] else 0, took))
+        say("paused", offered=picture["offered"], took_ms=round(took, 1))
+        if picture["again"]:
+            picture["again"] = False
+            resume_picture()
+        return False
+
+    def stop_picture(offered):
+        if channel and not offered:
+            # Whoever watches is let go at once, and nobody comes in its place.
+            media.istesso_media_host_offer(host, 0)
+            picture["offered"] = False
+        if picture["state"] == "paused":
+            say("paused", offered=picture["offered"], took_ms=0.0)
+        if picture["state"] != "running":
+            return
+        picture["state"] = "stopping"
+        picture["asked_ns"] = time.monotonic_ns()
+        kind = Gst.PadProbeType.BUFFER | (Gst.PadProbeType.BLOCK if pacing == "on-commit" else 0)
+        picture["probe"] = compositor_pad.add_probe(kind, on_stopped)
+
+    def resume_picture():
+        if channel:
+            media.istesso_media_host_offer(host, 1)
+            picture["offered"] = True
+        if picture["state"] in ("stopping", "stopped"):
+            picture["again"] = True  # Asked while the encoder was still being closed.
+        if picture["state"] != "paused":
+            return
+        picture["asked_ns"] = time.monotonic_ns()
+        enc = Gst.ElementFactory.make("nvcudah265enc", "enc")
+        for word in encoder_words[1:]:
+            name, _, value = word.partition("=")
+            if name != "name":
+                Gst.util_set_object_arg(enc, name, value)
+        pipeline.add(enc)
+        picture["before"].link(enc.get_static_pad("sink"))
+        enc.get_static_pad("src").link(picture["after"])
+        enc.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, on_encoded)
+        enc.sync_state_with_parent()
+        picture["opened_ns"] = time.monotonic_ns()
+        picture["state"] = "resuming"
+        if pacing == "on-commit":
+            # The frame in the compositor's hand is from before the stop. A second watch on the
+            # same pad sees it once the first lets it go, and throws it away: the first frame
+            # after the stop is one the compositor makes now.
+            compositor_pad.add_probe(Gst.PadProbeType.BUFFER, on_held_frame)
+            compositor_pad.remove_probe(picture["probe"])
+
+    def on_held_frame(pad, info):
+        if info.get_buffer().pts == picture.get("held_pts"):
+            picture["held_pts"] = None
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.REMOVE
+
+    def admit(who):
+        # Which one device is shown the picture: `admit ID PUBLIC_KEY`, or `admit nobody`. A
+        # session is shown to one device at a time; its runner says which. Whoever else
+        # watches is cut off at once, and whoever else connects is refused.
+        if not channel:
+            return
+        if len(who) == 2:
+            failed = media.istesso_media_host_admit(host, who[0].encode(), who[1].encode()) != 0
+            say("admitted", device=None if failed else who[0])
+        else:
+            # `nobody`, or half a device, which is nobody as well.
+            media.istesso_media_host_admit(host, None, None)
+            say("admitted", device=None)
+
+    def on_control(fd, condition):
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not data:
+            return False  # Nobody is going to tell this program anything; it goes on as it is.
+        control["text"] += data.decode(errors="replace")
+        *lines, control["text"] = control["text"].split("\n")
+        for word in (line.strip() for line in lines):
+            if word == "pause":
+                stop_picture(True if picture["state"] == "running" else picture["offered"])
+            elif word == "detach":
+                stop_picture(False)
+            elif word == "resume":
+                resume_picture()
+            elif word.split()[:1] == ["admit"]:
+                admit(word.split()[1:])
+            elif word:
+                print(f"note: {word!r} is not something this program can be told", file=sys.stderr)
+        return True
+
+    control = {"text": ""}
+    os.set_blocking(sys.stdin.fileno(), False)
+    GLib.io_add_watch(sys.stdin.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN | GLib.IOCondition.HUP, on_control)
 
     GLib.timeout_add(1000, every_second)
     if args.input:

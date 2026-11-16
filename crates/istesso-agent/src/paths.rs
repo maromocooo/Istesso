@@ -3,9 +3,13 @@
 //! * the configuration directory holds what must not be lost: the device
 //!   identity and the list of paired devices;
 //! * the cache directory holds what can be rebuilt: the last known state of
-//!   the other devices.
+//!   the other devices;
+//! * the runtime directory holds what only means something while a program
+//!   runs: sockets.
 
 use std::path::PathBuf;
+
+use istesso_proto::SessionId;
 
 /// Directory name used below the platform's standard locations.
 const APP_DIR: &str = "istesso";
@@ -14,6 +18,8 @@ const APP_DIR: &str = "istesso";
 pub struct Paths {
     pub config: PathBuf,
     pub cache: PathBuf,
+    /// Only the user can reach it, and it is emptied when they log out.
+    pub runtime: PathBuf,
 }
 
 /// The settings that decide the locations.
@@ -23,8 +29,11 @@ pub struct Environment {
     pub config_override: Option<PathBuf>,
     /// `ISTESSO_CACHE_DIR`
     pub cache_override: Option<PathBuf>,
+    /// `ISTESSO_RUNTIME_DIR`
+    pub runtime_override: Option<PathBuf>,
     pub xdg_config_home: Option<PathBuf>,
     pub xdg_cache_home: Option<PathBuf>,
+    pub xdg_runtime_dir: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub macos: bool,
 }
@@ -39,8 +48,10 @@ impl Environment {
         Environment {
             config_override: var("ISTESSO_CONFIG_DIR"),
             cache_override: var("ISTESSO_CACHE_DIR"),
+            runtime_override: var("ISTESSO_RUNTIME_DIR"),
             xdg_config_home: var("XDG_CONFIG_HOME"),
             xdg_cache_home: var("XDG_CACHE_HOME"),
+            xdg_runtime_dir: var("XDG_RUNTIME_DIR"),
             home: var("HOME"),
             macos: cfg!(target_os = "macos"),
         }
@@ -76,14 +87,37 @@ impl Paths {
                 .unwrap_or_else(|| home.join(".cache"))
                 .join(APP_DIR),
         };
-        Paths { config, cache }
+        let runtime = match (
+            &env.runtime_override,
+            &env.config_override,
+            &env.xdg_runtime_dir,
+        ) {
+            // A second agent of the same user needs sockets of its own.
+            (Some(dir), _, _) => dir.clone(),
+            // Everything in one place, as for the cache.
+            (None, Some(config), _) => config.join("run"),
+            (None, None, Some(dir)) => dir.join(APP_DIR),
+            // No such directory on this system (macOS): next to the cache,
+            // which is the user's alone as well.
+            (None, None, None) => cache.join("run"),
+        };
+        Paths {
+            config,
+            cache,
+            runtime,
+        }
     }
 
     /// Everything below one directory.
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         let config = dir.into();
         let cache = config.join("cache");
-        Paths { config, cache }
+        let runtime = config.join("run");
+        Paths {
+            config,
+            cache,
+            runtime,
+        }
     }
 
     pub fn identity(&self) -> PathBuf {
@@ -120,6 +154,36 @@ impl Paths {
     pub fn local_manifest(&self) -> PathBuf {
         self.cache.join("local-manifest.json")
     }
+
+    /// Where the runner of one streaming session takes the keyboard and
+    /// pointer input of the device that is shown the session: a datagram
+    /// socket the runner creates (ADR 0010). The agent only passes ids it
+    /// made up itself; the name is built from nothing else.
+    pub fn session_input_socket(&self, session: &SessionId) -> PathBuf {
+        self.runtime.join(format!("input-{session}.sock"))
+    }
+
+    /// Where the agent answers the person at this machine: a socket that
+    /// only this user can reach, because the directory it is in is theirs
+    /// alone (ADR 0010).
+    pub fn agent_socket(&self) -> PathBuf {
+        self.runtime.join("agent.sock")
+    }
+
+    /// The places where that socket can be, in the order they are tried.
+    ///
+    /// The second is next to the cache. An agent that was started where
+    /// there is no runtime directory listens there: at boot, before anyone
+    /// logged in. The person who asks later, from a login that has one,
+    /// would look in the wrong place otherwise.
+    pub fn agent_sockets(&self) -> Vec<PathBuf> {
+        let mut all = vec![self.agent_socket()];
+        let beside_cache = self.cache.join("run").join("agent.sock");
+        if !all.contains(&beside_cache) {
+            all.push(beside_cache);
+        }
+        all
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +210,72 @@ mod tests {
         });
         assert_eq!(paths.config, PathBuf::from("/xdg/config/istesso"));
         assert_eq!(paths.cache, PathBuf::from("/xdg/cache/istesso"));
+    }
+
+    #[test]
+    fn sockets_go_where_only_the_user_can_reach() {
+        // The runtime directory of the login session, where there is one.
+        let paths = Paths::resolve(&Environment {
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(paths.runtime, PathBuf::from("/run/user/1000/istesso"));
+        assert_eq!(
+            paths.session_input_socket(&SessionId("5b0c9e3a7f21d684".into())),
+            PathBuf::from("/run/user/1000/istesso/input-5b0c9e3a7f21d684.sock")
+        );
+        // Next to the cache where there is none.
+        let paths = Paths::resolve(&Environment {
+            macos: true,
+            ..env()
+        });
+        assert_eq!(
+            paths.runtime,
+            PathBuf::from("/home/u/Library/Caches/istesso/run")
+        );
+        // Someone who moved the configuration gets everything in one place.
+        let paths = Paths::resolve(&Environment {
+            config_override: Some(PathBuf::from("/custom")),
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(paths.runtime, PathBuf::from("/custom/run"));
+        assert_eq!(paths, Paths::at("/custom"));
+        assert_eq!(
+            paths.agent_socket(),
+            PathBuf::from("/custom/run/agent.sock")
+        );
+        // A second agent of the same user is given a place of its own.
+        let paths = Paths::resolve(&Environment {
+            runtime_override: Some(PathBuf::from("/second/run")),
+            config_override: Some(PathBuf::from("/custom")),
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(paths.runtime, PathBuf::from("/second/run"));
+        assert_eq!(paths.config, PathBuf::from("/custom"));
+    }
+
+    #[test]
+    fn the_agent_is_also_looked_for_next_to_the_cache() {
+        // Started at boot there is no runtime directory; asked from a
+        // login there is. Both look next to the cache as well.
+        let at_boot = Paths::resolve(&env());
+        let from_a_login = Paths::resolve(&Environment {
+            xdg_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..env()
+        });
+        assert_eq!(
+            at_boot.agent_sockets(),
+            [PathBuf::from("/home/u/.cache/istesso/run/agent.sock")]
+        );
+        assert_eq!(
+            from_a_login.agent_sockets(),
+            [
+                PathBuf::from("/run/user/1000/istesso/agent.sock"),
+                PathBuf::from("/home/u/.cache/istesso/run/agent.sock"),
+            ]
+        );
     }
 
     #[test]

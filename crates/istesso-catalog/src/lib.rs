@@ -5,6 +5,7 @@
 //! single icon no matter where the app lives. Apps whose hosts are all
 //! stopped stay in the catalogue with a badge instead of disappearing.
 
+pub mod launch;
 pub mod linux;
 pub mod macos;
 
