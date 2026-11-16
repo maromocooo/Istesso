@@ -18,6 +18,9 @@
 | snow | 制御チャンネルの Noise プロトコル（ADR 0007）。使う部品だけを有効にしている | Apache-2.0 OR MIT | <https://github.com/mcginty/snow> |
 | mdns-sd | LAN 内の発見（mDNS / DNS-SD） | Apache-2.0 OR MIT | <https://github.com/keepsimple1/mdns-sd> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
+| rubato、audioadapter-buffers | 音の時計のずれ補正（動かしながら比を変えられるリサンプラー）。sinc 補間だけを使う | MIT OR Apache-2.0 | <https://github.com/HEnquist/rubato> |
+| rtrb | 音のスレッドとの受け渡し（待たないリングバッファー） | MIT OR Apache-2.0 | <https://github.com/mgeier/rtrb> |
+| coreaudio-rs、objc2-core-audio | Mac の音の出力（Core Audio）。macOS でだけコンパイルされる | MIT OR Apache-2.0、Zlib OR Apache-2.0 OR MIT | <https://github.com/RustAudio/coreaudio-rs>、<https://github.com/madsmtm/objc2> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。導入を軽くするため、コンポジターと仮想入力、配信プラグインだけを取り込みます。
 
@@ -72,3 +75,5 @@ cargo deny check
 ```
 
 2026-11-15 時点の依存 99 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、Unicode-3.0 のいずれかで利用できます（cargo-deny 0.20.2 でライセンス・禁止項目・取得元・既知の脆弱性を検査済み）。
+
+音（`istesso-audio`）のために足した依存を含めると、`m2-audio` ブランチでは 128 クレートです（2026-11-16、同じ版の cargo-deny で、同じ 4 項目を検査済み）。足した分は、MIT、Apache-2.0、Zlib のいずれかで利用できます。Roc Toolkit は、[ADR 0011](adr/0011-audio-transport.md) の提案が採用されれば、使いません。
