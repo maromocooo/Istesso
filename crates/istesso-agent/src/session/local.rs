@@ -468,6 +468,7 @@ mod tests {
                 answer: None,
                 end: None,
                 left_by: None,
+                shown_on: None,
             },
             app_name: "Editor".to_string(),
             started_by: StartedBy {

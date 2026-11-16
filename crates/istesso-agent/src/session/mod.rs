@@ -62,7 +62,7 @@ pub use process::{app_environment, CommandRunner, DesktopLauncher};
 pub mod policy {
     use std::time::Duration;
 
-    use istesso_pair::{Peer, Permission};
+    use istesso_pair::Permission;
 
     /// What a device needs to start an application on this host, and to be
     /// shown one: to look and to control. A newly paired device has both.
@@ -74,34 +74,30 @@ pub mod policy {
     /// it closes its window.
     pub const CLIENT_LOST_AFTER: Duration = Duration::from_secs(15);
 
-    /// How many sessions one device may have on a host at the same time,
-    /// of the eight a host takes. Fewer than all of them, so that a device
-    /// cannot hold every place: with six, two are always left for another
-    /// device. Sessions nobody is shown count, and so do the sessions of a
-    /// device that was unpaired, until somebody ends them.
-    pub const SESSIONS_PER_DEVICE: usize = 6;
+    /// How many sessions a host keeps open at the same time, shown to
+    /// someone or not, unless it is set otherwise (`istesso agent
+    /// --max-sessions`). This is not what limits everyday use: a person
+    /// opens more than a handful of applications of one machine as a
+    /// matter of course. It is a safety value against a script or a fault
+    /// that starts applications without end. Every session is a runner
+    /// with a display of its own and an application; sixty-four of them
+    /// is several times what a person keeps open and still far from what
+    /// brings a host down. What really runs out is the number of pictures
+    /// a host can compress at once, which is counted separately (ADR 0010,
+    /// section 15).
+    pub const OPEN_SESSIONS: usize = 64;
 
-    /// Whether `peer` may see, attach to and stop a session that the device
-    /// with this id and key started. `rights` is what the list of paired
-    /// devices gives `peer` at the moment it asks.
+    /// Whether a device may see, attach to and stop a session of this
+    /// host. `rights` is what the list of paired devices gives the device
+    /// at the moment it asks.
     ///
-    /// Nobody may without what starting takes. With it, the device that
-    /// started the session may. Once that device was unpaired (`left`),
-    /// every device that has the rights may: the application was kept so
-    /// that the work in it is not lost, and somebody has to be able to
-    /// get back to it. That widening is the person's decision of
-    /// 2026-11-16; it never reaches a device that lacks a right. Whether
-    /// every paired device may use every session is still open (ADR 0010,
-    /// "決めてほしいこと").
-    pub fn may_use(
-        owner_id: &str,
-        owner_key: &str,
-        left: bool,
-        peer: &Peer,
-        rights: &[Permission],
-    ) -> bool {
-        let has_the_rights = START_NEEDS.iter().all(|need| rights.contains(need));
-        has_the_rights && (left || (owner_id == peer.id && owner_key == peer.public_key))
+    /// Every device that has what starting takes may, whichever device
+    /// started the session: an application that was opened at home is
+    /// carried on from a device elsewhere (the person's decision of
+    /// 2026-11-16). Nobody may without the rights. One device is shown a
+    /// session at a time.
+    pub fn may_use(rights: &[Permission]) -> bool {
+        START_NEEDS.iter().all(|need| rights.contains(need))
     }
 }
 
@@ -129,10 +125,9 @@ pub struct Rules {
     /// The longest an answer to `session_wait` is held back. Shorter than
     /// the agent waits for a caller's next message.
     pub wait_at_most: Duration,
-    /// Sessions that may run at the same time, shown to someone or not.
+    /// Sessions that may be open at the same time, shown to someone or
+    /// not. See [`policy::OPEN_SESSIONS`].
     pub max_sessions: usize,
-    /// See [`policy::SESSIONS_PER_DEVICE`].
-    pub max_sessions_per_device: usize,
     /// How often a session is looked after.
     pub tick: Duration,
     /// How often the list of paired devices is read again for a session.
@@ -149,8 +144,7 @@ impl Default for Rules {
             runner_stop_grace: Duration::from_secs(2),
             remember_ended_for: Duration::from_secs(60),
             wait_at_most: Duration::from_secs(3),
-            max_sessions: 8,
-            max_sessions_per_device: policy::SESSIONS_PER_DEVICE,
+            max_sessions: policy::OPEN_SESSIONS,
             tick: Duration::from_millis(100),
             recheck_rights_every: Duration::from_secs(1),
         }
@@ -675,6 +669,7 @@ impl Sessions {
             answer: None,
             end: None,
             left_by: None,
+            shown_on: None,
         };
         {
             let mut table = inner.lock();
@@ -1006,19 +1001,7 @@ impl Sessions {
 
 impl Entry {
     fn is_for(&self, caller: Caller<'_>) -> bool {
-        policy::may_use(
-            &self.owner.id,
-            &self.owner.public_key,
-            self.info.left_by.is_some(),
-            caller.peer,
-            caller.rights,
-        )
-    }
-
-    /// Whether `peer` is the device that started it, whoever else may use
-    /// it.
-    fn started_by(&self, peer: &Peer) -> bool {
-        self.owner.id == peer.id && self.owner.public_key == peer.public_key
+        policy::may_use(caller.rights)
     }
 
     /// What the person at the host is told about it.
@@ -1058,17 +1041,19 @@ impl Table {
         self.get(session, Asker::Device(caller))
     }
 
-    /// Why `peer` cannot start one more session, when it cannot: it has as
-    /// many as one device may, or the host has as many as it takes. Nothing
-    /// is ended to make room. The device is told which of the sessions it
-    /// may use nobody is shown, so that a person can decide.
+    /// Why one more session cannot be started, when it cannot: the host
+    /// keeps as many open as it is set to. Nothing is ended to make room.
+    /// The device is told which sessions nobody is shown, so that a person
+    /// can decide.
     fn full_for(&self, caller: Caller<'_>, rules: &Rules) -> Option<String> {
         let live: Vec<&Entry> = self
             .sessions
             .values()
             .filter(|e| e.ended_at.is_none())
             .collect();
-        let own = live.iter().filter(|e| e.started_by(caller.peer)).count();
+        if live.len() < rules.max_sessions {
+            return None;
+        }
         let mut idle: Vec<&&Entry> = live
             .iter()
             .filter(|e| e.info.state == SessionState::Detached && e.is_for(caller))
@@ -1081,40 +1066,15 @@ impl Table {
                 None => format!("{} ({})", e.app_name, e.info.id),
             })
             .collect();
-
-        if own >= rules.max_sessions_per_device {
-            let hint = if idle.is_empty() {
-                String::new()
-            } else {
-                format!("; nobody is shown: {}", idle.join(", "))
-            };
-            return Some(format!(
-                "this device already has {own} sessions on this host, as many as one device \
-                 may have{hint}"
-            ));
+        let mut why = format!(
+            "this host already keeps {} sessions open, as many as it is set to \
+             (`istesso agent --max-sessions`)",
+            live.len()
+        );
+        if !idle.is_empty() {
+            why.push_str(&format!("; nobody is shown: {}", idle.join(", ")));
         }
-        if live.len() >= rules.max_sessions {
-            let mut why = format!(
-                "this host already runs {} sessions, as many as it takes",
-                live.len()
-            );
-            if !idle.is_empty() {
-                why.push_str(&format!("; nobody is shown: {}", idle.join(", ")));
-            }
-            // Places that only the person at the host can free.
-            let closed = live
-                .iter()
-                .filter(|e| e.revoked && e.info.left_by.is_none())
-                .count();
-            if closed > 0 {
-                why.push_str(&format!(
-                    "; {closed} were started by devices that may not use them now: \
-                     `istesso sessions --local` on the host lists them"
-                ));
-            }
-            return Some(why);
-        }
-        None
+        Some(why)
     }
 }
 
@@ -1175,6 +1135,7 @@ impl Inner {
         self.update(id, |entry| {
             entry.info.state = SessionState::Detached;
             entry.info.answer = None;
+            entry.info.shown_on = None;
         });
         (self.log)(format!("session {id}: nobody is shown it now ({why})"));
     }
@@ -1417,6 +1378,7 @@ impl Inner {
                 entry.info.state = SessionState::Running;
                 entry.info.display = Some(display);
                 entry.info.answer = Some(answer);
+                entry.info.shown_on = Some(entry.viewer.name.clone());
                 entry.seen = Instant::now();
             });
             (self.log)(format!("session {id}: {} is running", job.app_name));
@@ -1466,6 +1428,7 @@ impl Inner {
                             entry.info.attachment += 1;
                             entry.info.display = Some(display);
                             entry.info.answer = Some(answer);
+                            entry.info.shown_on = Some(device.name.clone());
                             entry.viewer = device;
                             entry.seen = Instant::now();
                             entry.attached.push((number, Ok(())));
@@ -1545,6 +1508,7 @@ impl Inner {
         self.update(id, |entry| {
             entry.info.state = SessionState::Stopping;
             entry.info.answer = None;
+            entry.info.shown_on = None;
             entry.info.end = Some(end.clone());
         });
         // The application first: it can end while its display is still

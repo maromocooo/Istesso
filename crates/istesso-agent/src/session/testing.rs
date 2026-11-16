@@ -58,7 +58,6 @@ pub fn quick_rules() -> Rules {
         remember_ended_for: Duration::from_secs(60),
         wait_at_most: Duration::from_millis(500),
         max_sessions: 8,
-        max_sessions_per_device: 6,
         tick: Duration::from_millis(10),
         recheck_rights_every: Duration::from_millis(50),
     }

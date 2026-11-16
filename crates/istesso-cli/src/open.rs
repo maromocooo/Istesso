@@ -462,7 +462,15 @@ fn conclude(outcome: Outcome, name: &str, host: &str) -> Result<String, String> 
             ok: false,
             how,
         } => Err(format!("the viewer ended ({how}). {}", stays(&session))),
-        Outcome::TakenOver(_) => Ok(format!("{name} is shown in another window now.")),
+        Outcome::TakenOver {
+            by: Some(device), ..
+        } => Ok(format!(
+            "{name} moved to another window: it is shown on {device} now. One device is shown \
+             it at a time."
+        )),
+        Outcome::TakenOver { by: None, .. } => Ok(format!(
+            "{name} moved to another window, on this or another device."
+        )),
         Outcome::Detached(session) => Err(format!(
             "{host} stopped showing {name} to this device: it had not heard from it for too \
              long, or no longer allows it. {}",
@@ -608,6 +616,7 @@ mod tests {
                 answer: None,
                 end: None,
                 left_by: None,
+                shown_on: None,
             },
         }
     }
@@ -801,7 +810,12 @@ mod tests {
             dropped.contains("stopped showing") && dropped.contains("keeps running"),
             "{dropped}"
         );
-        assert!(conclude(Outcome::TakenOver(id()), "Blender", "ubuntu").is_ok());
+        let moved = Outcome::TakenOver {
+            session: id(),
+            by: Some("tablet".to_string()),
+        };
+        let moved = conclude(moved, "Blender", "ubuntu").unwrap();
+        assert!(moved.contains("is shown on tablet now"), "{moved}");
         let lost = Outcome::HostLost {
             session: id(),
             why: "no answer".into(),

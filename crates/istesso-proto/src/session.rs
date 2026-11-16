@@ -138,6 +138,11 @@ pub struct SessionInfo {
     /// host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_by: Option<String>,
+    /// The name of the device that is shown the session. Set while
+    /// `running`. One device is shown a session at a time; a client that
+    /// finds another name here has been replaced by that device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_on: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +399,7 @@ mod tests {
             answer: None,
             end: None,
             left_by: None,
+            shown_on: None,
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
@@ -428,9 +434,10 @@ mod tests {
         // it. Other sessions do not carry the field.
         assert!(!text.contains("left_by"), "{text}");
         info.left_by = Some("old laptop".to_string());
+        info.shown_on = Some("tablet".to_string());
         let text = serde_json::to_string(&info).unwrap();
         assert!(
-            text.ends_with(r#""message":""},"left_by":"old laptop"}"#),
+            text.ends_with(r#""message":""},"left_by":"old laptop","shown_on":"tablet"}"#),
             "{text}"
         );
         assert_eq!(serde_json::from_str::<SessionInfo>(&text).unwrap(), info);

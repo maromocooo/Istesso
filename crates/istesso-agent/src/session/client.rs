@@ -307,7 +307,11 @@ pub enum Outcome {
     /// application runs on.
     Detached(SessionId),
     /// Another window is shown the session now.
-    TakenOver(SessionId),
+    TakenOver {
+        session: SessionId,
+        /// The device that is shown the session now, as the host calls it.
+        by: Option<String>,
+    },
     /// The host stopped answering, or no longer knows the session.
     HostLost { session: SessionId, why: String },
 }
@@ -427,7 +431,12 @@ pub fn open_window(
                     }));
                 }
                 // A newer window has it. This one has nothing to leave.
-                _ if info.attachment != mine => break Outcome::TakenOver(session.clone()),
+                _ if info.attachment != mine => {
+                    break Outcome::TakenOver {
+                        session: session.clone(),
+                        by: info.shown_on.clone(),
+                    }
+                }
                 SessionState::Running if !shown => {
                     shown = true;
                     if let Err(why) = window.viewer.tell(&show(&info)) {

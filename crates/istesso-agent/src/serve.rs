@@ -158,18 +158,16 @@ impl Agent {
     /// session runner of ADR 0010). With it, paired devices that may look
     /// and control can start this machine's applications and be shown
     /// them; without it, they are told that this host cannot.
-    pub fn with_session_runner(self, program: impl Into<std::path::PathBuf>) -> Self {
-        use crate::session::{CommandRunner, DesktopLauncher, Rules};
+    pub fn with_session_runner(
+        self,
+        program: impl Into<std::path::PathBuf>,
+        rules: crate::session::Rules,
+    ) -> Self {
+        use crate::session::{CommandRunner, DesktopLauncher};
         let (paths, log) = (self.shared.paths.clone(), self.shared.log.clone());
         let runner = Arc::new(CommandRunner::new(program, log.clone()));
         let launcher = Arc::new(DesktopLauncher);
-        self.replace_sessions(Sessions::with(
-            paths,
-            log,
-            Some(runner),
-            launcher,
-            Rules::default(),
-        ))
+        self.replace_sessions(Sessions::with(paths, log, Some(runner), launcher, rules))
     }
 
     fn replace_sessions(mut self, sessions: Sessions) -> Self {

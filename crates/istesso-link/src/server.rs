@@ -361,6 +361,7 @@ mod tests {
                             answer: None,
                             end,
                             left_by: None,
+                            shown_on: None,
                         }),
                     };
                     let response = match &request {

@@ -81,10 +81,13 @@ pub fn state_words(state: SessionState) -> &'static str {
 /// A session's state, and whose it was when the device that opened it has
 /// been unpaired since.
 pub fn words(info: &SessionInfo) -> String {
-    let state = state_words(info.state);
+    let state = match (&info.shown_on, info.state) {
+        (Some(device), SessionState::Running) => format!("shown in a window on {device}"),
+        _ => state_words(info.state).to_string(),
+    };
     match &info.left_by {
         Some(device) => format!("{state}; opened by {device}, which was unpaired"),
-        None => state.to_string(),
+        None => state,
     }
 }
 
@@ -467,6 +470,7 @@ mod tests {
                 answer: None,
                 end: None,
                 left_by: None,
+                shown_on: None,
             },
         }
     }
@@ -513,6 +517,15 @@ mod tests {
 
     #[test]
     fn the_table_lines_up_and_says_what_is_shown() {
+        // Where a session is shown is said when the host says it: one
+        // device at a time is shown a session.
+        let mut shown = some().remove(1).info;
+        assert_eq!(words(&shown), "shown in a window");
+        shown.shown_on = Some("tablet".to_string());
+        assert_eq!(words(&shown), "shown in a window on tablet");
+        shown.state = SessionState::Detached;
+        assert_eq!(words(&shown), "running, not shown");
+
         let text = render(&some());
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4, "{text}");

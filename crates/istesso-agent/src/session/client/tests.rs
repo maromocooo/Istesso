@@ -458,7 +458,14 @@ fn a_second_window_takes_the_session_and_the_first_one_closes() {
     let other = Arc::new(FakeViewer::new(&pair.journal));
     let second = pair.open_with(other, Some(id.clone()), Arc::default(), 2);
     let (outcome, _) = first.join().unwrap();
-    assert_eq!(outcome, Ok(Outcome::TakenOver(id.clone())));
+    // It is told where the session went: here, to the same device.
+    assert_eq!(
+        outcome,
+        Ok(Outcome::TakenOver {
+            session: id.clone(),
+            by: Some("laptop".to_string())
+        })
+    );
     // The first window had nothing to leave: the session is shown, to the
     // second one.
     std::thread::sleep(Duration::from_millis(200));
@@ -696,6 +703,7 @@ fn a_host_that_goes_away_closes_the_window() {
                 answer: None,
                 end: None,
                 left_by: None,
+                shown_on: None,
             }),
         };
         for answer in [

@@ -73,6 +73,11 @@ enum Command {
         /// machine does not show its applications to other devices
         #[arg(long, value_name = "PROGRAM")]
         session_runner: Option<PathBuf>,
+        /// How many applications this machine keeps open for other devices
+        /// at the same time, shown or not (default: $ISTESSO_MAX_SESSIONS,
+        /// else 64). A safety value; one more is refused with the reason
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..=1024))]
+        max_sessions: Option<u32>,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -303,6 +308,7 @@ fn run(cli: Cli) -> Result<(), String> {
             no_discovery,
             verbose,
             session_runner,
+            max_sessions,
         } => run_agent(
             AgentOptions {
                 bind,
@@ -312,6 +318,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 ..AgentOptions::default()
             },
             session_runner,
+            max_sessions,
         ),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
         Command::Id => {
@@ -893,7 +900,34 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
 // agent / hosts
 // ---------------------------------------------------------------------------
 
-fn run_agent(options: AgentOptions, session_runner: Option<PathBuf>) -> Result<(), String> {
+/// How many sessions the agent keeps open: what was asked for, else what
+/// the environment says, else the default.
+fn session_limit(asked: Option<u32>, from_env: Option<&str>) -> Result<usize, String> {
+    let default = istesso_agent::session::policy::OPEN_SESSIONS;
+    match (
+        asked,
+        from_env.map(str::trim).filter(|text| !text.is_empty()),
+    ) {
+        (Some(count), _) => Ok(count as usize),
+        (None, None) => Ok(default),
+        (None, Some(text)) => match text.parse::<usize>() {
+            Ok(count) if (1..=1024).contains(&count) => Ok(count),
+            _ => Err(format!(
+                "ISTESSO_MAX_SESSIONS is '{text}'; it has to be a number from 1 to 1024"
+            )),
+        },
+    }
+}
+
+fn run_agent(
+    options: AgentOptions,
+    session_runner: Option<PathBuf>,
+    max_sessions: Option<u32>,
+) -> Result<(), String> {
+    let max_sessions = session_limit(
+        max_sessions,
+        std::env::var("ISTESSO_MAX_SESSIONS").ok().as_deref(),
+    )?;
     let paths = Paths::from_env();
     // Everything that takes time happens before the port is opened: from
     // that moment on callers expect a prompt reaction.
@@ -910,7 +944,13 @@ fn run_agent(options: AgentOptions, session_runner: Option<PathBuf>) -> Result<(
             .map(PathBuf::from)
     });
     let agent = match &session_runner {
-        Some(program) => agent.with_session_runner(program),
+        Some(program) => agent.with_session_runner(
+            program,
+            istesso_agent::session::Rules {
+                max_sessions,
+                ..Default::default()
+            },
+        ),
         None => agent,
     };
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
@@ -1100,6 +1140,23 @@ fn render_hosts(views: &[HostView], now: u64) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn the_number_of_open_sessions_is_a_setting() {
+        // Nothing said: the safety value.
+        assert_eq!(session_limit(None, None), Ok(64));
+        assert_eq!(session_limit(None, Some("  ")), Ok(64));
+        // The environment, and the command line before it.
+        assert_eq!(session_limit(None, Some("12")), Ok(12));
+        assert_eq!(session_limit(Some(200), Some("12")), Ok(200));
+        // A setting that is not a number is said, not ignored.
+        for wrong in ["many", "0", "-3", "5000"] {
+            let why = session_limit(None, Some(wrong)).unwrap_err();
+            assert!(why.contains("ISTESSO_MAX_SESSIONS"), "{why}");
+        }
+        let parsed = Cli::try_parse_from(["istesso", "agent", "--max-sessions", "0"]);
+        assert!(parsed.is_err());
+    }
 
     #[test]
     fn cli_definition_is_consistent() {
