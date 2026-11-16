@@ -73,8 +73,32 @@
 // network itself. Keys are named by their place on the keyboard, in Linux's numbers. The
 // pointer's place is given in pixels of the picture.
 //
+// The encrypted channel. With ISTESSO_CHANNEL=ADDRESS:PORT in the environment the frames do not
+// come from GStreamer at all: this program connects to the paired device that listens there
+// (scripts/m1-step3-host.py --to-channel), with this device's identity and list of paired devices,
+// through the library istesso-media, and is handed whole encoded frames over the control
+// channel's kind of channel (docs/adr/0015-media-transport.md). They go to VideoToolbox as
+// above. PIPELINE is then not used ("-" will do), and neither is KEY_REQUEST_PORT: key frames
+// are asked for over the same connection, and only when a frame could not be decoded, because
+// frames do not get lost on that way. When the connection ends, the program connects again.
+//   ISTESSO_CHANNEL_PEER       optional: the name or id of the paired device that has to answer
+//   ISTESSO_RECEIVE_REALTIME   set: the thread that receives and decodes is scheduled the way the
+//                              threads of the sound system are (off unless set, so that what it
+//                              changes can be measured)
+// The frame log keeps its lines, and two of them mean something a little different:
+//   {"kind":"arrived","rtp":S,"first_ns":T,"last_ns":T,"packets":N,"bytes":N,"key":K,"host_encoded_ns":E}
+//                              S is the frame's sequence number, not an RTP timestamp; first_ns
+//                              is when the frame's first bytes were there to be read, last_ns
+//                              when the whole frame had been read and decrypted; N packets are
+//                              the messages of the encrypted channel it came in; E is when the
+//                              host's encoder had finished it, on the HOST's clock
+//   {"kind":"key_request","t_ns":T,"sent":1}   asked for over the connection
+//   {"kind":"stream","t_ns":T,"event":"connected"|"ended"|"unreachable"}   the connection's life
+// Both ways write {"kind":"to_decoder","pts":P,"t_ns":T} when an access unit is handed to
+// VideoToolbox.
+//
 // Only for measurements and first trials: the own client of step 4 replaces it. GStreamer is
-// linked dynamically.
+// linked dynamically, istesso-media statically.
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
@@ -90,7 +114,9 @@
 #include <gst/net/gstnetaddressmeta.h>
 #include <gst/video/video.h>
 #include <gst/video/videooverlay.h>
+#include <pthread.h>
 #include <time.h>
+#include "istesso_media.h"
 
 static FILE *frame_log = NULL;
 
@@ -388,6 +414,8 @@ static void on_picture(void *context, void *frame, OSStatus status, VTDecodeInfo
 // given in these.
 static int picture_width = 0, picture_height = 0;
 
+static gboolean vt_start_session(gboolean all_colour, const char *stream_colours);
+
 static gboolean vt_configure(GstCaps *caps) {
     if (vt_session != NULL) {
         VTDecompressionSessionInvalidate(vt_session);
@@ -425,21 +453,26 @@ static gboolean vt_configure(GstCaps *caps) {
         fprintf(stderr, "error: VideoToolbox does not take the stream's parameter sets (%d)\n", (int)status);
         return FALSE;
     }
-    NSDictionary *decoder = @{(__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @YES};
-    // Pictures the window system can show as they are, on a surface it shares with the decoder,
-    // with as much colour as the stream has: asked for 4:2:0, a 4:4:4 stream would lose it here.
     const char *colours = gst_structure_get_string(stream, "colorimetry");
     GstVideoColorimetry described;
     vt_srgb = colours != NULL && gst_video_colorimetry_from_string(&described, colours) && described.transfer == GST_VIDEO_TRANSFER_SRGB;
     const char *chroma = gst_structure_get_string(stream, "chroma-format");
-    gboolean all_colour = chroma != NULL && strcmp(chroma, "4:4:4") == 0;
+    return vt_start_session(chroma != NULL && strcmp(chroma, "4:4:4") == 0, colours);
+}
+
+// Starts VideoToolbox for the stream that `vt_format` describes. `stream_colours` is what the
+// stream says about its colours, for the log.
+static gboolean vt_start_session(gboolean all_colour, const char *stream_colours) {
+    NSDictionary *decoder = @{(__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @YES};
+    // Pictures the window system can show as they are, on a surface it shares with the decoder,
+    // with as much colour as the stream has: asked for 4:2:0, a 4:4:4 stream would lose it here.
     NSDictionary *pictures = @{
         (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey :
             @(all_colour ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{}
     };
     VTDecompressionOutputCallbackRecord callback = {on_picture, NULL};
-    status = VTDecompressionSessionCreate(kCFAllocatorDefault, vt_format, (__bridge CFDictionaryRef)decoder,
+    OSStatus status = VTDecompressionSessionCreate(kCFAllocatorDefault, vt_format, (__bridge CFDictionaryRef)decoder,
                                           (__bridge CFDictionaryRef)pictures, &callback, &vt_session);
     if (status != noErr) {
         fprintf(stderr, "error: VideoToolbox cannot decode this stream (%d)\n", (int)status);
@@ -456,9 +489,8 @@ static gboolean vt_configure(GstCaps *caps) {
         fprintf(stderr, "note: VideoToolbox decodes this stream in software\n");
     }
     if (frame_log != NULL) {
-        const char *colorimetry = gst_structure_get_string(stream, "colorimetry");
         fprintf(frame_log, "{\"kind\":\"decoder\",\"hardware\":%d,\"pictures\":\"%s\",\"stream_colours\":\"%s\"}\n",
-                in_hardware ? 1 : 0, all_colour ? "444v" : "420v", colorimetry != NULL ? colorimetry : "-");
+                in_hardware ? 1 : 0, all_colour ? "444v" : "420v", stream_colours != NULL ? stream_colours : "-");
     }
     return TRUE;
 }
@@ -500,6 +532,10 @@ static GstFlowReturn on_access_unit(GstAppSink *sink, gpointer user_data) {
     }
     gst_buffer_unmap(buffer, &unit);
     if (status == noErr) {
+        if (frame_log != NULL) {
+            fprintf(frame_log, "{\"kind\":\"to_decoder\",\"pts\":%llu,\"t_ns\":%llu}\n",
+                    (unsigned long long)GST_BUFFER_PTS(buffer), (unsigned long long)now_ns());
+        }
         // No flags: decoded here and now, and `on_picture` has run by the time this returns.
         status = VTDecompressionSessionDecodeFrame(vt_session, frame, 0, (void *)(uintptr_t)GST_BUFFER_PTS(buffer), NULL);
     }
@@ -512,6 +548,262 @@ static GstFlowReturn on_access_unit(GstAppSink *sink, gpointer user_data) {
     }
     gst_sample_unref(sample);
     return GST_FLOW_OK;
+}
+
+// ---- Frames from the encrypted channel ----
+//
+// One thread connects to the host, is handed whole frames by the library, and decodes each one
+// there and then, as the streaming thread of the GStreamer source does on the other way.
+
+// Where the host listens: ISTESSO_CHANNEL. NULL when the frames come from GStreamer.
+static const char *channel_address = NULL;
+// The parameter sets VideoToolbox was last set up with: VPS, SPS, PPS.
+static uint8_t *channel_sets[3];
+static size_t channel_set_sizes[3];
+static IstessoMediaStreamInfo channel_info;
+static guint64 channel_asked_ns = 0;
+
+// Where the next start code (00 00 01) begins in `data`, from `from` on; `size` when there is none.
+static size_t next_start_code(const uint8_t *data, size_t from, size_t size) {
+    size_t i = from;
+    while (i + 3 <= size) {
+        if (data[i + 2] > 1) {
+            i += 3;
+        } else if (data[i + 2] == 1) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                return i;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    return size;
+}
+
+typedef struct {
+    const uint8_t *bytes;
+    size_t size;
+    int type;
+} NalUnit;
+
+// Splits an access unit whose NAL units stand behind start codes. Returns how many there are, at
+// most `room`.
+static size_t split_access_unit(const uint8_t *data, size_t size, NalUnit *units, size_t room) {
+    size_t count = 0;
+    size_t at = next_start_code(data, 0, size);
+    while (at < size && count < room) {
+        size_t begin = at + 3;
+        size_t next = next_start_code(data, begin, size);
+        size_t end = next;
+        // Zero bytes in front of the next start code belong to it, not to this unit.
+        while (end > begin && data[end - 1] == 0) {
+            end -= 1;
+        }
+        if (end > begin + 1) {
+            units[count].bytes = data + begin;
+            units[count].size = end - begin;
+            units[count].type = (data[begin] >> 1) & 0x3f;
+            count += 1;
+        }
+        at = next;
+    }
+    return count;
+}
+
+// Sets VideoToolbox up for a stream with these parameter sets, unless it is set up for them already.
+static gboolean channel_configure(const NalUnit *sets[3]) {
+    gboolean same = vt_session != NULL;
+    for (int i = 0; i < 3 && same; i++) {
+        same = channel_set_sizes[i] == sets[i]->size && memcmp(channel_sets[i], sets[i]->bytes, sets[i]->size) == 0;
+    }
+    if (same) {
+        return TRUE;
+    }
+    if (vt_session != NULL) {
+        VTDecompressionSessionInvalidate(vt_session);
+        CFRelease(vt_session);
+        vt_session = NULL;
+    }
+    if (vt_format != NULL) {
+        CFRelease(vt_format);
+        vt_format = NULL;
+    }
+    const uint8_t *pointers[3];
+    for (int i = 0; i < 3; i++) {
+        free(channel_sets[i]);
+        channel_sets[i] = malloc(sets[i]->size);
+        memcpy(channel_sets[i], sets[i]->bytes, sets[i]->size);
+        channel_set_sizes[i] = sets[i]->size;
+        pointers[i] = channel_sets[i];
+    }
+    // NAL units in a sample stand behind four bytes of length.
+    OSStatus status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, 3, pointers, channel_set_sizes, 4, NULL,
+                                                                          &vt_format);
+    if (status != noErr) {
+        fprintf(stderr, "error: VideoToolbox does not take the stream's parameter sets (%d)\n", (int)status);
+        return FALSE;
+    }
+    CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(vt_format);
+    picture_width = size.width;
+    picture_height = size.height;
+    vt_srgb = channel_info.colour == 1;
+    return vt_start_session(channel_info.chroma == 444, vt_srgb ? "srgb" : "-");
+}
+
+static void channel_ask_for_key_frame(IstessoMediaClient *client, guint64 t) {
+    // Once, and again every half second for as long as none has come.
+    if (channel_asked_ns != 0 && t - channel_asked_ns < 500 * 1000 * 1000ULL) {
+        return;
+    }
+    channel_asked_ns = t;
+    istesso_media_client_ask_key_frame(client);
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"key_request\",\"t_ns\":%llu,\"sent\":1}\n", (unsigned long long)t);
+    }
+}
+
+// One frame has arrived, whole: decode it now, on the thread that received it.
+static void on_channel_frame(IstessoMediaClient *client, const IstessoMediaFrame *frame) {
+    if (frame_log != NULL) {
+        fprintf(frame_log,
+                "{\"kind\":\"arrived\",\"rtp\":%llu,\"first_ns\":%llu,\"last_ns\":%llu,\"packets\":%u,\"bytes\":%zu,\"key\":%u,"
+                "\"host_encoded_ns\":%llu}\n",
+                (unsigned long long)frame->seq, (unsigned long long)frame->first_ns, (unsigned long long)frame->whole_ns,
+                frame->messages, frame->len, frame->key_frame, (unsigned long long)frame->encoded_ns);
+    }
+    NalUnit units[128];
+    size_t count = split_access_unit(frame->data, frame->len, units, sizeof units / sizeof units[0]);
+    // The parameter sets come with every key frame; everything else but the delimiter is the picture.
+    const NalUnit *sets[3] = {NULL, NULL, NULL};
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (units[i].type >= 32 && units[i].type <= 34) {
+            sets[units[i].type - 32] = &units[i];
+        } else if (units[i].type != 35) {
+            total += 4 + units[i].size;
+        }
+    }
+    if (frame->key_frame && sets[0] != NULL && sets[1] != NULL && sets[2] != NULL && !channel_configure(sets)) {
+        exit(1);
+    }
+    if (frame->discontinuity && !frame->key_frame) {
+        vt_needs_key_frame = TRUE;  // The host left frames out and went on without a key frame.
+    }
+    if (vt_session == NULL || total == 0 || (vt_needs_key_frame && !frame->key_frame)) {
+        vt_needs_key_frame = TRUE;
+        channel_ask_for_key_frame(client, now_ns());
+        return;
+    }
+    CMBlockBufferRef block = NULL;
+    CMSampleBufferRef sample = NULL;
+    char *bytes = NULL;
+    OSStatus status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, total, kCFAllocatorDefault, NULL, 0, total,
+                                                         kCMBlockBufferAssureMemoryNowFlag, &block);
+    if (status == noErr) {
+        status = CMBlockBufferGetDataPointer(block, 0, NULL, NULL, &bytes);
+    }
+    if (status == noErr) {
+        for (size_t i = 0; i < count; i++) {
+            if (units[i].type >= 32 && units[i].type <= 35) {
+                continue;
+            }
+            uint32_t length = (uint32_t)units[i].size;
+            const uint8_t prefix[4] = {(uint8_t)(length >> 24), (uint8_t)(length >> 16), (uint8_t)(length >> 8), (uint8_t)length};
+            memcpy(bytes, prefix, 4);
+            memcpy(bytes + 4, units[i].bytes, units[i].size);
+            bytes += 4 + units[i].size;
+        }
+        status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, vt_format, 1, 0, NULL, 1, &total, &sample);
+    }
+    if (status == noErr) {
+        vt_decoding_key_frame = frame->key_frame != 0;
+        if (frame_log != NULL) {
+            fprintf(frame_log, "{\"kind\":\"to_decoder\",\"pts\":%llu,\"t_ns\":%llu}\n", (unsigned long long)frame->pts_ns,
+                    (unsigned long long)now_ns());
+        }
+        // No flags: decoded here and now, and `on_picture` has run by the time this returns.
+        status = VTDecompressionSessionDecodeFrame(vt_session, sample, 0, (void *)(uintptr_t)frame->pts_ns, NULL);
+    }
+    vt_needs_key_frame = status != noErr;
+    if (vt_needs_key_frame) {
+        channel_ask_for_key_frame(client, now_ns());
+    } else if (frame->key_frame) {
+        channel_asked_ns = 0;
+    }
+    if (sample != NULL) {
+        CFRelease(sample);
+    }
+    if (block != NULL) {
+        CFRelease(block);
+    }
+}
+
+static void log_stream(const char *event) {
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"%s\"}\n", (unsigned long long)now_ns(), event);
+    }
+}
+
+// Connects, receives and decodes, and connects again when the connection has ended.
+static void *channel_thread(void *unused) {
+    if (getenv("ISTESSO_RECEIVE_REALTIME") != NULL) {
+        // Work once per frame (85 a second), a few milliseconds of it, to be done well within the frame.
+        int agreed = istesso_media_thread_real_time(11764706, 3000000, 6000000);
+        if (frame_log != NULL) {
+            fprintf(frame_log, "{\"kind\":\"scheduling\",\"real_time\":%d}\n", agreed);
+        }
+        if (!agreed) {
+            fprintf(stderr, "note: the receiving thread was not given real-time scheduling\n");
+        }
+    }
+    gboolean reachable = TRUE;
+    for (;;) {
+        IstessoMediaClient *client = istesso_media_client_connect(NULL, channel_address, getenv("ISTESSO_CHANNEL_PEER"), 3000);
+        if (client == NULL) {
+            if (reachable) {
+                // Said once for each time the host goes away; the sentence holds no address.
+                fprintf(stderr, "note: no picture from the host: %s; trying again\n", istesso_media_last_error());
+                log_stream("unreachable");
+                reachable = FALSE;
+            }
+            usleep(500 * 1000);
+            continue;
+        }
+        reachable = TRUE;
+        if (istesso_media_client_info(client, &channel_info) != 0 || channel_info.codec != 1) {
+            fprintf(stderr, "error: the host sends its picture in a form this program cannot decode\n");
+            exit(1);
+        }
+        log_stream("connected");
+        vt_needs_key_frame = TRUE;
+        channel_asked_ns = 0;
+        for (;;) {
+            IstessoMediaFrame frame;
+            int32_t got = istesso_media_client_next(client, 250, &frame);
+            if (got < 0) {
+                break;
+            }
+            if (got == 1) {
+                on_channel_frame(client, &frame);
+            }
+        }
+        fprintf(stderr, "note: the picture's connection is over: %s; connecting again\n", istesso_media_last_error());
+        log_stream("ended");
+        istesso_media_client_close(client);
+        usleep(200 * 1000);
+    }
+    return NULL;
+}
+
+// Shows the frames of the encrypted channel in the layer of `view`.
+static gboolean use_channel(NSView *view) {
+    view.wantsLayer = YES;
+    vt_layer = view.layer;
+    vt_layer.contentsGravity = kCAGravityResize;
+    vt_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    pthread_t thread;
+    return pthread_create(&thread, NULL, channel_thread, NULL) == 0;
 }
 
 static void watch(GstElement *pipeline, const char *name, const char *pad_name, GstPadProbeType type,
@@ -812,7 +1104,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-        if (argc >= 9) {
+        channel_address = getenv("ISTESSO_CHANNEL");
+        if (argc >= 9 && channel_address == NULL) {
             int port = atoi(argv[8]);
             if (port < 1 || port > 65535) {
                 fprintf(stderr, "error: KEY_REQUEST_PORT has to be a port number\n");
@@ -882,6 +1175,19 @@ int main(int argc, char *argv[]) {
             [window setFrameTopLeftPoint:NSMakePoint(x, mainHeight - y)];
         }
 
+        if (channel_address != NULL) {
+            // The frames come from the encrypted channel: no pipeline, and the log is written as
+            // with VideoToolbox behind a pipeline.
+            if (argc >= 8 && strcmp(argv[7], "-") != 0 && !start_frame_log(NULL, argv[7], TRUE)) {
+                return 1;
+            }
+            if (!use_channel(view)) {
+                fprintf(stderr, "error: cannot start the thread that receives\n");
+                return 1;
+            }
+            [NSApp run];
+            return 0;
+        }
         GError *error = NULL;
         GstElement *pipeline = gst_parse_launch(argv[6], &error);
         if (pipeline == NULL) {

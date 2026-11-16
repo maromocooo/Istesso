@@ -20,6 +20,19 @@ Optional:
     --probe-local, --local-app   the same pair for the local window, to see how long the
                                  client's window system takes when nothing is relayed
     --ping                       output of a ping that ran during the measurement
+
+The picture may have travelled as RTP over UDP or over the encrypted channel (the host's
+--to-channel, the viewer's ISTESSO_CHANNEL; docs/adr/0015-media-transport.md). The host's log
+says which, and --transport overrides it. Over the channel there are no packets, and three
+stretches are cut a little differently:
+
+    encoded to handed over     ends when the frame is handed to the library istesso-media
+    frame arrives              from the frame's first bytes being there to be read, to the
+                               whole frame read and decrypted
+    decode                     from there to decoded, with the splitting of the access unit
+                               in it instead of the depacketizing
+
+A frame's two logs are joined by its sequence number, where UDP has the RTP timestamp.
 """
 
 import argparse
@@ -203,7 +216,7 @@ def input_path(args, probe, order, client_frames, host_frames, host_line, handed
               "clocks is off by.")
 
 
-def key_frames(host_frames, client_frames, out, decoded):
+def key_frames(host_frames, client_frames, out, decoded, channel=False):
     """Says how many key frames there were and why, and what missing packets cost.
 
     A stream with key frames only when asked for lives on the client asking: at the start,
@@ -241,6 +254,14 @@ def key_frames(host_frames, client_frames, out, decoded):
     print(f"  the client decoded {len(decoded)} pictures, {sum(1 for l in decoded if l.get('key'))} of them key frames")
     print(f"  the client asked for a key frame {len(asked) - len(later)} times before its first picture and {len(later)} times after it"
           f"{'' if all(l.get('sent', 1) for l in asked) else '; ' + str(sum(1 for l in asked if not l.get('sent', 1))) + ' of the requests could not be sent'}")
+    if channel:
+        # Nothing is lost on this way; what there is to count is the connection's life.
+        events = collections.Counter(l.get("event") for l in client_frames if l.get("kind") == "stream")
+        print(f"  the connection was made {events.get('connected', 0)} times and ended {events.get('ended', 0)} times; "
+              f"the host was not to be reached {events.get('unreachable', 0)} times")
+        held = sum(1 for l in host_frames if l.get("kind") == "sent" and l.get("queued"))
+        print(f"  frames a connection did not take at once: {held}")
+        return
     print(f"  packets were found missing {len(gaps)} times")
     waits, frozen = [], []
     picture_times = [l["t_ns"] for l in decoded]
@@ -275,12 +296,20 @@ def main():
         help="how the probe's inputs reached the application on the host: straight to it, or as key presses "
         "through the control channel and the compositor (the probe's --relayed-keys)",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["auto", "udp", "channel"],
+        default="auto",
+        help="how the picture travelled: as RTP over UDP, or over the encrypted channel. auto: what the host's log says (UDP when it says nothing)",
+    )
     args = parser.parse_args()
 
     probe = {c["id"]: c for c in read(args.probe_relayed) if c.get("kind") == "client"}
     host_app = read(args.host_app)
     host_frames = read(args.host_frames)
     client_frames = read(args.client_frames)
+    said = next((l.get("transport") for l in host_frames if l.get("kind") == "header"), None)
+    channel = (said if args.transport == "auto" else args.transport) == "channel"
 
     # Host: the test application's clock onto the pipeline's.
     host_line = Timeline([l for l in host_frames if l.get("kind") == "clock"], "the host's frame log")
@@ -315,7 +344,8 @@ def main():
         if line.get("kind") == "sent":
             known = sent.setdefault(line["pts"], {"pts": line["pts"], "rtp": line["rtp"], "first_ns": line["t_ns"], "last_ns": line["t_ns"], "packets": 0})
             known["first_ns"] = min(known["first_ns"], line["t_ns"])
-            known["last_ns"] = max(known["last_ns"], line["t_ns"])
+            # Over the channel a frame is handed over once, and the library says when it had written it.
+            known["last_ns"] = max(known["last_ns"], line.get("written_ns", line["t_ns"]))
             known["packets"] += line["packets"]
             sent_by_rtp[line["rtp"]] = known
 
@@ -360,9 +390,9 @@ def main():
         ("application: input to commit", "app"),
         ("compositor: commit to frame out", "compositor"),
         ("upload, convert, encode: frame out to encoded", "encode"),
-        ("parse, packetize: encoded to network", "packetize"),
-        ("frame arrives: first packet to last", "arrival"),
-        ("depacketize, decode: last packet to decoded", "decode"),
+        ("parse: encoded to handed to the channel", "packetize") if channel else ("parse, packetize: encoded to network", "packetize"),
+        ("frame arrives: first bytes to whole, opened", "arrival") if channel else ("frame arrives: first packet to last", "arrival"),
+        ("split, decode: frame in hand to decoded", "decode") if channel else ("depacketize, decode: last packet to decoded", "decode"),
         ("queue: decoded to sink", "queue"),
         ("sink: reaching the sink to drawing", "draw"),
         ("window system and display: drawn to shown", "display"),
@@ -509,9 +539,14 @@ def main():
         of_all = sum(parts[key]) / len(parts[key])
         print(f"{label:<46}{of_slow:>9.2f}{of_all:>9.2f}{of_slow - of_all:>+9.2f}")
     print()
-    print(f"Frames that carried an input: {sum(sizes) / len(sizes) / 1000:.1f} kB and {sum(packets) / len(packets):.0f} packets on average, "
-          f"{keyframes} of them key frames; the host handed the packets over within {summary(handing)['median']:.2f} ms at the median "
-          f"({summary(handing)['max']:.2f} at most)")
+    if channel:
+        print(f"Frames that carried an input: {sum(sizes) / len(sizes) / 1000:.1f} kB and {sum(packets) / len(packets):.1f} messages of the channel on average, "
+              f"{keyframes} of them key frames; the library had sealed and written a frame {summary(handing)['median']:.3f} ms after it was handed over "
+              f"at the median ({summary(handing)['max']:.3f} at most)")
+    else:
+        print(f"Frames that carried an input: {sum(sizes) / len(sizes) / 1000:.1f} kB and {sum(packets) / len(packets):.0f} packets on average, "
+              f"{keyframes} of them key frames; the host handed the packets over within {summary(handing)['median']:.2f} ms at the median "
+              f"({summary(handing)['max']:.2f} at most)")
 
     if args.relayed_inputs == "keys":
         # The host's share of the input path: from the key press being handed to the compositor
@@ -548,7 +583,7 @@ def main():
         count = counts.get(start, 0)
         print(f"  {start:>4} to {start + 1:<4}{count:>5}  {'#' * -(-40 * count // most)}")
 
-    key_frames(host_frames, client_frames, out, decoded)
+    key_frames(host_frames, client_frames, out, decoded, channel)
 
     # The local window, when its logs are given.
     if args.probe_local and args.local_app:
