@@ -108,7 +108,27 @@ Air の上でコーディングエージェントを動かし、Ubuntu へは SS
 - 同じテストアプリを、Ubuntu に直接つないだディスプレイで操作したときの値も測る。これが「中継なし」の基準になる。
 - 結果を見て合格ラインを数値で決め、ADR 0002 と `requirements.md` を更新する。
 
-準備の状況（2026-11-16）：Mac に Moonlight 6.2.0 を入れました（Homebrew）。Ubuntu には Sunshine 2026.914.233613 のパッケージを置き、公開されているチェックサムと一致することを確かめてあります。導入には `sudo` が要るので、人の実行を待っています。Moonlight は、ペアリングと配信の開始をコマンドラインから行えます（`moonlight pair`、`moonlight stream`）。
+準備の状況（2026-11-16）：
+
+- Mac に Moonlight 6.2.0（Homebrew）、Ubuntu に Sunshine 2026.914.233613（公式の `.deb`）を入れ、ペアリングまで済ませました。
+- 動作の確認として、Ubuntu のデスクトップを 1720×720・85 fps・H.265 で 15 秒ほど配信し、テストアプリの切り替えが Moonlight の窓に映ることを見ました。Moonlight の統計は、ホストの処理が平均 11.1 ms（最小 6.2、最大 30.1）、ネットワークが平均 6 ms、描画が平均 0.5 ms、ネットワークの揺れで捨てたフレームが 2.1% でした。**これは基準の値ではありません。** Moonlight をエージェントのシェルから起動したので優先度が低く、回数も少ないためです。
+- Sunshine の取り込みは、このホストでは X11 の方法しか自動では使えません。公式の説明で「いちばん遅い」とされている方法です。NvFBC は初期化に失敗し、KMS は X11 のセッションでは初期化できず、既定の方法は起動のたびにデスクトップで「画面の共有」の許可を求めます。基準の値を読むときは、この条件を一緒に書きます。
+
+動かし方（どれも `sudo` は要りません）：
+
+| すること | コマンド |
+|---|---|
+| Sunshine の起動と停止（ホスト） | `systemctl --user start app-dev.lizardbyte.app.Sunshine`、`systemctl --user stop app-dev.lizardbyte.app.Sunshine`。ログインのたびの自動起動は無効のまま |
+| Sunshine の設定（ホスト） | `~/.config/sunshine/sunshine.conf` に `capture = x11` と `output_name = HDMI-0` |
+| Sunshine の管理画面の認証情報（ホスト） | `~/.config/sunshine/istesso-m1-webui-credentials`（本人だけが読める。中身を記録やログに書かない） |
+| ペアリング | Mac で `moonlight pair <ホスト> --pin <4桁>`。ホストで `GET https://localhost:47990/api/pin` が返す待ち受け中の `id` を、`POST /api/pin` に `pairing_id`、`pin`、`name` として送る |
+| 配信 | Mac で `moonlight stream <ホスト> Desktop --fps 85 --resolution <幅>x<高さ> --video-codec HEVC --display-mode windowed --performance-overlay`。終了時に、統計が `/tmp/Moonlight-*.log` に出る |
+
+残っていること：
+
+- Mac で Moonlight に「ローカルネットワーク」の許可を出す（人が行う）。`open` で起動した Moonlight は、許可がないのでホストに届きません。計測では、優先度をふつうにするために `open` で起動します（[measurements/README.md](measurements/README.md)）。
+- 計測のあいだ、Mac の AWDL を止めておく（[記録](measurements/2026-11-16-wifi-path-awdl-off.md)）。
+- カメラ。ホストにつないである Web カメラは最高 60 fps（1コマ 16.7 ms）で、240 fps を前提にした測り方には粗すぎます。
 
 ### 手順 3：既製の部品だけで1本通す
 
