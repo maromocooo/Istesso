@@ -48,7 +48,8 @@
 | `istesso-screen-probe` | Mac の画面を読んで、手元の窓と中継した窓が同じ入力に反応した時刻を記録する（`macos/screen-probe`、[ADR 0008](../adr/0008-screen-recording-for-measurement.md)） |
 | `istesso measure compare` | 上の道具の2つのログと、2つのテストアプリのログから、それぞれの窓の追加遅延と、その差を出す。差を合格ラインと並べて表示する |
 | `gst-viewer` | 手順 3 の受信側。GStreamer のパイプラインの映像を、指定した位置の窓に出す（`macos/gst-viewer`。`brew install gstreamer` のあと `macos/gst-viewer/build.sh`）。フレームごとに、届いた時刻、復号した時刻、描いた時刻を書き出せる。パイプラインの終わりを `appsink name=vt` にすると、VideoToolbox で直接復号して窓に出す |
-| `scripts/m1-step3-host.py` | 手順 3 の送信側。パイプラインを動かし、フレームごとに、コンポジターを出た時刻、圧縮が終わった時刻、ネットワークへ渡した時刻を書き出す |
+| `scripts/m1-step3-host.py` | 手順 3 の送信側。パイプラインを動かし、フレームごとに、コンポジターを出た時刻、圧縮が終わった時刻、ネットワークへ渡した時刻を書き出す。フレームの渡し方（`--frames memory\|cuda`）と、エンコーダーのレート制御のバッファー（`--vbv`）を選べる |
+| `scripts/patches/gst-wayland-display-render-on-commit.patch` | 手順 3 のコンポジターに当てる実験用の修正。アプリが新しい絵を確定したら、決まった間隔を待たずに描いて出す |
 | `scripts/m1-step3-breakdown.py` | 上の2つの記録と、テストアプリと `istesso-screen-probe` のログを突き合わせて、入力から表示までの内訳を出す（下の「内訳の計測」） |
 | `scripts/ping-stats.py` | `ping` の出力から、往復時間の分布と、跳ねの周期を出す |
 
@@ -173,7 +174,7 @@ open -n -g "target/release/Istesso Flash.app" --args --listen 127.0.0.1:47811 --
 
 「画面での計測」に、フレームごとの記録を足します。入力ごとに、その入力を最初に映したフレームを、コンポジターから画面まで追います。
 
-1. ホストで、`gst-launch-1.0` の代わりに `scripts/m1-step3-host.py --to <Mac のアドレス> --log host-frames.jsonl` でパイプラインを動かす（`GST_PLUGIN_PATH` は同じ）。
+1. ホストで、`gst-launch-1.0` の代わりに `scripts/m1-step3-host.py --to <Mac のアドレス> --log host-frames.jsonl` でパイプラインを動かす（`GST_PLUGIN_PATH` は同じ）。いまの基本の形は、`--frames cuda --vbv <ビットレート ÷ フレームレート>` を足したもの。`--frames cuda` には、`cuda` つきでビルドしたコンポジターのプラグインが要る（[記録](2026-11-16-step3-gpu-frames.md)）。動く絵では、`--vbv` を付けないと、キーフレームが数百パケットになって欠ける（[記録](2026-11-16-step3-moving-picture.md)）。
 2. Mac で、`gst-viewer` の最後の引数に記録の置き場所を足す。パイプラインには、見る要素に名前を付ける（`udpsrc name=net`、`avdec_h265 name=dec`、`glimagesink name=sink`）。VideoToolbox で復号するときは、`h265parse` のあとを `video/x-h265,stream-format=hvc1,alignment=au ! appsink name=vt sync=false` にする。
 3. 「画面での計測」のとおりに測る。同じ時間帯の `ping` と見比べたいときは、計測のあいだ `ping --apple-time -i 0.2 <ホスト>` も流す。
 4. 集計する。

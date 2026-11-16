@@ -1,0 +1,169 @@
+Render a frame as soon as an application commits, instead of on the next beat of the frame rate.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86. The lines of context are from that project.
+
+Only for the measurements of step 3 of docs/m1-plan.md: it shows what a compositor gains that
+does not wait for a fixed rhythm (docs/measurements/2026-11-16-step3-render-on-commit.md).
+The host of step 4 does this in its own compositor.
+
+What it changes: a frame the element has asked for waits, as before, until one frame interval
+has passed since the last one. If an application commits while it waits, it is rendered at
+once; if an application committed before it was asked for, it does not wait at all.
+Applications are still told to draw their next frame once per frame interval.
+
+Known limit: the timer still renders a frame when nothing was committed, so an application
+that draws at the frame rate gets some frames rendered twice (114 frames per second at a
+frame rate of 85).
+
+Apply and build, next to the unpatched checkout:
+
+    git worktree add ../repo-commit 1301f86
+    cd ../repo-commit && git apply <this file>
+    cargo build --release -p gst-plugin-wayland-display -p wayland-display-core --features cuda
+
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index ac6976d..f87e350 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -109,6 +109,15 @@ pub struct State {
+     pub renderer: GlesRenderer,
+     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
+     last_render: Option<Instant>,
++    /// The frame the element has asked for while it waits for its turn in the rhythm of
++    /// the frame rate. An application that commits meanwhile gets it rendered at once.
++    pub(crate) waiting_frame: Option<Box<dyn FnOnce(&mut State, Instant)>>,
++    /// Counts the element's requests, so that a timer set for an earlier one does nothing.
++    frame_request: u64,
++    /// Whether an application has committed since the last frame was rendered.
++    pub(crate) committed_since_render: bool,
++    /// When the applications were last told to draw their next frame.
++    last_frame_callbacks: Option<Instant>,
+ 
+     // management
+     pub output: Option<Output>,
+@@ -230,6 +239,10 @@ impl State {
+             dmabuf_global,
+             video_info: None,
+             last_render: None,
++            waiting_frame: None,
++            frame_request: 0,
++            committed_since_render: false,
++            last_frame_callbacks: None,
+ 
+             space,
+             popups: PopupManager::default(),
+@@ -437,12 +450,12 @@ pub(crate) fn init(
+                     state.input_context.path_add_device(&path);
+                 }
+                 Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
++                    let frame_duration = {
++                        let framerate = state.video_info.as_ref().unwrap().fps();
++                        Duration::from_secs_f64(framerate.denom() as f64 / framerate.numer() as f64)
++                    };
+                     let wait = if let Some(last_render) = state.last_render {
+-                        let base_info = state.video_info.as_ref().unwrap().clone();
+-                        let framerate = base_info.fps();
+-                        let duration = Duration::from_secs_f64(
+-                            framerate.denom() as f64 / framerate.numer() as f64,
+-                        );
++                        let duration = frame_duration;
+                         let time_passed = Instant::now().duration_since(last_render);
+                         if time_passed < duration {
+                             Some(duration - time_passed)
+@@ -458,6 +471,16 @@ pub(crate) fn init(
+                             Some(ref tracer) => Some(tracer.trace("render")),
+                             None => None,
+                         };
++                        state.committed_since_render = false;
++                        // Applications are told to draw their next frame in the rhythm of the
++                        // frame rate, also when a frame is rendered ahead of it. One that
++                        // draws on being told would otherwise be told again at once.
++                        let callbacks_due = state.last_frame_callbacks.is_none_or(|last| {
++                            now.duration_since(last) + Duration::from_millis(1) >= frame_duration
++                        });
++                        if callbacks_due {
++                            state.last_frame_callbacks = Some(now);
++                        }
+                         if let Err(_) = match state.create_frame() {
+                             Ok((buf, render_result)) => {
+                                 render_result
+@@ -481,12 +504,14 @@ pub(crate) fn init(
+                                                 |next_output, _, _, _| next_output,
+                                             );
+                                         });
+-                                        window.send_frame(
+-                                            output,
+-                                            state.clock.now(),
+-                                            Some(Duration::ZERO),
+-                                            |_, _| Some(output.clone()),
+-                                        );
++                                        if callbacks_due {
++                                            window.send_frame(
++                                                output,
++                                                state.clock.now(),
++                                                Some(Duration::ZERO),
++                                                |_, _| Some(output.clone()),
++                                            );
++                                        }
+                                         window.take_presentation_feedback(
+                                             &mut output_presentation_feedback,
+                                             surface_primary_scanout_output,
+@@ -513,8 +538,8 @@ pub(crate) fn init(
+                                             wp_presentation_feedback::Kind::Vsync,
+                                         );
+                                     }
+-                                    if let CursorImageStatus::Surface(wl_surface) =
+-                                        &state.cursor_state
++                                    if let (true, CursorImageStatus::Surface(wl_surface)) =
++                                        (callbacks_due, &state.cursor_state)
+                                     {
+                                         send_frames_surface_tree(
+                                             wl_surface,
+@@ -542,11 +567,23 @@ pub(crate) fn init(
+                     };
+ 
+                     match wait {
++                        // An application has drawn since the last frame: its picture does
++                        // not wait for the rhythm of the frame rate.
++                        Some(_) if state.committed_since_render => render(state, Instant::now()),
+                         Some(duration) => {
++                            // Kept where the commit handler finds it: if an application
++                            // draws before the timer runs out, the frame is rendered then.
++                            state.frame_request = state.frame_request.wrapping_add(1);
++                            let request = state.frame_request;
++                            state.waiting_frame = Some(Box::new(render));
+                             if let Err(err) = state.handle.insert_source(
+                                 Timer::from_duration(duration),
+                                 move |now, _, data| {
+-                                    render(data, now);
++                                    if data.frame_request == request {
++                                        if let Some(render) = data.waiting_frame.take() {
++                                            render(data, now);
++                                        }
++                                    }
+                                     TimeoutAction::Drop
+                                 },
+                             ) {
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index 63b5356..31ad232 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -36,6 +36,17 @@ impl CompositorHandler for State {
+     fn commit(&mut self, surface: &WlSurface) {
+         on_commit_buffer_handler::<Self>(surface);
+ 
++        // An application has drawn. A frame that waits for its turn is rendered as soon as
++        // this commit has been taken in; if none waits, the next one asked for will not.
++        self.committed_since_render = true;
++        if self.waiting_frame.is_some() {
++            self.handle.insert_idle(|state| {
++                if let Some(render) = state.waiting_frame.take() {
++                    render(state, std::time::Instant::now());
++                }
++            });
++        }
++
+         if let Some(window) = self
+             .space
+             .elements()
