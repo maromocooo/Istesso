@@ -852,9 +852,10 @@ mod mac {
         let (waits_in, mut waits_out) = RingBuffer::<WaitEvent>::new(1 << 16);
         let mut playout = Playout::new(cfg, queue_out, resampler, stats.clone(), Some(waits_in));
 
-        // What would have been played goes to a thread that keeps it.
+        // What would have been played goes to a thread that keeps it. Room
+        // for ten seconds: that thread is an ordinary one and may be held up.
         let (mut record_in, mut record_out) =
-            RingBuffer::<f32>::new((device.sample_rate as usize) * channels * 2);
+            RingBuffer::<f32>::new((device.sample_rate as usize) * channels * 10);
         let callbacks = Arc::new(Callbacks {
             frames_min: AtomicU64::new(u64::MAX),
             lead_min_us: AtomicI64::new(i64::MAX),
