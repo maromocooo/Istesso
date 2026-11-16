@@ -534,7 +534,7 @@ mod mac {
         let keep_ledger = options.ledger.is_some();
         let pumping = std::thread::spawn(move || {
             let mut arrivals = Arrivals::new(keep_ledger);
-            let _ = subscription.set_timeout(Duration::from_secs(3));
+            subscription.set_timeout(Duration::from_secs(3));
             let result = pump(&mut subscription, &mut queue_in, &mut arrivals, &stop_pump);
             (result, arrivals)
         });
