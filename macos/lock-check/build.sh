@@ -10,7 +10,7 @@ output=${1:-"$here/build"}
 bundle="$output/Istesso Lock Check.app"
 
 mkdir -p "$bundle/Contents/MacOS"
-swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
+swiftc -O -swift-version 5 -target arm64-apple-macos14.2 -import-objc-header "$here/virtual-display.h" \
     -o "$bundle/Contents/MacOS/istesso-lock-check" "$here/main.swift"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

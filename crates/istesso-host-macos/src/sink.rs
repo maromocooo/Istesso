@@ -107,9 +107,67 @@ impl FrameSource for Generated {
     }
 }
 
+/// What changes in a picture that differs from the one before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The text scrolls by a few rows: nearly every pixel changes.
+    Scroll,
+    /// One more character appears on the bottom line.
+    Type,
+}
+
+/// A source paced by a [`Pace`](crate::pace::Pace): the picture changes only
+/// where the pace says so (a probe), and stays the same in between.
+pub struct Paced {
+    text: crate::picture::ScrollingText,
+    pace: crate::pace::Pace,
+    change: Change,
+    next: u64,
+    changes: u64,
+    /// Stops after this many changed pictures; `None` goes on for ever.
+    pub probes: Option<u64>,
+}
+
+impl Paced {
+    pub fn new(width: usize, height: usize, pace: crate::pace::Pace, change: Change) -> Self {
+        Paced {
+            text: crate::picture::ScrollingText::new(width, height),
+            pace,
+            change,
+            next: 0,
+            changes: 0,
+            probes: None,
+        }
+    }
+}
+
+impl FrameSource for Paced {
+    fn size(&self) -> (usize, usize) {
+        (self.text.width(), self.text.height())
+    }
+
+    fn next_into(&mut self, dst: &mut [u8], stride: usize) -> Option<u64> {
+        if self.probes.is_some_and(|probes| self.changes >= probes) {
+            return None;
+        }
+        let number = self.next;
+        if self.pace.is_probe(number) {
+            self.changes += 1;
+        }
+        match self.change {
+            Change::Scroll => self.text.fill(self.changes, dst, stride),
+            Change::Type => self.text.fill_typed(0, self.changes, dst, stride),
+        }
+        self.next += 1;
+        Some(number)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pace::Pace;
+    use std::time::Duration;
 
     #[test]
     fn a_discarding_sink_counts() {
@@ -147,5 +205,33 @@ mod tests {
         assert_eq!(source.next_into(&mut buffer, 64 * 4), Some(1));
         assert_eq!(source.next_into(&mut buffer, 64 * 4), None);
         assert_eq!(source.size(), (64, 40));
+    }
+
+    #[test]
+    fn a_paced_source_changes_its_picture_only_on_probes() {
+        let pace = Pace::Sparse {
+            still: Duration::from_millis(300),
+            awake_fps: 10,
+        };
+        for change in [Change::Scroll, Change::Type] {
+            let mut source = Paced::new(320, 200, pace, change);
+            source.probes = Some(2);
+            let stride = 320 * 4;
+            let mut pictures = Vec::new();
+            loop {
+                let mut buffer = vec![0u8; stride * 200];
+                let Some(number) = source.next_into(&mut buffer, stride) else {
+                    break;
+                };
+                pictures.push((number, buffer));
+            }
+            // Two unchanged pictures and a probe, twice.
+            let numbers: Vec<u64> = pictures.iter().map(|(n, _)| *n).collect();
+            assert_eq!(numbers, vec![0, 1, 2, 3, 4, 5], "{change:?}");
+            assert!(pictures[0].1 == pictures[1].1, "{change:?}");
+            assert!(pictures[1].1 != pictures[2].1, "{change:?}");
+            assert!(pictures[2].1 == pictures[3].1 && pictures[3].1 == pictures[4].1);
+            assert!(pictures[4].1 != pictures[5].1, "{change:?}");
+        }
     }
 }

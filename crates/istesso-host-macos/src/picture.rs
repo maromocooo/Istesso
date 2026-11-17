@@ -77,7 +77,14 @@ impl ScrollingText {
                     // A space; the next word may have another colour.
                     ink = INKS[(bits >> 8) as usize % INKS.len()];
                 } else {
-                    Self::glyph(&mut page, width, column, top, bits >> 8, ink);
+                    glyph(
+                        &mut page,
+                        width * BYTES_PER_PIXEL,
+                        column,
+                        top,
+                        bits >> 8,
+                        ink,
+                    );
                 }
                 column += ADVANCE;
             }
@@ -88,23 +95,6 @@ impl ScrollingText {
             page_rows,
             page,
             step: 3,
-        }
-    }
-
-    fn glyph(page: &mut [u8], width: usize, left: usize, top: usize, bits: u64, ink: [u8; 4]) {
-        for row in 0..GLYPH_ROWS {
-            for col in 0..GLYPH_COLUMNS {
-                if (bits >> (row * GLYPH_COLUMNS + col)) & 1 == 0 {
-                    continue;
-                }
-                for y in 0..SCALE {
-                    for x in 0..SCALE {
-                        let at = ((top + row * SCALE + y) * width + left + col * SCALE + x)
-                            * BYTES_PER_PIXEL;
-                        page[at..at + BYTES_PER_PIXEL].copy_from_slice(&ink);
-                    }
-                }
-            }
         }
     }
 
@@ -133,6 +123,59 @@ impl ScrollingText {
             let from = ((first + y) % self.page_rows) * row_bytes;
             dst[y * stride..y * stride + row_bytes]
                 .copy_from_slice(&self.page[from..from + row_bytes]);
+        }
+    }
+
+    /// Writes frame `frame` and then `typed` characters on a line of its
+    /// own at the bottom, as if they had just been typed: each character
+    /// more changes one glyph's worth of pixels. When the line is full it
+    /// starts again from the left.
+    pub fn fill_typed(&self, frame: u64, typed: u64, dst: &mut [u8], stride: usize) {
+        self.fill(frame, dst, stride);
+        let top = self.height - LINE_PITCH;
+        let columns = (self.width / ADVANCE) as u64;
+        let row_bytes = self.width * BYTES_PER_PIXEL;
+        for y in top..self.height {
+            for pixel in dst[y * stride..y * stride + row_bytes].chunks_exact_mut(BYTES_PER_PIXEL) {
+                pixel.copy_from_slice(&BACKGROUND);
+            }
+        }
+        let on_line = if typed == 0 {
+            0
+        } else {
+            (typed - 1) % columns + 1
+        };
+        let first = typed - on_line;
+        for column in 0..on_line {
+            let mut random = Random(0x2545_f491_4f6c_dd1d ^ (first + column + 1));
+            let bits = random.next() | 1;
+            glyph(
+                dst,
+                stride,
+                column as usize * ADVANCE,
+                top + SCALE,
+                bits,
+                INKS[0],
+            );
+        }
+    }
+}
+
+/// Draws one made-up glyph whose pixels are the low bits of `bits`, with its
+/// top left at (`left`, `top`) in a picture whose rows are `stride` bytes apart.
+fn glyph(picture: &mut [u8], stride: usize, left: usize, top: usize, bits: u64, ink: [u8; 4]) {
+    for row in 0..GLYPH_ROWS {
+        for col in 0..GLYPH_COLUMNS {
+            if (bits >> (row * GLYPH_COLUMNS + col)) & 1 == 0 {
+                continue;
+            }
+            for y in 0..SCALE {
+                for x in 0..SCALE {
+                    let at = (top + row * SCALE + y) * stride
+                        + (left + col * SCALE + x) * BYTES_PER_PIXEL;
+                    picture[at..at + BYTES_PER_PIXEL].copy_from_slice(&ink);
+                }
+            }
         }
     }
 }
@@ -179,6 +222,43 @@ mod tests {
             let padding = &buffer[y * stride + 64 * BYTES_PER_PIXEL..(y + 1) * stride];
             assert!(padding.iter().all(|&b| b == 0xab));
         }
+    }
+
+    #[test]
+    fn each_character_typed_changes_only_the_bottom_line() {
+        let text = ScrollingText::new(320, 200);
+        let stride = 320 * BYTES_PER_PIXEL;
+        let typed = |n: u64| {
+            let mut buffer = vec![0u8; stride * 200];
+            text.fill_typed(7, n, &mut buffer, stride);
+            buffer
+        };
+        let bottom = (200 - LINE_PITCH) * stride;
+        let (none, one, two) = (typed(0), typed(1), typed(2));
+        assert!(none[..bottom] == one[..bottom] && one[..bottom] == two[..bottom]);
+        assert!(none[bottom..] != one[bottom..] && one[bottom..] != two[bottom..]);
+        // The first character stays where it was when the second comes.
+        let first_glyph = |b: &[u8]| -> Vec<u8> {
+            (200 - LINE_PITCH..200)
+                .flat_map(|y| b[y * stride..y * stride + ADVANCE * BYTES_PER_PIXEL].to_vec())
+                .collect()
+        };
+        assert_eq!(first_glyph(&one), first_glyph(&two));
+        assert_eq!(typed(5), typed(5), "the same count draws the same picture");
+    }
+
+    #[test]
+    fn a_full_line_of_typing_starts_again_from_the_left() {
+        let text = ScrollingText::new(64, 40);
+        let stride = 64 * BYTES_PER_PIXEL;
+        let columns = (64 / ADVANCE) as u64;
+        let mut full = vec![0u8; stride * 40];
+        let mut wrapped = vec![0u8; stride * 40];
+        text.fill_typed(0, columns, &mut full, stride);
+        text.fill_typed(0, columns + 1, &mut wrapped, stride);
+        let mut empty = vec![0u8; stride * 40];
+        text.fill_typed(0, 0, &mut empty, stride);
+        assert!(full != empty && wrapped != empty && full != wrapped);
     }
 
     #[test]

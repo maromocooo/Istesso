@@ -2,10 +2,11 @@
 //! each step took.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::annexb;
 use crate::encoder::{Encoder, Error, Feed, Outcome, PixelBufferPool, Settings};
+use crate::pace::Pace;
 use crate::sink::{EncodedFrame, FrameSink, FrameSource};
 
 /// What happened to one picture. Times are nanoseconds since the run began.
@@ -52,6 +53,18 @@ pub fn run(
     settings: &Settings,
     source: &mut dyn FrameSource,
     sink: Box<dyn FrameSink>,
+) -> Result<Report, Error> {
+    run_paced(settings, source, sink, Pace::Even { fps: settings.fps })
+}
+
+/// Encodes pictures from `source` until it has none left, each handed over
+/// when `pace` says it is due, and hands every frame to `sink`. The encoder
+/// is still told to expect `settings.fps` frames a second.
+pub fn run_paced(
+    settings: &Settings,
+    source: &mut dyn FrameSource,
+    sink: Box<dyn FrameSink>,
+    pace: Pace,
 ) -> Result<Report, Error> {
     let start = Instant::now();
     let since = move |at: Instant| at.duration_since(start).as_nanos() as u64;
@@ -114,10 +127,9 @@ pub fn run(
     let properties = encoder.properties();
     let (width, height) = source.size();
     let pictures = PixelBufferPool::bgra(width, height)?;
-    let interval = Duration::from_secs_f64(1.0 / f64::from(settings.fps));
-    let mut index = 0u32;
+    let mut index = 0u64;
     loop {
-        let due = start + interval * index;
+        let due = start + pace.due(index);
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
         }
@@ -199,7 +211,7 @@ fn sequence_parameter_set(unit: &[u8]) -> Option<&[u8]> {
 mod tests {
     use super::*;
     use crate::encoder::Chroma;
-    use crate::sink::{Discard, Generated};
+    use crate::sink::{Change, Discard, Generated, Paced};
 
     #[test]
     fn the_sequence_parameter_set_is_found_among_the_units() {
@@ -260,6 +272,52 @@ mod tests {
             assert!(record.bytes > 0);
             let converted = record.converted_ns.expect("the conversion is timed");
             assert!(record.submitted_ns <= converted && converted <= record.encoded_ns.unwrap());
+        }
+    }
+
+    /// A still screen with a character typed now and then, kept awake in
+    /// between: every picture is encoded, changed or not.
+    #[test]
+    fn a_sparse_pace_encodes_the_unchanged_pictures_too() {
+        let settings = Settings {
+            width: 640,
+            height: 360,
+            fps: 60,
+            bitrate_bps: 4_000_000,
+            chroma: Chroma::C420,
+            feed: Feed::Direct,
+            require_hardware: false,
+            low_latency_rate_control: false,
+            leave_unset: Vec::new(),
+            extra: Vec::new(),
+        };
+        let pace = Pace::Sparse {
+            still: std::time::Duration::from_millis(40),
+            awake_fps: 50,
+        };
+        let mut source = Paced::new(settings.width, settings.height, pace, Change::Type);
+        source.probes = Some(4);
+        let report = match run_paced(&settings, &mut source, Box::new(Discard::default()), pace) {
+            Ok(report) => report,
+            Err(error) if error.what == "VTCompressionSessionCreate" => {
+                eprintln!("no H.265 encoder on this machine ({error}); nothing was checked");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        // 40 ms at 50 a second: one unchanged picture, then the probe.
+        assert_eq!(report.frames.len(), 8);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let probes = report
+            .frames
+            .iter()
+            .filter(|r| pace.is_probe(r.number))
+            .count();
+        assert_eq!(probes, 4);
+        // Never handed over before it is due: the last one at 160 ms.
+        for record in &report.frames {
+            let due = pace.due(record.number).as_nanos() as u64;
+            assert!(record.submitted_ns >= due, "{record:?} before {due} ns");
         }
     }
 }

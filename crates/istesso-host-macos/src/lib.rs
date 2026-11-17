@@ -6,6 +6,8 @@
 //! * [`encoder`], [`pump`] (macOS only): H.265 from the Mac's own encoder
 //!   (VideoToolbox), paced like a display, with the time each step took.
 //!   Needs no permission.
+//! * [`pace`]: when pictures are handed over — a steady stream, or a still
+//!   screen with a change now and then.
 //! * [`annexb`]: from the encoder's bytes to what the picture's transport
 //!   carries.
 //! * [`picture`]: a picture to encode when there is no window to capture.
@@ -33,6 +35,7 @@ pub mod annexb;
 pub mod contract;
 pub mod input;
 pub mod keys;
+pub mod pace;
 pub mod picture;
 pub mod sink;
 pub mod stats;

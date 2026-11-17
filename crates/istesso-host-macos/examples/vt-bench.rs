@@ -5,6 +5,16 @@
 //!
 //! Prints the encoder's own account of itself and a table for a measurement
 //! record. Needs no permission and shows no window.
+//!
+//! A still screen with a change now and then (one character typed, or one
+//! frame per input as the verdict measures):
+//!
+//!     vt-bench --still-ms 1000 --probes 40 --change type
+//!     vt-bench --still-ms 1000 --probes 40 --change type --awake-fps 10
+//!
+//! The second keeps the encoder busy with the unchanged picture between the
+//! changes. Only the changed pictures (probes) are summarised as probes; the
+//! first two are left out (the first is the key frame).
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -15,9 +25,11 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn main() {
     use istesso_host_macos::encoder::{Chroma, Feed, PropertyValue, Settings};
+    use istesso_host_macos::pace::Pace;
     use istesso_host_macos::pump;
-    use istesso_host_macos::sink::{Discard, Generated};
+    use istesso_host_macos::sink::{Change, Discard, FrameSource, Generated, Paced};
     use istesso_host_macos::stats::summarise;
+    use std::time::Duration;
 
     let mut settings = Settings {
         width: 3440,
@@ -33,6 +45,10 @@ fn main() {
     };
     let mut list_properties = false;
     let mut seconds = 45u64;
+    let mut still_ms = None;
+    let mut awake_fps = 0u32;
+    let mut probes = 40u64;
+    let mut change = Change::Type;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut number = |name: &str| -> u64 {
@@ -49,6 +65,19 @@ fn main() {
             "--height" => settings.height = number("--height") as usize,
             "--fps" => settings.fps = number("--fps") as u32,
             "--seconds" => seconds = number("--seconds"),
+            "--still-ms" => still_ms = Some(number("--still-ms")),
+            "--awake-fps" => awake_fps = number("--awake-fps") as u32,
+            "--probes" => probes = number("--probes"),
+            "--change" => {
+                change = match arguments.next().as_deref() {
+                    Some("type") => Change::Type,
+                    Some("scroll") => Change::Scroll,
+                    _ => {
+                        eprintln!("--change is type or scroll");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--bitrate-kbps" => settings.bitrate_bps = number("--bitrate-kbps") as u32 * 1000,
             "--chroma" => {
                 settings.chroma = match number("--chroma") {
@@ -92,16 +121,39 @@ fn main() {
                 eprintln!(
                     "unknown argument {other}\nusage: vt-bench [--width N] [--height N] [--fps N] [--seconds N] \
                      [--bitrate-kbps N] [--chroma 420|444] [--convert-first] [--software-allowed] [--low-latency-rate-control] \
-                     [--unset Name] [--set Name=value] [--list-properties]"
+                     [--unset Name] [--set Name=value] [--list-properties] \
+                     [--still-ms N [--awake-fps N] [--probes N] [--change type|scroll]]"
                 );
                 std::process::exit(2);
             }
         }
     }
 
-    let mut source = Generated::new(settings.width, settings.height);
-    source.limit = Some(seconds * u64::from(settings.fps));
-    let report = match pump::run(&settings, &mut source, Box::new(Discard::default())) {
+    let pace = match still_ms {
+        Some(still) => Pace::Sparse {
+            still: Duration::from_millis(still),
+            awake_fps,
+        },
+        None => Pace::Even { fps: settings.fps },
+    };
+    let mut source: Box<dyn FrameSource> = match pace {
+        Pace::Even { .. } => {
+            let mut source = Generated::new(settings.width, settings.height);
+            source.limit = Some(seconds * u64::from(settings.fps));
+            Box::new(source)
+        }
+        Pace::Sparse { .. } => {
+            let mut source = Paced::new(settings.width, settings.height, pace, change);
+            source.probes = Some(probes);
+            Box::new(source)
+        }
+    };
+    let report = match pump::run_paced(
+        &settings,
+        source.as_mut(),
+        Box::new(Discard::default()),
+        pace,
+    ) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("error: {error}");
@@ -109,10 +161,33 @@ fn main() {
         }
     };
 
-    println!(
-        "picture: {}x{}, {} frames a second, {} s, scrolling text",
-        settings.width, settings.height, settings.fps, seconds
-    );
+    match pace {
+        Pace::Even { .. } => println!(
+            "picture: {}x{}, {} frames a second, {} s, scrolling text",
+            settings.width, settings.height, settings.fps, seconds
+        ),
+        Pace::Sparse { still, awake_fps } => println!(
+            "picture: {}x{}, still screen; one change ({}) after every {} ms, {} changes; \
+             in between: {}; encoder told to expect {} frames a second",
+            settings.width,
+            settings.height,
+            match change {
+                Change::Type => "one character typed",
+                Change::Scroll => "the text scrolls",
+            },
+            still.as_millis(),
+            probes,
+            if awake_fps == 0 {
+                "nothing".to_string()
+            } else {
+                format!(
+                    "the unchanged picture {awake_fps} times a second ({} each stretch)",
+                    pace.fillers()
+                )
+            },
+            settings.fps,
+        ),
+    }
     println!(
         "asked for: H.265 {}, ceiling {} kbit/s, hardware {}, low-latency rate control {}, {}",
         match settings.chroma {
@@ -153,6 +228,11 @@ fn main() {
         for (name, status) in &report.refused {
             println!("property refused: {name} (status {status})");
         }
+    }
+
+    if let Pace::Sparse { .. } = pace {
+        sparse_summary(&report, pace);
+        return;
     }
 
     // As the records of the Linux host do: leave out the first fifth.
@@ -219,4 +299,70 @@ fn main() {
             summary.row("handed over -> encoded (conversion inside the encoder)")
         );
     }
+}
+
+/// The changed pictures and the unchanged ones of a sparse pace, apart.
+#[cfg(target_os = "macos")]
+fn sparse_summary(report: &istesso_host_macos::pump::Report, pace: istesso_host_macos::pace::Pace) {
+    use istesso_host_macos::stats::summarise;
+
+    let encode = |r: &&istesso_host_macos::pump::FrameRecord| {
+        r.encoded_ns.map(|e| (e - r.submitted_ns) as f64 / 1e6)
+    };
+    let changes = report
+        .frames
+        .iter()
+        .filter(|r| pace.is_probe(r.number))
+        .count();
+    let probes: Vec<_> = report
+        .frames
+        .iter()
+        .filter(|r| pace.is_probe(r.number))
+        .skip(2)
+        .collect();
+    let unchanged: Vec<_> = report
+        .frames
+        .iter()
+        .filter(|r| !pace.is_probe(r.number))
+        .skip(2)
+        .collect();
+    println!(
+        "frames: {} handed over, {} changes of which {} measured (first 2 left out), {} unchanged, {} dropped, {} failed, {} key frames",
+        report.frames.len(),
+        changes,
+        probes.iter().filter(|r| r.encoded_ns.is_some()).count(),
+        report.frames.len() - changes,
+        report.dropped,
+        report.failed.len(),
+        report.frames.iter().filter(|r| r.key_frame).count(),
+    );
+    let bytes = |set: &[&istesso_host_macos::pump::FrameRecord]| {
+        set.iter().map(|r| r.bytes).sum::<usize>() as f64 / set.len().max(1) as f64 / 1000.0
+    };
+    println!(
+        "mean frame: changed {:.1} kB, unchanged {:.1} kB",
+        bytes(&probes),
+        bytes(&unchanged)
+    );
+    let late: Vec<f64> = probes.iter().map(|r| r.late_ns as f64 / 1e6).collect();
+    if let Some(late) = summarise(&late) {
+        println!(
+            "hand-over of the changes against the pace: median {:.2} ms late, 99% {:.2} ms, worst {:.2} ms",
+            late.median, late.p99, late.max
+        );
+    }
+    println!();
+    println!("| picture | mean | median | 95% | 99% | max |");
+    println!("|---|---|---|---|---|---|");
+    let changed: Vec<f64> = probes.iter().filter_map(encode).collect();
+    if let Some(summary) = summarise(&changed) {
+        println!("{}", summary.row("changed: handed over -> encoded"));
+    }
+    let same: Vec<f64> = unchanged.iter().filter_map(encode).collect();
+    if let Some(summary) = summarise(&same) {
+        println!("{}", summary.row("unchanged: handed over -> encoded"));
+    }
+    let each: Vec<String> = changed.iter().map(|v| format!("{v:.1}")).collect();
+    println!();
+    println!("changes, each (ms): {}", each.join(" "));
 }
