@@ -25,9 +25,30 @@ With --input it also takes keyboard and pointer input for the application: `iste
 on this machine receives it from a paired device over the control channel and hands it over
 through a socket in the user's runtime directory, one JSON event per datagram.
 
-The stream is not encrypted: for measurements on a trusted network only. Needs GStreamer with
-its Python bindings, the NVIDIA elements and gst-wayland-display (GST_PLUGIN_PATH).
+The stream sent with --to is not encrypted: for measurements on a trusted network only.
+
+With --to-channel the stream leaves encrypted and authenticated instead (docs/adr/0015-media-
+transport.md): this program listens, and a paired device that may look at this host connects
+and is sent the frames over the control channel's kind of channel. Every encoded frame is
+handed to the library `istesso-media` in this process. The lines are the same, and "sent"
+means something a little different:
+
+    sent        the frame was handed to the library (t_ns) and the library had written it to
+                the viewers' connections (written_ns); "rtp" is the frame's sequence number,
+                "packets" the messages of the encrypted channel it took, "viewers" how many
+                devices it went to (0: nobody watches, or the viewer waits for a key frame),
+                "queued" how many of those had not taken all of it at written_ns (the library
+                never waits for a viewer; the rest goes out behind this program's back)
+
+A key frame is made when a viewer connects or asks for one over its connection ("key_request"
+with "by":"client"); nothing listens for unauthenticated requests then.
+
+Needs GStreamer with its Python bindings, the NVIDIA elements and gst-wayland-display
+(GST_PLUGIN_PATH); with --to-channel also the shared library built by
+`cargo build --release -p istesso-media`.
 """
+
+import ctypes
 
 import argparse
 import json
@@ -47,9 +68,67 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from m1_encoder import BITRATE, CHROMA, COLOURS, GOP, RAW_FORMATS, encoder, rate_buffer  # noqa: E402
 
 
+class MediaStreamInfo(ctypes.Structure):
+    """IstessoMediaStreamInfo of crates/istesso-media/include/istesso_media.h."""
+
+    _fields_ = [(name, ctypes.c_uint32) for name in ("codec", "width", "height", "fps", "chroma", "colour")]
+
+
+class MediaSent(ctypes.Structure):
+    """IstessoMediaSent of the same header."""
+
+    _fields_ = [("seq", ctypes.c_uint64)] + [(name, ctypes.c_uint32) for name in ("viewers", "queued", "messages", "reserved")]
+
+
+def open_channel(args, bind, width, height):
+    """Loads istesso-media and starts listening for paired devices. Returns the library and the host, or the library and None."""
+    path = args.media_lib or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "target", "release", "libistesso_media.so")
+    try:
+        media = ctypes.CDLL(path)
+    except OSError as error:
+        print(f"error: cannot load istesso-media ({error}); build it with `cargo build --release -p istesso-media` or name it with --media-lib", file=sys.stderr)
+        return None, None
+    media.istesso_media_host_listen.restype = ctypes.c_void_p
+    media.istesso_media_host_listen.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(MediaStreamInfo)]
+    media.istesso_media_host_send.restype = ctypes.c_int32
+    media.istesso_media_host_send.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int32, ctypes.POINTER(MediaSent),
+    ]
+    media.istesso_media_host_key_frame_wanted.restype = ctypes.c_int32
+    media.istesso_media_host_key_frame_wanted.argtypes = [ctypes.c_void_p]
+    media.istesso_media_host_close.restype = None
+    media.istesso_media_host_close.argtypes = [ctypes.c_void_p]
+    media.istesso_media_last_error.restype = ctypes.c_char_p
+    media.istesso_media_last_error.argtypes = []
+    # H.265 (1), with all of its colour or a quarter of it, said to be sRGB (1) or nothing said (0).
+    info = MediaStreamInfo(1, width, height, args.fps, int(args.chroma), 1 if args.colour == "srgb" else 0)
+    host = media.istesso_media_host_listen(args.config_dir.encode() if args.config_dir else None, bind.encode(), ctypes.byref(info))
+    if not host:
+        print(f"error: cannot listen for paired devices: {media.istesso_media_last_error().decode()}", file=sys.stderr)
+        return media, None
+    return media, host
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--to", required=True, metavar="ADDR[:PORT]", help="where to send the stream (port 5004 unless given); an IPv6 address goes in brackets")
+    out = parser.add_mutually_exclusive_group(required=True)
+    out.add_argument("--to", metavar="ADDR[:PORT]", help="where to send the stream, unencrypted, as RTP over UDP (port 5004 unless given); an IPv6 address goes in brackets")
+    out.add_argument(
+        "--to-channel",
+        metavar="[ADDR:]PORT",
+        help="listen here for paired devices and send them the stream encrypted and authenticated, through the library "
+        "istesso-media (every address of this machine unless one is given; an IPv6 address goes in brackets)",
+    )
+    parser.add_argument(
+        "--media-lib",
+        metavar="FILE",
+        help="with --to-channel: the shared library of istesso-media (target/release/libistesso_media.so of this repository unless given)",
+    )
+    parser.add_argument(
+        "--config-dir",
+        metavar="DIR",
+        help="with --to-channel: where this device's identity and list of paired devices are (where `istesso` keeps them unless given)",
+    )
     parser.add_argument("--log", required=True, metavar="FILE", help="the frame log to write; an existing file is not overwritten. `-` for none: when the pipeline only shows something and nothing is measured")
     parser.add_argument("--render-node", metavar="PATH", help="DRM render node for the compositor, for example /dev/dri/renderD129")
     parser.add_argument("--size", default="1720x720", metavar="WxH")
@@ -109,7 +188,14 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.to.startswith("["):
+    channel = args.to_channel is not None
+    if channel:
+        if args.lose:
+            parser.error("--lose throws packets away, and the channel has none to throw away")
+        address, port = "", ""
+        # A port alone listens on every address, IPv4 and IPv6.
+        bind = args.to_channel if not args.to_channel.isdigit() else f"[::]:{args.to_channel}"
+    elif args.to.startswith("["):
         # An IPv6 address, in brackets as usual where a port follows.
         address, _, port = args.to[1:].partition("]")
         port = port.lstrip(":")
@@ -129,12 +215,23 @@ def main():
         frames = f"video/x-raw(memory:DMABuf),{size} ! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA ! cudaupload ! "
     else:
         frames = f"video/x-raw,{size} ! cudaupload ! "
+    if channel:
+        # Whole access units, NAL units behind start codes, parameter sets with every key frame:
+        # a viewer can begin at any key frame without having been told anything else.
+        way_out = "video/x-h265,stream-format=byte-stream,alignment=au ! appsink name=net emit-signals=true sync=false async=false"
+    else:
+        way_out = f"rtph265pay config-interval=-1 mtu=1200 ! udpsink name=net host={address} port={int(port or 5004)} sync=false async=false"
     description = (
         f"waylanddisplaysrc name=compositor{node} ! {frames}"
         f"{encoder(args.bitrate, args.fps, args.gop, vbv, args.chroma, args.preset, args.colour)} ! "
-        "rtph265pay config-interval=-1 mtu=1200 ! "
-        f"udpsink name=net host={address} port={int(port or 5004)} sync=false async=false"
+        f"{way_out}"
     )
+
+    media = host = None
+    if channel:
+        media, host = open_channel(args, bind, width, height)
+        if host is None:
+            return 1
 
     Gst.init(None)
     pipeline = Gst.parse_launch(description)
@@ -150,8 +247,11 @@ def main():
     log = open(os.devnull, "w") if args.log == "-" else open(args.log, "x", buffering=1 << 20)
     log.write(
         '{"kind":"header","side":"host","tool":"m1-step3-host","version":"2","started_unix_ms":%d,'
-        '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s","pacing":"%s"}\n'
-        % (time.time_ns() // 1_000_000, width, height, args.fps, args.bitrate, args.gop, vbv or 0, args.chroma, args.colour, args.preset, args.frames, pacing)
+        '"size":"%dx%d","fps":%d,"bitrate_kbit":%d,"gop":%d,"vbv_kbit":%d,"chroma":"%s","colour":"%s","preset":"%s","frames":"%s","pacing":"%s","transport":"%s"}\n'
+        % (
+            time.time_ns() // 1_000_000, width, height, args.fps, args.bitrate, args.gop, vbv or 0, args.chroma, args.colour, args.preset, args.frames, pacing,
+            "channel" if channel else "udp",
+        )
     )
 
     def clock_line():
@@ -184,12 +284,51 @@ def main():
         log.write('{"kind":"converted","pts":%d,"t_ns":%d}\n' % (info.get_buffer().pts, time.monotonic_ns()))
         return Gst.PadProbeReturn.OK
 
+    # When each frame left the encoder, until the frame is sent: the time travels with it.
+    encoded_at = {}
+
     def on_encoded(pad, info):
         now = time.monotonic_ns()
         buffer = info.get_buffer()
         key = 0 if buffer.has_flags(Gst.BufferFlags.DELTA_UNIT) else 1
         log.write('{"kind":"encoded","pts":%d,"t_ns":%d,"bytes":%d,"key":%d}\n' % (buffer.pts, now, buffer.get_size(), key))
+        if channel:
+            encoded_at[buffer.pts] = now
         return Gst.PadProbeReturn.OK
+
+    sent = MediaSent()
+
+    def on_access_unit(sink):
+        # On the thread the frame came out of the encoder on: the frame is sealed and put on
+        # the viewers' connections before this returns, as far as they take it at once.
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buffer = sample.get_buffer()
+        mapped, unit = buffer.map(Gst.MapFlags.READ)
+        if not mapped:
+            return Gst.FlowReturn.OK
+        key = 0 if buffer.has_flags(Gst.BufferFlags.DELTA_UNIT) else 1
+        data = unit.data
+        handed = time.monotonic_ns()
+        result = media.istesso_media_host_send(host, data, len(data), buffer.pts, encoded_at.pop(buffer.pts, handed), key, ctypes.byref(sent))
+        written = time.monotonic_ns()
+        buffer.unmap(unit)
+        if result != 0:
+            print(f"error: the frame was not sent: {media.istesso_media_last_error().decode()}", file=sys.stderr)
+            return Gst.FlowReturn.OK
+        log.write(
+            '{"kind":"sent","pts":%d,"t_ns":%d,"rtp":%d,"packets":%d,"written_ns":%d,"viewers":%d,"queued":%d,"bytes":%d}\n'
+            % (buffer.pts, handed, sent.seq, sent.messages, written, sent.viewers, sent.queued, len(data))
+        )
+        return Gst.FlowReturn.OK
+
+    def on_wanted():
+        # A viewer has connected, has asked for a key frame, or was held back. Looked at
+        # every few milliseconds, also while no frame is produced.
+        if media.istesso_media_host_key_frame_wanted(host):
+            key_frame("client")
+        return True
 
     lost = {"at": time.monotonic_ns()}
 
@@ -279,7 +418,10 @@ def main():
     watch("compositor", "src", Gst.PadProbeType.BUFFER, on_frame)
     watch("convert", "src", Gst.PadProbeType.BUFFER, on_converted)
     watch("enc", "src", Gst.PadProbeType.BUFFER, on_encoded)
-    watch("net", "sink", Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, on_send)
+    if channel:
+        pipeline.get_by_name("net").connect("new-sample", on_access_unit)
+    else:
+        watch("net", "sink", Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, on_send)
 
     loop = GLib.MainLoop()
     failed = []
@@ -320,7 +462,9 @@ def main():
         inputs.bind(path)
         inputs.setblocking(False)
         GLib.io_add_watch(inputs.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, on_input)
-    if args.key_requests:
+    if channel:
+        GLib.timeout_add(4, on_wanted)
+    elif args.key_requests:
         # Both kinds of address: the reports come from wherever the stream goes.
         requests = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         requests.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -338,6 +482,8 @@ def main():
     print("playing", flush=True)
     loop.run()
     pipeline.set_state(Gst.State.NULL)
+    if channel:
+        media.istesso_media_host_close(host)
     clock_line()
     if args.input:
         log.write('{"kind":"input","events":%d}\n' % taken["count"])

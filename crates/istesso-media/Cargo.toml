@@ -1,0 +1,31 @@
+[package]
+name = "istesso-media"
+description = "Carries the picture of an application from a host to a paired device, encrypted and authenticated."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# The library for Rust callers, and the same thing behind a C interface (include/istesso_media.h)
+# for the programs that are not written in Rust: the measuring pipeline on the host loads the
+# shared library, the viewer on the Mac links the static one.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+istesso-pair.workspace = true
+istesso-link.workspace = true
+# Only for where a device keeps its identity and its list of paired devices (`Paths`), so that the
+# C interface finds them without being told.
+istesso-agent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Waiting on a connection and a wake-up at once, the clock the measuring tools use, and the
+# scheduling of the receiving thread. Not through the workspace table yet: the audio stream adds
+# `libc` there on its branch, and two branches adding the same key do not merge. Once both are in,
+# this becomes `libc.workspace = true`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

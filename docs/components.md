@@ -17,6 +17,7 @@
 | RustCrypto（spake2、chacha20poly1305、hkdf、sha2）、dalek | ペアリングの暗号部品 | MIT OR Apache-2.0、BSD-3-Clause | <https://github.com/RustCrypto/PAKEs> |
 | snow | 制御チャンネルの Noise プロトコル（ADR 0007）。使う部品だけを有効にしている | Apache-2.0 OR MIT | <https://github.com/mcginty/snow> |
 | mdns-sd | LAN 内の発見（mDNS / DNS-SD） | Apache-2.0 OR MIT | <https://github.com/keepsimple1/mdns-sd> |
+| libc | OS の呼び出し。映像の経路（`istesso-media`、[ADR 0015](adr/0015-media-transport.md)）が、接続と合図を同時に待つこと（`poll`）、計測の道具と同じ時計を読むこと、受信スレッドの優先度を上げることに使う。これまでも、ほかのクレートの依存として入っていた | MIT OR Apache-2.0 | <https://github.com/rust-lang/libc> |
 | winit、softbuffer | テストアプリ（`istesso-flash`）の窓と描画。`istesso` 本体には入らない | Apache-2.0、MIT OR Apache-2.0 | <https://github.com/rust-windowing/winit>、<https://github.com/rust-windowing/softbuffer> |
 | glutin、glutin-winit、glow | テストアプリが GPU で描くときの OpenGL（`--draw gpu`）。`istesso` 本体には入らない | Apache-2.0、MIT、MIT OR Apache-2.0 OR Zlib | <https://github.com/rust-windowing/glutin>、<https://github.com/grovesNL/glow> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
