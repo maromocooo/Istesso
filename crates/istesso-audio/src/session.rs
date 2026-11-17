@@ -838,6 +838,10 @@ pub struct Arrivals {
     /// Time between audio packets that followed each other, microseconds.
     intervals_us: Vec<f64>,
     received: Option<Vec<Entry>>,
+    /// Connections that ended without the source having said so.
+    cuts: u64,
+    /// The next audio packet is the first of a new connection.
+    rejoined: bool,
 }
 
 /// [`Arrivals`] in numbers.
@@ -852,6 +856,9 @@ pub struct ArrivalStats {
     pub breaks: u64,
     /// Frames that found the queue to the sound card full.
     pub refused_frames: u64,
+    /// Connections that ended without the source having said so; each was
+    /// followed by a new one.
+    pub cut_connections: u64,
     /// Time between one audio packet and the next, in milliseconds.
     pub interval_ms: Option<crate::probe::Spread>,
 }
@@ -916,6 +923,7 @@ impl Arrivals {
             lost_packets: self.lost_packets,
             breaks: self.breaks,
             refused_frames: self.refused_frames,
+            cut_connections: self.cuts,
             interval_ms: crate::probe::Spread::of(&mut intervals),
         }
     }
@@ -933,6 +941,79 @@ pub enum Ended {
     BySource,
     /// `stop` was set.
     Stopped,
+}
+
+/// What happens to a stream that is kept alive across connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejoining {
+    /// The connection ended without the source having said so.
+    Cut,
+    /// A new connection carries the stream again.
+    Rejoined,
+}
+
+/// How long nothing may arrive on a healthy connection: a source with
+/// nothing to play still says so twice a second.
+pub const SILENT_CONNECTION: Duration = Duration::from_secs(1);
+
+/// [`pump`], and when the connection is cut, a new one: a network may drop
+/// a connection that both ends still believe in, and an exit that then
+/// stays silent is no use to anybody.
+///
+/// A connection counts as cut when it fails or when nothing arrives on it
+/// for the time it was given to wait ([`SILENT_CONNECTION`] is meant).
+/// `connect` is then tried every `retry` until it yields a connection or
+/// `stop` is set. The first audio of the new connection is marked as not
+/// following on, so that the playout joins it properly.
+///
+/// The stream is not taken up again when the source ended it: it may have
+/// handed the sound to another exit, and two exits that take it back from
+/// each other would never stop. Nor when the source refuses this device:
+/// then the pairing or the right is gone, and asking again changes nothing.
+pub fn pump_reconnecting(
+    mut subscription: Subscription,
+    mut connect: impl FnMut() -> Result<Subscription>,
+    queue: &mut Writer,
+    arrivals: &mut Arrivals,
+    stop: &AtomicBool,
+    retry: Duration,
+    mut said: impl FnMut(Rejoining),
+) -> Result<Ended> {
+    let (rate, channels) = (subscription.info.sample_rate, subscription.info.channels);
+    loop {
+        match pump(&mut subscription, queue, arrivals, stop) {
+            Ok(ended) => return Ok(ended),
+            Err(_) if stop.load(Ordering::Relaxed) => return Ok(Ended::Stopped),
+            Err(_) => {}
+        }
+        arrivals.cuts += 1;
+        // Sequence numbers and intervals begin anew with the connection.
+        arrivals.last_seq = None;
+        arrivals.last_audio_ns = None;
+        said(Rejoining::Cut);
+        subscription = loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(Ended::Stopped);
+            }
+            match connect() {
+                Ok(next) => break next,
+                Err(err @ (Error::Forbidden | Error::Refused(_) | Error::Unsupported(_))) => {
+                    return Err(err)
+                }
+                Err(Error::Link(LinkError::NotTrusted | LinkError::UnknownPeer)) => {
+                    return Err(Error::Forbidden)
+                }
+                Err(_) => std::thread::sleep(retry),
+            }
+        };
+        if (subscription.info.sample_rate, subscription.info.channels) != (rate, channels) {
+            return Err(Error::Unsupported(
+                "the source came back with another kind of stream".to_string(),
+            ));
+        }
+        arrivals.rejoined = true;
+        said(Rejoining::Rejoined);
+    }
 }
 
 /// Moves packets from the connection into the queue of the playout until
@@ -956,7 +1037,9 @@ pub fn pump(
             Kind::Audio => {
                 // A packet that never came breaks the stream as much as one
                 // the source left out.
-                let discontinuity = header.discontinuity || arrivals.lost_packets > lost_before;
+                let discontinuity = header.discontinuity
+                    || arrivals.lost_packets > lost_before
+                    || std::mem::take(&mut arrivals.rejoined);
                 if !queue.push_audio(
                     frames,
                     &samples,
@@ -1420,6 +1503,162 @@ mod tests {
         assert_eq!(stats.lost_packets, 0);
         assert_eq!(stats.refused_frames, 0);
         assert!(stats.interval_ms.is_some());
+    }
+
+    /// A connection to the source for [`pump_reconnecting`], with a second
+    /// handle on it left where the test can reach it.
+    fn connector(
+        addr: SocketAddr,
+        exit: &Device,
+        host_id: &str,
+        handles: Arc<Mutex<Vec<TcpStream>>>,
+    ) -> impl FnMut() -> Result<Subscription> {
+        let (keys, peers, host_id) = (exit.keys(), exit.peers(), host_id.to_string());
+        move || {
+            let subscription = subscribe(addr, &keys, &peers, Some(&host_id), WAIT)?;
+            subscription.set_timeout(SILENT_CONNECTION);
+            handles.lock().unwrap().push(subscription.connection()?);
+            Ok(subscription)
+        }
+    }
+
+    #[test]
+    fn a_connection_that_is_cut_is_followed_by_a_new_one() {
+        let (host, exit, host_id, _) = paired();
+        let (addr, mut capture, _, _) = start_source(&host);
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let mut connect = connector(addr, &exit, &host_id, handles.clone());
+        let subscription = connect().unwrap();
+        let (mut queue_in, mut queue_out) = queue(2, 1 << 16);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_pump = stop.clone();
+        let pumping = std::thread::spawn(move || {
+            let mut arrivals = Arrivals::new(false);
+            let mut events = Vec::new();
+            let result = pump_reconnecting(
+                subscription,
+                connect,
+                &mut queue_in,
+                &mut arrivals,
+                &stop_pump,
+                Duration::from_millis(20),
+                |event| events.push(event),
+            );
+            (result, arrivals.stats(), events)
+        });
+
+        // Audio flows; then the connection is cut under the stream, as a
+        // network does it: no word from the source.
+        let begin = Instant::now();
+        let mut n = 0;
+        let mut feed = |capture: &mut CaptureWriter| {
+            capture.push(&piece(n), 0);
+            n += 1;
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(begin.elapsed() < WAIT, "no audio in time");
+        };
+        while queue_out.available() < 10 * 256 {
+            feed(&mut capture);
+        }
+        handles.lock().unwrap()[0]
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
+        // A second connection appears, and audio arrives on it.
+        while handles.lock().unwrap().len() < 2 {
+            feed(&mut capture);
+        }
+        let before = queue_out.taken() + queue_out.available() as u64;
+        while queue_out.taken() + (queue_out.available() as u64) < before + 10 * 256 {
+            feed(&mut capture);
+        }
+        // The first audio after the cut is marked as not following on.
+        let mut marked = false;
+        let mut frames = vec![0.0f32; 512];
+        while queue_out.available() >= 256 {
+            queue_out.scan_new(|mark| marked |= mark.discontinuity);
+            queue_out.read(256, &mut frames);
+        }
+        assert!(marked, "the join after the cut was not marked");
+
+        stop.store(true, Ordering::Relaxed);
+        let (result, stats, events) = pumping.join().unwrap();
+        assert!(matches!(result, Ok(Ended::Stopped)), "{result:?}");
+        assert_eq!(stats.cut_connections, 1);
+        assert_eq!(events, vec![Rejoining::Cut, Rejoining::Rejoined]);
+        // Packets that went into the cut connection are not counted as
+        // lost within a connection.
+        assert_eq!(stats.lost_packets, 0);
+    }
+
+    #[test]
+    fn a_device_that_lost_its_right_does_not_keep_asking() {
+        let (host, exit, host_id, exit_id) = paired();
+        let (addr, _capture, _, _) = start_source(&host);
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let mut connect = connector(addr, &exit, &host_id, handles.clone());
+        let subscription = connect().unwrap();
+        let (mut queue_in, _queue_out) = queue(2, 1 << 16);
+        let stop = AtomicBool::new(false);
+        // The right goes, and the connection is cut before the source has
+        // said anything.
+        host.allow_audio(&exit_id, false);
+        handles.lock().unwrap()[0]
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
+        let mut arrivals = Arrivals::new(false);
+        let result = pump_reconnecting(
+            subscription,
+            connect,
+            &mut queue_in,
+            &mut arrivals,
+            &stop,
+            Duration::from_millis(20),
+            |_| {},
+        );
+        assert!(matches!(result, Err(Error::Forbidden)), "{result:?}");
+        assert_eq!(handles.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_source_that_is_gone_is_asked_again_until_the_exit_stops() {
+        let (host, exit, host_id, _) = paired();
+        // A source that never serves: its port is taken and released.
+        let (addr, _capture, _, _) = start_source(&host);
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let mut connect = connector(addr, &exit, &host_id, handles.clone());
+        let subscription = connect().unwrap();
+        handles.lock().unwrap()[0]
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
+        let (mut queue_in, _queue_out) = queue(2, 1 << 16);
+        let stop = Arc::new(AtomicBool::new(false));
+        let tries = Arc::new(AtomicU32::new(0));
+        let (stopping, tried) = (stop.clone(), tries.clone());
+        // Every attempt fails as an unreachable source does; after a few
+        // of them the exit is told to stop.
+        let failing = move || {
+            if tried.fetch_add(1, Ordering::Relaxed) == 4 {
+                stopping.store(true, Ordering::Relaxed);
+            }
+            Err(Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
+        };
+        let mut arrivals = Arrivals::new(false);
+        let result = pump_reconnecting(
+            subscription,
+            failing,
+            &mut queue_in,
+            &mut arrivals,
+            &stop,
+            Duration::from_millis(5),
+            |_| {},
+        );
+        assert!(matches!(result, Ok(Ended::Stopped)), "{result:?}");
+        assert_eq!(tries.load(Ordering::Relaxed), 5);
+        assert_eq!(arrivals.stats().cut_connections, 1);
+        drop(connect);
     }
 
     /// Reads until the other end hangs up, and says how long that took.

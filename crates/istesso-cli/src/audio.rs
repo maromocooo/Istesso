@@ -744,7 +744,9 @@ mod mac {
     use istesso_audio::probe::Spread;
     use istesso_audio::resample::Sinc;
     use istesso_audio::rtrb::RingBuffer;
-    use istesso_audio::session::{clock_offset, pump, subscribe, Arrivals};
+    use istesso_audio::session::{
+        clock_offset, pump_reconnecting, subscribe, Arrivals, Rejoining, SILENT_CONNECTION,
+    };
     use istesso_link::LocalKeys;
 
     /// How the device asked for audio.
@@ -804,7 +806,7 @@ mod mac {
                 Err(err) => return Err(err.to_string()),
             }
         };
-        let mut subscription =
+        let subscription =
             subscribe(addr, &keys, &peers, expected.as_deref(), wait).map_err(|e| e.to_string())?;
         let info = subscription.info().clone();
         let channels = usize::from(info.channels);
@@ -823,19 +825,61 @@ mod mac {
         // One packet's time, for the scheduling of the thread that receives.
         let packet_time =
             Duration::from_secs_f64(f64::from(info.packet_frames.max(64)) / stream_rate);
+        // The receiving thread makes a new connection when one is cut. It
+        // gets keys and a list of paired devices of its own for that.
+        let again_keys = LocalKeys::new(&identity).map_err(|e| e.to_string())?;
+        let again_peers = super::super::open_peers()?;
+        let again_expected = expected.clone();
         let pumping = std::thread::spawn(move || {
             // The receiving thread is part of the audio path: scheduled as
             // the sound card's thread is, so that it is not held up.
-            if !istesso_audio::mac::make_this_thread_real_time(
-                packet_time,
-                Duration::from_micros(1500),
-                Duration::from_millis(3),
-            ) {
-                eprintln!("the receiving thread could not be given real-time scheduling");
-            }
+            let real_time = || {
+                if !istesso_audio::mac::make_this_thread_real_time(
+                    packet_time,
+                    Duration::from_micros(1500),
+                    Duration::from_millis(3),
+                ) {
+                    eprintln!("the receiving thread could not be given real-time scheduling");
+                }
+            };
+            real_time();
             let mut arrivals = Arrivals::new(keep_ledger);
-            subscription.set_timeout(Duration::from_secs(3));
-            let result = pump(&mut subscription, &mut queue_in, &mut arrivals, &stop_pump);
+            subscription.set_timeout(SILENT_CONNECTION);
+            let connect = || {
+                let wait = Duration::from_secs(2);
+                let next = subscribe(
+                    addr,
+                    &again_keys,
+                    &again_peers,
+                    again_expected.as_deref(),
+                    wait,
+                )?;
+                next.set_timeout(SILENT_CONNECTION);
+                Ok(next)
+            };
+            let began = Instant::now();
+            let result = pump_reconnecting(
+                subscription,
+                connect,
+                &mut queue_in,
+                &mut arrivals,
+                &stop_pump,
+                Duration::from_millis(250),
+                |event| {
+                    let at = began.elapsed().as_secs_f64();
+                    match event {
+                        Rejoining::Cut => {
+                            eprintln!("{at:>7.1} s since the start: the connection was cut; connecting again")
+                        }
+                        Rejoining::Rejoined => {
+                            eprintln!("{at:>7.1} s since the start: connected again");
+                            // Making a connection takes longer than this
+                            // thread said its work would; say it anew.
+                            real_time();
+                        }
+                    }
+                },
+            );
             (result, arrivals)
         });
 
