@@ -1,0 +1,413 @@
+A record of the input the compositor was given, and of the modifier state it then holds: for
+finding a fault in the input by looking instead of guessing (docs/input-record.md). It is the
+last of three places such a record can be written; the other two need no patch
+(scripts/input_record.py: what reached the pipeline, and what the application was told).
+
+NOT for the plugin a measurement or the gate uses. Build it in a folder of its own and name
+that folder to a trial with ISTESSO_HOST_PLUGIN; the folders the other patches' headers name
+stay as they are.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
+gst-wayland-display-cursor-messages.patch, gst-wayland-display-windows.patch and
+gst-wayland-display-dialogs.patch in this directory, in that order. The lines of context are
+from that project and from those patches.
+
+What it adds:
+
+- wayland-display-core/src/comp/input_record.rs: when the environment names a file
+  (ISTESSO_COMPOSITOR_INPUT_RECORD=/path), one JSON line is added to it for each key, button
+  and scroll the compositor is given, with the keyboard's modifier state after it: the three
+  numbers a `wl_keyboard.modifiers` event carries (depressed, latched, locked), the modifiers
+  by name, and whether a window has the keyboard (a key is passed on only then). Without the
+  variable nothing is opened and nothing is written.
+- A modifier key is named (both Shifts, Controls, Alts and Supers, Caps Lock, Num Lock). Which
+  key any other key was is never written down: its line says "key". No pointer position is
+  written down. The file is its owner's only.
+- comp/input.rs: `keyboard_input`, `pointer_button` and `pointer_axis` call it.
+
+    {"kind":"header","record":"compositor","version":1,"note":"..."}
+    {"t_ns":...,"kind":"modifier","name":"shift_l","state":"down","depressed":1,"latched":0,"locked":0,"held":["shift"],"focus":true}
+    {"t_ns":...,"kind":"key","name":"key","state":"down","depressed":1,"latched":0,"locked":0,"held":["shift"],"focus":true}
+    {"t_ns":...,"kind":"button","name":"left","state":"down","depressed":8,"latched":0,"locked":0,"held":["alt"],"focus":true}
+    {"t_ns":...,"kind":"scroll","name":"vertical","dx":0.000,"dy":-0.375,"depressed":1,"latched":0,"locked":0,"held":["shift"],"focus":true}
+
+How to build (on the host, in a folder of its own; nothing existing is touched):
+
+    git clone https://github.com/games-on-whales/gst-wayland-display ~/.cache/istesso-inputlog-wip/gwd-input-record
+    cd ~/.cache/istesso-inputlog-wip/gwd-input-record && git checkout 1301f86
+    git apply <the four patches above, in that order> && git apply <this file>
+    cargo test -p wayland-display-core input_record
+    cargo build --release -p gst-plugin-wayland-display -p wayland-display-core --features cuda
+
+and a trial takes it with
+
+    ISTESSO_HOST_PLUGIN='~/.cache/istesso-inputlog-wip/gwd-input-record/target/release' ISTESSO_INPUT_RECORD=1 TRY=channel scripts/try.sh COMMAND
+
+State on 2026-11-18: NOT built and NOT run. It was written while nothing could be started on
+the host. Checked so far: it applies to the tree with the four patches (the `index` lines
+below match); input_record.rs uses the standard library only and was compiled alone, and its
+three tests passed (the named keys are the ten modifiers; a line is the same whichever other
+key it was; the lines of a modifier, a button and a scroll); the changed files pass rustfmt.
+The calls in comp/input.rs were written by reading smithay at the revision the project uses
+(`KeyboardHandle::modifier_state`, `current_focus`, `ModifiersState::serialized`) and have
+not been through a compiler.
+
+diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
+index ce1ce1a..f680fb4 100644
+--- a/wayland-display-core/src/comp/input.rs
++++ b/wayland-display-core/src/comp/input.rs
+@@ -1,4 +1,4 @@
+-use super::{State, focus::FocusTarget};
++use super::{State, focus::FocusTarget, input_record};
+ use smithay::backend::input::Keycode;
+ use smithay::backend::libinput::LibinputInputBackend;
+ use smithay::input::keyboard::Keysym;
+@@ -11,7 +11,7 @@ use smithay::{
+         TouchSlot,
+     },
+     input::{
+-        keyboard::{FilterResult, keysyms},
++        keyboard::{FilterResult, ModifiersState, keysyms},
+         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
+         touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
+     },
+@@ -40,7 +40,32 @@ impl LibinputInterface for NixInterface {
+     }
+ }
+ 
++/// The keyboard's modifier state as the input record writes it down.
++fn recorded(modifiers: &ModifiersState, focus: bool) -> input_record::Mods {
++    input_record::Mods {
++        depressed: modifiers.serialized.depressed,
++        latched: modifiers.serialized.latched,
++        locked: modifiers.serialized.locked,
++        shift: modifiers.shift,
++        ctrl: modifiers.ctrl,
++        alt: modifiers.alt,
++        logo: modifiers.logo,
++        caps_lock: modifiers.caps_lock,
++        num_lock: modifiers.num_lock,
++        focus,
++    }
++}
++
+ impl State {
++    /// The modifier state for a line of the input record about the pointer.
++    fn recorded_now(&self) -> input_record::Mods {
++        let keyboard = self.seat.get_keyboard().unwrap();
++        recorded(
++            &keyboard.modifier_state(),
++            keyboard.current_focus().is_some(),
++        )
++    }
++
+     pub fn scancode_to_keycode(&self, scancode: u32) -> Keycode {
+         // see: https://github.com/rust-x-bindings/xkbcommon-rs/blob/cb449998d8a3de375d492fb7ec015b2925f38ddb/src/xkb/mod.rs#L50-L58
+         Keycode::new(scancode + 8)
+@@ -49,6 +74,11 @@ impl State {
+     pub fn keyboard_input(&mut self, event_time_msec: u32, keycode: Keycode, state: KeyState) {
+         let serial = SERIAL_COUNTER.next_serial();
+         let keyboard = self.seat.get_keyboard().unwrap();
++        // For the input record (off unless asked for): Linux's number of the key, and whether
++        // a window has the keyboard.
++        let record = input_record::on();
++        let code = keycode.raw().wrapping_sub(8);
++        let focus = record && keyboard.current_focus().is_some();
+ 
+         keyboard.input::<(), _>(
+             self,
+@@ -57,6 +87,14 @@ impl State {
+             serial,
+             event_time_msec,
+             |data, modifiers, handle| {
++                if record {
++                    // What was given, and the modifier state after it.
++                    input_record::key(
++                        code,
++                        state == KeyState::Pressed,
++                        &recorded(modifiers, focus),
++                    );
++                }
+                 if state == KeyState::Pressed {
+                     if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.logo {
+                         match handle.modified_sym() {
+@@ -294,6 +332,13 @@ impl State {
+ 
+     pub fn pointer_button(&mut self, event_time_msec: u32, button_code: u32, state: ButtonState) {
+         self.last_pointer_movement = Instant::now();
++        if input_record::on() {
++            input_record::button(
++                button_code,
++                ButtonState::Pressed == state,
++                &self.recorded_now(),
++            );
++        }
+         let serial = SERIAL_COUNTER.next_serial();
+ 
+         if ButtonState::Pressed == state {
+@@ -321,6 +366,9 @@ impl State {
+         horizontal_amount_discrete: Option<f64>,
+         vertical_amount_discrete: Option<f64>,
+     ) {
++        if input_record::on() {
++            input_record::scroll(horizontal_amount, vertical_amount, &self.recorded_now());
++        }
+         let mut frame = AxisFrame::new(event_time_msec).source(source);
+         if horizontal_amount != 0.0 {
+             frame = frame.value(Axis::Horizontal, horizontal_amount);
+diff --git a/wayland-display-core/src/comp/input_record.rs b/wayland-display-core/src/comp/input_record.rs
+new file mode 100644
+index 0000000..83e7b72
+--- /dev/null
++++ b/wayland-display-core/src/comp/input_record.rs
+@@ -0,0 +1,237 @@
++//! A record of the input the compositor was given, and of the modifier state it then holds,
++//! for finding a fault by looking. Off unless the environment names a file:
++//!
++//!     ISTESSO_COMPOSITOR_INPUT_RECORD=/path/to/file
++//!
++//! One JSON line for each key, button and scroll, added to the file. A modifier key is named;
++//! which key any other key was is never written down: such a line says "key" and nothing more,
++//! so that what is typed cannot be read back. No pointer position is written down.
++//!
++//!     {"t_ns":…,"kind":"modifier","name":"shift_l","state":"down","depressed":1,"latched":0,"locked":0,"held":["shift"],"focus":true}
++//!     {"t_ns":…,"kind":"key","name":"key","state":"down","depressed":1,"latched":0,"locked":0,"held":["shift"],"focus":true}
++//!
++//! "depressed", "latched" and "locked" are the numbers a `wl_keyboard.modifiers` event carries,
++//! after the line's own key; "focus" says whether a window has the keyboard, which is when a key
++//! is passed on at all.
++
++use std::fs::{File, OpenOptions};
++use std::io::Write;
++use std::os::unix::fs::OpenOptionsExt;
++use std::sync::{Mutex, OnceLock};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++/// The keys that are named, by Linux's number for them (linux/input-event-codes.h). Every
++/// other key is "key".
++const MODIFIERS: [(u32, &str); 10] = [
++    (42, "shift_l"),
++    (54, "shift_r"),
++    (29, "ctrl_l"),
++    (97, "ctrl_r"),
++    (56, "alt_l"),
++    (100, "alt_r"),
++    (125, "super_l"),
++    (126, "super_r"),
++    (58, "caps_lock"),
++    (69, "num_lock"),
++];
++
++const HEADER: &str = "{\"kind\":\"header\",\"record\":\"compositor\",\"version\":1,\"note\":\"keys other than modifiers are never identified: such a line says key and not which; no pointer position is recorded\"}";
++
++/// The keyboard's modifier state at the moment of a line, in plain values.
++pub(crate) struct Mods {
++    pub depressed: u32,
++    pub latched: u32,
++    pub locked: u32,
++    pub shift: bool,
++    pub ctrl: bool,
++    pub alt: bool,
++    pub logo: bool,
++    pub caps_lock: bool,
++    pub num_lock: bool,
++    /// A window has the keyboard.
++    pub focus: bool,
++}
++
++fn key_name(code: u32) -> &'static str {
++    MODIFIERS
++        .iter()
++        .find(|(modifier, _)| *modifier == code)
++        .map_or("key", |(_, name)| name)
++}
++
++fn button_name(code: u32) -> &'static str {
++    match code {
++        0x110 => "left",
++        0x111 => "right",
++        0x112 => "middle",
++        0x113 => "side",
++        0x114 => "extra",
++        _ => "other",
++    }
++}
++
++fn state_name(pressed: bool) -> &'static str {
++    if pressed { "down" } else { "up" }
++}
++
++fn mods_fields(mods: &Mods) -> String {
++    let held: Vec<&str> = [
++        (mods.shift, "\"shift\""),
++        (mods.ctrl, "\"ctrl\""),
++        (mods.alt, "\"alt\""),
++        (mods.logo, "\"super\""),
++        (mods.caps_lock, "\"caps_lock\""),
++        (mods.num_lock, "\"num_lock\""),
++    ]
++    .iter()
++    .filter(|(on, _)| *on)
++    .map(|(_, name)| *name)
++    .collect();
++    format!(
++        "\"depressed\":{},\"latched\":{},\"locked\":{},\"held\":[{}],\"focus\":{}",
++        mods.depressed,
++        mods.latched,
++        mods.locked,
++        held.join(","),
++        mods.focus
++    )
++}
++
++fn key_line(t_ns: u128, code: u32, pressed: bool, mods: &Mods) -> String {
++    let name = key_name(code);
++    let kind = if name == "key" { "key" } else { "modifier" };
++    format!(
++        "{{\"t_ns\":{t_ns},\"kind\":\"{kind}\",\"name\":\"{name}\",\"state\":\"{}\",{}}}",
++        state_name(pressed),
++        mods_fields(mods)
++    )
++}
++
++fn button_line(t_ns: u128, code: u32, pressed: bool, mods: &Mods) -> String {
++    format!(
++        "{{\"t_ns\":{t_ns},\"kind\":\"button\",\"name\":\"{}\",\"state\":\"{}\",{}}}",
++        button_name(code),
++        state_name(pressed),
++        mods_fields(mods)
++    )
++}
++
++fn scroll_line(t_ns: u128, dx: f64, dy: f64, mods: &Mods) -> String {
++    let amount = |value: f64| if value.is_finite() { value } else { 0.0 };
++    let name = match (dx != 0.0, dy != 0.0) {
++        (true, true) => "both",
++        (true, false) => "horizontal",
++        _ => "vertical",
++    };
++    format!(
++        "{{\"t_ns\":{t_ns},\"kind\":\"scroll\",\"name\":\"{name}\",\"dx\":{:.3},\"dy\":{:.3},{}}}",
++        amount(dx),
++        amount(dy),
++        mods_fields(mods)
++    )
++}
++
++/// The file, opened the first time it is asked for. `None` when the environment names none or
++/// it cannot be opened: then nothing is written and nothing is said.
++fn file() -> Option<&'static Mutex<File>> {
++    static FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
++    FILE.get_or_init(|| {
++        let path = std::env::var_os("ISTESSO_COMPOSITOR_INPUT_RECORD")?;
++        let mut file = OpenOptions::new()
++            .create(true)
++            .append(true)
++            .mode(0o600) // its owner's only
++            .open(path)
++            .ok()?;
++        writeln!(file, "{HEADER}").ok()?;
++        Some(Mutex::new(file))
++    })
++    .as_ref()
++}
++
++fn now_ns() -> u128 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map_or(0, |since| since.as_nanos())
++}
++
++fn write(line: String) {
++    let Some(file) = file() else { return };
++    let Ok(mut file) = file.lock() else { return };
++    let _ = writeln!(file, "{line}");
++}
++
++/// Whether a record is being written. The callers ask first, so that nothing is put together
++/// for a record that is off.
++pub(crate) fn on() -> bool {
++    file().is_some()
++}
++
++pub(crate) fn key(code: u32, pressed: bool, mods: &Mods) {
++    write(key_line(now_ns(), code, pressed, mods));
++}
++
++pub(crate) fn button(code: u32, pressed: bool, mods: &Mods) {
++    write(button_line(now_ns(), code, pressed, mods));
++}
++
++pub(crate) fn scroll(dx: f64, dy: f64, mods: &Mods) {
++    write(scroll_line(now_ns(), dx, dy, mods));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn mods(depressed: u32, shift: bool) -> Mods {
++        Mods {
++            depressed,
++            latched: 0,
++            locked: 0,
++            shift,
++            ctrl: false,
++            alt: false,
++            logo: false,
++            caps_lock: false,
++            num_lock: false,
++            focus: true,
++        }
++    }
++
++    #[test]
++    fn the_named_keys_are_the_ten_modifiers_and_no_other() {
++        let named: Vec<u32> = (0..768).filter(|code| key_name(*code) != "key").collect();
++        assert_eq!(named, vec![29, 42, 54, 56, 58, 69, 97, 100, 125, 126]);
++        assert_eq!(key_name(42), "shift_l");
++        assert_eq!(key_name(100), "alt_r");
++    }
++
++    #[test]
++    fn a_line_is_the_same_whichever_key_it_was() {
++        let expected = key_line(7, 30, true, &mods(1, true));
++        assert_eq!(
++            expected,
++            "{\"t_ns\":7,\"kind\":\"key\",\"name\":\"key\",\"state\":\"down\",\"depressed\":1,\"latched\":0,\"locked\":0,\"held\":[\"shift\"],\"focus\":true}"
++        );
++        for code in (0..768).filter(|code| key_name(*code) == "key") {
++            assert_eq!(key_line(7, code, true, &mods(1, true)), expected);
++        }
++    }
++
++    #[test]
++    fn a_modifier_a_button_and_a_scroll() {
++        assert_eq!(
++            key_line(1, 42, true, &mods(1, true)),
++            "{\"t_ns\":1,\"kind\":\"modifier\",\"name\":\"shift_l\",\"state\":\"down\",\"depressed\":1,\"latched\":0,\"locked\":0,\"held\":[\"shift\"],\"focus\":true}"
++        );
++        assert_eq!(
++            button_line(2, 0x110, false, &mods(0, false)),
++            "{\"t_ns\":2,\"kind\":\"button\",\"name\":\"left\",\"state\":\"up\",\"depressed\":0,\"latched\":0,\"locked\":0,\"held\":[],\"focus\":true}"
++        );
++        assert_eq!(
++            scroll_line(3, 0.0, -15.0, &mods(1, true)),
++            "{\"t_ns\":3,\"kind\":\"scroll\",\"name\":\"vertical\",\"dx\":0.000,\"dy\":-15.000,\"depressed\":1,\"latched\":0,\"locked\":0,\"held\":[\"shift\"],\"focus\":true}"
++        );
++        assert!(scroll_line(4, f64::NAN, 1.0, &mods(0, false)).contains("\"dx\":0.000"));
++    }
++}
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 68e95df..a54696d 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -72,6 +72,7 @@ use tracing::debug;
+ pub(crate) mod cursor;
+ mod focus;
+ mod input;
++mod input_record;
+ pub(crate) mod pacing;
+ mod rendering;
+ pub(crate) mod windows;
