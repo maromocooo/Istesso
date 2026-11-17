@@ -1,7 +1,7 @@
 #!/bin/sh
 # What it does: creates the system group "istesso"; reloads the udev rules; writes the
 # number of pictures the GPU may compress at once, if there is none yet.
-# What it does NOT do: add anybody to a group; enable or start any service; enable linger;
+# What it does NOT do: add anybody to a group (it only prints the line for "render"); enable or start any service; enable linger;
 # touch any user's files, keys or paired devices; change any kernel or sleep setting;
 # download anything.
 set -e
@@ -14,6 +14,13 @@ configure)
 
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules >/dev/null 2>&1 || true
+    fi
+
+    # Without a login at the desk, the GPU render nodes are open to the group "render" only.
+    # The package cannot know which user runs the agent and adds nobody to a group: say what to run.
+    if getent group render >/dev/null; then
+        echo "istesso: for the user that runs the agent, so that the compositor can start with nobody logged in at the desk, run:" >&2
+        echo "istesso:   sudo gpasswd -a <user> render      (undo: sudo gpasswd -d <user> render; effective at the next login)" >&2
     fi
 
     # Number of simultaneous compression sessions: counted once, while no picture flows, as
