@@ -8,7 +8,7 @@
 //!
 //! The rule, for the item's group; all must hold:
 //! 1. Sources: every `passwd`, `group` and `initgroups` line of
-//!    `/etc/nsswitch.conf` names only `files`, `compat` or `systemd`, and no
+//!    `/etc/nsswitch.conf` names only `files` or `systemd`, and no
 //!    database is named twice. Any other source (a directory service) may
 //!    not list all its accounts when enumerated.
 //! 2. Accounts, from `getent passwd` (enumerated): every account whose
@@ -151,19 +151,37 @@ fn getent(database: &str) -> Result<String, String> {
         .map_err(|_| format!("`getent {database}` printed text that is not UTF-8"))
 }
 
-/// The sources `nsswitch.conf` may name for accounts and groups.
-const LOCAL_SOURCES: [&str; 3] = ["files", "compat", "systemd"];
+/// The sources `nsswitch.conf` may name for accounts and groups. Not
+/// `compat`: it pulls in entries from elsewhere through `+`/`-` lines.
+const LOCAL_SOURCES: [&str; 2] = ["files", "systemd"];
 
-/// Rule 1: accounts and groups come from local sources only.
+/// Rule 1: accounts and groups come from local sources only. Read strictly,
+/// as the system's own reader does: blank lines and comments are skipped;
+/// the database name starts after leading blanks, ends at a blank or a
+/// colon and is compared without regard to case; a line that cannot be read
+/// as `name: sources` refuses. Bracketed actions (`[NOTFOUND=return]`) are
+/// not sources.
 fn local_sources_only(nsswitch: &str) -> Result<(), String> {
-    let mut seen: Vec<&str> = Vec::new();
-    for line in nsswitch.lines() {
+    let mut seen: Vec<String> = Vec::new();
+    for (number, line) in nsswitch.lines().enumerate() {
         let line = line.split('#').next().unwrap_or_default();
-        let Some((database, sources)) = line.split_once(':') else {
+        if line.trim().is_empty() {
             continue;
+        }
+        let unreadable = || format!("line {} of /etc/nsswitch.conf cannot be read", number + 1);
+        let rest = line.trim_start();
+        let end = rest
+            .find(|c: char| c == ':' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let (name, after) = rest.split_at(end);
+        let Some(sources) = after.trim_start().strip_prefix(':') else {
+            return Err(unreadable());
         };
-        let database = database.trim();
-        if !["passwd", "group", "initgroups"].contains(&database) {
+        if name.is_empty() {
+            return Err(unreadable());
+        }
+        let database = name.to_ascii_lowercase();
+        if !["passwd", "group", "initgroups"].contains(&database.as_str()) {
             continue;
         }
         if seen.contains(&database) {
@@ -171,10 +189,9 @@ fn local_sources_only(nsswitch: &str) -> Result<(), String> {
                 "/etc/nsswitch.conf names `{database}` more than once"
             ));
         }
-        seen.push(database);
         // Drop the `[STATUS=action]` items, which name no source.
         let mut plain = String::new();
-        let mut depth = 0;
+        let mut depth = 0i32;
         for c in sources.chars() {
             match c {
                 '[' => depth += 1,
@@ -182,22 +199,24 @@ fn local_sources_only(nsswitch: &str) -> Result<(), String> {
                 _ if depth == 0 => plain.push(c),
                 _ => {}
             }
+            if depth < 0 {
+                return Err(unreadable());
+            }
         }
         if depth != 0 {
-            return Err(format!(
-                "/etc/nsswitch.conf has a line for `{database}` that cannot be read"
-            ));
+            return Err(unreadable());
         }
         for source in plain.split_whitespace() {
             if !LOCAL_SOURCES.contains(&source) {
                 return Err(format!(
-                    "accounts may come from `{source}` (/etc/nsswitch.conf, `{database}`), which may not list all of them"
+                    "accounts may come from `{source}` (/etc/nsswitch.conf, `{database}`), which may not list all of them or may pull in entries from elsewhere"
                 ));
             }
         }
+        seen.push(database);
     }
     for database in ["passwd", "group"] {
-        if !seen.contains(&database) {
+        if !seen.iter().any(|d| d == database) {
             return Err(format!(
                 "/etc/nsswitch.conf does not say where `{database}` comes from"
             ));
@@ -402,10 +421,23 @@ pub(crate) mod tests {
     fn sources_other_than_local_files_are_refused() {
         let check = |nsswitch: &str| group_is_private(1000, 1000, nsswitch, PASSWD, GROUPS);
         assert_eq!(check("passwd: files\ngroup: files\n"), Ok(()));
+        // A bracketed action is not a source.
         assert_eq!(
-            check("passwd: compat\ngroup: compat [NOTFOUND=return] files\n"),
+            check("passwd: files [NOTFOUND=return] systemd\ngroup: files\n"),
             Ok(())
         );
+        // `compat` pulls in entries from elsewhere.
+        let why = check("passwd: compat\ngroup: files\n").unwrap_err();
+        assert!(why.contains("`compat`"), "{why}");
+        // Another case and other spacing are still read and checked.
+        let why = check("  Passwd :   files ldap\ngroup: files\n").unwrap_err();
+        assert!(why.contains("`ldap`"), "{why}");
+        let why = check("passwd: files\nGROUP\t: files\ngroup: files\n").unwrap_err();
+        assert!(why.contains("more than once"), "{why}");
+        // A line that cannot be read as `name: sources`.
+        let why = check("passwd files\ngroup: files\n").unwrap_err();
+        assert!(why.contains("cannot be read"), "{why}");
+        assert!(check("hosts files dns\npasswd: files\ngroup: files\n").is_err());
         // A directory service on the first line.
         let why = check("passwd: files sss\ngroup: files sss\n").unwrap_err();
         assert!(why.contains("`sss`"), "{why}");
