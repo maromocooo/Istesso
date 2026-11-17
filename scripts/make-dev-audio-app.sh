@@ -23,8 +23,11 @@ EXECUTABLE="Istesso Dev Audio"
 USAGE="Istesso Dev Audio plays the sound of a paired computer on this network."
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-OUT=${ISTESSO_DEV_APP_DIR:-$ROOT/target/dev-audio-app}
-STAGED="$OUT/$VISIBLE_NAME.staged"; APP="$OUT/$VISIBLE_NAME.app"
+# Built under target/; staged, and later named, in a place that survives a
+# restart and a clean of the build: the person's own Applications folder.
+OUT=$ROOT/target/dev-audio-app
+PLACE=${ISTESSO_DEV_APP_DIR:-$HOME/Applications/Istesso Dev}
+STAGED="$PLACE/$VISIBLE_NAME.staged"; APP="$PLACE/$VISIBLE_NAME.app"
 PROFILE=${PROFILE:-dev}; [ "$PROFILE" = "release" ] && SUB=release || SUB=debug
 
 if [ "${1:-}" = "--finish" ]; then
@@ -49,6 +52,7 @@ for other in "$ROOT/target/debug/istesso" "$ROOT/target/release/istesso"; do
   fi
 done
 
+mkdir -p "$PLACE"
 [ -e "$STAGED" ] && mv "$STAGED" "$OUT/previous.$(date +%s)"
 mkdir -p "$STAGED/Contents/MacOS"
 cp "$BUILT" "$STAGED/Contents/MacOS/$EXECUTABLE"
