@@ -884,18 +884,19 @@ mod tests {
         };
         // A group with another member.
         let me = format!("me:x:{uid}:{gid}::/nonexistent:/bin/sh\n");
-        let db = AccountDb::given(Some(me.clone()), Some(format!("me:x:{gid}:guest\n")));
+        let nss = || Some(crate::accounts::tests::NSSWITCH.to_owned());
+        let db = AccountDb::given(nss(), Some(me.clone()), Some(format!("me:x:{gid}:guest\n")));
         assert!(refused(&db).to_string().contains("guest"));
         // A group that is another account's primary group.
         let other = format!(
             "{me}guest:x:{}:{gid}::/nonexistent:/bin/sh\n",
             uid.wrapping_add(1)
         );
-        let db = AccountDb::given(Some(other), Some(format!("me:x:{gid}:\n")));
+        let db = AccountDb::given(nss(), Some(other), Some(format!("me:x:{gid}:\n")));
         refused(&db);
         // A lookup that failed.
         let err = refused(&AccountDb::default());
-        assert!(err.to_string().contains("lookup failed"));
+        assert!(err.to_string().contains("could not be read"));
         // `o+w` stays refused, whatever the group.
         let db = crate::accounts::tests::private_db(uid, gid);
         set_mode(&file, 0o666);
