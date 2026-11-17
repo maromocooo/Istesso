@@ -2208,10 +2208,11 @@ fn a_host_that_is_away_is_asked_again_until_it_is_back() {
     while began.elapsed() < Duration::from_millis(900) {
         assert!(viewer.next(Duration::from_millis(50)).unwrap().is_none());
     }
-    // Tries that fail at once, a tenth of a second apart while the cut is
-    // fresh (fewer, if this machine was busy with something else).
+    // Tries that fail at once: the first, the two early ones, and then a
+    // tenth of a second apart while the cut is fresh (fewer, if this machine
+    // was busy with something else).
     let tried = between.connections() - 1;
-    assert!((3..=10).contains(&tried), "{tried} tries");
+    assert!((3..=12).contains(&tried), "{tried} tries");
     assert_eq!(viewer.tries(), tried);
 
     between.lead_to(pair.addr);

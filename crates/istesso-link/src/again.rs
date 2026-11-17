@@ -7,9 +7,11 @@
 //! and a host that comes back would not be noticed for as long. So a new
 //! try is started without waiting for the earlier ones: every half second,
 //! and during the first seconds after the cut more often while few are
-//! running. Each try has its own deadline, its own keys and its own state of
-//! the channel. The first whose handshake completes is used, the others are
-//! dropped (ADR 0007, "つなぎ直しの試みを、重ねる").
+//! running. The first try of a cut is followed by two early ones, a few
+//! milliseconds later: a system may drop what an application sends first
+//! for that long. Each try has its own deadline, its own keys and its own
+//! state of the channel. The first whose handshake completes is used, the
+//! others are dropped (ADR 0007, "つなぎ直しの試みを、重ねる").
 //!
 //! The host adopts nothing for a connection that has merely completed the
 //! handshake. It adopts the one on which the first request arrives, and
@@ -60,6 +62,18 @@ pub struct Pace {
     pub quick: Duration,
     pub quick_for: Duration,
     pub quick_below: usize,
+    /// Early tries: one this long after the first try of a cut, for each
+    /// of these, beside the tries above (which go on being counted from
+    /// the first one). Right after an application was built anew or
+    /// updated, macOS drops the first connections it makes for a moment:
+    /// about 2 ms was seen, and about 13 ms at worst. The first of these is
+    /// past the usual moment, and the second past the worst one, which the
+    /// first is not. Without them the next chance is [`Pace::quick`] later.
+    /// An early try is a try like any other, and is started only where a
+    /// quick one would be: within [`Pace::quick_for`] and while fewer than
+    /// [`Pace::quick_below`] are running. One that has not been started by
+    /// the time the next of the tries above is due is not made up for.
+    pub early: &'static [Duration],
     /// Tries that run at the same time, at most. With the numbers above
     /// this is never reached while every try ends by its deadline (four
     /// started quickly, and four more in the two seconds a try may take);
@@ -80,6 +94,10 @@ pub struct Pace {
     pub short_lived: Duration,
 }
 
+/// How long after the first try of a cut the early ones are started
+/// ([`Pace::early`]).
+const EARLY: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(50)];
+
 impl Default for Pace {
     fn default() -> Self {
         Pace {
@@ -87,6 +105,7 @@ impl Default for Pace {
             quick: Duration::from_millis(100),
             quick_for: Duration::from_secs(5),
             quick_below: 4,
+            early: &EARLY,
             at_once: 8,
             try_within: Duration::from_secs(2),
             answer_within: Duration::from_secs(1),
@@ -143,8 +162,14 @@ pub struct Tries {
     cut_at: Option<Instant>,
     /// No try is started before this.
     not_before: Option<Instant>,
-    /// When the last try was started, in this cut or an earlier one.
+    /// When the last try was started, in this cut or an earlier one. The
+    /// early tries ([`Pace::early`]) apart: they do not move the others.
     last_start: Option<Instant>,
+    /// When the first try of this cut was started.
+    first_start: Option<Instant>,
+    /// How many of the early tries of this cut are behind: started, or
+    /// passed over.
+    early: usize,
     /// The tries whose threads have not ended, dropped ones included.
     running: Vec<u64>,
     next_id: u64,
@@ -166,6 +191,8 @@ impl Tries {
             cut_at: None,
             not_before: None,
             last_start: None,
+            first_start: None,
+            early: 0,
             running: Vec::new(),
             next_id: 0,
             wanted_from: 0,
@@ -199,6 +226,8 @@ impl Tries {
         self.cuts += 1;
         self.cut_at = Some(now);
         self.asking = false;
+        self.first_start = None;
+        self.early = 0;
         let short_lived = self
             .made_at
             .is_some_and(|at| now.saturating_duration_since(at) < self.pace.short_lived);
@@ -215,6 +244,12 @@ impl Tries {
     /// answer is being waited for, as many tries run as may, or it is
     /// over).
     pub fn due(&self, now: Instant) -> Option<Instant> {
+        self.next(now).map(|(due, _)| due)
+    }
+
+    /// When the next try may be started, and whether it is an early one
+    /// ([`Pace::early`]).
+    fn next(&self, now: Instant) -> Option<(Instant, bool)> {
         if self.over || self.asking || self.running.len() >= self.pace.at_once {
             return None;
         }
@@ -227,25 +262,64 @@ impl Tries {
             self.pace.every
         };
         let mut due = self.not_before.unwrap_or(cut_at).max(cut_at);
+        let mut early = false;
         // The gap also holds towards a try of an earlier cut: cuts that follow
         // each other closely do not add tries faster than one cut does.
         if let Some(last) = self.last_start {
-            due = due.max(last + gap);
+            let mut next = last + gap;
+            // An early try comes before that, where a quick one may be started.
+            // Once the moment for the next of the others has come, it is that
+            // one which is started, and the early ones are over.
+            if quick && now < next {
+                if let Some(at) = self.early_at().filter(|at| *at < next) {
+                    (next, early) = (at, true);
+                }
+            }
+            due = due.max(next);
         }
-        Some(due)
+        Some((due, early))
+    }
+
+    /// When the next early try of this cut is to be started, if one is
+    /// left.
+    fn early_at(&self) -> Option<Instant> {
+        let first = self.first_start?;
+        let after = self.pace.early.get(self.early)?;
+        Some(first + *after)
     }
 
     /// Starts a try if one is due at `now`. The caller runs it, and says
     /// with [`Tries::ended`] how it ended.
     pub fn start(&mut self, now: Instant) -> Option<Try> {
-        if self.due(now)? > now {
+        let (due, early) = self.next(now)?;
+        if due > now {
             return None;
         }
         let id = self.next_id;
         self.next_id += 1;
         self.started += 1;
         self.running.push(id);
-        self.last_start = Some(now);
+        match (early, self.first_start) {
+            // One try for all the early ones whose moment has come: started
+            // late, they are not started together.
+            (true, Some(first)) => {
+                let come = |after: &Duration| first + *after <= now;
+                self.early += self.pace.early[self.early..]
+                    .iter()
+                    .take_while(|after| come(after))
+                    .count();
+            }
+            // The first try of this cut: the early ones follow it.
+            (_, None) => {
+                self.first_start = Some(now);
+                self.last_start = Some(now);
+            }
+            // A later one: there are no early tries after it.
+            (false, Some(_)) => {
+                self.early = self.pace.early.len();
+                self.last_start = Some(now);
+            }
+        }
         Some(Try {
             id,
             within: self.pace.try_within,
@@ -850,7 +924,7 @@ mod tests {
         world.run(Duration::from_secs(6), false);
         // Four quickly, then every half second, until the first has completed.
         let starts: Vec<u128> = world.starts.iter().map(Duration::as_millis).collect();
-        assert_eq!(starts, [0, 100, 200, 300, 800, 1300]);
+        assert_eq!(starts, [0, 10, 50, 100, 600, 1100]);
         // The first try is the one that is used: nothing was dropped before
         // its deadline, and nothing failed.
         assert_eq!(world.used, [0]);
@@ -913,7 +987,9 @@ mod tests {
         );
         world.cut();
         world.run(Duration::from_secs(10), true);
-        for pair in world.starts.windows(2) {
+        // The two early tries come first.
+        assert_eq!(world.starts[..4], [ms(0), ms(10), ms(50), ms(100)]);
+        for pair in world.starts[3..].windows(2) {
             let gap = pair[1] - pair[0];
             let expected = if pair[1] < Duration::from_secs(5) {
                 ms(100)
@@ -1200,6 +1276,243 @@ mod tests {
         world.run(Duration::from_secs(60), false);
         assert_eq!(world.starts.len(), 9);
         assert_eq!(world.most_running, 8);
+    }
+
+    // ---- The early tries: 10 ms and 50 ms after the first of a cut ----
+
+    /// The most connections that waited at the host at the same moment, as
+    /// the host counts them.
+    fn most_waiting(waited: &[(Duration, Duration)], per_device: usize) -> usize {
+        let mut moments: Vec<(Duration, bool)> = Vec::new();
+        for (from, to) in waited {
+            moments.push((*from, true));
+            moments.push((*to, false));
+        }
+        // What leaves at a moment leaves before what comes at it.
+        moments.sort_by_key(|(at, comes)| (*at, *comes));
+        let waiting = Waiting::new(per_device, 16);
+        let (mut places, mut most) = (Vec::new(), 0);
+        for (at, comes) in moments {
+            if comes {
+                let place = waiting.take("the device");
+                places.push(place.unwrap_or_else(|| panic!("no place at the host at {at:?}")));
+            } else {
+                places.remove(0);
+            }
+            most = most.max(waiting.waiting());
+        }
+        most
+    }
+
+    /// The tries of one cut start at 0, 10 ms, 50 ms, 100 ms, 200 ms, …
+    /// while they fail at once, and the two early ones come on top of the
+    /// ten a second there were: twelve in the first second.
+    #[test]
+    fn the_first_tries_of_a_cut_start_at_0_10_50_and_100_ms() {
+        let mut world = World::new(Pace::default(), &[(Duration::ZERO, Way::Refusing)]);
+        world.cut();
+        world.run(Duration::from_secs(2), false);
+        let starts: Vec<u128> = world.starts.iter().map(Duration::as_millis).collect();
+        assert_eq!(starts[..6], [0, 10, 50, 100, 200, 300]);
+        let in_the_first_second = starts.iter().filter(|at| **at < 1000).count();
+        assert_eq!(in_the_first_second, 12);
+        let in_the_second = starts.iter().filter(|at| (1000..2000).contains(*at));
+        assert_eq!(in_the_second.count(), 10);
+        assert_eq!(world.most_running, 1);
+        assert_eq!(world.tries.cuts(), 1);
+
+        // A host that says nothing: the same four, closer together, and then
+        // one every half second. As many in the first second as without the
+        // early ones (five), and the ninth after 2.6 s (ADR 0007 quotes both).
+        let mut world = World::new(Pace::default(), &[(Duration::ZERO, Way::Silent)]);
+        world.cut();
+        world.run(Duration::from_secs(3), false);
+        let starts: Vec<u128> = world.starts.iter().map(Duration::as_millis).collect();
+        assert_eq!(starts, [0, 10, 50, 100, 600, 1100, 1600, 2100, 2600]);
+        assert_eq!(world.tries.cuts(), 1);
+
+        // They are counted from the first try, also when that one waited: a
+        // conversation that did not last is opened again a quarter of a second
+        // later, and the early tries follow that.
+        let mut tries = Tries::new(Pace::default());
+        let made = Instant::now();
+        tries.made(made);
+        let cut = made + ms(20);
+        tries.cut(cut);
+        assert!(tries.start(cut + ms(250)).is_some());
+        assert_eq!(tries.due(cut + ms(250)), Some(cut + ms(260)));
+        assert_eq!(tries.start(cut + ms(259)), None);
+        assert!(tries.start(cut + ms(260)).is_some());
+        assert_eq!(tries.start(cut + ms(299)), None);
+        assert!(tries.start(cut + ms(300)).is_some());
+        assert_eq!(tries.start(cut + ms(349)), None);
+        assert!(tries.start(cut + ms(350)).is_some());
+        assert_eq!(tries.cuts(), 1);
+    }
+
+    /// What the early tries are for: a way that drops whatever is started
+    /// in its first 13 ms (the worst that was seen of macOS right after an
+    /// application was built anew) is through with the try at 50 ms, and
+    /// one that does so for 2 ms with the try at 10 ms.
+    #[test]
+    fn a_way_that_drops_what_is_started_in_its_first_13_ms_is_through_at_50_ms() {
+        let round_trip = MS;
+        let through = Way::Open { round_trip };
+        // Dropped without a word, or refused at once: the same.
+        for dropping in [Way::Silent, Way::Refusing] {
+            let connected_with = |pace: Pace, drops_for: Duration| {
+                let ways = [(Duration::ZERO, dropping), (drops_for, through)];
+                let mut world = World::new(pace, &ways);
+                world.cut();
+                world.run(Duration::from_secs(4), false);
+                assert_eq!(world.tries.cuts(), 1);
+                assert!(world.most_running <= 4, "{}", world.most_running);
+                assert_eq!(world.connected.len(), 1, "{dropping:?}");
+                (world.connected[0], world.used[0])
+            };
+            // The try at 10 ms is dropped as well; the one at 50 ms is the
+            // third. Four exchanges there and back for it, and one for the
+            // answer.
+            let (connected, used) = connected_with(Pace::default(), ms(13));
+            assert_eq!(connected, ms(50) + round_trip * 5, "{dropping:?}");
+            assert_eq!(used, 2);
+            let (connected, used) = connected_with(Pace::default(), ms(2));
+            assert_eq!(connected, ms(10) + round_trip * 5, "{dropping:?}");
+            assert_eq!(used, 1);
+            // Without the early tries the first chance is a tenth of a second
+            // after the cut.
+            let without = Pace {
+                early: &[],
+                ..Pace::default()
+            };
+            let (connected, used) = connected_with(without, ms(13));
+            assert_eq!(connected, ms(100) + round_trip * 5, "{dropping:?}");
+            assert_eq!(used, 1);
+        }
+    }
+
+    /// The limits hold with the early tries: no try follows another at
+    /// less than half a second while four are running, and never do more
+    /// than eight run.
+    #[test]
+    fn the_early_tries_keep_within_four_at_once_and_eight_ever() {
+        // No try ends, for three seconds.
+        let pace = Pace {
+            try_within: Duration::from_secs(60),
+            ..Pace::default()
+        };
+        let (mut tries, now) = cut_at(pace);
+        let mut starts = Vec::new();
+        for at in 0..=3000 {
+            let running = tries.running();
+            if tries.start(now + ms(at)).is_some() {
+                let gap = at - starts.last().copied().unwrap_or(0);
+                // Sooner than half a second after the one before only while
+                // fewer than four were running.
+                assert!(starts.is_empty() || gap >= 500 || running < 4, "at {at}");
+                assert!(running < 8, "at {at}");
+                starts.push(at);
+            }
+            assert_eq!(tries.start(now + ms(at)), None, "two tries at {at}");
+        }
+        assert_eq!(starts, [0, 10, 50, 100, 600, 1100, 1600, 2100]);
+        assert_eq!(tries.running(), 8);
+        assert_eq!(tries.due(now + ms(3000)), None);
+
+        // Tries of an earlier cut that were dropped and have not ended count:
+        // with three of them, the first try of the next cut is the fourth, and
+        // no early try follows it.
+        let (mut tries, now) = cut_at(Pace::default());
+        let first = tries.start(now).unwrap();
+        for at in [10, 50, 100] {
+            assert!(tries.start(now + ms(at)).is_some());
+        }
+        assert_eq!(
+            tries.ended(first.id, Ended::Opened, now + ms(150)),
+            Verdict::Use
+        );
+        tries.answered(now + ms(160));
+        assert_eq!(tries.running(), 3);
+        let cut = now + ms(700);
+        tries.cut(cut);
+        assert!(tries.start(cut).is_some());
+        assert_eq!(tries.running(), 4);
+        assert_eq!(tries.due(cut), Some(cut + ms(500)));
+        assert_eq!(tries.start(cut + ms(10)), None);
+        assert_eq!(tries.start(cut + ms(50)), None);
+        assert_eq!(tries.start(cut + ms(100)), None);
+        assert!(tries.start(cut + ms(500)).is_some());
+        assert_eq!(tries.cuts(), 2);
+
+        // An early try that could not be started in time is not made up for.
+        // Looked at late, between the two: one try for both.
+        let (mut tries, now) = cut_at(Pace::default());
+        assert!(tries.start(now).is_some());
+        assert!(tries.start(now + ms(60)).is_some());
+        assert_eq!(tries.start(now + ms(60)), None);
+        assert_eq!(tries.due(now + ms(60)), Some(now + ms(100)));
+        // Looked at after the moment of the next ordinary try: that one, and
+        // no early try after it.
+        let (mut tries, now) = cut_at(Pace::default());
+        assert!(tries.start(now).is_some());
+        assert!(tries.start(now + ms(120)).is_some());
+        assert_eq!(tries.start(now + ms(120)), None);
+        assert_eq!(tries.due(now + ms(120)), Some(now + ms(220)));
+        assert_eq!(tries.started(), 2);
+
+        // After an answer that asks for leisure, the pause is kept: nothing at
+        // 10 ms or 50 ms, and one try when it is over.
+        let (mut tries, now) = cut_at(Pace::default());
+        let first = tries.start(now).unwrap();
+        assert_eq!(
+            tries.ended(first.id, Ended::Failed(Again::Slowly), now + ms(2)),
+            Verdict::Drop
+        );
+        assert_eq!(tries.due(now + ms(2)), Some(now + ms(1002)));
+        assert_eq!(tries.start(now + ms(10)), None);
+        assert_eq!(tries.start(now + ms(50)), None);
+        assert!(tries.start(now + ms(1002)).is_some());
+        assert_eq!(tries.start(now + ms(1002)), None);
+        assert_eq!(tries.due(now + ms(1002)), Some(now + ms(1102)));
+    }
+
+    /// The host's side with the early tries: over ways of every length
+    /// within reach, a device that keeps to the pace never has more
+    /// connections waiting for the request than the host holds for it
+    /// (four for the picture; the agent holds six), also when cuts follow
+    /// each other.
+    #[test]
+    fn the_early_tries_do_not_take_more_places_at_the_host_than_it_holds() {
+        for round_trip in [
+            1, 3, 5, 10, 13, 20, 25, 50, 100, 125, 200, 300, 400, 450, 500,
+        ] {
+            let round_trip = ms(round_trip);
+            let mut world = World::new(
+                Pace::default(),
+                &[(Duration::ZERO, Way::Open { round_trip })],
+            );
+            world.cut();
+            for cut in 1..=6 {
+                let before = world.connected.len();
+                world.run(world.at + Duration::from_secs(20), true);
+                assert_eq!(world.connected.len(), before + 1, "cut {cut}");
+                // Cut again, a little later than a conversation that did not
+                // last, while the dropped tries of this cut are on their way.
+                world.run(world.at + ms(300), false);
+                world.cut();
+            }
+            // Until every try has ended.
+            world.tries.stop();
+            world.run(world.at + Duration::from_secs(3), false);
+            assert_eq!(world.tries.running(), 0);
+            assert!(world.most_running <= 8, "{}", world.most_running);
+            let most = most_waiting(&world.waited, crate::waiting::PER_DEVICE);
+            assert!(
+                most <= crate::waiting::PER_DEVICE,
+                "{most} at {round_trip:?}"
+            );
+            println!("round trip {round_trip:?}: at most {most} waiting at the host");
+        }
     }
 
     // ---- The part with threads and the real clock ----
