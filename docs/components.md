@@ -57,6 +57,12 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 3. Windows ホスト（将来）
 4. 制御面の全体（このリポジトリ）
 
+## 参考に読んだもの（コードは写さない）
+
+| 部品 | 読んだところ | ライセンス | 理由 |
+|---|---|---|---|
+| Chromium の app shim（2026-11-17） | `chrome/app_shim/`（README、`app_mode_loader_mac.mm`、`app_shim_controller.mm`）、`chrome/browser/apps/app_shim/`（`code_signature_mac.cc`、`app_shim_manager_mac.cc`）、`chrome/browser/web_applications/os_integration/mac/`（README、`web_app_shortcut_mac.mm`、`web_app_shortcut_creator.mm`） | BSD-3-Clause | 使う人の Mac の上で小さなアプリの包みを作り、本体のコードを読ませて窓を持たせる、という形の先例。署名、作り直し、Dock と Spotlight での動きを知るため（[m3-launcher.md](m3-launcher.md) の 7.4）。読んだのは、この範囲だけ。コードは写していない |
+
 ## 未確認
 
 | 部品 | 状況 |
