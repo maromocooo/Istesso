@@ -352,6 +352,50 @@ NVENC を直接呼ぶこと（ADR 0016）。途中で絵の大きさを変える
 - `no_window_yet`（60 秒）は、本物のコンポジターでは、動かしていない（コンポジターに関わらない、時計だけの動きで、どの PC でも動く試験がある）。
 - 試験用のアプリは、コンポジターがなくなると、自分で終わった（窓の口が切れたため）。窓の口を持たないプロセスが、セッションのあとに残るかどうかは、見ていない。
 
+## もとのコンポジターの不具合：出力ができる前に来た窓は、大きさを知らされない（再現のしかた）
+
+上の「`ready` が早すぎた」のもとになった不具合を、もとのプロジェクトに送れる形でまとめる。**送るかどうかは、あとで決める。送っていないし、どこにも書いていない。**
+
+- **何が起きるか**：アプリの窓（`xdg_toplevel`）の最初の確定（バッファーのない `wl_surface.commit`）が、コンポジターが出力を作る前に届くと、その窓には、最初の `configure` が、いつまでも送られない。アプリは、それを待ち続けて、窓を出せない。コンポジターは、何も言わない（記録にも、エラーにも出ない）。窓の数の知らせ（3 つ目の修正）では、窓は 1 枚と数えられている。
+- **版**：gst-wayland-display のコミット 1301f86（こちらの 4 つの修正を当てたもの。下の箇所は、修正が触っていない、もとのコードである）。Smithay は、そのプロジェクトが指しているもの（games-on-whales/smithay の a166cf4）。GStreamer 1.24（Ubuntu 24.04）、NVIDIA の GPU、フレームは CUDA。クライアントは winit 0.30.13（softbuffer で描く、こちらの試験用のアプリ）。
+- **見たこと**（2026-11-17 18:48〜18:50、ホスト）：自前のホストが、コンポジターの「アプリの入り方」の知らせ（`wayland.src`）を受けた直後（約 4 ms あと）に、アプリを起動した。3 回のうち 2 回、アプリは窓を出せなかった。クライアントの側の記録（`WAYLAND_DEBUG=1`）：
+  - 出せなかった回：`xdg_surface.get_toplevel`、`set_title`、`wl_surface.commit`、`wl_display.sync` のあと、届いたのは `wl_keyboard.keymap`、`repeat_info`、`wl_callback.done` だけ。`xdg_toplevel.configure` も `xdg_surface.configure` も、来ない。`wl_output` の口が知らされたのは、確定の 1.3 ms あとだった。アプリは、コンポジターが終わるまで、そこで止まっていた。
+  - 出せた回：同じ確定に、`xdg_toplevel.configure_bounds`、`wm_capabilities`、`configure(1280, 720, …)`、`xdg_surface.configure(1)` が返った。
+  - 起動に 0.2 秒かかるアプリ（GTK 4）では、1 度も起きなかった。
+- **わけ**（コードを読んだ。`wayland-display-core/src/wayland/handlers/compositor.rs` の `commit`）：確定した面が、待っている窓の一覧（`pending_windows`）にあると、まず、そこから外す（`swap_remove`）。そのあとで、出力がなければ、何もせずに戻る（`if self.output.is_none() { return; }`）。窓は、一覧に戻されない。出力は、要素が最初の映像の形を決めたとき（`Command::VideoInfo` → `apply_video_info`）に作られるが、そのとき、待たせた窓を見直す所はない。クライアントは、`configure` をもらうまで、次の確定をしないので、そのままになる。
+- **こちらの避け方**（自前のホスト。コンポジターは、変えていない）：ランナーは、コンポジターが最初のフレームを出してから、`ready` と言う。最初のフレームがあれば、出力はある。そのあと、同じアプリを `ready` の直後に 5 回起動して、5 回とも窓が出た。その晩の、`ready` の直後にアプリを起動した、ほかの 14 回でも、起きていない。
+- **直すなら**（書いていない。試していない）：出力がないときは、窓を一覧に戻す。出力を初めて作った所で、一覧にある、確定の済んだ窓に、最初の `configure` を送る。戻すだけでは、足りない（クライアントは、もう確定しないため）。
+- **もとのプロジェクトだけで再現する手順**（**案。動かしていない**）：`gst-launch-1.0` で `waylanddisplaysrc` を始め、ソケットのファイルができた瞬間に、数ミリ秒で窓を作るクライアント（winit の小さなアプリなど）を起動する。ソケットができてから出力ができるまでは、このホストで数ミリ秒だった。ゆっくり始まるクライアントでは、起きない。
+
+送るときの文面（英語。案）：
+
+```text
+A toplevel whose first commit arrives before the output exists is never configured
+
+With gst-wayland-display at 1301f86, a client that connects and commits its new xdg_toplevel
+before the compositor has created its output never receives the initial configure, and waits
+for it forever. Nothing is logged.
+
+Seen with a small winit 0.30 client started about 4 ms after the element posted `wayland.src`
+(2 of 3 starts; GStreamer 1.24, Ubuntu 24.04). With WAYLAND_DEBUG=1 the client shows
+get_toplevel, set_title, wl_surface.commit and a sync; the answers are wl_keyboard.keymap,
+repeat_info and the sync's done, and no xdg_toplevel.configure / xdg_surface.configure. The
+wl_output global was announced 1.3 ms after that commit. A client that starts more slowly
+(a GTK 4 application, about 0.2 s) is configured normally.
+
+Cause, from reading wayland-display-core/src/wayland/handlers/compositor.rs: `commit` takes the
+window out of `pending_windows` (`swap_remove`) and then returns when `self.output.is_none()`,
+without putting it back. The output is created later, by the first `Command::VideoInfo`
+(`apply_video_info`), which does not look at windows that committed before it. The client does
+not commit again until it has been configured.
+
+A possible fix (not written): keep the window in `pending_windows` when there is no output, and
+send the initial configure to the pending windows that have committed when the output is first
+created.
+
+What we do meanwhile: we let clients in only after the element has pushed its first buffer.
+```
+
 ## 確かめていないこと
 
 - 5 つ目の修正が、フレームの通り道に、何も足していないこと。本線が、計測の 1 を、4 つのプラグインと 5 つのプラグインで取り直す（手順は、この流れのフォルダーにある）。
