@@ -270,10 +270,11 @@ mod tests {
             return;
         };
         assert_eq!(counts.pictures, 1);
-        // Twenty a second for about half a second is ten. Never more; fewer when the test
-        // runs at a low priority, where the system wakes a sleeping thread late (on the Air,
-        // at nice 19, a 50 ms sleep took about 115 ms). The host runs at the normal priority.
-        assert!((3..=11).contains(&counts.repeats), "{counts:?}");
+        // Twenty a second for about half a second is ten, never more. How many come
+        // depends on how promptly the machine wakes the thread and how fast its encoder
+        // is (on the Air at nice 19 four; on a CI machine two), so only "some, and all
+        // of them sent" is checked here; the beat itself is tested in keep_awake.
+        assert!((1..=11).contains(&counts.repeats), "{counts:?}");
         assert_eq!(
             sent,
             counts.pictures + counts.repeats,
