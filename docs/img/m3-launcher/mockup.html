@@ -263,6 +263,30 @@
     .rows li { grid-template-columns: 28px 1fr; }
     .rows li > :last-child { grid-column: 2; justify-self: start; }
   }
+  .pairband { display: grid; grid-template-columns: 90px 1fr auto; gap: 12px; align-items: center;
+    background: color-mix(in srgb, var(--accent) 10%, var(--win)); border-radius: 10px; padding: 12px; margin-bottom: 10px; }
+  .pairband .art { width: 90px; height: 50px; position: relative; }
+  .pairband .art i { position: absolute; display: block; border: 2px solid var(--dim); border-radius: 5px; }
+  .pairband .art i:nth-child(1) { left: 0; top: 8px; width: 38px; height: 26px; }
+  .pairband .art i:nth-child(2) { right: 0; top: 0; width: 44px; height: 32px; border-color: var(--accent); }
+  .pairband .art i:nth-child(3) { left: 40px; top: 20px; width: 8px; height: 0; border-width: 1px 0 0; border-style: dashed; border-radius: 0; }
+  .pairband .close { align-self: start; color: var(--dim); font-size: 16px; }
+  .pin { display: inline-block; width: 7px; height: 7px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg);
+    background: var(--accent); margin-right: 4px; vertical-align: 1px; }
+  .menu.ctx { position: absolute; left: 96px; top: 40px; width: 200px; margin: 0; }
+  .menu.ctx.sub2 { left: 290px; top: 64px; width: 190px; }
+  .menu .muted { color: var(--dim); }
+  .menu .tick { width: 14px; display: inline-block; }
+  .dockwrap { position: relative; }
+  .dock { display: inline-flex; gap: 10px; align-items: flex-end; padding: 8px 12px 10px; border-radius: 16px;
+    background: color-mix(in srgb, var(--bar) 85%, transparent); border: 1px solid var(--win-edge); }
+  .icon.dk { width: 40px; height: 40px; border-radius: 10px; font-size: 16px; }
+  .icon.dk.run::after { content: ""; position: absolute; left: 50%; bottom: -8px; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: var(--text); }
+  .icon.dk.mini { width: 34px; height: 34px; opacity: .9; }
+  .icon.istesso { background: linear-gradient(160deg,#3a3f4b,#16181d); font-size: 13px; }
+  .dock .sep { width: 1px; height: 36px; background: var(--win-edge); }
+  .menu.dockmenu { width: 180px; margin: 0 0 8px 70px; }
+  @media (max-width: 520px) { .menu.ctx.sub2 { left: 120px; top: 150px; } .pairband { grid-template-columns: 1fr auto; } .pairband .art { display: none; } }
 </style>
 </head>
 <body>
@@ -275,22 +299,35 @@
 
   <!-- 1. No host paired -->
   <figure>
-    <figcaption>1. No computer paired yet<span>First start. One button; the launcher asks no host for anything.</span></figcaption>
+    <figcaption>1. No computer paired yet<span>This Mac's own apps are listed and open as usual. A band on top offers pairing; the launcher asks no host for anything.</span></figcaption>
     <div class="win" role="img" aria-label="Launcher window with no computer paired">
-      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div></div>
-      <div class="empty">
-        <div class="art"><i></i><i></i><i></i></div>
-        <h2>Use apps from your other computers</h2>
-        <p>Pair a computer that has Istesso installed. Its apps will appear here, and they open in windows on this Mac.</p>
-        <span class="btn primary">Pair a Computer…</span>
-        <span class="small link">How do I install Istesso on another computer?</span>
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search focus">Search apps</div></div>
+      <div class="body">
+        <div class="pairband">
+          <div class="art"><i></i><i></i><i></i></div>
+          <div>
+            <b>Use apps from your other computers</b><br>
+            <span class="where">Pair a computer that has Istesso installed. Its apps will appear here too, and they open in windows on this Mac.</span><br>
+            <span class="btn primary" style="margin-top:6px; display:inline-block">Pair a Computer…</span>
+            <span class="link" style="font-size:12px; margin-left:8px">How do I install Istesso on another computer?</span>
+          </div>
+          <span class="close" aria-label="Hide">×</span>
+        </div>
+        <h3 class="sec">All Apps</h3>
+        <div class="apps">
+          <div class="app"><div class="icon lg c2">C</div><div class="n">Calendar</div><div class="h">on this Mac</div></div>
+          <div class="app"><div class="icon lg c1">F</div><div class="n">Firefox</div><div class="h">on this Mac</div></div>
+          <div class="app"><div class="icon lg c4">L</div><div class="n">LibreOffice Writer</div><div class="h">on this Mac</div></div>
+          <div class="app"><div class="icon lg c8">N</div><div class="n">Notes</div><div class="h">on this Mac</div></div>
+          <div class="app"><div class="icon lg c7">T</div><div class="n">Terminal</div><div class="h">on this Mac</div></div>
+        </div>
       </div>
     </div>
   </figure>
 
   <!-- 2. Main -->
   <figure>
-    <figcaption>2. Hosts, their apps, and what is still running<span>Running on top: on this Mac, on another device, not shown anywhere, opened by an unpaired device. One icon per app; where it opens is written under it.</span></figcaption>
+    <figcaption>2. All apps, wherever they are, and what is still running<span>One icon per app, this Mac's included. Where a click opens it is always written under the name; a pin means the person chose that place.</span></figcaption>
     <div class="win">
       <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search focus">Search apps</div></div>
       <div class="body">
@@ -303,20 +340,48 @@
         <h3 class="sec">All Apps</h3>
         <div class="apps">
           <div class="app"><div class="icon lg c2">B</div><div class="n">Blender</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c8">N</div><div class="n">Notes</div><div class="h">on this Mac</div></div>
           <div class="app"><div class="icon lg c1">F<span class="more">+1</span></div><div class="n">Firefox</div><div class="h">running here</div></div>
           <div class="app dim"><span class="bang">!</span><div class="icon lg c3">G</div><div class="n">GIMP</div><div class="h">on attic</div></div>
-          <div class="app"><div class="icon lg c6">I</div><div class="n">Inkscape</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c6">I<span class="more">+1</span></div><div class="n">Inkscape</div><div class="h"><span class="pin" aria-label="you chose"></span>on tower</div></div>
           <div class="app"><div class="icon lg c5">K</div><div class="n">Kdenlive</div><div class="h">running on laptop</div></div>
-          <div class="app"><div class="icon lg c4">L</div><div class="n">LibreOffice Writer</div><div class="h">on this Mac</div></div>
+          <div class="app"><div class="icon lg c4">L<span class="more">+1</span></div><div class="n">LibreOffice Writer</div><div class="h">on this Mac</div></div>
+          <div class="app"><div class="icon lg c7">T</div><div class="n">Terminal</div><div class="h">on this Mac</div></div>
         </div>
       </div>
-      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="dot sleep"></span>attic · Asleep</span><span class="spacer"></span><span>⌘R to refresh</span></div>
+      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span class="h-bad"><span class="dot no"></span>attic · Not answering</span><span class="link">Wake</span><span class="spacer"></span><span>⌘R to refresh</span></div>
+    </div>
+  </figure>
+
+  <!-- 2b. Where it opens -->
+  <figure>
+    <figcaption>3. Changing where an app opens (right-click, or ⌃Return)<span>“Open on” changes it once. “Always Open on” remembers it and puts a pin under the name; “Automatic” goes back to the rule.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">fire</div></div>
+      <div class="body" style="position:relative; min-height:300px">
+        <h3 class="sec">All Apps</h3>
+        <div class="apps" style="grid-template-columns: repeat(auto-fill, 92px)">
+          <div class="app sel"><div class="icon lg c1">F<span class="more">+2</span></div><div class="n">Firefox</div><div class="h">on this Mac</div></div>
+        </div>
+        <div class="menu ctx" role="menu" aria-label="Firefox">
+          <div class="item">Open<span class="sub">on this Mac</span></div>
+          <div class="item sel">Open on<span class="key">▸</span></div>
+          <div class="item">Always Open on<span class="key">▸</span></div>
+          <div class="item muted">Open with Size…</div>
+          <div class="item">New Window</div>
+        </div>
+        <div class="menu ctx sub2" role="menu" aria-label="Open on">
+          <div class="item"><span class="tick">✓</span>This Mac</div>
+          <div class="item"><span class="tick"></span>tower</div>
+          <div class="item muted"><span class="tick"></span>attic<span class="sub">not answering</span></div>
+        </div>
+      </div>
     </div>
   </figure>
 
   <!-- 3. Paused for lack of a slot -->
   <figure>
-    <figcaption>3. Pictures paused: tower updates 8 windows at once<span>Which windows stopped, said in words and with a mark, not by colour alone. Clicking a row brings that window forward, which resumes it.</span></figcaption>
+    <figcaption>4. Pictures paused: tower updates 8 windows at once<span>Which windows stopped, said in words and with a mark, not by colour alone. Clicking a row brings that window forward, which resumes it.</span></figcaption>
     <div class="win">
       <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
       <div class="body">
@@ -330,13 +395,13 @@
           <li><span class="icon c4">L</span><span><span class="name">LibreOffice Writer</span><br><span class="where">tower · On this Mac</span></span><span class="btn">Quit</span></li>
         </ul>
       </div>
-      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="dot sleep"></span>attic · Asleep</span></div>
+      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="dot no"></span>attic · Not answering</span></div>
     </div>
   </figure>
 
   <!-- 4. Opening with size -->
   <figure>
-    <figcaption>4. Opening with a size (⌥Return or “Open with Size…”)<span>Sizes in points, computed from this Mac's screen. The window keeps its size; the sheet says so.</span></figcaption>
+    <figcaption>5. Opening with a size (⌥Return or “Open with Size…”)<span>Sizes in points, computed from this Mac's screen. The window keeps its size; the sheet says so.</span></figcaption>
     <div class="win">
       <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">ble</div></div>
       <div class="body faded">
@@ -364,7 +429,7 @@
 
   <!-- 5. Opening in progress, and failure -->
   <figure>
-    <figcaption>5. Opening, and when it fails<span>The launcher hides; an outline the size of the window shows progress. A failure gives the host's one line and a way on.</span></figcaption>
+    <figcaption>6. Opening, and when it fails<span>The launcher hides; an outline the size of the window shows progress. A failure gives the host's one line and a way on.</span></figcaption>
     <div class="win">
       <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
       <div class="body">
@@ -377,7 +442,7 @@
 
   <!-- 6. Host not answering; connection lost -->
   <figure>
-    <figcaption>6. A host that does not answer, and a cut connection<span>Apps keep running there; rows stay, greyed, until the host answers. Coming back from sleep reconnects windows nobody else took.</span></figcaption>
+    <figcaption>7. A host that does not answer, and a cut connection<span>Apps keep running there; rows stay, greyed, until the host answers. Coming back from sleep reconnects windows nobody else took.</span></figcaption>
     <div class="win">
       <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
       <div class="body" style="position:relative">
@@ -404,7 +469,7 @@
 
   <!-- 7. Unpaired -->
   <figure>
-    <figcaption>7. The host no longer accepts this Mac<span>Its apps and sessions leave the list. Apps this Mac opened there keep running for the other devices.</span></figcaption>
+    <figcaption>8. The host no longer accepts this Mac<span>Its apps and sessions leave the list. Apps this Mac opened there keep running for the other devices.</span></figcaption>
     <div class="win">
       <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
       <div class="body">
@@ -420,9 +485,32 @@
     </div>
   </figure>
 
+  <!-- Wake -->
+  <figure>
+    <figcaption>9. An app whose only host does not answer: “!” and Wake<span>Offered when the host's role table said it can be woken over the network. The app opens by itself once the host answers.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">gimp</div></div>
+      <div class="body" style="position:relative; min-height:280px">
+        <h3 class="sec">All Apps</h3>
+        <div class="apps" style="grid-template-columns: repeat(auto-fill, 92px)">
+          <div class="app dim sel"><span class="bang">!</span><div class="icon lg c3">G</div><div class="n">GIMP</div><div class="h">on attic</div></div>
+        </div>
+        <div class="pop" style="left:110px; top:30px">
+          <p><b>attic is not answering.</b> It may be asleep or turned off. Wake it to open GIMP.</p>
+          <div class="actions"><span class="btn">Cancel</span><span class="btn primary">Wake attic</span></div>
+        </div>
+        <div class="pop" style="left:110px; top:150px">
+          <p><span class="spin"></span>Waking attic… GIMP will open when attic answers.</p>
+          <div class="actions"><span class="btn">Cancel</span></div>
+        </div>
+      </div>
+      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="spin"></span>attic · Waking…</span></div>
+    </div>
+  </figure>
+
   <!-- 8. Menu bar -->
   <figure>
-    <figcaption>8. The menu bar item<span>The quick way back. The dot means a window is paused or lost. Opening the menu asks each awake host once; nothing is asked while it is closed.</span></figcaption>
+    <figcaption>10. The menu bar item<span>The quick way back. The dot means a window is paused or lost. Opening the menu asks each host once; nothing is asked while it is closed.</span></figcaption>
     <div>
       <div class="menubar"><span>Tue 15:40</span><span class="mb-icon alert open" aria-label="Istesso, 2 windows paused"></span></div>
       <div class="menu" role="menu">
@@ -432,7 +520,7 @@
         <div class="item"><span class="icon c5">K</span>Kdenlive<span class="sub">On laptop</span></div>
         <div class="item"><span class="icon c7">T</span>Text Editor<span class="sub">Not shown</span></div>
         <hr>
-        <div class="item">Open Launcher…<span class="key">⌃⌥Space</span></div>
+        <div class="item">Open Launcher…<span class="key">⌃⌥⌘Space</span></div>
         <div class="item">Pair a Computer…</div>
         <hr>
         <div class="item">Quit Istesso<span class="key">⌘Q</span></div>
@@ -440,9 +528,37 @@
     </div>
   </figure>
 
+  <!-- Dock -->
+  <figure>
+    <figcaption>11. Dock and ⌘Tab: first version (A) and app bundles (C, later if chosen)<span>A: one Istesso tile; its Dock menu lists the windows by name; a minimised window's tile shows the app's own icon. C: each relayed app has its own tile and ⌘Tab entry.</span></figcaption>
+    <div class="win">
+      <div class="body">
+        <h3 class="sec">A — first version</h3>
+        <div class="dockwrap">
+          <div class="menu dockmenu" role="menu" aria-label="Istesso Dock menu">
+            <div class="item">✓ Firefox</div>
+            <div class="item">GIMP</div>
+            <div class="item">Blender</div>
+            <hr>
+            <div class="item">Open Launcher…</div>
+          </div>
+          <div class="dock">
+            <span class="icon dk c7">F</span><span class="icon dk c2">M</span><span class="icon dk istesso run">Is</span><span class="sep"></span><span class="icon dk c2 mini">B</span>
+          </div>
+          <div class="where" style="margin-top:6px">⌘Tab: <b>Istesso</b> (one entry). ⌘` moves between its windows.</div>
+        </div>
+        <h3 class="sec" style="margin-top:14px">C — one bundle per relayed app (not in the first version)</h3>
+        <div class="dock">
+          <span class="icon dk c7">F</span><span class="icon dk c2">M</span><span class="icon dk c1 run">F</span><span class="icon dk c3 run">G</span><span class="icon dk c2 run">B</span>
+        </div>
+        <div class="where" style="margin-top:6px">⌘Tab: <b>Firefox</b>, <b>GIMP</b>, <b>Blender</b>, each with its own icon. Spotlight finds them.</div>
+      </div>
+    </div>
+  </figure>
+
   <!-- 9. Forced dark -->
   <figure>
-    <figcaption>9. Panel 2 in the dark appearance<span>Always dark, to compare with the system's setting.</span></figcaption>
+    <figcaption>12. Panel 2 in the dark appearance<span>Always dark, to compare with the system's setting.</span></figcaption>
     <div class="win force-dark">
       <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search focus">Search apps</div></div>
       <div class="body">
@@ -455,11 +571,12 @@
         <h3 class="sec">All Apps</h3>
         <div class="apps">
           <div class="app"><div class="icon lg c2">B</div><div class="n">Blender</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c8">N</div><div class="n">Notes</div><div class="h">on this Mac</div></div>
           <div class="app dim"><span class="bang">!</span><div class="icon lg c3">G</div><div class="n">GIMP</div><div class="h">on attic</div></div>
-          <div class="app"><div class="icon lg c6">I</div><div class="n">Inkscape</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c6">I</div><div class="n">Inkscape</div><div class="h"><span class="pin" aria-label="you chose"></span>on tower</div></div>
         </div>
       </div>
-      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="dot sleep"></span>attic · Asleep</span></div>
+      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span class="h-bad"><span class="dot no"></span>attic · Not answering</span></div>
     </div>
   </figure>
 
