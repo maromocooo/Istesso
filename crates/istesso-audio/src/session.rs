@@ -957,14 +957,34 @@ pub enum Rejoining {
 /// the sooner a connection that was cut is replaced.
 pub const SILENT_CONNECTION: Duration = Duration::from_millis(300);
 
+/// Right after a cut the way back is asked for this often, whatever `retry`
+/// says: what cut the connection is usually over within a second or two,
+/// and every wait between two tries is silence that somebody hears.
+pub const QUICK_RETRY: Duration = Duration::from_millis(100);
+
+/// How long after a cut [`QUICK_RETRY`] is kept up. After that the cause is
+/// not a passing one, and asking ten times a second helps nobody.
+pub const QUICK_RETRY_FOR: Duration = Duration::from_secs(5);
+
+/// The wait before the next try at a new connection, `since_cut` after the
+/// connection was found cut.
+pub fn wait_before_retry(since_cut: Duration, retry: Duration) -> Duration {
+    if since_cut < QUICK_RETRY_FOR {
+        retry.min(QUICK_RETRY)
+    } else {
+        retry
+    }
+}
+
 /// [`pump`], and when the connection is cut, a new one: a network may drop
 /// a connection that both ends still believe in, and an exit that then
 /// stays silent is no use to anybody.
 ///
 /// A connection counts as cut when it fails or when nothing arrives on it
 /// for the time it was given to wait ([`SILENT_CONNECTION`] is meant).
-/// `connect` is then tried every `retry` until it yields a connection or
-/// `stop` is set. The first audio of the new connection is marked as not
+/// `connect` is then tried until it yields a connection or `stop` is set:
+/// every [`QUICK_RETRY`] for the first [`QUICK_RETRY_FOR`], every `retry`
+/// after that. The first audio of the new connection is marked as not
 /// following on, so that the playout joins it properly.
 ///
 /// The stream is not taken up again when the source ended it: it may have
@@ -992,6 +1012,7 @@ pub fn pump_reconnecting(
         arrivals.last_seq = None;
         arrivals.last_audio_ns = None;
         said(Rejoining::Cut);
+        let cut_at = Instant::now();
         subscription = loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(Ended::Stopped);
@@ -1004,7 +1025,7 @@ pub fn pump_reconnecting(
                 Err(Error::Link(LinkError::NotTrusted | LinkError::UnknownPeer)) => {
                     return Err(Error::Forbidden)
                 }
-                Err(_) => std::thread::sleep(retry),
+                Err(_) => std::thread::sleep(wait_before_retry(cut_at.elapsed(), retry)),
             }
         };
         if (subscription.info.sample_rate, subscription.info.channels) != (rate, channels) {
@@ -1523,6 +1544,22 @@ mod tests {
             handles.lock().unwrap().push(subscription.connection()?);
             Ok(subscription)
         }
+    }
+
+    #[test]
+    fn the_way_back_is_asked_for_often_at_first_and_then_at_leisure() {
+        let leisurely = Duration::from_millis(250);
+        assert_eq!(wait_before_retry(Duration::ZERO, leisurely), QUICK_RETRY);
+        assert_eq!(
+            wait_before_retry(Duration::from_millis(4_900), leisurely),
+            QUICK_RETRY
+        );
+        assert_eq!(wait_before_retry(QUICK_RETRY_FOR, leisurely), leisurely);
+        // A caller that asks for less than the quick interval keeps what it asked for.
+        assert_eq!(
+            wait_before_retry(Duration::ZERO, Duration::from_millis(10)),
+            Duration::from_millis(10)
+        );
     }
 
     #[test]
