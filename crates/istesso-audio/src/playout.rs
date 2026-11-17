@@ -1006,6 +1006,32 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_is_not_a_number_leaves_no_trace_in_the_resampler() {
+        // Received values are cleaned before they reach the queue. Should
+        // one get there all the same, the resampler must not keep it: its
+        // filter looks back a fixed number of frames and feeds nothing
+        // back, so what a bad value spoils ends with that window.
+        let mut rig = sinc_rig();
+        rig.run(0.5);
+        let bad = [f32::INFINITY, f32::NAN, f32::NEG_INFINITY, f32::NAN];
+        let samples: Vec<f32> = bad.iter().cycle().take(PACKET).copied().collect();
+        let arrival = rig.now_ns();
+        rig.writer
+            .push_audio(PACKET, &samples, false, rig.position, arrival, arrival);
+        rig.position += PACKET as u64;
+        rig.run(0.5);
+        // Half a second on, every sample is a number again and at the
+        // level of the source.
+        let tail = &rig.played[rig.played.len() - (0.2 * RATE) as usize..];
+        assert!(tail.iter().all(|sample| sample.is_finite()));
+        assert!(
+            tail.iter().all(|sample| (sample - 0.5).abs() < 0.01),
+            "{:?}",
+            &tail[..4]
+        );
+    }
+
+    #[test]
     fn a_playout_that_is_taken_apart_keeps_what_is_in_the_queue() {
         let (mut writer, reader) = crate::fifo::queue(2, 48_000);
         let samples = vec![0.25f32; 256 * 2];

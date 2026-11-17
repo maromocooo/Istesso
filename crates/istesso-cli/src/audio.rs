@@ -798,6 +798,7 @@ mod mac {
     use istesso_audio::clock;
     use istesso_audio::fifo::queue;
     use istesso_audio::mac::Output;
+    use istesso_audio::outlet::{Outlet, OutletCounts, CLOSING_FADE_S};
     use istesso_audio::playout::{Playout, PlayoutConfig, PlayoutStats, WaitEvent};
     use istesso_audio::probe::Spread;
     use istesso_audio::resample::Sinc;
@@ -867,6 +868,11 @@ mod mac {
         )
     }
 
+    /// How long the player waits between asking the outlet to close and
+    /// stopping the device: the fade, and the two turns of the device it
+    /// may take until the callback has seen the request.
+    const CLOSING_WAIT: Duration = Duration::from_millis((CLOSING_FADE_S * 1e3) as u64 + 30);
+
     /// What the device's callback plays from and where it leaves what it
     /// would have played.
     struct Voice {
@@ -901,8 +907,12 @@ mod mac {
         audible: bool,
         voice: Arc<Mutex<Option<Voice>>>,
         seen: Arc<Callbacks>,
-    ) -> Result<(), String> {
+        counts: Arc<OutletCounts>,
+    ) -> Result<Arc<AtomicBool>, String> {
         let device_rate = output.device().sample_rate;
+        // Set before the device is stopped: what is played then fades out.
+        let closing = Arc::new(AtomicBool::new(false));
+        let mut outlet = Outlet::new(channels, device_rate, closing.clone(), counts);
         let mut turn_before: Option<(u64, u64)> = None;
         output
             .start(channels, move |frames, out, now_ns| {
@@ -912,6 +922,7 @@ mod mac {
                 match voice.try_lock().ok().as_deref_mut() {
                     Some(Some(voice)) => {
                         voice.playout.render(frames, out, now_ns);
+                        outlet.clean(out);
                         let _ = voice.record_in.push_partial_slice(out);
                         if audible {
                             voice.rise(out, channels, device_rate);
@@ -925,6 +936,7 @@ mod mac {
                 if !audible {
                     out.fill(0.0);
                 }
+                outlet.limit_and_close(out);
                 // Was this program late, or did the device not come? How
                 // long the work here took, and whether the frames of this
                 // callback are due when those of the last one end.
@@ -948,7 +960,8 @@ mod mac {
                 seen.lead_max_us.fetch_max(lead_us, Ordering::Relaxed);
                 seen.lead_sum_us.fetch_add(lead_us, Ordering::Relaxed);
             })
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(closing)
     }
 
     pub fn play(options: PlayOptions) -> Result<(), String> {
@@ -1202,12 +1215,14 @@ mod mac {
             record_in,
             risen_s: 0.0,
         })));
-        start_output(
+        let outlet_counts = Arc::new(OutletCounts::default());
+        let mut closing = start_output(
             &mut output,
             channels,
             audible,
             voice.clone(),
             callbacks.clone(),
+            outlet_counts.clone(),
         )?;
         eprintln!(
             "Playing {} an output at {} Hz ({} frames at a time); the stream is {} Hz, {} channels.",
@@ -1278,6 +1293,18 @@ mod mac {
                 (
                     "missed_device_turns",
                     callbacks.missed_turns.load(Ordering::Relaxed) as f64,
+                ),
+                // Values that were not numbers (as received, and at the
+                // outlet), and samples held at full scale.
+                (
+                    "not_numbers",
+                    (wire::not_numbers_received()
+                        + outlet_counts.not_numbers.load(Ordering::Relaxed))
+                        as f64,
+                ),
+                (
+                    "limited",
+                    outlet_counts.limited.load(Ordering::Relaxed) as f64,
                 ),
             ]
         };
@@ -1380,6 +1407,9 @@ mod mac {
                                 let to = next.device().clone();
                                 let resampler =
                                     Sinc::new(stream_rate, to.sample_rate, channels, 64, 1.01)?;
+                                // The old device is left with a fade, not a cut.
+                                closing.store(true, Ordering::Relaxed);
+                                std::thread::sleep(CLOSING_WAIT);
                                 output.stop();
                                 let old = voice
                                     .lock()
@@ -1399,12 +1429,13 @@ mod mac {
                                         record_in: old.record_in,
                                         risen_s: old.risen_s,
                                     });
-                                start_output(
+                                closing = start_output(
                                     &mut next,
                                     channels,
                                     audible,
                                     voice.clone(),
                                     callbacks.clone(),
+                                    outlet_counts.clone(),
                                 )?;
                                 if let Ok(count) = next.count_overloads() {
                                     overload_counts.borrow_mut().push(count);
@@ -1465,6 +1496,8 @@ mod mac {
         let (ended, arrivals) = pumping
             .join()
             .map_err(|_| "the receiving thread stopped unexpectedly".to_string())?;
+        closing.store(true, Ordering::Relaxed);
+        std::thread::sleep(CLOSING_WAIT);
         output.stop();
         if let Some(file) = &mut record_file {
             file.flush().map_err(|e| e.to_string())?;
@@ -1565,6 +1598,12 @@ mod mac {
             "devices": {
                 "default_output_changed": rearranged.as_ref().map(|c| c.default_output.load(Ordering::Relaxed)),
                 "rearranged": rearranged.as_ref().map(|c| c.devices.load(Ordering::Relaxed)),
+            },
+            // What the last step before the device had to do.
+            "outlet": {
+                "not_numbers_received": wire::not_numbers_received(),
+                "not_numbers_at_the_outlet": outlet_counts.not_numbers.load(Ordering::Relaxed),
+                "limited": outlet_counts.limited.load(Ordering::Relaxed),
             },
             "held_up": {
                 "longest_ms": held_up_max_us.load(Ordering::Relaxed) as f64 * 1e-3,

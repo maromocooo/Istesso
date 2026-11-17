@@ -36,6 +36,7 @@ pub mod clock;
 pub mod control;
 pub mod fifo;
 pub mod ledger;
+pub mod outlet;
 pub mod playout;
 pub mod probe;
 pub mod resample;

@@ -157,6 +157,17 @@ pub fn encode(header: &Header, samples: &[f32], out: &mut Vec<u8>) {
     }
 }
 
+/// How many received samples were not numbers (NaN, infinities) and were
+/// taken as silence, in this process: a source that sends such values
+/// shows here. They are replaced as they are read, before they reach the
+/// queue, the resampler or any fade.
+static NOT_NUMBERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`NOT_NUMBERS`].
+pub fn not_numbers_received() -> u64 {
+    NOT_NUMBERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Reads a packet: its header, and its samples into `samples` (replacing
 /// what was there). Returns the header and the number of frames.
 ///
@@ -211,6 +222,7 @@ pub fn decode(
         if value.is_finite() {
             value
         } else {
+            NOT_NUMBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             0.0
         }
     }));
