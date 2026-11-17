@@ -1268,6 +1268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "istesso-stay"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

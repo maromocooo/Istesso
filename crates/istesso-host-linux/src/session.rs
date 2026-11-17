@@ -20,6 +20,20 @@ use crate::words::{self, Answer, Word};
 /// be still open, in seconds.
 const STILL_OPEN_AFTER_S: u32 = 5;
 
+/// How long a runner's application may be without any window before the
+/// runner says that its last window has closed (`empty`), in seconds. A
+/// window that comes within this time is the application going on: one
+/// whose first window closes before its real one opens has no window for a
+/// moment, and to the compositor that moment looks the same as an
+/// application that has gone into the background for good. Only the length
+/// of the wait keeps the two apart.
+pub const LAST_WINDOW_WAIT_S: u32 = 5;
+
+/// A last window that goes within this long of a request to close that was
+/// passed on is the answer to that request, in seconds: the person asked
+/// for the end, and `empty` is said without the wait.
+pub const CLOSE_ANSWERED_WITHIN_S: u32 = 5;
+
 /// One key frame answers every request made within this long.
 const KEY_FRAME_EVERY_NS: u64 = 50_000_000;
 
@@ -113,6 +127,11 @@ pub struct Session {
     /// When the application's windows were asked to close, until they have
     /// all gone or it has been said that they are still open.
     close_asked_ns: Option<u64>,
+    /// When a request to close was last passed on to the application's windows.
+    close_passed_ns: Option<u64>,
+    /// A runner's application has no window: when that is said to be the
+    /// end (`empty`), unless a window comes first.
+    empty_due_ns: Option<u64>,
     environment: Option<Vec<(String, String)>>,
     /// A runner's lines that came up before it has said `ready`, in their
     /// order: an agent hears `ready` first. `None` once `ready` has been
@@ -157,6 +176,8 @@ impl Session {
             last_key_frame_ns: 0,
             windows: 0,
             close_asked_ns: None,
+            close_passed_ns: None,
+            empty_due_ns: None,
             environment: None,
             held,
         };
@@ -342,7 +363,16 @@ impl Session {
                     let windows = self.windows;
                     let asked = self.close_windows();
                     self.event(&Event::CloseAsked { asked, windows });
-                    self.close_asked_ns = (asked && windows > 0).then(|| (self.clock)());
+                    let now = (self.clock)();
+                    self.close_asked_ns = (asked && windows > 0).then_some(now);
+                    if asked {
+                        self.close_passed_ns = Some(now);
+                    }
+                    if self.empty_due_ns.take().is_some() {
+                        // No window is left to ask, and the end is asked for:
+                        // there is nothing more to wait for.
+                        self.event(&Event::Empty);
+                    }
                     if !asked {
                         (self.remark)(
                             "note: this compositor plugin cannot ask windows to close".to_string(),
@@ -435,10 +465,23 @@ impl Session {
                     }
                     Tongue::Runner { .. } => {
                         self.event(&Event::Windows { count });
-                        if gone {
-                            // The last window has gone: the application is over,
-                            // whatever its processes do.
-                            self.event(&Event::Empty);
+                        if count > 0 {
+                            // The application goes on: it was between two windows.
+                            self.empty_due_ns = None;
+                        } else if gone {
+                            let asked_for = self.close_passed_ns.is_some_and(|passed| {
+                                now.saturating_sub(passed)
+                                    <= u64::from(CLOSE_ANSWERED_WITHIN_S) * 1_000_000_000
+                            });
+                            if asked_for {
+                                // The answer to a request to close: the end, now.
+                                self.event(&Event::Empty);
+                            } else {
+                                // Closed by the application itself: it may be
+                                // about to show another window.
+                                self.empty_due_ns =
+                                    Some(now + u64::from(LAST_WINDOW_WAIT_S) * 1_000_000_000);
+                            }
                         }
                     }
                 }
@@ -545,6 +588,13 @@ impl Session {
     pub fn tick(&mut self) {
         if self.door.key_frame_wanted() {
             self.key_frame("client");
+        }
+        if self.empty_due_ns.is_some_and(|due| (self.clock)() >= due) {
+            // No window for the whole wait: the last one has closed, whatever
+            // the application's processes do. Ending them is up to the agent,
+            // whose processes they are.
+            self.empty_due_ns = None;
+            self.event(&Event::Empty);
         }
         if let Some(asked) = self.close_asked_ns {
             let waited = (self.clock)().saturating_sub(asked);
@@ -754,6 +804,14 @@ mod tests {
         }
     }
 
+    /// What a runner has said, by the names of its lines.
+    fn events(set: &Set) -> Vec<String> {
+        set.said()
+            .iter()
+            .map(|line| line["event"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     /// A runner that has said `ready`, as it has by the time an agent tells
     /// it anything; what it says from here on is all that `said` has.
     fn ready_runner(encoder: &str) -> Set {
@@ -774,12 +832,6 @@ mod tests {
         set.session.heard(Heard::Windows(1));
         assert!(set.said().is_empty());
         set.session.event(&ready());
-        let events = |set: &Set| -> Vec<String> {
-            set.said()
-                .iter()
-                .map(|line| line["event"].as_str().unwrap().to_string())
-                .collect()
-        };
         assert_eq!(events(&set), ["ready", "windows", "no_encoder", "windows"]);
         assert_eq!(set.said()[1]["count"], 0);
         assert_eq!(set.said()[3]["count"], 1);
@@ -898,20 +950,72 @@ mod tests {
         for count in [1, 2, 1, 0] {
             assert_eq!(set.session.heard(Heard::Windows(count)), Flow::On);
         }
-        let events: Vec<String> = set
-            .said()
-            .iter()
-            .map(|line| line["event"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            events,
-            ["windows", "windows", "windows", "windows", "empty"]
-        );
+        // The count is said at once. That it is the end is said only when no
+        // window has come for the wait.
+        assert_eq!(events(&set), ["windows", "windows", "windows", "windows"]);
+        assert_eq!(set.said()[3]["count"], 0);
+        let due = set.session.empty_due_ns.unwrap();
+        let wait = u64::from(LAST_WINDOW_WAIT_S) * 1_000_000_000;
+        assert!(due > clock() + wait - 1_000_000_000 && due <= clock() + wait);
+        set.session.tick();
+        assert_eq!(events(&set).len(), 4);
+        // The wait is over: said, once.
+        set.session.empty_due_ns = Some(clock() - 1);
+        set.session.tick();
+        set.session.tick();
+        assert_eq!(events(&set)[4..], ["empty"]);
         set.session.stop();
         // A compositor that begins with no window has not lost its last one.
         let mut set = self::set(ENCODER, Tongue::Measure);
         set.session.heard(Heard::Windows(0));
         assert_eq!(set.said().len(), 1);
+        set.session.stop();
+    }
+
+    #[test]
+    fn a_window_that_comes_within_the_wait_is_the_application_going_on() {
+        let mut set = ready_runner(ENCODER);
+        // A first window that closes before the real one opens.
+        set.session.heard(Heard::Windows(1));
+        set.session.heard(Heard::Windows(0));
+        assert!(set.session.empty_due_ns.is_some());
+        set.session.heard(Heard::Windows(1));
+        assert_eq!(set.session.empty_due_ns, None);
+        set.session.tick();
+        assert_eq!(events(&set), ["windows", "windows", "windows"]);
+        // The real window closing later is waited for anew.
+        set.session.heard(Heard::Windows(0));
+        assert!(set.session.empty_due_ns.is_some());
+        assert_eq!(events(&set).len(), 4);
+        set.session.stop();
+    }
+
+    #[test]
+    fn a_last_window_that_goes_when_asked_to_close_is_the_end_at_once() {
+        let mut set = ready_runner(ENCODER);
+        set.session.heard(Heard::Windows(1));
+        // A request to close was passed on a second ago, and the window goes.
+        set.session.close_passed_ns = Some(clock() - 1_000_000_000);
+        set.session.heard(Heard::Windows(0));
+        assert_eq!(events(&set), ["windows", "windows", "empty"]);
+        assert_eq!(set.session.empty_due_ns, None);
+
+        // One that goes long after the request is not its answer: waited for.
+        set.session.heard(Heard::Windows(1));
+        set.session.close_passed_ns =
+            Some(clock() - u64::from(CLOSE_ANSWERED_WITHIN_S + 1) * 1_000_000_000);
+        set.session.heard(Heard::Windows(0));
+        assert_eq!(events(&set)[3..], ["windows", "windows"]);
+        assert!(set.session.empty_due_ns.is_some());
+
+        // Asked to end while it is waited for: nothing is left to ask, and
+        // the end is said without the rest of the wait.
+        set.session.line(r#"{"v":1,"cmd":"close"}"#);
+        assert_eq!(events(&set)[5..], ["close_asked", "empty"]);
+        assert_eq!(set.said()[5]["windows"], 0);
+        assert_eq!(set.session.empty_due_ns, None);
+        set.session.tick();
+        assert_eq!(events(&set).len(), 7);
         set.session.stop();
     }
 
@@ -943,7 +1047,8 @@ mod tests {
             serde_json::json!({"v": 1, "event": "still_open", "windows": 2, "after_s": 5})
         );
         // The last window going ends the waiting: `empty`, and no `still_open` after it.
-        set.session.close_asked_ns = Some(clock() - 6_000_000_000);
+        set.session.close_asked_ns = Some(clock() - 3_000_000_000);
+        set.session.close_passed_ns = Some(clock() - 3_000_000_000);
         set.session.heard(Heard::Windows(0));
         set.session.tick();
         let events: Vec<String> = set.said()[3..]

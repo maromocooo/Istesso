@@ -39,7 +39,7 @@ if-addrs = "0.15"
 mdns-sd = { version = "0.21", default-features = false }
 unicode-width = "0.2"
 zeroize = "1"
-# Window and pixels for the test application (istesso-flash) only. X11 and Wayland are loaded at
+# Window and pixels for the test applications (istesso-flash, istesso-stay) only. X11 and Wayland are loaded at
 # run time, so building needs no system headers. No client-side decorations: inside the
 # streaming compositor the window is borderless, and elsewhere the window manager draws them.
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
