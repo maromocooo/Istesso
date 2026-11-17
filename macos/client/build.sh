@@ -3,7 +3,11 @@
 #
 #   macos/client/build.sh            build and sign the application that is handed out
 #   macos/client/build.sh measuring  build and sign the measuring build, a bundle of its own
-#   macos/client/build.sh check      only look into the application that was built: no way in
+#   macos/client/build.sh check [BUNDLE]   only look into an application bundle (the one that
+#                                    was built here, or the one named): no way in. For whoever
+#                                    hands the application out: run it on the copy that is signed.
+#                                    It fails when it finds the way in, and also when it cannot
+#                                    read what it was asked to look into.
 #
 # The measuring build is the same program with a local way in for the measurement's keys
 # (ADR 0018): the cargo feature `measure-keys` and the definition ISTESSO_MEASURING, which
@@ -27,13 +31,27 @@
 # Building does not start the application, and nothing here registers it with the system.
 # Needs cargo and the Xcode command line tools. No GStreamer.
 set -euo pipefail
+called_from=$PWD
 cd "$(dirname "$0")"
 . ./identity
 # What a way in for the measurement's keys leaves in an executable.
 marks="measure-keys istesso_measure_keys"
+# Whether a file holds it. What cannot be read is not called clean: the script ends.
 has_way_in() {
+    if [ ! -f "$1" ] || [ ! -r "$1" ]; then
+        echo "error: cannot read $1: it was not looked into"
+        exit 1
+    fi
     for mark in $marks; do
-        if grep -a -q -F -e "$mark" "$1"; then return 0; fi
+        if grep -a -q -F -e "$mark" "$1"; then
+            return 0
+        else
+            found=$?
+            if [ "$found" -ne 1 ]; then
+                echo "error: cannot search $1: it was not looked into"
+                exit 1
+            fi
+        fi
     done
     return 1
 }
@@ -43,6 +61,24 @@ no_way_in() {
         exit 1
     fi
 }
+# Looks into every file of a bundle, and makes sure its executable was among them.
+no_way_in_bundle() {
+    bundle=${1%/}
+    if [ ! -d "$bundle/Contents/MacOS" ] || [ ! -r "$bundle/Contents/Info.plist" ]; then
+        echo "error: $bundle is not an application bundle that can be looked into"
+        exit 1
+    fi
+    name=$(plutil -extract CFBundleExecutable raw "$bundle/Contents/Info.plist") \
+        || { echo "error: $bundle does not say which its executable is"; exit 1; }
+    no_way_in "$bundle/Contents/MacOS/$name"
+    files=$(find "$bundle/Contents" -type f -print) \
+        || { echo "error: cannot list what is in $bundle"; exit 1; }
+    while IFS= read -r file; do
+        no_way_in "$file"
+    done <<EOF
+$files
+EOF
+}
 what=${1:-}
 case "$what" in
     "") features=""; define=""; target="" ;;
@@ -50,13 +86,18 @@ case "$what" in
         BUNDLE_ID=$MEASURING_BUNDLE_ID; APP_NAME=$MEASURING_APP_NAME; EXECUTABLE=$MEASURING_EXECUTABLE
         features="--features measure-keys"; define="-DISTESSO_MEASURING=1"; target="--target-dir target/measuring" ;;
     check)
-        no_way_in "build/$APP_NAME.app/Contents/MacOS/$EXECUTABLE"
-        echo "no way in for the measurement's keys in build/$APP_NAME.app"
+        bundle=${2:-build/$APP_NAME.app}
+        # A path that was given counts from where the script was called.
+        case "$bundle" in /*) ;; *) [ -n "${2:-}" ] && bundle="$called_from/$bundle" ;; esac
+        no_way_in_bundle "$bundle"
+        echo "no way in for the measurement's keys in $bundle"
         exit 0 ;;
-    *) echo "usage: $0 [measuring|check]"; exit 2 ;;
+    *) echo "usage: $0 [measuring|check [BUNDLE]]"; exit 2 ;;
 esac
 library=../../target/${target:+measuring/}release/libistesso_client.a
 mkdir -p build
+# The search for the way in is tested before it is relied on.
+./check-test.sh
 # What goes to the other side for which key is tested first: it needs no window.
 cc -Wall -Wextra -o build/keys-test ../gst-viewer/keys-test.c && build/keys-test
 # The picture's and the input's connections come from the Rust crate istesso-client, linked statically.
