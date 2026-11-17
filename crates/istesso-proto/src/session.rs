@@ -181,6 +181,12 @@ pub struct SessionPeer {
     /// The other end of the control connection that belongs to this
     /// session, as text a program can use as it is ([`address_text`]).
     pub address: String,
+    /// Its public key, as the list of paired devices has it. An agent
+    /// says it to a runner, so that the picture can be kept to this one
+    /// device: the id alone is a fingerprint, and whoever checks compares
+    /// both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 /// What a host's agent tells a runner.
@@ -265,6 +271,15 @@ pub enum RunnerEvent {
     Empty,
     /// It cannot go on; it ends after this, and the application with it.
     Error { message: String },
+    /// The encoder was refused: when the picture was to be made again, or
+    /// in the middle of a run. A graphics card opens only so many for the
+    /// whole machine, and other programs use them too. No picture is made
+    /// for now; the display and the application go on, and the client
+    /// stays attached. The runner tries again when it is told `resume`.
+    NoEncoder {
+        #[serde(default)]
+        message: String,
+    },
 }
 
 /// What the person asked for on the command line. The viewer decides the
@@ -484,6 +499,46 @@ mod tests {
     }
 
     #[test]
+    fn a_runner_says_when_the_encoder_was_refused_and_is_told_the_devices_key() {
+        assert_eq!(
+            decode_line::<RunnerEvent>(
+                r#"{"v":1,"event":"no_encoder","message":"no session free"}"#
+            ),
+            Some(RunnerEvent::NoEncoder {
+                message: "no session free".to_string()
+            })
+        );
+        assert_eq!(
+            decode_line::<RunnerEvent>(r#"{"v":1,"event":"no_encoder"}"#),
+            Some(RunnerEvent::NoEncoder {
+                message: String::new()
+            })
+        );
+        // The device that is shown the session, by its id and its key.
+        let attach = RunnerCommand::Attach {
+            peer: SessionPeer {
+                id: "1a2b-3c4d-5e6f-7a8b".to_string(),
+                address: "192.0.2.10".to_string(),
+                public_key: Some("Zm9v".to_string()),
+            },
+            display: DisplayMode {
+                width: 1280,
+                height: 720,
+                fps: 60,
+            },
+            offer: serde_json::Value::Null,
+        };
+        let line = encode_line(&attach);
+        assert!(
+            line.starts_with(
+                r#"{"v":1,"cmd":"attach","peer":{"id":"1a2b-3c4d-5e6f-7a8b","address":"192.0.2.10","public_key":"Zm9v"},"#
+            ),
+            "{line}"
+        );
+        assert_eq!(decode_line::<RunnerCommand>(&line), Some(attach));
+    }
+
+    #[test]
     fn stopping_and_bringing_back_a_picture_are_lines_of_their_own() {
         assert_eq!(
             encode_line(&RunnerCommand::Pause),
@@ -545,6 +600,7 @@ mod tests {
             peer: SessionPeer {
                 id: "1a2b-3c4d-5e6f-7a8b".to_string(),
                 address: "192.0.2.10".to_string(),
+                public_key: None,
             },
             input_socket: "/run/user/1000/istesso/input-5b0c9e3a7f21d684.sock".to_string(),
             offer: json!({"rtp_port": 50004}),
@@ -581,6 +637,7 @@ mod tests {
             peer: SessionPeer {
                 id: "1a2b-3c4d-5e6f-7a8b".to_string(),
                 address: "192.0.2.10".to_string(),
+                public_key: None,
             },
             display: DisplayMode {
                 width: 1280,
@@ -697,6 +754,7 @@ mod tests {
             host: SessionPeer {
                 id: "9f8e-7d6c-5b4a-3921".to_string(),
                 address: "192.0.2.20".to_string(),
+                public_key: None,
             },
             display: mode(),
             answer: json!({"key_request_port": 50005}),

@@ -421,6 +421,7 @@ mod tests {
             peer: SessionPeer {
                 id: "1a2b-3c4d-5e6f-7a8b".into(),
                 address: "192.0.2.10".into(),
+                public_key: None,
             },
             input_socket: "/tmp/istesso-test/input.sock".into(),
             offer: serde_json::json!({"port": 50004}),

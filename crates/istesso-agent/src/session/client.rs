@@ -371,6 +371,7 @@ pub fn open_window(
     let host = SessionPeer {
         id: opening.host.clone(),
         address: address_text(&client.remote_addr().map_err(failed)?),
+        public_key: None,
     };
     let first = match &opening.session {
         None => client

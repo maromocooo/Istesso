@@ -303,6 +303,12 @@ fn an_application_is_started_inside_the_runners_display() {
             assert_eq!(kind, StreamKind::AppWindow);
             assert_eq!(display, mode());
             assert_eq!(peer.id, host.laptop.id);
+            // The device's key goes with its id: a runner keeps the
+            // picture to the device that has both.
+            assert_eq!(
+                peer.public_key.as_deref(),
+                Some(host.laptop.public_key.as_str())
+            );
             assert_eq!(peer.address, "192.0.2.10");
             assert_eq!(offer, serde_json::json!({"port": 50004}));
             let socket = std::path::PathBuf::from(input_socket);
@@ -406,6 +412,12 @@ fn a_client_comes_back_to_a_session_it_left() {
             offer,
         } => {
             assert_eq!(peer.id, host.laptop.id);
+            // The device's key goes with its id: a runner keeps the
+            // picture to the device that has both.
+            assert_eq!(
+                peer.public_key.as_deref(),
+                Some(host.laptop.public_key.as_str())
+            );
             assert_eq!(peer.address, "192.0.2.77");
             assert_eq!(display.width, 800);
             assert_eq!(offer, serde_json::json!({"port": 50010}));
@@ -1200,6 +1212,129 @@ fn an_attachment_belongs_to_the_device_it_was_given_to() {
 }
 
 #[test]
+fn input_for_a_session_is_taken_from_the_device_that_is_shown_it() {
+    let host = host();
+    let id = host.running().id;
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    // The laptop is shown the session: its input goes to the session's own
+    // socket. The tablet may use the session, and is not shown it.
+    assert_eq!(
+        host.sessions.input_socket_of(&id, &host.laptop),
+        Some(host.paths.session_input_socket(&id))
+    );
+    assert_eq!(host.sessions.input_socket_of(&id, &tablet), None);
+    // Nobody is shown it: nobody's input is taken.
+    host.detach(&id, 1);
+    host.settles(&id, |s| s.info.state == SessionState::Detached);
+    assert!(!host.sessions.shown_to(&id, &host.laptop));
+    // The tablet attaches: now it is the tablet's, and not the laptop's.
+    session(host.ask_from(
+        &tablet,
+        "192.0.2.88:50000",
+        Request::SessionAttach {
+            session: id.clone(),
+            display: mode(),
+            offer: serde_json::Value::Null,
+        },
+    ));
+    assert!(host.sessions.shown_to(&id, &tablet));
+    assert!(!host.sessions.shown_to(&id, &host.laptop));
+    assert!(!host
+        .sessions
+        .shown_to(&SessionId("0000000000000000".into()), &tablet));
+}
+
+#[test]
+fn an_encoder_that_is_refused_stops_the_picture_of_a_window_nobody_looks_at() {
+    // Eight slots by the setting, and three windows: room enough on paper.
+    let host = host_with(Rules {
+        encoder_retry_after: Duration::from_millis(700),
+        ..quick_rules()
+    });
+    let paused = |id: &SessionId| host.sessions.host_look(id).unwrap().info.paused;
+    let first = host.running().id;
+    let second = session(host.start_as(&host.laptop, "paint.desktop")).id;
+    host.follow_until(&second, SessionState::Running);
+    let third = session(host.start_as(&host.laptop, "editor.desktop")).id;
+    host.follow_until(&third, SessionState::Running);
+    let before = host.journal.all().len();
+
+    // The card refuses the third window's encoder in the middle of the
+    // run: another program on the machine took one.
+    host.runner.say(StreamEvent::Said(RunnerEvent::NoEncoder {
+        message: "the card gives no more".to_string(),
+    }));
+    // Nothing crashes and nothing ends. The window that was turned to
+    // longest ago gives its picture up, and its report says why, for its
+    // client to tell the person.
+    host.settles(&first, |s| s.info.paused == Some(PauseReason::NoSlot));
+    let told = session(host.wait_as(&first, 0, 0, 1));
+    assert_eq!(
+        (told.state, told.paused),
+        (SessionState::Running, Some(PauseReason::NoSlot))
+    );
+    // Its runner gives the encoder back first; then the one that was
+    // refused is told to try again.
+    host.journal.wait_for("runner pause", 1);
+    host.journal.wait_for("runner resume", 1);
+    assert_eq!(
+        host.journal.all()[before..],
+        ["runner pause", "runner resume"]
+    );
+    assert_eq!((paused(&second), paused(&third)), (None, None));
+    for id in [&first, &second, &third] {
+        assert_eq!(
+            host.sessions.host_look(id).unwrap().info.state,
+            SessionState::Running
+        );
+    }
+    // A window that is opened meanwhile is not refused either: it takes
+    // the place of the one that was turned to longest ago.
+    let fourth = session(host.start_as(&host.laptop, "paint.desktop")).id;
+    host.follow_until(&fourth, SessionState::Running);
+    host.settles(&second, |s| s.info.paused == Some(PauseReason::NoSlot));
+    assert_eq!(paused(&fourth), None);
+
+    // After a while the host tries what it is set to again.
+    host.settles(&first, |s| s.info.paused.is_none());
+    host.settles(&second, |s| s.info.paused.is_none());
+    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("runner stop"), 0);
+}
+
+#[test]
+fn a_single_window_whose_encoder_is_refused_waits_and_tries_again() {
+    let host = host_with(Rules {
+        encoder_retry_after: Duration::from_millis(400),
+        ..quick_rules()
+    });
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::NoEncoder {
+        message: String::new(),
+    }));
+    // The session is as it was, attached and running, with no picture and
+    // the reason for it. Its runner is told nothing: it has no encoder to
+    // give back.
+    let seen = host.settles(&id, |s| s.info.paused == Some(PauseReason::NoSlot));
+    assert_eq!(
+        (seen.info.state, seen.info.attachment),
+        (SessionState::Running, 1)
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(host.since_running().is_empty());
+    // Then it is told to try again, and the picture is back.
+    host.settles(&id, |s| s.info.paused.is_none());
+    host.journal.wait_for("runner resume", 1);
+    assert_eq!(host.since_running(), ["runner resume"]);
+    // Refused once more, it waits once more.
+    host.runner.say(StreamEvent::Said(RunnerEvent::NoEncoder {
+        message: String::new(),
+    }));
+    host.settles(&id, |s| s.info.paused == Some(PauseReason::NoSlot));
+    assert_eq!(host.journal.count("app stop"), 0);
+}
+
+#[test]
 fn a_session_can_be_there_and_hold_no_encoder() {
     let host = host();
     let id = host.running().id;
@@ -1415,6 +1550,7 @@ fn nobody_is_attached_while_the_list_cannot_be_read() {
             peer: SessionPeer {
                 id: host.laptop.id.clone(),
                 address: "192.0.2.10".to_string(),
+                public_key: None,
             },
             display: mode(),
             offer: serde_json::Value::Null,

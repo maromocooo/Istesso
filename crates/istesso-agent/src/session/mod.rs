@@ -142,6 +142,13 @@ pub struct Rules {
     /// Pictures that are compressed at the same time. See
     /// [`policy::ENCODER_SLOTS`].
     pub encoder_slots: usize,
+    /// After an encoder was refused, how long the host makes fewer
+    /// pictures than it is set to before it tries its setting again.
+    pub encoder_retry_after: Duration,
+    /// After an encoder was refused, how long a runner is left alone
+    /// before it is told to try again: the window that gave its slot up
+    /// needs a moment to close its encoder.
+    pub encoder_settle: Duration,
     /// How often a session is looked after.
     pub tick: Duration,
     /// How often the list of paired devices is read again for a session.
@@ -160,6 +167,8 @@ impl Default for Rules {
             wait_at_most: Duration::from_secs(3),
             max_sessions: policy::OPEN_SESSIONS,
             encoder_slots: policy::ENCODER_SLOTS,
+            encoder_retry_after: Duration::from_secs(60),
+            encoder_settle: Duration::from_millis(500),
             tick: Duration::from_millis(100),
             recheck_rights_every: Duration::from_secs(1),
         }
@@ -252,6 +261,10 @@ struct Table {
     sessions: HashMap<String, Entry>,
     /// How many sessions were started, to list them in that order.
     started: u64,
+    /// Set after an encoder was refused: how many pictures the host makes
+    /// at once for the time being, fewer than it is set to, and since
+    /// when. The setting is tried again after a while.
+    fewer: Option<(usize, Instant)>,
 }
 
 struct Entry {
@@ -747,6 +760,7 @@ impl Sessions {
                 peer: SessionPeer {
                     id: peer.id.clone(),
                     address: address_text(&remote),
+                    public_key: Some(peer.public_key.clone()),
                 },
                 input_socket: input_socket.to_string_lossy().into_owned(),
                 offer: asked.offer.clone(),
@@ -866,6 +880,7 @@ impl Sessions {
                 peer: SessionPeer {
                     id: peer.id.clone(),
                     address: address_text(&remote),
+                    public_key: Some(peer.public_key.clone()),
                 },
                 display,
                 offer: offer.clone(),
@@ -960,7 +975,7 @@ impl Sessions {
                 entry.touched = Instant::now();
             }
         }
-        table.allot(inner.rules.encoder_slots);
+        table.allot(&inner.rules);
         let report = table
             .owned(session, caller)
             .map(|entry| report_to(&entry.info, shown));
@@ -1002,6 +1017,29 @@ impl Sessions {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    /// Whether `peer` is the device that is shown `session` at this moment.
+    /// Keyboard and pointer input for a session is taken from that device
+    /// and from no other (the person's decision of 2026-11-17).
+    pub fn shown_to(&self, session: &SessionId, peer: &Peer) -> bool {
+        self.inner
+            .lock()
+            .sessions
+            .get(&session.0)
+            .is_some_and(|entry| {
+                entry.ended_at.is_none()
+                    && entry.info.state == SessionState::Running
+                    && entry.viewer.id == peer.id
+                    && entry.viewer.public_key == peer.public_key
+            })
+    }
+
+    /// Where the runner of `session` takes input, when `peer` is the device
+    /// that is shown the session.
+    pub fn input_socket_of(&self, session: &SessionId, peer: &Peer) -> Option<std::path::PathBuf> {
+        self.shown_to(session, peer)
+            .then(|| self.inner.paths.session_input_socket(session))
     }
 
     /// Somebody changed the list of paired devices: every session reads it
@@ -1129,7 +1167,12 @@ impl Table {
     /// most recently get a slot each, and the others wait with their
     /// picture stopped: they are open, attached and running, and say why
     /// they show nothing new. No session is refused or ended for a slot.
-    fn allot(&mut self, slots: usize) {
+    ///
+    /// The number of slots is what the host is set to, or fewer for a
+    /// while after an encoder was refused: the setting is only a guess at
+    /// what the card gives, and other programs on the machine take from
+    /// the same number.
+    fn allot(&mut self, rules: &Rules) {
         fn set(entry: &mut Entry, paused: Option<PauseReason>) {
             if entry.info.paused != paused {
                 entry.info.paused = paused;
@@ -1151,6 +1194,15 @@ impl Table {
                 wanting.push(entry);
             }
         }
+        if self
+            .fewer
+            .is_some_and(|(_, since)| since.elapsed() >= rules.encoder_retry_after)
+        {
+            self.fewer = None;
+        }
+        let slots = self
+            .fewer
+            .map_or(rules.encoder_slots, |(now, _)| now.min(rules.encoder_slots));
         wanting.sort_by(|a, b| b.touched.cmp(&a.touched).then(b.number.cmp(&a.number)));
         for (place, entry) in wanting.into_iter().enumerate() {
             set(entry, (place >= slots).then_some(PauseReason::NoSlot));
@@ -1252,7 +1304,7 @@ impl Inner {
             }
             // A session that came, went or changed hands changes which
             // windows have an encoder.
-            table.allot(self.rules.encoder_slots);
+            table.allot(&self.rules);
         }
         self.changed.notify_all();
     }
@@ -1265,6 +1317,46 @@ impl Inner {
             entry.info.shown_on = None;
         });
         (self.log)(format!("session {id}: nobody is shown it now ({why})"));
+    }
+
+    /// A runner's encoder was refused, though its session had a slot. The
+    /// setting was too high for this moment: the card gives fewer than it
+    /// says, or another program on the machine took one. Nothing crashes
+    /// and nothing ends. The host counts one picture fewer for a while,
+    /// which stops the picture of the window that was turned to longest
+    /// ago; that window's report says why, so that its client can tell
+    /// the person.
+    fn encoder_refused(&self, job: &Job, why: &str) {
+        let makes = {
+            let mut table = self.lock();
+            let making = table
+                .sessions
+                .values()
+                .filter(|entry| {
+                    entry.ended_at.is_none()
+                        && matches!(
+                            entry.info.state,
+                            SessionState::Starting | SessionState::Running
+                        )
+                        && !entry.hidden
+                        && entry.info.paused.is_none()
+                })
+                .count();
+            // The one that was refused counted as making a picture.
+            let makes = making.saturating_sub(1);
+            table.fewer = Some((makes, Instant::now()));
+            table.allot(&self.rules);
+            makes
+        };
+        self.changed.notify_all();
+        (self.log)(format!(
+            "session {}: the encoder was refused{}{why}; this host makes {makes} pictures at once \
+             for the next {} seconds, and a window that is not being looked at has its picture \
+             stopped",
+            job.id,
+            if why.is_empty() { "" } else { ": " },
+            self.rules.encoder_retry_after.as_secs()
+        ));
     }
 
     /// Tells the device that gave attach order `number` how it went.
@@ -1331,6 +1423,15 @@ impl Inner {
         // attached, or else the one that is shown the session.
         let subject = {
             let mut table = self.lock();
+            // The setting is tried again a while after an encoder was
+            // refused.
+            let again = self.rules.encoder_retry_after;
+            if table
+                .fewer
+                .is_some_and(|(_, since)| since.elapsed() >= again)
+            {
+                table.allot(&self.rules);
+            }
             let Some(entry) = table.sessions.get_mut(&id.0) else {
                 return round;
             };
@@ -1523,8 +1624,11 @@ impl Inner {
             // answered yet, and since when.
             let mut attaching: Option<(u64, Instant, Device)> = None;
             // Whether the runner was told to stop making the picture for
-            // the client that is attached.
+            // the client that is attached, or has said that it cannot.
             let mut paused = false;
+            // After an encoder was refused: when the runner may be told to
+            // try again.
+            let mut try_encoder_at: Option<Instant> = None;
             loop {
                 if let Some(how) = application.poll() {
                     let why = format!("the application ended ({how})");
@@ -1584,6 +1688,18 @@ impl Inner {
                         }
                         continue;
                     }
+                    Some(StreamEvent::Said(RunnerEvent::NoEncoder { message })) => {
+                        // Nothing ends for that. The host makes one picture
+                        // fewer for a while, and the window that was turned
+                        // to longest ago gives its picture up, with the
+                        // reason in its report. This runner has no encoder
+                        // now; if its window keeps a slot, it is told to try
+                        // again once the other has let go of one.
+                        self.encoder_refused(&job, &message);
+                        paused = true;
+                        try_encoder_at = Some(Instant::now() + rules.encoder_settle);
+                        continue;
+                    }
                     Some(StreamEvent::Said(RunnerEvent::Ready { .. })) => continue,
                     None => {}
                 }
@@ -1639,10 +1755,13 @@ impl Inner {
                 } else if !round.running {
                     // Nobody is attached: there is no picture to stop.
                     paused = false;
-                } else if round.pause != paused {
+                } else if round.pause != paused
+                    && (round.pause || try_encoder_at.is_none_or(|at| Instant::now() >= at))
+                {
                     // The session stays as it is, attached and running. It
                     // only holds no encoder for now, or holds one again.
                     paused = round.pause;
+                    try_encoder_at = None;
                     let (line, what) = if paused {
                         (RunnerCommand::Pause, "its picture is stopped for now")
                     } else {

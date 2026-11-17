@@ -59,6 +59,8 @@ pub fn quick_rules() -> Rules {
         wait_at_most: Duration::from_millis(500),
         max_sessions: 8,
         encoder_slots: 8,
+        encoder_retry_after: Duration::from_secs(60),
+        encoder_settle: Duration::from_millis(30),
         tick: Duration::from_millis(10),
         recheck_rights_every: Duration::from_millis(50),
     }
