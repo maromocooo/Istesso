@@ -37,7 +37,7 @@ use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
+use winit::window::{CustomCursor, Fullscreen, Window, WindowId, WindowLevel};
 
 mod gpu;
 mod picture;
@@ -161,6 +161,21 @@ struct Args {
     #[arg(long)]
     on_top: bool,
 
+    /// macOS: cover the whole display the window is on, without a title bar
+    /// and without a space of its own, and keep the menu bar and the Dock
+    /// away while this is the active application. The viewer shows a relayed
+    /// picture this way, so the guess test shows the local one the same
+    #[arg(long, conflicts_with = "fullscreen")]
+    whole_display: bool,
+
+    /// Show this picture as the pointer over the window instead of the
+    /// system's: a file that starts with the line `WIDTH HEIGHT HOTSPOT_X
+    /// HOTSPOT_Y` and goes on with WIDTH x HEIGHT pixels of four bytes each,
+    /// red, green, blue, alpha. For the guess test, where both windows show
+    /// the same pointer
+    #[arg(long, value_name = "FILE")]
+    cursor_image: Option<PathBuf>,
+
     /// Size of the window's content, in points
     #[arg(long, value_name = "WIDTHxHEIGHT", default_value = "960x600", value_parser = parse_size)]
     size: (u32, u32),
@@ -247,6 +262,36 @@ struct App {
     failure: Option<String>,
 }
 
+/// Reads a pointer's picture: a first line `WIDTH HEIGHT HOTSPOT_X HOTSPOT_Y`, then the pixels.
+fn read_cursor_image(file: &std::path::Path) -> Result<(Vec<u8>, u16, u16, u16, u16), String> {
+    let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let bad = || {
+        format!(
+            "{} does not start with `WIDTH HEIGHT HOTSPOT_X HOTSPOT_Y` followed by that many pixels",
+            file.display()
+        )
+    };
+    let end = bytes.iter().position(|b| *b == b'\n').ok_or_else(bad)?;
+    let numbers: Vec<u16> = std::str::from_utf8(&bytes[..end])
+        .map_err(|_| bad())?
+        .split_whitespace()
+        .map(|n| n.parse().map_err(|_| bad()))
+        .collect::<Result<_, _>>()?;
+    let [width, height, x, y] = numbers[..] else {
+        return Err(bad());
+    };
+    let pixels = bytes[end + 1..].to_vec();
+    if width == 0
+        || height == 0
+        || x >= width
+        || y >= height
+        || pixels.len() != usize::from(width) * usize::from(height) * 4
+    {
+        return Err(bad());
+    }
+    Ok((pixels, width, height, x, y))
+}
+
 impl App {
     fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let (width, height) = self.args.size;
@@ -264,6 +309,15 @@ impl App {
         }
         if self.args.fullscreen {
             attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
+        #[cfg(target_os = "macos")]
+        if self.args.whole_display {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            // With this the menu bar and the Dock stay hidden instead of coming back at the
+            // display's edge, as they do for the viewer's window.
+            attributes = attributes
+                .with_decorations(false)
+                .with_borderless_game(true);
         }
         let window = match self.args.draw {
             Draw::Gpu => {
@@ -292,6 +346,17 @@ impl App {
             // Asked for again once the window exists: at creation macOS moves a window that
             // was placed on another display than the one in use back onto that one.
             window.set_outer_position(LogicalPosition::new(f64::from(x), f64::from(y)));
+        }
+        #[cfg(target_os = "macos")]
+        if self.args.whole_display {
+            use winit::platform::macos::WindowExtMacOS;
+            window.set_simple_fullscreen(true);
+        }
+        if let Some(file) = &self.args.cursor_image {
+            let (rgba, width, height, x, y) = read_cursor_image(file)?;
+            let source = CustomCursor::from_rgba(rgba, width, height, x, y)
+                .map_err(|e| format!("{} is not a pointer's picture: {e}", file.display()))?;
+            window.set_cursor(event_loop.create_custom_cursor(source));
         }
         if self.args.picture != Picture::Grey && self.args.scroll > 0 {
             let refresh = window
@@ -752,6 +817,34 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pointers_picture_is_read_and_a_wrong_one_refused() {
+        let dir = std::env::temp_dir().join(format!("istesso-flash-cursor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pointer");
+        // Two pixels by one, the hotspot on the second.
+        let mut bytes = b"2 1 1 0\n".to_vec();
+        bytes.extend_from_slice(&[255, 0, 0, 255, 0, 0, 0, 0]);
+        std::fs::write(&file, &bytes).unwrap();
+        let (pixels, width, height, x, y) = read_cursor_image(&file).unwrap();
+        assert_eq!((width, height, x, y), (2, 1, 1, 0));
+        assert_eq!(pixels, [255, 0, 0, 255, 0, 0, 0, 0]);
+        // A pixel short, a hotspot outside the picture, and no first line.
+        std::fs::write(&file, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(read_cursor_image(&file).is_err());
+        std::fs::write(&file, b"1 1 1 0\n\0\0\0\0").unwrap();
+        assert!(read_cursor_image(&file).is_err());
+        std::fs::write(&file, b"no line break").unwrap();
+        assert!(read_cursor_image(&file).is_err());
+        // `--whole-display` and `--fullscreen` are two ways to the same thing: one at a time.
+        assert!(
+            Args::try_parse_from(["istesso-flash", "--whole-display", "--fullscreen"]).is_err()
+        );
+        assert!(Args::try_parse_from(["istesso-flash", "--whole-display"]).is_ok());
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
 
     #[test]
     fn sizes_are_width_by_height() {
