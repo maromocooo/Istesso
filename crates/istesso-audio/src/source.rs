@@ -206,6 +206,21 @@ impl Packetizer {
         self.without_audio(Kind::End, now_ns)
     }
 
+    /// The same word for a listener that another one has replaced. From the
+    /// moment the new listener asked, the sequence is the new one's: a
+    /// number taken here would be a hole in what the new one receives, and
+    /// it would take that for a lost packet. So this packet takes none; it
+    /// carries the number after the last one this listener was sent.
+    pub fn end_for_replaced(&self, last_sent: Option<u32>, now_ns: u64) -> Header {
+        Header {
+            kind: Kind::End,
+            discontinuity: false,
+            seq: last_sent.map_or(0, |seq| seq.wrapping_add(1)),
+            position: self.expected.unwrap_or(0),
+            capture_ns: now_ns,
+        }
+    }
+
     fn without_audio(&mut self, kind: Kind, now_ns: u64) -> Header {
         Header {
             kind,
@@ -436,6 +451,22 @@ mod tests {
         let (header, samples) = packets.next_packet().unwrap();
         assert_eq!(header.position, 2560);
         assert_eq!(samples[0], 10.0);
+    }
+
+    #[test]
+    fn the_end_for_a_replaced_listener_takes_no_number() {
+        let (mut writer, mut packets) = ring();
+        writer.push(&piece(0.0, 256), 0);
+        let (first, _) = packets.next_packet().unwrap();
+        let first_seq = first.seq;
+        let end = packets.end_for_replaced(Some(first_seq), 77);
+        assert_eq!(
+            (end.kind, end.seq, end.position),
+            (Kind::End, first_seq + 1, 256)
+        );
+        // The successor's next packet follows on from the last audio.
+        let idle = packets.idle(78);
+        assert_eq!(idle.seq, first_seq + 1);
     }
 
     #[test]

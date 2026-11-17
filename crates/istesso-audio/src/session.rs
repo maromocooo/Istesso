@@ -559,6 +559,8 @@ impl Shared {
         let mut last_audio = Instant::now();
         let mut last_idle: Option<Instant> = None;
         let mut last_taken_up: Option<u64> = None;
+        // The number of the last packet this listener was sent.
+        let mut last_sent: Option<u32> = None;
         let why = loop {
             if self.stop.load(Ordering::SeqCst) {
                 break "the source is stopping";
@@ -572,23 +574,34 @@ impl Shared {
             // The packetizer is held only while a packet is put together,
             // never while it is sent: a listener that takes nothing must
             // not keep the next one waiting.
-            let entry = self.packetizer().next_packet().map(|(header, samples)| {
-                wire::encode(&header, samples, &mut packet);
-                let entry = Entry {
-                    seq: header.seq,
-                    position: header.position,
-                    frames: (samples.len() / usize::from(self.info.channels)) as u32,
-                    digest: if self.sent.is_some() {
-                        wire::digest(samples)
-                    } else {
-                        0
-                    },
-                };
-                (entry, header.capture_ns)
-            });
+            let entry = {
+                let mut packetizer = self.packetizer();
+                // Looked at again with the packetizer held: a sender that
+                // was replaced must not take a packet after its successor
+                // has taken one, or the successor's stream has a hole right
+                // after it joined.
+                if self.listener_no.load(Ordering::SeqCst) != number {
+                    break "another device asked for the sound";
+                }
+                packetizer.next_packet().map(|(header, samples)| {
+                    wire::encode(&header, samples, &mut packet);
+                    let entry = Entry {
+                        seq: header.seq,
+                        position: header.position,
+                        frames: (samples.len() / usize::from(self.info.channels)) as u32,
+                        digest: if self.sent.is_some() {
+                            wire::digest(samples)
+                        } else {
+                            0
+                        },
+                    };
+                    (entry, header.capture_ns)
+                })
+            };
             match entry {
                 Some((entry, capture_ns)) => {
                     let taken_up = clock::now_ns();
+                    last_sent = Some(entry.seq);
                     if let Some(sent) = &self.sent {
                         sent.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
                     }
@@ -613,7 +626,14 @@ impl Shared {
                 None => {
                     let quiet = last_audio.elapsed() >= IDLE_AFTER;
                     if quiet && last_idle.is_none_or(|at| at.elapsed() >= IDLE_EVERY) {
-                        let header = self.packetizer().idle(clock::now_ns());
+                        let header = {
+                            let mut packetizer = self.packetizer();
+                            if self.listener_no.load(Ordering::SeqCst) != number {
+                                break "another device asked for the sound";
+                            }
+                            packetizer.idle(clock::now_ns())
+                        };
+                        last_sent = Some(header.seq);
                         wire::encode(&header, &[], &mut packet);
                         channel.send(&packet)?;
                         last_idle = Some(Instant::now());
@@ -625,7 +645,14 @@ impl Shared {
             }
         };
         (self.log)(format!("stopped sending sound to {}: {why}", peer.name));
-        let header = self.packetizer().end(clock::now_ns());
+        // A listener that was replaced is told so without taking a number
+        // from the sequence, which is its successor's by now.
+        let header = if self.listener_no.load(Ordering::SeqCst) != number {
+            self.packetizer()
+                .end_for_replaced(last_sent, clock::now_ns())
+        } else {
+            self.packetizer().end(clock::now_ns())
+        };
         wire::encode(&header, &[], &mut packet);
         // The listener may be gone already.
         let _ = channel.send(&packet);
