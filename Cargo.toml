@@ -18,6 +18,8 @@ istesso-pair = { path = "crates/istesso-pair" }
 istesso-link = { path = "crates/istesso-link" }
 istesso-agent = { path = "crates/istesso-agent" }
 istesso-measure = { path = "crates/istesso-measure" }
+istesso-device-api = { path = "crates/istesso-device-api" }
+istesso-device-adapters = { path = "crates/istesso-device-adapters" }
 
 # Third-party crates. Every dependency must pass the licence allowlist in deny.toml.
 serde = { version = "1", features = ["derive"] }
@@ -45,6 +47,14 @@ softbuffer = { version = "0.4", default-features = false, features = ["x11", "x1
 glutin = { version = "0.32", default-features = false, features = ["egl", "wayland", "x11"] }
 glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland", "x11"] }
 glow = "0.18"
+# Device framework (ADR 0012). Reasons and licences are in docs/components.md.
+# Pinned: later 0.25 releases need a newer Rust than this workspace asks for.
+image = { version = "=0.25.6", default-features = false, features = ["jpeg"] }
+# No default features: the default Linux backend needs the system's libudev,
+# and the libusb backends would bring in LGPL code.
+hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev"] }
+# Only in tests of the device framework. Already in the tree through serde and clap.
+proc-macro2 = "1"
 
 # Audio (istesso-audio), kept as one block at the end of this table.
 istesso-audio = { path = "crates/istesso-audio" }

@@ -42,3 +42,17 @@ unknown-git = "deny"
 
 [advisories]
 yanked = "deny"
+
+# hidapi: the crate is MIT. On macOS it compiles the HIDAPI C library that it
+# bundles, which may be used under GPL-3.0, a BSD-style licence or the original
+# HIDAPI licence, at the user's choice. We use it under the BSD-style licence
+# (decided 2026-11-17; text in third-party-licenses/HIDAPI-LICENSE-bsd.txt).
+# The hashes tie this statement to the licence files of the version we build;
+# a new version of the crate has to be looked at again.
+[[licenses.clarify]]
+crate = "hidapi"
+expression = "MIT AND BSD-3-Clause"
+license-files = [
+    { path = "LICENSE.txt", hash = 0xf528ab0f },
+    { path = "etc/hidapi/LICENSE-bsd.txt", hash = 0x520271c7 },
+]

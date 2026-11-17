@@ -1,0 +1,23 @@
+[package]
+name = "istesso-devices"
+description = "The device framework: finds devices, guards what an adapter may send, converts pictures, records and replays. Adapters live in adapters/ and are picked up at build time."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["hid"]
+# Talking to real HID devices. Everything else builds and is tested without it.
+hid = ["dep:hidapi"]
+
+[dependencies]
+istesso-device-api.workspace = true
+istesso-device-adapters.workspace = true
+image.workspace = true
+hidapi = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Reads the adapters' sources as tokens, for a check that helps review.
+proc-macro2.workspace = true
