@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Istesso Launcher Mock-up</title>
+<!--
+  Static mock-up for docs/m3-launcher.md (proposal). Plain HTML and CSS:
+  no scripts, nothing loaded from the network, system fonts only.
+  Host and device names (tower, attic, laptop, old-laptop) are invented.
+  Follows the system's light or dark setting; the last panel is always dark.
+-->
+<style>
+  :root {
+    --page: #ecebf0;
+    --page-text: #1d1d1f;
+    --note: #6e6e73;
+    --win: #f6f6f8;
+    --win-edge: #c9c9ce;
+    --bar: #e4e4e8;
+    --field: #ffffff;
+    --text: #1d1d1f;
+    --dim: #6e6e73;
+    --row-hover: #e6e6eb;
+    --sel: #0a64d6;
+    --sel-text: #ffffff;
+    --accent: #0a64d6;
+    --warn: #b25000;
+    --warn-bg: #fff1e0;
+    --bad: #c4271d;
+    --bad-bg: #fde8e6;
+    --shadow: 0 18px 40px rgba(0,0,0,.18), 0 0 0 .5px rgba(0,0,0,.12);
+    --sheet: #ffffff;
+    --chip: #dcdce2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #111114;
+      --page-text: #f2f2f7;
+      --note: #9a9aa2;
+      --win: #242428;
+      --win-edge: #3c3c42;
+      --bar: #2d2d32;
+      --field: #1b1b1e;
+      --text: #f2f2f7;
+      --dim: #9a9aa2;
+      --row-hover: #323238;
+      --sel: #2f7ff0;
+      --sel-text: #ffffff;
+      --accent: #4c9bff;
+      --warn: #ffab4d;
+      --warn-bg: #3a2a14;
+      --bad: #ff6b60;
+      --bad-bg: #3d1c1a;
+      --shadow: 0 18px 40px rgba(0,0,0,.55), 0 0 0 .5px rgba(255,255,255,.12);
+      --sheet: #2c2c31;
+      --chip: #3a3a40;
+    }
+  }
+  .force-dark {
+    --win: #242428; --win-edge: #3c3c42; --bar: #2d2d32; --field: #1b1b1e;
+    --text: #f2f2f7; --dim: #9a9aa2; --row-hover: #323238; --sel: #2f7ff0;
+    --accent: #4c9bff; --warn: #ffab4d; --warn-bg: #3a2a14; --bad: #ff6b60;
+    --bad-bg: #3d1c1a; --sheet: #2c2c31; --chip: #3a3a40;
+    --shadow: 0 18px 40px rgba(0,0,0,.55), 0 0 0 .5px rgba(255,255,255,.12);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px 64px;
+    background: var(--page); color: var(--page-text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Hiragino Sans", sans-serif;
+  }
+  header.page { max-width: 1180px; margin: 0 auto 28px; }
+  header.page h1 { font-size: 22px; margin: 0 0 6px; }
+  header.page p { margin: 0; color: var(--note); max-width: 70ch; }
+
+  .grid {
+    max-width: 1180px; margin: 0 auto;
+    display: grid; gap: 40px 32px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 540px), 1fr));
+  }
+  figure { margin: 0; }
+  figcaption { margin: 0 0 10px; font-weight: 600; }
+  figcaption span { display: block; font-weight: 400; color: var(--note); font-size: 12px; }
+
+  /* A macOS-like window */
+  .win {
+    background: var(--win); color: var(--text);
+    border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
+    position: relative;
+  }
+  .titlebar {
+    height: 36px; display: flex; align-items: center; gap: 8px; padding: 0 14px;
+    background: var(--bar); border-bottom: 1px solid var(--win-edge);
+  }
+  .lights { display: flex; gap: 8px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .lights i:nth-child(1) { background: #ff5f57; }
+  .lights i:nth-child(2) { background: #febc2e; }
+  .lights i:nth-child(3) { background: #28c840; }
+  .titlebar .search {
+    flex: 1; margin-left: 10px; height: 24px; border-radius: 6px;
+    background: var(--field); border: 1px solid var(--win-edge);
+    display: flex; align-items: center; padding: 0 8px; color: var(--dim);
+  }
+  .titlebar .search.focus { outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 0; color: var(--text); }
+  .body { padding: 12px 16px 14px; }
+
+  h3.sec { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); margin: 6px 0 6px; }
+  .banner {
+    display: flex; gap: 8px; align-items: flex-start;
+    background: var(--warn-bg); color: var(--text);
+    border-radius: 8px; padding: 8px 10px; margin: 2px 0 8px; font-size: 12px;
+  }
+  .banner.bad { background: var(--bad-bg); }
+  .banner b { color: var(--warn); }
+  .banner.bad b { color: var(--bad); }
+  .link { color: var(--accent); white-space: nowrap; }
+
+  .rows { list-style: none; margin: 0 0 10px; padding: 0; }
+  .rows li {
+    display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; align-items: center;
+    padding: 5px 8px; border-radius: 7px;
+  }
+  .rows li.sel { background: var(--sel); color: var(--sel-text); }
+  .rows li.sel .where, .rows li.sel .state { color: var(--sel-text); opacity: .9; }
+  .rows li.gone { opacity: .55; }
+  .name { font-weight: 600; }
+  .where { color: var(--dim); font-size: 12px; }
+  .state { font-size: 12px; white-space: nowrap; }
+  .state.paused { color: var(--warn); font-weight: 600; }
+  .state.lost { color: var(--dim); }
+  .btn {
+    font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 6px;
+    border: 1px solid var(--win-edge); background: var(--field); color: var(--text);
+    white-space: nowrap;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.danger { color: var(--bad); }
+  .rows li.sel .btn { background: rgba(255,255,255,.2); border-color: rgba(255,255,255,.5); color: #fff; }
+
+  .icon {
+    width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center;
+    color: #fff; font-weight: 700; font-size: 13px; position: relative;
+  }
+  .icon.lg { width: 52px; height: 52px; border-radius: 12px; font-size: 22px; }
+  .c1 { background: linear-gradient(160deg,#ff9b3d,#e2591b); }
+  .c2 { background: linear-gradient(160deg,#5fa8ff,#2559d6); }
+  .c3 { background: linear-gradient(160deg,#7c6f64,#4a4038); }
+  .c4 { background: linear-gradient(160deg,#4ec38a,#178a55); }
+  .c5 { background: linear-gradient(160deg,#c48bff,#7a3fd6); }
+  .c6 { background: linear-gradient(160deg,#ff6f91,#c92f5d); }
+  .c7 { background: linear-gradient(160deg,#9aa4b2,#5c6676); }
+  .c8 { background: linear-gradient(160deg,#ffd34d,#d69a00); color: #3a2a00; }
+  .pausemark {
+    position: absolute; right: -4px; bottom: -4px; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--warn); border: 2px solid var(--win); display: grid; place-items: center;
+  }
+  .pausemark::before { content: ""; width: 4px; height: 5px; border-left: 1.5px solid #fff; border-right: 1.5px solid #fff; }
+
+  .apps {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+    gap: 10px 6px; margin-bottom: 8px;
+  }
+  .app { text-align: center; padding: 8px 4px 6px; border-radius: 10px; position: relative; }
+  .app .icon { margin: 0 auto 6px; }
+  .app .n { font-weight: 500; font-size: 12px; }
+  .app .h { color: var(--dim); font-size: 11px; }
+  .app.sel { background: color-mix(in srgb, var(--accent) 20%, transparent); outline: 2px solid var(--accent); }
+  .app.dim .icon { opacity: .45; }
+  .app.dim .n { opacity: .6; }
+  .bang {
+    position: absolute; top: 2px; right: 18px; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--warn); color: #fff; font-weight: 800; font-size: 12px; line-height: 18px;
+  }
+  .more { position: absolute; right: -6px; bottom: -4px; font-size: 10px; font-weight: 700;
+    background: var(--chip); color: var(--text); border-radius: 8px; padding: 0 4px; }
+
+  .hosts {
+    display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+    border-top: 1px solid var(--win-edge); padding: 8px 16px; font-size: 12px; color: var(--dim);
+    background: var(--bar);
+  }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
+  .dot.ok { background: #2fb55a; }
+  .dot.sleep { background: transparent; border: 1.5px solid var(--dim); }
+  .dot.no { background: transparent; border: 1.5px solid var(--bad); position: relative; }
+  .dot.no::after { content: ""; position: absolute; left: -1px; top: 2px; width: 9px; height: 1.5px; background: var(--bad); transform: rotate(-45deg); }
+  .hosts .h-bad { color: var(--bad); }
+  .hosts .spacer { flex: 1; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 34px 24px 30px; }
+  .empty .art { width: 120px; height: 64px; margin: 0 auto 14px; position: relative; }
+  .empty .art i { position: absolute; display: block; border: 2px solid var(--dim); border-radius: 6px; }
+  .empty .art i:nth-child(1) { left: 0; top: 10px; width: 50px; height: 34px; }
+  .empty .art i:nth-child(2) { right: 0; top: 0; width: 56px; height: 40px; border-color: var(--accent); }
+  .empty .art i:nth-child(3) { left: 52px; top: 26px; width: 14px; height: 0; border-width: 1px 0 0; border-style: dashed; border-radius: 0; }
+  .empty h2 { font-size: 17px; margin: 0 0 6px; }
+  .empty p { color: var(--dim); max-width: 40ch; margin: 0 auto 16px; }
+  .empty .btn { font-size: 13px; padding: 5px 16px; }
+  .empty .small { display: block; margin-top: 14px; font-size: 12px; }
+
+  /* Sheet */
+  .scrim { position: absolute; inset: 36px 0 0 0; background: rgba(0,0,0,.18); }
+  .sheet {
+    position: absolute; left: 50%; top: 36px; transform: translateX(-50%);
+    width: min(360px, 92%); background: var(--sheet); border-radius: 0 0 12px 12px;
+    box-shadow: var(--shadow); padding: 16px 18px 14px;
+  }
+  .sheet h4 { margin: 0 0 10px; font-size: 13px; }
+  .opt { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+  .radio { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--dim); flex: none; }
+  .radio.on { border: 4px solid var(--accent); }
+  .opt .num { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .sheet .hint { color: var(--dim); font-size: 12px; margin: 10px 0; }
+  .check { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+  .box { width: 14px; height: 14px; border-radius: 3px; background: var(--accent); color: #fff; font-size: 10px; display: grid; place-items: center; }
+  .sheet .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .faded { opacity: .35; }
+
+  /* Popover note */
+  .pop {
+    position: absolute; background: var(--sheet); border-radius: 10px; box-shadow: var(--shadow);
+    padding: 10px 12px; width: 270px; font-size: 12px; z-index: 2;
+  }
+  .pop p { margin: 0 0 8px; }
+  .pop .actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+  /* Menu bar */
+  .menubar {
+    height: 26px; background: color-mix(in srgb, var(--win) 75%, transparent);
+    border-radius: 8px 8px 0 0; display: flex; align-items: center; justify-content: flex-end;
+    gap: 16px; padding: 0 12px; color: var(--text); font-size: 13px;
+    border: 1px solid var(--win-edge); border-bottom: 0;
+  }
+  .mb-icon { position: relative; width: 18px; height: 14px; border: 1.5px solid var(--text); border-radius: 3px; }
+  .mb-icon::before { content: ""; position: absolute; left: 3px; top: 3px; width: 6px; height: 4px; border: 1.5px solid var(--text); border-radius: 1px; }
+  .mb-icon.alert::after { content: ""; position: absolute; right: -4px; top: -4px; width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
+  .mb-icon.open { background: var(--sel); border-color: var(--sel); }
+  .menu {
+    margin-left: auto; width: min(330px, 100%); background: var(--sheet); color: var(--text);
+    border-radius: 8px; box-shadow: var(--shadow); padding: 5px; font-size: 13px;
+  }
+  .menu .item { display: flex; gap: 8px; align-items: center; padding: 4px 9px; border-radius: 5px; }
+  .menu .item.sel { background: var(--sel); color: var(--sel-text); }
+  .menu .item.sel .sub { color: var(--sel-text); opacity: .85; }
+  .menu .sub { color: var(--dim); font-size: 12px; margin-left: auto; white-space: nowrap; }
+  .menu .head { color: var(--dim); font-size: 12px; font-weight: 600; padding: 4px 9px 2px; }
+  .menu hr { border: 0; border-top: 1px solid var(--win-edge); margin: 5px 4px; }
+  .menu .icon { width: 18px; height: 18px; border-radius: 5px; font-size: 10px; }
+  .menu .key { margin-left: auto; color: var(--dim); }
+
+  .placeholder {
+    border: 2px dashed var(--accent); border-radius: 10px; height: 150px; margin: 10px 0 4px;
+    display: grid; place-items: center; color: var(--dim);
+  }
+  .spin { display: inline-block; width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid var(--chip); border-top-color: var(--accent); vertical-align: -2px; margin-right: 6px; }
+
+  @media (max-width: 520px) {
+    .rows li { grid-template-columns: 28px 1fr; }
+    .rows li > :last-child { grid-column: 2; justify-self: start; }
+  }
+</style>
+</head>
+<body>
+<header class="page">
+  <h1>Istesso launcher — mock-up of the proposal</h1>
+  <p>Static pictures of the main states in docs/m3-launcher.md. Nothing here works; it shows what is seen and the words used. Host and device names are made up. The panels follow the system's light or dark setting; the last one is always dark.</p>
+</header>
+
+<div class="grid">
+
+  <!-- 1. No host paired -->
+  <figure>
+    <figcaption>1. No computer paired yet<span>First start. One button; the launcher asks no host for anything.</span></figcaption>
+    <div class="win" role="img" aria-label="Launcher window with no computer paired">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div></div>
+      <div class="empty">
+        <div class="art"><i></i><i></i><i></i></div>
+        <h2>Use apps from your other computers</h2>
+        <p>Pair a computer that has Istesso installed. Its apps will appear here, and they open in windows on this Mac.</p>
+        <span class="btn primary">Pair a Computer…</span>
+        <span class="small link">How do I install Istesso on another computer?</span>
+      </div>
+    </div>
+  </figure>
+
+  <!-- 2. Main -->
+  <figure>
+    <figcaption>2. Hosts, their apps, and what is still running<span>Running on top: on this Mac, on another device, not shown anywhere, opened by an unpaired device. One icon per app; where it opens is written under it.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search focus">Search apps</div></div>
+      <div class="body">
+        <h3 class="sec">Running</h3>
+        <ul class="rows">
+          <li class="sel"><span class="icon c1">F</span><span><span class="name">Firefox</span><br><span class="where">tower · On this Mac</span></span><span class="btn">Quit</span></li>
+          <li><span class="icon c5">K</span><span><span class="name">Kdenlive</span><br><span class="where">tower · On laptop</span></span><span class="btn">Show Here</span></li>
+          <li><span class="icon c7">T</span><span><span class="name">Text Editor</span><br><span class="where">tower · Not shown · Opened by old-laptop (unpaired)</span></span><span class="btn">Show</span></li>
+        </ul>
+        <h3 class="sec">All Apps</h3>
+        <div class="apps">
+          <div class="app"><div class="icon lg c2">B</div><div class="n">Blender</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c1">F<span class="more">+1</span></div><div class="n">Firefox</div><div class="h">running here</div></div>
+          <div class="app dim"><span class="bang">!</span><div class="icon lg c3">G</div><div class="n">GIMP</div><div class="h">on attic</div></div>
+          <div class="app"><div class="icon lg c6">I</div><div class="n">Inkscape</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c5">K</div><div class="n">Kdenlive</div><div class="h">running on laptop</div></div>
+          <div class="app"><div class="icon lg c4">L</div><div class="n">LibreOffice Writer</div><div class="h">on this Mac</div></div>
+        </div>
+      </div>
+      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="dot sleep"></span>attic · Asleep</span><span class="spacer"></span><span>⌘R to refresh</span></div>
+    </div>
+  </figure>
+
+  <!-- 3. Paused for lack of a slot -->
+  <figure>
+    <figcaption>3. Pictures paused: tower updates 8 windows at once<span>Which windows stopped, said in words and with a mark, not by colour alone. Clicking a row brings that window forward, which resumes it.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
+      <div class="body">
+        <h3 class="sec">Running</h3>
+        <div class="banner"><span><b>2 windows are paused.</b> tower updates up to 8 windows at once; the others resume when you look at them. The apps keep running. <span class="link">Why?</span></span></div>
+        <ul class="rows">
+          <li><span class="icon c1">F</span><span><span class="name">Firefox</span><br><span class="where">tower · On this Mac</span></span><span class="btn">Quit</span></li>
+          <li class="sel"><span class="icon c3">G<span class="pausemark"></span></span><span><span class="name">GIMP</span><br><span class="where">tower · On this Mac</span></span><span class="state paused">❚❚ Paused</span></li>
+          <li><span class="icon c6">I<span class="pausemark"></span></span><span><span class="name">Inkscape</span><br><span class="where">tower · On this Mac</span></span><span class="state paused">❚❚ Paused</span></li>
+          <li><span class="icon c2">B</span><span><span class="name">Blender</span><br><span class="where">tower · On this Mac</span></span><span class="state lost">Minimised</span></li>
+          <li><span class="icon c4">L</span><span><span class="name">LibreOffice Writer</span><br><span class="where">tower · On this Mac</span></span><span class="btn">Quit</span></li>
+        </ul>
+      </div>
+      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="dot sleep"></span>attic · Asleep</span></div>
+    </div>
+  </figure>
+
+  <!-- 4. Opening with size -->
+  <figure>
+    <figcaption>4. Opening with a size (⌥Return or “Open with Size…”)<span>Sizes in points, computed from this Mac's screen. The window keeps its size; the sheet says so.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">ble</div></div>
+      <div class="body faded">
+        <h3 class="sec">All Apps</h3>
+        <div class="apps">
+          <div class="app sel"><div class="icon lg c2">B</div><div class="n">Blender</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c8">S</div><div class="n">Scribble</div><div class="h">on tower</div></div>
+        </div>
+        <div style="height:120px"></div>
+      </div>
+      <div class="scrim"></div>
+      <div class="sheet" role="dialog" aria-label="Open Blender with size">
+        <h4>Open Blender on tower</h4>
+        <div class="opt"><span class="radio"></span>Fill Screen<span class="num">1470 × 900</span></div>
+        <div class="opt"><span class="radio on"></span>Large<span class="num">1250 × 765</span></div>
+        <div class="opt"><span class="radio"></span>Medium<span class="num">1280 × 800</span></div>
+        <div class="opt"><span class="radio"></span>Small<span class="num">960 × 600</span></div>
+        <div class="opt"><span class="radio"></span>Custom…</div>
+        <p class="hint">The window keeps this size until you close it. To change the size, quit and open again.</p>
+        <div class="check"><span class="box">✓</span>Use this size for Blender next time</div>
+        <div class="actions"><span class="btn">Cancel</span><span class="btn primary">Open</span></div>
+      </div>
+    </div>
+  </figure>
+
+  <!-- 5. Opening in progress, and failure -->
+  <figure>
+    <figcaption>5. Opening, and when it fails<span>The launcher hides; an outline the size of the window shows progress. A failure gives the host's one line and a way on.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
+      <div class="body">
+        <div class="placeholder"><span><span class="spin"></span>Opening Blender on tower… This can take a few seconds the first time.</span></div>
+        <div class="banner bad"><span><b>tower already has 64 apps open, the most it allows.</b> Quit some in Running, then try again.</span><span class="btn">Show Running</span></div>
+        <div class="banner bad"><span><b>GNU Nano runs in a terminal.</b> Open it in a terminal window instead.</span><span class="btn">OK</span></div>
+      </div>
+    </div>
+  </figure>
+
+  <!-- 6. Host not answering; connection lost -->
+  <figure>
+    <figcaption>6. A host that does not answer, and a cut connection<span>Apps keep running there; rows stay, greyed, until the host answers. Coming back from sleep reconnects windows nobody else took.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
+      <div class="body" style="position:relative">
+        <h3 class="sec">Running</h3>
+        <ul class="rows">
+          <li class="gone"><span class="icon c1">F</span><span><span class="name">Firefox</span><br><span class="where">tower · Connection lost</span></span><span class="btn">Reconnect</span></li>
+          <li class="gone"><span class="icon c7">T</span><span><span class="name">Text Editor</span><br><span class="where">tower · Can't reach tower</span></span><span></span></li>
+          <li><span class="icon c5">K</span><span><span class="name">Kdenlive</span><br><span class="where">tower · Moved to laptop while this Mac was away</span></span><span class="btn">Show Here</span></li>
+        </ul>
+        <h3 class="sec">All Apps</h3>
+        <div class="apps">
+          <div class="app dim"><span class="bang">!</span><div class="icon lg c2">B</div><div class="n">Blender</div><div class="h">on tower</div></div>
+          <div class="app"><div class="icon lg c4">L</div><div class="n">LibreOffice Writer</div><div class="h">on attic</div></div>
+          <div class="app dim"><span class="bang">!</span><div class="icon lg c6">I</div><div class="n">Inkscape</div><div class="h">on tower</div></div>
+        </div>
+        <div class="pop" style="left:20px; bottom:-6px">
+          <p><b>tower is not answering.</b> It may be asleep, turned off, or on another network.</p>
+          <div class="actions"><span class="btn">OK</span><span class="btn primary">Try Again</span></div>
+        </div>
+      </div>
+      <div class="hosts"><span class="h-bad"><span class="dot no"></span>tower · Not answering</span><span><span class="dot ok"></span>attic · Ready</span></div>
+    </div>
+  </figure>
+
+  <!-- 7. Unpaired -->
+  <figure>
+    <figcaption>7. The host no longer accepts this Mac<span>Its apps and sessions leave the list. Apps this Mac opened there keep running for the other devices.</span></figcaption>
+    <div class="win">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search">Search apps</div></div>
+      <div class="body">
+        <div class="banner bad"><span><b>tower no longer accepts this Mac.</b> Apps this Mac opened there keep running and can be used from your other devices. To use tower here again, pair it again.</span></div>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-bottom:10px"><span class="btn">Remove tower</span><span class="btn primary">Pair Again…</span></div>
+        <h3 class="sec">All Apps</h3>
+        <div class="apps">
+          <div class="app"><div class="icon lg c1">F</div><div class="n">Firefox</div><div class="h">on attic</div></div>
+          <div class="app"><div class="icon lg c3">G</div><div class="n">GIMP</div><div class="h">on attic</div></div>
+        </div>
+      </div>
+      <div class="hosts"><span class="h-bad"><span class="dot no"></span>tower · Not paired</span><span><span class="dot ok"></span>attic · Ready</span></div>
+    </div>
+  </figure>
+
+  <!-- 8. Menu bar -->
+  <figure>
+    <figcaption>8. The menu bar item<span>The quick way back. The dot means a window is paused or lost. Opening the menu asks each awake host once; nothing is asked while it is closed.</span></figcaption>
+    <div>
+      <div class="menubar"><span>Tue 15:40</span><span class="mb-icon alert open" aria-label="Istesso, 2 windows paused"></span></div>
+      <div class="menu" role="menu">
+        <div class="head">Running</div>
+        <div class="item sel"><span class="icon c1">F</span>Firefox<span class="sub">On this Mac</span></div>
+        <div class="item"><span class="icon c3">G</span>GIMP<span class="sub">❚❚ Paused</span></div>
+        <div class="item"><span class="icon c5">K</span>Kdenlive<span class="sub">On laptop</span></div>
+        <div class="item"><span class="icon c7">T</span>Text Editor<span class="sub">Not shown</span></div>
+        <hr>
+        <div class="item">Open Launcher…<span class="key">⌃⌥Space</span></div>
+        <div class="item">Pair a Computer…</div>
+        <hr>
+        <div class="item">Quit Istesso<span class="key">⌘Q</span></div>
+      </div>
+    </div>
+  </figure>
+
+  <!-- 9. Forced dark -->
+  <figure>
+    <figcaption>9. Panel 2 in the dark appearance<span>Always dark, to compare with the system's setting.</span></figcaption>
+    <div class="win force-dark">
+      <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="search focus">Search apps</div></div>
+      <div class="body">
+        <h3 class="sec">Running</h3>
+        <ul class="rows">
+          <li class="sel"><span class="icon c1">F</span><span><span class="name">Firefox</span><br><span class="where">tower · On this Mac</span></span><span class="btn">Quit</span></li>
+          <li><span class="icon c3">G<span class="pausemark"></span></span><span><span class="name">GIMP</span><br><span class="where">tower · On this Mac</span></span><span class="state paused">❚❚ Paused</span></li>
+          <li><span class="icon c5">K</span><span><span class="name">Kdenlive</span><br><span class="where">tower · On laptop</span></span><span class="btn">Show Here</span></li>
+        </ul>
+        <h3 class="sec">All Apps</h3>
+        <div class="apps">
+          <div class="app"><div class="icon lg c2">B</div><div class="n">Blender</div><div class="h">on tower</div></div>
+          <div class="app dim"><span class="bang">!</span><div class="icon lg c3">G</div><div class="n">GIMP</div><div class="h">on attic</div></div>
+          <div class="app"><div class="icon lg c6">I</div><div class="n">Inkscape</div><div class="h">on tower</div></div>
+        </div>
+      </div>
+      <div class="hosts"><span><span class="dot ok"></span>tower · Ready</span><span><span class="dot sleep"></span>attic · Asleep</span></div>
+    </div>
+  </figure>
+
+</div>
+</body>
+</html>
