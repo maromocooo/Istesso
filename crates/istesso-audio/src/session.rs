@@ -54,8 +54,8 @@ const SEND_WAIT: Duration = Duration::from_secs(5);
 const RECHECK: Duration = Duration::from_secs(1);
 /// With no audio for this long, the source says that it has nothing to
 /// play, and repeats it this often.
-const IDLE_AFTER: Duration = Duration::from_millis(200);
-const IDLE_EVERY: Duration = Duration::from_millis(500);
+const IDLE_AFTER: Duration = Duration::from_millis(100);
+const IDLE_EVERY: Duration = Duration::from_millis(100);
 /// How long the sending thread sleeps when there is nothing to send.
 const POLL: Duration = Duration::from_millis(1);
 /// How often captured audio is thrown away while nobody listens.
@@ -953,8 +953,9 @@ pub enum Rejoining {
 }
 
 /// How long nothing may arrive on a healthy connection: a source with
-/// nothing to play still says so twice a second.
-pub const SILENT_CONNECTION: Duration = Duration::from_secs(1);
+/// nothing to play still says so ten times a second. The shorter this is,
+/// the sooner a connection that was cut is replaced.
+pub const SILENT_CONNECTION: Duration = Duration::from_millis(300);
 
 /// [`pump`], and when the connection is cut, a new one: a network may drop
 /// a connection that both ends still believe in, and an exit that then
@@ -1458,10 +1459,12 @@ mod tests {
         let (second, _) = subscription.next_packet(&mut samples).unwrap();
         assert_eq!(second.kind, Kind::Idle);
         assert_eq!(second.seq, first.seq + 1);
-        // The first after a fifth of a second, the next half a second on.
+        // The first after a tenth of a second, the next a tenth on: often
+        // enough for an exit to tell silence from a connection that was
+        // cut within its allowance.
         let took = begin.elapsed();
         assert!(
-            took > Duration::from_millis(600) && took < Duration::from_millis(1500),
+            took > Duration::from_millis(180) && took < SILENT_CONNECTION,
             "{took:?}"
         );
     }
