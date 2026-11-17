@@ -798,7 +798,7 @@ mod mac {
     use istesso_audio::clock;
     use istesso_audio::fifo::queue;
     use istesso_audio::mac::Output;
-    use istesso_audio::outlet::{Outlet, OutletCounts, CLOSING_FADE_S};
+    use istesso_audio::outlet::{Outlet, OutletCounts};
     use istesso_audio::playout::{Playout, PlayoutConfig, PlayoutStats, WaitEvent};
     use istesso_audio::probe::Spread;
     use istesso_audio::resample::Sinc;
@@ -868,10 +868,32 @@ mod mac {
         )
     }
 
-    /// How long the player waits between asking the outlet to close and
-    /// stopping the device: the fade, and the two turns of the device it
-    /// may take until the callback has seen the request.
-    const CLOSING_WAIT: Duration = Duration::from_millis((CLOSING_FADE_S * 1e3) as u64 + 30);
+    /// The longest the player waits for the outlet's fade to have been
+    /// handed to the device before it stops the device all the same.
+    const CLOSING_CEILING: Duration = Duration::from_millis(300);
+
+    /// The two ends of an outlet's closing: the request, and the word that
+    /// the faded block is with the device.
+    struct Closing {
+        ask: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+    }
+
+    /// Asks the outlet to fade to silence and waits until the device has
+    /// taken the fade, however long its turns are. A device that does not
+    /// come within [`CLOSING_CEILING`] is stopped all the same, and that is
+    /// counted.
+    fn close_outlet(closing: &Closing, counts: &OutletCounts) {
+        closing.ask.store(true, Ordering::Relaxed);
+        let asked = Instant::now();
+        while !closing.done.load(Ordering::Relaxed) {
+            if asked.elapsed() >= CLOSING_CEILING {
+                counts.closed_without_fade.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 
     /// What the device's callback plays from and where it leaves what it
     /// would have played.
@@ -908,11 +930,12 @@ mod mac {
         voice: Arc<Mutex<Option<Voice>>>,
         seen: Arc<Callbacks>,
         counts: Arc<OutletCounts>,
-    ) -> Result<Arc<AtomicBool>, String> {
+    ) -> Result<Closing, String> {
         let device_rate = output.device().sample_rate;
         // Set before the device is stopped: what is played then fades out.
         let closing = Arc::new(AtomicBool::new(false));
         let mut outlet = Outlet::new(channels, device_rate, closing.clone(), counts);
+        let done = outlet.closed_flag();
         let mut turn_before: Option<(u64, u64)> = None;
         output
             .start(channels, move |frames, out, now_ns| {
@@ -961,7 +984,7 @@ mod mac {
                 seen.lead_sum_us.fetch_add(lead_us, Ordering::Relaxed);
             })
             .map_err(|e| e.to_string())?;
-        Ok(closing)
+        Ok(Closing { ask: closing, done })
     }
 
     pub fn play(options: PlayOptions) -> Result<(), String> {
@@ -1306,6 +1329,10 @@ mod mac {
                     "limited",
                     outlet_counts.limited.load(Ordering::Relaxed) as f64,
                 ),
+                (
+                    "closed_without_fade",
+                    outlet_counts.closed_without_fade.load(Ordering::Relaxed) as f64,
+                ),
             ]
         };
         loop {
@@ -1408,8 +1435,7 @@ mod mac {
                                 let resampler =
                                     Sinc::new(stream_rate, to.sample_rate, channels, 64, 1.01)?;
                                 // The old device is left with a fade, not a cut.
-                                closing.store(true, Ordering::Relaxed);
-                                std::thread::sleep(CLOSING_WAIT);
+                                close_outlet(&closing, &outlet_counts);
                                 output.stop();
                                 let old = voice
                                     .lock()
@@ -1496,8 +1522,7 @@ mod mac {
         let (ended, arrivals) = pumping
             .join()
             .map_err(|_| "the receiving thread stopped unexpectedly".to_string())?;
-        closing.store(true, Ordering::Relaxed);
-        std::thread::sleep(CLOSING_WAIT);
+        close_outlet(&closing, &outlet_counts);
         output.stop();
         if let Some(file) = &mut record_file {
             file.flush().map_err(|e| e.to_string())?;
@@ -1604,6 +1629,7 @@ mod mac {
                 "not_numbers_received": wire::not_numbers_received(),
                 "not_numbers_at_the_outlet": outlet_counts.not_numbers.load(Ordering::Relaxed),
                 "limited": outlet_counts.limited.load(Ordering::Relaxed),
+                "closed_without_fade": outlet_counts.closed_without_fade.load(Ordering::Relaxed),
             },
             "held_up": {
                 "longest_ms": held_up_max_us.load(Ordering::Relaxed) as f64 * 1e-3,

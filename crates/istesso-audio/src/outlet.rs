@@ -16,6 +16,9 @@ pub struct OutletCounts {
     pub not_numbers: AtomicU64,
     /// Samples beyond full scale that were held at full scale.
     pub limited: AtomicU64,
+    /// Times the device was stopped although the fade to silence had not
+    /// been handed over: the device did not come for it in time.
+    pub closed_without_fade: AtomicU64,
 }
 
 /// What every block of samples passes on its way to the device.
@@ -24,6 +27,7 @@ pub struct Outlet {
     fade_frames: usize,
     faded: usize,
     closing: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     counts: Arc<OutletCounts>,
 }
 
@@ -42,8 +46,17 @@ impl Outlet {
             fade_frames: ((device_rate * CLOSING_FADE_S).round() as usize).max(1),
             faded: 0,
             closing,
+            closed: Arc::new(AtomicBool::new(false)),
             counts,
         }
+    }
+
+    /// Set once the fade to silence is complete and the device has taken
+    /// the block that held its end: from then on stopping the device cuts
+    /// nothing off. A device may take thousands of frames at a time, so
+    /// how long this takes is the device's to say, not a fixed time.
+    pub fn closed_flag(&self) -> Arc<AtomicBool> {
+        self.closed.clone()
     }
 
     /// First of all, before any gain: what is not a number becomes
@@ -86,6 +99,11 @@ impl Outlet {
         }
         if !self.closing.load(Ordering::Relaxed) {
             return;
+        }
+        // The device is here for more after the block in which the fade
+        // ended: that block has been handed over.
+        if self.faded >= self.fade_frames {
+            self.closed.store(true, Ordering::Relaxed);
         }
         for frame in out.chunks_exact_mut(self.channels) {
             let gain = if self.faded >= self.fade_frames {
@@ -155,6 +173,44 @@ mod tests {
         let mut out = vec![1.0f32; 64];
         next.limit_and_close(&mut out);
         assert!(out.iter().all(|sample| *sample == 1.0));
+    }
+
+    #[test]
+    fn a_device_with_a_long_turn_is_waited_for() {
+        // A Bluetooth output may ask for 4096 frames at a time: 85 ms at
+        // 48 kHz. A player that stopped the device a fixed 35 ms after
+        // asking would stop it before the fade had even begun.
+        let closing = Arc::new(AtomicBool::new(false));
+        let (mut outlet, _) = outlet(&closing);
+        let closed = outlet.closed_flag();
+        let mut played = Vec::new();
+        let turn = |outlet: &mut Outlet, played: &mut Vec<f32>| {
+            let mut out = vec![1.0f32; 4096 * 2];
+            outlet.clean(&mut out);
+            outlet.limit_and_close(&mut out);
+            played.extend_from_slice(&out);
+        };
+        turn(&mut outlet, &mut played);
+        closing.store(true, Ordering::Relaxed);
+        assert!(!closed.load(Ordering::Relaxed), "nothing has faded yet");
+        // The turn in which the fade happens: handed over when the device
+        // comes again, not before.
+        turn(&mut outlet, &mut played);
+        assert!(
+            !closed.load(Ordering::Relaxed),
+            "the faded block is not with the device yet"
+        );
+        turn(&mut outlet, &mut played);
+        assert!(closed.load(Ordering::Relaxed));
+        assert!(played[..4096 * 2].iter().all(|sample| *sample == 1.0));
+        assert!(played[(4096 + 240) * 2..]
+            .iter()
+            .all(|sample| *sample == 0.0));
+        assert!(
+            steepest(&played) <= 1.0 / 240.0 + 1e-6,
+            "{}",
+            steepest(&played)
+        );
     }
 
     #[test]
