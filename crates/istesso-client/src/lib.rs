@@ -18,6 +18,11 @@
 mod ffi;
 #[cfg(unix)]
 pub mod input;
+// The measurement's way in for keys: in a measuring build only (ADR 0018). A build that is
+// handed out is made without the feature and does not contain the module. (Its tests are
+// compiled with the crate's other tests, so that the refusals are checked wherever tests run.)
+#[cfg(all(unix, any(test, feature = "measure-keys")))]
+pub mod measure;
 
 // Linked in whole, so that its C interface is part of this library.
 #[cfg(unix)]

@@ -512,6 +512,17 @@ static int input_stands = 0;
 static NSWindow *counted_window = nil;
 static NSString *counted_title = nil;
 
+// A measuring build says that it is one, wherever it says who it is: it has a local way in for
+// the measurement's keys, which a build that is handed out does not contain at all (ADR 0018).
+#ifdef ISTESSO_MEASURING
+#define MEASURING_TITLE "[measuring build] "
+#define MEASURING_HEADER ",\"measuring_build\":true"
+static IstessoMeasureKeys *measure_keys = NULL;
+#else
+#define MEASURING_TITLE ""
+#define MEASURING_HEADER ""
+#endif
+
 static void log_reconnections(const char *at) {
     if (frame_log != NULL) {
         fprintf(frame_log, "{\"kind\":\"reconnections\",\"t_ns\":%llu,\"at\":\"%s\",\"picture\":%lu,\"input\":%ld}\n",
@@ -530,7 +541,7 @@ static void show_counts(void) {
         : input_stands == 0 ? @"input not open yet"
         : [NSString stringWithFormat:@"input %ld", cuts];
     counted_window.title =
-        [NSString stringWithFormat:@"%@ — reconnections: picture %lu, %@", counted_title, atomic_load(&picture_cuts), input];
+        [NSString stringWithFormat:@MEASURING_TITLE "%@ — reconnections: picture %lu, %@", counted_title, atomic_load(&picture_cuts), input];
 }
 
 // ---- Frames from the encrypted channel ----
@@ -949,7 +960,7 @@ static bool start_frame_log(const char *path) {
     }
     struct timespec day;
     clock_gettime(CLOCK_REALTIME, &day);
-    fprintf(frame_log, "{\"kind\":\"header\",\"side\":\"client\",\"tool\":\"istesso-client\",\"version\":\"0.0.1\",\"started_unix_ms\":%llu}\n",
+    fprintf(frame_log, "{\"kind\":\"header\",\"side\":\"client\",\"tool\":\"istesso-client\",\"version\":\"0.0.1\"" MEASURING_HEADER ",\"started_unix_ms\":%llu}\n",
             (unsigned long long)day.tv_sec * 1000ULL + (unsigned long long)day.tv_nsec / 1000000ULL);
     fprintf(frame_log, "{\"kind\":\"wake\",\"picture_qos\":%d,\"picture_realtime\":%d,\"input_qos\":%d,\"latency_critical\":%d}\n",
             wake_picture_qos, wake_picture_realtime, wake_input_qos, wake_latency_critical);
@@ -974,6 +985,13 @@ static void finish(void) {
         return;
     }
     finished = true;
+#ifdef ISTESSO_MEASURING
+    if (measure_keys != NULL) {
+        // Before the input: nothing may be handed to an input that is closed.
+        istesso_measure_keys_close(measure_keys);
+        measure_keys = NULL;
+    }
+#endif
     if (input != NULL) {
         IstessoInput *closing = input;
         input = NULL;
@@ -1385,12 +1403,19 @@ static void usage(void) {
     fprintf(stderr,
             "usage: Istesso --address ADDRESS:PORT [--host NAME] [--input-address ADDRESS[:PORT]] [--size WxH] [--position X,Y]\n"
             "               [--whole-display] [--title TEXT] [--frame-log FILE] [--input-timings FILE] [--wake NAME,...]\n"
-            "               [--command-key super] [--config DIR] [--on-top]\n");
+            "               [--command-key super] [--config DIR] [--on-top]\n"
+#ifdef ISTESSO_MEASURING
+            "               [--measure-keys FOLDER]   (a measuring build: keys written to FOLDER/measure-keys.sock go to the host)\n"
+#endif
+            );
 }
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         const char *title = "Istesso", *frame_log_path = NULL, *timings_path = NULL, *input_address = NULL;
+#ifdef ISTESSO_MEASURING
+        const char *measure_keys_dir = NULL;
+#endif
         double width = 0, height = 0;
         bool on_top = false;
         window_at = NSMakePoint(100, 100);
@@ -1442,6 +1467,10 @@ int main(int argc, char *argv[]) {
                 timings_path = value;
             } else if (strcmp(name, "--config") == 0) {
                 config_dir = value;
+#ifdef ISTESSO_MEASURING
+            } else if (strcmp(name, "--measure-keys") == 0) {
+                measure_keys_dir = value;
+#endif
             } else if (strcmp(name, "--command-key") == 0) {
                 command_is_control = strcmp(value, "super") != 0;
             } else if (strcmp(name, "--check-cursor-at") == 0) {
@@ -1562,6 +1591,24 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+#ifdef ISTESSO_MEASURING
+        if (measure_keys_dir != NULL) {
+            if (input == NULL) {
+                fprintf(stderr, "error: --measure-keys needs --host: there is no input to hand the keys to\n");
+                return 1;
+            }
+            // Not started without it: a measurement would begin with nowhere to write its keys.
+            measure_keys = istesso_measure_keys_open(input, measure_keys_dir);
+            if (measure_keys == NULL) {
+                fprintf(stderr, "error: the measurement's keys: %s\n", istesso_client_last_error());
+                istesso_input_close(input);
+                return 1;
+            }
+            if (frame_log != NULL) {
+                fprintf(frame_log, "{\"kind\":\"measure_keys\",\"t_ns\":%llu}\n", (unsigned long long)now_ns());
+            }
+        }
+#endif
         // How often the connections were cut is counted from here, and always shown.
         log_reconnections("start");
         counted_window = window;

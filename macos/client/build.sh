@@ -1,7 +1,17 @@
 #!/bin/bash
 # Builds the Mac client as an application bundle: build/<APP_NAME>.app.
 #
-#   macos/client/build.sh            build and sign
+#   macos/client/build.sh            build and sign the application that is handed out
+#   macos/client/build.sh measuring  build and sign the measuring build, a bundle of its own
+#   macos/client/build.sh check      only look into the application that was built: no way in
+#
+# The measuring build is the same program with a local way in for the measurement's keys
+# (ADR 0018): the cargo feature `measure-keys` and the definition ISTESSO_MEASURING, which
+# nothing but `measuring` here sets (no environment variable does). It has its own output
+# folder for the library, its own bundle, name and identifier, and says what it is in its
+# window's title and in the frame log. The application that is handed out does not contain the
+# way in at all, and this script makes sure of it: it searches the executable it built for the
+# socket's name and the functions' name and fails if it finds either.
 #
 # Signing: with the certificate named in the environment, ISTESSO_SIGN_IDENTITY="<name in the
 # keychain>". The name comes from outside and is never written into the repository, and this
@@ -19,17 +29,52 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 . ./identity
+# What a way in for the measurement's keys leaves in an executable.
+marks="measure-keys istesso_measure_keys"
+has_way_in() {
+    for mark in $marks; do
+        if grep -a -q -F -e "$mark" "$1"; then return 0; fi
+    done
+    return 1
+}
+no_way_in() {
+    if has_way_in "$1"; then
+        echo "error: $1 contains the measurement's way in for keys; it must not be handed out"
+        exit 1
+    fi
+}
+what=${1:-}
+case "$what" in
+    "") features=""; define=""; target="" ;;
+    measuring)
+        BUNDLE_ID=$MEASURING_BUNDLE_ID; APP_NAME=$MEASURING_APP_NAME; EXECUTABLE=$MEASURING_EXECUTABLE
+        features="--features measure-keys"; define="-DISTESSO_MEASURING=1"; target="--target-dir target/measuring" ;;
+    check)
+        no_way_in "build/$APP_NAME.app/Contents/MacOS/$EXECUTABLE"
+        echo "no way in for the measurement's keys in build/$APP_NAME.app"
+        exit 0 ;;
+    *) echo "usage: $0 [measuring|check]"; exit 2 ;;
+esac
+library=../../target/${target:+measuring/}release/libistesso_client.a
 mkdir -p build
 # What goes to the other side for which key is tested first: it needs no window.
 cc -Wall -Wextra -o build/keys-test ../gst-viewer/keys-test.c && build/keys-test
 # The picture's and the input's connections come from the Rust crate istesso-client, linked statically.
-(cd ../.. && cargo build --release -p istesso-client)
+# (The measuring build's library goes to a folder of its own: the two are never mixed up.)
+(cd ../.. && cargo build --release -p istesso-client $features $target)
 app="build/$APP_NAME.app"
 mkdir -p "$app/Contents/MacOS"
-clang -fobjc-arc -O2 -Wall -o "$app/Contents/MacOS/$EXECUTABLE.new" Istesso.m \
+clang -fobjc-arc -O2 -Wall $define -o "$app/Contents/MacOS/$EXECUTABLE.new" Istesso.m \
     -I ../../crates/istesso-client/include -I ../../crates/istesso-media/include \
-    ../../target/release/libistesso_client.a -liconv \
+    "$library" -liconv \
     -framework Cocoa -framework QuartzCore -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface
+# Before it gets its name and its signature: which of the two it is, by what is in it.
+if [ "$what" = measuring ]; then
+    has_way_in "$app/Contents/MacOS/$EXECUTABLE.new" \
+        || { echo "error: the measuring build has no way in (or the search does not find it)"; exit 1; }
+else
+    no_way_in "$app/Contents/MacOS/$EXECUTABLE.new"
+fi
 mv -f "$app/Contents/MacOS/$EXECUTABLE.new" "$app/Contents/MacOS/$EXECUTABLE"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -90,3 +135,8 @@ fi
 [ "$(uuid "$app/Contents/MacOS/$EXECUTABLE")" = "$built" ] || { echo "signing changed the build UUID"; exit 1; }
 echo "built and signed (not started, not registered): $app"
 echo "identifier: $BUNDLE_ID; signature: $kind; build UUID: $built"
+if [ "$what" = measuring ]; then
+    echo "A MEASURING BUILD: it has a local way in for keys. Not to be handed out."
+else
+    echo "no way in for the measurement's keys"
+fi

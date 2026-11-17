@@ -90,6 +90,23 @@ int32_t istesso_input_state(const IstessoInput *input, IstessoInputState *state)
  */
 void istesso_input_close(IstessoInput *input);
 
+#ifdef ISTESSO_MEASURING
+/*
+ * The measurement's way in for keys. ONLY IN A MEASURING BUILD: the library has these two
+ * functions only when it was built with the feature `measure-keys`, and an application that is
+ * handed out is built without this definition and without that feature (ADR 0018).
+ *
+ * Opens <dir>/measure-keys.sock, a datagram socket as the relay's was: one event in a datagram,
+ * as JSON. What arrives goes to the host as what is handed over with istesso_input_send goes.
+ * The folder is made for its owner alone (0700); one that is already there is used only if it is
+ * a real folder of this user's with exactly those rights, and the socket is 0600. Null when it
+ * cannot be opened so (the reason is in istesso_client_last_error()). Closed before `input` is.
+ */
+typedef struct IstessoMeasureKeys IstessoMeasureKeys;
+IstessoMeasureKeys *istesso_measure_keys_open(const IstessoInput *input, const char *dir);
+void istesso_measure_keys_close(IstessoMeasureKeys *keys);
+#endif
+
 /* Why the last call failed on this thread. Valid until the next call on this thread. */
 const char *istesso_client_last_error(void);
 

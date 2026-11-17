@@ -248,6 +248,53 @@ pub unsafe extern "C" fn istesso_input_close(input: *mut IstessoInput) {
     }
 }
 
+/// The measurement's way in for keys, open. In a measuring build only.
+#[cfg(feature = "measure-keys")]
+pub struct IstessoMeasureKeys {
+    _keys: crate::measure::MeasureKeys,
+}
+
+/// Opens `<dir>/measure-keys.sock`: what is written there goes to the host
+/// as what the person does in the window goes. Null when it cannot be
+/// opened as it must be (the folder for its owner alone); the reason is in
+/// `istesso_client_last_error`.
+///
+/// # Safety
+/// `input` came from `istesso_input_open` and has not been closed; `dir` is
+/// a C string. The result is closed before `input` is.
+#[cfg(feature = "measure-keys")]
+#[no_mangle]
+pub unsafe extern "C" fn istesso_measure_keys_open(
+    input: *const IstessoInput,
+    dir: *const c_char,
+) -> *mut IstessoMeasureKeys {
+    // SAFETY: the caller's promises.
+    let opened = unsafe { text(dir) }.and_then(|dir| {
+        let dir = dir.ok_or("no folder for the measurement's keys was named")?;
+        let input = unsafe { input.as_ref() }.ok_or("there is no input to hand the keys to")?;
+        crate::measure::MeasureKeys::open(std::path::Path::new(&dir), input.input.hand())
+    });
+    match opened {
+        Ok(keys) => Box::into_raw(Box::new(IstessoMeasureKeys { _keys: keys })),
+        Err(err) => {
+            remember(err);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `keys` is null or came from `istesso_measure_keys_open`, and is not used
+/// again. Returns once nothing listens any more.
+#[cfg(feature = "measure-keys")]
+#[no_mangle]
+pub unsafe extern "C" fn istesso_measure_keys_close(keys: *mut IstessoMeasureKeys) {
+    if !keys.is_null() {
+        // SAFETY: made by `Box::into_raw` in `istesso_measure_keys_open`, handed back once.
+        drop(unsafe { Box::from_raw(keys) });
+    }
+}
+
 /// Why the last call of this library's own functions failed on this thread.
 #[no_mangle]
 pub extern "C" fn istesso_client_last_error() -> *const c_char {
@@ -380,6 +427,46 @@ mod tests {
     fn the_structures_are_laid_out_as_the_header_says() {
         assert_eq!(std::mem::size_of::<IstessoInputEvent>(), 12);
         assert_eq!(std::mem::size_of::<IstessoInputState>(), 24);
+    }
+
+    #[test]
+    fn what_the_measurement_writes_goes_the_way_of_what_the_window_hands_over() {
+        let pair = Pair::new();
+        let (dir, address) = (c_path(&pair.root.join("d")), c(&pair.addr.to_string()));
+        let timings = pair.root.join("t.jsonl");
+        // A short path: a socket's may not be long.
+        let place = std::env::temp_dir().join(format!("imk-{}-way", std::process::id()));
+        let _ = std::fs::remove_dir_all(&place);
+        // SAFETY: C strings that live through the calls; no function to tell.
+        unsafe {
+            let input = istesso_input_open(
+                dir.as_ptr(),
+                c("a host").as_ptr(),
+                address.as_ptr(),
+                c_path(&timings).as_ptr(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            );
+            assert!(!input.is_null());
+            until("the conversation", || {
+                let mut state = IstessoInputState::default();
+                istesso_input_state(input, &mut state) == 0 && state.open == 1
+            });
+            let keys = crate::measure::MeasureKeys::open(&place, (*input).input.hand()).unwrap();
+            let writer = std::os::unix::net::UnixDatagram::unbound().unwrap();
+            let down = r#"{"kind":"key","code":30,"pressed":true}"#;
+            writer.send_to(down.as_bytes(), keys.socket()).unwrap();
+            assert_eq!(pair.handed_over(Duration::from_secs(3)).unwrap(), down);
+            // The way in is closed before the input is.
+            drop(keys);
+            istesso_input_close(input);
+        }
+        // Timed as what the window hands over is: one line for the message, never the key.
+        let log = std::fs::read_to_string(&timings).unwrap();
+        assert_eq!(log.matches(r#""kind":"passed""#).count(), 1, "{log}");
+        assert!(!log.contains("code"), "{log}");
+        std::fs::remove_dir_all(place).unwrap();
     }
 
     #[test]

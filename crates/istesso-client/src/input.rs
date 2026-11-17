@@ -129,6 +129,21 @@ impl Input {
         });
     }
 
+    /// For the measurement's way in: hands over events as [`Input::send`]
+    /// does, with the time they were in hand as the caller took it.
+    #[cfg(any(test, feature = "measure-keys"))]
+    pub fn hand(&self) -> crate::measure::Hand {
+        let events = self.events.clone();
+        Box::new(move |batch, mark| {
+            if !batch.is_empty() {
+                let _ = events.send(Batch {
+                    events: batch,
+                    mark,
+                });
+            }
+        })
+    }
+
     pub fn state(&self) -> State {
         self.shared
             .state
@@ -152,7 +167,7 @@ impl Drop for Input {
 
 /// Adds an event to those that leave together. Of pointer positions in a
 /// row only the last one matters.
-fn take(events: &mut Vec<InputEvent>, event: InputEvent) {
+pub(crate) fn take(events: &mut Vec<InputEvent>, event: InputEvent) {
     match (events.last_mut(), &event) {
         (Some(last @ InputEvent::PointerAt { .. }), InputEvent::PointerAt { .. }) => *last = event,
         _ => events.push(event),

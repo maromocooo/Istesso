@@ -13,7 +13,14 @@ publish.workspace = true
 # the application links one Rust library and not two.
 crate-type = ["lib", "staticlib"]
 
+[features]
+# The measurement's way in for keys (src/measure.rs, ADR 0018). Off, and never on in a build
+# that is handed out: only `macos/client/build.sh measuring` sets it, into an output folder of
+# its own. The ordinary build searches its executable for what this adds and fails if it finds it.
+measure-keys = ["dep:serde_json"]
+
 [dependencies]
+serde_json = { workspace = true, optional = true }
 istesso-proto.workspace = true
 istesso-link.workspace = true
 istesso-agent.workspace = true
