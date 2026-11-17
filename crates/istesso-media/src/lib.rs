@@ -46,7 +46,7 @@ pub use host::{Admit, Host};
 #[cfg(unix)]
 pub use rejoin::{Lasting, LastingAsker, Step};
 #[cfg(unix)]
-pub use viewer::{Asker, Event, Frame, Viewer};
+pub use viewer::{Asker, Event, Frame, Opened, Viewer};
 pub use wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, DEFAULT_PORT};
 
 /// Receives one line for each thing worth telling the person who runs a
@@ -89,21 +89,9 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// What a viewer does about a connection that has ended, or could not be
-/// made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Again {
-    /// Connect again at once, and then at short intervals: the connection
-    /// was cut and nobody said why. A network may drop a connection that
-    /// both ends still believe in.
-    Soon,
-    /// Connect again, but at leisure: the host said that it cannot take
-    /// this device at the moment, or something on this device is in the
-    /// way that may pass.
-    Slowly,
-    /// Do not connect again: the host said that it is over, or refused,
-    /// and asking again changes nothing.
-    Never,
-}
+/// made: connect again soon, at leisure, or never. The same for input and
+/// for sound.
+pub use istesso_link::Again;
 
 impl Error {
     /// What a viewer does after this error. Only a connection that ended

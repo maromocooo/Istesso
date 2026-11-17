@@ -124,6 +124,22 @@ impl Viewer {
         expected: Option<&str>,
         within: Duration,
     ) -> Result<Self> {
+        Self::open(addr, keys, peers, expected, within)?.watch()
+    }
+
+    /// The first half of [`Viewer::connect`]: connects to the host at
+    /// `addr` and runs the handshake, within this time, all of it together.
+    /// Nothing is asked of the host yet, and the host does nothing for this
+    /// connection yet: a device that had a picture keeps getting it on the
+    /// connection it has. One try at connecting again is this, and several
+    /// are made at once ([`crate::rejoin`]).
+    pub fn open(
+        addr: SocketAddr,
+        keys: &LocalKeys,
+        peers: &PeerStore,
+        expected: Option<&str>,
+        within: Duration,
+    ) -> Result<Opened> {
         let deadline = Instant::now() + within;
         let stream = TcpStream::connect_timeout(&addr, within).map_err(connect_error)?;
         // A request for a key frame leaves when it is written.
@@ -131,7 +147,7 @@ impl Viewer {
         let stream = Timed::new(stream, deadline);
 
         let mut found: Option<Peer> = None;
-        let mut channel = Channel::initiate(stream, keys, |key| {
+        let channel = Channel::initiate(stream, keys, |key| {
             let peer = peers.find_by_key(key).ok_or(LinkError::UnknownPeer)?;
             if let Some(expected) = expected {
                 if peer.id != expected {
@@ -146,7 +162,30 @@ impl Viewer {
         })?;
         // `initiate` only succeeds after the closure has run and agreed.
         let peer = found.ok_or(LinkError::UnknownPeer)?;
+        Ok(Opened { channel, peer })
+    }
+}
 
+/// A connection to a host that has shown who it is, on which nothing has
+/// been asked yet. Dropping it closes it, and that is all it ever was to
+/// the host.
+pub struct Opened {
+    channel: Channel<Timed>,
+    peer: Peer,
+}
+
+impl Opened {
+    /// The host at the other end.
+    pub fn peer(&self) -> &Peer {
+        &self.peer
+    }
+
+    /// The second half of [`Viewer::connect`]: asks the host for its
+    /// picture on this connection, which is the request that makes the
+    /// host use this connection for the device from now on. The answer has
+    /// what is left of the time the connection was opened with.
+    pub fn watch(self) -> Result<Viewer> {
+        let Opened { mut channel, peer } = self;
         let watch = Ask::Watch {
             version: u32::from(wire::VERSION),
         };
@@ -186,6 +225,16 @@ impl Viewer {
         })
     }
 
+    /// As [`Opened::watch`], with `within` this time for the host's
+    /// answer, counted from now: a try that completed its handshake just
+    /// before its time was up can still be asked on.
+    pub fn watch_within(self, within: Duration) -> Result<Viewer> {
+        self.channel.stream().limit(Instant::now() + within);
+        self.watch()
+    }
+}
+
+impl Viewer {
     /// The host at the other end.
     pub fn peer(&self) -> &Peer {
         &self.peer
