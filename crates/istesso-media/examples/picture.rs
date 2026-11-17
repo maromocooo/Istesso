@@ -14,6 +14,22 @@
 //!     says what the cursor is: a made-up image (a magenta triangle of 64
 //!     pixels with a white edge, its tip the hot spot), hidden, or one
 //!     without an image.
+//! picture stay ADDR [--config DIR] [--peer NAME] [--seconds S]
+//!     A viewer that lasts: it takes the host's frames as `watch` does, and
+//!     when the connection is cut it connects again. Says each thing that
+//!     happens to the connection as it happens (connected, cut, the first
+//!     key frame after a cut and how long that took, over and why), and
+//!     ends when the host said that it is over or after S seconds (20
+//!     unless given).
+//! picture between LISTEN TO [--silent-after S] [--close-after S]
+//!     Stands between a viewer and a host: what connects to LISTEN is
+//!     passed on to TO, both ways. For trying what a viewer does when its
+//!     connection is cut. A line on standard input tells it what to do with
+//!     the connections there are (later ones are passed on as before):
+//!     `silent` (they stay open and carry nothing any more, as a network
+//!     does that drops a connection which both ends still believe in),
+//!     `close` (they are closed). --silent-after and --close-after do the
+//!     same once, S seconds after the first connection was made.
 //! picture pair DIR
 //!     Makes DIR/host and DIR/device, two configuration directories of
 //!     devices that are paired with each other, for `--config`: a host and
@@ -33,7 +49,7 @@ use std::time::{Duration, Instant};
 use istesso_agent::Paths;
 use istesso_link::LocalKeys;
 use istesso_media::wire::{self, Cursor, CursorImage, StreamInfo};
-use istesso_media::{Host, Viewer};
+use istesso_media::{Event, Host, Lasting, Step, Viewer};
 use istesso_pair::{Hello, Identity, Peer, PeerStore};
 
 type Failure = Box<dyn std::error::Error>;
@@ -303,6 +319,224 @@ fn pair(args: Args) -> Result<(), Failure> {
     Ok(())
 }
 
+fn stay(mut args: Args) -> Result<(), Failure> {
+    let paths = args.paths();
+    let peer = args.option("--peer");
+    let seconds: f64 = args.option("--seconds").map_or(Ok(20.0), |s| s.parse())?;
+    let addr = args
+        .0
+        .first()
+        .ok_or("which host? give its address and port")?;
+    let addr = addr.to_socket_addrs()?.next().ok_or("that is no address")?;
+
+    let mut viewer = Lasting::new(
+        Box::new(move |began_with, within| {
+            // Read anew for every connection: the pairing may have changed.
+            // Never made here: a device without an identity has nothing to connect with.
+            if !paths.identity().exists() {
+                return Err(istesso_media::Error::NoIdentity);
+            }
+            let keys = LocalKeys::new(&Identity::load_or_create(&paths.identity())?)?;
+            let peers = PeerStore::open(paths.peers())?;
+            let expected = match (began_with, &peer) {
+                (Some(id), _) => Some(id.to_string()),
+                (None, Some(name)) => Some(
+                    peers
+                        .find(name)?
+                        .ok_or(istesso_link::Error::UnknownPeer)?
+                        .id
+                        .clone(),
+                ),
+                (None, None) => None,
+            };
+            Viewer::connect(addr, &keys, &peers, expected.as_deref(), within)
+        }),
+        None,
+    );
+    let began = Instant::now();
+    let at = |began: Instant| format!("{:7.2} s", began.elapsed().as_secs_f64());
+    let (mut frames, mut since_cut, mut waiting_for_key) = (0u64, None::<Instant>, false);
+    let over = loop {
+        if began.elapsed().as_secs_f64() >= seconds {
+            break None;
+        }
+        match viewer.next(Duration::from_millis(100)) {
+            Ok(None) => {}
+            Ok(Some(Step::Event(Event::Frame(frame)))) => {
+                frames += 1;
+                if waiting_for_key && frame.key_frame {
+                    waiting_for_key = false;
+                    match since_cut.take() {
+                        Some(cut) => println!(
+                            "{}  the first key frame after the cut, {:.0} ms after it was noticed",
+                            at(began),
+                            cut.elapsed().as_secs_f64() * 1e3
+                        ),
+                        None => println!("{}  the first key frame", at(began)),
+                    }
+                }
+            }
+            Ok(Some(Step::Event(Event::Cursor(_)))) => {}
+            Ok(Some(Step::Cut)) => {
+                since_cut = Some(Instant::now());
+                println!("{}  cut after {frames} frames; connecting again", at(began));
+            }
+            Ok(Some(Step::Connected { again, silent_for })) => {
+                waiting_for_key = true;
+                if again {
+                    println!(
+                        "{}  connected again; the host had not been heard for {:.0} ms",
+                        at(began),
+                        silent_for.as_secs_f64() * 1e3
+                    );
+                } else {
+                    println!("{}  connected to a paired host", at(began));
+                }
+            }
+            Err(err) => break Some(err),
+        }
+    };
+    match over {
+        Some(err) => println!("{}  over, and not tried again: {err}", at(began)),
+        None => println!(
+            "{}  stopped after the time asked for; {frames} frames, {} cuts",
+            at(began),
+            viewer.cuts()
+        ),
+    }
+    Ok(())
+}
+
+/// What `between` does with the connections there are.
+#[derive(Default)]
+struct Passing {
+    /// Connections numbered below this carry nothing any more.
+    silent_below: std::sync::atomic::AtomicU64,
+    /// Connections numbered below this are closed.
+    closed_below: std::sync::atomic::AtomicU64,
+    made: std::sync::atomic::AtomicU64,
+}
+
+fn pass_on(
+    mut from: std::net::TcpStream,
+    mut to: std::net::TcpStream,
+    number: u64,
+    passing: &Passing,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _ = from.set_read_timeout(Some(Duration::from_millis(20)));
+    let mut buffer = [0u8; 65536];
+    loop {
+        if number < passing.closed_below.load(SeqCst) {
+            let _ = from.shutdown(std::net::Shutdown::Both);
+            let _ = to.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        match from.read(&mut buffer) {
+            Ok(0) => break,
+            // Read, and gone: the sender is not held up, and nothing arrives.
+            Ok(_) if number < passing.silent_below.load(SeqCst) => {}
+            Ok(n) => {
+                if to.write_all(&buffer[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    // One end has closed. The other is told, unless this connection carries nothing any
+    // more: then it is left as it is, as a network would leave it.
+    if number >= passing.silent_below.load(SeqCst) {
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn between(mut args: Args) -> Result<(), Failure> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let silent_after: Option<f64> = args
+        .option("--silent-after")
+        .map(|s| s.parse())
+        .transpose()?;
+    let close_after: Option<f64> = args
+        .option("--close-after")
+        .map(|s| s.parse())
+        .transpose()?;
+    let [listen, to] = &args.0[..] else {
+        return Err("where to listen, and where to pass connections on to?".into());
+    };
+    let to = to.to_socket_addrs()?.next().ok_or("that is no address")?;
+    let listener = std::net::TcpListener::bind(listen.as_str())?;
+    let passing = Arc::new(Passing::default());
+    let began = Instant::now();
+    let at = move || format!("{:7.2} s", began.elapsed().as_secs_f64());
+
+    // What it is told on standard input.
+    {
+        let passing = passing.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines().map_while(Result::ok) {
+                let made = passing.made.load(SeqCst);
+                match line.trim() {
+                    "silent" => {
+                        passing.silent_below.store(made, SeqCst);
+                        println!(
+                            "{}  the {made} connection(s) so far carry nothing any more",
+                            at()
+                        );
+                    }
+                    "close" => {
+                        passing.closed_below.store(made, SeqCst);
+                        println!("{}  the {made} connection(s) so far are closed", at());
+                    }
+                    "" => {}
+                    other => eprintln!("note: {other:?} is not something this program can be told"),
+                }
+            }
+        });
+    }
+    println!("passing connections on; `silent` or `close` on standard input");
+    for near in listener.incoming() {
+        let near = near?;
+        let number = passing.made.fetch_add(1, SeqCst);
+        println!("{}  connection {}", at(), number + 1);
+        if number == 0 {
+            for (after, silent) in [(silent_after, true), (close_after, false)] {
+                let Some(after) = after else { continue };
+                let passing = passing.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs_f64(after));
+                    let made = passing.made.load(SeqCst);
+                    if silent {
+                        passing.silent_below.store(made, SeqCst);
+                        println!(
+                            "{}  the {made} connection(s) so far carry nothing any more",
+                            at()
+                        );
+                    } else {
+                        passing.closed_below.store(made, SeqCst);
+                        println!("{}  the {made} connection(s) so far are closed", at());
+                    }
+                });
+            }
+        }
+        let Ok(far) = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(1)) else {
+            println!("{}  nothing answers where it is to be passed on to", at());
+            continue;
+        };
+        let _ = (near.set_nodelay(true), far.set_nodelay(true));
+        for (from, to) in [(near.try_clone()?, far.try_clone()?), (far, near)] {
+            let passing = passing.clone();
+            std::thread::spawn(move || pass_on(from, to, number, &passing));
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let command = if args.is_empty() {
@@ -313,9 +547,14 @@ fn main() {
     let result = match command.as_str() {
         "watch" => watch(Args(args)),
         "replay" => replay(Args(args)),
+        "stay" => stay(Args(args)),
+        "between" => between(Args(args)),
         "pair" => pair(Args(args)),
         _ => {
-            eprintln!("usage: picture watch ADDR [...] | picture replay FILE --bind ADDR [...] | picture pair DIR");
+            eprintln!(
+                "usage: picture watch ADDR [...] | picture replay FILE --bind ADDR [...] | picture stay ADDR [...] | \
+                 picture between LISTEN TO [...] | picture pair DIR"
+            );
             std::process::exit(2);
         }
     };
