@@ -369,16 +369,30 @@ fn read_checked(path: &Path, accounts: &AccountDb) -> Result<String, FindError> 
     Ok(text)
 }
 
+/// What the check of a task's program found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Program {
+    /// An absolute path or a bare name (looked up on `PATH`): outside what
+    /// this command checks; started as named.
+    Unchecked,
+    /// A relative program that passed the check: start exactly this real path.
+    Checked(PathBuf),
+    /// A relative program that is not there, where the folders down to the
+    /// place it would be in passed the check. It cannot be started (127).
+    Missing(PathBuf),
+}
+
 /// Checks the program a task names by a relative path (one with a `/` that
 /// is not absolute, which is read from the project's root), before it is
 /// started: its real place must lie inside `root`, every folder from `root`
 /// down to it must pass the same check as the folders down to the task
 /// file, and the program itself must be a regular file of this user that no
-/// one else may write to, without an ACL.
+/// one else may write to, without an ACL. The real path is returned, and it
+/// is what must be started.
 ///
 /// Absolute paths and bare names (looked up on `PATH`) are not checked: they
 /// lie outside what this command checks (see the crate's description).
-pub fn check_program(program: &str, root: &Path) -> Result<(), FindError> {
+pub fn check_program(program: &str, root: &Path) -> Result<Program, FindError> {
     check_program_with(program, root, &AccountDb::system())
 }
 
@@ -386,20 +400,53 @@ pub(crate) fn check_program_with(
     program: &str,
     root: &Path,
     accounts: &AccountDb,
-) -> Result<(), FindError> {
+) -> Result<Program, FindError> {
     let path = Path::new(program);
     if !program.contains('/') || path.is_absolute() {
-        return Ok(());
+        return Ok(Program::Unchecked);
     }
     let root = root.canonicalize().map_err(|e| unreadable(root, e))?;
-    let real = inside(&root.join(path), &root)?;
-    let parent = real.parent().unwrap_or(&root);
-    for step in parent.ancestors() {
-        if !step.starts_with(&root) {
-            break;
+    let named = root.join(path);
+    let folders_down_to = |real_folder: &Path| -> Result<(), FindError> {
+        for step in real_folder.ancestors() {
+            if !step.starts_with(&root) {
+                break;
+            }
+            check_folder(step, accounts)?;
         }
-        check_folder(step, accounts)?;
+        Ok(())
+    };
+    let real = match named.canonicalize() {
+        Ok(real) => real,
+        // Not there (and not a broken link): check the folders down to the
+        // deepest one that exists, then report it missing.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&named).is_err() =>
+        {
+            let existing = named
+                .ancestors()
+                .skip(1)
+                .find_map(|a| a.canonicalize().ok())
+                .unwrap_or_else(|| root.clone());
+            if !existing.starts_with(&root) {
+                return Err(FindError::OutsideProject {
+                    path: named,
+                    allowed: root.clone(),
+                });
+            }
+            folders_down_to(&existing)?;
+            return Ok(Program::Missing(named));
+        }
+        Err(e) => return Err(unreadable(&named, e)),
+    };
+    if !real.starts_with(&root) {
+        return Err(FindError::OutsideProject {
+            path: named,
+            allowed: root.clone(),
+        });
     }
+    folders_down_to(real.parent().unwrap_or(&root))?;
     let meta = std::fs::metadata(&real).map_err(|e| unreadable(&real, e))?;
     if !meta.is_file() {
         return Err(FindError::NotAFile { path: real });
@@ -415,7 +462,7 @@ pub(crate) fn check_program_with(
     }
     #[cfg(not(unix))]
     let _ = (meta, accounts);
-    Ok(())
+    Ok(Program::Checked(real))
 }
 
 /// Refuses a path that carries an access control list.
@@ -1000,11 +1047,11 @@ mod tests {
         let shared = AccountDb::default();
         assert_eq!(
             check_program_with("scripts/build.sh", &root, &shared),
-            Ok(())
+            Ok(Program::Checked(script.clone()))
         );
         assert_eq!(
             check_program_with("./scripts/build.sh", &root, &shared),
-            Ok(())
+            Ok(Program::Checked(script.clone()))
         );
         // Group-writable (775 folders and file, as umask 002 makes them)
         // with the user's private group.
@@ -1016,7 +1063,7 @@ mod tests {
         let private = crate::accounts::tests::private_db(effective_uid(), gid);
         assert_eq!(
             check_program_with("scripts/build.sh", &root, &private),
-            Ok(())
+            Ok(Program::Checked(script.clone()))
         );
         // The same with a group that may hold someone else.
         assert!(matches!(
@@ -1031,8 +1078,14 @@ mod tests {
         let base = Base::new("program-outside");
         let (root, _) = with_script(&base);
         let shared = AccountDb::default();
-        assert_eq!(check_program_with("/bin/sh", &root, &shared), Ok(()));
-        assert_eq!(check_program_with("cargo", &root, &shared), Ok(()));
+        assert_eq!(
+            check_program_with("/bin/sh", &root, &shared),
+            Ok(Program::Unchecked)
+        );
+        assert_eq!(
+            check_program_with("cargo", &root, &shared),
+            Ok(Program::Unchecked)
+        );
     }
 
     #[cfg(unix)]
@@ -1069,7 +1122,7 @@ mod tests {
         set_mode(&root, 0o757);
         assert_eq!(check(), Err(FindError::Writable { path: root.clone() }));
         set_mode(&root, 0o755);
-        assert_eq!(check(), Ok(()));
+        assert_eq!(check(), Ok(Program::Checked(script.clone())));
 
         // An ACL on the program or on its folder.
         if give_acl(&script, false) {
@@ -1120,7 +1173,7 @@ mod tests {
         symlink(&kept, &script2).unwrap();
         assert_eq!(
             check_program_with("scripts/build.sh", &root2, &shared),
-            Ok(())
+            Ok(Program::Checked(kept.clone()))
         );
 
         // Not a regular file, or not there.
@@ -1131,7 +1184,7 @@ mod tests {
         ));
         assert!(matches!(
             check_program_with("scripts/none.sh", &root2, &shared),
-            Err(FindError::Unreadable { .. })
+            Ok(Program::Missing(_))
         ));
         // A file of another user (root's), reached by a link inside: the
         // link leads out of the project, so it is refused before that.
@@ -1165,5 +1218,53 @@ mod tests {
         );
         set_mode(&root, 0o755);
         assert!(base.find("repo/sub").unwrap().is_some());
+    }
+
+    /// What runs is the checked real file, so a link in a folder others can
+    /// write to cannot be swapped between the check and the start: the
+    /// link's folder plays no part.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_a_folder_others_can_write_leads_to_the_real_file() {
+        use std::os::unix::fs::symlink;
+        let base = Base::new("program-link-folder");
+        let (root, script) = with_script(&base);
+        let tools = base.dir("proj/tools");
+        set_mode(&tools, 0o777);
+        symlink(&script, tools.join("run")).unwrap();
+        let shared = AccountDb::default();
+        assert_eq!(
+            check_program_with("tools/run", &root, &shared),
+            Ok(Program::Checked(script.clone()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_program_is_told_apart_from_an_untrusted_one() {
+        let base = Base::new("program-missing");
+        let (root, _) = with_script(&base);
+        let shared = AccountDb::default();
+        // Not there, folders fine: missing (127).
+        assert_eq!(
+            check_program_with("scripts/none.sh", &root, &shared),
+            Ok(Program::Missing(root.join("scripts/none.sh")))
+        );
+        assert!(matches!(
+            check_program_with("no/such/folder/x", &root, &shared),
+            Ok(Program::Missing(_))
+        ));
+        // Not there, and a folder on the way fails: refused (73).
+        set_mode(&root.join("scripts"), 0o777);
+        assert!(matches!(
+            check_program_with("scripts/none.sh", &root, &shared),
+            Err(FindError::Writable { .. })
+        ));
+        set_mode(&root.join("scripts"), 0o755);
+        // Not there, and it would be outside the root: refused.
+        assert!(matches!(
+            check_program_with("../none.sh", &root, &shared),
+            Err(FindError::OutsideProject { .. })
+        ));
     }
 }

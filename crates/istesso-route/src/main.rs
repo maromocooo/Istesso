@@ -14,7 +14,7 @@ use istesso_route::decide::{
     decide, lacks, when_several_match, Decision, Place, Remembered, SeveralMatch, Stale,
 };
 use istesso_route::exec::{carry_out, ExecError, Local};
-use istesso_route::find::{check_program, find_tasks, Found};
+use istesso_route::find::{check_program, find_tasks, Found, Program};
 use istesso_route::table::{read_table, Candidate};
 use istesso_route::tasks::{read_tasks, Task, TaskFile, TaskKind, TASKS_FILE};
 use istesso_route::{exit, now_unix, utc_date, utc_time};
@@ -377,10 +377,11 @@ fn carry_out_task(kind: TaskKind, args: &RunArgs) -> Result<Outcome, Fail> {
         }
         return Ok(not_run(decision.exit_code(), task, decision));
     };
+    let mut local = Local::default();
     if place.local {
-        check_program_of(&task, &project.root)?;
+        local.program = check_program_of(&task, &project.root)?;
     }
-    match carry_out(&mut Local, place, &task, &project.root) {
+    match carry_out(&mut local, place, &task, &project.root) {
         Ok(code) => Ok(Outcome {
             code,
             ran: true,
@@ -405,18 +406,30 @@ fn carry_out_task(kind: TaskKind, args: &RunArgs) -> Result<Outcome, Fail> {
     }
 }
 
-/// Refuses a program the task names by a relative path that cannot be
-/// trusted; it ends like an untrusted task file (73) and nothing runs.
-fn check_program_of(task: &Task, root: &std::path::Path) -> Result<(), Fail> {
+/// Checks the program the task names. A relative program that cannot be
+/// trusted ends like an untrusted task file (73); one that is not there,
+/// where the folders down to it pass, cannot be started (127). Either way
+/// nothing runs. `Ok` holds the path to start (`None`: as named).
+fn check_program_of(task: &Task, root: &std::path::Path) -> Result<Option<PathBuf>, Fail> {
     let Some(program) = task.command.first() else {
-        return Ok(());
+        return Ok(None);
     };
-    check_program(program, root).map_err(|e| {
-        fail(
+    match check_program(program, root) {
+        Ok(Program::Unchecked) => Ok(None),
+        Ok(Program::Checked(real)) => Ok(Some(real)),
+        Ok(Program::Missing(path)) => Err(fail(
+            exit::CANNOT_START,
+            format!(
+                "the program `{program}` of `{}` cannot be started: {} is not there",
+                task.name,
+                path.display()
+            ),
+        )),
+        Err(e) => Err(fail(
             exit::UNREADABLE,
             format!("the program `{program}` of `{}` is not run: {e}", task.name),
-        )
-    })
+        )),
+    }
 }
 
 fn choose(name: &str, machine: &str, hosts: &HostsArg) -> Result<i32, Fail> {
