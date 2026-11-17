@@ -110,6 +110,14 @@ M9 は、Mac の署名・公証つき pkg と、Ubuntu の .deb を作り、公�
 
 ビルド UUID の確認（署名したビルドでやる。提案）：`dwarfdump --uuid` で、バンドルの実行ファイルの UUID が、ほかの配布物と重ならないことを見る。重なるときは、ビルドし直す。
 
+### 1.6 リリースの手順の順番（署名の前の確認を含む）
+
+1. リリース用にビルドする：`macos/client/build.sh`（`origin/m1-own-client`、ADR 0018）。**リリースの流れは、`measuring` を、ビルドに決して渡さない。** 計測用のビルドは、計測の鍵のための入口をプログラムの中に持つ。配るビルドには、そのコードが、まったく入らない（持ち主の決定）。
+2. **Developer ID で署名する前に**、署名しようとするバンドルに `macos/client/build.sh check` を実行する。実行ファイルの中に、計測用の印（`measure-keys`、`istesso_measure_keys`）があれば失敗する。**失敗したら、リリースを止める。** 直してからやり直す。`build-pkg.sh` も、署名の前に、同じ印を実行ファイルから探し、あれば止まる（二重の確認。印の一覧は、`build.sh` の `marks` と同じにしておく）。
+3. `build-pkg.sh` で署名、pkg、公証（1.5）。
+
+開発用の補助の識別子（0.1 の接頭辞のもとで、いま使われているもの）：`com.maromoco.istesso-dev.audio`（`Istesso Dev Audio`）、`com.maromoco.istesso-dev.measure`（`Istesso Dev Measure`）。配布物には入らない。
+
 ## 2. Ubuntu
 
 ### 2.1 `.deb` の中身（提案）

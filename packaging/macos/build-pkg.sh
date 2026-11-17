@@ -89,6 +89,14 @@ mkdir -p "$root/$app_dir_default" "$root/Library/LaunchAgents" "$root/usr/local/
 ditto --norsrc --noextattr "$bundle" "$root/$app_dir_default/$app_name"
 staged_app="$root/$app_dir_default/$app_name"
 
+# A measuring build (a local way in for the measurement's keys, ADR 0018) is never handed out.
+# Same marks as `macos/client/build.sh check`; keep the two lists equal.
+for mark in measure-keys istesso_measure_keys; do
+    if grep -a -q -F -e "$mark" "$bundle/Contents/MacOS/$executable"; then
+        die "the executable carries the mark of the measuring build ($mark); not releasing"
+    fi
+done
+
 signed_app=no
 if [ -n "${ISTESSO_SIGN_APP_IDENTITY:-}" ]; then
     echo "signing the bundle as a whole (identifier $bundle_id, hardened runtime, timestamp)"
