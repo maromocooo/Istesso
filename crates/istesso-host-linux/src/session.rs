@@ -392,7 +392,20 @@ impl Session {
                     }
                 }
             }
-            Heard::Environment(environment) => self.environment = Some(environment),
+            Heard::Environment(environment) => {
+                if self.tongue == Tongue::Measure {
+                    // Whoever starts an application by hand reads this.
+                    let text: Vec<String> = environment
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect();
+                    (self.remark)(format!(
+                        "note: an application gets into the compositor with {}",
+                        text.join(" ")
+                    ));
+                }
+                self.environment = Some(environment);
+            }
             Heard::EncoderError(reason) => self.encoder_failed(reason),
             Heard::Error(reason) => return Flow::End(Err(reason)),
             Heard::End => return Flow::End(Ok(())),
