@@ -7,8 +7,19 @@ use istesso_pair::{Peer, PeerStore};
 use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
 
 use crate::channel::{Channel, LocalKeys};
-use crate::message::{Request, Response};
+use crate::message::{ErrorCode, Request, Response};
 use crate::{Error, Result};
+
+/// What the other device said to a request to send it input
+/// ([`Client::open_input_alive`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputAnswer {
+    /// Input is taken. `alive`: and empty messages are answered, so that
+    /// [`Client::heard_alive`] has something to hear.
+    Open { alive: bool },
+    /// It is not, and this is why: callers decide by the code.
+    Refused { code: ErrorCode, message: String },
+}
 
 /// An open conversation with one paired device.
 pub struct Client {
@@ -120,8 +131,8 @@ impl Client {
     /// Asks whether the other device takes keyboard and pointer input from
     /// this one. After `Ok`, [`Client::send_input`] may be used.
     pub fn open_input(&mut self) -> Result<()> {
-        match self.call(&Request::InputOpen)? {
-            Response::InputOpen => Ok(()),
+        match self.call(&Request::InputOpen { alive: false })? {
+            Response::InputOpen { .. } => Ok(()),
             _ => Err(Error::Malformed),
         }
     }
@@ -135,5 +146,56 @@ impl Client {
         };
         let bytes = serde_json::to_vec(&request).map_err(|_| Error::Malformed)?;
         self.channel.send(&bytes)
+    }
+
+    /// As [`Client::open_input`], and asks the other device to answer the
+    /// empty messages of [`Client::send_input`]: a sender that hears nothing
+    /// for a while then knows that the connection is gone, although nobody
+    /// closed it. A device that does not know the request for answers takes
+    /// the input all the same and says `alive: false`.
+    pub fn open_input_alive(&mut self) -> Result<InputAnswer> {
+        let bytes = serde_json::to_vec(&Request::InputOpen { alive: true })
+            .map_err(|_| Error::Malformed)?;
+        self.channel.send(&bytes)?;
+        let answer = self.channel.recv()?;
+        match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
+            Response::InputOpen { alive } => Ok(InputAnswer::Open { alive }),
+            Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Whether the other device has said "still here" since this was last
+    /// asked. Takes what has arrived and waits for nothing: sending input
+    /// is never held up by it. An error means that the connection is over.
+    pub fn heard_alive(&mut self) -> Result<bool> {
+        let mut heard = false;
+        while self.something_has_arrived()? {
+            // The rest of a message that has begun to arrive is there within the
+            // connection's own timeout, or the connection is gone.
+            let answer = self.channel.recv()?;
+            match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
+                Response::InputAlive => heard = true,
+                Response::Error { code, message } => {
+                    return Err(Error::Remote(format!("{message} ({code:?})")))
+                }
+                // Nothing else is expected here; a later version may say more.
+                _ => {}
+            }
+        }
+        Ok(heard)
+    }
+
+    fn something_has_arrived(&self) -> Result<bool> {
+        let stream = self.channel.stream();
+        stream.set_nonblocking(true).map_err(Error::from_io)?;
+        let peeked = stream.peek(&mut [0u8; 1]);
+        stream.set_nonblocking(false).map_err(Error::from_io)?;
+        match peeked {
+            Ok(0) => Err(Error::Closed),
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(Error::from_io(e)),
+        }
     }
 }

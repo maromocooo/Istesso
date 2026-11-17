@@ -1,0 +1,510 @@
+Ask the clients to close their windows, and tell the application how many windows there are,
+so that whoever runs the compositor can end an application politely and knows when its last
+window has gone. Nothing happens unless asked for.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch and
+gst-wayland-display-cursor-messages.patch in this directory, in that order. The lines of
+context are from that project and from those patches.
+
+It is kept small and in a shape that can be proposed to that project
+(docs/adr/0009-host-compositor.md). The rules are in one new file with its tests,
+wayland-display-core/src/comp/windows.rs.
+
+What it adds:
+
+- A custom upstream event with a structure called `CloseWindows`, taken by the element
+  `waylanddisplaysrc` the way it takes its input events (`KeyboardKey`, `MouseButton`, ...):
+  the compositor sends `xdg_toplevel.close` to every toplevel, which is what the close button
+  of a window manager does. What a client does about it is the client's business. One that
+  has nothing to lose ends; one with unsaved work asks its user and stays. Nothing is closed
+  by force, here or anywhere else in the compositor.
+- A property, `window-messages`, off by default. With it on, the element posts an application
+  message, `wayland.windows`, with a `count`: the number of toplevels the clients have, when
+  the property is set and whenever the number changes. 0 says that the last window has gone.
+  Popups and the cursor are not windows.
+- The core has `WaylandDisplay::close_windows` and `WaylandDisplay::set_window_sink` for
+  callers that do not go through the element.
+
+Tests (`cargo test -p wayland-display-core`): one of the rule for telling a change, and four
+with a real Wayland client: one that is asked to close and does (the count goes to 0), one that
+is asked and does not (it keeps its window however often it is asked), two windows of which
+one goes, and that nothing is asked or told unless somebody wants it.
+
+Known limits:
+
+- Every toplevel of every client is asked; there is no way yet to ask one window only.
+- A client that never answers the request cannot be told apart from one that waits for its
+  user. Ending it is up to whoever started it.
+- Nothing is exposed through the C bindings yet.
+
+Apply and build, in a checkout that has the first two patches applied:
+
+    git apply <this file>
+    cargo build --release -p gst-plugin-wayland-display -p wayland-display-core --features cuda
+
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 6a6a964..53edd93 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -74,6 +74,7 @@ mod focus;
+ mod input;
+ pub(crate) mod pacing;
+ mod rendering;
++pub(crate) mod windows;
+ 
+ pub use self::focus::*;
+ pub use self::input::*;
+@@ -131,6 +132,8 @@ pub struct State {
+     pub cursor_state: CursorImageStatus,
+     /// Who is told about the cursor instead of the cursor being drawn into the frames.
+     pub(crate) cursor_report: cursor::CursorReport,
++    /// Who is told how many windows the clients have.
++    pub(crate) window_report: windows::WindowReport,
+     surpressed_keys: HashSet<u32>,
+     pub pending_windows: Vec<Window>,
+     input_context: Libinput,
+@@ -254,6 +257,7 @@ impl State {
+             cursor_element,
+             cursor_state: CursorImageStatus::default_named(),
+             cursor_report: cursor::CursorReport::default(),
++            window_report: windows::WindowReport::default(),
+             cursor_event_count: 0,
+             surpressed_keys: HashSet::new(),
+             pending_windows: Vec::new(),
+@@ -453,6 +457,41 @@ impl State {
+         }
+     }
+ 
++    /// Asks every client to close its windows, as the close button of a window manager does
++    /// (`xdg_toplevel.close`). What a client does about it is the client's business: one
++    /// with unsaved work asks its user and stays. Returns how many windows were asked.
++    pub(crate) fn close_windows(&mut self) -> usize {
++        let windows = self.shell_state.toplevel_surfaces();
++        for window in windows {
++            window.send_close();
++        }
++        windows.len()
++    }
++
++    /// Tells whoever wants to know how many windows there are, if that is news. `gone` is a
++    /// window that is being destroyed at this moment and no longer counts.
++    pub(crate) fn tell_windows(
++        &mut self,
++        gone: Option<&smithay::wayland::shell::xdg::ToplevelSurface>,
++    ) {
++        if self.window_report.listening() {
++            let windows = self
++                .shell_state
++                .toplevel_surfaces()
++                .iter()
++                .filter(|window| window.alive() && Some(*window) != gone)
++                .count();
++            self.window_report.tell(windows);
++        }
++    }
++
++    /// Tells `sink` how many windows there are, now and whenever that changes; with `None`,
++    /// nobody.
++    pub(crate) fn set_window_sink(&mut self, sink: Option<windows::WindowSink>) {
++        self.window_report.set_sink(sink);
++        self.tell_windows(None);
++    }
++
+     /// Leaves the cursor out of the frames and tells `sink` about it instead, or, with
+     /// `None`, draws it into the frames again.
+     pub(crate) fn set_cursor_sink(&mut self, sink: Option<cursor::CursorSink>) {
+@@ -701,6 +740,13 @@ pub(crate) fn init(
+                         };
+                     }
+                 }
++                Event::Msg(Command::CloseWindows) => {
++                    let asked = state.close_windows();
++                    tracing::info!(asked, "Asked the windows to close.");
++                }
++                Event::Msg(Command::WindowSink(sink)) => {
++                    state.set_window_sink(sink);
++                }
+                 Event::Msg(Command::CursorSink(sink)) => {
+                     tracing::info!(outside = sink.is_some(), "Cursor outside the picture.");
+                     state.set_cursor_sink(sink);
+diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
+new file mode 100644
+index 0000000..f99a2cb
+--- /dev/null
++++ b/wayland-display-core/src/comp/windows.rs
+@@ -0,0 +1,78 @@
++//! The application's windows, as far as whoever runs the compositor has to know about them.
++//!
++//! The compositor shows what its clients draw and otherwise leaves them alone. Two things an
++//! owner of a session needs all the same, and both are here:
++//!
++//! * to ask the clients to close their windows, the way a window manager's close button
++//!   does (`xdg_toplevel.close`). A client that has nothing to lose ends; one that has asks
++//!   its user first, and stays. Nothing is ever closed by force here.
++//! * to be told how many windows there are ([`WindowReport`]), so that it knows when the first
++//!   has come and when the last has gone, which is when an application is over whatever its
++//!   processes do.
++//!
++//! "Windows" are toplevels: popups and the cursor do not count.
++
++/// Receives the number of windows whenever it changes. Called on the compositor's thread.
++pub type WindowSink = Box<dyn Fn(usize) + Send>;
++
++/// Tells a sink how many windows there are, and only when that is not what it was told last.
++#[derive(Default)]
++pub struct WindowReport {
++    sink: Option<WindowSink>,
++    last: Option<usize>,
++}
++
++impl WindowReport {
++    /// A new sink is told the number as it is; `None` tells nobody.
++    pub fn set_sink(&mut self, sink: Option<WindowSink>) {
++        self.sink = sink;
++        self.last = None;
++    }
++
++    pub fn listening(&self) -> bool {
++        self.sink.is_some()
++    }
++
++    /// Tells the sink the number of windows, unless that is what it was told last.
++    pub fn tell(&mut self, windows: usize) {
++        let Some(sink) = &self.sink else {
++            return;
++        };
++        if self.last != Some(windows) {
++            sink(windows);
++            self.last = Some(windows);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::{Arc, Mutex};
++
++    #[test]
++    fn a_sink_is_told_a_change_once_and_a_new_sink_is_told_what_is() {
++        let told = Arc::new(Mutex::new(Vec::new()));
++        let sink = |told: &Arc<Mutex<Vec<usize>>>| -> WindowSink {
++            let told = told.clone();
++            Box::new(move |windows| told.lock().unwrap().push(windows))
++        };
++        let mut report = WindowReport::default();
++        report.tell(1);
++        assert!(!report.listening());
++
++        report.set_sink(Some(sink(&told)));
++        for windows in [0, 0, 1, 1, 2, 1, 0, 0] {
++            report.tell(windows);
++        }
++        assert_eq!(*told.lock().unwrap(), [0, 1, 2, 1, 0]);
++
++        let other = Arc::new(Mutex::new(Vec::new()));
++        report.set_sink(Some(sink(&other)));
++        report.tell(0);
++        assert_eq!(*other.lock().unwrap(), [0]);
++        report.set_sink(None);
++        report.tell(3);
++        assert_eq!(other.lock().unwrap().len(), 1);
++    }
++}
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index 3374561..e307e15 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod utils;
+ pub(crate) mod wayland;
+ 
+ pub use crate::comp::cursor::{Cursor, CursorImage, CursorSink};
++pub use crate::comp::windows::WindowSink;
+ pub use crate::utils::video_info::GstVideoInfo;
+ 
+ pub enum Command {
+@@ -53,6 +54,12 @@ pub enum Command {
+     /// Leave the cursor out of the frames and tell the sink whenever it changes; with `None`,
+     /// draw it into the frames again. Drawn into the frames unless asked for.
+     CursorSink(Option<CursorSink>),
++    /// Ask every client to close its windows (`xdg_toplevel.close`). Nothing is closed by
++    /// force: what a client does about it is up to the client.
++    CloseWindows,
++    /// Tell the sink how many windows the clients have, now and whenever that changes; with
++    /// `None`, nobody.
++    WindowSink(Option<WindowSink>),
+     Quit,
+ }
+ 
+@@ -270,6 +277,19 @@ impl WaylandDisplay {
+         let _ = self.command_tx.send(Command::CursorSink(sink));
+     }
+ 
++    /// Asks every client to close its windows, as the close button of a window manager does.
++    /// A client that has nothing to lose ends; one that has asks its user first, and stays.
++    pub fn close_windows(&self) {
++        let _ = self.command_tx.send(Command::CloseWindows);
++    }
++
++    /// Tells `sink` how many windows (toplevels) the clients have, now and whenever that
++    /// changes: 0 when the last one has gone. With `None`, nobody is told. The sink is
++    /// called on the compositor's thread.
++    pub fn set_window_sink(&self, sink: Option<WindowSink>) {
++        let _ = self.command_tx.send(Command::WindowSink(sink));
++    }
++
+     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
+         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+         if let Err(err) = self
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index fb41b4b..2a8407c 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -306,6 +306,21 @@ impl WaylandClient {
+             .set_cursor(state.pointer_entered, None, 0, 0);
+     }
+ 
++    /// Whether the compositor has asked the last window to close.
++    pub fn asked_to_close(&self) -> bool {
++        self.state.windows.last().is_some_and(|w| w.close_requested)
++    }
++
++    /// Closes the last window, as a client does that was asked to and has nothing to lose.
++    pub fn close_window(&mut self) {
++        if let Some(window) = self.state.windows.pop() {
++            window.viewport.destroy();
++            window.xdg_toplevel.destroy();
++            window.xdg_surface.destroy();
++            window.surface.destroy();
++        }
++    }
++
+     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
+         self.state.mouse_events.as_mut()
+     }
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index 53fab8d..928944b 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -5,3 +5,4 @@ mod test_cursor;
+ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
++mod test_windows;
+diff --git a/wayland-display-core/src/tests/test_windows.rs b/wayland-display-core/src/tests/test_windows.rs
+new file mode 100644
+index 0000000..8d177dc
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_windows.rs
+@@ -0,0 +1,100 @@
++//! Integration tests for asking windows to close and for telling how many there are (see
++//! `comp::windows`). A real Wayland client has the window, so that a failure here says that
++//! the request no longer reaches clients, or that their windows are no longer counted.
++
++use crate::comp::windows::WindowSink;
++use crate::tests::fixture::Fixture;
++use std::sync::{Arc, Mutex};
++use test_log::test;
++
++type Told = Arc<Mutex<Vec<usize>>>;
++
++fn listen(f: &mut Fixture) -> Told {
++    let told = Told::default();
++    let sink: WindowSink = {
++        let told = told.clone();
++        Box::new(move |windows| told.lock().unwrap().push(windows))
++    };
++    f.server.set_window_sink(Some(sink));
++    told
++}
++
++#[test]
++fn a_client_that_is_asked_to_close_and_does_leaves_no_window() {
++    let mut f = Fixture::new();
++    let told = listen(&mut f);
++    // Nothing yet: a new listener is told so.
++    assert_eq!(*told.lock().unwrap(), [0]);
++
++    f.create_window(320, 240);
++    assert_eq!(*told.lock().unwrap(), [0, 1]);
++    assert!(!f.client.asked_to_close());
++
++    assert_eq!(f.server.close_windows(), 1);
++    f.round_trip();
++    assert!(f.client.asked_to_close());
++    // The window is still there: it was asked, not closed.
++    assert_eq!(*told.lock().unwrap(), [0, 1]);
++
++    // The client has nothing to lose and closes its window.
++    f.client.close_window();
++    f.round_trip();
++    assert_eq!(*told.lock().unwrap(), [0, 1, 0]);
++    assert_eq!(f.server.space.elements().count(), 0);
++}
++
++#[test]
++fn a_client_that_is_asked_to_close_and_does_not_keeps_its_window() {
++    let mut f = Fixture::new();
++    let told = listen(&mut f);
++    f.create_window(320, 240);
++
++    f.server.close_windows();
++    f.round_trip();
++    assert!(f.client.asked_to_close());
++    // The client ignores it, as one does that waits for its user's answer. Nothing is done
++    // by force, however often it is asked.
++    f.server.close_windows();
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(*told.lock().unwrap(), [0, 1]);
++    assert_eq!(f.server.space.elements().count(), 1);
++    // And it can still be drawn into.
++    f.client.commit_window();
++    f.round_trip();
++    assert_eq!(f.server.space.elements().count(), 1);
++}
++
++#[test]
++fn every_window_is_counted_and_asked() {
++    let mut f = Fixture::new();
++    let told = listen(&mut f);
++    f.create_window(320, 240);
++    f.create_window(160, 120);
++    assert_eq!(*told.lock().unwrap(), [0, 1, 2]);
++    assert_eq!(f.server.close_windows(), 2);
++    f.round_trip();
++
++    // One goes, one stays: the application is not over.
++    f.client.close_window();
++    f.round_trip();
++    assert_eq!(*told.lock().unwrap(), [0, 1, 2, 1]);
++    f.client.close_window();
++    f.round_trip();
++    assert_eq!(*told.lock().unwrap(), [0, 1, 2, 1, 0]);
++}
++
++#[test]
++fn nobody_is_told_and_nothing_is_asked_unless_somebody_wants_it() {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.round_trip();
++    assert!(!f.client.asked_to_close());
++    // Somebody who starts to listen later is told how many windows there are by then.
++    let told = listen(&mut f);
++    assert_eq!(*told.lock().unwrap(), [1]);
++    f.server.set_window_sink(None);
++    f.client.close_window();
++    f.round_trip();
++    assert_eq!(*told.lock().unwrap(), [1]);
++}
+diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
+index ed6a31c..1c22b23 100644
+--- a/wayland-display-core/src/wayland/handlers/xdg.rs
++++ b/wayland-display-core/src/wayland/handlers/xdg.rs
+@@ -25,6 +25,11 @@ impl XdgShellHandler for State {
+     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+         let window = Window::new_wayland_window(surface);
+         self.pending_windows.push(window);
++        self.tell_windows(None);
++    }
++
++    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
++        self.tell_windows(Some(&surface));
+     }
+ 
+     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index ed80dca..a5cb4ec 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -55,6 +55,7 @@ pub struct Settings {
+     disable_intel_workaround: bool,
+     render_on_commit: bool,
+     cursor_messages: bool,
++    window_messages: bool,
+     #[cfg(feature = "cuda")]
+     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
+     #[cfg(feature = "cuda")]
+@@ -65,6 +66,28 @@ pub struct State {
+     display: WaylandDisplay,
+ }
+ 
++/// Posts the number of windows (toplevels) the clients have as an application message on the
++/// element's bus: the structure `wayland.windows` with a `count`. 0 says that the last window
++/// has gone.
++fn window_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddisplaycore::WindowSink {
++    Box::new(move |windows| {
++        let Some(element) = element.upgrade() else {
++            return;
++        };
++        let structure = Structure::builder("wayland.windows")
++            .field("count", windows as u32)
++            .build();
++        let message = Application::builder(structure).src(&element).build();
++        if let Err(err) = element.post_message(message) {
++            gst::warning!(
++                CAT,
++                "Failed to post the number of windows to the bus: {}",
++                err
++            );
++        }
++    })
++}
++
+ /// Posts what the cursor is as an application message on the element's bus, as the element
+ /// posts its environment (`wayland.src`). The structure `wayland.cursor` has a `kind`:
+ /// "hidden"; "named", with a `name`, for a cursor there is no image of; or "image", with
+@@ -120,7 +143,12 @@ impl EventHandler for WaylandDisplaySrc {
+         match event.view() {
+             gst::EventView::CustomUpstream(e) => {
+                 let structure = e.structure().expect("Unable to get message structure");
+-                if structure.has_name("VirtualDevicesReady") {
++                if structure.has_name("CloseWindows") {
++                    // Asks the clients to close their windows, as a window manager's close
++                    // button does. Nothing is closed by force.
++                    let _ = self.command_tx.send(Command::CloseWindows);
++                    return true;
++                } else if structure.has_name("VirtualDevicesReady") {
+                     let path = structure
+                         .get::<String>("path")
+                         .expect("Should contain the path to the device as a String");
+@@ -319,6 +347,13 @@ impl ObjectImpl for WaylandDisplaySrc {
+                     )
+                     .default_value(false)
+                     .build(),
++                glib::ParamSpecBoolean::builder("window-messages")
++                    .nick("Window messages")
++                    .blurb(
++                        "Post an application message, wayland.windows, with the number of windows (toplevels) the clients have, whenever it changes; 0 when the last one has gone",
++                    )
++                    .default_value(false)
++                    .build(),
+                 glib::ParamSpecBoolean::builder("cursor-messages")
+                     .nick("Cursor messages")
+                     .blurb(
+@@ -395,6 +430,13 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 // Taken in by the compositor when it runs; it may be changed while it does.
+                 let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
+             }
++            "window-messages" => {
++                let enabled = value.get::<bool>().expect("Type checked upstream");
++                self.settings.lock().unwrap().window_messages = enabled;
++                let sink = enabled.then(|| window_sink(self.obj().downgrade()));
++                // Taken in by the compositor when it runs; it may be changed while it does.
++                let _ = self.command_tx.send(Command::WindowSink(sink));
++            }
+             "cursor-messages" => {
+                 let enabled = value.get::<bool>().expect("Type checked upstream");
+                 self.settings.lock().unwrap().cursor_messages = enabled;
+@@ -444,6 +486,10 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 let settings = self.settings.lock().unwrap();
+                 settings.cursor_messages.to_value()
+             }
++            "window-messages" => {
++                let settings = self.settings.lock().unwrap();
++                settings.window_messages.to_value()
++            }
+             _ => unreachable!(),
+         }
+     }

@@ -167,13 +167,46 @@ pub fn connect_peer_at(
     address: Option<&str>,
     timeout: Duration,
 ) -> Result<Client, String> {
-    let identity = Identity::load_or_create(&paths.identity()).map_err(|e| e.to_string())?;
-    let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| e.to_string())?);
-    let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| e.to_string())?);
+    connect_peer_or_say_why(paths, who, address, timeout).map_err(|e| e.to_string())
+}
+
+/// Why a conversation with a paired device could not be opened.
+#[derive(Debug)]
+pub enum ConnectFailure {
+    /// Something on this device is in the way, and the other one was not
+    /// asked: no identity, a list of paired devices that cannot be read,
+    /// nobody of that name in it, no address known.
+    Here(String),
+    /// The other device was not reached, or it refused.
+    Link(istesso_link::Error),
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectFailure::Here(why) => f.write_str(why),
+            ConnectFailure::Link(err) => err.fmt(f),
+        }
+    }
+}
+
+/// As [`connect_peer_at`], for a caller that decides by the kind of failure
+/// what to do next: a device that is asleep is asked again, one that says
+/// that it is not paired with this one is not.
+pub fn connect_peer_or_say_why(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    timeout: Duration,
+) -> Result<Client, ConnectFailure> {
+    let here = |e: &dyn std::fmt::Display| ConnectFailure::Here(e.to_string());
+    let identity = Identity::load_or_create(&paths.identity()).map_err(|e| here(&e))?;
+    let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| here(&e))?);
+    let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| here(&e))?);
     let peer = peers
         .find(who)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no paired device matches {who:?}"))?
+        .map_err(|e| here(&e))?
+        .ok_or_else(|| ConnectFailure::Here(format!("no paired device matches {who:?}")))?
         .clone();
     let candidates = match address {
         Some(address) if address.parse::<std::net::IpAddr>().is_ok() => {
@@ -191,11 +224,13 @@ pub fn connect_peer_at(
             .unwrap_or_default(),
     };
     if candidates.is_empty() {
-        return Err("no address is known for this device yet: run `istesso hosts` once".into());
+        return Err(ConnectFailure::Here(
+            "no address is known for this device yet: run `istesso hosts` once".into(),
+        ));
     }
     connect_any(candidates, keys, peers, &peer.id, timeout)
         .map(|(client, _)| client)
-        .map_err(|e| e.to_string())
+        .map_err(ConnectFailure::Link)
 }
 
 /// True when something accepts connections on the agent port of this
@@ -507,7 +542,7 @@ mod tests {
                         Request::Status => Response::Status {
                             status: HostStatus::default(),
                         },
-                        Request::InputOpen | Request::Input { .. } => continue,
+                        Request::InputOpen { .. } | Request::Input { .. } => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;
@@ -530,10 +565,18 @@ mod tests {
         }
     }
 
-    /// An address on this machine where nothing listens.
+    /// An address on this machine where nothing listens, and where nothing
+    /// will: the port of a connection's calling end. It is taken for as long
+    /// as that connection lives, so no other test that asks for a free port
+    /// while this one runs is handed it (a port that was only let go of
+    /// could be, a moment later).
     fn dead_address() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
+        let caller = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let addr = caller.local_addr().unwrap();
+        // Kept until the tests are over.
+        std::mem::forget((listener, caller));
+        addr
     }
 
     #[test]

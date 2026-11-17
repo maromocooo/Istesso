@@ -530,15 +530,25 @@ fn relay_input(
         ),
         None => None,
     };
+    use istesso_agent::relay::{Happened, InputLine, LISTEN_EVERY};
+    // Opens a conversation with the device: now, and again whenever it is cut. The
+    // list of paired devices is read each time, so a pairing that was removed
+    // meanwhile is not used.
+    let mut connect: istesso_agent::relay::Connect = {
+        let (to, address) = (to.to_string(), address.map(str::to_string));
+        Box::new(move |within| {
+            istesso_agent::connect_peer_or_say_why(
+                &Paths::from_env(),
+                &to,
+                address.as_deref(),
+                within,
+            )
+        })
+    };
     let began = std::time::Instant::now();
     let mut said = false;
-    let mut client = loop {
-        match istesso_agent::connect_peer_at(
-            &Paths::from_env(),
-            to,
-            address,
-            Duration::from_secs(3),
-        ) {
+    let client = loop {
+        match connect(Duration::from_secs(3)) {
             Ok(client) => break client,
             Err(why) if began.elapsed() < keep_trying => {
                 if !said {
@@ -547,12 +557,10 @@ fn relay_input(
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            Err(why) => return Err(why),
+            Err(why) => return Err(why.to_string()),
         }
     };
-    client
-        .set_timeout(Duration::from_secs(5))
-        .and_then(|_| client.open_input())
+    let mut line = InputLine::open(client, connect)
         .map_err(|e| format!("the device does not take input from here: {e}"))?;
     // A socket left by an earlier run is in the way of a new one.
     match std::fs::remove_file(socket) {
@@ -567,6 +575,38 @@ fn relay_input(
         "Input written to {} goes to the paired device.",
         socket.display()
     );
+    // How often the conversation was cut is always said, also when it is 0: on standard
+    // output, in the log of times if there is one, and in a small file next to the socket
+    // for the program that shows the window.
+    let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
+    let tell = |event: &str, cuts: u64, after: Option<Duration>| {
+        let unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let after = after.map_or(String::new(), |after| {
+            format!(",\"after_ms\":{:.1}", after.as_secs_f64() * 1e3)
+        });
+        println!(
+            "{{\"istesso\":\"input\",\"event\":\"{event}\",\"reconnections\":{cuts},\"unix_ns\":{unix_ns}{after}}}"
+        );
+        if let Some(passing) = &passing {
+            passing.reconnection(event, cuts);
+        }
+        // Written beside and moved over, so that nobody reads half of it. Whoever reads
+        // it checks that the process named in it still runs.
+        let beside = state.with_extension("state.new");
+        let line = format!("{{\"pid\":{},\"input\":{cuts}}}\n", std::process::id());
+        if std::fs::write(&beside, line).is_ok() {
+            let _ = std::fs::rename(&beside, &state);
+        }
+    };
+    tell("open", 0, None);
+    if !line.is_answered() {
+        eprintln!(
+            "note: the device is of a version that does not answer \"still here\"; a connection \
+             that goes silent is only noticed when sending fails"
+        );
+    }
 
     let mut buffer = [0u8; 2048];
     let take = |events: &mut Vec<InputEvent>, datagram: &[u8]| {
@@ -583,11 +623,16 @@ fn relay_input(
     };
     loop {
         let mut events = Vec::new();
-        // Wait for something to happen, but not for long: an empty message every two
-        // seconds tells the device that this end is still there.
-        listener
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(failed)?;
+        // Wait for something to happen, but not for long: the conversation is looked
+        // after in between (saying "still here", hearing the answers, opening it again
+        // when it was cut).
+        // While it is being opened again, more often: the attempt is due at once.
+        let wait = if line.is_open() {
+            LISTEN_EVERY
+        } else {
+            Duration::from_millis(5)
+        };
+        listener.set_read_timeout(Some(wait)).map_err(failed)?;
         match listener.recv(&mut buffer) {
             Ok(length) => take(&mut events, &buffer[..length]),
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
@@ -600,11 +645,34 @@ fn relay_input(
             take(&mut events, &buffer[..length]);
         }
         listener.set_nonblocking(false).map_err(failed)?;
-        client
-            .send_input(&events)
-            .map_err(|e| format!("the conversation with the device ended: {e}"))?;
-        if let (Some(passing), false) = (&passing, events.is_empty()) {
-            passing.passed(in_hand, events.len());
+        let now = std::time::Instant::now();
+        let mut happened = None;
+        if !events.is_empty() {
+            // Without a conversation the events are gone: they are not sent later.
+            let passed = line.pass(&events, now);
+            happened = passed.happened;
+            if let (Some(passing), true) = (&passing, passed.sent) {
+                passing.passed(in_hand, events.len());
+            }
+        }
+        if happened.is_none() {
+            happened = line.turn(now).map_err(|why| {
+                format!("the device does not take input from here any more: {why}")
+            })?;
+        }
+        match happened {
+            Some(Happened::Cut) => {
+                eprintln!("note: the conversation with the device was cut; opening it again");
+                tell("cut", line.cuts(), None);
+            }
+            Some(Happened::Back { after }) => {
+                eprintln!(
+                    "note: the conversation with the device is back after {:.2} s",
+                    after.as_secs_f64()
+                );
+                tell("back", line.cuts(), Some(after));
+            }
+            None => {}
         }
     }
 }
