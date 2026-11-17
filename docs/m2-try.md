@@ -109,8 +109,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
-# 署名の名前を決めておく。macOS は、ローカルネットワークの許可を、この名前で覚える。
-codesign --force --sign - --identifier dev.istesso.audio-test "$APP"
+# codesign で署名し直さない。リンカーが付けた署名のままにしておく。
+# プログラムを入れ替えるときは、新しい名前でコピーしてから、mv で置き換える。
 
 open -n -g -W "$APP" --env ISTESSO_CONFIG_DIR="$ISTESSO_CONFIG_DIR" \
     --stdout play.out --stderr play.log --args \
@@ -120,6 +120,10 @@ open -n -g -W "$APP" --env ISTESSO_CONFIG_DIR="$ISTESSO_CONFIG_DIR" \
 ```
 
 最初の起動では、macOS が「ローカルネットワーク上のデバイスの検索および接続」の許可を求めます。「許可」を押すまで、プログラムは 1 秒おきに試し続けます（180 秒まで）。
+
+- **`.app` を新しく起動すると、Mac にアプリが登録されます。** そのとき、自分の許可を持たないほかのプログラム（シェルから起動したものなど）の、ローカルネットワークの接続が切られることがあります。ほかの計測や作業が動いているあいだは、始める前に知らせます。
+- 許可は、`.app` の識別子（`Info.plist` の `CFBundleIdentifier`）に付くようです。`codesign` で署名し直した `.app` は、許可を失いました。署名し直さずにプログラムだけを入れ替えた `.app` は、許可を保ちました（どちらも、観察は 2 回ずつ）。
+
 
 ## 7. 結果を見る
 
