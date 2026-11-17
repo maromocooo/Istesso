@@ -112,7 +112,7 @@ pub enum AudioAction {
     /// the audio that would have been played is measured, and written to a
     /// file with --record.
     Play {
-        /// Address of the source, e.g. `studio.local` or `192.168.1.20:47802`
+        /// Address of the source, e.g. `studio.local` or `192.0.2.20:47802`
         address: String,
         /// Id or name of the paired device expected there (default: any
         /// paired device)
