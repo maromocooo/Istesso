@@ -143,6 +143,7 @@ mod tests {
             name: "t".into(),
             kind: TaskKind::Build,
             needs: Needs::default(),
+            prefers: Needs::default(),
             unknown_needs: Vec::new(),
             command: command.iter().map(|s| s.to_string()).collect(),
         }

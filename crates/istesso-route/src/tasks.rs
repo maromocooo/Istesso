@@ -10,7 +10,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
 
 use istesso_proto::{OsFamily, Role};
 use serde_json::{Map, Value};
@@ -110,8 +109,14 @@ pub struct Task {
     pub name: String,
     pub kind: TaskKind,
     pub needs: Needs,
-    /// Needs this version does not know, as they were written ("roles: quantum",
-    /// "gpu_memory"). A task that has any is never decided.
+    /// What the task would rather have, in the same words as `needs`. Among
+    /// the machines that meet the needs and answer, one that also meets these
+    /// is picked first, before this machine. Only build and run pick in order,
+    /// so a deploy does not look at it.
+    pub prefers: Needs,
+    /// Needs (and preferences, as "prefers: ...") this version does not know,
+    /// as they were written ("roles: quantum", "gpu_memory"). A task that has
+    /// any is never decided: dropping one would change where it goes.
     pub unknown_needs: Vec<String>,
     /// Program and arguments; no shell. Empty: the task can be asked about,
     /// not run.
@@ -120,6 +125,10 @@ pub struct Task {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFile {
+    /// The project's name, when the file gives one. Remembered choices are
+    /// then kept by this name, so that every worktree of the project shares
+    /// them; without it, by the project's location.
+    pub project: Option<String>,
     pub tasks: BTreeMap<String, Task>,
     /// What the reader skipped and why: unknown keys, tasks of an unknown
     /// kind, tasks whose shape it cannot read.
@@ -198,7 +207,7 @@ pub fn read_tasks(text: &str) -> Result<TaskFile, TasksError> {
 
     let mut skipped = Vec::new();
     for key in top.keys() {
-        if key != "version" && key != "tasks" {
+        if !["version", "tasks", "project"].contains(&key.as_str()) {
             skipped.push(Skipped {
                 what: format!("the key `{key}`"),
                 why: "this version does not know it".into(),
@@ -206,6 +215,18 @@ pub fn read_tasks(text: &str) -> Result<TaskFile, TasksError> {
             });
         }
     }
+    let project = match top.get("project") {
+        None => None,
+        Some(Value::String(name)) if !name.trim().is_empty() => Some(name.clone()),
+        Some(_) => {
+            skipped.push(Skipped {
+                what: "the key `project`".into(),
+                why: "it is not a name (a string that is not empty); choices are kept by the project's location".into(),
+                task: None,
+            });
+            None
+        }
+    };
 
     let mut tasks = BTreeMap::new();
     for (name, entry) in entries {
@@ -220,10 +241,14 @@ pub fn read_tasks(text: &str) -> Result<TaskFile, TasksError> {
             }),
         }
     }
-    Ok(TaskFile { tasks, skipped })
+    Ok(TaskFile {
+        project,
+        tasks,
+        skipped,
+    })
 }
 
-const TASK_KEYS: [&str; 3] = ["kind", "needs", "command"];
+const TASK_KEYS: [&str; 4] = ["kind", "needs", "prefers", "command"];
 
 fn read_task(name: &str, entry: &Value, skipped: &mut Vec<Skipped>) -> Result<Task, String> {
     let Value::Object(fields) = entry else {
@@ -244,10 +269,19 @@ fn read_task(name: &str, entry: &Value, skipped: &mut Vec<Skipped>) -> Result<Ta
             .ok_or("its `command` is not a list of strings")?,
         Some(_) => return Err("its `command` is not a list of strings".into()),
     };
-    let (needs, unknown_needs) = match fields.get("needs") {
+    let (needs, mut unknown_needs) = match fields.get("needs") {
         None => (Needs::default(), Vec::new()),
         Some(Value::Object(needs)) => read_needs(needs),
         Some(_) => return Err("its `needs` is not an object".into()),
+    };
+    let prefers = match fields.get("prefers") {
+        None => Needs::default(),
+        Some(Value::Object(prefers)) => {
+            let (prefers, unknown) = read_needs(prefers);
+            unknown_needs.extend(unknown.into_iter().map(|u| format!("prefers: {u}")));
+            prefers
+        }
+        Some(_) => return Err("its `prefers` is not an object".into()),
     };
     for key in fields.keys() {
         if !TASK_KEYS.contains(&key.as_str()) {
@@ -262,6 +296,7 @@ fn read_task(name: &str, entry: &Value, skipped: &mut Vec<Skipped>) -> Result<Ta
         name: name.to_owned(),
         kind,
         needs,
+        prefers,
         unknown_needs,
         command,
     })
@@ -348,174 +383,6 @@ pub fn os_name(os: OsFamily) -> String {
         Ok(Value::String(s)) => s,
         _ => format!("{os:?}"),
     }
-}
-
-/// Why a task file that was found is not used. The file names commands that
-/// `run`, `build` and `deploy` start with this user's rights, so a file that
-/// someone else could have written is refused, never skipped silently.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FindError {
-    /// The file or its `.istesso` folder belongs to another user.
-    NotOwned { path: PathBuf },
-    /// The file or its `.istesso` folder can be written by its group or by others.
-    Writable { path: PathBuf },
-    /// The file or its `.istesso` folder is a link that leads out of the project.
-    OutsideProject { path: PathBuf, project: PathBuf },
-    /// The file or its folder cannot be looked at (e.g. a broken link).
-    Unreadable { path: PathBuf, why: String },
-}
-
-impl fmt::Display for FindError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FindError::NotOwned { path } => write!(
-                f,
-                "{} is not used: it belongs to another user, and its commands would run as you",
-                path.display()
-            ),
-            FindError::Writable { path } => write!(
-                f,
-                "{} is not used: others can write to it, and its commands would run as you (`chmod go-w` it if that is not meant)",
-                path.display()
-            ),
-            FindError::OutsideProject { path, project } => write!(
-                f,
-                "{} is not used: it is a link that leads out of the project {}",
-                path.display(),
-                project.display()
-            ),
-            FindError::Unreadable { path, why } => {
-                write!(f, "{} cannot be looked at: {why}", path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for FindError {}
-
-/// Looks for `.istesso/tasks.json` from `start` up to the project's
-/// boundary, with the user's home folder from `HOME` as the upper limit.
-/// See [`find_tasks_within`].
-pub fn find_tasks(start: &Path) -> Result<Option<(PathBuf, PathBuf)>, FindError> {
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from);
-    find_tasks_within(start, home.as_deref())
-}
-
-/// Looks for `.istesso/tasks.json` in `start` and its parents, but not past
-/// the project's boundary. Returns the file and the project's root (the
-/// folder that holds `.istesso`), both canonical.
-///
-/// - The boundary is the first folder from `start` upwards that holds `.git`
-///   (a file or a folder). Without one, only `start` itself is looked at.
-/// - The search for `.git` never goes above `home`, and never reaches the
-///   root of the file system.
-/// - `start` is canonicalized once; the file and its `.istesso` folder may
-///   be links only when they lead to a place inside the boundary.
-/// - On Unix, the file and its `.istesso` folder must belong to the user
-///   this runs as, and must not be writable by their group or by others.
-///   Elsewhere ownership is not checked; the boundary and links still are.
-pub fn find_tasks_within(
-    start: &Path,
-    home: Option<&Path>,
-) -> Result<Option<(PathBuf, PathBuf)>, FindError> {
-    let start = start.canonicalize().map_err(|e| FindError::Unreadable {
-        path: start.to_path_buf(),
-        why: e.to_string(),
-    })?;
-    let home = home.and_then(|h| h.canonicalize().ok());
-    let Some(boundary) = project_boundary(&start, home.as_deref()) else {
-        return Ok(None);
-    };
-    for dir in start.ancestors() {
-        if !dir.starts_with(&boundary) {
-            break;
-        }
-        let folder = dir.join(".istesso");
-        let file = dir.join(TASKS_FILE);
-        if std::fs::symlink_metadata(&file).is_err() {
-            continue;
-        }
-        let folder = inside(&folder, &boundary)?;
-        let file = inside(&file, &boundary)?;
-        trusted(&folder)?;
-        trusted(&file)?;
-        return Ok(Some((file, dir.to_path_buf())));
-    }
-    Ok(None)
-}
-
-/// The highest folder the search may look in: the first folder from `start`
-/// upwards that holds `.git`, else `start` itself. `None` when `start` is
-/// the root of the file system.
-fn project_boundary(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    start.parent()?;
-    for dir in start.ancestors() {
-        if dir.parent().is_none() {
-            break;
-        }
-        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
-            return Some(dir.to_path_buf());
-        }
-        if Some(dir) == home {
-            break;
-        }
-    }
-    Some(start.to_path_buf())
-}
-
-/// The canonical place of `path`, which must lie inside `boundary`.
-fn inside(path: &Path, boundary: &Path) -> Result<PathBuf, FindError> {
-    let real = path.canonicalize().map_err(|e| FindError::Unreadable {
-        path: path.to_path_buf(),
-        why: e.to_string(),
-    })?;
-    if !real.starts_with(boundary) {
-        return Err(FindError::OutsideProject {
-            path: path.to_path_buf(),
-            project: boundary.to_path_buf(),
-        });
-    }
-    Ok(real)
-}
-
-/// Refuses a file or folder that another user owns or that others can write.
-#[cfg(unix)]
-fn trusted(path: &Path) -> Result<(), FindError> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).map_err(|e| FindError::Unreadable {
-        path: path.to_path_buf(),
-        why: e.to_string(),
-    })?;
-    if meta.uid() != effective_uid() {
-        return Err(FindError::NotOwned {
-            path: path.to_path_buf(),
-        });
-    }
-    if meta.mode() & 0o022 != 0 {
-        return Err(FindError::Writable {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn trusted(_path: &Path) -> Result<(), FindError> {
-    Ok(())
-}
-
-/// The user this process runs as.
-#[cfg(unix)]
-fn effective_uid() -> u32 {
-    extern "C" {
-        fn geteuid() -> u32;
-    }
-    // SAFETY: geteuid(2) takes no arguments, always succeeds and touches no
-    // memory of the caller. `uid_t` is a 32-bit unsigned integer on the
-    // Unix systems this builds for (Linux, macOS).
-    unsafe { geteuid() }
 }
 
 #[cfg(test)]
@@ -672,204 +539,42 @@ mod tests {
         assert_eq!(parse_os("linux"), Some(OsFamily::Linux));
     }
 
-    /// A folder of its own under the temporary folder, removed afterwards.
-    /// It also serves as `home`, so that nothing above it is ever looked at.
-    struct Base(PathBuf);
-
-    impl Base {
-        fn new(name: &str) -> Base {
-            let dir = std::env::temp_dir()
-                .join(format!("istesso-route-find-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Base(dir.canonicalize().unwrap())
-        }
-
-        fn find(&self, start: &str) -> Result<Option<(PathBuf, PathBuf)>, FindError> {
-            find_tasks_within(&self.0.join(start), Some(&self.0))
-        }
-
-        fn dir(&self, rel: impl AsRef<Path>) -> PathBuf {
-            let rel = rel.as_ref();
-            assert!(rel.is_relative());
-            let dir = self.0.join(rel);
-            std::fs::create_dir_all(&dir).unwrap();
-            set_mode(&dir, 0o755);
-            dir
-        }
-
-        /// A task file in `rel`, owned by this user and writable by it alone.
-        fn tasks(&self, rel: &str) -> PathBuf {
-            let folder = self.dir(Path::new(rel).join(".istesso"));
-            let file = folder.join("tasks.json");
-            std::fs::write(&file, PLAN_EXAMPLE).unwrap();
-            set_mode(&file, 0o644);
-            file
-        }
-    }
-
-    impl Drop for Base {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn set_mode(path: &Path, mode: u32) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        }
-        let _ = (path, mode);
-    }
-
     #[test]
-    fn the_search_from_a_subfolder_finds_the_project_s_file() {
-        let base = Base::new("sub");
-        base.dir("proj/.git");
-        let file = base.tasks("proj");
-        base.dir("proj/a/b/c");
-        let (found, root) = base.find("proj/a/b/c").unwrap().unwrap();
-        assert_eq!(found, file);
-        assert_eq!(root, base.0.join("proj"));
-        assert!(root.is_absolute());
-        // `.git` may be a file too (a worktree).
-        let other = Base::new("sub-file");
-        other.dir("proj");
-        std::fs::write(other.0.join("proj/.git"), "gitdir: elsewhere\n").unwrap();
-        other.tasks("proj");
-        other.dir("proj/x");
-        assert!(other.find("proj/x").unwrap().is_some());
-    }
-
-    #[test]
-    fn a_file_above_the_project_root_is_not_taken() {
-        let base = Base::new("above");
-        base.tasks("outer");
-        base.dir("outer/proj/.git");
-        base.dir("outer/proj/sub");
-        assert_eq!(base.find("outer/proj/sub").unwrap(), None);
-        assert_eq!(base.find("outer/proj").unwrap(), None);
-    }
-
-    #[test]
-    fn without_a_project_root_only_the_start_folder_is_looked_at() {
-        let base = Base::new("norepo");
-        base.tasks("work");
-        base.dir("work/sub");
-        assert_eq!(base.find("work/sub").unwrap(), None);
-        assert!(base.find("work").unwrap().is_some());
-    }
-
-    #[test]
-    fn the_search_stops_at_home() {
-        // `.git` and a task file above home are not used.
-        let base = Base::new("home");
-        base.dir(".git");
-        base.tasks("");
-        base.dir("me/work");
-        let home = base.0.join("me");
-        assert_eq!(
-            find_tasks_within(&home.join("work"), Some(&home)).unwrap(),
-            None
-        );
-        // Home itself may be the project.
-        base.dir("me/.git");
-        base.tasks("me");
-        assert!(find_tasks_within(&home.join("work"), Some(&home))
-            .unwrap()
-            .is_some());
-    }
-
-    #[test]
-    fn the_root_of_the_file_system_is_never_a_project() {
-        assert_eq!(project_boundary(Path::new("/"), None), None);
-        assert_eq!(find_tasks_within(Path::new("/"), None).unwrap(), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_file_others_can_write_is_refused() {
-        let base = Base::new("writable");
-        base.dir("proj/.git");
-        let file = base.tasks("proj");
-        assert!(base.find("proj").unwrap().is_some());
-
-        set_mode(&file, 0o666);
-        let err = base.find("proj").unwrap_err();
-        assert_eq!(err, FindError::Writable { path: file.clone() });
-        assert!(err.to_string().contains("others can write"));
-        set_mode(&file, 0o664);
-        assert!(matches!(base.find("proj"), Err(FindError::Writable { .. })));
-
-        set_mode(&file, 0o644);
-        set_mode(file.parent().unwrap(), 0o777);
-        let err = base.find("proj").unwrap_err();
-        assert_eq!(
-            err,
-            FindError::Writable {
-                path: file.parent().unwrap().to_path_buf()
-            }
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_file_owned_as_expected_is_taken() {
-        use std::os::unix::fs::MetadataExt;
-        let base = Base::new("owned");
-        base.dir("proj/.git");
-        let file = base.tasks("proj");
-        assert_eq!(std::fs::metadata(&file).unwrap().uid(), effective_uid());
-        assert!(trusted(&file).is_ok());
-        assert_eq!(base.find("proj").unwrap().unwrap().0, file);
-        // A file of another user (root owns `/`) is refused. Creating one
-        // needs root, so only the check is tried here.
-        if effective_uid() != 0 {
-            assert_eq!(
-                trusted(Path::new("/")),
-                Err(FindError::NotOwned { path: "/".into() })
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_link_out_of_the_project_is_refused() {
-        use std::os::unix::fs::symlink;
-        let base = Base::new("link");
-        let outside = base.tasks("elsewhere");
-        base.dir("proj/.git");
-        base.dir("proj/.istesso");
-        symlink(&outside, base.0.join("proj/.istesso/tasks.json")).unwrap();
-        assert!(matches!(
-            base.find("proj"),
-            Err(FindError::OutsideProject { .. })
-        ));
-        // The folder as a link out of the project.
-        base.dir("proj2/.git");
-        symlink(outside.parent().unwrap(), base.0.join("proj2/.istesso")).unwrap();
-        assert!(matches!(
-            base.find("proj2"),
-            Err(FindError::OutsideProject { .. })
-        ));
-        // A link that stays inside the project is fine.
-        base.dir("proj3/.git");
-        let real = base.tasks("proj3/config");
-        base.dir("proj3/.istesso");
-        symlink(&real, base.0.join("proj3/.istesso/tasks.json")).unwrap();
-        assert_eq!(base.find("proj3").unwrap().unwrap().0, real);
-        // A broken link cannot be looked at.
-        base.dir("proj4/.git");
-        base.dir("proj4/.istesso");
-        symlink(
-            base.0.join("nothing"),
-            base.0.join("proj4/.istesso/tasks.json"),
+    fn prefers_is_read_like_needs() {
+        let file = read_tasks(
+            r#"{"version": 1, "tasks": {"mac-host": {"kind": "run",
+                "needs": {"os": "macos"}, "prefers": {"roles": ["always_on_candidate"]}}}}"#,
         )
         .unwrap();
-        assert!(matches!(
-            base.find("proj4"),
-            Err(FindError::Unreadable { .. })
-        ));
+        let task = &file.tasks["mac-host"];
+        assert_eq!(task.prefers.roles, vec![Role::AlwaysOnCandidate]);
+        assert!(task.unknown_needs.is_empty());
+        assert!(file.skipped.is_empty());
+
+        let file = read_tasks(
+            r#"{"version": 1, "tasks": {
+                "a": {"kind": "run", "prefers": {"roles": ["quiet"], "colour": "red"}},
+                "b": {"kind": "run", "prefers": ["gpu"]}}}"#,
+        )
+        .unwrap();
+        let mut unknown = file.tasks["a"].unknown_needs.clone();
+        unknown.sort();
+        assert_eq!(unknown, vec!["prefers: colour", "prefers: roles: quiet"]);
+        assert!(file.skipped_task("b").unwrap().why.contains("prefers"));
+    }
+
+    #[test]
+    fn the_project_s_name_is_read() {
+        let file = read_tasks(r#"{"version": 1, "project": "istesso", "tasks": {}}"#).unwrap();
+        assert_eq!(file.project.as_deref(), Some("istesso"));
+        assert!(file.skipped.is_empty());
+        let file = read_tasks(r#"{"version": 1, "tasks": {}}"#).unwrap();
+        assert_eq!(file.project, None);
+        for bad in [r#"7"#, r#""  ""#] {
+            let text = format!(r#"{{"version": 1, "project": {bad}, "tasks": {{}}}}"#);
+            let file = read_tasks(&text).unwrap();
+            assert_eq!(file.project, None, "{bad}");
+            assert!(file.skipped.iter().any(|s| s.what == "the key `project`"));
+        }
     }
 }

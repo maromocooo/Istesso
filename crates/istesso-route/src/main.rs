@@ -9,13 +9,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
-use istesso_route::choices::{choices_path, Choices};
+use istesso_route::choices::{choices_path, Choices, ProjectKey};
 use istesso_route::decide::{
     decide, lacks, when_several_match, Decision, Place, Remembered, SeveralMatch, Stale,
 };
 use istesso_route::exec::{carry_out, ExecError, Local};
+use istesso_route::find::{find_tasks, Found};
 use istesso_route::table::{read_table, Candidate};
-use istesso_route::tasks::{find_tasks, read_tasks, Task, TaskFile, TaskKind, TASKS_FILE};
+use istesso_route::tasks::{read_tasks, Task, TaskFile, TaskKind, TASKS_FILE};
 use istesso_route::{exit, now_unix, utc_date, utc_time};
 
 #[derive(Parser)]
@@ -85,6 +86,9 @@ struct RunArgs {
     task: String,
     #[command(flatten)]
     hosts: HostsArg,
+    /// End with one JSON line on standard error instead of the text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
@@ -161,9 +165,9 @@ fn run(command: Command) -> Result<i32, Fail> {
             println!("{}", one_line(&task, &decision));
             Ok(decision.exit_code())
         }
-        Command::Run(args) => run_task(TaskKind::Run, args),
-        Command::Build(args) => run_task(TaskKind::Build, args),
-        Command::Deploy(args) => run_task(TaskKind::Deploy, args),
+        Command::Run(args) => Ok(run_task(TaskKind::Run, args)),
+        Command::Build(args) => Ok(run_task(TaskKind::Build, args)),
+        Command::Deploy(args) => Ok(run_task(TaskKind::Deploy, args)),
         Command::Choose {
             task,
             machine,
@@ -181,6 +185,13 @@ struct Project {
     tasks: TaskFile,
 }
 
+impl Project {
+    /// How remembered choices tell this project apart.
+    fn key(&self) -> ProjectKey {
+        ProjectKey::of(self.tasks.project.as_deref(), &self.root)
+    }
+}
+
 fn project() -> Result<Project, Fail> {
     let here = std::env::current_dir().map_err(|e| {
         fail(
@@ -190,7 +201,7 @@ fn project() -> Result<Project, Fail> {
     })?;
     // A refused task file ends with the same code as an unreadable one (73):
     // every code of the plan's range is taken.
-    let (file, root) = find_tasks(&here)
+    let Found { file, root, text } = find_tasks(&here)
         .map_err(|e| fail(exit::UNREADABLE, e.to_string()))?
         .ok_or_else(|| {
             fail(
@@ -201,12 +212,6 @@ fn project() -> Result<Project, Fail> {
                 ),
             )
         })?;
-    let text = std::fs::read_to_string(&file).map_err(|e| {
-        fail(
-            exit::UNREADABLE,
-            format!("{} cannot be read: {e}", file.display()),
-        )
-    })?;
     let tasks = read_tasks(&text)
         .map_err(|e| fail(exit::UNREADABLE, format!("{}: {e}", file.display())))?;
     Ok(Project { root, file, tasks })
@@ -290,7 +295,7 @@ fn remembered(project: &Project, task: &Task) -> Result<Option<Remembered>, Fail
     }
     let choices =
         Choices::load(&choices_path()).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
-    Ok(choices.get(&project.root, &task.name))
+    Ok(choices.get(&project.key(), &task.name))
 }
 
 fn decide_task(project: &Project, task: &Task, hosts: &HostsArg) -> Result<Decision, Fail> {
@@ -299,23 +304,88 @@ fn decide_task(project: &Project, task: &Task, hosts: &HostsArg) -> Result<Decis
     Ok(decide(task, &table, remembered.as_ref()))
 }
 
-fn run_task(kind: TaskKind, args: RunArgs) -> Result<i32, Fail> {
+/// `run`, `build` and `deploy`. Standard output belongs to the task; what
+/// this command says goes to standard error, and its last line always says,
+/// in a fixed form, whether the task ran: the exit code alone cannot tell,
+/// because a task may end with any number, 70-75 included.
+fn run_task(kind: TaskKind, args: RunArgs) -> i32 {
+    let outcome = carry_out_task(kind, &args);
+    let (code, ran, decision) = match outcome {
+        Ok(Outcome {
+            code,
+            ran,
+            task,
+            decision,
+        }) => (code, ran, Some((task, decision))),
+        Err(Fail { code, message }) => {
+            eprintln!("istesso-route: {message}");
+            (code, false, None)
+        }
+    };
+    if args.json {
+        let mut line = json!({
+            "task": args.task,
+            "kind": kind.as_str(),
+            "ran": ran,
+            "exit_code": code,
+            "decision": Value::Null,
+        });
+        if let Some((task, decision)) = &decision {
+            line["decision"] = to_json(task, decision);
+        }
+        eprintln!("{line}");
+    } else {
+        eprintln!("{}", ran_line(kind, &args.task, ran, code));
+    }
+    code
+}
+
+/// The fixed last line of `run`, `build` and `deploy`.
+fn ran_line(kind: TaskKind, task: &str, ran: bool, code: i32) -> String {
+    if ran {
+        format!("istesso-route: ran {kind} `{task}` here; it ended with {code}")
+    } else {
+        format!("istesso-route: did not run {kind} `{task}`; exit code {code}")
+    }
+}
+
+struct Outcome {
+    code: i32,
+    ran: bool,
+    task: Task,
+    decision: Decision,
+}
+
+fn carry_out_task(kind: TaskKind, args: &RunArgs) -> Result<Outcome, Fail> {
     let (project, task) = project_task(&args.task, Some(kind))?;
     let decision = decide_task(&project, &task, &args.hosts)?;
-    // Standard output belongs to the task; what this command says goes to
-    // standard error.
+    let not_run = |code: i32, task: Task, decision: Decision| Outcome {
+        code,
+        ran: false,
+        task,
+        decision,
+    };
     let Decision::Go { place, .. } = &decision else {
-        eprint!("{}", render(&task, &decision));
-        return Ok(decision.exit_code());
+        if !args.json {
+            eprint!("{}", render(&task, &decision));
+        }
+        return Ok(not_run(decision.exit_code(), task, decision));
     };
     match carry_out(&mut Local, place, &task, &project.root) {
-        Ok(code) => Ok(code),
+        Ok(code) => Ok(Outcome {
+            code,
+            ran: true,
+            task,
+            decision,
+        }),
         Err(ExecError::Elsewhere) => {
-            eprint!("{}", render(&task, &decision));
-            eprintln!(
-                "  not run: running on another machine is not built yet (it waits for the isolation, M5)"
-            );
-            Ok(exit::ELSEWHERE)
+            if !args.json {
+                eprint!("{}", render(&task, &decision));
+                eprintln!(
+                    "  not run: running on another machine is not built yet (it waits for the isolation, M5)"
+                );
+            }
+            Ok(not_run(exit::ELSEWHERE, task, decision))
         }
         Err(e @ ExecError::NoCommand) => {
             Err(fail(exit::UNREADABLE, format!("`{}`: {e}", task.name)))
@@ -363,7 +433,8 @@ fn choose(name: &str, machine: &str, hosts: &HostsArg) -> Result<i32, Fail> {
     let path = choices_path();
     let mut choices = Choices::load(&path).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
     let place = Place::of(candidate);
-    choices.set(&project.root, name, &place, now_unix());
+    let key = project.key();
+    choices.set(&key, name, &place, now_unix());
     choices
         .save()
         .map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
@@ -377,7 +448,7 @@ fn choose(name: &str, machine: &str, hosts: &HostsArg) -> Result<i32, Fail> {
             place.name
         );
     }
-    println!("  remembered in {}", path.display());
+    println!("  remembered for {key} in {}", path.display());
     println!("  `istesso-route forget {name}` drops it");
     Ok(exit::OK)
 }
@@ -420,7 +491,7 @@ fn forget(name: &str) -> Result<i32, Fail> {
     let project = project()?;
     let path = choices_path();
     let mut choices = Choices::load(&path).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
-    if choices.forget(&project.root, name) {
+    if choices.forget(&project.key(), name) {
         choices
             .save()
             .map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;

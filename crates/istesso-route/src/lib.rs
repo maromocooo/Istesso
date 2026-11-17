@@ -1,7 +1,8 @@
 //! Decides which machine a project's task goes to.
 //!
 //! A project states what each of its build, run and deploy tasks needs from
-//! the machine it runs on, in `.istesso/tasks.json` ([`tasks`]). The role
+//! the machine it runs on, in `.istesso/tasks.json` ([`tasks`]); only a file
+//! this user alone can have written is used ([`find`]). The role
 //! table that `istesso hosts --json` prints says what every paired machine
 //! can do ([`table`]). [`decide`] puts the two together and answers with a
 //! place and the reasons, or with why there is none. A person's choice of a
@@ -14,6 +15,7 @@
 pub mod choices;
 pub mod decide;
 pub mod exec;
+pub mod find;
 pub mod table;
 pub mod tasks;
 

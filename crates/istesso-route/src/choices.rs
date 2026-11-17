@@ -7,14 +7,19 @@
 //! off from that folder.
 //!
 //! A machine is remembered by the id the role table uses; the name is kept
-//! for display only. A task is remembered by the project's root and the
-//! task's name, so that a task of the same name in another project is not
-//! mistaken for it.
+//! for display only. A task is remembered by its project and its name, so
+//! that a task of the same name in another project is not mistaken for it.
+//! The project is the name the task file gives (`project`), so that every
+//! worktree of the project shares the choice; a task file without a name is
+//! told apart by the project's location instead.
 //!
 //! ```json
 //! { "version": 1,
-//!   "choices": [ { "project": "/path/to/project", "task": "site",
+//!   "choices": [ { "project_name": "example", "task": "site",
 //!                  "host": "9f8e-7d6c-5b4a-3921", "name": "tower",
+//!                  "chosen_at": 1794879000 },
+//!                { "project": "/path/to/project", "task": "site",
+//!                  "host": "5d4c-3b2a-1f0e-9d8c", "name": "mini",
 //!                  "chosen_at": 1794879000 } ] }
 //! ```
 //!
@@ -97,10 +102,38 @@ impl fmt::Display for ChoicesError {
 
 impl std::error::Error for ChoicesError {}
 
+/// How a project is told apart in the choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectKey {
+    /// The name the task file gives (`project`).
+    Name(String),
+    /// The project's root, absolute with links followed.
+    Location(PathBuf),
+}
+
+impl ProjectKey {
+    /// The name when the task file gives one, else the location.
+    pub fn of(name: Option<&str>, root: &Path) -> ProjectKey {
+        match name {
+            Some(name) => ProjectKey::Name(name.to_owned()),
+            None => ProjectKey::Location(root.to_path_buf()),
+        }
+    }
+}
+
+impl fmt::Display for ProjectKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProjectKey::Name(name) => write!(f, "the project `{name}`"),
+            ProjectKey::Location(path) => write!(f, "the project at {}", path.display()),
+        }
+    }
+}
+
 /// One remembered choice, as `istesso-route choices` lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
-    pub project: String,
+    pub project: ProjectKey,
     pub task: String,
     pub remembered: Remembered,
 }
@@ -113,13 +146,29 @@ pub struct Choices {
     doc: Map<String, Value>,
 }
 
-fn project_key(project: &Path) -> String {
-    project.to_string_lossy().into_owned()
+/// The entry's project: by name when it has one, else by location.
+fn key_of(entry: &Value) -> Option<ProjectKey> {
+    if let Some(name) = entry.get("project_name") {
+        return name.as_str().map(|n| ProjectKey::Name(n.to_owned()));
+    }
+    entry
+        .get("project")
+        .and_then(Value::as_str)
+        .map(|p| ProjectKey::Location(PathBuf::from(p)))
 }
 
-fn matches(entry: &Value, project: &str, task: &str) -> bool {
-    entry.get("project").and_then(Value::as_str) == Some(project)
+fn matches(entry: &Value, project: &ProjectKey, task: &str) -> bool {
+    key_of(entry).as_ref() == Some(project)
         && entry.get("task").and_then(Value::as_str) == Some(task)
+}
+
+fn new_entry(project: &ProjectKey, task: &str) -> Value {
+    match project {
+        ProjectKey::Name(name) => json!({ "project_name": name, "task": task }),
+        ProjectKey::Location(path) => {
+            json!({ "project": path.to_string_lossy(), "task": task })
+        }
+    }
 }
 
 fn remembered_of(entry: &Value) -> Option<Remembered> {
@@ -211,23 +260,21 @@ impl Choices {
         entry.as_array_mut().expect("just made a list")
     }
 
-    pub fn get(&self, project: &Path, task: &str) -> Option<Remembered> {
-        let project = project_key(project);
+    pub fn get(&self, project: &ProjectKey, task: &str) -> Option<Remembered> {
         self.list()
             .iter()
-            .filter(|e| matches(e, &project, task))
+            .filter(|e| matches(e, project, task))
             .find_map(remembered_of)
     }
 
     /// Remembers `place` for the task, replacing an earlier choice. Unknown
     /// items of an earlier entry are kept.
-    pub fn set(&mut self, project: &Path, task: &str, place: &Place, now: u64) {
-        let project = project_key(project);
+    pub fn set(&mut self, project: &ProjectKey, task: &str, place: &Place, now: u64) {
         let list = self.list_mut();
-        let entry = match list.iter_mut().position(|e| matches(e, &project, task)) {
+        let entry = match list.iter_mut().position(|e| matches(e, project, task)) {
             Some(i) => &mut list[i],
             None => {
-                list.push(json!({ "project": project, "task": task }));
+                list.push(new_entry(project, task));
                 list.last_mut().expect("just pushed")
             }
         };
@@ -239,11 +286,10 @@ impl Choices {
     }
 
     /// Forgets the task's choice. False when there was none.
-    pub fn forget(&mut self, project: &Path, task: &str) -> bool {
-        let project = project_key(project);
+    pub fn forget(&mut self, project: &ProjectKey, task: &str) -> bool {
         let list = self.list_mut();
         let before = list.len();
-        list.retain(|e| !matches(e, &project, task));
+        list.retain(|e| !matches(e, project, task));
         list.len() != before
     }
 
@@ -253,7 +299,7 @@ impl Choices {
             .iter()
             .filter_map(|e| {
                 Some(Choice {
-                    project: e.get("project")?.as_str()?.to_owned(),
+                    project: key_of(e)?,
                     task: e.get("task")?.as_str()?.to_owned(),
                     remembered: remembered_of(e)?,
                 })
@@ -344,19 +390,23 @@ mod tests {
 
     const PROJECT: &str = "/example/project";
 
+    fn at(path: &str) -> ProjectKey {
+        ProjectKey::Location(PathBuf::from(path))
+    }
+
     #[test]
     fn a_missing_file_is_an_empty_list() {
         let dir = TempDir::new("missing");
         let choices = Choices::load(&dir.file()).unwrap();
         assert!(choices.all().is_empty());
-        assert!(choices.get(Path::new(PROJECT), "site").is_none());
+        assert!(choices.get(&at(PROJECT), "site").is_none());
         assert!(!dir.file().exists());
     }
 
     #[test]
     fn choose_choose_again_and_forget() {
         let dir = TempDir::new("cycle");
-        let project = Path::new(PROJECT);
+        let project = &at(PROJECT);
         let mut choices = Choices::load(&dir.file()).unwrap();
         choices.set(project, "site", &place("tower", "id-tower"), 100);
         choices.save().unwrap();
@@ -387,29 +437,19 @@ mod tests {
     fn projects_do_not_mix() {
         let dir = TempDir::new("projects");
         let mut choices = Choices::load(&dir.file()).unwrap();
-        choices.set(
-            Path::new("/example/one"),
-            "site",
-            &place("tower", "id-tower"),
-            1,
-        );
-        choices.set(
-            Path::new("/example/two"),
-            "site",
-            &place("mini", "id-mini"),
-            2,
-        );
+        choices.set(&at("/example/one"), "site", &place("tower", "id-tower"), 1);
+        choices.set(&at("/example/two"), "site", &place("mini", "id-mini"), 2);
         assert_eq!(
-            choices.get(Path::new("/example/one"), "site").unwrap().name,
+            choices.get(&at("/example/one"), "site").unwrap().name,
             "tower"
         );
         assert_eq!(
-            choices.get(Path::new("/example/two"), "site").unwrap().name,
+            choices.get(&at("/example/two"), "site").unwrap().name,
             "mini"
         );
-        assert!(choices.get(Path::new("/example/three"), "site").is_none());
-        assert!(choices.forget(Path::new("/example/one"), "site"));
-        assert!(choices.get(Path::new("/example/two"), "site").is_some());
+        assert!(choices.get(&at("/example/three"), "site").is_none());
+        assert!(choices.forget(&at("/example/one"), "site"));
+        assert!(choices.get(&at("/example/two"), "site").is_some());
     }
 
     #[test]
@@ -425,7 +465,7 @@ mod tests {
         )
         .unwrap();
         let mut choices = Choices::load(&dir.file()).unwrap();
-        choices.set(Path::new(PROJECT), "site", &place("mini", "id-mini"), 9);
+        choices.set(&at(PROJECT), "site", &place("mini", "id-mini"), 9);
         choices.save().unwrap();
         let text = std::fs::read_to_string(dir.file()).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
@@ -467,7 +507,7 @@ mod tests {
         )
         .unwrap();
         let choices = Choices::load(&dir.file()).unwrap();
-        let got = choices.get(Path::new(PROJECT), "site").unwrap();
+        let got = choices.get(&at(PROJECT), "site").unwrap();
         assert_eq!(got.host, "9f8e-7d6c-5b4a-3921");
         assert_eq!(got.chosen_at, 0);
         assert_eq!(choices.all().len(), 1);
@@ -479,7 +519,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new("mode");
         let mut choices = Choices::load(&dir.file()).unwrap();
-        choices.set(Path::new(PROJECT), "site", &place("tower", "id-tower"), 1);
+        choices.set(&at(PROJECT), "site", &place("tower", "id-tower"), 1);
         choices.save().unwrap();
         let mode = std::fs::metadata(dir.file()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -497,5 +537,29 @@ mod tests {
             assert_eq!(choices_dir(), PathBuf::from(dir));
         }
         assert!(choices_path().ends_with("choices.json"));
+    }
+
+    #[test]
+    fn a_named_project_is_shared_by_its_worktrees() {
+        let dir = TempDir::new("named");
+        let name = ProjectKey::of(Some("example"), Path::new("/example/worktree-a"));
+        assert_eq!(name, ProjectKey::Name("example".into()));
+        let mut choices = Choices::load(&dir.file()).unwrap();
+        choices.set(&name, "site", &place("tower", "id-tower"), 1);
+        choices.save().unwrap();
+        let choices = Choices::load(&dir.file()).unwrap();
+        // Another worktree of the same project finds it by the name.
+        let other = ProjectKey::of(Some("example"), Path::new("/example/worktree-b"));
+        assert_eq!(choices.get(&other, "site").unwrap().host, "id-tower");
+        // A project without a name, at either location, does not.
+        assert!(choices.get(&at("/example/worktree-a"), "site").is_none());
+        assert!(choices
+            .get(&ProjectKey::Name("another".into()), "site")
+            .is_none());
+        let text = std::fs::read_to_string(dir.file()).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["choices"][0]["project_name"], "example");
+        assert!(value["choices"][0].get("project").is_none());
+        assert_eq!(choices.all()[0].project, ProjectKey::Name("example".into()));
     }
 }

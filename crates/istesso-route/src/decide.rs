@@ -278,9 +278,9 @@ pub fn decide(task: &Task, table: &[Candidate], remembered: Option<&Remembered>)
                     stale: None,
                 };
             }
-            pick_in_order(&meeting, met, true)
+            pick_in_order(&meeting, met, None)
         }
-        SeveralMatch::PickInOrder => pick_in_order(&meeting, met, false),
+        SeveralMatch::PickInOrder => pick_in_order(&meeting, met, Some(&task.prefers)),
     }
 }
 
@@ -319,9 +319,16 @@ fn decide_remembered(
     }
 }
 
-/// Picks the first machine that answers. `alone`: the caller already knows
-/// that at most one machine counts, so the reason says so.
-fn pick_in_order(meeting: &[&Candidate], mut because: Vec<String>, alone: bool) -> Decision {
+/// Picks the first machine that answers. `prefers`: what a build or run task
+/// would rather have; `None` for a deploy, where at most one machine counts.
+///
+/// Order: machines that meet the preferences, then this machine, machines
+/// that answer, lower load, the name (see `in_order`).
+fn pick_in_order(
+    meeting: &[&Candidate],
+    mut because: Vec<String>,
+    prefers: Option<&Needs>,
+) -> Decision {
     let mut answering: Vec<&Candidate> = meeting.iter().copied().filter(|c| c.answers()).collect();
     if answering.is_empty() {
         return Decision::Stopped {
@@ -329,17 +336,47 @@ fn pick_in_order(meeting: &[&Candidate], mut because: Vec<String>, alone: bool) 
             remembered: false,
         };
     }
-    answering.sort_by(|a, b| in_order(a, b));
+    let Some(prefers) = prefers else {
+        because.push("is the only machine that meets the needs".to_owned());
+        return Decision::Go {
+            place: Place::of(answering[0]),
+            because,
+            remembered: None,
+        };
+    };
+    let stated = *prefers != Needs::default();
+    let preferred = |c: &Candidate| stated && lacks(prefers, c).is_empty();
+    answering.sort_by(|a, b| preferred(b).cmp(&preferred(a)).then_with(|| in_order(a, b)));
     let first = answering[0];
-    let why_first = if alone {
-        "is the only machine that meets the needs".to_owned()
-    } else if first.local {
+    if stated {
+        let wished = meets(prefers).join(", ");
+        if preferred(first) {
+            because.push(format!(
+                "also has what the task prefers ({wished}), so it comes before this machine"
+            ));
+        } else {
+            because.push(format!(
+                "no machine that answers has what the task prefers ({wished})"
+            ));
+        }
+    }
+    // Why it comes first among the machines that are equally preferred.
+    let tier: Vec<&Candidate> = answering
+        .iter()
+        .copied()
+        .filter(|c| preferred(c) == preferred(first))
+        .collect();
+    let why_first = if first.local {
         "is this machine (this machine comes first)".to_owned()
-    } else if answering.len() == 1 {
-        "is the only machine that meets the needs and answers".to_owned()
+    } else if tier.len() == 1 {
+        if stated && preferred(first) {
+            "is the only machine that answers and has it".to_owned()
+        } else {
+            "is the only machine that meets the needs and answers".to_owned()
+        }
     } else {
         match first.load() {
-            Some(load) if answering[1].load() != Some(load) => {
+            Some(load) if tier[1].load() != Some(load) => {
                 format!("answers and has the lowest load ({load:.2})")
             }
             _ => "answers, and comes first by name among the machines that answer".to_owned(),
@@ -426,14 +463,108 @@ mod tests {
             )),
             "air"
         );
-        // Mac host ("prefer the always-on Mac"). The preference cannot be
-        // written with today's needs, so the row is only `os: macos`.
+        // Mac host ("prefer the always-on Mac"): with only one Mac, the Mac
+        // at hand.
+        assert_eq!(go_to(&decide(&mac_host(), &table, None)), "air");
+        // Rows that cannot be written as needs: the test application's window
+        // (the role table has no role for "can open a window"), and latency
+        // measurement over a cable (two machines at once; a task goes to one).
+    }
+
+    /// The row "Mac host (prefer the always-on Mac)".
+    fn mac_host() -> Task {
+        task_with(
+            "run",
+            r#"{"os": "macos"}"#,
+            r#"{"roles": ["always_on_candidate"]}"#,
+        )
+    }
+
+    fn task_with(kind: &str, needs: &str, prefers: &str) -> Task {
+        let text = format!(
+            r#"{{"version": 1, "tasks": {{"t": {{"kind": "{kind}", "needs": {needs}, "prefers": {prefers}}}}}}}"#
+        );
+        read_tasks(&text).unwrap().tasks.remove("t").unwrap()
+    }
+
+    // The same rows with the three machines of `hosts-three.json`: the
+    // always-on Mac takes the Mac host row; every other row stays.
+    #[test]
+    fn the_agents_md_table_gives_the_same_places_with_three_machines() {
+        let table = three();
+        assert_eq!(
+            go_to(&decide(
+                &task("build", r#"{"tools": ["cargo"]}"#),
+                &table,
+                None
+            )),
+            "air"
+        );
         assert_eq!(
             go_to(&decide(&task("run", r#"{"os": "macos"}"#), &table, None)),
             "air"
         );
-        // Latency measurement over a cable needs two machines at once; one
-        // task goes to one machine, so that row is not a test.
+        assert_eq!(
+            go_to(&decide(
+                &task(
+                    "run",
+                    r#"{"os": "linux", "roles": ["gpu", "hardware_encode"]}"#
+                ),
+                &table,
+                None
+            )),
+            "tower"
+        );
+        assert_eq!(
+            go_to(&decide(
+                &task("build", r#"{"roles": ["xcode_build"]}"#),
+                &table,
+                None
+            )),
+            "air"
+        );
+        let decision = decide(&mac_host(), &table, None);
+        assert_eq!(go_to(&decision), "mini");
+        let Decision::Go { because, .. } = decision else {
+            panic!()
+        };
+        assert!(because.iter().any(|b| b.contains("what the task prefers")));
+    }
+
+    #[test]
+    fn preferences_order_but_never_widen() {
+        // No machine that answers has the preference: the usual order, said so.
+        let decision = decide(&mac_host(), &two(), None);
+        let Decision::Go { place, because, .. } = decision else {
+            panic!()
+        };
+        assert_eq!(place.name, "air");
+        assert!(because
+            .iter()
+            .any(|b| b.starts_with("no machine that answers has")));
+        // A preferred machine that does not answer is passed over.
+        let mut table = three();
+        table[2].state = HostState::Unknown;
+        assert_eq!(go_to(&decide(&mac_host(), &table, None)), "air");
+        // A preference never lets in a machine that lacks the needs.
+        let linux_pref = task_with("build", r#"{"os": "macos"}"#, r#"{"os": "linux"}"#);
+        assert_eq!(go_to(&decide(&linux_pref, &three(), None)), "air");
+        // Deploy does not pick in order, so it does not look at preferences.
+        let deploy = task_with(
+            "deploy",
+            r#"{"roles": ["always_on_candidate"]}"#,
+            r#"{"os": "macos"}"#,
+        );
+        assert!(matches!(
+            decide(&deploy, &three(), None),
+            Decision::Ambiguous { .. }
+        ));
+        // An unknown preference is not decided either.
+        let unknown = task_with("run", "{}", r#"{"roles": ["quiet"]}"#);
+        assert!(matches!(
+            decide(&unknown, &three(), None),
+            Decision::NotUnderstood { .. }
+        ));
     }
 
     #[test]

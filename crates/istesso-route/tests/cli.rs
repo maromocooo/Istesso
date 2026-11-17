@@ -49,6 +49,7 @@ impl Project {
         std::fs::write(&script, "#!/bin/sh\npwd > marker\nexit 3\n").unwrap();
         // Whatever the umask: the task file and its folder must not be
         // writable by others, or they are refused.
+        set_mode(&root, 0o755);
         set_mode(&root.join(".istesso"), 0o755);
         set_mode(&root.join(".istesso/tasks.json"), 0o644);
         set_mode(&script, 0o755);
@@ -515,4 +516,109 @@ fn task_files_that_cannot_be_trusted_are_not_used() {
         let run = project.with_hosts("hosts-two.json", &["build", "test"]);
         assert_eq!(run.code, 3, "{}", run.all());
     }
+}
+
+fn last_line(text: &str) -> &str {
+    text.lines().last().unwrap_or_default()
+}
+
+#[test]
+fn run_says_in_a_fixed_line_whether_the_task_ran() {
+    let project = Project::new("ran-line");
+    // The task ran and ended with 3.
+    let run = project.with_hosts("hosts-two.json", &["build", "test"]);
+    assert_eq!(run.code, 3);
+    assert_eq!(
+        last_line(&run.stderr),
+        "istesso-route: ran build `test` here; it ended with 3"
+    );
+    std::fs::remove_file(project.root().join("marker")).unwrap();
+    // Not run, for each reason.
+    for (hosts, args, code) in [
+        ("hosts-two.json", ["run", "encode"], exit::ELSEWHERE),
+        ("hosts-three.json", ["deploy", "site"], exit::AMBIGUOUS),
+        ("hosts-two.json", ["build", "windows"], exit::NOBODY),
+        ("hosts-two.json", ["build", "quantum"], exit::NOT_UNDERSTOOD),
+        ("hosts-two.json", ["run", "missing"], exit::CANNOT_START),
+        ("hosts-two.json", ["run", "nothing"], exit::UNREADABLE),
+    ] {
+        let run = project.with_hosts(hosts, &args);
+        assert_eq!(run.code, code, "{args:?}");
+        assert_eq!(
+            last_line(&run.stderr),
+            format!(
+                "istesso-route: did not run {} `{}`; exit code {code}",
+                args[0], args[1]
+            )
+        );
+    }
+    assert!(!project.root().join("marker").exists());
+
+    // The same as JSON: one line, the last one.
+    let run = project.with_hosts("hosts-two.json", &["run", "encode", "--json"]);
+    assert_eq!(run.code, exit::ELSEWHERE);
+    let value: Value = serde_json::from_str(last_line(&run.stderr)).unwrap();
+    assert_eq!(value["ran"], false);
+    assert_eq!(value["exit_code"], exit::ELSEWHERE);
+    assert_eq!(value["decision"]["decision"], "go");
+    assert_eq!(value["decision"]["place"]["name"], "tower");
+    assert_eq!(run.stderr.lines().count(), 1);
+    let run = project.with_hosts("hosts-two.json", &["build", "test", "--json"]);
+    assert_eq!(run.code, 3);
+    let value: Value = serde_json::from_str(last_line(&run.stderr)).unwrap();
+    assert_eq!(value["ran"], true);
+    assert_eq!(value["exit_code"], 3);
+    let run = project.with_hosts("hosts-two.json", &["run", "nothing", "--json"]);
+    let value: Value = serde_json::from_str(last_line(&run.stderr)).unwrap();
+    assert_eq!(value["ran"], false);
+    assert_eq!(value["decision"], Value::Null);
+}
+
+#[test]
+fn a_named_project_shares_its_choices_across_worktrees() {
+    let named = TASKS.replacen(
+        r#""version": 1,"#,
+        r#""version": 1, "project": "example","#,
+        1,
+    );
+    let first = Project::new("worktree-a");
+    let second = Project::new("worktree-b");
+    for project in [&first, &second] {
+        std::fs::write(project.root().join(".istesso/tasks.json"), &named).unwrap();
+    }
+    let run = first.with_hosts("hosts-three.json", &["choose", "site", "tower"]);
+    assert_eq!(run.code, exit::OK, "{}", run.all());
+    assert!(run.stdout.contains("the project `example`"));
+    // Same settings folder, another worktree of the same project.
+    let run = Run::of(
+        second
+            .command(&[
+                "where",
+                "deploy",
+                "site",
+                "--hosts",
+                &format!("{FIXTURES}/hosts-three.json"),
+            ])
+            .env("ISTESSO_ROUTE_DIR", first.settings())
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(run.code, exit::OK, "{}", run.all());
+    assert!(run.stdout.contains("(remembered;"));
+    // A project without the name is told apart by its location.
+    let unnamed = Project::new("worktree-c");
+    let run = Run::of(
+        unnamed
+            .command(&[
+                "where",
+                "deploy",
+                "site",
+                "--hosts",
+                &format!("{FIXTURES}/hosts-three.json"),
+            ])
+            .env("ISTESSO_ROUTE_DIR", first.settings())
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(run.code, exit::AMBIGUOUS);
 }

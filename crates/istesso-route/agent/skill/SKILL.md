@@ -35,7 +35,7 @@ istesso-route where build test --hosts hosts.json
 | `istesso-route check deploy <task>` | One line: does the deploy task have a single place that answers now? |
 | `istesso-route build <task>` | Runs a build task, when its place is this machine. |
 | `istesso-route run <task>` | Runs a run task, when its place is this machine. |
-| `istesso-route deploy <task>` | Runs a deploy task, when its place is this machine. |
+| `istesso-route deploy <task>` | Runs a deploy task, when its place is this machine. `--json` ends with one JSON line. |
 | `istesso-route choose <task> <machine>` | Remembers the machine a person chose for a deploy task. |
 | `istesso-route forget <task>` | Forgets the remembered machine of a deploy task. |
 | `istesso-route choices` | Lists the remembered choices and where they are kept. |
@@ -57,7 +57,17 @@ Read the exit code first; the text says the same in words.
 | 127 | The task's program could not be started. | Tell the person; the task's `command` may be wrong. |
 
 When `build`, `run` or `deploy` ran the task here, the command ends with the
-task's own exit code, which may be any number, these included.
+task's own exit code, which may be any number, these included. So these three
+commands always end with one fixed line on standard error that says whether
+the task ran; read that line, not the exit code alone:
+
+```text
+istesso-route: ran build `test` here; it ended with 3
+istesso-route: did not run deploy `site`; exit code 72
+```
+
+With `--json`, that last line is one JSON object instead, with `ran` (true or
+false), `exit_code` and `decision`.
 
 ## Rules
 

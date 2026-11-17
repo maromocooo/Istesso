@@ -85,6 +85,14 @@ fn the_exit_codes_in_the_skill_are_the_code_s() {
 }
 
 #[test]
+fn the_skill_shows_the_fixed_line_of_run() {
+    // The same forms that `tests/cli.rs` checks the command against.
+    assert!(SKILL.contains("istesso-route: ran build `test` here; it ended with 3"));
+    assert!(SKILL.contains("istesso-route: did not run deploy `site`; exit code 72"));
+    assert!(help(&["run"]).contains("--json"));
+}
+
+#[test]
 fn the_entry_is_one_line_naming_the_command_and_the_file() {
     let lines: Vec<&str> = ENTRY.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines.len(), 1);
