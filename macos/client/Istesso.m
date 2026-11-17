@@ -339,6 +339,9 @@ static CATextLayer *note_layer = nil;
 static CALayer *standing_box = nil;
 static CATextLayer *standing_layer = nil;
 static BOOL view_only = NO;
+// The small line is made noticeable for a moment when a key or a button is pressed.
+static BOOL standing_loud = NO;
+static unsigned long standing_generation = 0;
 // No picture has been shown yet: the window is up and says so.
 static BOOL before_first_picture = YES;
 // The line is up: no key or button press is passed on.
@@ -410,19 +413,42 @@ static void show_standing_note(void) {
     [CATransaction setDisableActions:YES];
     if (on) {
         NSString *text = @"View only — what you type is not sent";
-        NSFont *font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+        CGFloat points = standing_loud ? 15 : 11;
+        NSFont *font = [NSFont systemFontOfSize:points weight:standing_loud ? NSFontWeightSemibold : NSFontWeightMedium];
         NSSize fit = [text sizeWithAttributes:@{NSFontAttributeName : font}];
         CGFloat width = ceil(fit.width) + 20, height = ceil(fit.height) + 10;
         // The layer counts from the bottom left, as the view does.
         standing_box.frame = CGRectMake(10, 10, width, height);
         standing_layer.frame = CGRectMake(10, 5, width - 20, height - 10);
         standing_layer.font = (__bridge CFTypeRef)font;
-        standing_layer.fontSize = 11;
+        standing_layer.fontSize = points;
+        standing_box.backgroundColor = CGColorCreateGenericGray(0.08, standing_loud ? 0.96 : 0.82);
+        standing_box.borderColor = CGColorGetConstantColor(kCGColorWhite);
+        standing_box.borderWidth = standing_loud ? 1.5 : 0;
         standing_layer.contentsScale = cursor_view.window != nil ? cursor_view.window.backingScaleFactor : 2;
         standing_layer.string = text;
     }
     standing_box.hidden = !on;
     [CATransaction commit];
+}
+
+// A key or a button was pressed on a device that may only look: the small line is larger and
+// framed for a moment, so that the person sees why nothing happens, and then small again.
+static void notice_standing_note(void) {
+    if (!view_only || picture_over) {
+        return;
+    }
+    unsigned long generation = ++standing_generation;
+    if (!standing_loud) {
+        standing_loud = YES;
+        show_standing_note();
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation == standing_generation) {
+            standing_loud = NO;
+            show_standing_note();
+        }
+    });
 }
 
 static void set_dim(BOOL on) {
@@ -1392,6 +1418,8 @@ static NSCursor *empty_cursor(void) {
     _keys.command_is_control = command_is_control;
     if (input_away && !picture_stale) {
         mark_at_once_for_the_input();
+    } else if (view_only) {
+        notice_standing_note();
     }
     size_t count = keys_key_down(&_keys, event.keyCode, event.modifierFlags, event.isARepeat, changes);
     if (picture_stale) {
@@ -1456,6 +1484,8 @@ static NSCursor *empty_cursor(void) {
     unsigned bit = 1u << (code - 0x110);
     if (pressed && input_away && !picture_stale) {
         mark_at_once_for_the_input();
+    } else if (pressed && view_only) {
+        notice_standing_note();
     }
     if (pressed && picture_stale) {
         // Not pressed on the other side while the picture is not the host's of this moment.
@@ -1582,8 +1612,14 @@ static void first_picture_is_there(void) {
         return;
     }
     before_first_picture = NO;
-    if (the_window != nil) {
-        place_the_window();
+    if (the_window != nil && !window_whole_display && !window_sized && picture_width > 0 && picture_height > 0) {
+        // The picture's size, one pixel of the picture to one of the display the window is
+        // on now. Its top left corner stays where it is: the person may have moved it.
+        NSRect frame = the_window.frame;
+        NSPoint top_left = NSMakePoint(NSMinX(frame), NSMaxY(frame));
+        CGFloat scale = the_window.screen != nil ? the_window.screen.backingScaleFactor : 1;
+        [the_window setContentSize:NSMakeSize(picture_width / scale, picture_height / scale)];
+        [the_window setFrameTopLeftPoint:top_left];
     }
     // A line that is up for the input stays, with its own words.
     show_note(picture_stale && !picture_over ? away_line() : nil);
@@ -1726,7 +1762,11 @@ int main(int argc, char *argv[]) {
                         wake_keys_qos = true;
 #endif
                     } else if (*each != '\0') {
+#ifdef ISTESSO_MEASURING
+                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical and keys-qos, not %s\n", each);
+#else
                         fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos and latency-critical, not %s\n", each);
+#endif
                         return 2;
                     }
                 }
@@ -1746,6 +1786,18 @@ int main(int argc, char *argv[]) {
         static IstessoApplication *application;
         application = [IstessoApplication new];
         NSApp.delegate = application;
+        // The application's own menu, with its own Quit. It has no shortcut: Command-Q belongs
+        // to the application of the host that the window shows, as every other key with
+        // Command does (ADR 0018).
+        NSMenu *bar = [NSMenu new];
+        NSMenuItem *own = [NSMenuItem new];
+        [bar addItem:own];
+        NSMenu *menu = [NSMenu new];
+        [menu addItemWithTitle:[@"Quit " stringByAppendingString:NSProcessInfo.processInfo.processName]
+                        action:@selector(terminate:)
+                 keyEquivalent:@""];
+        own.submenu = menu;
+        NSApp.mainMenu = bar;
         if (wake_latency_critical) {
             // Kept until the program ends: timers and wake-ups of this process are not put off.
             wake_activity = [NSProcessInfo.processInfo beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
@@ -1851,11 +1903,18 @@ int main(int argc, char *argv[]) {
         counted_window = window;
         counted_title = [window.title copy];
         show_counts();
-        // The window is there from the start, with a word about what it waits for.
-        show_the_window();
         if (!use_channel(view)) {
             fprintf(stderr, "error: cannot start the thread that receives\n");
             return 1;
+        }
+        // The window is there from the start, with a word about what it waits for. After
+        // `use_channel`: that is where the layers the word is drawn in are made.
+        show_the_window();
+        if (input != NULL) {
+            // There is no conversation for the input yet, from the first moment on and not
+            // only once an attempt has failed: what is typed now does not arrive, a press
+            // brings the mark up at once and is not passed on.
+            input_went_away(now_ns());
         }
         [NSApp run];
         finish();
