@@ -1031,9 +1031,11 @@ impl Shared {
             }
             (self.log)(format!("showing the picture to {}", watcher.peer.name));
             watchers.list.push(watcher.clone());
+            // A viewer can only begin with a key frame, and is not made to ask. Said
+            // with the viewers still in hand: whoever finds this viewer among them (a
+            // frame, or a question how many there are) finds the key frame asked for.
+            self.key_wanted.store(true, Ordering::SeqCst);
         }
-        // A viewer can only begin with a key frame, and is not made to ask.
-        self.key_wanted.store(true, Ordering::SeqCst);
         self.attend(&watcher);
         self.watchers()
             .list
