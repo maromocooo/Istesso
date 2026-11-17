@@ -19,6 +19,13 @@
 //! vt-collide --changes 200 --side-fps 30
 //! ```
 //!
+//! A change usually answers an input. With `--hold-ms N` the same-session
+//! form holds its unchanged pictures back for N ms after each input, so that
+//! the change that follows meets one less often. The change comes a random
+//! `--lead-min-ms`..`--lead-max-ms` after its input (2..12 by default: from
+//! a quick redraw to one frame at 85 Hz). `--no-input` makes the picture
+//! change by itself, with no input before it, so nothing is held back.
+//!
 //! The pictures are drawn before the run starts, so handing one over costs
 //! nothing and does not hold the next one back. Needs no permission and
 //! shows no window. Measures only; nothing here is part of the host.
@@ -49,6 +56,10 @@ fn main() {
     let mut side_fps = 0u64;
     let mut side_size = 64usize;
     let mut seed = 0x5eed_u64;
+    let mut hold_ms = 0u64;
+    let mut lead_min_ms = 2u64;
+    let mut lead_max_ms = 12u64;
+    let mut with_input = true;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut number = |name: &str| -> u64 {
@@ -70,10 +81,15 @@ fn main() {
             "--side-fps" => side_fps = number("--side-fps"),
             "--side-size" => side_size = number("--side-size") as usize,
             "--seed" => seed = number("--seed").max(1),
+            "--hold-ms" => hold_ms = number("--hold-ms"),
+            "--lead-min-ms" => lead_min_ms = number("--lead-min-ms"),
+            "--lead-max-ms" => lead_max_ms = number("--lead-max-ms"),
+            "--no-input" => with_input = false,
             other => {
                 eprintln!(
                     "unknown argument {other}\nusage: vt-collide [--width N] [--height N] [--changes N] \
-                     [--gap-min-ms N] [--gap-max-ms N] [--awake-fps N | --side-fps N [--side-size N]] [--seed N]"
+                     [--gap-min-ms N] [--gap-max-ms N] [--awake-fps N [--hold-ms N] | --side-fps N [--side-size N]] [--seed N] \
+                     [--lead-min-ms N] [--lead-max-ms N] [--no-input]"
                 );
                 std::process::exit(2);
             }
@@ -114,10 +130,29 @@ fn main() {
         Change,
         Unchanged,
     }
+    // The leads come from a random series of their own, so that the inputs fall at the same
+    // times with and without them.
+    let mut lead_state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    let mut lead = move || {
+        lead_state ^= lead_state << 13;
+        lead_state ^= lead_state >> 7;
+        lead_state ^= lead_state << 17;
+        let lead_max_ms = lead_max_ms.max(lead_min_ms);
+        let spread = (lead_max_ms - lead_min_ms) * 1000;
+        Duration::from_micros(
+            lead_min_ms * 1000 + if spread == 0 { 0 } else { lead_state % spread },
+        )
+    };
     let mut events: Vec<(Duration, Kind)> = vec![(Duration::ZERO, Kind::First)];
+    let mut inputs: Vec<Duration> = Vec::new();
     let mut at = Duration::from_secs(1);
     for _ in 0..changes {
-        events.push((at, Kind::Change));
+        if with_input {
+            inputs.push(at);
+            events.push((at + lead(), Kind::Change));
+        } else {
+            events.push((at, Kind::Change));
+        }
         let spread = gap_max_ms - gap_min_ms;
         let gap_us = gap_min_ms * 1000
             + if spread == 0 {
@@ -135,7 +170,12 @@ fn main() {
             if due >= end {
                 break;
             }
-            events.push((due, Kind::Unchanged));
+            let held = inputs
+                .iter()
+                .any(|&input| input <= due && due < input + Duration::from_millis(hold_ms));
+            if !held {
+                events.push((due, Kind::Unchanged));
+            }
             k += 1;
         }
     }
@@ -305,9 +345,19 @@ fn main() {
         "picture: {width}x{height}, still; {changes} changes (one character typed), gaps {gap_min_ms}..{gap_max_ms} ms at random (seed {seed}), run {seconds:.1} s"
     );
     println!(
+        "input: {}",
+        if with_input {
+            format!("each change {lead_min_ms}..{lead_max_ms} ms after its input")
+        } else {
+            "none; the picture changes by itself".to_string()
+        }
+    );
+    println!(
         "kept awake: {}",
         if awake_fps > 0 {
-            format!("the same session, the unchanged picture {awake_fps} times a second")
+            format!(
+                "the same session, the unchanged picture {awake_fps} times a second, held back {hold_ms} ms after an input"
+            )
         } else if side_fps > 0 {
             format!("a separate {side_size}x{side_size} session, {side_fps} pictures a second")
         } else {
@@ -362,6 +412,11 @@ fn main() {
     let each: Vec<String> = measured.iter().map(|v| format!("{v:.3}")).collect();
     println!();
     println!("changes, each (ms): {}", each.join(" "));
+    let flags: String = all[skip..]
+        .iter()
+        .map(|v| if v.1 { '1' } else { '0' })
+        .collect();
+    println!("met an unchanged picture, each: {flags}");
 }
 
 #[cfg(target_os = "macos")]
