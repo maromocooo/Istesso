@@ -262,7 +262,7 @@ fn check_writers(
         });
     }
     if meta.mode() & 0o020 != 0 {
-        if let Err(why) = crate::accounts::group_is_private(meta.gid(), effective_uid(), accounts) {
+        if let Err(why) = accounts.is_private(meta.gid(), effective_uid()) {
             return Err(FindError::GroupWritable {
                 path,
                 group: accounts.group_name(meta.gid()),
@@ -883,19 +883,19 @@ mod tests {
             err
         };
         // A group with another member.
-        let mut db = crate::accounts::tests::private_db(uid, gid);
-        db.group = Some(format!("me:x:{gid}:guest\n"));
+        let me = format!("me:x:{uid}:{gid}::/nonexistent:/bin/sh\n");
+        let db = AccountDb::given(Some(me.clone()), Some(format!("me:x:{gid}:guest\n")));
         assert!(refused(&db).to_string().contains("guest"));
         // A group that is another account's primary group.
-        let mut db = crate::accounts::tests::private_db(uid, gid);
-        db.passwd = Some(format!(
-            "me:x:{uid}:{gid}::/nonexistent:/bin/sh\nguest:x:{}:{gid}::/nonexistent:/bin/sh\n",
+        let other = format!(
+            "{me}guest:x:{}:{gid}::/nonexistent:/bin/sh\n",
             uid.wrapping_add(1)
-        ));
+        );
+        let db = AccountDb::given(Some(other), Some(format!("me:x:{gid}:\n")));
         refused(&db);
-        // Databases that cannot be read.
+        // A lookup that failed.
         let err = refused(&AccountDb::default());
-        assert!(err.to_string().contains("cannot be read"));
+        assert!(err.to_string().contains("lookup failed"));
         // `o+w` stays refused, whatever the group.
         let db = crate::accounts::tests::private_db(uid, gid);
         set_mode(&file, 0o666);
