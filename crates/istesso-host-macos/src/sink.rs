@@ -27,6 +27,12 @@ pub trait FrameSink: Send {
     /// Whether a key frame is needed (a viewer has connected, asked for one,
     /// or was held back). True once for each time it is needed.
     fn key_frame_wanted(&mut self) -> bool;
+
+    /// Whether a device is being shown the session now. The encoder is kept
+    /// awake only then ([`crate::keep_awake`]). Sinks that cannot tell say yes.
+    fn viewed(&self) -> bool {
+        true
+    }
 }
 
 /// A sink that counts and drops. For measuring the encoder alone.
