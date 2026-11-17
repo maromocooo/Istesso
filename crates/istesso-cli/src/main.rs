@@ -531,24 +531,25 @@ fn relay_input(
         None => None,
     };
     use istesso_agent::relay::{Happened, InputLine, LISTEN_EVERY};
-    // Opens a conversation with the device: now, and again whenever it is cut. The
-    // list of paired devices is read each time, so a pairing that was removed
-    // meanwhile is not used.
-    let mut connect: istesso_agent::relay::Connect = {
+    // Opens a conversation with the device, now. The list of paired devices is
+    // read each time, so a pairing that was removed meanwhile is not used.
+    let first = || {
+        let within = Duration::from_secs(3);
+        istesso_agent::connect_peer_or_say_why(&Paths::from_env(), to, address, within)
+    };
+    // One try at opening it again when it was cut. Several run at once, each with
+    // its own keys and its own reading of the list, and each is over when its time
+    // is (ADR 0007).
+    let connect: istesso_agent::relay::Connect = {
         let (to, address) = (to.to_string(), address.map(str::to_string));
-        Box::new(move |within| {
-            istesso_agent::connect_peer_or_say_why(
-                &Paths::from_env(),
-                &to,
-                address.as_deref(),
-                within,
-            )
+        std::sync::Arc::new(move |within| {
+            istesso_agent::connect_peer_within(&Paths::from_env(), &to, address.as_deref(), within)
         })
     };
     let began = std::time::Instant::now();
     let mut said = false;
     let client = loop {
-        match connect(Duration::from_secs(3)) {
+        match first() {
             Ok(client) => break client,
             Err(why) if began.elapsed() < keep_trying => {
                 if !said {

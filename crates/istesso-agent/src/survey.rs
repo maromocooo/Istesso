@@ -5,8 +5,9 @@
 //! timeout instead of several. A device that does not answer is still listed,
 //! with what it reported when it was last seen.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use istesso_link::{Client, LocalKeys, DEFAULT_PORT};
@@ -199,6 +200,40 @@ pub fn connect_peer_or_say_why(
     address: Option<&str>,
     timeout: Duration,
 ) -> Result<Client, ConnectFailure> {
+    connect_peer_how(paths, who, address, Waits::Each(timeout))
+}
+
+/// As [`connect_peer_or_say_why`], for one try at opening a conversation
+/// again (ADR 0007): looking a name up, connecting and the handshake have
+/// `within` this time, all of it together, and the try is over when that
+/// time is. Tries run beside each other, so each has to end when it said
+/// it would. Afterwards a wait for the other device may take `within`.
+pub fn connect_peer_within(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    within: Duration,
+) -> Result<Client, ConnectFailure> {
+    let waits = Waits::AllBy(Instant::now() + within, within);
+    connect_peer_how(paths, who, address, waits)
+}
+
+/// How long opening a conversation may take.
+#[derive(Debug, Clone, Copy)]
+enum Waits {
+    /// Connecting, and each step of the handshake: this long each.
+    Each(Duration),
+    /// Everything together is over by this time. Each wait after that may
+    /// take this long.
+    AllBy(Instant, Duration),
+}
+
+fn connect_peer_how(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    waits: Waits,
+) -> Result<Client, ConnectFailure> {
     let here = |e: &dyn std::fmt::Display| ConnectFailure::Here(e.to_string());
     let identity = Identity::load_or_create(&paths.identity()).map_err(|e| here(&e))?;
     let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| here(&e))?);
@@ -228,7 +263,7 @@ pub fn connect_peer_or_say_why(
             "no address is known for this device yet: run `istesso hosts` once".into(),
         ));
     }
-    connect_any(candidates, keys, peers, &peer.id, timeout)
+    connect_any(candidates, keys, peers, &peer.id, waits)
         .map(|(client, _)| client)
         .map_err(ConnectFailure::Link)
 }
@@ -296,11 +331,16 @@ fn query_peer(
         );
     }
 
-    let (mut client, address) =
-        match connect_any(candidates, keys, peers, &peer.id, options.timeout) {
-            Ok(connected) => connected,
-            Err(err) => return unreachable_view(peer, snapshot, err.to_string()),
-        };
+    let (mut client, address) = match connect_any(
+        candidates,
+        keys,
+        peers,
+        &peer.id,
+        Waits::Each(options.timeout),
+    ) {
+        Ok(connected) => connected,
+        Err(err) => return unreachable_view(peer, snapshot, err.to_string()),
+    };
     // The device is there. From here on it gets more time: being slow to
     // answer is not the same as being away.
     let fetched = (|| -> istesso_link::Result<_> {
@@ -365,23 +405,36 @@ fn connect_any(
     keys: Arc<LocalKeys>,
     peers: Arc<PeerStore>,
     expected: &str,
-    timeout: Duration,
+    waits: Waits,
 ) -> istesso_link::Result<(Client, String)> {
     let (sender, receiver) = mpsc::channel();
     for candidate in candidates {
         let sender = sender.clone();
         let (keys, peers, expected) = (keys.clone(), peers.clone(), expected.to_string());
         std::thread::spawn(move || {
-            let result = resolve(&candidate)
-                .and_then(|addr| Client::connect(addr, &keys, &peers, Some(&expected), timeout));
+            let expected = Some(expected.as_str());
+            let result = match waits {
+                Waits::Each(timeout) => resolve(&candidate)
+                    .and_then(|addr| Client::connect(addr, &keys, &peers, expected, timeout)),
+                // One point in time for all of it, the looking up of a name
+                // included: this thread is over by then.
+                Waits::AllBy(by, afterwards) => {
+                    look_up_by(&candidate, by, resolve).and_then(|addr| {
+                        Client::connect_by(addr, &keys, &peers, expected, by, afterwards)
+                    })
+                }
+            };
             // Nobody listens any more once another address has won.
             let _ = sender.send((candidate, result));
         });
     }
     drop(sender);
 
-    // Name resolution has no timeout of its own, so the wait is bounded here.
-    let deadline = Instant::now() + timeout * 3;
+    let deadline = match waits {
+        // Name resolution has no timeout of its own, so the wait is bounded here.
+        Waits::Each(timeout) => Instant::now() + timeout * 3,
+        Waits::AllBy(by, _) => by,
+    };
     let mut best: Option<istesso_link::Error> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -416,6 +469,87 @@ fn resolve(candidate: &str) -> istesso_link::Result<SocketAddr> {
         .or(addresses.first())
         .copied()
         .ok_or_else(not_found)
+}
+
+/// One looking up of a name that is under way, and what it found.
+struct LookUp {
+    /// `None` until it is over; then the address, or that there is none.
+    found: Mutex<Option<Option<SocketAddr>>>,
+    over: Condvar,
+}
+
+/// The names that are being looked up at this moment.
+static LOOKED_UP: Mutex<BTreeMap<String, Arc<LookUp>>> = Mutex::new(BTreeMap::new());
+
+/// What `look_up` finds for `candidate`, if it finds it by `by`.
+///
+/// Looking a name up cannot be given a time limit, and cannot be stopped:
+/// when the network is away it may take the system many seconds. So it is
+/// done on a thread of its own, and whoever asks waits for it only until
+/// `by`: a try at connecting that is addressed by name ends at its deadline
+/// like any other. While a name is being looked up, nobody starts looking
+/// it up again: everybody who asks meanwhile waits for the one answer, each
+/// until its own deadline. Tries that follow each other every half second
+/// therefore leave one thread behind for a name that does not resolve, and
+/// not one each.
+///
+/// An address in numbers is not looked up at all.
+fn look_up_by(
+    candidate: &str,
+    by: Instant,
+    look_up: fn(&str) -> istesso_link::Result<SocketAddr>,
+) -> istesso_link::Result<SocketAddr> {
+    if let Ok(addr) = candidate.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let under_way = {
+        let mut looked_up = LOOKED_UP.lock().unwrap_or_else(|e| e.into_inner());
+        match looked_up.get(candidate) {
+            Some(under_way) => under_way.clone(),
+            None => {
+                let new = Arc::new(LookUp {
+                    found: Mutex::new(None),
+                    over: Condvar::new(),
+                });
+                let (name, mine) = (candidate.to_string(), new.clone());
+                let spawned = std::thread::Builder::new()
+                    .name("istesso-look-up".into())
+                    .spawn(move || {
+                        let found = look_up(&name).ok();
+                        // The next one who asks looks the name up anew.
+                        LOOKED_UP
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&name);
+                        *mine.found.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+                        mine.over.notify_all();
+                    });
+                spawned.map_err(istesso_link::Error::Io)?;
+                looked_up.insert(candidate.to_string(), new.clone());
+                new
+            }
+        }
+    };
+    let mut found = under_way.found.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(found) = *found {
+            return found.ok_or_else(|| {
+                istesso_link::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{candidate} does not resolve to an address"),
+                ))
+            });
+        }
+        let left = by
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(istesso_link::Error::Timeout)?;
+        found = under_way
+            .over
+            .wait_timeout(found, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
 }
 
 /// How much an error tells the user about what to do. When several
@@ -839,6 +973,97 @@ mod tests {
         assert_eq!(port_of("studio.local:47801"), 47801);
         assert_eq!(port_of("studio.local"), DEFAULT_PORT);
         assert_eq!(port_of("[::1]:6000"), 6000);
+    }
+
+    static LOOKED_UP_AND_STUCK: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Looking a name up when the network is away: it takes the system a
+    /// long time to say that it found nothing.
+    fn stuck(_name: &str) -> istesso_link::Result<SocketAddr> {
+        LOOKED_UP_AND_STUCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1500));
+        Err(istesso_link::Error::Timeout)
+    }
+
+    fn found(_name: &str) -> istesso_link::Result<SocketAddr> {
+        Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)))
+    }
+
+    #[test]
+    fn looking_a_name_up_ends_with_the_try_and_is_not_begun_again_meanwhile() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let name = "a-name-that-takes-long.invalid:47801";
+        // Four tries, one after the other, each with a fifth of a second.
+        for _ in 0..4 {
+            let began = Instant::now();
+            let result = look_up_by(name, began + Duration::from_millis(200), stuck);
+            let took = began.elapsed();
+            assert!(
+                matches!(result, Err(istesso_link::Error::Timeout)),
+                "{:?}",
+                result.err()
+            );
+            assert!(
+                took >= Duration::from_millis(150) && took < Duration::from_millis(700),
+                "the name was waited for {took:?}"
+            );
+        }
+        // All four waited for the one looking up that was under way.
+        assert_eq!(LOOKED_UP_AND_STUCK.load(SeqCst), 1);
+
+        // When that is over, the next try looks the name up anew.
+        let began = Instant::now();
+        while LOOKED_UP.lock().unwrap().contains_key(name) {
+            assert!(began.elapsed() < Duration::from_secs(5), "it never ends");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let by = Instant::now() + Duration::from_secs(5);
+        assert_eq!(look_up_by(name, by, found).unwrap().port(), 4242);
+
+        // An address in numbers is not looked up at all, deadline or not.
+        let numbers = SocketAddr::from((Ipv4Addr::LOCALHOST, 47801));
+        let past = Instant::now();
+        assert_eq!(
+            look_up_by(&numbers.to_string(), past, stuck).unwrap(),
+            numbers
+        );
+        assert_eq!(LOOKED_UP_AND_STUCK.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn a_try_has_one_deadline_for_all_of_it() {
+        let air = Device::new("air");
+        let ubuntu = Device::new("ubuntu");
+        pair(&air, &ubuntu);
+        // Something takes the connection there and never says a word.
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        air.knows_address_of(&ubuntu, silent.local_addr().unwrap());
+
+        let began = Instant::now();
+        let result = connect_peer_within(&air.paths(), "ubuntu", None, Duration::from_millis(300));
+        let took = began.elapsed();
+        assert!(
+            matches!(
+                result,
+                Err(ConnectFailure::Link(istesso_link::Error::Timeout))
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            took >= Duration::from_millis(250) && took < Duration::from_millis(900),
+            "the try took {took:?}"
+        );
+
+        // A device that is there is reached the same way.
+        let addr = ubuntu.start_agent();
+        let far = Device::new("far");
+        pair(&far, &ubuntu);
+        far.knows_address_of(&ubuntu, addr);
+        let mut client =
+            connect_peer_within(&far.paths(), "ubuntu", None, Duration::from_secs(2)).unwrap();
+        client.ping().unwrap();
     }
 
     #[test]
