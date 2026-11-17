@@ -72,6 +72,7 @@ istesso apps list --all
 - [docs/components.md](docs/components.md)：部品の採否とライセンス
 - [docs/milestones.md](docs/milestones.md)：進め方
 - [docs/m1-plan.md](docs/m1-plan.md)：次の関門（遅延の検証）の手順
+- [docs/wifi.md](docs/wifi.md)：Wi-Fi で使うときの手引き
 - [docs/adr/](docs/adr/)：決定の記録
 
 ## 開発
@@ -82,6 +83,7 @@ cargo test -p istesso-agent -- --ignored      # LAN 内の発見。マルチキ�
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo deny check                         # cargo-deny が必要
+swift build --package-path macos/screen-probe   # Mac だけ。遅延の計測の道具
 ```
 
 コーディングエージェント向けの規約は [AGENTS.md](AGENTS.md) にあります。

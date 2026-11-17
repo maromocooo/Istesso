@@ -405,8 +405,60 @@ pub enum InputMode {
     Gamepad,
 }
 
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+/// What a person did with the keyboard or the pointer, meant for an
+/// application that is shown to them from another device.
+///
+/// Keys and buttons are named by the numbers Linux gives them
+/// (`linux/input-event-codes.h`), whatever the sender runs on: a key is its
+/// place on the keyboard, not the letter printed on it, and the device that
+/// runs the application decides what the key means there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputEvent {
+    /// A key went down or came up.
+    Key { code: u32, pressed: bool },
+    /// The pointer is at this place of the picture, in the picture's own
+    /// pixels, counted from its top left corner.
+    PointerAt { x: i32, y: i32 },
+    /// A button of the pointer went down or came up (0x110 is the left one).
+    Button { code: u32, pressed: bool },
+    /// The wheel was turned or two fingers moved: how far the content
+    /// should move, in pixels, to the right and down.
+    Scroll { dx: i32, dy: i32 },
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_events_are_small_tagged_objects() {
+        use super::InputEvent;
+        let key = InputEvent::Key {
+            code: 30,
+            pressed: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&key).unwrap(),
+            r#"{"kind":"key","code":30,"pressed":true}"#
+        );
+        for event in [
+            key,
+            InputEvent::PointerAt { x: 12, y: 700 },
+            InputEvent::Button {
+                code: 0x110,
+                pressed: false,
+            },
+            InputEvent::Scroll { dx: 0, dy: -15 },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), event);
+        }
+        assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
+    }
+
     use super::*;
 
     #[test]

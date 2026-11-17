@@ -1,0 +1,139 @@
+[
+  {
+    "id": "1a2b-3c4d-5e6f-7a8b",
+    "name": "air",
+    "local": true,
+    "state": "awake",
+    "manifest": {
+      "schema": 2,
+      "name": "air",
+      "os": {
+        "family": "macos",
+        "name": "macOS",
+        "version": "26.0",
+        "kernel": "25.0.0",
+        "arch": "aarch64"
+      },
+      "hardware": {
+        "cpu_model": "Apple M4",
+        "cpu_cores": 10,
+        "memory_bytes": 17179869184,
+        "gpus": [
+          {
+            "vendor": "apple",
+            "name": "Apple M4",
+            "vram_bytes": null,
+            "driver": null
+          }
+        ]
+      },
+      "video": {
+        "display_server": "quartz",
+        "encoders": [
+          "videotoolbox"
+        ]
+      },
+      "audio": {
+        "server": "coreaudio",
+        "app_capture": true
+      },
+      "power": {
+        "portable": true,
+        "interfaces": []
+      },
+      "tools": {
+        "xcode": "26.0",
+        "docker": false,
+        "gstreamer": false,
+        "cargo": true
+      },
+      "roles": [
+        "mac_apps",
+        "xcode_build",
+        "hardware_encode",
+        "app_audio_capture"
+      ],
+      "warnings": []
+    },
+    "status": {
+      "load": 0.2,
+      "memory_available_bytes": 8589934592
+    },
+    "apps": [],
+    "seen_at": 1794870000,
+    "address": null,
+    "problem": null
+  },
+  {
+    "id": "9f8e-7d6c-5b4a-3921",
+    "name": "tower",
+    "local": false,
+    "state": "unknown",
+    "manifest": {
+      "schema": 2,
+      "name": "tower",
+      "os": {
+        "family": "linux",
+        "name": "Ubuntu",
+        "version": "24.04",
+        "kernel": "6.8.0",
+        "arch": "x86_64"
+      },
+      "hardware": {
+        "cpu_model": "Example CPU 16-Core",
+        "cpu_cores": 16,
+        "memory_bytes": 68719476736,
+        "gpus": [
+          {
+            "vendor": "nvidia",
+            "name": "Example GPU",
+            "vram_bytes": 17179869184,
+            "driver": "550.0"
+          }
+        ]
+      },
+      "video": {
+        "display_server": "wayland",
+        "encoders": [
+          "nvenc",
+          "software"
+        ]
+      },
+      "audio": {
+        "server": "pipewire",
+        "app_capture": true
+      },
+      "power": {
+        "portable": false,
+        "interfaces": [
+          {
+            "name": "eth0",
+            "mac": "02:00:00:00:00:20",
+            "kind": "ethernet",
+            "addresses": [
+              "192.0.2.20"
+            ]
+          }
+        ]
+      },
+      "tools": {
+        "xcode": null,
+        "docker": true,
+        "gstreamer": true,
+        "cargo": true
+      },
+      "roles": [
+        "gpu",
+        "always_on_candidate",
+        "hardware_encode",
+        "app_audio_capture"
+      ],
+      "warnings": []
+    },
+    "status": null,
+    "apps": [],
+    "seen_at": 1794870000,
+    "address": null,
+    "problem": "it did not answer"
+  }
+]
