@@ -1,0 +1,17 @@
+[package]
+name = "istesso-host-linux"
+description = "The Linux host: shows one application in a compositor of its own, encodes its picture and hands it to paired devices; takes their input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# What decides and what is tested everywhere (the runner's lines, the picture's states, the
+# gate between the compositor and the encoder, the input, the frame log) needs no GStreamer:
+# the workspace builds on a machine without it, as before (docs/adr/0019-own-host.md).
+
+[dependencies]
+istesso-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
