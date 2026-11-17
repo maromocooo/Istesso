@@ -1079,6 +1079,59 @@ pub fn pump(
     }
 }
 
+/// What [`pump`] does, with a source inside this program instead of one on
+/// the network: packets of `info`'s size, made by `fill`, each handed over
+/// at the moment its last frame would have been captured.
+///
+/// This is the reference for a player on a machine: what it skips and
+/// breaks with this source is the machine's and the output device's doing,
+/// not the network's or the other machine's. Call it on a thread scheduled
+/// as the receiving thread is.
+pub fn pump_local(
+    info: &StreamInfo,
+    mut fill: impl FnMut(&mut [f32]),
+    queue: &mut Writer,
+    arrivals: &mut Arrivals,
+    stop: &AtomicBool,
+) -> Ended {
+    let frames = info.packet_frames.max(1) as usize;
+    let mut samples = vec![0.0f32; frames * usize::from(info.channels)];
+    let packet_s = frames as f64 / f64::from(info.sample_rate);
+    let began_ns = clock::now_ns();
+    let at_ns = |packets: u64| began_ns + (packets as f64 * packet_s * 1e9) as u64;
+    let mut seq = 0u32;
+    while !stop.load(Ordering::Relaxed) {
+        let packets = u64::from(seq);
+        let due_ns = at_ns(packets + 1);
+        let now_ns = clock::now_ns();
+        if due_ns > now_ns {
+            std::thread::sleep(Duration::from_nanos(due_ns - now_ns));
+        }
+        fill(&mut samples);
+        let header = Header {
+            kind: Kind::Audio,
+            discontinuity: seq == 0,
+            seq,
+            position: packets * frames as u64,
+            capture_ns: at_ns(packets),
+        };
+        let arrival_ns = clock::now_ns();
+        arrivals.note(&header, frames, &samples, arrival_ns);
+        if !queue.push_audio(
+            frames,
+            &samples,
+            header.discontinuity,
+            header.position,
+            header.capture_ns,
+            arrival_ns,
+        ) {
+            arrivals.refused_frames += frames as u64;
+        }
+        seq = seq.wrapping_add(1);
+    }
+    Ended::Stopped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,6 +1597,40 @@ mod tests {
             handles.lock().unwrap().push(subscription.connection()?);
             Ok(subscription)
         }
+    }
+
+    #[test]
+    fn a_source_inside_the_program_hands_its_packets_over_on_time() {
+        let info = StreamInfo::new(48_000, 2, 256);
+        let (mut queue_in, _queue_out) = crate::fifo::queue(2, 48_000);
+        let mut arrivals = Arrivals::new(false);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let began = Instant::now();
+        let ended = pump_local(
+            &info,
+            |out| out.fill(0.25),
+            &mut queue_in,
+            &mut arrivals,
+            &stop,
+        );
+        let ran = began.elapsed().as_secs_f64();
+        stopper.join().unwrap();
+        assert_eq!(ended, Ended::Stopped);
+        let stats = serde_json::to_value(arrivals.stats()).unwrap();
+        let packets = stats["packets"].as_u64().unwrap() as f64;
+        // 187.5 packets a second, neither a burst at the start nor a lag.
+        assert!(
+            (packets - ran * 187.5).abs() <= 3.0,
+            "{packets} packets in {ran} s"
+        );
+        assert_eq!(stats["lost_packets"], 0);
     }
 
     #[test]

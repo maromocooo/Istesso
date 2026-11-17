@@ -113,7 +113,13 @@ pub enum AudioAction {
     /// file with --record.
     Play {
         /// Address of the source, e.g. `studio.local` or `192.0.2.20:47802`
-        address: String,
+        #[arg(required_unless_present = "reference")]
+        address: Option<String>,
+        /// Play from a source inside this program instead of from the
+        /// network: a reference for what this machine and its output
+        /// device skip and break on their own. No address is given
+        #[arg(long, conflicts_with = "address")]
+        reference: bool,
         /// Id or name of the paired device expected there (default: any
         /// paired device)
         #[arg(long)]
@@ -259,6 +265,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
         }),
         AudioAction::Play {
             address,
+            reference,
             peer,
             output,
             latency_ms,
@@ -271,7 +278,8 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             stop_file,
             keep_awake,
         } => play(PlayOptions {
-            address,
+            address: address.unwrap_or_default(),
+            reference,
             peer,
             output,
             latency_ms,
@@ -661,6 +669,7 @@ fn serve(options: ServeOptions) -> Result<(), String> {
 
 struct PlayOptions {
     address: String,
+    reference: bool,
     peer: Option<String>,
     output: Option<String>,
     latency_ms: f64,
@@ -698,6 +707,7 @@ fn play(options: PlayOptions) -> Result<(), String> {
         options.connect_for,
         options.stop_file,
         options.keep_awake,
+        options.reference,
     );
     Err("playing is only built for macOS so far".to_string())
 }
@@ -745,7 +755,8 @@ mod mac {
     use istesso_audio::resample::Sinc;
     use istesso_audio::rtrb::RingBuffer;
     use istesso_audio::session::{
-        clock_offset, pump_reconnecting, subscribe, Arrivals, Rejoining, SILENT_CONNECTION,
+        clock_offset, pump_local, pump_reconnecting, subscribe, Arrivals, ClockOffset, Ended,
+        Rejoining, SILENT_CONNECTION,
     };
     use istesso_link::LocalKeys;
 
@@ -812,20 +823,27 @@ mod mac {
         if !(5.0..=2000.0).contains(&options.latency_ms) {
             return Err("the wait is between 5 and 2000 milliseconds".to_string());
         }
-        let addr = resolve(&options.address)?;
-        let identity = super::super::load_identity()?;
-        let keys = LocalKeys::new(&identity).map_err(|e| e.to_string())?;
-        let peers = super::super::open_peers()?;
-        let expected = match &options.peer {
-            Some(selector) => Some(
-                peers
-                    .find(selector)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("no paired device matches '{selector}'"))?
-                    .id
-                    .clone(),
-            ),
-            None => None,
+        // The network side, or none: the reference plays from a source
+        // inside this program and needs neither keys nor a paired device.
+        let net = if options.reference {
+            None
+        } else {
+            let addr = resolve(&options.address)?;
+            let identity = super::super::load_identity()?;
+            let keys = LocalKeys::new(&identity).map_err(|e| e.to_string())?;
+            let peers = super::super::open_peers()?;
+            let expected = match &options.peer {
+                Some(selector) => Some(
+                    peers
+                        .find(selector)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("no paired device matches '{selector}'"))?
+                        .id
+                        .clone(),
+                ),
+                None => None,
+            };
+            Some((addr, identity, keys, peers, expected))
         };
         let wait = Duration::from_secs(3);
         // Playing keeps the machine awake (ADR 0005). For now the system's
@@ -843,21 +861,35 @@ mod mac {
         // the person whether this program may use the local network, and it
         // only asks while the program keeps trying.
         let give_up = Instant::now() + Duration::from_secs_f64(options.connect_for.max(0.0));
-        let mut offset = loop {
-            match clock_offset(addr, &keys, &peers, expected.as_deref(), 16, wait) {
-                Ok(offset) => break offset,
-                Err(istesso_audio::Error::Io(err)) if Instant::now() < give_up => {
-                    eprintln!("cannot reach the source yet ({err}); trying again");
-                    std::thread::sleep(Duration::from_secs(1));
+        let mut offset = match &net {
+            None => ClockOffset {
+                source_to_local_ns: 0,
+                round_trip_ns: 0,
+                rounds: 0,
+            },
+            Some((addr, _, keys, peers, expected)) => loop {
+                match clock_offset(*addr, keys, peers, expected.as_deref(), 16, wait) {
+                    Ok(offset) => break offset,
+                    Err(istesso_audio::Error::Io(err)) if Instant::now() < give_up => {
+                        eprintln!("cannot reach the source yet ({err}); trying again");
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    Err(err) => return Err(err.to_string()),
                 }
-                Err(err) => return Err(err.to_string()),
-            }
+            },
         };
-        let subscription =
-            subscribe(addr, &keys, &peers, expected.as_deref(), wait).map_err(|e| e.to_string())?;
-        let info = subscription.info().clone();
+        let (info, connection, subscription) = match &net {
+            Some((addr, _, keys, peers, expected)) => {
+                let subscription = subscribe(*addr, keys, peers, expected.as_deref(), wait)
+                    .map_err(|e| e.to_string())?;
+                let info = subscription.info().clone();
+                let connection = subscription.connection().map_err(|e| e.to_string())?;
+                (info, Some(connection), Some(subscription))
+            }
+            // What the host sends: 48 kHz, two channels, 256 frames a packet.
+            None => (StreamInfo::new(48_000, 2, 256), None, None),
+        };
         let channels = usize::from(info.channels);
-        let connection = subscription.connection().map_err(|e| e.to_string())?;
         let stream_rate = f64::from(info.sample_rate);
 
         // The network side: packets into the queue. It runs from the moment
@@ -874,61 +906,89 @@ mod mac {
             Duration::from_secs_f64(f64::from(info.packet_frames.max(64)) / stream_rate);
         // The receiving thread makes a new connection when one is cut. It
         // gets keys and a list of paired devices of its own for that.
-        let again_keys = LocalKeys::new(&identity).map_err(|e| e.to_string())?;
-        let again_peers = super::super::open_peers()?;
-        let again_expected = expected.clone();
-        let pumping = std::thread::spawn(move || {
-            // The receiving thread is part of the audio path: scheduled as
-            // the sound card's thread is, so that it is not held up.
-            let real_time = || {
+        let pumping = if let (Some((addr, identity, _, _, expected)), Some(subscription)) =
+            (&net, subscription)
+        {
+            let addr = *addr;
+            let again_keys = LocalKeys::new(identity).map_err(|e| e.to_string())?;
+            let again_peers = super::super::open_peers()?;
+            let again_expected = expected.clone();
+            std::thread::spawn(move || {
+                // The receiving thread is part of the audio path: scheduled as
+                // the sound card's thread is, so that it is not held up.
+                let real_time = || {
+                    if !istesso_audio::mac::make_this_thread_real_time(
+                        packet_time,
+                        Duration::from_micros(1500),
+                        Duration::from_millis(3),
+                    ) {
+                        eprintln!("the receiving thread could not be given real-time scheduling");
+                    }
+                };
+                real_time();
+                let mut arrivals = Arrivals::new(keep_ledger);
+                subscription.set_timeout(SILENT_CONNECTION);
+                let connect = || {
+                    let wait = Duration::from_secs(2);
+                    let next = subscribe(
+                        addr,
+                        &again_keys,
+                        &again_peers,
+                        again_expected.as_deref(),
+                        wait,
+                    )?;
+                    next.set_timeout(SILENT_CONNECTION);
+                    Ok(next)
+                };
+                let began = Instant::now();
+                let result = pump_reconnecting(
+                    subscription,
+                    connect,
+                    &mut queue_in,
+                    &mut arrivals,
+                    &stop_pump,
+                    Duration::from_millis(250),
+                    |event| {
+                        let at = began.elapsed().as_secs_f64();
+                        match event {
+                            Rejoining::Cut => {
+                                eprintln!("{at:>7.1} s since the start: the connection was cut; connecting again")
+                            }
+                            Rejoining::Rejoined => {
+                                eprintln!("{at:>7.1} s since the start: connected again");
+                                // Making a connection takes longer than this
+                                // thread said its work would; say it anew.
+                                real_time();
+                            }
+                        }
+                    },
+                );
+                (result, arrivals)
+            })
+        } else {
+            // The reference: the same test tone, from this program's own
+            // clock, on a thread scheduled as the receiving thread is.
+            let local = info.clone();
+            let mut tone = Tone::new(options.tone_hz.max(0.0), 0.001, stream_rate);
+            std::thread::spawn(move || {
                 if !istesso_audio::mac::make_this_thread_real_time(
                     packet_time,
                     Duration::from_micros(1500),
                     Duration::from_millis(3),
                 ) {
-                    eprintln!("the receiving thread could not be given real-time scheduling");
+                    eprintln!("the reference's source could not be given real-time scheduling");
                 }
-            };
-            real_time();
-            let mut arrivals = Arrivals::new(keep_ledger);
-            subscription.set_timeout(SILENT_CONNECTION);
-            let connect = || {
-                let wait = Duration::from_secs(2);
-                let next = subscribe(
-                    addr,
-                    &again_keys,
-                    &again_peers,
-                    again_expected.as_deref(),
-                    wait,
-                )?;
-                next.set_timeout(SILENT_CONNECTION);
-                Ok(next)
-            };
-            let began = Instant::now();
-            let result = pump_reconnecting(
-                subscription,
-                connect,
-                &mut queue_in,
-                &mut arrivals,
-                &stop_pump,
-                Duration::from_millis(250),
-                |event| {
-                    let at = began.elapsed().as_secs_f64();
-                    match event {
-                        Rejoining::Cut => {
-                            eprintln!("{at:>7.1} s since the start: the connection was cut; connecting again")
-                        }
-                        Rejoining::Rejoined => {
-                            eprintln!("{at:>7.1} s since the start: connected again");
-                            // Making a connection takes longer than this
-                            // thread said its work would; say it anew.
-                            real_time();
-                        }
-                    }
-                },
-            );
-            (result, arrivals)
-        });
+                let mut arrivals = Arrivals::new(keep_ledger);
+                let ended = pump_local(
+                    &local,
+                    |out| tone.fill(out, usize::from(local.channels)),
+                    &mut queue_in,
+                    &mut arrivals,
+                    &stop_pump,
+                );
+                (Ok::<Ended, istesso_audio::Error>(ended), arrivals)
+            })
+        };
 
         let mut output = Output::open(options.output.as_deref()).map_err(|e| e.to_string())?;
         let device = output.device().clone();
@@ -981,8 +1041,11 @@ mod mac {
             });
         }
 
-        // The device's own word on turns that were not made in time.
+        // The device's own word on turns that were not made in time, and
+        // the system's on its devices being rearranged.
         let overloads = output.count_overloads().ok();
+        let rearranged = istesso_audio::mac::watch_devices().ok();
+        let mut rearranged_seen = (0u64, 0u64);
         let seen = callbacks.clone();
         let device_rate = device.sample_rate;
         let mut turn_before: Option<(u64, u64)> = None;
@@ -1085,9 +1148,12 @@ mod mac {
                     on_the_way_ms.push(on_the_way);
                 }
             }
-            if offset_taken.elapsed() >= Duration::from_secs(60) {
+            if let Some((addr, _, keys, peers, expected)) = net
+                .as_ref()
+                .filter(|_| offset_taken.elapsed() >= Duration::from_secs(60))
+            {
                 offset_taken = Instant::now();
-                match clock_offset(addr, &keys, &peers, expected.as_deref(), 8, wait) {
+                match clock_offset(*addr, keys, peers, expected.as_deref(), 8, wait) {
                     Ok(taken) => {
                         offset = taken;
                         offset_checks += 1;
@@ -1109,6 +1175,27 @@ mod mac {
                     now.underruns,
                     now.skips
                 );
+                if let Some(changes) = &rearranged {
+                    let now = (
+                        changes.default_output.load(Ordering::Relaxed),
+                        changes.devices.load(Ordering::Relaxed),
+                    );
+                    if now.0 != rearranged_seen.0 {
+                        eprintln!(
+                            "{:>7.1} s since the start: the default output changed ({} so far); this player stays on the device it opened",
+                            begin.elapsed().as_secs_f64(),
+                            now.0
+                        );
+                    }
+                    if now.1 != rearranged_seen.1 {
+                        eprintln!(
+                            "{:>7.1} s since the start: the audio devices were rearranged ({} so far)",
+                            begin.elapsed().as_secs_f64(),
+                            now.1
+                        );
+                    }
+                    rearranged_seen = now;
+                }
                 if options.stop_file.as_ref().is_some_and(|file| file.exists()) {
                     break;
                 }
@@ -1128,7 +1215,9 @@ mod mac {
 
         // Hang up, and let the device finish.
         stop.store(true, Ordering::Relaxed);
-        let _ = connection.shutdown(std::net::Shutdown::Both);
+        if let Some(connection) = &connection {
+            let _ = connection.shutdown(std::net::Shutdown::Both);
+        }
         let (ended, arrivals) = pumping
             .join()
             .map_err(|_| "the receiving thread stopped unexpectedly".to_string())?;
@@ -1226,6 +1315,13 @@ mod mac {
             },
             // How much later than asked a thread of this process that only
             // sleeps was woken: the longest, and how often by 10 ms or more.
+            // Whether the source was inside this program (the reference).
+            "reference": options.reference,
+            // How often the system said that its audio devices changed.
+            "devices": {
+                "default_output_changed": rearranged.as_ref().map(|c| c.default_output.load(Ordering::Relaxed)),
+                "rearranged": rearranged.as_ref().map(|c| c.devices.load(Ordering::Relaxed)),
+            },
             "held_up": {
                 "longest_ms": held_up_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
                 "times_10_ms_or_more": held_up_times.load(Ordering::Relaxed),

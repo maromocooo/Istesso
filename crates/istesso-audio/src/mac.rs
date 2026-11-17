@@ -120,6 +120,68 @@ fn find(name: Option<&str>) -> Result<OutputDevice> {
     }
 }
 
+/// How often this Mac's audio devices were rearranged since
+/// [`watch_devices`] was called.
+#[derive(Clone)]
+pub struct DeviceChanges {
+    /// Another device became the default output.
+    pub default_output: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// A device came or went (a headset connecting, for instance).
+    pub devices: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Counts the system's notices that the default output changed and that
+/// the list of devices changed. A player that keeps to the device it
+/// opened does not follow such a change; the counts say when one happened.
+///
+/// The counts live as long as the process does: the listeners are not taken
+/// away again.
+pub fn watch_devices() -> Result<DeviceChanges> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    unsafe extern "C-unwind" fn noticed(
+        _object: u32,
+        _addresses: u32,
+        _address: NonNull<AudioObjectPropertyAddress>,
+        count: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: `count` is the pointer handed over below, to a counter
+        // that is never freed.
+        unsafe { &*count.cast::<AtomicU64>() }.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+
+    let listen = |selector: u32| -> Result<Arc<AtomicU64>> {
+        let count = Arc::new(AtomicU64::new(0));
+        let address = AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: objc2_core_audio::kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        // SAFETY: the address is valid for the call; the counter is kept
+        // alive for good by the reference given away here.
+        let status = unsafe {
+            objc2_core_audio::AudioObjectAddPropertyListener(
+                objc2_core_audio::kAudioObjectSystemObject as u32,
+                NonNull::from(&address),
+                Some(noticed),
+                Arc::into_raw(count.clone()).cast_mut().cast(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Device(format!(
+                "the system does not report changes of its audio devices (status {status})"
+            )));
+        }
+        Ok(count)
+    };
+    Ok(DeviceChanges {
+        default_output: listen(objc2_core_audio::kAudioHardwarePropertyDefaultOutputDevice)?,
+        devices: listen(objc2_core_audio::kAudioHardwarePropertyDevices)?,
+    })
+}
+
 /// Relates Core Audio's host time to [`clock::now_ns`].
 #[derive(Clone, Copy)]
 struct HostClock {
