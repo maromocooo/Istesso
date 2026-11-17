@@ -63,13 +63,32 @@ final class DisplayHold {
     }
 }
 
-// MARK: - Where input may go: the rule of crates/istesso-host-macos/src/confine.rs
+// MARK: - Where input may go: a copy of the rule of crates/istesso-host-macos/src/confine.rs
+// (copied from commit 2ab17c2; keep the two the same by hand)
+
+/// Whether the screen is locked, as far as the session's state can be read.
+enum LockState: String {
+    case unlocked
+    case locked
+    /// The session's state could not be read at all; refused like locked.
+    case unknown = "unknown (the session's state could not be read)"
+}
+
+/// Reads the lock state. An absent dictionary is "unknown", not "unlocked"; an absent key is unlocked.
+func lockState() -> LockState {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return .unknown }
+    return (session["CGSSessionScreenIsLocked"] as? Bool ?? false) ? .locked : .unlocked
+}
 
 /// The session tap is allowed only unlocked, frontmost, and with this program's window topmost under
 /// the point. Returns nil when allowed, else the reason it is not. Direct delivery to its own process
 /// needs no check: it can reach nothing else.
-func sessionTapRefusal(locked: Bool, frontmost: Bool, topIsOwn: Bool?) -> String? {
-    if locked { return "locked (the session tap is never used while locked)" }
+func sessionTapRefusal(lock: LockState, frontmost: Bool, topIsOwn: Bool?) -> String? {
+    switch lock {
+    case .unlocked: break
+    case .locked: return "locked (the session tap is never used while locked)"
+    case .unknown: return "the session's state could not be read (refused as if locked)"
+    }
     if !frontmost { return "not frontmost" }
     switch topIsOwn {
     case .some(true): return nil
@@ -303,6 +322,7 @@ struct Answer {
     var live = false
     var stopped: String?
     var frontmost = false
+    var lock = LockState.unknown
     var direct = (key: false, move: false, click: false)
     var tap: (posted: Bool, refusal: String?, move: Bool, click: Bool) = (false, nil, false, false)
     var sinceKeyBefore = 0.0
@@ -377,9 +397,8 @@ final class Probe: NSObject, NSApplicationDelegate {
 
     @objc private func woke() { wokeAt = Date() }
 
-    private var locked: Bool {
-        (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
-    }
+    /// For naming the state only; the rule reads `lockState()` itself, where unknown is refused.
+    private var locked: Bool { lockState() != .unlocked }
 
     private var frontmost: Bool {
         NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid()
@@ -441,6 +460,7 @@ final class Probe: NSObject, NSApplicationDelegate {
         guard mayPost else { return finish(answer) }
         answer.inputTried = true
         answer.frontmost = frontmost
+        answer.lock = lockState()
         let me = getpid()
         answer.sinceKeyBefore = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
 
@@ -456,7 +476,7 @@ final class Probe: NSObject, NSApplicationDelegate {
             answer.sinceKeyAfter = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
 
             // 3: the session tap, only if the rule allows it. Never while locked.
-            let refusal = sessionTapRefusal(locked: self.locked, frontmost: self.frontmost,
+            let refusal = sessionTapRefusal(lock: lockState(), frontmost: self.frontmost,
                                             topIsOwn: topWindowIsOwn(at: self.middle))
             answer.tap.refusal = refusal
             guard refusal == nil else { return self.finish(answer) }
@@ -520,6 +540,7 @@ final class Probe: NSObject, NSApplicationDelegate {
             lines.append("  picture follows the window: \(yes(answer.live))")
             if let stopped = answer.stopped { lines.append("  the capture stopped: \(stopped)") }
             guard answer.inputTried else { continue }
+            lines.append("  lock state read: \(answer.lock.rawValue)")
             lines.append("  this program frontmost: \(yes(answer.frontmost))")
             lines.append("  direct to own process: key \(yes(answer.direct.key)), move \(yes(answer.direct.move)), click \(yes(answer.direct.click))")
             lines.append(String(format: "  session's last key event, seconds ago: %.2f before, %.2f after the direct key (a fall to near 0 would mean it entered the session stream)",
