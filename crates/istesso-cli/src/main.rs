@@ -575,6 +575,32 @@ fn relay_input(
         "Input written to {} goes to the paired device.",
         socket.display()
     );
+    // How often the conversation was cut is always said, also when it is 0: on standard
+    // output, in the log of times if there is one, and in a small file next to the socket
+    // for the program that shows the window.
+    let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
+    let tell = |event: &str, cuts: u64, after: Option<Duration>| {
+        let unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let after = after.map_or(String::new(), |after| {
+            format!(",\"after_ms\":{:.1}", after.as_secs_f64() * 1e3)
+        });
+        println!(
+            "{{\"istesso\":\"input\",\"event\":\"{event}\",\"reconnections\":{cuts},\"unix_ns\":{unix_ns}{after}}}"
+        );
+        if let Some(passing) = &passing {
+            passing.reconnection(event, cuts);
+        }
+        // Written beside and moved over, so that nobody reads half of it. Whoever reads
+        // it checks that the process named in it still runs.
+        let beside = state.with_extension("state.new");
+        let line = format!("{{\"pid\":{},\"input\":{cuts}}}\n", std::process::id());
+        if std::fs::write(&beside, line).is_ok() {
+            let _ = std::fs::rename(&beside, &state);
+        }
+    };
+    tell("open", 0, None);
     if !line.is_answered() {
         eprintln!(
             "note: the device is of a version that does not answer \"still here\"; a connection \
@@ -636,12 +662,16 @@ fn relay_input(
         }
         match happened {
             Some(Happened::Cut) => {
-                eprintln!("note: the conversation with the device was cut; opening it again")
+                eprintln!("note: the conversation with the device was cut; opening it again");
+                tell("cut", line.cuts(), None);
             }
-            Some(Happened::Back { after }) => eprintln!(
-                "note: the conversation with the device is back after {:.2} s",
-                after.as_secs_f64()
-            ),
+            Some(Happened::Back { after }) => {
+                eprintln!(
+                    "note: the conversation with the device is back after {:.2} s",
+                    after.as_secs_f64()
+                );
+                tell("back", line.cuts(), Some(after));
+            }
             None => {}
         }
     }

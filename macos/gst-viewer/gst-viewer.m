@@ -108,6 +108,10 @@
 //   ISTESSO_CURSOR_AT=X,Y      for checks that must not touch the pointer: draw the cursor at this
 //                              place of the view (points from its top left) whatever the pointer
 //                              does and whichever window is key
+//   ISTESSO_PRETEND_TYPING     for checks that must not touch the keyboard: behave as if a key
+//                              were pressed ten times a second, as far as the line about a cut
+//                              connection goes (it comes at once, and counts what was not passed
+//                              on). Nothing is sent anywhere for it
 // The frame log gets {"kind":"cursor","t_ns":T,"shape":0|1|2,"width":W,"height":H,
 // "hotspot_x":X,"hotspot_y":Y,"scale":S} for every cursor the host tells (0 hidden, 1 no image,
 // 2 an image).
@@ -125,6 +129,11 @@
 //                              first picture after a cut is decoded; "gap_ms" since the cut was
 //                              noticed), "unreachable" (no host there yet), "over" (not tried
 //                              again; "why" is one of ISTESSO_MEDIA_OVER_*)
+//   {"kind":"reconnections","t_ns":T,"at":"start"|"cut"|"end","picture":N}   how often the
+//                              picture's connection was cut so far: written when the log begins
+//                              (0), at every cut, and when the program is asked to stop. The
+//                              last such line has the count. A log without any was written
+//                              without the channel, where nothing is counted: that is not 0.
 //   {"kind":"held_back","t_ns":T,"marked":0|1,"dropped":N,"in_doubt":M}   when the picture is back
 //                              or over: whether the line was shown, how many presses were not
 //                              passed on, and how many were passed on in the second before the cut
@@ -148,7 +157,10 @@
 #include <gst/net/gstnetaddressmeta.h>
 #include <gst/video/video.h>
 #include <gst/video/videooverlay.h>
+#include <errno.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <time.h>
 #include "istesso_media.h"
 
@@ -803,6 +815,66 @@ static void picture_is_over(int32_t why) {
     log_held_back(YES);
 }
 
+// ---- How often the connections were cut, where a person sees it ----
+//
+// The window's title says it for as long as the program runs: "... picture 0, input 0". The
+// picture's count is this program's own. The input's is the relay's, which writes it into a
+// small file next to its socket (SOCKET.state: its process id and the count); "input not
+// counted" when there is no relay that counts. Without the channel the title is left alone.
+
+static atomic_ulong picture_cuts;
+// The input's count as the relay says it; -1 when no relay that counts is running.
+static long input_cuts = -1;
+static NSWindow *counted_window = nil;
+static NSString *counted_title = nil;
+
+static void log_reconnections(const char *at) {
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"reconnections\",\"t_ns\":%llu,\"at\":\"%s\",\"picture\":%lu}\n",
+                (unsigned long long)now_ns(), at, atomic_load(&picture_cuts));
+    }
+}
+
+// On the main thread.
+static void show_counts(void) {
+    if (counted_window == nil) {
+        return;
+    }
+    NSString *input = input_cuts < 0 ? @"input not counted" : [NSString stringWithFormat:@"input %ld", input_cuts];
+    counted_window.title =
+        [NSString stringWithFormat:@"%@ \u2014 reconnections: picture %lu, %@", counted_title, atomic_load(&picture_cuts), input];
+}
+
+// Looks once a second at what the relay says about its own connection, off the main thread:
+// reading a file must never hold up a key on its way out.
+static void watch_relay_state(const char *socket_path) {
+    NSString *path = [NSString stringWithFormat:@"%s.state", socket_path];
+    static dispatch_source_t timer;
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    dispatch_source_set_event_handler(timer, ^{
+        long now = -1;
+        FILE *file = fopen(path.fileSystemRepresentation, "r");
+        if (file != NULL) {
+            long pid = 0, count = -1;
+            // Only a relay that still runs counts: a file left by an earlier one says nothing.
+            if (fscanf(file, "{\"pid\":%ld,\"input\":%ld}", &pid, &count) == 2 && pid > 0 && count >= 0
+                && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
+                now = count;
+            }
+            fclose(file);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (now != input_cuts) {
+                input_cuts = now;
+                show_counts();
+            }
+        });
+    });
+    dispatch_resume(timer);
+}
+
 // ---- Frames from the encrypted channel ----
 //
 // One thread connects to the host, is handed whole frames by the library, and decodes each one
@@ -1085,10 +1157,13 @@ static void *channel_thread(void *unused) {
             // Cut, and nobody said why: the library is connecting again.
             cut_at = now_ns();
             back_pending = TRUE;
+            atomic_fetch_add(&picture_cuts, 1);
             fprintf(stderr, "note: the picture's connection was cut; connecting again\n");
             log_stream("ended");
+            log_reconnections("cut");
             guint64 t = cut_at;
             dispatch_async(dispatch_get_main_queue(), ^{
+                show_counts();
                 picture_was_cut(t);
             });
         } else if (got == 4) {
@@ -1116,6 +1191,7 @@ static void *channel_thread(void *unused) {
             if (frame_log != NULL) {
                 fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"over\",\"why\":%d}\n",
                         (unsigned long long)now_ns(), state.why);
+                log_reconnections("end");
                 fflush(frame_log);
             }
             int32_t why = state.why;
@@ -1168,6 +1244,20 @@ static gboolean use_channel(NSView *view) {
     if (pin != NULL && sscanf(pin, "%lf,%lf", &pin_x, &pin_y) == 2) {
         cursor_pinned = YES;
         cursor_pin = NSMakePoint(pin_x, pin_y);
+    }
+    if (getenv("ISTESSO_PRETEND_TYPING") != NULL) {
+        static dispatch_source_t typing;
+        typing = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(typing, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC / 10, NSEC_PER_SEC / 100);
+        dispatch_source_set_event_handler(typing, ^{
+            // As a key press would be: noted when it would be passed on, counted when not.
+            if (picture_stale) {
+                held_back_count++;
+            } else {
+                note_press();
+            }
+        });
+        dispatch_resume(typing);
     }
     pthread_t thread;
     return pthread_create(&thread, NULL, channel_thread, NULL) == 0;
@@ -1257,6 +1347,9 @@ static gboolean start_frame_log(GstElement *pipeline, const char *path, gboolean
         stop[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, signals[i], 0, dispatch_get_main_queue());
         dispatch_source_set_event_handler(stop[i], ^{
             log_clock();
+            if (channel_address != NULL) {
+                log_reconnections("end");
+            }
             fflush(frame_log);
             exit(0);
         });
@@ -1678,6 +1771,14 @@ int main(int argc, char *argv[]) {
             // with VideoToolbox behind a pipeline.
             if (argc >= 8 && strcmp(argv[7], "-") != 0 && !start_frame_log(NULL, argv[7], TRUE)) {
                 return 1;
+            }
+            // How often the connections were cut is counted from here, and always shown.
+            log_reconnections("start");
+            counted_window = window;
+            counted_title = [window.title copy];
+            show_counts();
+            if (input_socket >= 0) {
+                watch_relay_state(argv[9]);
             }
             if (!use_channel(view)) {
                 fprintf(stderr, "error: cannot start the thread that receives\n");

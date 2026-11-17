@@ -134,6 +134,8 @@ pub struct InputLine {
     without_since: Option<Instant>,
     due: Instant,
     made_at: Instant,
+    /// How often the conversation was cut.
+    cuts: u64,
 }
 
 impl InputLine {
@@ -155,7 +157,15 @@ impl InputLine {
             without_since: None,
             due: now,
             made_at: now,
+            cuts: 0,
         })
+    }
+
+    /// How often the conversation was cut since this line was opened,
+    /// whether or not it is back. A measurement that is to say something
+    /// about an undisturbed line wants this to be 0.
+    pub fn cuts(&self) -> u64 {
+        self.cuts
     }
 
     /// Whether there is a conversation at the moment.
@@ -244,6 +254,7 @@ impl InputLine {
     }
 
     fn cut(&mut self, now: Instant) -> Happened {
+        self.cuts += 1;
         self.client = None;
         self.without_since = Some(now);
         // At once, unless the conversation had only just been opened: a device that
@@ -423,6 +434,7 @@ mod tests {
         };
         assert!(after < AGAIN_WITHIN, "{after:?}");
         assert_eq!(between.connections(), 2);
+        assert_eq!(line.cuts(), 1);
         // The host let go of what the first conversation had down, before the second
         // pressed anything; then Shift is down again and the pointer is where it was.
         // The letter is not pressed again, and what was typed in between never arrives.
@@ -460,6 +472,7 @@ mod tests {
             handed_over += pair.all_handed_over(Duration::from_millis(50)).len();
         }
         assert!(line.is_open());
+        assert_eq!(line.cuts(), 0);
         handed_over += pair.all_handed_over(A_MOMENT).len();
         assert_eq!(handed_over, typed);
     }
