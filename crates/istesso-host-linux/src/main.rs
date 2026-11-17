@@ -232,7 +232,7 @@ fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> Result<JoinHandle<
         .map_err(|error| format!("a thread cannot be started: {error}"))
 }
 
-fn run(setup: Setup, display: Display) -> Result<(), String> {
+fn run(mut setup: Setup, display: Display) -> Result<(), String> {
     gstreamer::init().map_err(|error| format!("GStreamer does not start: {error}"))?;
     // For trying this program where there is no compositor plugin and no
     // graphics card to encode on: other elements in their places. Never set
@@ -252,7 +252,20 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
         }
         "as-built"
     };
+    let mut render_node = "the compositor's choice".to_string();
     if stand_in.is_none() {
+        // A compositor left to choose may take a card the encoder is not on.
+        match &setup.settings.render_node {
+            Some(told) => render_node = told.clone(),
+            None => {
+                let found =
+                    render::of_the_encoder(Path::new(render::CARDS), Path::new(render::DEVICES));
+                if let Some(node) = found.as_deref().and_then(Path::to_str) {
+                    render_node = format!("{node} (chosen: the encoder's card)");
+                    setup.settings.render_node = Some(node.to_string());
+                }
+            }
+        }
         if setup.cursor && !plugin_has("waylanddisplaysrc", "cursor-messages") {
             return Err("this compositor plugin has no cursor-messages property; build it with the second patch in scripts/patches".into());
         }
@@ -267,12 +280,24 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
 
     // The switches, and which of them could be had.
     let mut switches = setup.switches.listed();
-    if setup.switches.sched == Sched::Rt {
-        // The scheduling is put in on the host, where it can be tried.
-        switches.retain(|switch| switch != "sched=rt");
-        switches.push("sched=rt (not built yet)".to_string());
-        remark("note: --sched rt is not built yet; the threads stay as they are".into());
+    // Whether real-time scheduling can be had is tried on a thread that is
+    // made for the trying, so that this thread stays as it is.
+    let mut sched = setup.switches.sched == Sched::Rt;
+    if sched {
+        let tried = std::thread::spawn(|| wake::real_time(None))
+            .join()
+            .unwrap_or(Err("the trying thread ended badly".to_string()));
+        if let Err(why) = tried {
+            sched = false;
+            switches.retain(|switch| switch != "sched=rt");
+            switches.push(format!("sched=rt (refused: {why})"));
+            remark(format!(
+                "note: real-time scheduling cannot be had ({why}); the threads stay as they are"
+            ));
+        }
     }
+    let tasks = Path::new("/proc/self/task");
+    let threads_before = wake::threads(tasks);
     let tight_us = match setup.switches.cpu_latency {
         CpuLatency::Off => None,
         CpuLatency::Shown { us } | CpuLatency::Input { us, .. } => Some(us),
@@ -318,7 +343,15 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
         clock: clock::now_ns,
         out: Arc::new(ThroughDoor(door.clone())),
         notes: notes_in,
-        on_path_thread: None,
+        // The compositor element's streaming thread and the encoder's thread say
+        // so themselves, the first time a frame passes on them.
+        on_path_thread: sched.then(|| {
+            let log = log.clone();
+            let ask: istesso_host_linux::stage::PathThread = Box::new(move |thread: &str| {
+                log.line(line::sched(thread, &wake::real_time(None)));
+            });
+            ask
+        }),
     })?;
     {
         let compositor = stage.compositor();
@@ -353,6 +386,7 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
         preset: &settings.preset,
         pacing,
         cursor: if setup.cursor { "told" } else { "in-picture" },
+        render_node: &render_node,
         switches: &switches,
     }));
 
@@ -380,6 +414,9 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
             _ => None,
         };
         threads.push(spawn("istesso-host-input", move || {
+            if sched {
+                log.line(line::sched("input", &wake::real_time(None)));
+            }
             let listened = socket.listen(spin, &stopping, clock::now_ns, |event, now| {
                 if let Some((latch, for_ns)) = &after_input {
                     latch.input(now + for_ns);
@@ -472,6 +509,15 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
         },
     )?;
 
+    if sched {
+        // The compositor plugin's own threads have started with the pipeline.
+        let own = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+        let after = wake::threads(tasks);
+        let main = std::process::id() as i32;
+        for thread in wake::started_unnamed(&threads_before, &after, own.trim_end(), main) {
+            log.line(line::sched("compositor", &wake::real_time(Some(thread))));
+        }
+    }
     let mut outcome = Ok(());
     if stand_in.is_some() {
         // What stands in for the compositor never says how an application gets into it.

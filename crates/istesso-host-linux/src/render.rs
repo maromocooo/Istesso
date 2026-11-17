@@ -14,6 +14,32 @@ use std::path::{Path, PathBuf};
 /// Where the render devices are.
 pub const DEVICES: &str = "/dev/dri";
 
+/// Where the system says which card a render device belongs to.
+pub const CARDS: &str = "/sys/class/drm";
+
+/// The vendor of the card the encoder runs on (NVIDIA).
+const ENCODER_VENDOR: &str = "0x10de";
+
+/// The render device of the card the encoder runs on, for a compositor
+/// that was not told which to use. Left to itself the compositor may pick
+/// another card (a built-in one comes first on many machines); its frames
+/// then are not where the encoder can take them, and no picture is made.
+/// With several such cards the first is taken. `None` when there is none.
+pub fn of_the_encoder(cards: &Path, devices: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(cards)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_str()?.to_string();
+            let vendor = std::fs::read_to_string(entry.path().join("device/vendor")).ok()?;
+            (name.starts_with("renderD") && vendor.trim() == ENCODER_VENDOR)
+                .then(|| devices.join(name))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
 fn opens(device: &Path) -> std::io::Result<()> {
     // Opening a render device and closing it again does nothing to it.
     OpenOptions::new()
@@ -144,6 +170,32 @@ mod tests {
         if can_be_refused(&told) {
             assert!(check(Some(&told), &devices).is_err());
         }
+    }
+
+    #[test]
+    fn the_render_device_of_the_encoder_s_card_is_found_by_its_vendor() {
+        let cards = place("cards");
+        let card = |name: &str, vendor: &str| {
+            std::fs::create_dir_all(cards.join(name).join("device")).unwrap();
+            std::fs::write(
+                cards.join(name).join("device/vendor"),
+                format!("{vendor}\n"),
+            )
+            .unwrap();
+        };
+        card("renderD128", "0x8086");
+        card("card1", "0x10de");
+        assert_eq!(of_the_encoder(&cards, Path::new("/dev/dri")), None);
+        card("renderD130", "0x10de");
+        card("renderD129", "0x10de");
+        assert_eq!(
+            of_the_encoder(&cards, Path::new("/dev/dri")),
+            Some(PathBuf::from("/dev/dri/renderD129"))
+        );
+        assert_eq!(
+            of_the_encoder(&cards.join("missing"), Path::new("/dev/dri")),
+            None
+        );
     }
 
     #[test]

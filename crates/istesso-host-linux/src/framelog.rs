@@ -147,6 +147,9 @@ pub mod line {
         pub pacing: &'a str,
         /// "told" when the viewers draw the cursor, "in-picture" otherwise.
         pub cursor: &'a str,
+        /// The render device the compositor was told to use, and whether
+        /// this program chose it.
+        pub render_node: &'a str,
         /// The switches that are on (ADR 0019), as they were asked for; a
         /// switch that could not be had says so here. A measurement is read
         /// with this line.
@@ -160,7 +163,7 @@ pub mod line {
         let text = |text: &str| serde_json::Value::from(text).to_string();
         let switches = serde_json::Value::from(header.switches.to_vec()).to_string();
         format!(
-            r#"{{"kind":"header","side":"host","tool":"istesso-host-linux","version":"2","started_unix_ms":{started},"size":"{}x{}","fps":{},"bitrate_kbit":{},"gop":{},"vbv_kbit":{},"chroma":{},"colour":{},"preset":{},"frames":"cuda","pacing":{},"transport":"channel","cursor":{},"switches":{switches}}}"#,
+            r#"{{"kind":"header","side":"host","tool":"istesso-host-linux","version":"2","started_unix_ms":{started},"size":"{}x{}","fps":{},"bitrate_kbit":{},"gop":{},"vbv_kbit":{},"chroma":{},"colour":{},"preset":{},"frames":"cuda","pacing":{},"transport":"channel","cursor":{},"render_node":{},"switches":{switches}}}"#,
             header.width,
             header.height,
             header.fps,
@@ -172,6 +175,7 @@ pub mod line {
             text(header.preset),
             text(header.pacing),
             text(header.cursor),
+            text(header.render_node),
         )
     }
 
@@ -195,6 +199,18 @@ pub mod line {
     pub fn frame_out(pts: u64, t_ns: u64, again: bool) -> String {
         let again = if again { r#","again":1"# } else { "" };
         format!(r#"{{"kind":"frame_out","pts":{pts},"t_ns":{t_ns},"luma":-1{again}}}"#)
+    }
+
+    /// A thread on a frame's or an input's path was asked to be scheduled
+    /// ahead of ordinary threads (the `sched` switch), and whether it was.
+    pub fn sched(thread: &str, asked: &Result<(), String>) -> String {
+        match asked {
+            Ok(()) => format!(r#"{{"kind":"sched","thread":"{thread}","rt":1}}"#),
+            Err(why) => format!(
+                r#"{{"kind":"sched","thread":"{thread}","rt":0,"refused":{}}}"#,
+                serde_json::Value::from(why.as_str())
+            ),
+        }
     }
 
     /// A new frame went on with another time stamp than the compositor gave
@@ -429,6 +445,7 @@ mod tests {
             preset: "p1",
             pacing: "on-commit",
             cursor: "told",
+            render_node: "/dev/dri/renderD129 (chosen: the encoder's card)",
             switches: &switches,
         }))
         .unwrap();
@@ -441,6 +458,18 @@ mod tests {
         assert_eq!(header["transport"], "channel");
         assert_eq!(header["pacing"], "on-commit");
         assert_eq!(header["switches"][1], "sched=rt (refused)");
+        assert_eq!(
+            header["render_node"],
+            "/dev/dri/renderD129 (chosen: the encoder's card)"
+        );
+        assert_eq!(
+            line::sched("frames", &Ok(())),
+            r#"{"kind":"sched","thread":"frames","rt":1}"#
+        );
+        let refused: Value =
+            serde_json::from_str(&line::sched("input", &Err("not permitted".into()))).unwrap();
+        assert_eq!(refused["rt"], 0);
+        assert_eq!(refused["refused"], "not permitted");
         assert!(header["started_unix_ms"].as_u64().unwrap() > 1_700_000_000_000);
     }
 

@@ -18,6 +18,75 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+/// The priority the threads on a frame's and an input's path are given with
+/// the `sched` switch: real-time, ahead of every ordinary thread, and low
+/// among the real-time ones, below the sound's.
+pub const RT_PRIORITY: i32 = 10;
+
+/// Asks for real-time scheduling for a thread of this process: the calling
+/// one, or the one with this id. Needs the right to it (a limit on real-time
+/// priority of at least [`RT_PRIORITY`], which the installer gives); `Err`
+/// says why it was not had, and the thread stays as it is.
+#[cfg(all(target_os = "linux", feature = "pipeline"))]
+pub fn real_time(thread: Option<i32>) -> Result<(), String> {
+    let parameters = libc::sched_param {
+        sched_priority: RT_PRIORITY,
+    };
+    // A program started by this one does not inherit it.
+    let policy = libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK;
+    // SAFETY: the parameters are valid for the call, which keeps nothing of them.
+    let done = unsafe { libc::sched_setscheduler(thread.unwrap_or(0), policy, &parameters) };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().to_string())
+    }
+}
+
+/// Elsewhere it is not asked for.
+#[cfg(not(all(target_os = "linux", feature = "pipeline")))]
+pub fn real_time(_thread: Option<i32>) -> Result<(), String> {
+    Err("real-time scheduling is asked for on Linux only".to_string())
+}
+
+/// The threads of a process, each with its id and its name, as the system
+/// lists them (`/proc/self/task`).
+pub fn threads(tasks: &Path) -> Vec<(i32, String)> {
+    let Ok(entries) = std::fs::read_dir(tasks) else {
+        return Vec::new();
+    };
+    let mut threads: Vec<(i32, String)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let id = entry.file_name().to_str()?.parse().ok()?;
+            let name = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            Some((id, name.trim_end().to_string()))
+        })
+        .collect();
+    threads.sort();
+    threads
+}
+
+/// The threads the compositor plugin started for itself: those that are
+/// there `after` the pipeline has started and were not `before`, and that
+/// carry the name of the thread that started them (`own`: the plugin gives
+/// its threads no name of their own, and this program names all of its
+/// own). `main` is the program's first thread, which is never one of them.
+pub fn started_unnamed(
+    before: &[(i32, String)],
+    after: &[(i32, String)],
+    own: &str,
+    main: i32,
+) -> Vec<i32> {
+    after
+        .iter()
+        .filter(|(id, name)| {
+            *id != main && name == own && !before.iter().any(|(known, _)| known == id)
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// The device.
 pub const DEVICE: &str = "/dev/cpu_dma_latency";
 
@@ -143,6 +212,40 @@ mod tests {
         assert!(!latch.is_tight());
         assert_eq!(written(&path), LOOSE);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_compositor_s_threads_are_the_new_ones_without_a_name_of_their_own() {
+        let tasks = std::env::temp_dir().join(format!("ihl-wake-tasks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tasks);
+        let thread = |id: i32, name: &str| {
+            std::fs::create_dir_all(tasks.join(id.to_string())).unwrap();
+            std::fs::write(tasks.join(id.to_string()).join("comm"), format!("{name}\n")).unwrap();
+        };
+        thread(100, "istesso-host-li");
+        thread(101, "istesso-host-lo");
+        std::fs::create_dir_all(tasks.join("not-a-thread")).unwrap();
+        let before = threads(&tasks);
+        assert_eq!(
+            before,
+            [
+                (100, "istesso-host-li".to_string()),
+                (101, "istesso-host-lo".to_string())
+            ]
+        );
+        thread(102, "istesso-host-li");
+        thread(103, "compositor:src");
+        thread(104, "istesso-host-in");
+        thread(105, "istesso-host-li");
+        let after = threads(&tasks);
+        assert_eq!(
+            started_unnamed(&before, &after, "istesso-host-li", 100),
+            [102, 105]
+        );
+        // Nothing new, nothing found; and a list that cannot be read is empty.
+        assert!(started_unnamed(&after, &after, "istesso-host-li", 100).is_empty());
+        assert!(threads(&tasks.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&tasks);
     }
 
     #[test]
