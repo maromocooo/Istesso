@@ -263,7 +263,21 @@ pub unsafe extern "C" fn istesso_input_close(input: *mut IstessoInput) {
 /// The measurement's way in for keys, open. In a measuring build only.
 #[cfg(feature = "measure-keys")]
 pub struct IstessoMeasureKeys {
-    _keys: crate::measure::MeasureKeys,
+    keys: crate::measure::MeasureKeys,
+}
+
+/// How the way in stands.
+#[cfg(feature = "measure-keys")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IstessoMeasureKeysState {
+    /// Keys and buttons that were let go because nothing came any more
+    /// while they were down.
+    pub let_go: u64,
+    /// The listening thread's scheduling: 0 not asked for, 1 in effect, 2
+    /// asked for and not in effect.
+    pub interactive: u32,
+    pub reserved: u32,
 }
 
 /// Opens `<dir>/measure-keys.sock`: what is written there goes to the host
@@ -279,20 +293,53 @@ pub struct IstessoMeasureKeys {
 pub unsafe extern "C" fn istesso_measure_keys_open(
     input: *const IstessoInput,
     dir: *const c_char,
+    flags: u32,
 ) -> *mut IstessoMeasureKeys {
     // SAFETY: the caller's promises.
     let opened = unsafe { text(dir) }.and_then(|dir| {
         let dir = dir.ok_or("no folder for the measurement's keys was named")?;
         let input = unsafe { input.as_ref() }.ok_or("there is no input to hand the keys to")?;
-        crate::measure::MeasureKeys::open(std::path::Path::new(&dir), input.input.hand())
+        crate::measure::MeasureKeys::open(
+            std::path::Path::new(&dir),
+            input.input.hand(),
+            flags & FLAG_INTERACTIVE != 0,
+        )
     });
     match opened {
-        Ok(keys) => Box::into_raw(Box::new(IstessoMeasureKeys { _keys: keys })),
+        Ok(keys) => Box::into_raw(Box::new(IstessoMeasureKeys { keys })),
         Err(err) => {
             remember(err);
             std::ptr::null_mut()
         }
     }
+}
+
+/// # Safety
+/// `keys` came from `istesso_measure_keys_open` and has not been closed;
+/// `state` points to room for the result.
+#[cfg(feature = "measure-keys")]
+#[no_mangle]
+pub unsafe extern "C" fn istesso_measure_keys_state(
+    keys: *const IstessoMeasureKeys,
+    state: *mut IstessoMeasureKeysState,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let (Some(keys), false) = (unsafe { keys.as_ref() }, state.is_null()) else {
+        return -1;
+    };
+    // SAFETY: not null, and room for the result by the caller's promise.
+    unsafe {
+        *state = IstessoMeasureKeysState {
+            let_go: keys.keys.let_go(),
+            interactive: match keys.keys.interactive() {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            reserved: 0,
+        }
+    };
+    0
 }
 
 /// # Safety
@@ -465,7 +512,8 @@ mod tests {
                 let mut state = IstessoInputState::default();
                 istesso_input_state(input, &mut state) == 0 && state.open == 1
             });
-            let keys = crate::measure::MeasureKeys::open(&place, (*input).input.hand()).unwrap();
+            let keys =
+                crate::measure::MeasureKeys::open(&place, (*input).input.hand(), false).unwrap();
             let writer = std::os::unix::net::UnixDatagram::unbound().unwrap();
             let down = r#"{"kind":"key","code":30,"pressed":true}"#;
             writer.send_to(down.as_bytes(), keys.socket()).unwrap();

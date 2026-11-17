@@ -101,18 +101,35 @@ void istesso_input_close(IstessoInput *input);
 
 #ifdef ISTESSO_MEASURING
 /*
- * The measurement's way in for keys. ONLY IN A MEASURING BUILD: the library has these two
+ * The measurement's way in for keys. ONLY IN A MEASURING BUILD: the library has these
  * functions only when it was built with the feature `measure-keys`, and an application that is
  * handed out is built without this definition and without that feature (ADR 0018).
  *
  * Opens <dir>/measure-keys.sock, a datagram socket as the relay's was: one event in a datagram,
- * as JSON. What arrives goes to the host as what is handed over with istesso_input_send goes.
- * The folder is made for its owner alone (0700); one that is already there is used only if it is
- * a real folder of this user's with exactly those rights, and the socket is 0600. Null when it
- * cannot be opened so (the reason is in istesso_client_last_error()). Closed before `input` is.
+ * as JSON. A thread of its own listens there and hands what arrives to the input's thread, as
+ * the window's thread hands over what the person does; from there on it is the same way.
+ * `flags`: ISTESSO_INPUT_INTERACTIVE asks for that thread to be scheduled as the window's is.
+ *
+ * Who can reach it: the folder is made for its owner alone (0700). One that is already there
+ * is used only if it is a real folder of this user's with exactly those rights and without an
+ * access control list; a symbolic link is refused, also behind a slash at the path's end. The
+ * socket is 0600. A socket that another program listens on is not taken from it. Null when it
+ * cannot be opened so (the reason is in istesso_client_last_error()).
+ *
+ * Keys and buttons that came through the way in and are still down when nothing has come for
+ * two seconds are let go on the host (a measuring program that died), and counted.
+ *
+ * Closed before `input` is.
  */
 typedef struct IstessoMeasureKeys IstessoMeasureKeys;
-IstessoMeasureKeys *istesso_measure_keys_open(const IstessoInput *input, const char *dir);
+typedef struct IstessoMeasureKeysState {
+    uint64_t let_go;      /* keys and buttons let go because nothing came any more */
+    uint32_t interactive; /* the listening thread's scheduling: 0 not asked for, 1 in effect,
+                           * 2 asked for and not in effect */
+    uint32_t reserved;
+} IstessoMeasureKeysState;
+IstessoMeasureKeys *istesso_measure_keys_open(const IstessoInput *input, const char *dir, uint32_t flags);
+int32_t istesso_measure_keys_state(const IstessoMeasureKeys *keys, IstessoMeasureKeysState *state);
 void istesso_measure_keys_close(IstessoMeasureKeys *keys);
 #endif
 

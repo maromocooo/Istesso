@@ -17,15 +17,18 @@
 //! who sent only on a stream socket, and what it would tell (the user) the
 //! folder has settled.
 
+use std::collections::BTreeSet;
+use std::ffi::CString;
 use std::fs;
-use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::io::{self, ErrorKind};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use istesso_agent::passing::Mark;
 use istesso_agent::PassLog;
@@ -35,6 +38,12 @@ use istesso_proto::InputEvent;
 /// own executable for this and fails if it is there.
 pub const SOCKET_NAME: &str = "measure-keys.sock";
 
+/// A measuring program that died with keys down would leave them down on
+/// the host. When nothing has come through the way in for this long, what
+/// came through it and is still down is let go, and counted. (A verdict
+/// presses and releases within a twentieth of a second.)
+pub const LET_GO_AFTER: Duration = Duration::from_secs(2);
+
 /// Where what arrived is handed on: the events, and when the first of them
 /// was in hand.
 pub type Hand = Box<dyn Fn(Vec<InputEvent>, Mark) + Send>;
@@ -43,21 +52,51 @@ pub type Hand = Box<dyn Fn(Vec<InputEvent>, Mark) + Send>;
 pub struct MeasureKeys {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    folder: fs::File,
     socket: PathBuf,
+    let_go: Arc<AtomicU64>,
+    interactive: Option<bool>,
 }
 
-/// Which file a path named when it was looked at.
-#[derive(PartialEq, Eq, Debug)]
-struct Which(u64, u64);
+fn name() -> CString {
+    CString::new(SOCKET_NAME).expect("no NUL in the name")
+}
 
-/// The folder must be a folder of `user`'s own that nobody else can read,
-/// write or enter. A symbolic link is not followed: it is refused.
-fn folder_is_the_users_alone(dir: &Path, user: u32) -> Result<Which, String> {
-    let found =
+/// The path without what would make the system follow a link in its last
+/// part: a slash at the end, or a part that is "." or "..".
+fn plain(dir: &Path) -> Result<PathBuf, String> {
+    let plain: PathBuf = dir.components().collect();
+    match plain.components().next_back() {
+        Some(Component::Normal(_)) => Ok(plain),
+        _ => Err(format!(
+            "{} does not name a folder of its own",
+            dir.display()
+        )),
+    }
+}
+
+/// Opens the folder without following a link, and looks at what was opened
+/// (not at the path again): it must be a folder of `user`'s own that nobody
+/// else can read, write or enter, by its rights and by any list of further
+/// rights the system keeps for it.
+fn folder_of_the_users_alone(dir: &Path, user: u32) -> Result<fs::File, String> {
+    // Said plainly when it is a link; the opening below would refuse it too.
+    let seen =
         fs::symlink_metadata(dir).map_err(|e| format!("cannot look at {}: {e}", dir.display()))?;
-    if found.file_type().is_symlink() {
+    if seen.file_type().is_symlink() {
         return Err(format!("{} is a symbolic link", dir.display()));
     }
+    if !seen.file_type().is_dir() {
+        return Err(format!("{} is not a folder", dir.display()));
+    }
+    let folder = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
+    let found = folder
+        .metadata()
+        .map_err(|e| format!("cannot look at {}: {e}", dir.display()))?;
     if !found.file_type().is_dir() {
         return Err(format!("{} is not a folder", dir.display()));
     }
@@ -71,92 +110,235 @@ fn folder_is_the_users_alone(dir: &Path, user: u32) -> Result<Which, String> {
             dir.display()
         ));
     }
-    Ok(Which(found.dev(), found.ino()))
+    if has_further_rights(&folder) {
+        return Err(format!(
+            "{} has a list of further rights (an ACL); only a folder without one is taken",
+            dir.display()
+        ));
+    }
+    Ok(folder)
 }
 
-/// The socket as it must be once it is bound.
-fn socket_is_the_users_alone(socket: &Path, user: u32) -> Result<(), String> {
-    let found = fs::symlink_metadata(socket)
-        .map_err(|e| format!("cannot look at {}: {e}", socket.display()))?;
-    if !found.file_type().is_socket() || found.uid() != user || found.mode() & 0o7777 != 0o600 {
-        return Err(format!("{} is not as it was made", socket.display()));
+/// Whether the system keeps an access control list for what is open: it
+/// can let others in whatever the rights say.
+#[cfg(target_os = "macos")]
+fn has_further_rights(folder: &fs::File) -> bool {
+    extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
     }
-    Ok(())
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+    // SAFETY: an open descriptor; what comes back is freed here and not used.
+    unsafe {
+        let list = acl_get_fd_np(folder.as_raw_fd(), ACL_TYPE_EXTENDED);
+        if list.is_null() {
+            return false;
+        }
+        acl_free(list);
+        true
+    }
+}
+
+/// The measuring build is made for the Mac. Elsewhere this module is only
+/// compiled for its tests, and such a list is not looked for.
+#[cfg(not(target_os = "macos"))]
+fn has_further_rights(_folder: &fs::File) -> bool {
+    false
+}
+
+/// What lies in the folder under the socket's name, itself (a link is not
+/// followed): its kind and rights, and whose it is. `None` when nothing.
+fn in_folder(folder: &fs::File) -> io::Result<Option<(u32, u32)>> {
+    // SAFETY: an open descriptor, a C string, and room for the answer.
+    unsafe {
+        let mut found: libc::stat = std::mem::zeroed();
+        if libc::fstatat(
+            folder.as_raw_fd(),
+            name().as_ptr(),
+            &mut found,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == 0
+        {
+            return Ok(Some((found.st_mode as u32, found.st_uid)));
+        }
+    }
+    match io::Error::last_os_error() {
+        e if e.kind() == ErrorKind::NotFound => Ok(None),
+        e => Err(e),
+    }
+}
+
+fn is_socket(mode: u32) -> bool {
+    mode & libc::S_IFMT as u32 == libc::S_IFSOCK as u32
+}
+
+fn remove_from(folder: &fs::File) -> io::Result<()> {
+    // SAFETY: an open descriptor and a C string.
+    match unsafe { libc::unlinkat(folder.as_raw_fd(), name().as_ptr(), 0) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 /// Makes the folder if it is not there, checks it, and binds the socket in
 /// it. `user` is who runs this.
-fn bind(dir: &Path, user: u32) -> Result<(UnixDatagram, PathBuf), String> {
+fn bind(dir: &Path, user: u32) -> Result<(UnixDatagram, fs::File, PathBuf), String> {
+    let dir = &plain(dir)?;
     match fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(format!("cannot make {}: {e}", dir.display())),
     }
-    let folder = folder_is_the_users_alone(dir, user)?;
+    let folder = folder_of_the_users_alone(dir, user)?;
     let socket = dir.join(SOCKET_NAME);
+    let cannot_look = |e: io::Error| format!("cannot look at {}: {e}", socket.display());
     // What an earlier run left is taken away, if it is that and nothing else.
-    match fs::symlink_metadata(&socket) {
-        Ok(left) if left.file_type().is_socket() && left.uid() == user => {
-            fs::remove_file(&socket)
+    match in_folder(&folder).map_err(cannot_look)? {
+        None => {}
+        Some((mode, owner)) if is_socket(mode) && owner == user => {
+            // Somebody may be listening there: a second measuring client would take
+            // the first one's keys away from it.
+            let knock = UnixDatagram::unbound()
+                .map_err(|e| format!("cannot make a socket: {e}"))?
+                .connect(&socket);
+            match knock {
+                Ok(()) => {
+                    return Err(format!(
+                        "another program listens on {} already",
+                        socket.display()
+                    ))
+                }
+                Err(e) if e.kind() == ErrorKind::ConnectionRefused => {}
+                Err(e) => {
+                    return Err(format!(
+                        "cannot tell whether {} is in use: {e}",
+                        socket.display()
+                    ))
+                }
+            }
+            remove_from(&folder)
                 .map_err(|e| format!("cannot replace {}: {e}", socket.display()))?;
         }
-        Ok(_) => {
+        Some(_) => {
             return Err(format!(
                 "{} is there and is not a socket of this user's",
                 socket.display()
             ))
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot look at {}: {e}", socket.display())),
     }
     let listener = UnixDatagram::bind(&socket)
         .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
-    let made = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("cannot set the rights of {}: {e}", socket.display()))
-        // Looked at once more: nothing was put in the folder's or the socket's place
-        // between the look and the binding.
-        .and_then(|()| folder_is_the_users_alone(dir, user))
-        .and_then(|again| {
-            if again == folder {
-                socket_is_the_users_alone(&socket, user)
-            } else {
-                Err(format!("{} was replaced meanwhile", dir.display()))
+    // The path was walked once more for the binding. What is there now must be
+    // what was opened and checked, and the socket in it a socket of this user's for
+    // its owner alone. Its rights are set in the opened folder, by name, and a link
+    // in its place is not followed.
+    let made = (|| {
+        let (opened, now) = (
+            folder.metadata().map_err(|e| e.to_string())?,
+            fs::symlink_metadata(dir).map_err(|e| e.to_string())?,
+        );
+        if (opened.dev(), opened.ino()) != (now.dev(), now.ino()) {
+            return Err(format!("{} was replaced meanwhile", dir.display()));
+        }
+        // SAFETY: an open descriptor and a C string.
+        if unsafe {
+            libc::fchmodat(
+                folder.as_raw_fd(),
+                name().as_ptr(),
+                0o600,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "cannot set the rights of {}: {}",
+                socket.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        match in_folder(&folder).map_err(cannot_look)? {
+            Some((mode, owner)) if is_socket(mode) && owner == user && mode & 0o7777 == 0o600 => {
+                Ok(())
             }
-        });
+            _ => Err(format!("{} is not as it was made", socket.display())),
+        }
+    })();
     match made {
-        Ok(()) => Ok((listener, socket)),
+        Ok(()) => Ok((listener, folder, socket)),
         Err(why) => {
-            let _ = fs::remove_file(&socket);
+            let _ = remove_from(&folder);
             Err(why)
         }
     }
 }
 
 impl MeasureKeys {
-    /// Opens the way in: `<dir>/measure-keys.sock`. `Err` says why not, and
-    /// then nothing listens.
-    pub fn open(dir: &Path, hand: Hand) -> Result<Self, String> {
+    /// Opens the way in: `<dir>/measure-keys.sock`. `interactive`: the
+    /// thread that listens asks to be scheduled as work a person is waiting
+    /// for, as the window's thread is, in whose place it stands. `Err` says
+    /// why not, and then nothing listens.
+    pub fn open(dir: &Path, hand: Hand, interactive: bool) -> Result<Self, String> {
+        Self::open_letting_go_after(dir, hand, interactive, LET_GO_AFTER)
+    }
+
+    fn open_letting_go_after(
+        dir: &Path,
+        hand: Hand,
+        interactive: bool,
+        let_go_after: Duration,
+    ) -> Result<Self, String> {
         // SAFETY: no arguments, cannot fail.
         let user = unsafe { libc::geteuid() };
-        let (listener, socket) = bind(dir, user)?;
-        listener
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("istesso-measure-keys".into())
-            .spawn(move || listen(&listener, &stopped, &hand))
-            .map_err(|e| format!("cannot start the thread that listens: {e}"))?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-            socket,
-        })
+        let (listener, folder, socket) = bind(dir, user)?;
+        let started = (|| {
+            listener
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let let_go = Arc::new(AtomicU64::new(0));
+            let (stopped, counted) = (stop.clone(), let_go.clone());
+            let (says, said) = mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name("istesso measure keys".into())
+                .spawn(move || {
+                    let took = interactive.then(crate::input::ask_to_be_interactive);
+                    let _ = says.send(took);
+                    listen(&listener, &stopped, &hand, let_go_after, &counted);
+                })
+                .map_err(|e| format!("cannot start the thread that listens: {e}"))?;
+            let interactive = said.recv().unwrap_or(None);
+            Ok((stop, thread, let_go, interactive))
+        })();
+        match started {
+            Ok((stop, thread, let_go, interactive)) => Ok(Self {
+                stop,
+                thread: Some(thread),
+                folder,
+                socket,
+                let_go,
+                interactive,
+            }),
+            Err(why) => {
+                let _ = remove_from(&folder);
+                Err(why)
+            }
+        }
     }
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// How many keys and buttons were let go because nothing came through
+    /// the way in any more while they were down.
+    pub fn let_go(&self) -> u64 {
+        self.let_go.load(Ordering::SeqCst)
+    }
+
+    /// Whether the thread that listens is scheduled as work a person is
+    /// waiting for: `None` when that was not asked for.
+    pub fn interactive(&self) -> Option<bool> {
+        self.interactive
     }
 }
 
@@ -166,27 +348,76 @@ impl Drop for MeasureKeys {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let _ = fs::remove_file(&self.socket);
+        let _ = remove_from(&self.folder);
+    }
+}
+
+/// What is down of what came through the way in: (a key, or a button), its
+/// number.
+type Down = BTreeSet<(bool, u32)>;
+
+fn keep(events: &[InputEvent], down: &mut Down) {
+    for event in events {
+        let (key, code, pressed) = match *event {
+            InputEvent::Key { code, pressed } => (true, code, pressed),
+            InputEvent::Button { code, pressed } => (false, code, pressed),
+            _ => continue,
+        };
+        if pressed {
+            down.insert((key, code));
+        } else {
+            down.remove(&(key, code));
+        }
     }
 }
 
 /// As the relay took them: one event in a datagram; whatever else has
 /// arrived meanwhile goes on together with it.
-fn listen(listener: &UnixDatagram, stop: &AtomicBool, hand: &Hand) {
+fn listen(
+    listener: &UnixDatagram,
+    stop: &AtomicBool,
+    hand: &Hand,
+    let_go_after: Duration,
+    let_go: &AtomicU64,
+) {
     let mut buffer = [0u8; 2048];
     let take = |events: &mut Vec<InputEvent>, datagram: &[u8]| {
         if let Ok(event) = serde_json::from_slice::<InputEvent>(datagram) {
             crate::input::take(events, event);
         }
     };
+    let mut down = Down::new();
+    let mut heard = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         let mut events = Vec::new();
         match listener.recv(&mut buffer) {
             Ok(length) => take(&mut events, &buffer[..length]),
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                // Whoever wrote here has been silent for long with keys down: it may
+                // have died. They come up, so that the host does not go on typing.
+                if !down.is_empty() && heard.elapsed() >= let_go_after {
+                    let up: Vec<InputEvent> = std::mem::take(&mut down)
+                        .into_iter()
+                        .map(|(key, code)| match key {
+                            true => InputEvent::Key {
+                                code,
+                                pressed: false,
+                            },
+                            false => InputEvent::Button {
+                                code,
+                                pressed: false,
+                            },
+                        })
+                        .collect();
+                    let_go.fetch_add(up.len() as u64, Ordering::SeqCst);
+                    hand(up, PassLog::mark());
+                }
+                continue;
+            }
             Err(_) => return,
         }
         let in_hand = PassLog::mark();
+        heard = Instant::now();
         if listener.set_nonblocking(true).is_ok() {
             while let Ok(length) = listener.recv(&mut buffer) {
                 take(&mut events, &buffer[..length]);
@@ -196,6 +427,7 @@ fn listen(listener: &UnixDatagram, stop: &AtomicBool, hand: &Hand) {
             return;
         }
         if !events.is_empty() {
+            keep(&events, &mut down);
             hand(events, in_hand);
         }
     }
@@ -204,7 +436,7 @@ fn listen(listener: &UnixDatagram, stop: &AtomicBool, hand: &Hand) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     fn me() -> u32 {
         // SAFETY: no arguments, cannot fail.
@@ -224,7 +456,7 @@ mod tests {
     }
 
     fn refused(dir: &Path) -> String {
-        match MeasureKeys::open(dir, nobody()) {
+        match MeasureKeys::open(dir, nobody(), false) {
             Ok(_) => panic!("it was opened"),
             Err(why) => why,
         }
@@ -234,7 +466,7 @@ mod tests {
     fn the_folder_is_made_for_its_owner_alone_and_the_socket_too() {
         let place = place("made");
         let dir = place.join("keys");
-        let keys = MeasureKeys::open(&dir, nobody()).unwrap();
+        let keys = MeasureKeys::open(&dir, nobody(), false).unwrap();
         let folder = fs::symlink_metadata(&dir).unwrap();
         assert!(folder.file_type().is_dir());
         assert_eq!(folder.mode() & 0o7777, 0o700);
@@ -245,7 +477,7 @@ mod tests {
         // Closed: the socket is gone, the folder stays and is taken again.
         drop(keys);
         assert!(!dir.join(SOCKET_NAME).exists());
-        drop(MeasureKeys::open(&dir, nobody()).unwrap());
+        drop(MeasureKeys::open(&dir, nobody(), false).unwrap());
         fs::remove_dir_all(place).unwrap();
     }
 
@@ -282,6 +514,158 @@ mod tests {
         let why = refused(&nowhere);
         assert!(why.contains("symbolic link"), "{why}");
         assert!(!place.join("missing").exists());
+        fs::remove_dir_all(place).unwrap();
+    }
+
+    #[test]
+    fn a_link_is_not_followed_through_a_slash_or_a_dot_at_the_end_either() {
+        let place = place("slash");
+        let real = place.join("real");
+        fs::DirBuilder::new().mode(0o700).create(&real).unwrap();
+        let link = place.join("keys");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for end in ["/", "//", "/."] {
+            let path = PathBuf::from(format!("{}{end}", link.display()));
+            // The system would follow the link for such a path.
+            assert!(fs::symlink_metadata(&path).unwrap().is_dir(), "{end}");
+            let why = refused(&path);
+            assert!(why.contains("symbolic link"), "{end}: {why}");
+            assert!(!real.join(SOCKET_NAME).exists(), "{end}");
+        }
+        // A path that ends in the folder above names no folder of its own.
+        let why = refused(&real.join(".."));
+        assert!(why.contains("folder of its own"), "{why}");
+        assert!(!place.join(SOCKET_NAME).exists());
+        // A real folder may be named with a slash at its end.
+        let with_slash = PathBuf::from(format!("{}/", real.display()));
+        drop(MeasureKeys::open(&with_slash, nobody(), false).unwrap());
+        fs::remove_dir_all(place).unwrap();
+    }
+
+    #[test]
+    fn a_second_program_does_not_take_the_socket_of_one_that_listens() {
+        let place = place("two");
+        let dir = place.join("keys");
+        let (handed, taken) = mpsc::channel();
+        let first = MeasureKeys::open(
+            &dir,
+            Box::new(move |events, _| {
+                let _ = handed.send(events);
+            }),
+            false,
+        )
+        .unwrap();
+        let why = refused(&dir);
+        assert!(why.contains("listens"), "{why}");
+        // The first one still has its socket, and its keys.
+        let writer = UnixDatagram::unbound().unwrap();
+        let key = InputEvent::Key {
+            code: 30,
+            pressed: true,
+        };
+        writer
+            .send_to(&serde_json::to_vec(&key).unwrap(), first.socket())
+            .unwrap();
+        assert_eq!(taken.recv_timeout(Duration::from_secs(2)).unwrap(), [key]);
+        drop(first);
+        // A socket that nobody listens on any more is what an earlier run left: taken away.
+        let left = UnixDatagram::bind(dir.join(SOCKET_NAME)).unwrap();
+        drop(left);
+        assert!(dir.join(SOCKET_NAME).exists());
+        drop(MeasureKeys::open(&dir, nobody(), false).unwrap());
+        fs::remove_dir_all(place).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_folder_with_a_list_of_further_rights_is_refused() {
+        let place = place("acl");
+        let dir = place.join("keys");
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        // Its rights say "its owner alone"; the list lets everybody look in.
+        let added = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow list,search"])
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(added.success());
+        assert_eq!(fs::symlink_metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+        let why = refused(&dir);
+        assert!(why.contains("ACL"), "{why}");
+        assert!(!dir.join(SOCKET_NAME).exists());
+        // Without the list it is taken.
+        let removed = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(removed.success());
+        drop(MeasureKeys::open(&dir, nobody(), false).unwrap());
+        fs::remove_dir_all(place).unwrap();
+    }
+
+    #[test]
+    fn keys_left_down_by_a_program_that_fell_silent_come_up_and_are_counted() {
+        let place = place("silent");
+        let dir = place.join("keys");
+        let (handed, taken) = mpsc::channel();
+        let keys = MeasureKeys::open_letting_go_after(
+            &dir,
+            Box::new(move |events, _| {
+                let _ = handed.send(events);
+            }),
+            false,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let writer = UnixDatagram::unbound().unwrap();
+        let write = |event: InputEvent| {
+            writer
+                .send_to(&serde_json::to_vec(&event).unwrap(), keys.socket())
+                .unwrap();
+            assert_eq!(taken.recv_timeout(Duration::from_secs(2)).unwrap(), [event]);
+        };
+        // A key that goes down and comes up is nothing to let go of.
+        write(InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        write(InputEvent::Key {
+            code: 30,
+            pressed: false,
+        });
+        assert!(taken.recv_timeout(Duration::from_millis(600)).is_err());
+        assert_eq!(keys.let_go(), 0);
+        // A key and a button go down, and then nothing comes any more.
+        let began = Instant::now();
+        write(InputEvent::Key {
+            code: 31,
+            pressed: true,
+        });
+        write(InputEvent::Button {
+            code: 0x110,
+            pressed: true,
+        });
+        let up = taken.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(began.elapsed() >= Duration::from_millis(300), "too early");
+        assert_eq!(
+            up,
+            [
+                InputEvent::Button {
+                    code: 0x110,
+                    pressed: false
+                },
+                InputEvent::Key {
+                    code: 31,
+                    pressed: false
+                },
+            ]
+        );
+        assert_eq!(keys.let_go(), 2);
+        // Once.
+        assert!(taken.recv_timeout(Duration::from_millis(600)).is_err());
+        assert_eq!(keys.let_go(), 2);
+        drop(keys);
         fs::remove_dir_all(place).unwrap();
     }
 
@@ -355,8 +739,10 @@ mod tests {
             Box::new(move |events, _| {
                 let _ = handed.send(events);
             }),
+            false,
         )
         .unwrap();
+        assert_eq!(keys.interactive(), None);
         let writer = UnixDatagram::unbound().unwrap();
         let write = |event: &InputEvent| {
             writer
