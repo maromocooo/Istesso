@@ -11,9 +11,13 @@
 |---|---|---|---|
 | Wolf（本体のうち配信部分）、gst-wayland-display、inputtino | Linux ホストの仮想デスクトップ、配信、仮想入力 | MIT | <https://games-on-whales.github.io/wolf/stable/> |
 | webrtc-rs、str0m | 通信層の候補 | MIT OR Apache-2.0 | <https://github.com/webrtc-rs/webrtc>、<https://github.com/algesten/str0m> |
-| jiegec/usbip | USB/IP の出す側（Mac → Linux の共有にも対応） | MIT | <https://github.com/jiegec/usbip> |
+| jiegec/usbip | USB/IP の出す側（Mac → Linux の共有にも対応）。今回の公開では、付け替えを作らないので、使わない。使うときは、`rusb` クレートを通じて libusb（LGPL-2.1）を呼ぶ。libusb を動的リンクにして、「条件つきで使える」に書く | MIT（クレート）。libusb は LGPL-2.1 | <https://github.com/jiegec/usbip> |
 | usbip-win2 | Windows が受け側になる場合の USB/IP クライアント | BSD-2-Clause（0.9.7.0 以降） | <https://github.com/vadimgrn/usbip-win2> |
-| python-elgato-streamdeck（実装の参考） | Stream Deck の直接制御 | MIT | <https://github.com/abcminiuser/python-elgato-streamdeck> |
+| python-elgato-streamdeck（実装の参考。Elgato が公開している HID の仕様 <https://docs.elgato.com/streamdeck/hid/> を第一の情報源にし、足りないところだけ見る） | Stream Deck の直接制御 | HPND の系統の文面。プロジェクトは「MIT」と名乗っているが、LICENSE の本文は MIT ではない。SPDX の文面では HPND-sell-variant がいちばん近い（2026-11-16 に確認）。条件は、著作権表示と許諾の文を残すことと、作者の名前を宣伝に使わないこと。コピーレフトではない | <https://github.com/abcminiuser/python-elgato-streamdeck> |
+| hidapi（Rust のクレート）と、その中の HIDAPI（C のライブラリ） | 機器のフレームワークが、HID の機器と話す（`istesso-devices` の機能 `hid`）。macOS では、クレートに入っている HIDAPI の `mac/hid.c` をコンパイルして使う。Linux では、機能 `linux-native-basic-udev` だけを有効にして、Rust だけの実装を使う。C のコードも、システムの libudev も、libusb も使わない | クレートは MIT。HIDAPI（同梱の版は 0.15.0）は、GPL-3.0、BSD 形式、もとの HIDAPI ライセンスの 3 つから、使う側が選べる。**BSD 形式で使う（2026-11-17 に決定）。** HIDAPI の C のコードが入るのは、macOS 向けのビルドだけ。Linux 向けには入らない。文面は [third-party-licenses/HIDAPI-LICENSE-bsd.txt](../third-party-licenses/HIDAPI-LICENSE-bsd.txt) に置いた（クレートの `etc/hidapi/LICENSE-bsd.txt` と同じもの）。配布するものに、この文面を一緒に入れる。`deny.toml` にも、この選び方を書いてある。既定の機能（libudev を使う実装）と、libusb を使う機能（LGPL のライブラリが入る）は、有効にしない | <https://github.com/ruabmbua/hidapi-rs>、<https://github.com/libusb/hidapi> |
+| basic-udev、nix | hidapi が、Linux で機器を探して開くために使う | MIT OR Apache-2.0、MIT | <https://crates.io> |
+| proc-macro2 | 機器のフレームワークのテストが、アダプターのソースをトークンに分けて調べる。テストでだけ使う。serde と clap を通じて、もともと入っていた | MIT OR Apache-2.0 | <https://github.com/dtolnay/proc-macro2> |
+| image（0.25.6 に固定）、zune-jpeg、zune-core、bytemuck、byteorder-lite、num-traits | 機器のフレームワークが、絵を機器の求める形（大きさ、回転、JPEG）に変える。有効にしているのは JPEG だけ。0.25.6 に固定しているのは、それより新しい版が、このワークスペースより新しい Rust を求めるため | MIT OR Apache-2.0。zune-jpeg と zune-core は MIT OR Apache-2.0 OR Zlib、bytemuck は Zlib OR Apache-2.0 OR MIT、byteorder-lite は Unlicense OR MIT（MIT を選ぶ） | <https://github.com/image-rs/image> |
 | RustCrypto（spake2、chacha20poly1305、hkdf、sha2）、dalek | ペアリングの暗号部品 | MIT OR Apache-2.0、BSD-3-Clause | <https://github.com/RustCrypto/PAKEs> |
 | snow | 制御チャンネルの Noise プロトコル（ADR 0007）。使う部品だけを有効にしている | Apache-2.0 OR MIT | <https://github.com/mcginty/snow> |
 | mdns-sd | LAN 内の発見（mDNS / DNS-SD） | Apache-2.0 OR MIT | <https://github.com/keepsimple1/mdns-sd> |
