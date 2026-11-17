@@ -27,6 +27,8 @@
 
 進め方と体制は [m1-plan.md](m1-plan.md)、計測の方法は [measurements/README.md](measurements/README.md) にあります。
 
+**状態（2026-11-17）：M1 は、関門を通過。受け入れは、確定の判定のあと。** 関門の判定（[記録](measurements/2026-11-17-m1-gate.md)）は、いまの形（試作のビューアーと、計測用のホストのスクリプト）で測った。確定の判定は、自前のクライアントとホストが入ったあとに測る（[計画](m1-final-verdict-plan.md)、[ADR 0002](adr/0002-latency-first.md)）。
+
 1. **基準を取る。** 既存の配信ソフトを比較対象として動かし、遅延の体感と数値を記録する（`docs/measurements/`）。ここで合格ラインを数値で決める。
 2. **縦に1本通す。** Ubuntu のアプリ1つを、Mac の窓1枚として出す。
    - Linux ホスト：仮想コンポジター → NVENC → 送信
