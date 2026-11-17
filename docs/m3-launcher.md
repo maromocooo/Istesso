@@ -467,6 +467,7 @@ Chrome は、インストールしたウェブアプリを、Mac で別のアプ
 | T5 | **App Management を見る**：T2 と T4 のあとに、システムの記録（`/usr/bin/log show`）を読むだけで、`tccd` の App Management（`SystemPolicyAppBundles`）の出来事を探す。知らせが出たかは、人に聞く | なし | 知らせが出たら、**許さずに、閉じてもらう** |
 | T6 | 後片づけ：人が Dock から外す。包みを、書いた名前のまま消し、登録を外す | Dock から項目が消える | **人** |
 
+- **T1 は行った**（2026-11-17 19:03。[記録](measurements/2026-11-17-dock-trial.md) の 10）：Hardened Runtime なしと、Hardened Runtime ＋「ライブラリーの確かめを切る」権利では読めた。Hardened Runtime だけでは読めなかった（チームが違う）。
 - 作り直しの主は、T4 ではこの Mac のシェルから動かす道具である。本番の作り直しの主は Istesso（Developer ID）なので、App Management の掛かり方は違いうる。本番に近い確かめは、T1' と同じく、署名つきの版ができてから。
 - 手間：T1 は半日。T2〜T6 は、人と一緒に 30 分ほど（準備は半日）。
 
