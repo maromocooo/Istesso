@@ -8,16 +8,19 @@
 //! told and what it answers ([`contract`] for the agent, [`words`] for the
 //! measuring tools), what the picture does when it is paused or an encoder
 //! is refused ([`picture`]), the gate every frame passes ([`gate`]), the
-//! pipeline's description ([`encoder`]), the input ([`input`]) and the
-//! frame log ([`framelog`]). The part that drives GStreamer is built on the
-//! host only.
+//! pipeline's description ([`encoder`]), the input ([`input`]), the frame
+//! log ([`framelog`]), what it is started with ([`options`]) and the look
+//! at the render device before the compositor starts ([`render`]). The part
+//! that drives GStreamer is behind the feature `pipeline`.
 
 pub mod contract;
 pub mod encoder;
 pub mod framelog;
 pub mod gate;
 pub mod input;
+pub mod options;
 pub mod picture;
+pub mod render;
 #[cfg(feature = "pipeline")]
 pub mod stage;
 pub mod words;
