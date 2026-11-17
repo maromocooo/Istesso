@@ -718,6 +718,13 @@ impl Shared {
         if !watcher.confirmed_lately() {
             return Ok(Sealed::Nothing);
         }
+        // Nothing is sealed behind a packet whose rest still waits for the connection:
+        // it would wait with it, and move that packet's deadline. Every caller looks
+        // first; a debug build, which the tests are, checks that they did.
+        debug_assert!(
+            line.unsent_since.is_none(),
+            "a packet was sealed behind one that still waits for the connection"
+        );
         // Sealing writes into memory; only `push` touches the connection.
         line.channel.send(packet)?;
         if line.channel.stream().push()? {
@@ -1024,9 +1031,11 @@ impl Shared {
             }
             (self.log)(format!("showing the picture to {}", watcher.peer.name));
             watchers.list.push(watcher.clone());
+            // A viewer can only begin with a key frame, and is not made to ask. Said
+            // with the viewers still in hand: whoever finds this viewer among them (a
+            // frame, or a question how many there are) finds the key frame asked for.
+            self.key_wanted.store(true, Ordering::SeqCst);
         }
-        // A viewer can only begin with a key frame, and is not made to ask.
-        self.key_wanted.store(true, Ordering::SeqCst);
         self.attend(&watcher);
         self.watchers()
             .list

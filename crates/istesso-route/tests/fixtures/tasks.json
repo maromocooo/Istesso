@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "comment": "an item this version does not know; it is skipped",
+  "tasks": {
+    "test":     { "kind": "build",  "needs": { "tools": ["cargo"] },
+                  "command": ["./mark.sh"] },
+    "mac-app":  { "kind": "build",  "needs": { "roles": ["xcode_build"] },
+                  "command": ["xcodebuild", "-scheme", "App"] },
+    "encode":   { "kind": "run",    "needs": { "os": "linux", "roles": ["gpu", "hardware_encode"] },
+                  "command": ["./mark.sh"] },
+    "site":     { "kind": "deploy", "needs": { "roles": ["always_on_candidate"] },
+                  "command": ["./mark.sh"] },
+    "windows":  { "kind": "build",  "needs": { "os": "windows" },
+                  "command": ["./mark.sh"] },
+    "quantum":  { "kind": "build",  "needs": { "roles": ["quantum"] },
+                  "command": ["./mark.sh"] },
+    "notes":    { "kind": "run" },
+    "missing":  { "kind": "run",    "command": ["./does-not-exist"] },
+    "no-such":  { "kind": "run",    "command": ["istesso-route-test-no-such-program"] },
+    "teleport": { "kind": "teleport", "command": ["./mark.sh"] }
+  }
+}

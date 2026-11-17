@@ -225,7 +225,7 @@ fn run(
             let opened = first(FIRST_WITHIN)
                 .map_err(|failure| (after_failure(&failure), failure.to_string()))
                 .and_then(|client| {
-                    InputLine::open(client, make_connect()).map_err(|why| (Again::Never, why))
+                    InputLine::open(client, make_connect()).map_err(|(_, why)| (Again::Never, why))
                 });
             match opened {
                 Ok(opened) => {
