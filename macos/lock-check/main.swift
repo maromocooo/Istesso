@@ -12,7 +12,7 @@
 //     own window for 4 s, then sends input ONLY to itself, as listed below, and counts what its
 //     own window received. Quits once the three locked states are tried, or after <n> minutes.
 //
-//   open "Istesso Lock Check Dev.app" --args --watch <seconds> [--report <file> --declare-every <s>]
+//   open "Istesso Lock Check Dev.app" --args --watch <seconds> [--no-input --report <file> --declare-every <s>]
 //     One run in whatever state the Mac is in: capture runs the whole time and every 5 s the report
 //     gets complete and idle frames, whether the picture follows the window, the lock state and
 //     whether the main display reads asleep. The same confined input as above is sent once 4 s in
@@ -117,7 +117,7 @@ func sessionTapRefusal(lock: LockState, frontmost: Bool, topIsOwn: Bool?) -> Str
 
 /// The topmost non-transparent on-screen window containing `point`: its owner's pid and its layer.
 /// Reads only owner, layer, bounds and alpha, never names.
-func topWindow(at point: CGPoint) -> (pid: Int32, layer: Int)? {
+func topWindow(at point: CGPoint) -> (pid: Int32, layer: Int, alpha: Double)? {
     guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
         return nil
     }
@@ -128,7 +128,7 @@ func topWindow(at point: CGPoint) -> (pid: Int32, layer: Int)? {
             let bounds = CGRect(dictionaryRepresentation: boundsInfo),
             bounds.contains(point)
         else { continue }
-        return ((info[kCGWindowOwnerPID as String] as? Int32) ?? -1, (info[kCGWindowLayer as String] as? Int) ?? 0)
+        return ((info[kCGWindowOwnerPID as String] as? Int32) ?? -1, (info[kCGWindowLayer as String] as? Int) ?? 0, alpha)
     }
     return nil
 }
@@ -162,7 +162,11 @@ final class ProbeView: NSView {
     var keys = 0
     var moves = 0
     var clicks = 0
+    /// How many times the view was actually drawn.
+    private(set) var draws = 0
     var status = "starting" { didSet { needsDisplay = true } }
+    /// The colour the view is meant to show now.
+    var colour: (UInt8, UInt8, UInt8) { ProbeView.colours[step % ProbeView.colours.count] }
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
@@ -175,7 +179,8 @@ final class ProbeView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let (r, g, b) = ProbeView.colours[step % ProbeView.colours.count]
+        draws += 1
+        let (r, g, b) = colour
         NSColor(srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1).setFill()
         bounds.fill()
         let text = "Istesso lock check (Dev)\n\(status)" as NSString
@@ -222,6 +227,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var statuses: [String: Int] = [:]
     private var arrivals: [CFTimeInterval] = []
     private var seen: [(UInt8, UInt8, UInt8)] = []
+    private var last: (UInt8, UInt8, UInt8)?
     private(set) var size = (0, 0)
     private(set) var stopped: String?
     private let queue = DispatchQueue(label: "dev.istesso.lock-check.capture")
@@ -318,6 +324,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             arrivals.append(now)
             if let dims { size = dims }
             if let colour, seen.last.map({ $0 != colour }) ?? true { seen.append(colour) }
+            if let colour { last = colour }
         }
         lock.unlock()
     }
@@ -330,16 +337,23 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Everything since the last call.
     func take() -> (complete: Int, statuses: [String: Int], gaps: [Double], colours: [(UInt8, UInt8, UInt8)], stopped: String?) {
+        let taken = takeWithLast()
+        return (taken.complete, taken.statuses, taken.gaps, taken.colours, taken.stopped)
+    }
+
+    /// As `take`, plus the centre colour of the last complete frame (numbers only).
+    func takeWithLast() -> (complete: Int, statuses: [String: Int], gaps: [Double], colours: [(UInt8, UInt8, UInt8)], stopped: String?, last: (UInt8, UInt8, UInt8)?) {
         lock.lock()
         defer {
             complete = 0
             statuses = [:]
             arrivals = []
             seen = []
+            last = nil
             lock.unlock()
         }
         let gaps = zip(arrivals.dropFirst(), arrivals).map { ($0 - $1) * 1000 }
-        return (complete, statuses, gaps, seen, stopped)
+        return (complete, statuses, gaps, seen, stopped, last)
     }
 }
 
@@ -391,11 +405,14 @@ final class Probe: NSObject, NSApplicationDelegate {
     private var mayPost = false
     /// `--watch <seconds>`: one continuous run instead of one trial per state.
     private let watch: Double?
+    private let noInput: Bool
+    private var drawsBefore = 0
     private var buckets: [String] = []
     private var watchStart = Date()
 
     init(arguments: [String]) {
         watch = argument(arguments, "--watch").flatMap(Double.init).flatMap { $0 >= 30 ? $0 : nil }
+        noInput = arguments.contains("--no-input")
         minutes = argument(arguments, "--minutes").flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil } ?? 60
         holdDisplay = !arguments.contains("--no-hold")
         report = reportURL(arguments, default: "lock-check-report.txt")
@@ -472,11 +489,14 @@ final class Probe: NSObject, NSApplicationDelegate {
         _ = capture.take()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in self.view.advance() }
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.bucket() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            self.input(into: Answer(state: String(format: "watch, input at %.0f s", Date().timeIntervalSince(self.watchStart))))
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds - 15) {
-            self.input(into: Answer(state: String(format: "watch, input at %.0f s", Date().timeIntervalSince(self.watchStart))))
+        drawsBefore = view.draws
+        if !noInput {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                self.input(into: Answer(state: String(format: "watch, input at %.0f s", Date().timeIntervalSince(self.watchStart))))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds - 15) {
+                self.input(into: Answer(state: String(format: "watch, input at %.0f s", Date().timeIntervalSince(self.watchStart))))
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
             self.bucket()
@@ -485,7 +505,19 @@ final class Probe: NSObject, NSApplicationDelegate {
     }
 
     private func bucket() {
-        let taken = capture.take()
+        let taken = capture.takeWithLast()
+        let draws = view.draws - drawsBefore
+        drawsBefore = view.draws
+        let visible = window.occlusionState.contains(.visible)
+        let drawing = view.colour
+        let centre = taken.last.map { "(\($0.0),\($0.1),\($0.2))" } ?? "none"
+        // The topmost window at the point: only whether it is the system's Dock process, its layer
+        // and its alpha. Nothing else of another application is read.
+        let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").map { $0.processIdentifier }
+        let top = topWindow(at: middle).map { top -> String in
+            let who = top.pid == getpid() ? "this program" : (dock.contains(top.pid) ? "the Dock process" : "another process")
+            return String(format: "%@, layer %d, alpha %.2f", who, top.layer, top.alpha)
+        } ?? "none"
         let known = taken.colours.filter { colour in
             ProbeView.colours.contains {
                 abs(Int($0.0) - Int(colour.0)) + abs(Int($0.1) - Int(colour.1)) + abs(Int($0.2) - Int(colour.2)) < 40
@@ -493,10 +525,11 @@ final class Probe: NSObject, NSApplicationDelegate {
         }
         let asleep = CGDisplayIsAsleep(CGMainDisplayID()) != 0
         buckets.append(String(
-            format: "  %5.1f s (%@): complete %d, idle %d, follows the window %@, lock %@, main display reads %@%@",
+            format: "  %5.1f s (%@): complete %d, idle %d, follows the window %@, lock %@, main display reads %@; window drew %d times, occlusion says %@; last captured centre %@, the window draws (%d,%d,%d) now; on top at the point: %@%@",
             Date().timeIntervalSince(watchStart), ISO8601DateFormatter().string(from: Date()),
             taken.complete, taken.statuses["idle"] ?? 0, known.count >= 3 ? "YES" : "NO",
-            lockState().rawValue, asleep ? "asleep" : "awake",
+            lockState().rawValue, asleep ? "asleep" : "awake", draws, visible ? "visible" : "NOT visible",
+            centre, Int(drawing.0), Int(drawing.1), Int(drawing.2), top,
             taken.stopped.map { "; the capture stopped: \($0)" } ?? ""))
         write()
     }
