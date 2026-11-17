@@ -118,10 +118,13 @@ static DECLARATION: Declaration = Declaration {
         linux_process: None,
     }],
     used_by_apps: &[],
+    // Run by the author on their own device on 2026-11-17: every button, dial
+    // and kind of touch gave its notice, and the pictures came out in order
+    // and the right way up. Linux has not been run.
     confirmation: Confirmation {
-        by: ConfirmedBy::NotYet,
-        systems: &[],
-        date: "",
+        by: ConfirmedBy::Author,
+        systems: &["macOS 26"],
+        date: "2026-11-17",
     },
 };
 
