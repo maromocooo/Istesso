@@ -679,10 +679,19 @@ static void check_show_menu(void) {
                 (unsigned long long)now_ns(), (long)menu.numberOfItems, menu.itemArray.firstObject.title.UTF8String,
                 menu.itemArray.firstObject.keyEquivalent.UTF8String);
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [menu cancelTracking];
-    });
+    // Closed again by a timer of the run loop's common modes: while a menu is open the main
+    // thread is inside the menu's own loop, and what is queued for the main queue waits until
+    // the menu is closed (the first form of this check waited there for good).
+    NSTimer *close = [NSTimer timerWithTimeInterval:1.5
+                                            repeats:NO
+                                              block:^(NSTimer *timer) {
+                                                  [menu cancelTracking];
+                                              }];
+    [NSRunLoop.mainRunLoop addTimer:close forMode:NSRunLoopCommonModes];
     [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(20, view.bounds.size.height - 20) inView:view];
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"check\",\"t_ns\":%llu,\"event\":\"menu_closed\"}\n", (unsigned long long)now_ns());
+    }
 }
 #endif
 
