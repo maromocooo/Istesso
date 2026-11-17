@@ -114,6 +114,10 @@ pub struct Session {
     /// all gone or it has been said that they are still open.
     close_asked_ns: Option<u64>,
     environment: Option<Vec<(String, String)>>,
+    /// A runner's lines that came up before it has said `ready`, in their
+    /// order: an agent hears `ready` first. `None` once `ready` has been
+    /// said, and always for a measuring run, which holds nothing back.
+    held: Option<Vec<String>>,
 }
 
 /// What a session is begun with, besides its pipeline.
@@ -137,6 +141,7 @@ impl Session {
         let started = stage.start()?;
         let (picture, told) = Picture::begin(started, begin.clock);
         let to_compositor = stage.to_compositor();
+        let held = matches!(begin.tongue, Tongue::Runner { .. }).then(Vec::new);
         let session = Session {
             stage,
             door: begin.door,
@@ -153,6 +158,7 @@ impl Session {
             windows: 0,
             close_asked_ns: None,
             environment: None,
+            held,
         };
         Ok((session, told))
     }
@@ -167,9 +173,21 @@ impl Session {
         self.environment.as_deref()
     }
 
-    /// Says one of the runner's lines.
+    /// Says one of the runner's lines. Before `ready` has been said, every
+    /// other line is kept; `ready` goes out first and they follow it, in the
+    /// order they came up.
     pub fn event(&mut self, event: &Event) {
-        (self.say)(contract::write(event));
+        let line = contract::write(event);
+        if matches!(event, Event::Ready { .. }) {
+            (self.say)(line);
+            for kept in self.held.take().unwrap_or_default() {
+                (self.say)(kept);
+            }
+        } else if let Some(held) = &mut self.held {
+            held.push(line);
+        } else {
+            (self.say)(line);
+        }
     }
 
     /// Tells whoever started the program what has become of the picture,
@@ -177,13 +195,15 @@ impl Session {
     pub fn tell(&mut self, told: Vec<Told>) {
         let now = (self.clock)();
         for told in told {
-            match (&self.tongue, told) {
+            match (self.tongue.clone(), told) {
                 (tongue, Told::Paused { offered, took_ms }) => {
                     self.log.line(line::paused(now, offered, took_ms));
-                    (self.say)(match tongue {
-                        Tongue::Measure => words::write(&Answer::Paused { offered, took_ms }),
-                        Tongue::Runner { .. } => contract::write(&Event::Paused { took_ms }),
-                    });
+                    match tongue {
+                        Tongue::Measure => {
+                            (self.say)(words::write(&Answer::Paused { offered, took_ms }));
+                        }
+                        Tongue::Runner { .. } => self.event(&Event::Paused { took_ms }),
+                    }
                 }
                 (
                     tongue,
@@ -196,36 +216,36 @@ impl Session {
                 ) => {
                     self.log
                         .line(line::resumed(now, opened_ms, encoded_ms, written_ms, key));
-                    (self.say)(match tongue {
-                        Tongue::Measure => words::write(&Answer::Resumed {
+                    match tongue {
+                        Tongue::Measure => (self.say)(words::write(&Answer::Resumed {
                             opened_ms,
                             encoded_ms,
                             written_ms,
                             key,
-                        }),
-                        Tongue::Runner { .. } => contract::write(&Event::Resumed {
+                        })),
+                        Tongue::Runner { .. } => self.event(&Event::Resumed {
                             opened_ms,
                             encoded_ms,
                             written_ms,
                         }),
-                    });
+                    }
                 }
                 (tongue, Told::NoEncoder { at, reason }) => {
                     self.log.line(line::refused(now, &reason));
                     let message = format!(
                         "no encoder could be had ({reason}); no picture is made, the application goes on"
                     );
-                    (self.say)(match tongue {
-                        Tongue::Measure => words::write(&Answer::Refused {
+                    match tongue {
+                        Tongue::Measure => (self.say)(words::write(&Answer::Refused {
                             word: match at {
                                 At::Start => "start",
                                 At::Resume => "resume",
                                 At::Run => "run",
                             },
                             reason: message,
-                        }),
-                        Tongue::Runner { .. } => contract::write(&Event::NoEncoder { message }),
-                    });
+                        })),
+                        Tongue::Runner { .. } => self.event(&Event::NoEncoder { message }),
+                    }
                 }
                 (Tongue::Measure, Told::Admitted { device }) => {
                     (self.say)(words::write(&Answer::Admitted { device }));
@@ -693,6 +713,60 @@ mod tests {
         }
     }
 
+    fn ready() -> Event {
+        Event::Ready {
+            env: Default::default(),
+            display: Display {
+                width: 32,
+                height: 32,
+                fps: Some(100),
+            },
+            answer: contract::answer(47850),
+        }
+    }
+
+    /// A runner that has said `ready`, as it has by the time an agent tells
+    /// it anything; what it says from here on is all that `said` has.
+    fn ready_runner(encoder: &str) -> Set {
+        let mut set = set(encoder, runner());
+        set.session.event(&ready());
+        set.said.lock().unwrap().clear();
+        set
+    }
+
+    #[test]
+    fn a_runner_says_nothing_before_ready_and_what_came_up_follows_it_in_order() {
+        let mut set = set(MISSING, runner());
+        // A compositor that begins with no window says so before it says how
+        // an application gets into it; the encoder was refused before that.
+        set.session.heard(Heard::Windows(0));
+        let told = std::mem::take(&mut set.told);
+        set.session.tell(told);
+        set.session.heard(Heard::Windows(1));
+        assert!(set.said().is_empty());
+        set.session.event(&ready());
+        let events = |set: &Set| -> Vec<String> {
+            set.said()
+                .iter()
+                .map(|line| line["event"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(events(&set), ["ready", "windows", "no_encoder", "windows"]);
+        assert_eq!(set.said()[1]["count"], 0);
+        assert_eq!(set.said()[3]["count"], 1);
+        // From here on a line is said when it comes up, and none twice.
+        set.session.heard(Heard::Windows(2));
+        assert_eq!(events(&set).len(), 5);
+        assert_eq!(set.said()[4]["count"], 2);
+        set.session.stop();
+
+        // A measuring run holds nothing back: its tools read the lines as they come.
+        let mut set = self::set(ENCODER, Tongue::Measure);
+        set.session.heard(Heard::Windows(0));
+        assert_eq!(set.said().len(), 1);
+        set.session.stop();
+    }
+
     #[test]
     fn the_measuring_tools_words_stop_the_picture_and_bring_it_back() {
         let mut set = set(ENCODER, Tongue::Measure);
@@ -716,7 +790,7 @@ mod tests {
 
     #[test]
     fn a_runner_s_detach_and_attach_name_nobody_and_then_the_device() {
-        let mut set = set(ENCODER, runner());
+        let mut set = ready_runner(ENCODER);
         set.until("frames", |set| set.frames() >= 5);
         set.session.line(r#"{"v":1,"cmd":"detach"}"#);
         assert_eq!(set.calls(), ["admit nobody", "offer false"]);
@@ -747,7 +821,7 @@ mod tests {
 
     #[test]
     fn an_encoder_that_cannot_be_had_at_the_start_is_said_and_resume_tries_again() {
-        let mut set = set(MISSING, runner());
+        let mut set = ready_runner(MISSING);
         assert!(matches!(
             set.told[..],
             [Told::NoEncoder { at: At::Start, .. }]
@@ -791,7 +865,7 @@ mod tests {
 
     #[test]
     fn windows_are_counted_out_loud_and_the_last_one_gone_is_the_end_of_the_application() {
-        let mut set = set(ENCODER, runner());
+        let mut set = ready_runner(ENCODER);
         for count in [1, 2, 1, 0] {
             assert_eq!(set.session.heard(Heard::Windows(count)), Flow::On);
         }
@@ -814,7 +888,7 @@ mod tests {
 
     #[test]
     fn ending_the_application_asks_its_windows_and_says_once_when_they_are_still_open() {
-        let mut set = set(ENCODER, runner());
+        let mut set = ready_runner(ENCODER);
         set.session.heard(Heard::Windows(2));
         // The stand-in for the compositor cannot be asked: that is said, and nothing is waited for.
         set.session.line(r#"{"v":1,"cmd":"close"}"#);
