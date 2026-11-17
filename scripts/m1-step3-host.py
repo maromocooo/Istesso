@@ -25,6 +25,11 @@ With --input it also takes keyboard and pointer input for the application: `iste
 on this machine receives it from a paired device over the control channel and hands it over
 through a socket in the user's runtime directory, one JSON event per datagram.
 
+With --input-record FILE it also writes down what input arrived, for finding a fault by looking
+instead of guessing: modifier keys, buttons and scrolls by name, each with the modifiers held at
+that moment. Which key any other key was is never written down, and no pointer position
+(scripts/input_record.py has the lines and the rule). Off unless given.
+
 The stream sent with --to is not encrypted: for measurements on a trusted network only.
 
 With --to-channel the stream leaves encrypted and authenticated instead (docs/adr/0015-media-
@@ -231,6 +236,13 @@ def main():
         metavar="PATH",
         help="with --input: the socket to take the input on, for a pipeline that runs next to another one "
         "($XDG_RUNTIME_DIR/istesso/input.sock, where `istesso agent` hands input over, unless given)",
+    )
+    parser.add_argument(
+        "--input-record",
+        metavar="FILE",
+        help="with --input: write down what input arrived here, for finding a fault by looking (scripts/input_record.py): "
+        "modifier keys, buttons and scrolls by name, each with the modifiers held at that moment. Which key another key "
+        "was is never written down, and no pointer position. The file is added to. Off unless given",
     )
     parser.add_argument(
         "--cursor",
@@ -476,6 +488,12 @@ def main():
         return True
 
     taken = {"count": 0}
+    record = {"to": None}
+    if args.input and args.input_record:
+        # Only loaded when asked for: without the option nothing here is different.
+        import input_record
+
+        record["to"] = input_record.InputRecord(input_record.open_record(args.input_record))
 
     def on_input(fd, condition):
         # One event per datagram, as `istesso agent` passes them on (istesso_proto::InputEvent).
@@ -488,6 +506,14 @@ def main():
             except (OSError, ValueError):
                 continue
             kind = event.get("kind") if isinstance(event, dict) else None
+            if record["to"] is not None:
+                # What arrived, before anything is made of it: also what is then not passed on.
+                try:
+                    record["to"].take(event)
+                except OSError as error:
+                    # A record that cannot be written must not stop the input.
+                    print("note: the input record ended: %s" % error.strerror, file=sys.stderr)
+                    record["to"] = None
             try:
                 if kind == "key":
                     text = "KeyboardKey, key=(uint)%d, pressed=(boolean)%s" % (int(event["code"]), "true" if event["pressed"] else "false")
@@ -779,6 +805,12 @@ def main():
     clock_line()
     if args.input:
         log.write('{"kind":"input","events":%d}\n' % taken["count"])
+    if record["to"] is not None:
+        try:
+            record["to"].close()
+            record["to"].out.close()
+        except OSError:
+            pass
     log.close()
     return 1 if failed else 0
 

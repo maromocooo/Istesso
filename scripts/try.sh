@@ -55,6 +55,21 @@
 #                         input.sock in that directory. Keyboard and mouse are NOT passed on from the
 #                         window in such a run: the host's agent hands input to the ordinary run only.
 #                         `stop` with the same name stops that run and nothing else.
+#   ISTESSO_BUILT         with TRY=channel: another checkout of this repository whose built programs are
+#                         started on this Mac (its target/release/istesso and its
+#                         macos/gst-viewer/build/gst-viewer), for a checkout that has nothing built:
+#                         the very programs of an earlier trial, with this script (default: this one)
+#   ISTESSO_INPUT_RECORD  for finding a fault in the input by looking: write down, on the host, what
+#                         input arrived (scripts/input_record.py; docs/input-record.md has the steps).
+#                         Unset: nothing is written down. 1: what reached the pipeline, in
+#                         input-record.jsonl in the run's directory on the host (~/.cache/istesso-try).
+#                         2: also what the compositor then told the application, in
+#                         input-record-application.jsonl, read from the application's own
+#                         WAYLAND_DEBUG output; the application's other output is dropped in such a run.
+#                         Modifier keys, buttons and scrolls are named; which key any other key was is
+#                         never written down, and no pointer position. A compositor plugin built with
+#                         scripts/patches/gst-wayland-display-input-record.patch (a folder of its own,
+#                         named with ISTESSO_HOST_PLUGIN) adds input-record-compositor.jsonl.
 set -u
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
@@ -79,6 +94,15 @@ fi
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 port=${ISTESSO_TRY_PORT:-47803}
+built=${ISTESSO_BUILT:-.}
+if [ "$built" != . ] && [ "$way" != channel ]; then
+    echo "error: ISTESSO_BUILT is for TRY=channel"; exit 2
+fi
+record=${ISTESSO_INPUT_RECORD:-}
+case "$record" in
+"" | 1 | 2) ;;
+*) echo "error: ISTESSO_INPUT_RECORD is 1 or 2, not $record"; exit 2 ;;
+esac
 cache="$HOME/Library/Caches/istesso"
 socket="$cache/viewer-input.sock"
 relay_log="$cache/try-relay.log"
@@ -97,7 +121,7 @@ usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; }
 
 on_host() {
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-        "export LC_ALL=C SRC=$host_src PLUGIN=$host_plugin TO='${to:-}' SIZE=$size LAYOUT=$layout APP=$(printf '%q' "${app:-}") WAY=$way PORT=$port NAMED=$name RUN=$host_run PIPELINE_SESSION=$pipeline_session APP_SESSION=$app_session; bash -s" 2>&1 |
+        "export LC_ALL=C SRC=$host_src PLUGIN=$host_plugin TO='${to:-}' SIZE=$size LAYOUT=$layout APP=$(printf '%q' "${app:-}") WAY=$way PORT=$port NAMED=$name RUN=$host_run PIPELINE_SESSION=$pipeline_session APP_SESSION=$app_session RECORD=$record; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
 }
 
@@ -184,9 +208,9 @@ app="$*"
 
 if [ "$way" = channel ]; then
     # No application is made or touched in this way: the programs are started as they are.
-    [ -x macos/gst-viewer/build/gst-viewer ] ||
+    [ -x "$built/macos/gst-viewer/build/gst-viewer" ] ||
         { echo "error: the viewer is not built: run macos/gst-viewer/build.sh"; exit 1; }
-    [ -n "$name" ] || [ -x target/release/istesso ] ||
+    [ -n "$name" ] || [ -x "$built/target/release/istesso" ] ||
         { echo "error: istesso is not built: run cargo build --release -p istesso-cli"; exit 1; }
 else
     wrap "$viewer_app" "Istesso Gst Viewer" dev.istesso.gst-viewer macos/gst-viewer/build/gst-viewer ||
@@ -230,7 +254,9 @@ cat > "$run/pipeline.sh" <<SCRIPT
 export GST_PLUGIN_PATH=$plugin GST_REGISTRY=$run/gst-registry.bin XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
 # The keys arrive as places on the keyboard; this says what is printed on them.
 export XKB_DEFAULT_LAYOUT=$LAYOUT
-exec python3 -u $src/scripts/m1-step3-host.py $way --size $SIZE --fps 85 --frames cuda ${node:+--render-node $node} --log -
+${RECORD:+# A compositor plugin with the input-record patch writes its record here; any other does not look.}
+${RECORD:+export ISTESSO_COMPOSITOR_INPUT_RECORD=$run/input-record-compositor.jsonl}
+exec python3 -u $src/scripts/m1-step3-host.py $way --size $SIZE --fps 85 --frames cuda ${node:+--render-node $node} --log - ${RECORD:+--input-record $run/input-record.jsonl}
 SCRIPT
 chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"
 tmux new-session -d -s "$PIPELINE_SESSION" "$run/pipeline.sh > $run/pipeline.log 2>&1"
@@ -239,13 +265,22 @@ for i in $(seq 1 60); do
     sock=$(sed -E 's/\x1b\[[0-9;]*m//g' "$run/pipeline.log" 2>/dev/null | grep -o 'socket_name="[^"]*"' | head -1 | cut -d'"' -f2)
     [ -n "$sock" ] && break; sleep 0.25
 done
+if [ "$RECORD" = 2 ]; then
+    # What the compositor tells the application, as the application's own library prints it, goes
+    # through a filter that keeps the keyboard's and the pointer's buttons, scrolls and focus, names
+    # modifier keys only, and drops everything else: nothing unfiltered reaches a disk.
+    begin="export WAYLAND_DEBUG=1
+$APP 2>&1 | python3 $src/scripts/input_record.py --wayland-debug $run/input-record-application.jsonl"
+else
+    begin="exec $APP"
+fi
 [ -n "$sock" ] || { echo "host: the compositor did not start:"; sed -E 's/\x1b\[[0-9;]*m//g' "$run/pipeline.log" | tail -3 | cut -c1-200; exit 1; }
 cat > "$run/app.sh" <<SCRIPT
 #!/bin/bash
 # The application inside the virtual compositor: Wayland only, so that it cannot open on the desktop instead.
 unset DISPLAY
 export WAYLAND_DISPLAY=$sock XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland MOZ_ENABLE_WAYLAND=1 XDG_SESSION_TYPE=wayland
-exec $APP
+$begin
 SCRIPT
 chmod +x "$run/app.sh"
 tmux new-session -d -s "$APP_SESSION" "$run/app.sh > $run/app.log 2>&1"
@@ -255,6 +290,8 @@ tmux new-session -d -s "$APP_SESSION" "$run/app.sh > $run/app.log 2>&1"
 sleep 2
 echo "host: the application is $(tmux has-session -t "$APP_SESSION" 2>/dev/null && echo running || echo NOT running)"
 [ -s "$run/app.log" ] && { echo "host: it said:"; head -3 "$run/app.log" | cut -c1-200; }
+[ -z "$RECORD" ] || echo "host: input that arrives is written down in $RUN/input-record.jsonl (modifier keys, buttons and scrolls by name; other keys only as \"key\")"
+[ "$RECORD" != 2 ] || echo "host: what the application is told is written down in $RUN/input-record-application.jsonl"
 exit 0
 HOST
 
@@ -267,10 +304,10 @@ if [ -n "$name" ]; then
     socket=""
 else
     : > "$relay_log"
-    peer=$(./target/release/istesso peers list 2>/dev/null | awk 'NR==1 {print $NF}')
+    peer=$("$built/target/release/istesso" peers list 2>/dev/null | awk 'NR==1 {print $NF}')
     if [ "$way" = channel ]; then
         : > "$started"
-        ./target/release/istesso input relay --to "$peer" --socket "$socket" ${host_side:+--address "$host_side"} --keep-trying 30 > "$relay_log" 2>&1 &
+        "$built/target/release/istesso" input relay --to "$peer" --socket "$socket" ${host_side:+--address "$host_side"} --keep-trying 30 > "$relay_log" 2>&1 &
         echo "$! istesso" >> "$started"
     else
         open -n -g --stdout "$relay_log" --stderr "$relay_log" "$input_app" --args input relay --to "$peer" --socket "$socket" ${host_side:+--address "$host_side"} --keep-trying 30
@@ -300,7 +337,7 @@ if [ "$way" = channel ]; then
     [ -n "$name" ] && : > "$started"
     # The viewer connects to the host and shows what the channel brings; the picture's size is the
     # host's. It is started as it is, in the background of this shell.
-    ISTESSO_CHANNEL="$host_side:$port" macos/gst-viewer/build/gst-viewer "$x" "$y" "$width" "$height" "Istesso" - - 0 ${socket:+"$socket"} > "$viewer_log" 2>&1 &
+    ISTESSO_CHANNEL="$host_side:$port" "$built/macos/gst-viewer/build/gst-viewer" "$x" "$y" "$width" "$height" "Istesso" - - 0 ${socket:+"$socket"} > "$viewer_log" 2>&1 &
     viewer=$!
     echo "$viewer gst-viewer" >> "$started"
     sleep 2
