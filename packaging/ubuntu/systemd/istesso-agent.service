@@ -1,0 +1,25 @@
+# systemd USER unit. Installed by the .deb as /usr/lib/systemd/user/istesso-agent.service.
+# The package does not enable it. The person who owns the host runs, once, as that user:
+#   systemctl --user enable --now istesso-agent.service
+# and, as root, so that the user's services start at boot with nobody logged in:
+#   loginctl enable-linger <user>
+#
+# Why a user unit: the device key and the list of paired devices live in that user's own
+# configuration directory, and the host's pictures and sound come from that user's
+# services (compositor, PipeWire). A system unit would need a fixed user name and would
+# leave those services out of reach.
+[Unit]
+Description=Istesso agent (answers paired devices)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/istesso agent
+# Stopping on purpose (exit 0) stays stopped; a crash starts it again.
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+# No log files: standard error goes to the journal. The agent never prints pairing codes,
+# keys or tokens.
+
+[Install]
+WantedBy=default.target

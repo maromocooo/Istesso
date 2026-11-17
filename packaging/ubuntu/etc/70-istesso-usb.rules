@@ -1,0 +1,14 @@
+# Installed by the istesso package as /usr/lib/udev/rules.d/70-istesso-usb.rules.
+#
+# Gives the group "plugdev" read and write access to the supported USB devices, so that a
+# program of that user can open them without root and without somebody sitting at the
+# screen. (TAG+="uaccess" would only work for a user logged in at the machine; the host
+# normally has nobody there.) The group is the one that the host's user is normally in.
+#
+# One line per supported device, written with the vendor and product number only (four
+# hexadecimal digits each). The lines are meant to be generated from the adapters' own
+# list by the function in the device framework (branch m7-usb-devices); until then this
+# file carries one entry as an example.
+# Stream Deck Plus (Elgato, 0fd9:0084). The numbers must be checked against the real device.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0084", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="0084", GROUP="plugdev", MODE="0660"
