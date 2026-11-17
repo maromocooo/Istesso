@@ -28,6 +28,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use istesso_measure::flash::Rgb;
 use istesso_measure::{
     Clock, FlashAck, FlashInput, Header, HostSample, InputSource, Jitter, LogWriter, Record, Shade,
     Side,
@@ -168,6 +169,19 @@ struct Args {
     #[arg(long, conflicts_with = "fullscreen")]
     whole_display: bool,
 
+    /// Show some of the picture's colours as other colours: a file with a line
+    /// `RRGGBB RRGGBB` for each, the colour and what to show instead, in
+    /// hexadecimal. For the guess test, where the local window has to look
+    /// like the relayed one as this display shows it
+    #[arg(long, value_name = "FILE")]
+    colours: Option<PathBuf>,
+
+    /// Wait this long before answering an input, in milliseconds. For the
+    /// guess test, where the application on the host is made as slow to
+    /// answer as the one on the client
+    #[arg(long, value_name = "MS", default_value_t = 0.0)]
+    hold_ms: f64,
+
     /// Show this picture as the pointer over the window instead of the
     /// system's: a file that starts with the line `WIDTH HEIGHT HOTSPOT_X
     /// HOTSPOT_Y` and goes on with WIDTH x HEIGHT pixels of four bytes each,
@@ -262,6 +276,39 @@ struct App {
     failure: Option<String>,
 }
 
+/// Reads pairs of colours, `RRGGBB RRGGBB` a line: a colour and what to show instead.
+fn read_colours(file: &std::path::Path) -> Result<Vec<(Rgb, Rgb)>, String> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let colour = |word: &str| -> Option<Rgb> {
+        let number = u32::from_str_radix(word, 16)
+            .ok()
+            .filter(|_| word.len() == 6)?;
+        Some(Rgb::new(
+            (number >> 16) as u8,
+            (number >> 8) as u8,
+            number as u8,
+        ))
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut words = line.split_whitespace();
+            match (
+                words.next().and_then(colour),
+                words.next().and_then(colour),
+                words.next(),
+            ) {
+                (Some(from), Some(to), None) => Ok((from, to)),
+                _ => Err(format!(
+                    "{}: `{line}` is not `RRGGBB RRGGBB`",
+                    file.display()
+                )),
+            }
+        })
+        .collect()
+}
+
 /// Reads a pointer's picture: a first line `WIDTH HEIGHT HOTSPOT_X HOTSPOT_Y`, then the pixels.
 fn read_cursor_image(file: &std::path::Path) -> Result<(Vec<u8>, u16, u16, u16, u16), String> {
     let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
@@ -294,6 +341,9 @@ fn read_cursor_image(file: &std::path::Path) -> Result<(Vec<u8>, u16, u16, u16, 
 
 impl App {
     fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        if let Some(file) = &self.args.colours {
+            picture::show_colours_as(read_colours(file)?);
+        }
         let (width, height) = self.args.size;
         let mut attributes = Window::default_attributes()
             .with_title(self.args.title.clone())
@@ -478,6 +528,9 @@ impl App {
     /// every input that has been waiting for it.
     fn next_frame(&mut self) -> Result<(), String> {
         let waiting = std::mem::take(&mut self.waiting);
+        if !waiting.is_empty() {
+            self.hold();
+        }
         for _ in &waiting {
             self.shade = self.shade.toggled();
         }
@@ -523,6 +576,7 @@ impl App {
             });
             return Ok(true);
         }
+        self.hold();
         self.shade = self.shade.toggled();
         if !self.draw()? {
             self.shade = self.shade.toggled();
@@ -564,6 +618,13 @@ impl App {
             .map_err(|e| format!("cannot write the log: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Waits as long as `--hold-ms` says before an input is answered.
+    fn hold(&self) {
+        if self.args.hold_ms > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(self.args.hold_ms / 1000.0));
+        }
     }
 
     fn flash_by_hand(&mut self, source: InputSource, input_ns: u64) -> Result<(), String> {
@@ -837,6 +898,19 @@ mod tests {
         assert!(read_cursor_image(&file).is_err());
         std::fs::write(&file, b"no line break").unwrap();
         assert!(read_cursor_image(&file).is_err());
+        // Pairs of colours: two words of six hexadecimal digits a line, nothing else.
+        std::fs::write(&file, "1E2026 1B1D20\n\nC8CCD4 BFC4CA\n").unwrap();
+        assert_eq!(
+            read_colours(&file).unwrap(),
+            vec![
+                (Rgb::new(0x1E, 0x20, 0x26), Rgb::new(0x1B, 0x1D, 0x20)),
+                (Rgb::new(0xC8, 0xCC, 0xD4), Rgb::new(0xBF, 0xC4, 0xCA)),
+            ]
+        );
+        std::fs::write(&file, "1E2026 1B1D2\n").unwrap();
+        assert!(read_colours(&file).is_err());
+        std::fs::write(&file, "1E2026 1B1D20 000000\n").unwrap();
+        assert!(read_colours(&file).is_err());
         // `--whole-display` and `--fullscreen` are two ways to the same thing: one at a time.
         assert!(
             Args::try_parse_from(["istesso-flash", "--whole-display", "--fullscreen"]).is_err()

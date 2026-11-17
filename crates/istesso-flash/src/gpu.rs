@@ -110,6 +110,7 @@ pub struct Gpu {
 }
 
 fn colour(rgb: Rgb) -> [f32; 3] {
+    let rgb = picture::shown(rgb);
     [
         f32::from(rgb.r) / 255.0,
         f32::from(rgb.g) / 255.0,
