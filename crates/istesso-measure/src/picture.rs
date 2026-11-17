@@ -24,10 +24,34 @@
 //! judges what a relay did to a frame has to make the very same frame again
 //! to compare with ([`crate::quality`]).
 
+use std::sync::OnceLock;
+
 use crate::flash::{Rgb, Shade};
+
+/// Colours to show in place of the pictures' own, for one process: see [`show_colours_as`].
+static SHOWN: OnceLock<Vec<(Rgb, Rgb)>> = OnceLock::new();
+
+/// From now on, in this process, every colour named first in a pair is shown as the second.
+///
+/// For the guess test only: there the test application on the client has to look like the
+/// relayed one, colours included, so that a difference in colour does not give away what a
+/// difference in latency should. A tool that judges a relay's picture never calls this. Only
+/// the first call counts.
+pub fn show_colours_as(pairs: Vec<(Rgb, Rgb)>) {
+    let _ = SHOWN.set(pairs);
+}
+
+/// The colour that is shown for `colour`: itself, unless [`show_colours_as`] said otherwise.
+pub fn shown(colour: Rgb) -> Rgb {
+    SHOWN
+        .get()
+        .and_then(|pairs| pairs.iter().find(|(from, _)| *from == colour))
+        .map_or(colour, |(_, to)| *to)
+}
 
 /// softbuffer's pixel layout: 0x00RRGGBB.
 pub fn pixel(colour: Rgb) -> u32 {
+    let colour = shown(colour);
     u32::from(colour.r) << 16 | u32::from(colour.g) << 8 | u32::from(colour.b)
 }
 
