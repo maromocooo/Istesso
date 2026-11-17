@@ -49,6 +49,7 @@ impl Project {
         std::fs::write(&script, "#!/bin/sh\npwd > marker\nexit 3\n").unwrap();
         // Whatever the umask: the task file and its folder must not be
         // writable by others, or they are refused.
+        set_mode(&base, 0o755);
         set_mode(&root, 0o755);
         set_mode(&root.join(".istesso"), 0o755);
         set_mode(&root.join(".istesso/tasks.json"), 0o644);

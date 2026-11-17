@@ -16,6 +16,14 @@
 //!   them may be writable by group or others, and none may carry an access
 //!   control list (ACL) at all, since an ACL can grant writing beyond the
 //!   mode bits.
+//! - Every folder above the boundary, up to the root of the file system,
+//!   must belong to this user or to root and must not be writable by group
+//!   or others unless its sticky bit is set (in a sticky folder no one can
+//!   rename or remove another user's entries, so a project under a shared
+//!   temporary folder is judged by its own folders). Otherwise someone could
+//!   swap the whole project for a tree of their own. ACLs are not refused up
+//!   there: on macOS a user's Documents, Desktop and Downloads carry a
+//!   deny-delete ACL by default, and projects live under them.
 //! - The file is opened once; its owner and mode are checked on the open
 //!   handle, and the text is read from that same handle. The ACL is checked
 //!   by path, which is sound because no one else can write to the folders
@@ -48,6 +56,11 @@ pub enum FindError {
     NotOwned { path: PathBuf },
     /// The file or a folder leading to it can be written by group or others.
     Writable { path: PathBuf },
+    /// A folder above the project's root belongs to another user.
+    AboveNotOwned { path: PathBuf },
+    /// A folder above the project's root can be written by group or others
+    /// and is not sticky.
+    AboveWritable { path: PathBuf },
     /// The file or a folder leading to it carries an access control list.
     HasAcl { path: PathBuf },
     /// A link that leads out of the place it must stay in.
@@ -70,6 +83,16 @@ impl fmt::Display for FindError {
             FindError::Writable { path } => write!(
                 f,
                 "{} is not used: others can write to it, {run_as_you} (`chmod go-w` it if that is not meant)",
+                path.display()
+            ),
+            FindError::AboveNotOwned { path } => write!(
+                f,
+                "the project is not used: {}, a folder above it, belongs to another user, who could replace the project with their own, {run_as_you}",
+                path.display()
+            ),
+            FindError::AboveWritable { path } => write!(
+                f,
+                "the project is not used: others can write to {}, a folder above it, and could replace the project with their own, {run_as_you} (`chmod go-w` it, or set its sticky bit, if that is not meant)",
                 path.display()
             ),
             FindError::HasAcl { path } => write!(
@@ -128,6 +151,9 @@ pub fn find_tasks_within(start: &Path, home: Option<&Path>) -> Result<Option<Fou
                 break;
             }
             check_folder(step)?;
+        }
+        for above in boundary.ancestors().skip(1) {
+            check_above(above)?;
         }
         let text = read_checked(&real)?;
         return Ok(Some(Found {
@@ -204,6 +230,32 @@ fn check_folder(path: &Path) -> Result<(), FindError> {
 
 #[cfg(not(unix))]
 fn check_folder(_path: &Path) -> Result<(), FindError> {
+    Ok(())
+}
+
+/// A folder above the project's root: this user's or root's, and not
+/// writable by group or others unless sticky. Its ACL is not looked at.
+#[cfg(unix)]
+fn check_above(path: &Path) -> Result<(), FindError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| unreadable(path, e))?;
+    let uid = meta.uid();
+    if uid != effective_uid() && uid != 0 {
+        return Err(FindError::AboveNotOwned {
+            path: path.to_path_buf(),
+        });
+    }
+    let sticky = meta.mode() & 0o1000 != 0;
+    if meta.mode() & 0o022 != 0 && !sticky {
+        return Err(FindError::AboveWritable {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_above(_path: &Path) -> Result<(), FindError> {
     Ok(())
 }
 
@@ -293,15 +345,21 @@ fn has_acl(listing: &str, macos: bool) -> bool {
     }
 }
 
-/// The user this process runs as.
+/// The user this process runs as (its effective user id).
+///
+/// The standard library has no safe call that gives the effective user id
+/// (`std::os::unix` exposes the owner of files, not of the process), and
+/// this crate takes no new dependency, so the C library's `geteuid` is
+/// declared here; it is the crate's only `unsafe`.
 #[cfg(unix)]
 pub(crate) fn effective_uid() -> u32 {
     extern "C" {
         fn geteuid() -> u32;
     }
-    // SAFETY: geteuid(2) takes no arguments, always succeeds and touches no
-    // memory of the caller. `uid_t` is a 32-bit unsigned integer on the
-    // Unix systems this builds for (Linux, macOS).
+    // SAFETY: geteuid(2) cannot fail: POSIX says it "shall always be
+    // successful", it takes no arguments and touches no memory of the
+    // caller. `uid_t` is a 32-bit unsigned integer on the Unix systems this
+    // builds for (Linux, macOS), which matches the declaration.
     unsafe { geteuid() }
 }
 
@@ -321,6 +379,9 @@ mod tests {
                 .join(format!("istesso-route-find-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
+            // It is above every project here, so it must pass that check
+            // whatever the umask.
+            set_mode(&dir, 0o755);
             Base(dir.canonicalize().unwrap())
         }
 
@@ -633,5 +694,74 @@ mod tests {
             base.find("proj").unwrap_err(),
             FindError::HasAcl { path: folder }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_under_a_group_writable_parent_is_refused() {
+        let base = Base::new("above-writable");
+        base.project("outer/proj");
+        base.tasks("outer/proj");
+        let outer = base.0.join("outer");
+        set_mode(&outer, 0o775);
+        let err = base.find("outer/proj").unwrap_err();
+        assert_eq!(
+            err,
+            FindError::AboveWritable {
+                path: outer.clone()
+            }
+        );
+        assert!(err.to_string().contains("a folder above it"));
+        set_mode(&outer, 0o757);
+        assert!(matches!(
+            base.find("outer/proj"),
+            Err(FindError::AboveWritable { .. })
+        ));
+        set_mode(&outer, 0o755);
+        assert!(base.find("outer/proj").unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_under_a_sticky_shared_folder_is_judged_by_its_own_folders() {
+        let base = Base::new("above-sticky");
+        base.project("shared/proj");
+        base.tasks("shared/proj");
+        let shared = base.0.join("shared");
+        set_mode(&shared, 0o1777);
+        assert!(base.find("shared/proj").unwrap().is_some());
+        // Its own folders still count.
+        set_mode(&base.0.join("shared/proj"), 0o1777);
+        assert!(matches!(
+            base.find("shared/proj"),
+            Err(FindError::Writable { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_usual_home_layout_is_accepted() {
+        // A home folder of the user's own (0750), a Documents folder (0700)
+        // that on macOS carries the default deny-delete ACL, and a project
+        // in it. Everything above is whatever the temporary folder sits in.
+        let base = Base::new("home-layout");
+        base.dir("me/Documents/work");
+        set_mode(&base.0.join("me"), 0o750);
+        set_mode(&base.0.join("me/Documents"), 0o700);
+        if cfg!(target_os = "macos") {
+            let status = std::process::Command::new("/bin/chmod")
+                .args(["+a", "everyone deny delete"])
+                .arg(base.0.join("me/Documents"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        base.project("me/Documents/work/proj");
+        let file = base.tasks("me/Documents/work/proj");
+        let home = base.0.join("me");
+        let found = find_tasks_within(&base.0.join("me/Documents/work/proj"), Some(&home))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.file, file);
     }
 }

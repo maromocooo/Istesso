@@ -37,6 +37,7 @@ fn prepare() -> Folder {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::create_dir_all(root.join(".istesso")).unwrap();
     std::fs::write(root.join(".istesso/tasks.json"), TASKS).unwrap();
+    set_mode(&base, 0o755);
     set_mode(&root, 0o755);
     set_mode(&root.join(".istesso"), 0o755);
     set_mode(&root.join(".istesso/tasks.json"), 0o644);
