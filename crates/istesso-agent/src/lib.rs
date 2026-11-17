@@ -22,8 +22,8 @@ pub use passing::PassLog;
 pub use paths::Paths;
 pub use serve::{Agent, AgentOptions};
 pub use survey::{
-    connect_peer, connect_peer_at, connect_peer_or_say_why, connect_peer_within, survey,
-    ConnectFailure, HostView, SurveyOptions,
+    connect_peer, connect_peer_and_say_where, connect_peer_at, connect_peer_or_say_why,
+    connect_peer_within, survey, ConnectFailure, HostView, Reaching, SurveyOptions,
 };
 
 #[cfg(test)]
