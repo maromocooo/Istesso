@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "project": "check-d",
+  "tasks": {
+    "core":         { "kind": "build",  "needs": { "tools": ["cargo"] },
+                      "command": ["/bin/echo", "core"] },
+    "flash-build":  { "kind": "build",  "needs": { "tools": ["cargo"] },
+                      "command": ["/bin/echo", "flash-build"] },
+    "screen-probe": { "kind": "run",    "needs": { "os": "macos" },
+                      "command": ["/bin/echo", "screen-probe"] },
+    "mac-host":     { "kind": "run",    "needs": { "os": "macos" },
+                      "prefers": { "roles": ["always_on_candidate"] },
+                      "command": ["/bin/echo", "mac-host"] },
+    "linux-host":   { "kind": "run",    "needs": { "os": "linux", "roles": ["gpu", "hardware_encode"] },
+                      "command": ["/bin/echo", "linux-host"] },
+    "apple-build":  { "kind": "build",  "needs": { "roles": ["xcode_build"] },
+                      "command": ["/bin/echo", "apple-build"] },
+    "windows-app":  { "kind": "build",  "needs": { "os": "windows" },
+                      "command": ["/bin/echo", "windows-app"] },
+    "site":         { "kind": "deploy", "needs": { "roles": ["always_on_candidate"] },
+                      "command": ["/bin/echo", "site"] },
+    "quantum":      { "kind": "build",  "needs": { "roles": ["quantum"] },
+                      "command": ["/bin/echo", "quantum"] }
+  }
+}

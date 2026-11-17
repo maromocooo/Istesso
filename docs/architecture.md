@@ -40,7 +40,14 @@
 | `istesso-pair` | ペアリング（SPAKE2、鍵の固定、失効） | 実装済み |
 | `istesso-link` | 固定した鍵で相互認証する制御チャンネル（Noise XX）と、その上のメッセージ | 実装済み |
 | `istesso-agent` | エージェント（問い合わせへの応答、全端末の調査、LAN 内の発見、最後に見えた内容の記憶） | 実装済み。常駐サービス化は未着手 |
-| `istesso-cli` | コマンド `istesso` | 実装済み |
+| `istesso-cli` | コマンド `istesso` | 実装済み。`istesso input relay` は、窓で受けたキーボードとマウスの入力を、制御チャンネルでホストへ送る（ADR 0007） |
+| `istesso-measure` | 遅延の計測の記録と集計（ログの形式、統計、追加遅延の計算、手元の窓との差、入力の間隔）。テストアプリの絵と、画質の比べ方（SSIM、PSNR）もここにある | 実装済み。受信側の中から時刻を記録する部分は未着手 |
+| `istesso-flash` | 遅延の計測に使うテストアプリ（入力のたびに窓の色を切り替える） | 実装済み。macOS、X11、Wayland（仮想コンポジターの中）で動作を確認 |
+| `macos/screen-probe`（Swift） | 遅延の計測の道具。Mac の画面を読み、手元の窓と中継した窓の反応の時刻を記録する（ADR 0008） | 実装済み。製品には入れない |
+| `macos/gst-viewer`（Objective-C） | 手順 3 の受信側。GStreamer のパイプラインの映像を、指定した位置の窓に出す。フレームごとに、届いた時刻、復号した時刻、描いた時刻を記録できる。GStreamer の復号の代わりに、VideoToolbox で直接復号して窓のレイヤーに渡すこともできる。その形では、4:4:4 のストリームを色を間引かずに出し、sRGB と伝えられた絵を手元の窓と同じ色で出し、キーフレームが要るときに送信側へ求める。窓の中のキーボードとマウスの操作を、手元のソケットに書き出すこともできる。GStreamer の代わりに、`istesso-media` の暗号化した経路からフレームを受け取ることもできる（`ISTESSO_CHANNEL`） | 計測と、最初の試用のためのもの。手順 4 の自前の受信側に置き換える |
+| `scripts/m1-step3-host.py`、`scripts/m1-step3-breakdown.py`、`scripts/m1-channel-check.py`（Python） | 手順 3 の送信側と、内訳の集計。フレームごとの時刻を記録し、入力から表示までをどこで使っているかを出す。送信側は、暗号化していない UDP のほかに、`istesso-media` の暗号化した経路へも出せる（`--to-channel`）。`m1-channel-check.py` は、画面の計測なしで、フレームの数と、1 台の時計で閉じる区間を出す | 計測のためだけのもの。手順 4 の自前の実装では、同じ時刻を中から記録する |
+| `scripts/m1-quality.py`、`scripts/m1_encoder.py`（Python） | 画質の計測。送信側と同じ設定のエンコーダーに、テストアプリの絵を通して比べる | 計測のためだけのもの |
+| `istesso-media` | 映像を、ペアリング済みで「閲覧」の権限を持つ端末へ、制御チャンネルと同じ通信路で運ぶ（[ADR 0015](adr/0015-media-transport.md)）。送る側と受ける側、フレームの並び、流しているあいだの権限の確かめ直し、キーフレームの求め。C から呼ぶ口（`crates/istesso-media/include/istesso_media.h`）があり、共有ライブラリーと静的ライブラリーにもなる。圧縮と復号は、ここではしない | 実装済み（ADR 0015 は提案）。いまの使い手は、計測の道具（ホストのパイプラインと、Mac のビューアー）。封と開封にかかる時間は `cargo run --release -p istesso-media --example seal-bench` で測る |
 | `istesso-audio` | 音の出口と配信 | 未着手 |
 | `istesso-media-*` | OS ごとの取り込み・圧縮・入力 | 未着手 |
 | `istesso-device-api` | 機器のアダプターに渡す口（[ADR 0012](adr/0012-device-framework.md)）。アダプターは、これにしか依存しない。依存クレートを持たない | 実装済み。口は固めていない（版 0） |
@@ -54,7 +61,7 @@ OS ごとの違いは、次の4つの口の裏に閉じ込めます。Windows �
 | 口 | macOS | Linux | Windows（将来） |
 |---|---|---|---|
 | 取り込みと圧縮 | ScreenCaptureKit + VideoToolbox | 仮想コンポジター + NVENC | Windows.Graphics.Capture + Media Foundation |
-| 入力 | CGEvent | 仮想入力デバイス（uinput） | SendInput、仮想ゲームパッド |
+| 入力 | CGEvent | 仮想コンポジターに直接渡す（[ADR 0009](adr/0009-host-compositor.md)）。仮想入力デバイス（uinput）は、ゲームパッドが要るようになったら考える | SendInput、仮想ゲームパッド |
 | アプリ管理 | `.app`、Homebrew | `.desktop`、apt | スタートメニュー、winget |
 | 起床 | 差し替え式（Wake-on-LAN など） | 同左 | 同左 |
 
