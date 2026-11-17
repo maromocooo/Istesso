@@ -25,4 +25,5 @@ pub mod render;
 pub mod session;
 #[cfg(feature = "pipeline")]
 pub mod stage;
+pub mod wake;
 pub mod words;
