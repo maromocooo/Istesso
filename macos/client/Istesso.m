@@ -319,10 +319,12 @@ static void show_cursor(uint32_t shape, CGImageRef image, CGSize pixels, CGPoint
     }
 }
 
-// ---- When the connection is cut ----
+// ---- When a connection is cut ----
 //
-// What the window shows while the picture is not the host's picture of this moment, and what is
-// passed on of the keyboard and the pointer meanwhile. Only touched on the main thread.
+// What the window shows while the picture is not the host's picture of this moment, or while
+// what is typed does not reach the host although the picture runs, and what is passed on of the
+// keyboard and the pointer meanwhile: nobody is to type into a window that does not pass it on
+// without knowing (ADR 0015, ADR 0018). Only touched on the main thread.
 
 static CALayer *dim_layer = nil;
 static CALayer *note_box = nil;
@@ -331,6 +333,12 @@ static CATextLayer *note_layer = nil;
 static BOOL picture_stale = NO;
 // The connection was cut and the picture is not back yet.
 static BOOL cut_pending = NO;
+// The picture's connection is over for good: its line stays whatever the input does.
+static BOOL picture_over = NO;
+// The input's conversation is not there (not open yet, or cut) and is being asked for.
+static BOOL input_away = NO, input_was_open = NO;
+static uint64_t away_noticed_ns = 0;
+static unsigned long away_generation = 0;
 static uint64_t cut_noticed_ns = 0;
 static unsigned long cut_generation = 0, note_generation = 0;
 // Presses that were not passed on since the cut, and presses that were passed on in the second
@@ -415,6 +423,13 @@ static void mark_the_picture(NSString *text) {
     }
 }
 
+// What the line says while something is being made again.
+static NSString *away_line(void) {
+    return input_away && !input_was_open && !cut_pending
+        ? @"Input is not available yet. What you type now does not arrive."
+        : @"Reconnecting. What you type now does not arrive.";
+}
+
 // The connection was cut and is being made again.
 static void picture_was_cut(uint64_t t) {
     if (cut_pending) {
@@ -423,9 +438,16 @@ static void picture_was_cut(uint64_t t) {
     cut_pending = YES;
     cut_noticed_ns = t;
     unsigned long generation = ++cut_generation;
-    held_back_count = 0;
-    in_doubt_count = presses_since(t > 1000000000ULL ? t - 1000000000ULL : 0);
-    NSString *line = @"Reconnecting. What you type now does not arrive.";
+    if (picture_stale) {
+        // The line is up already, for the input: it stays up, and the counts go on.
+        show_note(away_line());
+        return;
+    }
+    if (!input_away) {
+        held_back_count = 0;
+        in_doubt_count = presses_since(t > 1000000000ULL ? t - 1000000000ULL : 0);
+    }
+    NSString *line = away_line();
     if (in_doubt_count > 0) {
         // Somebody is typing: said at once.
         mark_the_picture(line);
@@ -439,6 +461,8 @@ static void picture_was_cut(uint64_t t) {
     });
 }
 
+static void take_the_line_down(void);
+
 // The first picture after a cut is on the screen.
 static void picture_is_back(void) {
     if (!cut_pending) {
@@ -446,6 +470,19 @@ static void picture_is_back(void) {
     }
     cut_pending = NO;
     cut_generation++;
+    if (input_away) {
+        // The picture is the host's again, but what is typed still does not arrive: a line
+        // that is up stays up (one that is not is the input's own to bring up).
+        if (picture_stale) {
+            show_note(away_line());
+        }
+        return;
+    }
+    take_the_line_down();
+}
+
+// Picture and input are both there again.
+static void take_the_line_down(void) {
     BOOL was_marked = picture_stale;
     picture_stale = NO;
     set_dim(NO);
@@ -485,6 +522,7 @@ static void picture_is_back(void) {
 static void picture_is_over(int32_t why) {
     cut_pending = NO;
     cut_generation++;
+    picture_over = YES;
     NSString *line;
     switch (why) {
         case ISTESSO_MEDIA_OVER_ENDED: line = @"The session has ended."; break;
@@ -497,6 +535,63 @@ static void picture_is_over(int32_t why) {
     }
     mark_the_picture(line);
     log_held_back(YES);
+}
+
+// The input's conversation is not there: it was cut, or it has not been open yet and the host
+// is asked again. The picture may well be running; what is typed does not arrive.
+static void input_went_away(uint64_t t) {
+    if (input_away || picture_over) {
+        return;
+    }
+    input_away = YES;
+    away_noticed_ns = t;
+    unsigned long generation = ++away_generation;
+    if (picture_stale) {
+        return;  // The line is up for the picture: it stays until both are back.
+    }
+    if (!cut_pending) {
+        held_back_count = 0;
+        in_doubt_count = presses_since(t > 1000000000ULL ? t - 1000000000ULL : 0);
+    }
+    if (in_doubt_count > 0) {
+        // Somebody is typing: said at once.
+        mark_the_picture(away_line());
+        return;
+    }
+    // As with the picture: one that is over before anybody could read a line is not said.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if (input_away && generation == away_generation && !picture_stale && !picture_over) {
+            // What was pressed since the input went away was handed on to nobody.
+            held_back_count += presses_since(away_noticed_ns);
+            mark_the_picture(away_line());
+        }
+    });
+}
+
+// The input's conversation is open (again).
+static void input_is_there(void) {
+    input_was_open = YES;
+    if (!input_away) {
+        return;
+    }
+    input_away = NO;
+    away_generation++;
+    if (cut_pending || picture_over) {
+        return;  // The picture's line stays.
+    }
+    take_the_line_down();
+}
+
+// The host refused for good: nothing is asked for any more. The title says so.
+static void input_is_over(void) {
+    if (!input_away) {
+        return;
+    }
+    input_away = NO;
+    away_generation++;
+    if (!cut_pending && !picture_over) {
+        take_the_line_down();
+    }
 }
 
 // ---- How often the connections were cut, where a person sees it ----
@@ -1022,8 +1117,9 @@ static void send_one(uint32_t kind, int32_t a, int32_t b) {
 
 // Called on the input's thread for what happens to its conversation with the host.
 static void on_input_told(void *context, int32_t event, uint64_t cuts, double after_ms, const char *why) {
-    static const char *const names[] = {"", "open", "cut", "back", "over"};
-    const char *name = event >= 1 && event <= 4 ? names[event] : "other";
+    static const char *const names[] = {"", "open", "cut", "back", "over", "not_yet"};
+    const char *name = event >= 1 && event <= 5 ? names[event] : "other";
+    uint64_t t = now_ns();
     atomic_store(&input_cuts, (long)cuts);
     if (frame_log != NULL) {
         fprintf(frame_log, "{\"kind\":\"input\",\"t_ns\":%llu,\"event\":\"%s\",\"reconnections\":%llu,\"after_ms\":%.1f}\n",
@@ -1034,9 +1130,20 @@ static void on_input_told(void *context, int32_t event, uint64_t cuts, double af
     } else if (event == ISTESSO_INPUT_OVER) {
         // The sentence holds no address and no key.
         fprintf(stderr, "note: the host does not take input from here: %s\n", why != NULL ? why : "");
+    } else if (event == ISTESSO_INPUT_NOT_YET) {
+        // Without the reason: when the host could not be reached, it names an address.
+        fprintf(stderr, "note: the host does not take input yet; asking again\n");
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        input_stands = event == ISTESSO_INPUT_OVER ? 2 : 1;
+        input_stands = event == ISTESSO_INPUT_OVER ? 2 : event == ISTESSO_INPUT_NOT_YET ? 0 : 1;
+        switch (event) {
+            case ISTESSO_INPUT_OPEN:
+            case ISTESSO_INPUT_BACK: input_is_there(); break;
+            case ISTESSO_INPUT_CUT:
+            case ISTESSO_INPUT_NOT_YET: input_went_away(t); break;
+            case ISTESSO_INPUT_OVER: input_is_over(); break;
+            default: break;
+        }
         show_counts();
     });
 }

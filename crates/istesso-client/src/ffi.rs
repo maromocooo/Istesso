@@ -136,6 +136,11 @@ pub unsafe extern "C" fn istesso_input_open(
             let context = &context;
             let (event, after_ms, why) = match what {
                 Told::Open => (1, 0.0, None),
+                Told::NotYet { why } => (
+                    5,
+                    0.0,
+                    Some(CString::new(why.replace('\0', " ")).unwrap_or_default()),
+                ),
                 Told::Cut => (2, 0.0, None),
                 Told::Back { after } => (3, after.as_secs_f64() * 1e3, None),
                 Told::Over { why } => (
@@ -588,6 +593,68 @@ mod tests {
     }
 
     #[test]
+    fn a_host_where_nothing_takes_input_yet_is_asked_again_and_says_so_once() {
+        let pair = Pair::new();
+        // The application was opened before the host's side was up: nothing listens
+        // where the agent passes input on.
+        let socket = pair.root.join("i.sock");
+        std::fs::remove_file(&socket).unwrap();
+        let heard: Heard = Mutex::new(Vec::new());
+        let (dir, address) = (c_path(&pair.root.join("d")), c(&pair.addr.to_string()));
+        // SAFETY: as in the tests above.
+        unsafe {
+            let input = istesso_input_open(
+                dir.as_ptr(),
+                c("a host").as_ptr(),
+                address.as_ptr(),
+                std::ptr::null(),
+                0,
+                Some(hear),
+                &heard as *const Heard as *mut c_void,
+            );
+            assert!(!input.is_null());
+            until("the word that it is not there yet", || {
+                !heard.lock().unwrap().is_empty()
+            });
+            // Asked again, about once a second, and not given up: said once, and it is
+            // neither open nor over.
+            std::thread::sleep(Duration::from_millis(2300));
+            {
+                let heard = heard.lock().unwrap();
+                assert_eq!(heard.len(), 1, "{heard:?}");
+                assert_eq!((heard[0].0, heard[0].1), (5, 0), "{heard:?}");
+                assert!(heard[0].2.contains("takes input"), "{heard:?}");
+            }
+            let mut state = IstessoInputState::default();
+            assert_eq!(istesso_input_state(input, &mut state), 0);
+            assert_eq!((state.open, state.over), (0, 0));
+
+            // The host's side comes up: the next question is answered, and keys arrive.
+            let taken = UnixDatagram::bind(&socket).unwrap();
+            until("the conversation", || {
+                heard.lock().unwrap().iter().any(|told| told.0 == 1)
+            });
+            assert_eq!(heard.lock().unwrap().len(), 2);
+            let key = IstessoInputEvent {
+                kind: 1,
+                a: 30,
+                b: 1,
+            };
+            istesso_input_send(input, &key, 1);
+            taken
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut buffer = [0u8; 512];
+            let length = taken.recv(&mut buffer).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&buffer[..length]).unwrap(),
+                r#"{"kind":"key","code":30,"pressed":true}"#
+            );
+            istesso_input_close(input);
+        }
+    }
+
+    #[test]
     fn a_device_that_may_not_control_is_told_so_once_and_what_it_hands_over_goes_nowhere() {
         let pair = Pair::new();
         let mut peers = PeerStore::open(Paths::at(pair.root.join("h")).peers()).unwrap();
@@ -710,7 +777,13 @@ mod tests {
             );
             assert!(!input.is_null());
             std::thread::sleep(Duration::from_millis(700));
-            assert!(heard.lock().unwrap().is_empty(), "nobody is there yet");
+            // Nobody is there yet: said once, however often it was asked meanwhile
+            // (four times a second), and it is not given up.
+            {
+                let heard = heard.lock().unwrap();
+                assert_eq!(heard.len(), 1, "{heard:?}");
+                assert_eq!((heard[0].0, heard[0].1), (5, 0), "{heard:?}");
+            }
             let mut state = IstessoInputState::default();
             assert_eq!(istesso_input_state(input, &mut state), 0);
             assert_eq!((state.open, state.over, state.cuts), (0, 0, 0));
@@ -729,12 +802,9 @@ mod tests {
             *leads_to.lock().unwrap() = Some(agent.local_addr().unwrap());
             std::thread::spawn(move || agent.run());
             until("the conversation", || {
-                heard
-                    .lock()
-                    .unwrap()
-                    .first()
-                    .is_some_and(|told| told.0 == 1)
+                heard.lock().unwrap().iter().any(|told| told.0 == 1)
             });
+            assert_eq!(heard.lock().unwrap().len(), 2);
             // A first attempt that found nobody is not a cut.
             assert_eq!(istesso_input_state(input, &mut state), 0);
             assert_eq!((state.open, state.cuts), (1, 0));

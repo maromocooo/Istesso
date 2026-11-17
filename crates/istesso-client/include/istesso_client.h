@@ -47,7 +47,12 @@ typedef struct IstessoInputState {
 #define ISTESSO_INPUT_OPEN 1 /* the first conversation is open */
 #define ISTESSO_INPUT_CUT 2  /* cut; it is being opened again */
 #define ISTESSO_INPUT_BACK 3 /* open again, `after_ms` after the cut */
-#define ISTESSO_INPUT_OVER 4 /* refused, with `why` in a sentence; nothing is tried after it */
+#define ISTESSO_INPUT_OVER 4 /* refused for good, with `why` in a sentence: the refusal is about
+                              * rights or about a request the host does not know; nothing is
+                              * tried after it */
+#define ISTESSO_INPUT_NOT_YET 5 /* no conversation yet, with `why`: the host could not be reached
+                                 * or has nothing that takes input at the moment; it is asked
+                                 * again. Told once, before ISTESSO_INPUT_OPEN */
 
 /*
  * Called on the input's thread, never on the caller's. `cuts` is the count so far. `why` is

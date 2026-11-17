@@ -15,15 +15,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use istesso_agent::passing::Mark;
-use istesso_agent::relay::{after_failure, Again, Connect, Happened, InputLine, LISTEN_EVERY};
+use istesso_agent::relay::{
+    after_failure, Again, Connect, Happened, InputLine, LISTEN_EVERY, RETRY, RETRY_SLOWLY, SOON_FOR,
+};
 use istesso_agent::PassLog;
 use istesso_proto::InputEvent;
 
 /// How long the thread waits for events while there is no conversation:
 /// an attempt to open one may be due at once.
 const WHILE_CLOSED: Duration = Duration::from_millis(5);
-/// How long after a failed first attempt the next one is made.
-const FIRST_RETRY: Duration = Duration::from_millis(500);
 /// What connecting and the handshake may take the first time.
 const FIRST_WITHIN: Duration = Duration::from_secs(3);
 
@@ -33,12 +33,18 @@ const FIRST_WITHIN: Duration = Duration::from_secs(3);
 pub enum Told {
     /// The first conversation is open.
     Open,
+    /// There is no conversation yet, and the host is asked again: it could
+    /// not be reached, or said that nothing on it takes input at the moment
+    /// (the application was opened before the host's side was up). Told
+    /// once, with the reason of the first attempt that failed.
+    NotYet { why: String },
     /// It was cut; it is being opened again.
     Cut,
     /// It is back, this long after it was cut.
     Back { after: Duration },
-    /// The host does not take input from here (any more), and said why.
-    /// Nothing is tried after this.
+    /// The host does not take input from here (any more), and said why: the
+    /// refusal is about rights (not paired, not allowed to control) or about
+    /// a request it does not know. Nothing is tried after this.
     Over { why: String },
 }
 
@@ -188,6 +194,8 @@ fn run(
     let mut first = make_connect();
     let mut due = Instant::now();
     let mut over = false;
+    // Since when the first conversation has been asked for in vain.
+    let mut in_vain_since: Option<Instant> = None;
     while !shared.stop.load(Ordering::SeqCst) {
         let open = line.as_ref().is_some_and(InputLine::is_open);
         // While a conversation is being opened, the attempt may be due at once. Once
@@ -224,9 +232,7 @@ fn run(
             }
             let opened = first(FIRST_WITHIN)
                 .map_err(|failure| (after_failure(&failure), failure.to_string()))
-                .and_then(|client| {
-                    InputLine::open(client, make_connect()).map_err(|(_, why)| (Again::Never, why))
-                });
+                .and_then(|client| InputLine::open(client, make_connect()));
             match opened {
                 Ok(opened) => {
                     let answered = opened.is_answered();
@@ -245,7 +251,25 @@ fn run(
                     set(&|state| state.over = Some(why.clone()));
                     tell(&Told::Over { why }, 0);
                 }
-                Err(_) => due = Instant::now() + FIRST_RETRY,
+                // A state that passes: asked again, at the pace the line uses for
+                // coming back after a cut.
+                Err((again, why)) => {
+                    let now = Instant::now();
+                    let since = match in_vain_since {
+                        Some(since) => since,
+                        None => {
+                            in_vain_since = Some(now);
+                            tell(&Told::NotYet { why }, 0);
+                            now
+                        }
+                    };
+                    let fresh = now.saturating_duration_since(since) < SOON_FOR;
+                    due = now
+                        + match again {
+                            Again::Soon if fresh => RETRY,
+                            _ => RETRY_SLOWLY,
+                        };
+                }
             }
             continue;
         };
