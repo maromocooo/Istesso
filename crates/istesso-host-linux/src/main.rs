@@ -388,7 +388,7 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
                     // When a key press was handed to the compositor. Never which key.
                     log.line(line::key_in(clock::now_ns()));
                 }
-                to_compositor.input(&input::for_compositor(&event), now);
+                to_compositor.input(&event, now);
                 taken.fetch_add(1, Ordering::Relaxed);
             });
             if let Err(error) = listened {
@@ -551,6 +551,8 @@ fn run(setup: Setup, display: Display) -> Result<(), String> {
     }
 
     stopping.store(true, Ordering::SeqCst);
+    // Each frame whose time stamp had to be moved on is in the log; this is how many.
+    log.line(line::restamps(session.stage().restamped()));
     session.stop();
     drop(session);
     for thread in threads {

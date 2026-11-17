@@ -87,6 +87,23 @@ pub fn for_compositor(event: &InputEvent) -> ForCompositor {
     }
 }
 
+/// Whether an input holds the sending again of the last frame back
+/// (`crate::gate`): whether it is likely to be answered by a new frame. A
+/// key or a button going down and scrolling are. A pointer that moves is
+/// not: it comes sixty and more times a second over a window that stands
+/// still, and holding back on it would stop every frame from being sent
+/// again and leave the encoder asleep for the click that follows. A key or
+/// button coming up is rarely answered by a frame either. (The Mac host
+/// decides the same way.)
+pub fn holds(event: &InputEvent) -> bool {
+    matches!(
+        event,
+        InputEvent::Key { pressed: true, .. }
+            | InputEvent::Button { pressed: true, .. }
+            | InputEvent::Scroll { .. }
+    )
+}
+
 /// Reads one datagram. `None` for anything that is not an event: it is
 /// dropped, and the next one is read.
 pub fn read(datagram: &[u8]) -> Option<InputEvent> {
@@ -248,6 +265,28 @@ mod tests {
             text(InputEvent::Scroll { dx: 0, dy: -15 }),
             "MouseAxis, x=(double)0.0, y=(double)-15.0"
         );
+    }
+
+    #[test]
+    fn presses_and_scrolling_hold_and_motion_and_releases_do_not() {
+        assert!(holds(&InputEvent::Key {
+            code: 30,
+            pressed: true
+        }));
+        assert!(holds(&InputEvent::Button {
+            code: 0x110,
+            pressed: true
+        }));
+        assert!(holds(&InputEvent::Scroll { dx: 0, dy: 3 }));
+        assert!(!holds(&InputEvent::PointerAt { x: 1, y: 2 }));
+        assert!(!holds(&InputEvent::Key {
+            code: 30,
+            pressed: false
+        }));
+        assert!(!holds(&InputEvent::Button {
+            code: 0x110,
+            pressed: false
+        }));
     }
 
     #[test]

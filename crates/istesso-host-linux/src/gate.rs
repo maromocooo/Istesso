@@ -65,6 +65,29 @@ pub enum Which {
     Repeat,
 }
 
+/// The time stamp a frame goes on with, and whether that is another than
+/// the one a new frame came with.
+///
+/// Time stamps must never go backwards into the encoder. A frame that is
+/// sent again is stamped with the pipeline's time now (`now`), or just
+/// after the last frame if that is later. A new frame keeps the stamp the
+/// compositor gave it (`own`), unless that is not later than the last
+/// frame's (`last`): the compositor may stamp a frame with the moment it
+/// began to render, which can lie before the "now" of a frame sent again
+/// just ahead of it. Such a frame goes on with the last stamp plus one, and
+/// the caller counts it and writes it down, so that no stamp is changed
+/// without the frame log saying so.
+pub fn stamp(which: Which, own: Option<u64>, last: Option<u64>, now: u64) -> (u64, bool) {
+    let after_last = last.map_or(0, |last| last + 1);
+    match (which, own) {
+        (Which::Repeat, _) => (now.max(after_last), false),
+        (Which::New, Some(own)) if own >= after_last => (own, false),
+        (Which::New, Some(_)) => (after_last, true),
+        // A frame that came without a stamp gets the time now.
+        (Which::New, None) => (now.max(after_last), true),
+    }
+}
+
 struct Inner<F> {
     open: bool,
     /// The last frame the compositor made, and whether it has been handed on.
@@ -193,19 +216,26 @@ impl<F: Clone> Gate<F> {
         Ok(())
     }
 
-    /// Notes that an input has come. Never waits.
+    /// Notes an input that holds the sending again back: one that is likely
+    /// to be answered by a new frame (`crate::input::holds`). Never waits.
     pub fn input(&self, now_ns: u64) {
         self.last_input_ns.store(now_ns, Ordering::Relaxed);
     }
 
-    /// When the last frame may next be sent again: `every_ns` after the
-    /// last frame went on and `hold_ns` after the last input, whichever is
-    /// later. An application's answer to an input then never finds the
-    /// encoder busy with a frame that shows nothing new.
+    /// When the last frame may next be sent again: on its beat, `every_ns`
+    /// after the last frame went on, or `hold_ns` after the last input that
+    /// holds, whichever is later. An application's answer to an input then
+    /// does not find the encoder busy with a frame that shows nothing new.
+    ///
+    /// But never more than `hold_ns` past the beat: under a steady stream of
+    /// key presses the frames sent again still come, every
+    /// `every_ns + hold_ns` at the least. Without that ceiling, typing
+    /// would stop them altogether and the encoder would be asleep for the
+    /// very frames that answer the typing. (The Mac host has the same rule.)
     pub fn due_ns(&self, every_ns: u64, hold_ns: u64) -> u64 {
-        let after_frame = self.last_frame_ns.load(Ordering::Relaxed) + every_ns;
-        let after_input = self.last_input_ns.load(Ordering::Relaxed) + hold_ns;
-        after_frame.max(after_input)
+        let beat = self.last_frame_ns.load(Ordering::Relaxed) + every_ns;
+        let held = self.last_input_ns.load(Ordering::Relaxed) + hold_ns;
+        beat.max(held).min(beat + hold_ns)
     }
 
     /// Sends the last frame again if it is time, through `push`.
@@ -474,6 +504,80 @@ mod tests {
             encoder.got(),
             [(1, Which::New), (2, Which::New), (2, Which::Repeat)]
         );
+    }
+
+    #[test]
+    fn presses_that_never_stop_do_not_stop_the_frames_sent_again() {
+        let (gate, encoder) = (Gate::new(true), Encoder::default());
+        let (every, hold) = (50 * MS, 50 * MS);
+        gate.frame(1, 0, encoder.push());
+        // A key press every 20 ms for two seconds, looked at every millisecond.
+        let mut sent = Vec::new();
+        for now in (1..=2_000).map(|ms| ms * MS) {
+            if now % (20 * MS) == 0 {
+                gate.input(now);
+            }
+            if gate.again(now, every, hold, encoder.push()) == Again::Sent {
+                sent.push(now);
+            }
+        }
+        // Held back, but never more than `hold` past its beat: one every 100 ms.
+        assert_eq!(sent.len(), 20, "{sent:?}");
+        assert_eq!(sent[0], 100 * MS);
+        assert!(sent
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] <= every + hold));
+    }
+
+    #[test]
+    fn a_pointer_that_moves_over_a_still_window_leaves_the_frames_sent_again_at_their_rate() {
+        use istesso_proto::InputEvent;
+        let (gate, encoder) = (Gate::new(true), Encoder::default());
+        let (every, hold) = (50 * MS, 50 * MS);
+        gate.frame(1, 0, encoder.push());
+        let mut sent = 0;
+        let mut motions = 0;
+        // 200 motions 8 ms apart, and the button coming up once among them.
+        for now in (1..=1_600).map(|ms| ms * MS) {
+            if now % (8 * MS) == 0 {
+                motions += 1;
+                let moved = InputEvent::PointerAt { x: 1, y: 1 };
+                let up = InputEvent::Button {
+                    code: 0x110,
+                    pressed: false,
+                };
+                for event in [moved, up] {
+                    if crate::input::holds(&event) {
+                        gate.input(now);
+                    }
+                }
+            }
+            if gate.again(now, every, hold, encoder.push()) == Again::Sent {
+                sent += 1;
+            }
+        }
+        assert_eq!(motions, 200);
+        // Twenty a second, as if nobody had touched anything.
+        assert_eq!(sent, 32);
+    }
+
+    #[test]
+    fn a_time_stamp_never_goes_backwards_and_a_changed_one_is_said() {
+        // A new frame keeps its stamp while that is later than the last one.
+        assert_eq!(stamp(Which::New, Some(100), None, 5), (100, false));
+        assert_eq!(stamp(Which::New, Some(0), None, 5), (0, false));
+        assert_eq!(stamp(Which::New, Some(101), Some(100), 5), (101, false));
+        // One that is not later goes on just after the last, and that is said.
+        assert_eq!(stamp(Which::New, Some(100), Some(100), 5), (101, true));
+        assert_eq!(stamp(Which::New, Some(40), Some(100), 5), (101, true));
+        assert_eq!(stamp(Which::New, None, Some(100), 500), (500, true));
+        // A frame sent again takes the time now, or just after the last.
+        assert_eq!(stamp(Which::Repeat, Some(40), Some(100), 500), (500, false));
+        assert_eq!(stamp(Which::Repeat, Some(40), Some(100), 90), (101, false));
+        // The case the rule is for: a frame is sent again at 500, and the
+        // compositor's next frame says 480, when it began to render.
+        let (again, _) = stamp(Which::Repeat, Some(400), Some(400), 500);
+        assert_eq!(stamp(Which::New, Some(480), Some(again), 510), (501, true));
     }
 
     #[test]

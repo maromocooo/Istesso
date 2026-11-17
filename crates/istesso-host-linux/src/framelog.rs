@@ -197,6 +197,25 @@ pub mod line {
         format!(r#"{{"kind":"frame_out","pts":{pts},"t_ns":{t_ns},"luma":-1{again}}}"#)
     }
 
+    /// A new frame went on with another time stamp than the compositor gave
+    /// it (`was`), because that one was not later than the last frame's.
+    /// Every line of this frame after the gate carries `pts`.
+    pub fn restamped(pts: u64, was: Option<u64>, t_ns: u64) -> String {
+        let was = was.map_or("null".to_string(), |was| was.to_string());
+        format!(r#"{{"kind":"restamped","pts":{pts},"was":{was},"t_ns":{t_ns}}}"#)
+    }
+
+    /// How many frames went on with a changed time stamp in all.
+    pub fn restamps(count: u64) -> String {
+        format!(r#"{{"kind":"restamps","count":{count}}}"#)
+    }
+
+    /// A new frame had to wait at the gate while another frame was being
+    /// handed on (one sent again, as a rule). `t_ns` is when it arrived.
+    pub fn gate_wait(pts: u64, t_ns: u64, waited_ns: u64) -> String {
+        format!(r#"{{"kind":"gate_wait","pts":{pts},"t_ns":{t_ns},"waited_ns":{waited_ns}}}"#)
+    }
+
     /// The frame left the colour conversion, on its way into the encoder.
     pub fn converted(pts: u64, t_ns: u64) -> String {
         format!(r#"{{"kind":"converted","pts":{pts},"t_ns":{t_ns}}}"#)
@@ -366,6 +385,19 @@ mod tests {
             r#"{"kind":"picture","t_ns":9,"state":"resumed","opened_ms":3.000,"encoded_ms":30.000,"written_ms":30.500,"key":1}"#
         );
         assert_eq!(line::input(7), r#"{"kind":"input","events":7}"#);
+        assert_eq!(
+            line::restamped(101, Some(40), 9),
+            r#"{"kind":"restamped","pts":101,"was":40,"t_ns":9}"#
+        );
+        assert_eq!(
+            line::restamped(101, None, 9),
+            r#"{"kind":"restamped","pts":101,"was":null,"t_ns":9}"#
+        );
+        assert_eq!(line::restamps(3), r#"{"kind":"restamps","count":3}"#);
+        assert_eq!(
+            line::gate_wait(1_000, 9, 250_000),
+            r#"{"kind":"gate_wait","pts":1000,"t_ns":9,"waited_ns":250000}"#
+        );
     }
 
     #[test]

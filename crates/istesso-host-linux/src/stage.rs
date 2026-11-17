@@ -32,8 +32,8 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 
 use crate::framelog::{line, FrameLog};
-use crate::gate::{Again, Gate, Went, Which};
-use crate::input::{ForCompositor, Value};
+use crate::gate::{self, Again, Gate, Went, Which};
+use crate::input::{self, ForCompositor, Value};
 
 /// The name of the bin that holds the encoder's side. A failure whose
 /// source sits inside a bin of this name is the encoder's, and never the
@@ -82,8 +82,11 @@ struct Shared {
     clock: fn() -> u64,
     notes: Mutex<Sender<Note>>,
     out: Arc<dyn Out>,
-    /// The time stamp of the last frame that went past the gate.
+    /// The time stamp of the last frame that went past the gate
+    /// ([`NO_FRAME_YET`] before the first).
     last_pts: AtomicU64,
+    /// How many new frames went on with another time stamp than their own.
+    restamped: AtomicU64,
     /// When each frame left the encoder, until it is handed on: the time
     /// travels with it. Both ends are on the encoder's thread.
     encoded_at: Mutex<VecDeque<(u64, u64)>>,
@@ -95,6 +98,13 @@ struct Shared {
     /// frame passes on it (for the `sched` switch).
     on_path_thread: Option<PathThread>,
 }
+
+/// What `last_pts` holds before any frame has gone past the gate.
+const NO_FRAME_YET: u64 = u64::MAX;
+
+/// A frame that waits for the gate's lock longer than this is written to
+/// the frame log: another frame, one sent again as a rule, was in its way.
+const WAIT_WORTH_WRITING_NS: u64 = 100_000;
 
 thread_local! {
     static KNOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -115,31 +125,54 @@ impl Shared {
         }
     }
 
-    /// Hands a frame on from the gate's source pad. A frame that goes on
-    /// once more gets a time stamp of its own, later than every one before.
-    fn push(&self, element: &GateElement, frame: gst::Buffer, which: Which) -> Result<(), String> {
-        let frame = match which {
-            Which::New => frame,
-            Which::Repeat => {
-                let after = self.last_pts.load(Ordering::Relaxed) + 1;
-                let now = element
-                    .current_running_time()
-                    .map_or(0, |time| time.nseconds());
-                let mut again = frame.copy();
-                let pts = after.max(now);
-                again
-                    .get_mut()
-                    .expect("a copy has one owner")
-                    .set_pts(gst::ClockTime::from_nseconds(pts));
-                if self.log.on() {
-                    self.log.line(line::frame_out(pts, (self.clock)(), true));
-                }
-                again
-            }
+    /// Hands a frame on from the gate's source pad: the one place a frame
+    /// goes into the encoder's side from, with the gate's lock held.
+    ///
+    /// Its time stamp is later than that of every frame before it
+    /// ([`gate::stamp`]): a frame that goes on once more gets one of its own,
+    /// and a new frame whose own is not later is given the next one, which
+    /// is counted and written to the frame log. `at_ns` is when the frame
+    /// came to the gate, for the log.
+    fn push(
+        &self,
+        element: &GateElement,
+        frame: gst::Buffer,
+        which: Which,
+        at_ns: u64,
+    ) -> Result<(), String> {
+        let own = frame.pts().map(|pts| pts.nseconds());
+        let last = match self.last_pts.load(Ordering::Relaxed) {
+            NO_FRAME_YET => None,
+            last => Some(last),
         };
-        if let Some(pts) = frame.pts() {
-            self.last_pts.store(pts.nseconds(), Ordering::Relaxed);
+        let now = element
+            .current_running_time()
+            .map_or(0, |time| time.nseconds());
+        let (pts, changed) = gate::stamp(which, own, last, now);
+        let frame = if own == Some(pts) {
+            frame
+        } else {
+            // The picture is shared; only what is written on it is this frame's own.
+            let mut stamped = frame.copy();
+            stamped
+                .get_mut()
+                .expect("a copy has one owner")
+                .set_pts(gst::ClockTime::from_nseconds(pts));
+            stamped
+        };
+        if changed {
+            self.restamped.fetch_add(1, Ordering::Relaxed);
         }
+        if self.log.on() {
+            // With the stamp the frame goes on with, so that this line and the
+            // lines after the gate are of the same frame.
+            self.log
+                .line(line::frame_out(pts, at_ns, which == Which::Repeat));
+            if changed {
+                self.log.line(line::restamped(pts, own, at_ns));
+            }
+        }
+        self.last_pts.store(pts, Ordering::Relaxed);
         match element.imp().srcpad.push(frame) {
             Ok(_) => Ok(()),
             Err(flow) => Err(format!(
@@ -204,13 +237,18 @@ mod imp {
             };
             shared.path_thread("frames");
             let now = (shared.clock)();
-            if shared.log.on() {
-                let pts = buffer.pts().map_or(0, |pts| pts.nseconds());
-                shared.log.line(line::frame_out(pts, now, false));
-            }
             let element = self.obj();
+            // A frame that stays at the shut gate is written to the log when,
+            // and if, it goes on.
             let went = shared.gate.frame(buffer, now, |frame, which| {
-                shared.push(&element, frame, which)
+                if shared.log.on() {
+                    let waited = (shared.clock)().saturating_sub(now);
+                    if waited > WAIT_WORTH_WRITING_NS {
+                        let pts = frame.pts().map_or(0, |pts| pts.nseconds());
+                        shared.log.line(line::gate_wait(pts, now, waited));
+                    }
+                }
+                shared.push(&element, frame, which, now)
             });
             if let Went::Refused(reason) = went {
                 shared.note(Note::EncoderFailed(reason));
@@ -326,7 +364,7 @@ impl Repeater {
     pub fn again(&self, every: Duration, hold: Duration) -> Duration {
         let (every_ns, hold_ns) = (every.as_nanos() as u64, hold.as_nanos() as u64);
         let now = (self.shared.clock)();
-        let push = |frame, which| self.shared.push(&self.gate, frame, which);
+        let push = |frame, which| self.shared.push(&self.gate, frame, which, now);
         match self.shared.gate.again(now, every_ns, hold_ns, push) {
             Again::Sent | Again::Idle => every,
             Again::Wait(wait_ns) => Duration::from_nanos(wait_ns),
@@ -348,11 +386,14 @@ pub struct ToCompositor {
 impl ToCompositor {
     /// Sends one event up the pipeline from the compositor's source pad,
     /// which is how the compositor takes its input. `at_ns` is when the
-    /// event was read; a frame is not sent again for a while after it.
-    pub fn input(&self, event: &ForCompositor, at_ns: u64) -> bool {
-        self.shared.gate.input(at_ns);
-        self.pad
-            .send_event(gst::event::CustomUpstream::new(structure_of(event)))
+    /// event was read. After an event that is likely to be answered by a new
+    /// frame ([`input::holds`]) no frame is sent again for a while.
+    pub fn input(&self, event: &istesso_proto::InputEvent, at_ns: u64) -> bool {
+        if input::holds(event) {
+            self.shared.gate.input(at_ns);
+        }
+        let told = structure_of(&input::for_compositor(event));
+        self.pad.send_event(gst::event::CustomUpstream::new(told))
     }
 
     /// Asks the application's windows to close, as a window manager's close
@@ -482,7 +523,8 @@ impl Stage {
             clock: plan.clock,
             notes: Mutex::new(plan.notes),
             out: plan.out,
-            last_pts: AtomicU64::new(0),
+            last_pts: AtomicU64::new(NO_FRAME_YET),
+            restamped: AtomicU64::new(0),
             encoded_at: Mutex::new(VecDeque::new()),
             first_awaited: AtomicBool::new(false),
             encoder_error: Mutex::new(None),
@@ -684,9 +726,10 @@ impl Stage {
         self.put_encoder_in()?;
         self.shared.first_awaited.store(true, Ordering::SeqCst);
         let (shared, gate) = (&self.shared, &self.gate);
-        let opened = shared.gate.open((shared.clock)(), |frame, which| {
-            shared.push(gate, frame, which)
-        });
+        let now = (shared.clock)();
+        let opened = shared
+            .gate
+            .open(now, |frame, which| shared.push(gate, frame, which, now));
         if let Err(reason) = opened {
             let said = self.encoder_error(Duration::from_millis(100));
             self.close_encoder();
@@ -723,6 +766,12 @@ impl Stage {
     /// names an element that does not exist is refused like a real one.
     pub fn set_encoder_side(&mut self, description: String) {
         self.encoder_side = description;
+    }
+
+    /// How many new frames went on with another time stamp than the
+    /// compositor gave them. Each is in the frame log; this is the count.
+    pub fn restamped(&self) -> u64 {
+        self.shared.restamped.load(Ordering::Relaxed)
     }
 
     /// Whether frames go on to an encoder.
@@ -1131,19 +1180,52 @@ mod tests {
         until("the three frames", || set.out.count() >= 3);
         std::thread::sleep(Duration::from_millis(60));
         let to_compositor = set.stage.to_compositor().unwrap();
-        let key = crate::input::for_compositor(&istesso_proto::InputEvent::Key {
+        let repeater = set.stage.repeater();
+        let (every, hold) = (Duration::from_millis(50), Duration::from_millis(50));
+        // The stand-in for the compositor takes no input; what counts is the note of it.
+        // A pointer that moves holds nothing back: the frame is sent again at once.
+        to_compositor.input(
+            &istesso_proto::InputEvent::PointerAt { x: 1, y: 1 },
+            clock(),
+        );
+        assert_eq!(repeater.again(every, hold), every);
+        assert_eq!(set.out.count(), 4);
+        // A key that goes down does.
+        let key = istesso_proto::InputEvent::Key {
             code: 30,
             pressed: true,
-        });
-        // The stand-in for the compositor takes no input; what counts is the note of it.
+        };
         to_compositor.input(&key, clock());
-        let repeater = set.stage.repeater();
-        let wait = repeater.again(Duration::from_millis(50), Duration::from_millis(50));
-        assert_eq!(set.out.count(), 3);
+        let wait = repeater.again(every, hold);
+        assert_eq!(set.out.count(), 4);
         assert!(
             wait > Duration::from_millis(30) && wait <= Duration::from_millis(50),
             "{wait:?}"
         );
+        set.stage.stop();
+    }
+
+    #[test]
+    fn frames_sent_again_among_the_compositor_s_own_never_take_the_stamps_backwards() {
+        let mut set = set(COMPOSITOR, ENCODER, false);
+        set.stage.start().unwrap().unwrap();
+        until("frames", || set.out.count() >= 5);
+        // As often as it can, with no quiet while asked for: frames sent again
+        // land between the compositor's own, stamped with the time now, which
+        // is later than the stamps the stand-in counts out for its frames.
+        let repeater = set.stage.repeater();
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(300) {
+            repeater.again(Duration::ZERO, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let frames = set.out.frames.lock().unwrap().clone();
+        assert!(frames.len() > 40, "{}", frames.len());
+        assert!(
+            frames.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "{frames:?}"
+        );
+        drop(frames);
         set.stage.stop();
     }
 
