@@ -35,7 +35,13 @@
 //                                                 the window and the person do
 //                               usage             nothing is switched: the frame log says at start
 //                                                 and end what the process used (processor time,
-//                                                 energy as the system bills it)
+//                                                 energy as the system bills it), at the end also
+//                                                 for each thread, and when the window was in front
+//                                                 (usage.h)
+//                               front             the application asks to be the active one and its
+//                                                 window the one that takes the keys, at the start
+//                                                 and again whenever it is not, and the log says
+//                                                 what came of it
 //   --command-key super       send the Command keys as Super instead of Control
 //   --config DIR              this device's identity and list of paired devices (default: where
 //                             `istesso` keeps them; ISTESSO_CONFIG_DIR works as well)
@@ -67,7 +73,11 @@
 // The other lines are those of the prototype, and: {"kind":"wake",...} with the switches that are
 // on, {"kind":"input","t_ns":T,"event":"open"|"cut"|"back"|"over","reconnections":N}, and with
 // --wake awake-spin or awake-tick {"kind":"awake","t_ns":T,"on":1|0} for when a core was kept
-// awake and {"kind":"awake","t_ns":T,"in_front":1|0} for when the window was the one in front.
+// awake. With those, with usage and with front: {"kind":"awake","t_ns":T,"in_front":1|0,
+// "active":1|0,"key":1|0,"visible":1|0,"role":N} whenever one of them changes (in front: the
+// application is the active one and the window takes the keys; visible: the window is not
+// wholly covered; role: usage.h). With front: {"kind":"front","t_ns":T,"event":"lost"|"asked"|
+// "granted"|"refused"|"gave_up","how":"activate"|"activate_ignoring_others"}.
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
@@ -75,8 +85,6 @@
 #import <IOSurface/IOSurface.h>
 #import <IOKit/hidsystem/IOLLEvent.h>
 #include <errno.h>
-#include <libproc.h>
-#include <mach/mach_time.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <signal.h>
@@ -86,6 +94,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "awake.h"
+#include "usage.h"
 #include "istesso_client.h"
 #include "istesso_media.h"
 
@@ -141,34 +150,23 @@ static void log_clock(void) {
             (unsigned long long)day.tv_sec * 1000000000ULL + (unsigned long long)day.tv_nsec);
 }
 
-// ---- What the process used (--wake usage) ----
+// ---- What the process used (--wake usage; usage.h) ----
 //
-// For reading what a switch costs (the one that keeps a core awake, awake.h) without root: the
-// system tells any program about itself how long it had the processor, how much of that on the
-// fast cores, and the energy it bills to the process. Written at the start and at the end; the
-// difference is the session's. It changes nothing else. (The system's own figure for this
-// process: it is not the power of the whole Mac.)
+// Switches nothing. The frame log says at start and end what the system counts for the process,
+// at the end also for each of its threads and on which cores the picture's thread was when a
+// frame arrived and when it was decoded; and, as with the switches below, when the window was
+// the one in front.
 static bool wake_usage = false;
 
-static void log_usage(const char *at) {
-    if (frame_log == NULL) {
-        return;
-    }
-    struct rusage_info_v6 used;
-    memset(&used, 0, sizeof used);
-    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&used) != 0) {
-        fprintf(frame_log, "{\"kind\":\"wake_effect\",\"t_ns\":%llu,\"usage\":\"%s\",\"read\":0}\n", (unsigned long long)now_ns(), at);
-        return;
-    }
-    // The times are in the units of the system's clock, not in nanoseconds.
-    mach_timebase_info_data_t base;
-    mach_timebase_info(&base);
-    double ms = (double)base.numer / base.denom / 1e6;
-    fprintf(frame_log, "{\"kind\":\"wake_effect\",\"t_ns\":%llu,\"usage\":\"%s\",\"read\":1,\"cpu_ms\":%.1f,\"fast_cpu_ms\":%.1f,\"energy_mj\":%.1f,\"fast_energy_mj\":%.1f}\n",
-            (unsigned long long)now_ns(), at, (used.ri_user_time + used.ri_system_time) * ms,
-            (used.ri_user_ptime + used.ri_system_ptime) * ms, used.ri_energy_nj / 1e6, used.ri_penergy_nj / 1e6);
-}
-
+// ---- Staying in front (--wake front) ----
+//
+// A measuring switch: the application asks to be the active one, and its window the one that
+// takes the keys, at the start and again whenever it stops being that, for the whole run. The
+// system may refuse an application that asks for itself; the log says what was asked and what
+// came of it. Not for a program that is handed out: it takes the front from whatever the
+// person turned to.
+static bool wake_front = false;
+static bool front_over = false;  // the program is ending: nothing is asked any more
 
 // Whether the next access unit has to be a key frame for the decoder to go on.
 static bool vt_needs_key_frame = true;
@@ -1140,7 +1138,13 @@ static void *channel_thread(void *unused) {
         IstessoMediaFrame frame;
         int32_t got = istesso_media_watch_next(watch, 250, &frame);
         if (got == 1) {
+            if (wake_usage) {
+                usage_sample(0);
+            }
             on_channel_frame(watch, &frame);
+            if (wake_usage) {
+                usage_sample(1);
+            }
             if (!shown && !vt_needs_key_frame) {
                 // The first picture is on the layer.
                 shown = true;
@@ -1305,11 +1309,11 @@ static bool start_frame_log(const char *path) {
 #ifdef ISTESSO_MEASURING
     fprintf(frame_log, ",\"keys_qos\":%d", wake_keys_qos);
 #endif
-    fprintf(frame_log, ",\"awake_spin\":%d,\"awake_tick\":%d,\"awake_session\":%d,\"usage\":%d", awake_form == AWAKE_SPIN,
-            awake_form == AWAKE_TICK, awake_whole_session, wake_usage);
+    fprintf(frame_log, ",\"awake_spin\":%d,\"awake_tick\":%d,\"awake_session\":%d,\"usage\":%d,\"front\":%d", awake_form == AWAKE_SPIN,
+            awake_form == AWAKE_TICK, awake_whole_session, wake_usage, wake_front);
     fprintf(frame_log, "}\n");
     if (wake_usage) {
-        log_usage("start");
+        usage_log_process(frame_log, "start");
     }
     log_clock();
     // The log reaches the disk twice a second, and once more when the program ends.
@@ -1332,6 +1336,7 @@ static void finish(void) {
         return;
     }
     finished = true;
+    front_over = true;
     awake_finish();
 #ifdef ISTESSO_MEASURING
     if (measure_keys != NULL) {
@@ -1355,7 +1360,9 @@ static void finish(void) {
     }
     if (frame_log != NULL) {
         if (wake_usage) {
-            log_usage("end");
+            usage_log_process(frame_log, "end");
+            usage_log_threads(frame_log);
+            usage_log_cores(frame_log, "picture", "frame_arrived", "frame_decoded");
         }
         log_clock();
         log_reconnections("end");
@@ -1836,31 +1843,152 @@ static void first_picture_is_there(void) {
 
 @end
 
-// ---- Keeping a fast core awake (awake.h): whether the window is the one in front ----
+// ---- Whether the window is the one in front (--wake awake-spin, awake-tick, usage, front) ----
+
+static void front_ask(void);
+static void front_look(bool first);
+
+// What was asked for the window to be in front again, and what came of it (--wake front).
+static int front_asked = 0;  // 0 nothing is asked; 1 asked with activate; 2 with activateIgnoringOtherApps
+static uint64_t front_asked_ns = 0;
+static unsigned front_refused = 0;  // askings in a row that the system did not grant
+static unsigned long front_asking = 0;
+
+static void front_say(const char *event, const char *how, double after_ms) {
+    if (frame_log == NULL) {
+        return;
+    }
+    fprintf(frame_log, "{\"kind\":\"front\",\"t_ns\":%llu,\"event\":\"%s\"", (unsigned long long)now_ns(), event);
+    if (how != NULL) {
+        fprintf(frame_log, ",\"how\":\"%s\"", how);
+    }
+    if (after_ms >= 0) {
+        fprintf(frame_log, ",\"after_ms\":%.1f", after_ms);
+    }
+    fprintf(frame_log, "}\n");
+}
+
+static const char *front_how(void) {
+    return front_asked == 1 ? "activate" : "activate_ignoring_others";
+}
 
 // The application is the active one and the window takes the keys. Looked at on the window's
-// thread whenever either changes; the log says each change, also with awake-session, where
-// nothing depends on it (it shows whether the rule could have held in that layout).
-static void awake_look(bool first) {
-    bool front = NSApp.active && the_window != nil && the_window.keyWindow;
-    if ((awake_set_in_front(front) || first) && frame_log != NULL) {
-        fprintf(frame_log, "{\"kind\":\"awake\",\"t_ns\":%llu,\"in_front\":%d}\n", (unsigned long long)now_ns(), front);
+// thread whenever one of them, or whether the window can be seen, changes; the log says each
+// change, and how the system treats the process at that moment (it may follow a little later,
+// so there is a second look half a second after every change).
+static void front_look(bool first) {
+    static int said[4] = {-1, -1, -1, -2};
+    BOOL active = NSApp.active, key = the_window != nil && the_window.keyWindow;
+    BOOL visible = the_window != nil && (the_window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+    int stands[4] = {active, key, visible, usage_role()};
+    bool front = active && key, was_front = atomic_load(&awake_in_front);
+    awake_set_in_front(front);
+    if (!first && memcmp(said, stands, sizeof said) == 0) {
+        return;
+    }
+    bool role_only = !first && memcmp(said, stands, 3 * sizeof *said) == 0;
+    memcpy(said, stands, sizeof said);
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"awake\",\"t_ns\":%llu,\"in_front\":%d,\"active\":%d,\"key\":%d,\"visible\":%d,\"role\":%d}\n",
+                (unsigned long long)now_ns(), front, active, key, visible, stands[3]);
+    }
+    if (!role_only) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
+            front_look(false);
+        });
+    }
+    if (!wake_front || front_over) {
+        return;
+    }
+    if (front) {
+        if (front_asked != 0) {
+            // What was asked for has come.
+            front_say("granted", front_how(), (now_ns() - front_asked_ns) / 1e6);
+        }
+        front_asked = 0;
+        front_refused = 0;
+        front_asking++;
+    } else if (was_front) {
+        front_say("lost", NULL, -1);
+        // Not from inside the notification that says so.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            front_ask();
+        });
     }
 }
 
-static void awake_watch_the_window(void) {
+// Asks the system for the front: first as an application asks since macOS 14 (the system
+// decides), and when that is not granted within a quarter of a second, with the older call.
+// Both are AppKit's own, and nothing else is tried. After both were refused it asks again every
+// two seconds, ten times, and then leaves it; whenever the front is lost anew it begins anew.
+static void front_ask(void) {
+    if (front_over || (NSApp.active && the_window.keyWindow)) {
+        return;
+    }
+    front_asked = front_asked == 1 ? 2 : 1;
+    if (@available(macOS 14.0, *)) {
+    } else {
+        front_asked = 2;  // Before macOS 14 there is only the older call.
+    }
+    // Said before it is asked: what comes of it may come during the call.
+    front_asked_ns = now_ns();
+    front_say("asked", front_how(), -1);
+    unsigned long asking = ++front_asking;
+    if (front_asked == 1) {
+        if (@available(macOS 14.0, *)) {
+            [NSApp activate];
+        }
+    } else {
+        [NSApp activateIgnoringOtherApps:YES];
+    }
+    [the_window makeKeyAndOrderFront:nil];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4), dispatch_get_main_queue(), ^{
+        if (asking != front_asking || front_over) {
+            return;  // Granted meanwhile, or the program is ending.
+        }
+        front_look(false);
+        if (asking != front_asking) {
+            return;  // In front after all: the look has said so.
+        }
+        front_say("refused", front_how(), (now_ns() - front_asked_ns) / 1e6);
+        if (front_asked == 1) {
+            front_ask();
+            return;
+        }
+        front_asked = 0;
+        if (++front_refused >= 10) {
+            front_say("gave_up", NULL, -1);
+            return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (asking == front_asking && !front_over) {
+                front_ask();
+            }
+        });
+    });
+}
+
+static void front_watch_the_window(void) {
     NSNotificationCenter *centre = NSNotificationCenter.defaultCenter;
     for (NSNotificationName name in @[NSApplicationDidBecomeActiveNotification, NSApplicationDidResignActiveNotification]) {
         [centre addObserverForName:name object:NSApp queue:nil usingBlock:^(NSNotification *note) {
-            awake_look(false);
+            front_look(false);
         }];
     }
-    for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification]) {
+    for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification,
+                                      NSWindowDidChangeOcclusionStateNotification]) {
         [centre addObserverForName:name object:the_window queue:nil usingBlock:^(NSNotification *note) {
-            awake_look(false);
+            front_look(false);
         }];
     }
-    awake_look(true);
+    front_look(true);
+    if (wake_front) {
+        // Once the application runs: started in the background, or behind another that came
+        // to the front meanwhile, it asks.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4), dispatch_get_main_queue(), ^{
+            front_ask();
+        });
+    }
 }
 
 #ifdef ISTESSO_MEASURING
@@ -1983,15 +2111,17 @@ int main(int argc, char *argv[]) {
                         awake_whole_session = true;
                     } else if (strcmp(each, "usage") == 0) {
                         wake_usage = true;
+                    } else if (strcmp(each, "front") == 0) {
+                        wake_front = true;
 #ifdef ISTESSO_MEASURING
                     } else if (strcmp(each, "keys-qos") == 0) {
                         wake_keys_qos = true;
 #endif
                     } else if (*each != '\0') {
 #ifdef ISTESSO_MEASURING
-                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical, awake-spin, awake-tick, awake-session, usage and keys-qos, not %s\n", each);
+                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical, awake-spin, awake-tick, awake-session, usage, front and keys-qos, not %s\n", each);
 #else
-                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical, awake-spin, awake-tick, awake-session and usage, not %s\n", each);
+                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical, awake-spin, awake-tick, awake-session, usage and front, not %s\n", each);
 #endif
                         return 2;
                     }
@@ -2083,10 +2213,13 @@ int main(int argc, char *argv[]) {
         if (frame_log_path != NULL && !start_frame_log(frame_log_path)) {
             return 1;
         }
+        if (awake_form != AWAKE_OFF || wake_usage || wake_front) {
+            // Without one of these switches nothing is watched.
+            front_watch_the_window();
+        }
         if (awake_form != AWAKE_OFF) {
-            // Before anything can hand input on. Without the switch: no thread, nothing watched.
+            // Before anything can hand input on. Without the switch: no thread.
             awake_log = frame_log;
-            awake_watch_the_window();
             if (!awake_start()) {
                 fprintf(stderr, "error: cannot start the thread that keeps a core awake\n");
                 return 1;

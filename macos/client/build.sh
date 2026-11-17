@@ -114,6 +114,8 @@ mkdir -p build
 cc -Wall -Wextra -o build/keys-test ../gst-viewer/keys-test.c && build/keys-test
 # When a fast core is kept awake (a measuring switch, ADR 0018): the rule, tested without a window.
 cc -Wall -Wextra -o build/awake-test awake-test.c && build/awake-test
+# What the process used (another measuring switch): that the lines are written as described.
+cc -Wall -Wextra -o build/usage-test usage-test.c && build/usage-test
 # The picture's and the input's connections come from the Rust crate istesso-client, linked statically.
 # (The measuring build's library goes to a folder of its own: the two are never mixed up.)
 (cd ../.. && cargo build --release -p istesso-client $features $target)
