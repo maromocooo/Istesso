@@ -277,7 +277,7 @@ impl Adapter for StreamDeckPlus {
             return Err(AdapterError::Malformed("firmware version is not text"));
         }
         (cx.emit)(Event::Info {
-            name: "firmware",
+            name: String::from("firmware"),
             value: version,
         });
 
