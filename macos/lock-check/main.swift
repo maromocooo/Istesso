@@ -522,8 +522,17 @@ final class Probe: NSObject, NSApplicationDelegate {
             let (moves1, clicks1) = (self.view.moves, self.view.clicks)
             answer.tap.posted = true
             self.pointer(.mouseMoved)?.post(tap: .cgSessionEventTap)
-            self.pointer(.leftMouseDown)?.post(tap: .cgSessionEventTap)
-            self.pointer(.leftMouseUp)?.post(tap: .cgSessionEventTap)
+            // Check again right before the click: the press and the release go together, so that a
+            // press is never left at the session tap without its release.
+            if let late = sessionTapRefusal(lock: lockState(), frontmost: self.frontmost,
+                                            topIsOwn: topWindowIsOwn(at: self.middle)) {
+                answer.tap.refusal = "the move was posted, the click was not: \(late)"
+            } else {
+                let down = self.pointer(.leftMouseDown)
+                let up = self.pointer(.leftMouseUp)
+                down?.post(tap: .cgSessionEventTap)
+                up?.post(tap: .cgSessionEventTap)
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
                 answer.tap.move = self.view.moves > moves1
                 answer.tap.click = self.view.clicks > clicks1
@@ -589,8 +598,10 @@ final class Probe: NSObject, NSApplicationDelegate {
             } else {
                 lines.append("  topmost window at the point: none")
             }
-            if let refusal = answer.tap.refusal {
+            if let refusal = answer.tap.refusal, !answer.tap.posted {
                 lines.append("  session tap: not posted, \(refusal)")
+            } else if let refusal = answer.tap.refusal {
+                lines.append("  session tap: \(refusal); move \(yes(answer.tap.move))")
             } else {
                 lines.append("  session tap (allowed by the rule): move \(yes(answer.tap.move)), click \(yes(answer.tap.click))")
             }
