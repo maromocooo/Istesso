@@ -334,6 +334,11 @@ static void show_cursor(uint32_t shape, CGImageRef image, CGSize pixels, CGPoint
 static CALayer *dim_layer = nil;
 static CALayer *note_box = nil;
 static CATextLayer *note_layer = nil;
+// A small line that stays, at the bottom left: this device may look at the host and not type.
+// The picture is not dimmed for it: looking is what the device is there for.
+static CALayer *standing_box = nil;
+static CATextLayer *standing_layer = nil;
+static BOOL view_only = NO;
 // No picture has been shown yet: the window is up and says so.
 static BOOL before_first_picture = YES;
 // The line is up: no key or button press is passed on.
@@ -395,6 +400,28 @@ static void show_note(NSString *text) {
         note_layer.string = text;
         note_box.hidden = NO;
     }
+    [CATransaction commit];
+}
+
+// Shows the standing line while the device may only look and there is a picture to look at.
+static void show_standing_note(void) {
+    BOOL on = view_only && !picture_over && cursor_view != nil && standing_box != nil;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (on) {
+        NSString *text = @"View only — what you type is not sent";
+        NSFont *font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+        NSSize fit = [text sizeWithAttributes:@{NSFontAttributeName : font}];
+        CGFloat width = ceil(fit.width) + 20, height = ceil(fit.height) + 10;
+        // The layer counts from the bottom left, as the view does.
+        standing_box.frame = CGRectMake(10, 10, width, height);
+        standing_layer.frame = CGRectMake(10, 5, width - 20, height - 10);
+        standing_layer.font = (__bridge CFTypeRef)font;
+        standing_layer.fontSize = 11;
+        standing_layer.contentsScale = cursor_view.window != nil ? cursor_view.window.backingScaleFactor : 2;
+        standing_layer.string = text;
+    }
+    standing_box.hidden = !on;
     [CATransaction commit];
 }
 
@@ -533,6 +560,7 @@ static void picture_is_over(int32_t why) {
     cut_pending = NO;
     cut_generation++;
     picture_over = YES;
+    show_standing_note();  // The reason the picture ended is what the window says now.
     NSString *line;
     switch (why) {
         case ISTESSO_MEDIA_OVER_ENDED: line = @"The session has ended."; break;
@@ -603,8 +631,11 @@ static void input_is_there(void) {
     take_the_line_down();
 }
 
-// The host refused for good: nothing is asked for any more. The title says so.
+// The host refused for good: nothing is asked for any more. The device may look and not type:
+// the title says so, and a small line that stays.
 static void input_is_over(void) {
+    view_only = YES;
+    show_standing_note();
     if (!input_away) {
         return;
     }
@@ -653,7 +684,7 @@ static void show_counts(void) {
     }
     long cuts = atomic_load(&input_cuts);
     NSString *input = cuts < 0 ? @"input off"
-        : input_stands == 2 ? @"input refused"
+        : input_stands == 2 ? @"view only"
         : input_stands == 0 ? @"input not open yet"
         : [NSString stringWithFormat:@"input %ld", cuts];
     counted_window.title =
@@ -1045,6 +1076,16 @@ static bool use_channel(NSView *view) {
     note_layer.foregroundColor = CGColorGetConstantColor(kCGColorWhite);
     [note_box addSublayer:note_layer];
     [vt_layer addSublayer:note_box];
+    standing_box = [CALayer layer];
+    standing_box.zPosition = 25;  // Above the dimming, below the line in the middle.
+    standing_box.hidden = YES;
+    standing_box.cornerRadius = 6;
+    standing_box.backgroundColor = CGColorCreateGenericGray(0.08, 0.82);
+    standing_layer = [CATextLayer layer];
+    standing_layer.alignmentMode = kCAAlignmentLeft;
+    standing_layer.foregroundColor = CGColorCreateGenericGray(1, 0.92);
+    [standing_box addSublayer:standing_layer];
+    [vt_layer addSublayer:standing_box];
     if (check_pretend_typing) {
         static dispatch_source_t typing;
         typing = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
