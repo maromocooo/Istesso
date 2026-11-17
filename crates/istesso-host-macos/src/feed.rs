@@ -6,6 +6,12 @@
 //! calls [`Feeder::picture`] for every new picture, [`Feeder::input`] for
 //! every input it delivers to the application, and [`Feeder::tick`] whenever
 //! [`Feeder::next_wake`] comes round.
+//!
+//! The feeder does not rely on being woken on time. A [`Feeder::tick`] that
+//! comes late hands over one repeat, not one for every beat it missed, and
+//! the next one is back on the 20-a-second beat (see [`KeepAwake`]). The
+//! capture loop should still run at the normal priority: woken too late,
+//! the rate falls towards 10 a second, where the encoder slows down again.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -96,7 +102,8 @@ impl Feeder {
 
     /// A new picture: encode it, and keep it for repeating.
     pub fn picture(&mut self, picture: PixelBuffer) -> Result<(), Error> {
-        self.hand_over(&picture)?;
+        let at = self.hand_over(&picture)?;
+        self.keep_awake.picture(at);
         self.with_counts(|c| c.pictures += 1);
         self.last = Some(picture);
         Ok(())
@@ -119,7 +126,7 @@ impl Feeder {
         };
         let outcome = self.hand_over(&last);
         self.last = Some(last);
-        outcome?;
+        self.keep_awake.repeated(outcome?);
         self.with_counts(|c| c.repeats += 1);
         Ok(true)
     }
@@ -150,7 +157,8 @@ impl Feeder {
         }
     }
 
-    fn hand_over(&mut self, picture: &PixelBuffer) -> Result<(), Error> {
+    /// Returns when the picture was handed over.
+    fn hand_over(&mut self, picture: &PixelBuffer) -> Result<Instant, Error> {
         let (key_frame, started) = {
             let mut shared = self
                 .shared
@@ -162,8 +170,7 @@ impl Feeder {
         let pts_ns = (now.duration_since(started).as_nanos() as u64).max(self.last_pts_ns + 1);
         self.last_pts_ns = pts_ns;
         self.encoder.encode(picture, pts_ns, pts_ns, key_frame)?;
-        self.keep_awake.handed(now);
-        Ok(())
+        Ok(now)
     }
 }
 

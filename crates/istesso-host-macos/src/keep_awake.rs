@@ -39,10 +39,20 @@ impl Default for KeepAwakeSettings {
 pub const HOLD_AFTER_INPUT: Duration = Duration::from_millis(50);
 
 /// When the last picture is to be handed over again.
+///
+/// The repeats keep a beat of `1 / fps` that starts at the last new picture.
+/// Nothing here depends on the caller waking exactly on time: a thread may be
+/// woken late (on the Air, at nice 19, a 50 ms sleep took about 115 ms).
+/// When a repeat is handed over late, the next one goes back onto the beat:
+/// it is the first beat at least half an interval after the late one.
+/// Beats that were missed are dropped, never made up for, so pictures are
+/// never bunched — no two repeats closer together than half an interval.
+/// While the caller is late by less than half an interval, the rate stays
+/// `fps`; when it is later, the rate falls, but the beat does not drift.
 #[derive(Debug, Clone)]
 pub struct KeepAwake {
     settings: KeepAwakeSettings,
-    last_handed: Option<Instant>,
+    next_beat: Option<Instant>,
     held_until: Option<Instant>,
 }
 
@@ -50,7 +60,7 @@ impl KeepAwake {
     pub fn new(settings: KeepAwakeSettings) -> Self {
         KeepAwake {
             settings,
-            last_handed: None,
+            next_beat: None,
             held_until: None,
         }
     }
@@ -59,9 +69,31 @@ impl KeepAwake {
         self.settings
     }
 
-    /// A picture, new or repeated, was handed to the encoder.
-    pub fn handed(&mut self, at: Instant) {
-        self.last_handed = Some(at);
+    /// `None` when switched off or at 0 a second.
+    fn interval(&self) -> Option<Duration> {
+        if !self.settings.enabled {
+            return None;
+        }
+        1_000_000_000u64
+            .checked_div(u64::from(self.settings.fps))
+            .map(Duration::from_nanos)
+    }
+
+    /// A new picture was handed to the encoder: the beat starts again from it.
+    pub fn picture(&mut self, at: Instant) {
+        self.next_beat = self.interval().map(|interval| at + interval);
+    }
+
+    /// The last picture was handed over again, at `at` (on time or late).
+    pub fn repeated(&mut self, at: Instant) {
+        let (Some(interval), Some(beat)) = (self.interval(), self.next_beat) else {
+            return;
+        };
+        let mut next = beat + interval;
+        while next < at + interval / 2 {
+            next += interval;
+        }
+        self.next_beat = Some(next);
     }
 
     /// An input for the session arrived.
@@ -76,14 +108,14 @@ impl KeepAwake {
     /// when it should not be at all: switched off, no device being shown
     /// the session (`viewed`), or no picture handed over yet.
     pub fn next_repeat(&self, viewed: bool) -> Option<Instant> {
-        if !self.settings.enabled || !viewed || self.settings.fps == 0 {
+        self.interval()?;
+        if !viewed {
             return None;
         }
-        let interval = Duration::from_nanos(1_000_000_000 / u64::from(self.settings.fps));
-        let after_last = self.last_handed? + interval;
+        let beat = self.next_beat?;
         Some(match self.held_until {
-            Some(held) => after_last.max(held),
-            None => after_last,
+            Some(held) => beat.max(held),
+            None => beat,
         })
     }
 
@@ -114,28 +146,73 @@ mod tests {
         let start = Instant::now();
         let mut keep = KeepAwake::new(KeepAwakeSettings::default());
         assert_eq!(keep.next_repeat(true), None, "nothing to repeat yet");
-        keep.handed(start);
+        keep.picture(start);
         assert_eq!(keep.next_repeat(true), Some(start + ms(50)));
         assert!(!keep.repeat_due(start + ms(49), true));
         assert!(keep.repeat_due(start + ms(50), true));
-        // A new picture moves the next repeat.
-        keep.handed(start + ms(30));
-        assert_eq!(keep.next_repeat(true), Some(start + ms(80)));
+        // On time: the next beat.
+        keep.repeated(start + ms(50));
+        assert_eq!(keep.next_repeat(true), Some(start + ms(100)));
+        // A new picture starts the beat again.
+        keep.picture(start + ms(70));
+        assert_eq!(keep.next_repeat(true), Some(start + ms(120)));
     }
 
     #[test]
     fn nothing_is_repeated_while_no_device_is_shown_the_session_or_when_it_is_off() {
         let start = Instant::now();
         let mut keep = KeepAwake::new(KeepAwakeSettings::default());
-        keep.handed(start);
+        keep.picture(start);
         assert_eq!(keep.next_repeat(false), None);
         assert!(!keep.repeat_due(start + ms(500), false));
         let mut off = KeepAwake::new(KeepAwakeSettings {
             enabled: false,
             ..KeepAwakeSettings::default()
         });
-        off.handed(start);
+        off.picture(start);
         assert_eq!(off.next_repeat(true), None);
+    }
+
+    /// Woken late every time: each repeat goes back onto the beat, missed
+    /// beats are dropped, and no two repeats come closer than half an interval.
+    fn repeats_when_woken(late: Duration, beats: u32) -> Vec<Duration> {
+        let start = Instant::now();
+        let mut keep = KeepAwake::new(KeepAwakeSettings::default());
+        keep.picture(start);
+        let mut handed = Vec::new();
+        for _ in 0..beats {
+            let due = keep.next_repeat(true).unwrap();
+            let woke = due + late;
+            assert!(keep.repeat_due(woke, true));
+            keep.repeated(woke);
+            handed.push(woke - start);
+        }
+        handed
+    }
+
+    #[test]
+    fn a_little_late_keeps_twenty_a_second_on_the_beat() {
+        let handed = repeats_when_woken(ms(7), 200);
+        // Every repeat is 7 ms after its beat: 57, 107, 157 ... ms; the beat does not drift.
+        for (n, at) in handed.iter().enumerate() {
+            assert_eq!(*at, ms(50 * (n as u64 + 1) + 7));
+        }
+    }
+
+    #[test]
+    fn very_late_drops_beats_and_never_bunches() {
+        // A 50 ms wait that takes 115 ms, as at nice 19 on the Air.
+        let handed = repeats_when_woken(ms(65), 50);
+        for pair in handed.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(gap >= ms(25), "two repeats {gap:?} apart");
+            // Always back on the beat (a multiple of 50 ms), then 65 ms late.
+            assert_eq!((pair[1].as_millis() - 65) % 50, 0, "{:?}", pair[1]);
+        }
+        // Fewer than twenty a second, but never more.
+        let span = *handed.last().unwrap() - handed[0];
+        let rate = (handed.len() - 1) as f64 / span.as_secs_f64();
+        assert!(rate < 20.0 && rate > 5.0, "{rate}");
     }
 
     #[test]
@@ -145,7 +222,7 @@ mod tests {
             hold_after_input: ms(50),
             ..KeepAwakeSettings::default()
         });
-        keep.handed(start);
+        keep.picture(start);
         keep.input(start + ms(40));
         assert_eq!(keep.next_repeat(true), Some(start + ms(90)));
         // A later input holds longer; an earlier one does not shorten it.
@@ -157,7 +234,7 @@ mod tests {
             hold_after_input: Duration::ZERO,
             ..KeepAwakeSettings::default()
         });
-        plain.handed(start);
+        plain.picture(start);
         plain.input(start + ms(40));
         assert_eq!(plain.next_repeat(true), Some(start + ms(50)));
     }
