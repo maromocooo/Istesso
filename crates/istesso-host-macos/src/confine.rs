@@ -53,13 +53,25 @@ pub enum Item {
     Pointer { x: f64, y: f64 },
 }
 
+/// Whether the screen is locked, as far as the session's state can be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lock {
+    Unlocked,
+    /// The ordinary state of a Mac host (docs/m4-plan.md 4.4): input must
+    /// still reach the application, so locked is not by itself a reason to
+    /// drop.
+    Locked,
+    /// The session's state could not be read at all (a program started
+    /// without a login session can get no answer). Treated as locked for
+    /// the session tap: it is refused.
+    Unknown,
+}
+
 /// The state of the Mac when the input is about to be delivered.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct State<'a> {
-    /// The screen is locked. This is the ordinary state of a Mac host
-    /// (docs/m4-plan.md 4.4): input must still reach the application, so
-    /// locked is not by itself a reason to drop.
-    pub locked: bool,
+    /// Whether the screen is locked.
+    pub lock: Lock,
     /// The process of the application this session shows, if there is one.
     pub session_app: Option<Pid>,
     /// The process that is frontmost now.
@@ -93,6 +105,9 @@ pub enum DropReason {
     NotFrontmost,
     /// The session tap is never used while the screen is locked.
     LockedSessionTap,
+    /// The session's state could not be read, so the session tap is refused
+    /// as if locked.
+    SessionStateUnknown,
     /// The topmost window under the pointer belongs to another process.
     OtherWindowOnTop,
     /// No window is under the pointer.
@@ -140,8 +155,10 @@ impl Confine {
         }
         // The session tap: unlocked only, application frontmost, and for a
         // pointer the topmost window under it must be the application's.
-        if state.locked {
-            return Delivery::Drop(DropReason::LockedSessionTap);
+        match state.lock {
+            Lock::Unlocked => {}
+            Lock::Locked => return Delivery::Drop(DropReason::LockedSessionTap),
+            Lock::Unknown => return Delivery::Drop(DropReason::SessionStateUnknown),
         }
         if state.frontmost != Some(app) {
             return Delivery::Drop(DropReason::NotFrontmost);
@@ -191,7 +208,7 @@ mod tests {
 
     fn state<'a>(locked: bool, frontmost: Pid, windows: &'a [Window]) -> State<'a> {
         State {
-            locked,
+            lock: if locked { Lock::Locked } else { Lock::Unlocked },
             session_app: Some(APP),
             frontmost: Some(frontmost),
             windows,
@@ -331,6 +348,31 @@ mod tests {
                 &state(false, APP, &windows)
             ),
             Delivery::SessionTap,
+        );
+    }
+
+    #[test]
+    fn an_unreadable_session_state_refuses_the_session_tap_but_not_direct_delivery() {
+        let windows = [window(APP, rect(0.0, 0.0, 100.0, 100.0))];
+        let unknown = State {
+            lock: Lock::Unknown,
+            ..state(false, APP, &windows)
+        };
+        let tap = Confine {
+            direct: false,
+            ..Confine::default()
+        };
+        assert_eq!(
+            tap.decide(Item::Key, &unknown),
+            Delivery::Drop(DropReason::SessionStateUnknown),
+        );
+        assert_eq!(
+            tap.decide(Item::Pointer { x: 10.0, y: 10.0 }, &unknown),
+            Delivery::Drop(DropReason::SessionStateUnknown),
+        );
+        assert_eq!(
+            Confine::default().decide(Item::Key, &unknown),
+            Delivery::ToProcess(APP),
         );
     }
 }
