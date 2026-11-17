@@ -18,9 +18,38 @@ pub struct KeepAwakeSettings {
     pub enabled: bool,
     /// Pictures a second while nothing changes.
     pub fps: u32,
-    /// After an input, no repeat for this long, so that the frame that
-    /// answers the input does not wait behind one (0: no holding back).
+    /// After an input that is likely answered by a picture, no repeat for
+    /// this long, so that the frame that answers it does not wait behind one
+    /// (0: no holding back). Never more than this past a repeat's own beat.
     pub hold_after_input: Duration,
+}
+
+/// An input delivered to the application, as far as keeping awake cares.
+///
+/// Only presses and scrolling hold the repeats back: they are likely to be
+/// answered by a new picture. Pointer motion must not hold anything back —
+/// it comes 60 or more times a second over a still window, and holding back
+/// on it would stop every repeat and leave the encoder asleep for the click
+/// that follows. Releases are rarely answered by a picture either. The
+/// capture loop reports every input with its kind; this type decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    PointerMotion,
+    KeyDown,
+    KeyUp,
+    ButtonDown,
+    ButtonUp,
+    Scroll,
+}
+
+impl InputKind {
+    /// Whether this input holds the repeats back.
+    pub fn holds(self) -> bool {
+        matches!(
+            self,
+            InputKind::KeyDown | InputKind::ButtonDown | InputKind::Scroll
+        )
+    }
 }
 
 impl Default for KeepAwakeSettings {
@@ -49,6 +78,12 @@ pub const HOLD_AFTER_INPUT: Duration = Duration::from_millis(50);
 /// never bunched — no two repeats closer together than half an interval.
 /// While the caller is late by less than half an interval, the rate stays
 /// `fps`; when it is later, the rate falls, but the beat does not drift.
+///
+/// An input that holds (see [`InputKind`]) delays the next repeat to
+/// `hold_after_input` after it, but never further than `hold_after_input`
+/// past the repeat's own beat: under a continuous stream of key presses the
+/// repeats still come, at 10 a second with the defaults. That is where the
+/// encoder slows down again, so it is better than nothing, not enough.
 #[derive(Debug, Clone)]
 pub struct KeepAwake {
     settings: KeepAwakeSettings,
@@ -89,16 +124,25 @@ impl KeepAwake {
         let (Some(interval), Some(beat)) = (self.interval(), self.next_beat) else {
             return;
         };
-        let mut next = beat + interval;
-        while next < at + interval / 2 {
-            next += interval;
-        }
+        // The first beat after `beat` that is at least half an interval after `at`, in one
+        // step: after days without a hand-over, walking beat by beat would take millions.
+        let first = beat + interval;
+        let earliest = at + interval / 2;
+        let next = match earliest.checked_duration_since(first) {
+            None => first,
+            Some(short) => {
+                let step = interval.as_nanos();
+                let beats = short.as_nanos().div_ceil(step);
+                first + Duration::from_nanos(u64::try_from(beats * step).unwrap_or(u64::MAX))
+            }
+        };
         self.next_beat = Some(next);
     }
 
-    /// An input for the session arrived.
-    pub fn input(&mut self, at: Instant) {
-        if !self.settings.hold_after_input.is_zero() {
+    /// An input was delivered to the application. Only the kinds that
+    /// [hold](InputKind::holds) change anything.
+    pub fn input(&mut self, at: Instant, kind: InputKind) {
+        if kind.holds() && !self.settings.hold_after_input.is_zero() {
             let until = at + self.settings.hold_after_input;
             self.held_until = Some(self.held_until.map_or(until, |held| held.max(until)));
         }
@@ -114,7 +158,7 @@ impl KeepAwake {
         }
         let beat = self.next_beat?;
         Some(match self.held_until {
-            Some(held) => beat.max(held),
+            Some(held) => beat.max(held).min(beat + self.settings.hold_after_input),
             None => beat,
         })
     }
@@ -223,19 +267,97 @@ mod tests {
             ..KeepAwakeSettings::default()
         });
         keep.picture(start);
-        keep.input(start + ms(40));
+        keep.input(start + ms(40), InputKind::KeyDown);
         assert_eq!(keep.next_repeat(true), Some(start + ms(90)));
-        // A later input holds longer; an earlier one does not shorten it.
-        keep.input(start + ms(60));
-        keep.input(start + ms(10));
-        assert_eq!(keep.next_repeat(true), Some(start + ms(110)));
+        // A later input holds longer, but never more than 50 ms past the beat (50 ms):
+        // held to 110 ms, due at 100 ms. An earlier input does not shorten it.
+        keep.input(start + ms(60), InputKind::ButtonDown);
+        keep.input(start + ms(10), InputKind::Scroll);
+        assert_eq!(keep.next_repeat(true), Some(start + ms(100)));
+        // Pointer motion holds nothing.
+        let mut moved = KeepAwake::new(KeepAwakeSettings::default());
+        moved.picture(start);
+        moved.input(start + ms(40), InputKind::PointerMotion);
+        assert_eq!(moved.next_repeat(true), Some(start + ms(50)));
         // Without holding back, an input changes nothing.
         let mut plain = KeepAwake::new(KeepAwakeSettings {
             hold_after_input: Duration::ZERO,
             ..KeepAwakeSettings::default()
         });
         plain.picture(start);
-        plain.input(start + ms(40));
+        plain.input(start + ms(40), InputKind::KeyDown);
         assert_eq!(plain.next_repeat(true), Some(start + ms(50)));
+    }
+
+    /// Hands over every repeat on time, feeding `inputs` (time from the
+    /// start, kind) as they come; returns the times of the repeats.
+    fn drive(inputs: &[(Duration, InputKind)], until: Duration) -> Vec<Duration> {
+        let start = Instant::now();
+        let mut keep = KeepAwake::new(KeepAwakeSettings::default());
+        keep.picture(start);
+        let mut pending = inputs.iter().peekable();
+        let mut repeats = Vec::new();
+        loop {
+            let due = keep.next_repeat(true).unwrap() - start;
+            // Inputs that come before the repeat is due change when it is due.
+            if let Some(&&(at, kind)) = pending.peek() {
+                if at <= due {
+                    keep.input(start + at, kind);
+                    pending.next();
+                    continue;
+                }
+            }
+            if due > until {
+                return repeats;
+            }
+            keep.repeated(start + due);
+            repeats.push(due);
+        }
+    }
+
+    #[test]
+    fn pointer_motion_does_not_hold_the_repeats_back() {
+        // 200 motions 8 ms apart, from 10 ms on: 1.6 s of moving over a still window.
+        let motions: Vec<_> = (0..200)
+            .map(|n| (ms(10 + 8 * n), InputKind::PointerMotion))
+            .collect();
+        let repeats = drive(&motions, ms(1_650));
+        let expected: Vec<_> = (1..=33).map(|n| ms(50 * n)).collect();
+        assert_eq!(repeats, expected, "twenty a second, on the beat");
+        assert!(!InputKind::PointerMotion.holds());
+        assert!(!InputKind::KeyUp.holds() && !InputKind::ButtonUp.holds());
+    }
+
+    #[test]
+    fn key_presses_without_pause_still_let_a_repeat_through_every_100_ms() {
+        // A key press every 20 ms for 2 s.
+        let presses: Vec<_> = (0..100)
+            .map(|n| (ms(5 + 20 * n), InputKind::KeyDown))
+            .collect();
+        let repeats = drive(&presses, ms(2_000));
+        assert!(repeats[0] <= ms(100), "{repeats:?}");
+        for pair in repeats.windows(2) {
+            assert!(pair[1] - pair[0] <= ms(100), "{repeats:?}");
+            assert!(pair[1] - pair[0] >= ms(25), "{repeats:?}");
+        }
+        assert!(repeats.len() >= 19, "{}", repeats.len());
+    }
+
+    #[test]
+    fn after_thirty_days_without_a_hand_over_the_next_beat_comes_at_once_and_on_the_beat() {
+        let start = Instant::now();
+        let mut keep = KeepAwake::new(KeepAwakeSettings::default());
+        keep.picture(start);
+        let late = Duration::from_secs(30 * 24 * 3600) + ms(13);
+        let began = Instant::now();
+        keep.repeated(start + late);
+        assert!(began.elapsed() < ms(5), "computed, not walked");
+        let next = keep.next_repeat(true).unwrap() - start;
+        assert_eq!(
+            next.as_nanos() % ms(50).as_nanos(),
+            0,
+            "{next:?} is on the beat"
+        );
+        assert!(next >= late + ms(25) && next < late + ms(75), "{next:?}");
     }
 }

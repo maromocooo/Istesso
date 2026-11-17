@@ -21,7 +21,9 @@ pub struct EncodedFrame<'a> {
 
 /// Takes encoded frames and says when a key frame is needed.
 pub trait FrameSink: Send {
-    /// Takes one frame. Must not wait for a viewer.
+    /// Takes one frame. Must not wait for a viewer, and must not block: it is
+    /// called while the encoder's feeder holds the lock that the next
+    /// picture's hand-over needs (`crate::feed`). Queue the frame and return.
     fn send(&mut self, frame: &EncodedFrame<'_>) -> Result<(), String>;
 
     /// Whether a key frame is needed (a viewer has connected, asked for one,

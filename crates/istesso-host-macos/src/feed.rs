@@ -4,8 +4,16 @@
 //!
 //! The capture loop (not written yet: it waits for the permissions, ADR 0017)
 //! calls [`Feeder::picture`] for every new picture, [`Feeder::input`] for
-//! every input it delivers to the application, and [`Feeder::tick`] whenever
-//! [`Feeder::next_wake`] comes round.
+//! every input it delivers to the application, with its kind (pointer motion
+//! included: [`InputKind`] decides that it holds nothing back), and
+//! [`Feeder::tick`] whenever [`Feeder::next_wake`] comes round.
+//!
+//! The encoder's callback hands each frame to the sink while it holds the
+//! feeder's lock, and the capture thread takes the same lock to hand over a
+//! picture. That is kept, because the sink is the host end of the picture's
+//! transport, whose `send` only queues ([`FrameSink::send`] must not block).
+//! The longest `send` is counted ([`FeedCounts::longest_send_ns`]), so that
+//! a sink that blocks shows in the records.
 //!
 //! The feeder does not rely on being woken on time. A [`Feeder::tick`] that
 //! comes late hands over one repeat, not one for every beat it missed, and
@@ -17,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::encoder::{Encoder, Error, Outcome, PixelBuffer, Settings};
-use crate::keep_awake::{KeepAwake, KeepAwakeSettings};
+use crate::keep_awake::{InputKind, KeepAwake, KeepAwakeSettings};
 use crate::sink::{EncodedFrame, FrameSink};
 
 /// Counts, for the records.
@@ -33,6 +41,9 @@ pub struct FeedCounts {
     pub unsent: u64,
     pub dropped: u64,
     pub failed: u64,
+    /// The longest time one `send` to the sink took, in nanoseconds. The
+    /// next picture's hand-over may have waited that long.
+    pub longest_send_ns: u64,
 }
 
 struct Shared {
@@ -81,7 +92,11 @@ impl Feeder {
                         encoded_ns: encoded_at.duration_since(shared.started).as_nanos() as u64,
                         key_frame,
                     };
-                    if shared.sink.send(&frame).is_ok() {
+                    let sending = Instant::now();
+                    let sent = shared.sink.send(&frame).is_ok();
+                    let took = sending.elapsed().as_nanos() as u64;
+                    shared.counts.longest_send_ns = shared.counts.longest_send_ns.max(took);
+                    if sent {
                         shared.counts.sent += 1;
                     } else {
                         shared.counts.unsent += 1;
@@ -109,9 +124,11 @@ impl Feeder {
         Ok(())
     }
 
-    /// An input for the session was delivered to the application.
-    pub fn input(&mut self) {
-        self.keep_awake.input(Instant::now());
+    /// An input for the session was delivered to the application. Report
+    /// every one with its kind; only presses and scrolling hold the repeats
+    /// back ([`InputKind::holds`]).
+    pub fn input(&mut self, kind: InputKind) {
+        self.keep_awake.input(Instant::now(), kind);
     }
 
     /// Hands the last picture over again if it is time to. Returns whether
@@ -282,5 +299,40 @@ mod tests {
             return;
         };
         assert_eq!(counts.repeats, 0);
+    }
+
+    /// A sink that blocks in `send`, against the rule: it shows in the counts.
+    struct Slow;
+
+    impl FrameSink for Slow {
+        fn send(&mut self, _frame: &EncodedFrame<'_>) -> Result<(), String> {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(())
+        }
+        fn key_frame_wanted(&mut self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_sink_that_blocks_shows_in_the_longest_send() {
+        let mut feeder =
+            match Feeder::new(&settings(), KeepAwakeSettings::default(), Box::new(Slow)) {
+                Ok(feeder) => feeder,
+                Err(error) if error.what == "VTCompressionSessionCreate" => {
+                    eprintln!("no H.265 encoder on this machine ({error}); nothing was checked");
+                    return;
+                }
+                Err(error) => panic!("{error}"),
+            };
+        let pool = PixelBufferPool::bgra(320, 180).unwrap();
+        let mut picture = pool.next().unwrap();
+        picture.with_bytes(|b, _| b.fill(0x40)).unwrap();
+        feeder.picture(picture).unwrap();
+        feeder.input(InputKind::PointerMotion);
+        feeder.finish().unwrap();
+        let counts = feeder.counts();
+        assert_eq!(counts.sent, 1);
+        assert!(counts.longest_send_ns >= 30_000_000, "{counts:?}");
     }
 }
