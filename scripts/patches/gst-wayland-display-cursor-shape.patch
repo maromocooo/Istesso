@@ -1,0 +1,369 @@
+Let clients name the shape of their cursor (the cursor-shape protocol,
+`wp_cursor_shape_manager_v1`), so that whoever draws the cursor outside the picture is told
+"text" or "pointer" instead of an image, and can show its own cursor of that shape. Offered
+only while the cursor is told to somebody; otherwise nothing changes.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
+gst-wayland-display-cursor-messages.patch, gst-wayland-display-windows.patch and
+gst-wayland-display-dialogs.patch in this directory, in that order. The lines of context are
+from that project and from those patches.
+
+It is kept small and in a shape that can be proposed to that project
+(docs/adr/0009-host-compositor.md). There is no new property: it belongs to `cursor-messages`
+(the second patch), and with that off no such global exists and nothing changes.
+
+Why: with `cursor-messages` on, a client's cursor is told as the image the client hands in.
+Whoever shows the picture on another machine would rather show that machine's own cursor
+(its arrow, its I-beam, its hand), and an image does not say which one it is. Toolkits name
+the shape where the compositor offers the protocol (GTK 4, for one), and hand in an image
+where it does not.
+
+What it changes:
+
+- The compositor's state has an optional cursor-shape manager (Smithay's
+  `CursorShapeManagerState`). It is made, and its global advertised, the first time a cursor
+  sink is set (`State::set_cursor_sink`, which is what `cursor-messages` does). Until then
+  there is no global. A compositor that draws the cursor into its frames has one image for
+  every name, so offering the protocol there would turn every cursor into an arrow.
+- Once made, the global stays when the sink is taken away again: clients keep what they have
+  bound. A named shape is then drawn into the frames as every named cursor is (the built-in
+  image).
+- A new file, wayland-display-core/src/wayland/handlers/cursor_shape.rs, with
+  `delegate_cursor_shape!(State)` and the empty `TabletSeatHandler` the delegate needs
+  (the protocol also covers tablet tools; nothing here announces a tablet).
+- Nothing else. Smithay calls `SeatHandler::cursor_image` with the name, and the second
+  patch tells a named cursor by its name already (`wayland.cursor`, kind "named", `name`:
+  the CSS name, as the protocol has it). Frame pacing, rendering, the hand-over of frames,
+  input handling and the element are not touched.
+
+Tests (`cargo test -p wayland-display-core`), four with a real Wayland client: shapes it
+names are told by their names; the same shape is not told twice, and an image, a hidden
+cursor and a name follow each other; with nobody told about the cursor there is no such
+global among those the client hears of, and the compositor has not made one; the global is
+made once and stays when nobody listens any more.
+
+Known limits:
+
+- A client that connected before the sink was set hears of the global later, as of any
+  global that comes late; what it does then is up to its toolkit. With the property set
+  before the element starts, the sink is set as the compositor begins, before a client can
+  know its socket.
+- The global is not taken away when `cursor-messages` is turned off again.
+- Nothing is exposed through the C bindings.
+
+Apply and build, in a checkout that has the first four patches applied:
+
+    git apply <this file>
+    cargo build --release -p gst-plugin-wayland-display -p wayland-display-core --features cuda
+
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 68e95df..b14aed5 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -48,6 +48,7 @@ use smithay::{
+     utils::{Clock, Logical, Monotonic, Physical, Point, Rectangle, Size, Transform},
+     wayland::{
+         compositor::{CompositorClientState, CompositorState, with_states},
++        cursor_shape::CursorShapeManagerState,
+         dmabuf::{DmabufGlobal, DmabufState},
+         output::OutputManagerState,
+         pointer_constraints::PointerConstraintsState,
+@@ -141,6 +142,10 @@ pub struct State {
+     // wayland state
+     pub dh: DisplayHandle,
+     pub compositor_state: CompositorState,
++    /// Lets clients name the shape of their cursor (`wp_cursor_shape_manager_v1`). There
++    /// from the first time somebody is told about the cursor; `None`, and no such global,
++    /// until then.
++    pub(crate) cursor_shape_state: Option<CursorShapeManagerState>,
+     pub data_device_state: DataDeviceState,
+     pub dmabuf_state: DmabufState,
+     output_state: OutputManagerState,
+@@ -265,6 +270,7 @@ impl State {
+ 
+             dh: dh.clone(),
+             compositor_state,
++            cursor_shape_state: None,
+             data_device_state,
+             dmabuf_state,
+             output_state,
+@@ -565,7 +571,17 @@ impl State {
+ 
+     /// Leaves the cursor out of the frames and tells `sink` about it instead, or, with
+     /// `None`, draws it into the frames again.
++    ///
++    /// The first sink also lets clients name the shape of their cursor instead of handing in
++    /// an image of it (`wp_cursor_shape_manager_v1`): whoever draws the cursor itself is told
++    /// the name and can show its own cursor of that shape. A compositor that draws the cursor
++    /// into its frames has one image for every name, so it does not offer this until somebody
++    /// is told about the cursor. Once offered it stays, because clients keep what they have
++    /// bound; a named shape is then drawn into the frames as every named cursor is.
+     pub(crate) fn set_cursor_sink(&mut self, sink: Option<cursor::CursorSink>) {
++        if sink.is_some() && self.cursor_shape_state.is_none() {
++            self.cursor_shape_state = Some(CursorShapeManagerState::new::<State>(&self.dh));
++        }
+         self.cursor_report.set_sink(sink);
+         self.tell_cursor();
+     }
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index d552363..df896ad 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -16,6 +16,10 @@ use wayland_client::{
+ };
+ use wayland_protocols::{
+     wp::{
++        cursor_shape::v1::client::{
++            wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
++            wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
++        },
+         pointer_constraints::zv1::{
+             client::zwp_confined_pointer_v1, client::zwp_locked_pointer_v1::ZwpLockedPointerV1,
+             client::zwp_pointer_constraints_v1,
+@@ -61,6 +65,9 @@ struct State {
+     pointer_entered: u32,
+     shm: Option<wl_shm::WlShm>,
+     cursor_surface: Option<wl_surface::WlSurface>,
++    /// What lets a client name the shape of its cursor, if the compositor offers it.
++    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
++    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+     keyboard: Option<wl_keyboard::WlKeyboard>,
+     windows: Vec<Window>,
+     pub mouse_events: Vec<MouseEvents>,
+@@ -144,6 +151,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
+                         registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
+                     );
+                 }
++                "wp_cursor_shape_manager_v1" => {
++                    // Offered only from the time somebody is told about the cursor, so this
++                    // may come after the first list of globals. Version 1 has all that is
++                    // used here.
++                    state.cursor_shape_manager =
++                        Some(registry.bind::<WpCursorShapeManagerV1, _, _>(name, 1, qh, ()));
++                }
+                 "wl_output" => {
+                     // The compositor only advertises wl_output after the first
+                     // VideoInfo has created it, so this branch may fire well after
+@@ -168,6 +182,8 @@ delegate_noop!(State: ignore WpViewport);
+ delegate_noop!(State: ignore ZwpPointerConstraintsV1);
+ delegate_noop!(State: ignore ZwpLockedPointerV1);
+ delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
++delegate_noop!(State: ignore WpCursorShapeManagerV1);
++delegate_noop!(State: ignore WpCursorShapeDeviceV1);
+ 
+ impl WaylandClient {
+     pub fn new(w_socket: UnixStream) -> Self {
+@@ -195,6 +211,8 @@ impl WaylandClient {
+             pointer_entered: 0,
+             shm: None,
+             cursor_surface: None,
++            cursor_shape_manager: None,
++            cursor_shape_device: None,
+             keyboard: None,
+             windows: Vec::new(),
+             mouse_events: Vec::new(),
+@@ -296,6 +314,28 @@ impl WaylandClient {
+         );
+     }
+ 
++    /// Whether the compositor lets clients name the shape of their cursor
++    /// (`wp_cursor_shape_manager_v1` is among its globals).
++    pub fn can_name_cursor_shapes(&self) -> bool {
++        self.state.cursor_shape_manager.is_some()
++    }
++
++    /// Names the shape of the cursor instead of handing in an image of it, as a toolkit does
++    /// where the compositor offers that.
++    pub fn set_cursor_shape(&mut self, shape: Shape) {
++        let state = &mut self.state;
++        if state.cursor_shape_device.is_none() {
++            let manager = state.cursor_shape_manager.as_ref().unwrap();
++            let pointer = state.pointer.as_ref().unwrap();
++            state.cursor_shape_device = Some(manager.get_pointer(pointer, &state.qh, ()));
++        }
++        state
++            .cursor_shape_device
++            .as_ref()
++            .unwrap()
++            .set_shape(state.pointer_entered, shape);
++    }
++
+     /// Hides the pointer, as a client does that draws its own or wants none.
+     pub fn hide_cursor(&mut self) {
+         let state = &self.state;
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index fc6caee..d83eda6 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -2,6 +2,7 @@ pub(crate) mod client;
+ mod device;
+ mod fixture;
+ mod test_cursor;
++mod test_cursor_shape;
+ mod test_dialogs;
+ mod test_frame_pacing;
+ mod test_pointer;
+diff --git a/wayland-display-core/src/tests/test_cursor_shape.rs b/wayland-display-core/src/tests/test_cursor_shape.rs
+new file mode 100644
+index 0000000..1a3198b
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_cursor_shape.rs
+@@ -0,0 +1,127 @@
++//! Integration tests for clients that name the shape of their cursor
++//! (`wp_cursor_shape_manager_v1`). The compositor offers that only from the first time
++//! somebody is told about the cursor (see `State::set_cursor_sink`); whoever is told then
++//! hears the name. A real Wayland client names the shapes.
++
++use crate::comp::cursor::{Cursor, CursorSink};
++use crate::tests::fixture::Fixture;
++use smithay::utils::Point;
++use std::sync::{Arc, Mutex};
++use test_log::test;
++use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
++
++type Told = Arc<Mutex<Vec<Cursor>>>;
++
++/// A window under the pointer, and nobody who is told about the cursor.
++fn fixture() -> Fixture {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    f
++}
++
++fn listen(f: &mut Fixture) -> Told {
++    let told = Told::default();
++    let sink: CursorSink = {
++        let told = told.clone();
++        Box::new(move |cursor| told.lock().unwrap().push(cursor.clone()))
++    };
++    f.server.set_cursor_sink(Some(sink));
++    // The client hears of the new global.
++    f.round_trip();
++    told
++}
++
++fn last(told: &Told) -> Cursor {
++    told.lock().unwrap().last().cloned().expect("nothing told")
++}
++
++#[test]
++fn a_shape_a_client_names_is_told_by_its_name() {
++    let mut f = fixture();
++    let told = listen(&mut f);
++    assert!(f.client.can_name_cursor_shapes());
++    for (shape, name) in [
++        (Shape::Text, "text"),
++        (Shape::Pointer, "pointer"),
++        (Shape::NwseResize, "nwse-resize"),
++        (Shape::ColResize, "col-resize"),
++        (Shape::Grabbing, "grabbing"),
++        (Shape::Default, "default"),
++    ] {
++        f.client.set_cursor_shape(shape);
++        f.round_trip();
++        assert_eq!(last(&told), Cursor::Named(name.into()));
++    }
++}
++
++#[test]
++fn the_same_shape_is_not_told_twice_and_an_image_and_a_name_follow_each_other() {
++    let mut f = fixture();
++    let told = listen(&mut f);
++    f.client.set_cursor_shape(Shape::Text);
++    f.round_trip();
++    let after_the_first = told.lock().unwrap().len();
++    // Again, as a toolkit does on every motion.
++    f.client.set_cursor_shape(Shape::Text);
++    f.round_trip();
++    assert_eq!(told.lock().unwrap().len(), after_the_first);
++
++    // The same client hands in an image, hides the cursor, and names a shape again.
++    f.client.set_cursor((16, 16), (2, 3), [0, 0, 255, 255]);
++    f.round_trip();
++    assert!(matches!(last(&told), Cursor::Image(_)));
++    f.client.hide_cursor();
++    f.round_trip();
++    assert_eq!(last(&told), Cursor::Hidden);
++    f.client.set_cursor_shape(Shape::Pointer);
++    f.round_trip();
++    assert_eq!(last(&told), Cursor::Named("pointer".into()));
++}
++
++#[test]
++fn no_client_can_name_a_shape_unless_somebody_is_told_about_the_cursor() {
++    let mut f = fixture();
++    // The cursor is drawn into the frames: the global is not among those the client was
++    // told of, and the compositor has not made it.
++    assert!(!f.client.can_name_cursor_shapes());
++    assert!(f.server.cursor_shape_state.is_none());
++    // Taking away a sink that was never there changes nothing.
++    f.server.set_cursor_sink(None);
++    f.round_trip();
++    assert!(!f.client.can_name_cursor_shapes());
++    assert!(f.server.cursor_shape_state.is_none());
++    // A client's image is still its cursor, in the frames as before.
++    f.client.set_cursor((16, 16), (0, 0), [0, 0, 255, 255]);
++    f.round_trip();
++    assert!(f.server.create_frame().is_ok());
++}
++
++#[test]
++fn the_global_is_made_once_and_stays_when_nobody_listens_any_more() {
++    let mut f = fixture();
++    let told = listen(&mut f);
++    let global = f.server.cursor_shape_state.as_ref().unwrap().global();
++    f.client.set_cursor_shape(Shape::Text);
++    f.round_trip();
++    assert_eq!(last(&told), Cursor::Named("text".into()));
++    let heard = told.lock().unwrap().len();
++
++    // Nobody listens: the client may go on naming shapes, nobody is told, and the frames are
++    // made with the cursor in them.
++    f.server.set_cursor_sink(None);
++    f.client.set_cursor_shape(Shape::Pointer);
++    f.round_trip();
++    assert_eq!(told.lock().unwrap().len(), heard);
++    assert!(f.server.create_frame().is_ok());
++
++    // Somebody listens again: the same global, and the cursor as it is by now.
++    let again = listen(&mut f);
++    assert_eq!(
++        f.server.cursor_shape_state.as_ref().unwrap().global(),
++        global
++    );
++    assert_eq!(*again.lock().unwrap(), [Cursor::Named("pointer".into())]);
++}
+diff --git a/wayland-display-core/src/wayland/handlers/cursor_shape.rs b/wayland-display-core/src/wayland/handlers/cursor_shape.rs
+new file mode 100644
+index 0000000..0d24a4b
+--- /dev/null
++++ b/wayland-display-core/src/wayland/handlers/cursor_shape.rs
+@@ -0,0 +1,14 @@
++//! Clients that name the shape of their cursor (`wp_cursor_shape_manager_v1`) instead of
++//! handing in an image of it. Smithay does the work and calls `SeatHandler::cursor_image`
++//! with the name, as it does with a client's image. The global is made in
++//! `State::set_cursor_sink`, the first time somebody is told about the cursor, and not before.
++
++use smithay::{delegate_cursor_shape, wayland::tablet_manager::TabletSeatHandler};
++
++use crate::comp::State;
++
++/// The protocol also covers the tools of a drawing tablet, so the delegate asks for this.
++/// There is no tablet here: nothing announces one, and the cursor of one is ignored.
++impl TabletSeatHandler for State {}
++
++delegate_cursor_shape!(State);
+diff --git a/wayland-display-core/src/wayland/handlers/mod.rs b/wayland-display-core/src/wayland/handlers/mod.rs
+index e41c12b..2f5829e 100644
+--- a/wayland-display-core/src/wayland/handlers/mod.rs
++++ b/wayland-display-core/src/wayland/handlers/mod.rs
+@@ -1,4 +1,5 @@
+ pub mod compositor;
++pub mod cursor_shape;
+ pub mod data_device;
+ pub mod dmabuf;
+ pub mod output;
