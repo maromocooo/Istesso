@@ -21,7 +21,16 @@ pub enum Sched {
     Off,
     /// Real-time scheduling at a low priority. Needs the right to it.
     Rt,
+    /// The same, and also for the thread the graphics driver runs in this
+    /// process. A value of its own, so that it can be measured apart.
+    RtDriver,
 }
+
+/// The longest the input's thread may be told to stay awake after an input,
+/// in milliseconds. A thread that waits without sleeping keeps a processor
+/// to itself, and with `sched rt` ahead of every ordinary thread: how long
+/// it may do so is bounded here, by a constant, and nowhere by a setting.
+pub const SPIN_AT_MOST_MS: u32 = 20;
 
 /// Whether, and when, the machine is kept from sleeping deeply
 /// (`/dev/cpu_dma_latency`). Needs the right to open that device.
@@ -93,10 +102,18 @@ impl Switches {
                 self.sched = match value {
                     "off" => Sched::Off,
                     "rt" => Sched::Rt,
-                    _ => return Err(format!("--sched is off or rt, not `{value}`")),
+                    "rt+driver" => Sched::RtDriver,
+                    _ => return Err(format!("--sched is off, rt or rt+driver, not `{value}`")),
                 }
             }
-            "spin-after-input" => self.spin_after_input = number(name, value)?,
+            "spin-after-input" => {
+                self.spin_after_input = number(name, value)?;
+                if self.spin_after_input > SPIN_AT_MOST_MS {
+                    return Err(format!(
+                        "--spin-after-input is at most {SPIN_AT_MOST_MS} milliseconds"
+                    ));
+                }
+            }
             "cpu-latency" => {
                 let parts: Vec<&str> = value.split(':').collect();
                 self.cpu_latency = match parts.as_slice() {
@@ -147,8 +164,10 @@ impl Switches {
             on.push(format!("keep-awake={}", self.keep_awake));
             on.push(format!("keep-awake-hold={}", self.keep_awake_hold));
         }
-        if self.sched == Sched::Rt {
-            on.push("sched=rt".to_string());
+        match self.sched {
+            Sched::Off => {}
+            Sched::Rt => on.push("sched=rt".to_string()),
+            Sched::RtDriver => on.push("sched=rt+driver".to_string()),
         }
         if self.spin_after_input > 0 {
             on.push(format!("spin-after-input={}", self.spin_after_input));
@@ -433,6 +452,12 @@ mod tests {
         assert!(switches.set("keep-awake", "200").is_err());
         assert!(switches.set("keep-awake", "often").is_err());
         assert!(switches.set("warp", "9").is_err());
+        // A thread may be kept from sleeping for a bounded while only.
+        assert!(switches.set("spin-after-input", "20").is_ok());
+        assert!(switches.set("spin-after-input", "21").is_err());
+        switches.set("sched", "rt+driver").unwrap();
+        assert_eq!(switches.sched, Sched::RtDriver);
+        assert!(switches.listed().contains(&"sched=rt+driver".to_string()));
         switches.set("cpu-latency", "shown:2").unwrap();
         assert_eq!(switches.cpu_latency, CpuLatency::Shown { us: 2 });
         switches.set("cpu-latency", "off").unwrap();

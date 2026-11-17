@@ -282,15 +282,15 @@ fn run(mut setup: Setup, display: Display) -> Result<(), String> {
     let mut switches = setup.switches.listed();
     // Whether real-time scheduling can be had is tried on a thread that is
     // made for the trying, so that this thread stays as it is.
-    let mut sched = setup.switches.sched == Sched::Rt;
+    let mut sched = setup.switches.sched != Sched::Off;
     if sched {
         let tried = std::thread::spawn(|| wake::real_time(None))
             .join()
             .unwrap_or(Err("the trying thread ended badly".to_string()));
         if let Err(why) = tried {
             sched = false;
-            switches.retain(|switch| switch != "sched=rt");
-            switches.push(format!("sched=rt (refused: {why})"));
+            switches.retain(|switch| !switch.starts_with("sched="));
+            switches.push(format!("sched (refused: {why})"));
             remark(format!(
                 "note: real-time scheduling cannot be had ({why}); the threads stay as they are"
             ));
@@ -516,6 +516,18 @@ fn run(mut setup: Setup, display: Display) -> Result<(), String> {
         let main = std::process::id() as i32;
         for thread in wake::started_unnamed(&threads_before, &after, own.trim_end(), main) {
             log.line(line::sched("compositor", &wake::real_time(Some(thread))));
+        }
+        if setup.switches.sched == Sched::RtDriver {
+            let found = wake::of_the_driver(&after);
+            if found.is_empty() {
+                log.line(line::sched(
+                    "driver",
+                    &Err("no thread of the driver's was found".to_string()),
+                ));
+            }
+            for thread in found {
+                log.line(line::sched("driver", &wake::real_time(Some(thread))));
+            }
         }
     }
     let mut outcome = Ok(());

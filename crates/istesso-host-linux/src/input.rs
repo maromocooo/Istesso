@@ -122,6 +122,18 @@ pub fn default_socket() -> PathBuf {
     runtime.join("istesso").join("input.sock")
 }
 
+/// The longest the input's thread goes without sleeping, however closely
+/// the inputs follow one another. After this long it waits for the next
+/// input asleep at least once, as it does without the switch: a pointer
+/// that never rests cannot keep a processor busy for good.
+pub const AWAKE_AT_MOST: Duration = Duration::from_millis(200);
+
+/// Until when the input's thread stays awake: `spin` after the last input,
+/// but never more than [`AWAKE_AT_MOST`] after it last slept.
+pub fn awake_until(last_input: Instant, woke: Instant, spin: Duration) -> Instant {
+    (last_input + spin).min(woke + AWAKE_AT_MOST)
+}
+
 /// The socket the agent hands input over on.
 #[cfg(unix)]
 pub struct InputSocket {
@@ -181,11 +193,12 @@ impl InputSocket {
             .set_read_timeout(Some(Duration::from_millis(100)))?;
         let mut datagram = [0u8; 2048];
         let mut taken = 0u64;
-        let mut awake_until: Option<Instant> = None;
+        // Until when the thread stays awake, and since when it has been.
+        let mut awake: Option<(Instant, Instant)> = None;
         while !stop.load(Ordering::Relaxed) {
-            let spinning = awake_until.is_some_and(|until| Instant::now() < until);
-            if awake_until.is_some() && !spinning {
-                awake_until = None;
+            let spinning = awake.is_some_and(|(until, _)| Instant::now() < until);
+            if awake.is_some() && !spinning {
+                awake = None;
                 self.socket.set_nonblocking(false)?;
             }
             let length = match self.socket.recv(&mut datagram) {
@@ -211,10 +224,15 @@ impl InputSocket {
                 taken += 1;
             }
             if !spin.is_zero() {
-                if awake_until.is_none() {
-                    self.socket.set_nonblocking(true)?;
-                }
-                awake_until = Some(Instant::now() + spin);
+                let at = Instant::now();
+                let woke = match awake {
+                    Some((_, woke)) => woke,
+                    None => {
+                        self.socket.set_nonblocking(true)?;
+                        at
+                    }
+                };
+                awake = Some((awake_until(at, woke, spin), woke));
             }
         }
         Ok(taken)
@@ -287,6 +305,24 @@ mod tests {
             code: 0x110,
             pressed: false
         }));
+    }
+
+    #[test]
+    fn the_thread_stays_awake_for_a_bounded_while_however_the_inputs_come() {
+        let woke = Instant::now();
+        let spin = Duration::from_millis(5);
+        // After an input: for as long as the switch says.
+        assert_eq!(awake_until(woke, woke, spin), woke + spin);
+        let later = woke + Duration::from_millis(150);
+        assert_eq!(awake_until(later, woke, spin), later + spin);
+        // Inputs that never stop: not past the bound, counted from when it last slept.
+        let much_later = woke + Duration::from_millis(199);
+        assert_eq!(awake_until(much_later, woke, spin), woke + AWAKE_AT_MOST);
+        let past = woke + Duration::from_millis(400);
+        assert_eq!(awake_until(past, woke, spin), woke + AWAKE_AT_MOST);
+        // The bound is a constant of the program, and a short one.
+        const { assert!(AWAKE_AT_MOST.as_millis() <= 200) };
+        const { assert!(crate::options::SPIN_AT_MOST_MS <= 20) };
     }
 
     #[test]

@@ -87,6 +87,20 @@ pub fn started_unnamed(
         .collect()
 }
 
+/// The thread the graphics driver runs in this process to hand over what
+/// the card has finished (its name, as the driver gives it). It is the
+/// driver's, not this program's: raised only with `sched rt+driver`.
+pub const DRIVER_THREAD: &str = "cuda-EvtHandlr";
+
+/// The driver's threads among the threads of this process.
+pub fn of_the_driver(threads: &[(i32, String)]) -> Vec<i32> {
+    threads
+        .iter()
+        .filter(|(_, name)| name == DRIVER_THREAD)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// The device.
 pub const DEVICE: &str = "/dev/cpu_dma_latency";
 
@@ -244,6 +258,10 @@ mod tests {
         );
         // Nothing new, nothing found; and a list that cannot be read is empty.
         assert!(started_unnamed(&after, &after, "istesso-host-li", 100).is_empty());
+        // The driver's thread is found by the name the driver gives it, and only that.
+        thread(106, DRIVER_THREAD);
+        thread(107, "cuda00002c0000c");
+        assert_eq!(of_the_driver(&threads(&tasks)), [106]);
         assert!(threads(&tasks.join("missing")).is_empty());
         let _ = std::fs::remove_dir_all(&tasks);
     }
