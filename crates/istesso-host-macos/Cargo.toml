@@ -1,0 +1,15 @@
+[package]
+name = "istesso-host-macos"
+description = "The Mac as a host: turns the picture of an application into encoded frames (VideoToolbox) and hands input to it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# No dependency on the crates that carry the picture (istesso-media) or start sessions
+# (istesso-agent's runner contract): they are not in `main` yet. This crate meets them through
+# the small interfaces in src/sink.rs and src/contract.rs (docs/m4-plan.md, "作り").
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -449,6 +449,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "istesso-host-macos"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "istesso-link"
 version = "0.0.1"
 dependencies = [
