@@ -1,0 +1,8 @@
+# Who this application is, in one place: the build script makes the bundle's Info.plist and its
+# signature from these three lines. The system hangs permissions (the local network) on the
+# identifier, so it changes at most once, and only here.
+#
+# Proposed, not yet confirmed by the owner.
+BUNDLE_ID=com.maromoco.istesso
+APP_NAME=Istesso
+EXECUTABLE=Istesso
