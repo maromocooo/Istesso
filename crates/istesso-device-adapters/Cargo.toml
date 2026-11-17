@@ -1,0 +1,11 @@
+[package]
+name = "istesso-device-adapters"
+description = "The device adapters, one directory each. This crate has no standard library and depends on the interface crate only, so an adapter cannot name anything else."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+istesso-device-api.workspace = true
