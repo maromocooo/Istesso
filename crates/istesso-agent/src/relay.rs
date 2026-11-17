@@ -48,6 +48,9 @@ pub const SOON_FOR: Duration = Duration::from_secs(10);
 /// What connecting, the handshake and the answer to the request may take
 /// together when the conversation is made again, and what a write may take.
 pub const AGAIN_WITHIN: Duration = Duration::from_secs(1);
+/// What the answer to the first request may take. A host that is busy
+/// answers late; that is not a host that refuses.
+pub const FIRST_ANSWER_WITHIN: Duration = Duration::from_secs(3);
 
 /// The keys that are pressed again when a conversation is back: Control,
 /// Shift, Alt and Super, left and right (Linux key numbers).
@@ -141,9 +144,11 @@ pub struct InputLine {
 impl InputLine {
     /// Asks on a conversation that has just been opened whether input is
     /// taken there. `connect` opens the next one when this one is cut.
-    /// `Err` says why the device does not take input from here.
-    pub fn open(mut client: Client, connect: Connect) -> Result<Self, String> {
-        let alive = ask(&mut client).map_err(|(_, why)| why)?;
+    /// `Err` says why there is no line, and what to do about it: a device
+    /// that refuses is not asked again ([`Again::Never`]); one that did not
+    /// answer in time may be, with a new conversation.
+    pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
+        let alive = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let now = Instant::now();
         Ok(InputLine {
             connect,
@@ -288,7 +293,7 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let alive = match ask(&mut client) {
+        let alive = match ask(&mut client, AGAIN_WITHIN) {
             Ok(alive) => alive,
             Err((what, why)) => return self.wait(what, why, now),
         };
@@ -321,15 +326,18 @@ impl InputLine {
 }
 
 /// Asks whether input is taken, and to be answered when saying "still
-/// here". `Ok` says whether the device answers; `Err` what to do about its
-/// refusal, and the refusal in a sentence.
-fn ask(client: &mut Client) -> Result<bool, (Again, String)> {
+/// here"; the answer has `within` this time. `Ok` says whether the device
+/// answers; `Err` what to do about its refusal, and the refusal in a
+/// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
+fn ask(client: &mut Client, within: Duration) -> Result<bool, (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
     };
+    client.set_timeout(within).map_err(link)?;
+    let answer = client.open_input_alive().map_err(link)?;
     client.set_timeout(AGAIN_WITHIN).map_err(link)?;
-    match client.open_input_alive().map_err(link)? {
+    match answer {
         InputAnswer::Open { alive } => Ok(alive),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
@@ -481,14 +489,32 @@ mod tests {
     fn a_sender_that_stood_still_itself_does_not_take_that_for_silence() {
         let pair = std::sync::Arc::new(InputPair::new("rf"));
         let mut line = line_through(&pair, pair.addr);
-        assert_eq!(turn_until_something(&mut line, ALIVE_EVERY * 2), Ok(None));
+        // Looked after until "still here" has just been said and not been answered yet.
+        let began = Instant::now();
+        while line.unanswered_since.is_none() {
+            assert!(began.elapsed() < Duration::from_secs(3), "it never asked");
+            assert_eq!(line.turn(Instant::now()), Ok(None));
+            std::thread::sleep(Duration::from_millis(1));
+        }
         // This program is not run for a while (the machine was busy, or asleep for a
-        // moment), for longer than silence may last. The host cuts a device off only
-        // after two seconds, so the conversation is still there, and so are the
-        // answers that came meanwhile.
-        std::thread::sleep(SILENT_AFTER + Duration::from_millis(300));
-        assert_eq!(turn_until_something(&mut line, ALIVE_EVERY * 3), Ok(None));
+        // moment): for longer than an answer may take, and for much less than the two
+        // seconds after which the host lets go of a device that says nothing. The
+        // answer comes meanwhile and waits to be read.
+        let stood_still_from = Instant::now();
+        std::thread::sleep(UNANSWERED_FOR + Duration::from_millis(300));
+        // The question is older now than an answer may be, counted by the clock. What
+        // has arrived is looked at before that is believed: the line is not cut, and
+        // the question it has open now, if any, is a new one.
+        assert_eq!(line.turn(Instant::now()), Ok(None));
         assert!(line.is_open());
+        assert!(
+            line.unanswered_since
+                .is_none_or(|since| since > stood_still_from),
+            "the answer was not heard"
+        );
+        assert_eq!(line.cuts(), 0);
+        // And it goes on as before.
+        assert_eq!(turn_until_something(&mut line, ALIVE_EVERY * 3), Ok(None));
     }
 
     #[test]
