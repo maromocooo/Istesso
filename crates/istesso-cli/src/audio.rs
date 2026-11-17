@@ -616,6 +616,7 @@ fn serve(options: ServeOptions) -> Result<(), String> {
     // does. With a limit and a pipe that goes on, stop at the limit.
     let begin = Instant::now();
     let mut late_cycles_said = 0u64;
+    let mut watchdog_said = 0u64;
     let mut record = record::Record::open("source", &[]);
     let mut record_at = Instant::now();
     let source_totals = |capture: &serde_json::Value| {
@@ -627,6 +628,10 @@ fn serve(options: ServeOptions) -> Result<(), String> {
             ("late_ms", capture["late_total_ms"].as_f64().unwrap_or(0.0)),
             ("cycles", capture["cycles"].as_u64().unwrap_or(0) as f64),
             ("pauses", capture["resumed"].as_u64().unwrap_or(0) as f64),
+            (
+                "watchdog_late",
+                capture["watchdog_late"].as_u64().unwrap_or(0) as f64,
+            ),
         ]
     };
     while !feeder.is_finished() {
@@ -644,6 +649,19 @@ fn serve(options: ServeOptions) -> Result<(), String> {
                     begin.elapsed().as_secs_f64(),
                     late["late_last_ms"].as_f64().unwrap_or(0.0),
                     cycles
+                );
+            }
+            // So is a late wake-up of the watchdog beside the capture: the
+            // two at the same moment mean that the whole machine stood
+            // still; the capture alone, that PipeWire's side was late.
+            let wakes = late["watchdog_late"].as_u64().unwrap_or(0);
+            if wakes > watchdog_said {
+                watchdog_said = wakes;
+                eprintln!(
+                    "{:>8.1} s since the start: the watchdog beside the capture woke {:.1} ms late ({} so far)",
+                    begin.elapsed().as_secs_f64(),
+                    late["watchdog_late_last_ms"].as_f64().unwrap_or(0.0),
+                    wakes
                 );
             }
         }

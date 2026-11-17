@@ -56,6 +56,13 @@ pub struct SinkStats {
     step_max_ns: AtomicU64,
     resumed: AtomicU64,
     late_cycles: AtomicU64,
+    watchdog_wakes: AtomicU64,
+    watchdog_late: AtomicU64,
+    watchdog_late_max_ns: AtomicU64,
+    watchdog_late_last_ns: AtomicU64,
+    /// 0: not running; 1: ordinary scheduling; 2: real-time.
+    watchdog_class: AtomicU32,
+    watchdog_priority: AtomicU32,
     late_total_ns: AtomicU64,
     late_max_ns: AtomicU64,
     late_last_ns: AtomicU64,
@@ -76,6 +83,12 @@ impl Default for SinkStats {
             step_max_ns: AtomicU64::new(0),
             resumed: AtomicU64::new(0),
             late_cycles: AtomicU64::new(0),
+            watchdog_wakes: AtomicU64::new(0),
+            watchdog_late: AtomicU64::new(0),
+            watchdog_late_max_ns: AtomicU64::new(0),
+            watchdog_late_last_ns: AtomicU64::new(0),
+            watchdog_class: AtomicU32::new(0),
+            watchdog_priority: AtomicU32::new(0),
             late_total_ns: AtomicU64::new(0),
             late_max_ns: AtomicU64::new(0),
             late_last_ns: AtomicU64::new(0),
@@ -114,6 +127,18 @@ pub struct SinkSnapshot {
     pub late_total_ms: f64,
     pub late_max_ms: f64,
     pub late_last_ms: f64,
+    /// The watchdog beside the capture: a thread that only wakes every two
+    /// milliseconds. How often it woke, how often a millisecond or more
+    /// late, its latest and its last lateness, and whether it runs with
+    /// real-time scheduling as the capture does (`None`: it is not
+    /// running), at which priority. Late at the same moment as the capture:
+    /// the whole machine stood still. The capture alone: PipeWire's side.
+    pub watchdog_wakes: u64,
+    pub watchdog_late: u64,
+    pub watchdog_late_max_ms: f64,
+    pub watchdog_late_last_ms: f64,
+    pub watchdog_real_time: Option<bool>,
+    pub watchdog_priority: u32,
 }
 
 impl SinkStats {
@@ -141,6 +166,15 @@ impl SinkStats {
             late_total_ms: self.late_total_ns.load(Ordering::Relaxed) as f64 * 1e-6,
             late_max_ms: self.late_max_ns.load(Ordering::Relaxed) as f64 * 1e-6,
             late_last_ms: self.late_last_ns.load(Ordering::Relaxed) as f64 * 1e-6,
+            watchdog_wakes: self.watchdog_wakes.load(Ordering::Relaxed),
+            watchdog_late: self.watchdog_late.load(Ordering::Relaxed),
+            watchdog_late_max_ms: self.watchdog_late_max_ns.load(Ordering::Relaxed) as f64 * 1e-6,
+            watchdog_late_last_ms: self.watchdog_late_last_ns.load(Ordering::Relaxed) as f64 * 1e-6,
+            watchdog_real_time: match self.watchdog_class.load(Ordering::Relaxed) {
+                0 => None,
+                class => Some(class == 2),
+            },
+            watchdog_priority: self.watchdog_priority.load(Ordering::Relaxed),
         }
     }
 }
@@ -302,6 +336,90 @@ fn format(rate: u32, channels: u32) -> Result<Vec<u8>> {
 /// Offers a sink to the applications of this machine and writes what they
 /// play into `writer`, until `stop` is set. Runs on the calling thread.
 ///
+/// The name under which a PipeWire context keeps the helper that gives
+/// threads real-time scheduling.
+const THREAD_UTILS: &[u8] = b"Spa:Pointer:Interface:ThreadUtils\0";
+
+/// How often the watchdog wakes, and from when on a wake-up counts as late.
+const WATCHDOG_STEP: Duration = Duration::from_millis(2);
+const WATCHDOG_LATE: Duration = Duration::from_millis(1);
+
+/// Asks the helper PipeWire uses for its own processing threads to
+/// schedule the calling thread as it schedules those.
+///
+/// # Safety
+/// `utils` is null or the thread helper of a context that is alive.
+unsafe fn schedule_as_the_capture(utils: *mut spa::sys::spa_thread_utils) -> bool {
+    if utils.is_null() {
+        return false;
+    }
+    // SAFETY: the helper is an interface of the context: a table of
+    // functions and the object they are called with.
+    unsafe {
+        let iface = &(*utils).iface;
+        let methods = iface.cb.funcs.cast::<spa::sys::spa_thread_utils_methods>();
+        if methods.is_null() {
+            return false;
+        }
+        match (*methods).acquire_rt {
+            Some(acquire) => {
+                let this_thread = libc::pthread_self() as usize as *mut spa::sys::spa_thread;
+                // -1: the priority the configuration gives processing threads.
+                acquire(iface.cb.data, this_thread, -1) >= 0
+            }
+            None => false,
+        }
+    }
+}
+
+/// The watchdog beside the capture: a thread scheduled as the capture's
+/// is, that does nothing but wake every [`WATCHDOG_STEP`] and note how late
+/// it was woken. `utils` is the context's thread helper, as a number so
+/// that it can cross to the new thread.
+fn start_watchdog(stats: Arc<SinkStats>, stop: Arc<AtomicBool>, utils: usize) {
+    let spawned = std::thread::Builder::new()
+        .name("istesso-watchdog".to_string())
+        .spawn(move || {
+            // SAFETY: the pointer comes from the context of `run_sink`,
+            // which outlives this thread's use of it: the request is made
+            // once, here, before the sink's loop can end.
+            let _ = unsafe { schedule_as_the_capture(utils as *mut spa::sys::spa_thread_utils) };
+            // What the thread really has, whatever was answered.
+            let mut policy = 0;
+            // SAFETY: plain values for the call to fill.
+            let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+            // SAFETY: both pointers are valid for the call.
+            unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
+            let policy = policy & !libc::SCHED_RESET_ON_FORK;
+            let real_time = policy == libc::SCHED_FIFO || policy == libc::SCHED_RR;
+            stats
+                .watchdog_class
+                .store(if real_time { 2 } else { 1 }, Ordering::Relaxed);
+            stats
+                .watchdog_priority
+                .store(param.sched_priority.max(0) as u32, Ordering::Relaxed);
+            while !stop.load(Ordering::Relaxed) {
+                let due = std::time::Instant::now() + WATCHDOG_STEP;
+                std::thread::sleep(WATCHDOG_STEP);
+                let late = std::time::Instant::now().saturating_duration_since(due);
+                stats.watchdog_wakes.fetch_add(1, Ordering::Relaxed);
+                let late_ns = late.as_nanos() as u64;
+                stats
+                    .watchdog_late_max_ns
+                    .fetch_max(late_ns, Ordering::Relaxed);
+                if late >= WATCHDOG_LATE {
+                    stats
+                        .watchdog_late_last_ns
+                        .store(late_ns, Ordering::Relaxed);
+                    stats.watchdog_late.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    if spawned.is_err() {
+        // Without the watchdog the capture works as before.
+    }
+}
+
 /// The sink takes audio in the form `writer` was made for (its rate and
 /// channels); PipeWire converts what applications play.
 pub fn run_sink(
@@ -324,6 +442,12 @@ pub fn run_sink(
         .or_else(|_| pw::context::ContextRc::new(&mainloop, None))
         .map_err(device)?;
     let core = context.connect_rc(None).map_err(device)?;
+
+    // SAFETY: the context is alive; the name is a C string.
+    let utils = unsafe {
+        pw::sys::pw_context_get_object(context.as_raw_ptr(), THREAD_UTILS.as_ptr().cast())
+    } as usize;
+    start_watchdog(stats.clone(), stop.clone(), utils);
 
     let mut props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
