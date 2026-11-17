@@ -37,7 +37,7 @@ use istesso_host_linux::options::{self, CpuLatency, Measure, Sched, Switches};
 use istesso_host_linux::picture::Who;
 use istesso_host_linux::session::{self, Begin, Door, Flow, Session, ThroughDoor, Tongue};
 use istesso_host_linux::stage::{CursorSeen, Handed, Heard, Note, Plan, Stage};
-use istesso_host_linux::{render, wake};
+use istesso_host_linux::{cursor, render, wake};
 use istesso_media::{clock, wire, Admit, Host, StreamInfo};
 use istesso_pair::Identity;
 use istesso_proto::InputEvent;
@@ -506,6 +506,10 @@ fn run(mut setup: Setup, display: Display) -> Result<(), String> {
             log: log.clone(),
             clock: clock::now_ns,
             cursor_told: setup.cursor,
+            // Read on a thread of their own, while the pipeline starts.
+            cursors: setup
+                .cursor
+                .then(|| cursor::Book::open(cursor::theme_directories())),
         },
     )?;
 

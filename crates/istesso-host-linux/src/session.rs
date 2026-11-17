@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::contract::{self, Command, Display, Event};
+use crate::cursor;
 use crate::framelog::{line, FrameLog};
 use crate::picture::{At, Picture, State, Told, Who, Works};
 use crate::stage::{CursorSeen, Handed, Heard, Note, Out, Stage, ToCompositor};
@@ -101,6 +102,8 @@ pub struct Session {
     to_compositor: Option<ToCompositor>,
     /// Whether the viewers draw the cursor and are told what it looks like.
     cursor_told: bool,
+    /// The host's cursor themes, for telling a shape by its name.
+    cursors: Option<Arc<cursor::Book>>,
     last_key_frame_ns: u64,
     windows: u32,
     environment: Option<Vec<(String, String)>>,
@@ -115,6 +118,8 @@ pub struct Begin {
     pub log: FrameLog,
     pub clock: fn() -> u64,
     pub cursor_told: bool,
+    /// The host's cursor themes; `None` passes every cursor on as it comes.
+    pub cursors: Option<Arc<cursor::Book>>,
 }
 
 impl Session {
@@ -136,6 +141,7 @@ impl Session {
             clock: begin.clock,
             to_compositor,
             cursor_told: begin.cursor_told,
+            cursors: begin.cursors,
             last_key_frame_ns: 0,
             windows: 0,
             environment: None,
@@ -352,6 +358,7 @@ impl Session {
         match heard {
             Heard::Cursor(cursor) => {
                 if self.cursor_told {
+                    let cursor = self.by_name_where_it_can(cursor);
                     let accepted = self.door.cursor(&cursor);
                     let (shape, image) = match &cursor {
                         CursorSeen::Hidden => ("hidden", None),
@@ -411,6 +418,60 @@ impl Session {
             Heard::End => return Flow::End(Ok(())),
         }
         Flow::On
+    }
+
+    /// Turns a cursor into what travels: the name of its shape where the
+    /// device has a cursor of its own for it, an image otherwise (see
+    /// [`cursor`]). On the thread that hears the bus; never on a frame's path.
+    fn by_name_where_it_can(&self, seen: CursorSeen) -> CursorSeen {
+        let Some(book) = &self.cursors else {
+            return seen;
+        };
+        match seen {
+            CursorSeen::Hidden => CursorSeen::Hidden,
+            CursorSeen::Named(name) if cursor::travels_as_name(&name) => CursorSeen::Named(name),
+            // A shape the set does not have: as the theme draws it. Where no
+            // theme has it, the name goes: a device that knows it shows its
+            // own, one that does not shows its arrow.
+            CursorSeen::Named(name) => match book.image_of(&name, 24) {
+                Some(image) => CursorSeen::Image {
+                    width: image.width,
+                    height: image.height,
+                    hotspot_x: image.hotspot_x,
+                    hotspot_y: image.hotspot_y,
+                    scale: 1,
+                    pixels: image.rgba,
+                },
+                None => CursorSeen::Named(name),
+            },
+            CursorSeen::Image {
+                width,
+                height,
+                hotspot_x,
+                hotspot_y,
+                scale,
+                pixels,
+            } => {
+                let image = cursor::Image {
+                    width,
+                    height,
+                    hotspot_x,
+                    hotspot_y,
+                    rgba: pixels,
+                };
+                match book.name_of(&image) {
+                    Some(name) => CursorSeen::Named(name.to_string()),
+                    None => CursorSeen::Image {
+                        width,
+                        height,
+                        hotspot_x,
+                        hotspot_y,
+                        scale,
+                        pixels: image.rgba,
+                    },
+                }
+            }
+        }
     }
 
     /// Looked at every few milliseconds, also while no frame is made: a
@@ -548,6 +609,7 @@ mod tests {
                 log: FrameLog::none(),
                 clock,
                 cursor_told: true,
+                cursors: None,
             },
         )
         .unwrap();
@@ -731,6 +793,59 @@ mod tests {
         set.session.tick();
         assert_eq!(set.session.last_key_frame_ns, first);
         set.session.stop();
+    }
+
+    #[test]
+    fn a_cursor_that_is_the_theme_s_image_goes_to_the_viewers_by_its_name() {
+        // A theme with one cursor, the I-beam, of one pixel.
+        let icons = std::env::temp_dir().join(format!("ihl-session-icons-{}", std::process::id()));
+        let cursors = icons.join("Theme/cursors");
+        std::fs::create_dir_all(&cursors).unwrap();
+        let mut file = b"Xcur".to_vec();
+        for number in [16u32, 0x1_0000, 1, 0xfffd_0002, 24, 28] {
+            file.extend_from_slice(&number.to_le_bytes());
+        }
+        for number in [36u32, 0xfffd_0002, 24, 1, 1, 1, 0, 0, 0] {
+            file.extend_from_slice(&number.to_le_bytes());
+        }
+        file.extend_from_slice(&[30, 20, 10, 255]);
+        std::fs::write(cursors.join("xterm"), &file).unwrap();
+        let book = cursor::Book::open(vec![icons.clone()]);
+        let began = Instant::now();
+        while !book.is_read() {
+            assert!(began.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let mut set = set(ENCODER, Tongue::Measure);
+        set.session.cursors = Some(book);
+        let image = |pixels: Vec<u8>| CursorSeen::Image {
+            width: 1,
+            height: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            scale: 1,
+            pixels,
+        };
+        // The theme's own image: told by name. Another image: told as it is.
+        set.session
+            .heard(Heard::Cursor(image(vec![10, 20, 30, 255])));
+        set.session
+            .heard(Heard::Cursor(image(vec![11, 20, 30, 255])));
+        // A name of the set stays a name; one outside it, which no theme here has, too.
+        set.session
+            .heard(Heard::Cursor(CursorSeen::Named("pointer".into())));
+        set.session
+            .heard(Heard::Cursor(CursorSeen::Named("crosshair".into())));
+        set.session.heard(Heard::Cursor(CursorSeen::Hidden));
+        let calls = set.calls();
+        assert_eq!(calls[0], r#"cursor Named("text")"#);
+        assert!(calls[1].starts_with("cursor Image"), "{}", calls[1]);
+        assert_eq!(calls[2], r#"cursor Named("pointer")"#);
+        assert_eq!(calls[3], r#"cursor Named("crosshair")"#);
+        assert_eq!(calls[4], "cursor Hidden");
+        set.session.stop();
+        let _ = std::fs::remove_dir_all(&icons);
     }
 
     #[test]

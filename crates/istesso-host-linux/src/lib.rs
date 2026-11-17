@@ -14,6 +14,7 @@
 //! that drives GStreamer is behind the feature `pipeline`.
 
 pub mod contract;
+pub mod cursor;
 pub mod encoder;
 pub mod framelog;
 pub mod gate;
