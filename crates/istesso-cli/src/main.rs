@@ -561,7 +561,7 @@ fn relay_input(
         }
     };
     let mut line = InputLine::open(client, connect)
-        .map_err(|e| format!("the device does not take input from here: {e}"))?;
+        .map_err(|(_, why)| format!("the device does not take input from here: {why}"))?;
     // A socket left by an earlier run is in the way of a new one.
     match std::fs::remove_file(socket) {
         Ok(()) => {}

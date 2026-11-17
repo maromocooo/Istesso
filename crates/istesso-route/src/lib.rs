@@ -11,6 +11,14 @@
 //! ([`exec`]); running on other machines waits for the isolation (M5).
 //!
 //! Nothing in this crate talks to other machines or reads this device's keys.
+//!
+//! What is checked before anything runs is the file this command reads
+//! itself (the task file), the file it starts itself (a program the task
+//! names by a relative path), and the folders leading to them. What a
+//! started program reads or runs after that is not checked. Anything outside
+//! this line is a limit written in the documents, not something to fix; one
+//! of them, until ADR 0014, is that the ACLs of folders above the project's
+//! root are not looked at.
 
 mod accounts;
 pub mod choices;

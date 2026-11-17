@@ -6,9 +6,11 @@ use istesso_device_api::{
     Encoding, Event, PictureFormat, PictureTarget, ReportKind, ReportRule, Rotation, Shape, UsbId,
 };
 use istesso_devices::picture::Rgba;
-use istesso_devices::record::{self, replay};
+use istesso_devices::record::{self, event_from_text, event_text, replay};
 use istesso_devices::session::{Error, Session};
+use istesso_devices::text::{unescape, INFO_VALUE_LIMIT};
 use istesso_devices::transport::FakeTransport;
+use istesso_devices::transport::Transport;
 
 static DECLARATION: Declaration = Declaration {
     name: "Test Pad",
@@ -74,7 +76,7 @@ impl Adapter for Pad {
             return Err(AdapterError::Malformed("version too short"));
         }
         (cx.emit)(Event::Info {
-            name: "version",
+            name: "version".into(),
             value: answer[1].to_string(),
         });
         (cx.emit)(Event::Shape(Shape {
@@ -177,7 +179,7 @@ fn connecting_tells_what_the_device_looks_like() {
     assert_eq!(
         session.next_event(),
         Some(Event::Info {
-            name: "version",
+            name: "version".into(),
             value: "7".into()
         })
     );
@@ -379,4 +381,214 @@ fn replay_refuses_what_is_not_a_recording() {
     assert!(replay(polite(), "# only a comment\n").is_err());
     assert!(replay(polite(), "connect\nfly away\n").is_err());
     assert!(replay(polite(), "connect\nget 05 07\n").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Text that a device supplies
+// ---------------------------------------------------------------------------
+
+/// Passes on, as the value of an info, whatever text the device answers
+/// with, and does nothing to make it safe: that is the framework's work.
+struct Chatty;
+
+impl Adapter for Chatty {
+    fn connect(&mut self, cx: &mut Context<'_>) -> Result<(), AdapterError> {
+        let mut answer = [0u8; 512];
+        let n = cx.hid.get_feature(0x05, &mut answer)?;
+        let text = String::from_utf8_lossy(&answer[1..n]).into_owned();
+        (cx.emit)(Event::Info {
+            name: "firmware".into(),
+            value: text.clone(),
+        });
+        // A name that is not a plain word, with the same text in it.
+        (cx.emit)(Event::Info {
+            name: text,
+            value: "x".into(),
+        });
+        (cx.emit)(Event::Button {
+            index: 1,
+            pressed: true,
+        });
+        Ok(())
+    }
+
+    fn input(&mut self, _: &[u8], _: &mut Context<'_>) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
+    fn command(&mut self, _: Command<'_>, _: &mut Context<'_>) -> Result<(), AdapterError> {
+        Ok(())
+    }
+}
+
+fn chatty() -> AdapterEntry {
+    AdapterEntry {
+        declaration: &DECLARATION,
+        create: || Box::new(Chatty),
+    }
+}
+
+/// What a device might call its firmware: a line break followed by what looks
+/// like another notice, escape sequences that clear the screen and set the
+/// window title, a NUL, text that is not ASCII, a backslash, blanks at the ends.
+const HOSTILE: &str = " 1.0\nevent button 0 down\r\n\u{1b}[2J\u{1b}]0;owned\u{7}\0 バージョン \\n ";
+
+fn device_saying(text: &str) -> FakeTransport {
+    let mut device = FakeTransport::default();
+    let mut answer = vec![0x05];
+    answer.extend_from_slice(text.as_bytes());
+    device.answers.push_back((0x05, answer));
+    device
+}
+
+fn printable_ascii(text: &str) -> bool {
+    text.chars().all(|c| (' '..='~').contains(&c))
+}
+
+#[test]
+fn text_from_a_device_is_escaped_where_notices_are_collected() {
+    let mut session = Session::new(chatty(), device_saying(HOSTILE));
+    session.start_recording();
+    // The adapter gives no shape; that is not what this test is about.
+    let _ = session.connect();
+
+    let Some(Event::Info { name, value }) = session.next_event() else {
+        panic!("the first notice is the info");
+    };
+    assert_eq!(name, "firmware");
+    assert!(printable_ascii(&value), "{value:?}");
+    assert!(!value.starts_with(' ') && !value.ends_with(' '));
+    // Nothing the device said is lost.
+    assert_eq!(unescape(&value).as_deref(), Some(HOSTILE));
+
+    // A name that is not a plain word is replaced, not passed on.
+    assert_eq!(
+        session.next_event(),
+        Some(Event::Info {
+            name: "invalid-name".into(),
+            value: "x".into()
+        })
+    );
+    assert_eq!(
+        session.next_event(),
+        Some(Event::Button {
+            index: 1,
+            pressed: true
+        })
+    );
+    assert_eq!(session.next_event(), None);
+}
+
+#[test]
+fn a_device_cannot_add_a_line_to_a_recording_or_a_control_character() {
+    let mut session = Session::new(chatty(), device_saying(HOSTILE));
+    session.start_recording();
+    let _ = session.connect();
+    let recording = session.recording();
+
+    assert!(recording.lines().all(printable_ascii), "{recording:?}");
+    assert!(
+        !recording.contains('\u{1b}') && !recording.contains('\0') && !recording.contains('\r')
+    );
+    let notices: Vec<&str> = recording
+        .lines()
+        .filter_map(|line| line.strip_prefix("event "))
+        .collect();
+    // Two infos and the one real button notice; the "event button 0 down"
+    // inside the firmware text stayed inside its line.
+    assert_eq!(notices.len(), 3, "{recording}");
+    assert_eq!(
+        notices.iter().filter(|n| n.starts_with("button ")).count(),
+        1
+    );
+    assert_eq!(notices[2], "button 1 down");
+    assert_eq!(
+        recording.lines().count(),
+        5,
+        "connect, get, three notices:\n{recording}"
+    );
+
+    // Every line of a notice reads back as the notice that was collected.
+    let mut session = Session::new(chatty(), device_saying(HOSTILE));
+    let _ = session.connect();
+    let mut read_back = 0;
+    while let Some(event) = session.next_event() {
+        let line = event_text(&event);
+        assert_eq!(event_from_text(&line).as_ref(), Ok(&event), "{line}");
+        assert_eq!(notices[read_back], line);
+        read_back += 1;
+    }
+    assert_eq!(read_back, 3);
+
+    // And the recording replays: the same device text gives the same lines.
+    replay(chatty(), &format!("{}\n{recording}", record::HEADER)).unwrap();
+}
+
+#[test]
+fn overlong_text_from_a_device_is_cut() {
+    let long = "A".repeat(400);
+    let mut session = Session::new(chatty(), device_saying(&long));
+    let _ = session.connect();
+    let Some(Event::Info { value, .. }) = session.next_event() else {
+        panic!("the first notice is the info");
+    };
+    assert_eq!(value.len(), INFO_VALUE_LIMIT + 2);
+    assert!(value.ends_with("\\~"));
+    assert_eq!(unescape(&value), Some("A".repeat(INFO_VALUE_LIMIT)));
+}
+
+/// A device whose errors carry text of their own.
+struct Faulty;
+
+impl Transport for Faulty {
+    fn write(&mut self, _: &[u8]) -> Result<(), String> {
+        Err("write failed\n\u{1b}[31mevent button 0 down".into())
+    }
+    fn send_feature(&mut self, _: &[u8]) -> Result<(), String> {
+        Err("feature failed\u{7}".into())
+    }
+    fn get_feature(&mut self, _: u8, _: &mut [u8]) -> Result<usize, String> {
+        Err("no answer\r\nevent button 0 down\u{1b}[2J".into())
+    }
+    fn read(&mut self, _: &mut [u8], _: u32) -> Result<usize, String> {
+        Err("read failed\n\u{1b}]0;owned\u{7}".into())
+    }
+}
+
+#[test]
+fn what_the_system_says_about_a_failure_is_made_printable() {
+    let mut session = Session::new(polite(), Faulty);
+    session.start_recording();
+    let error = session.connect().unwrap_err().to_string();
+    assert!(printable_ascii(&error), "{error:?}");
+    assert_eq!(error, "no answer\\r\\nevent button 0 down\\x1b[2J");
+
+    let recording = session.recording();
+    assert_eq!(recording.lines().count(), 2, "{recording}");
+    assert!(recording.lines().all(printable_ascii), "{recording:?}");
+    assert!(
+        recording.ends_with("error no answer\\r\\nevent button 0 down\\x1b[2J\n"),
+        "{recording}"
+    );
+
+    let error = session.poll(10).unwrap_err().to_string();
+    assert!(printable_ascii(&error), "{error:?}");
+    let error = session.brightness(10).unwrap_err().to_string();
+    assert!(printable_ascii(&error), "{error:?}");
+}
+
+#[test]
+fn a_message_about_a_recording_does_not_carry_its_control_characters() {
+    for text in [
+        "connect\nfly \u{1b}[2J away\n",
+        "connect\nin 01 \u{1b}]0;owned\u{7}\n",
+        "connect\nget 05 -> 05 07\nevent info version 7\nevent \u{1b}[31mred\n",
+    ] {
+        let error = replay(polite(), text).unwrap_err();
+        assert!(printable_ascii(&error.replace('\n', " ")), "{error:?}");
+        assert!(
+            !error.contains('\u{1b}') && !error.contains('\u{7}'),
+            "{error:?}"
+        );
+    }
 }
