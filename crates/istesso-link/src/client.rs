@@ -205,15 +205,8 @@ impl Client {
     pub fn open_input_alive_by(&mut self, by: Instant, then: Duration) -> Result<InputAnswer> {
         let bytes = serde_json::to_vec(&Request::InputOpen { alive: true })
             .map_err(|_| Error::Malformed)?;
-        let left = by
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or(Error::Timeout)?;
-        self.channel
-            .stream()
-            .set_write_timeout(Some(left))
-            .map_err(Error::from_io)?;
-        self.channel.send(&bytes)?;
+        // Asking and the answer end at the same point in time.
+        self.channel.send_by(&bytes, by)?;
         let answer = self.channel.recv_by(by);
         self.set_timeout(then)?;
         match serde_json::from_slice(&answer?).map_err(|_| Error::Malformed)? {

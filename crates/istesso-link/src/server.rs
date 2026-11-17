@@ -112,10 +112,12 @@ impl Session {
     /// As [`Session::next_request`], for the first request of a
     /// conversation: it has to be there, whole, by `by`, however slowly the
     /// caller sends it, and whatever the caller sends before it. A request
-    /// this version does not know is answered and does not add to the time;
-    /// a byte now and then does not either. `Ok(None)` means that the time
-    /// is up or the caller is gone. Afterwards each wait for the caller may
-    /// take `then`.
+    /// this version does not know is answered and does not add to the time,
+    /// whether the caller reads the answer or not; a byte now and then does
+    /// not either. `Ok(None)` means that the time is up or the caller is
+    /// gone: the conversation is over then, and the session is to be
+    /// dropped (an answer may have been cut off half written). Afterwards
+    /// each wait for the caller may take `then`.
     ///
     /// Until its first request a paired device has asked for nothing, and
     /// holds one of a few places ([`crate::waiting`]): it must not be able
@@ -136,10 +138,22 @@ impl Session {
                     self.set_wait(then)?;
                     return Ok(Some(request));
                 }
-                Err(_) => self.respond(&Response::error(
-                    ErrorCode::Unsupported,
-                    "this version of istesso does not know that request",
-                ))?,
+                Err(_) => {
+                    // The answer ends at the same point in time as the
+                    // reading: a caller that asks and never reads would
+                    // otherwise be waited for once more, for as long as a
+                    // write may take, when the connection takes no more.
+                    let answer = serde_json::to_vec(&Response::error(
+                        ErrorCode::Unsupported,
+                        "this version of istesso does not know that request",
+                    ))
+                    .map_err(|_| Error::Malformed)?;
+                    match self.channel.send_by(&answer, by) {
+                        Ok(()) => {}
+                        Err(Error::Closed | Error::Timeout) => return Ok(None),
+                        Err(err) => return Err(err),
+                    }
+                }
             }
         }
     }
@@ -494,6 +508,98 @@ mod tests {
         assert!(
             *silent >= Duration::from_millis(800) && *silent < Duration::from_millis(2500),
             "the next request was waited for {silent:?}"
+        );
+    }
+
+    /// The time for the first request covers the answers as well. A paired
+    /// caller that sends requests this version does not know as fast as it
+    /// can, and reads none of the answers, gets to where the connection
+    /// takes no more of them: the answer that waits there is let go of when
+    /// the time is up, and does not wait for as long as a write may take on
+    /// top of it.
+    #[test]
+    fn a_caller_that_never_reads_the_answers_is_let_go_of_when_the_time_is_up() {
+        use std::io::Write;
+        use std::time::Instant;
+
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = thread::spawn(move || {
+            let keys = LocalKeys::new(&studio).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            // A write may take ten seconds: far longer than the first
+            // request is given.
+            let mut session =
+                Session::accept(stream, &keys, &studio_trusts.store, TIMEOUT).unwrap();
+
+            // How many answers a connection holds before it takes no more
+            // depends on the system, and how soon the caller gets there on
+            // how busy the machine is. So that the test depends on neither,
+            // the connection is filled here, before the clock starts, with
+            // bytes the caller never reads either. Should it take a few
+            // more after all, the caller's own requests see to the rest.
+            let mut stream = session.channel.stream();
+            stream
+                .set_write_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let filler = [0u8; 64 * 1024];
+            loop {
+                match stream.write(&filler) {
+                    Ok(_) => {}
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(err) => panic!("filling the connection: {err}"),
+                }
+            }
+            session.set_wait(TIMEOUT).unwrap();
+
+            let began = Instant::now();
+            let first = session.first_request_by(began + Duration::from_secs(1), TIMEOUT);
+            (first, began.elapsed())
+        });
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        // The caller's own writes stop taking once the host reads no more;
+        // they must not keep the test for ever.
+        stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+        let mut junk = Channel::initiate(stream, &keys, |key| {
+            air_trusts
+                .store
+                .find_by_key(key)
+                .map(|_| ())
+                .ok_or(Error::UnknownPeer)
+        })
+        .unwrap();
+        // It asks until the host hangs up (or until nothing has been taken
+        // for a long time), and reads nothing.
+        let mut asked = 0u64;
+        while junk.send(br#"{"type":"teleport"}"#).is_ok() {
+            asked += 1;
+        }
+        assert!(asked >= 1);
+        // The connection stays open until the host has made up its mind.
+        let (first, took) = host.join().unwrap();
+        drop(junk);
+
+        assert!(matches!(first, Ok(None)), "{first:?}");
+        // Not before the time was up, and nowhere near the ten seconds that
+        // a write may take: the margin is for a busy machine.
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(5),
+            "the first request was waited for {took:?}"
         );
     }
 }

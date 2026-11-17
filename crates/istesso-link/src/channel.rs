@@ -249,6 +249,25 @@ impl Channel<TcpStream> {
         receive(&mut hurried, &mut self.transport, &mut self.scratch)
     }
 
+    /// As [`Channel::send`], with the whole message on its way by `by`,
+    /// however little the other device takes at a time: every write is
+    /// given what is left of the time, not a wait of its own. A device that
+    /// reads nothing holds the sender no longer than one that reads
+    /// everything.
+    ///
+    /// When the time runs out, part of the message may have gone: as after
+    /// any error, the channel must be dropped. Afterwards the connection's
+    /// wait for a write is whatever was left at the last one: whoever goes
+    /// on writing sets it anew.
+    pub fn send_by(&mut self, message: &[u8], by: Instant) -> Result<()> {
+        let wire = self.seal(message)?;
+        let mut hurried = Hurried {
+            stream: &self.stream,
+            until: by,
+        };
+        write_all(&mut hurried, &wire)
+    }
+
     /// Opens a channel as the answering side, as [`Channel::respond`] does,
     /// with the whole handshake over `within` this time, however slowly the
     /// other device sends. Until it is over nobody knows who is calling: a
@@ -393,6 +412,15 @@ impl<S: Read + Write> Channel<S> {
 
     /// Sends one message.
     pub fn send(&mut self, message: &[u8]) -> Result<()> {
+        let wire = self.seal(message)?;
+        write_all(&mut self.stream, &wire)
+    }
+
+    /// Seals one message into the bytes that go onto the wire for it. What
+    /// [`Channel::send`] does before it writes; apart from it only so that
+    /// the same bytes can be written with one deadline for all of them
+    /// ([`Channel::send_by`]). Nothing differs but the waiting.
+    fn seal(&mut self, message: &[u8]) -> Result<Vec<u8>> {
         if message.len() > MAX_MESSAGE {
             return Err(Error::TooLarge);
         }
@@ -411,7 +439,7 @@ impl<S: Read + Write> Channel<S> {
                 .map_err(Error::crypto)?;
             encode_frame(&mut wire, &self.scratch[..n]);
         }
-        write_all(&mut self.stream, &wire)
+        Ok(wire)
     }
 
     /// Waits for the next message. [`Error::Closed`] means the other end hung
