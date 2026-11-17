@@ -384,6 +384,16 @@ pub unsafe extern "C" fn istesso_media_host_key_frame_wanted(host: *const Istess
 /// # Safety
 /// `host` as above.
 #[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_offer(host: *const IstessoMediaHost, offered: i32) {
+    // SAFETY: the caller's promise.
+    if let Some(host) = unsafe { host.as_ref() } {
+        host.host.offer(offered != 0);
+    }
+}
+
+/// # Safety
+/// `host` as above.
+#[no_mangle]
 pub unsafe extern "C" fn istesso_media_host_viewers(host: *const IstessoMediaHost) -> u32 {
     // SAFETY: the caller's promise.
     unsafe { host.as_ref() }.map_or(0, |host| host.host.viewers() as u32)
@@ -877,6 +887,32 @@ mod tests {
             assert!(frame.first_ns >= before && frame.whole_ns >= frame.first_ns);
             // Nothing more for now.
             assert_eq!(istesso_media_client_next(client, 30, &mut frame), 0);
+
+            // Not offered for a moment: nobody watches, and the port takes no caller.
+            istesso_media_host_offer(host, 0);
+            assert_eq!(istesso_media_host_viewers(host), 0);
+            assert_eq!(istesso_media_client_next(client, 5000, &mut frame), -1);
+            istesso_media_client_close(client);
+            let refused = istesso_media_client_connect(
+                c(&dirs.device()).as_ptr(),
+                addr.as_ptr(),
+                name.as_ptr(),
+                1000,
+            );
+            assert!(refused.is_null());
+            istesso_media_host_offer(host, 1);
+            let client = istesso_media_client_connect(
+                c(&dirs.device()).as_ptr(),
+                addr.as_ptr(),
+                name.as_ptr(),
+                5000,
+            );
+            assert!(!client.is_null(), "{}", last_error());
+            let began = Instant::now();
+            while istesso_media_host_viewers(host) == 0 {
+                assert!(began.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
 
             istesso_media_client_ask_key_frame(client);
             assert_eq!(istesso_media_client_next(client, 30, &mut frame), 0);

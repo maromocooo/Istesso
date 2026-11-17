@@ -135,6 +135,13 @@ int32_t istesso_media_host_key_frame_wanted(const IstessoMediaHost *host);
  */
 int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const IstessoMediaCursor *cursor);
 
+/*
+ * Offers the picture to paired devices (1, as from the start) or stops offering it (0): every
+ * viewer is cut off at once and no caller is taken, or even answered, until it is offered again.
+ * For a session that is shown to nobody for the time being.
+ */
+void istesso_media_host_offer(const IstessoMediaHost *host, int32_t offered);
+
 /* Devices that are being shown the picture now. */
 uint32_t istesso_media_host_viewers(const IstessoMediaHost *host);
 

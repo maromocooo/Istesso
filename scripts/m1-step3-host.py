@@ -55,6 +55,41 @@ every cursor the compositor reports:
 
 The unencrypted stream of --to never carries the cursor: there it stays in the picture.
 
+Whoever started this program can tell it things while it runs, one word a line on standard
+input, and is told things in lines of JSON on standard output, each with the key "istesso"
+(docs/adr/0015-media-transport.md, "止める、戻す、閉じる"):
+
+    pause     stop making the picture and give the encoder back: the element that holds the
+              NVENC session is closed and taken out of the pipeline. The compositor and the
+              application go on; viewers stay connected and are told that the picture stands
+              still. Answered with {"istesso":"paused","offered":true,"took_ms":T}
+    detach    the same, and with --to-channel every viewer is cut off and no caller is taken
+              until `resume`. Answered with {"istesso":"paused","offered":false,"took_ms":T}
+    resume    open an encoder again and go on; the first frame is a key frame. With
+              --to-channel the picture is offered again. Answered with {"istesso":"resumed",
+              "opened_ms":T,"encoded_ms":T,"written_ms":T,"key":1} once the first frame is out
+              (from reading the word to: the encoder being there, the first frame leaving it,
+              that frame handed on). When the graphics card opens no encoder, because all of
+              its sessions are taken, the answer is {"istesso":"refused","word":"resume",
+              "reason":"..."}: the picture stays stopped, the compositor and the application
+              go on, and `resume` can be said again later
+
+    close     ask the application to close its windows, as the close button of a window
+              manager does (xdg_toplevel.close to every toplevel). An application with nothing
+              to lose ends; one with unsaved work asks and stays; nothing is closed by force.
+              Answered with {"istesso":"close","asked":true}, or false when the compositor
+              plugin cannot do it (it needs the third patch in scripts/patches)
+
+Without being asked, it says how many windows the application has, whenever that changes, and
+when the last one has gone (with the same third patch; otherwise it says neither):
+
+    {"istesso":"windows","count":N}
+    {"istesso":"empty"}                 the last window has gone: the application is over,
+                                        whatever its processes do
+
+The frame log gets a "picture" line for each stop and resume, with the same times, and a
+"windows" line for each count.
+
 Needs GStreamer with its Python bindings, the NVIDIA elements and gst-wayland-display
 (GST_PLUGIN_PATH); with --to-channel also the shared library built by
 `cargo build --release -p istesso-media`.
@@ -281,6 +316,9 @@ def main():
         pacing = "as-built"
         if args.render_on_commit:
             print("note: this compositor plugin has no render-on-commit property; it paces frames the way it was built", file=sys.stderr)
+    if compositor.find_property("window-messages") is not None:
+        # Told how many windows the application has, so that its end can be passed on.
+        compositor.set_property("window-messages", True)
     if args.cursor:
         if compositor.find_property("cursor-messages") is None:
             print("error: this compositor plugin has no cursor-messages property; build it with the second patch in scripts/patches", file=sys.stderr)
@@ -337,7 +375,20 @@ def main():
         log.write('{"kind":"encoded","pts":%d,"t_ns":%d,"bytes":%d,"key":%d}\n' % (buffer.pts, now, buffer.get_size(), key))
         if channel:
             encoded_at[buffer.pts] = now
+        if picture["state"] == "resuming":
+            picture["state"] = "running"
+            picture["first"] = {"pts": buffer.pts, "encoded_ns": now, "key": key}
+            if not channel:
+                first_frame_out(now)
         return Gst.PadProbeReturn.OK
+
+    def first_frame_out(written):
+        # The first frame after the picture was resumed has left: how long it all took.
+        first = picture.pop("first")
+        asked_at = picture["asked_ns"]
+        times = ((picture["opened_ns"] - asked_at) / 1e6, (first["encoded_ns"] - asked_at) / 1e6, (written - asked_at) / 1e6)
+        log.write('{"kind":"picture","t_ns":%d,"state":"resumed","opened_ms":%.3f,"encoded_ms":%.3f,"written_ms":%.3f,"key":%d}\n' % ((written,) + times + (first["key"],)))
+        say("resumed", opened_ms=round(times[0], 1), encoded_ms=round(times[1], 1), written_ms=round(times[2], 1), key=first["key"])
 
     sent = MediaSent()
 
@@ -364,6 +415,8 @@ def main():
             '{"kind":"sent","pts":%d,"t_ns":%d,"rtp":%d,"packets":%d,"written_ns":%d,"viewers":%d,"queued":%d,"bytes":%d}\n'
             % (buffer.pts, handed, sent.seq, sent.messages, written, sent.viewers, sent.queued, len(data))
         )
+        if "first" in picture and picture["first"]["pts"] == buffer.pts:
+            first_frame_out(written)
         return Gst.FlowReturn.OK
 
     def on_wanted():
@@ -392,11 +445,14 @@ def main():
         return Gst.PadProbeReturn.OK
 
     asked = {"at": 0, "count": 0}
+    # Whether the picture is being made: "running", on its way to "paused", or on its way back.
+    picture = {"state": "running", "offered": True, "again": False, "asked_ns": 0, "opened_ns": 0}
 
     def key_frame(by):
         now = time.monotonic_ns()
-        # One key frame answers every report of the same loss.
-        made = now - asked["at"] >= 50_000_000
+        # One key frame answers every report of the same loss. While the picture is stopped
+        # there is no encoder to ask; it begins with a key frame when it comes back.
+        made = now - asked["at"] >= 50_000_000 and picture["state"] == "running"
         if made:
             asked["at"] = now
             asked["count"] += 1
@@ -494,11 +550,29 @@ def main():
         accepted = media.istesso_media_host_set_cursor(host, ctypes.byref(cursor)) == 0
         log.write('{"kind":"cursor","t_ns":%d,"shape":"%s"%s,"accepted":%d}\n' % (time.monotonic_ns(), kind, detail, 1 if accepted else 0))
 
+    windows = {"count": 0}
+
+    def on_windows(count):
+        # How many windows the application has (the element's application message
+        # wayland.windows). The last one gone means that the application is over.
+        log.write('{"kind":"windows","t_ns":%d,"count":%d}\n' % (time.monotonic_ns(), count))
+        say("windows", count=count)
+        if count == 0 and windows["count"] > 0:
+            say("empty")
+        windows["count"] = count
+
     def on_message(bus, message):
         if message.type == Gst.MessageType.APPLICATION:
             structure = message.get_structure()
             if args.cursor and structure is not None and structure.get_name() == "wayland.cursor":
                 on_cursor(structure)
+            elif structure is not None and structure.get_name() == "wayland.windows":
+                on_windows(structure.get_uint("count")[1])
+        elif message.type == Gst.MessageType.ERROR and time.monotonic_ns() - picture.get("refused_ns", -(10**12)) < 2_000_000_000:
+            # The encoder that could not be opened says so here as well. It has been taken out
+            # again, and the pipeline goes on without a picture.
+            error, detail = message.parse_error()
+            print(f"note: {error.message}", file=sys.stderr)
         elif message.type == Gst.MessageType.ERROR:
             error, detail = message.parse_error()
             print(f"error: {error.message}", file=sys.stderr)
@@ -521,6 +595,149 @@ def main():
     def stop():
         loop.quit()
         return False
+
+    # ---- Stopping the picture and resuming it, without ending the application ----
+    #
+    # The encoder is the scarce thing: a graphics card opens only a few at once for the whole
+    # machine. A picture that nobody looks at gives its encoder back. The frames are stopped
+    # where they leave the compositor, the encoder element is closed and removed, and on the
+    # way back a new one is put in its place, which begins with a key frame.
+
+    encoder_words = next(part for part in description.split(" ! ") if part.startswith("nvcudah265enc")).split()
+    compositor_pad = compositor.get_static_pad("src")
+
+    def say(event, **fields):
+        print(json.dumps({"istesso": event, **fields}, separators=(",", ":")), flush=True)
+
+    def on_stopped(pad, info):
+        # On the compositor's thread, with a frame in hand. In the mode that renders when an
+        # application commits, the thread stays here with that one frame until the picture is
+        # resumed: nothing is rendered meanwhile, and the applications are told to draw on a beat
+        # of their own. On the fixed beat the applications are told to draw by the frames, so
+        # there the frames go on being made and are thrown away here.
+        # The frame in hand is kept: it is the first to go into the encoder that is opened on
+        # the way back.
+        picture["held"] = info.get_buffer()
+        if picture["state"] == "stopping":
+            picture["state"] = "stopped"
+            GLib.idle_add(close_encoder)
+        if picture["state"] in ("resuming", "running"):
+            return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK if pacing == "on-commit" else Gst.PadProbeReturn.DROP
+
+    def close_encoder():
+        enc = pipeline.get_by_name("enc")
+        picture["before"] = enc.get_static_pad("sink").get_peer()
+        picture["after"] = enc.get_static_pad("src").get_peer()
+        # Closing the element closes its session with the card.
+        enc.set_locked_state(True)
+        enc.set_state(Gst.State.NULL)
+        pipeline.remove(enc)
+        now = time.monotonic_ns()
+        took = (now - picture["asked_ns"]) / 1e6
+        picture["state"] = "paused"
+        log.write('{"kind":"picture","t_ns":%d,"state":"paused","offered":%d,"took_ms":%.3f}\n' % (now, 1 if picture["offered"] else 0, took))
+        say("paused", offered=picture["offered"], took_ms=round(took, 1))
+        if picture["again"]:
+            picture["again"] = False
+            resume_picture()
+        return False
+
+    def stop_picture(offered):
+        if channel and not offered:
+            # Whoever watches is let go at once, and nobody comes in its place.
+            media.istesso_media_host_offer(host, 0)
+            picture["offered"] = False
+        if picture["state"] == "paused":
+            say("paused", offered=picture["offered"], took_ms=0.0)
+        if picture["state"] != "running":
+            return
+        picture["state"] = "stopping"
+        picture["asked_ns"] = time.monotonic_ns()
+        kind = Gst.PadProbeType.BUFFER | (Gst.PadProbeType.BLOCK if pacing == "on-commit" else 0)
+        picture["probe"] = compositor_pad.add_probe(kind, on_stopped)
+
+    def resume_picture():
+        if channel:
+            media.istesso_media_host_offer(host, 1)
+            picture["offered"] = True
+        if picture["state"] in ("stopping", "stopped"):
+            picture["again"] = True  # Asked while the encoder was still being closed.
+        if picture["state"] != "paused":
+            return
+        picture["asked_ns"] = time.monotonic_ns()
+        enc = Gst.ElementFactory.make("nvcudah265enc", "enc")
+        for word in encoder_words[1:]:
+            name, _, value = word.partition("=")
+            if name != "name":
+                Gst.util_set_object_arg(enc, name, value)
+        pipeline.add(enc)
+        picture["before"].link(enc.get_static_pad("sink"))
+        enc.get_static_pad("src").link(picture["after"])
+        enc.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, on_encoded)
+        enc.sync_state_with_parent()
+        picture["opened_ns"] = time.monotonic_ns()
+        picture["state"] = "resuming"
+        # The frame that was in hand when the picture stopped goes into the new encoder first,
+        # from here and not from the compositor's thread: if the graphics card opens no encoder
+        # (all of its sessions are taken), that is found out here, and the compositor never
+        # learns of it. It and the application go on, and the picture stays stopped.
+        held = picture.get("held")
+        result = compositor_pad.get_peer().chain(held) if held is not None else Gst.FlowReturn.OK
+        if result != Gst.FlowReturn.OK:
+            picture["refused_ns"] = time.monotonic_ns()
+            picture.pop("first", None)
+            enc.set_locked_state(True)
+            enc.set_state(Gst.State.NULL)
+            pipeline.remove(enc)
+            picture["state"] = "paused"
+            log.write('{"kind":"picture","t_ns":%d,"state":"refused","reason":"%s"}\n' % (picture["refused_ns"], result.value_nick))
+            say("refused", word="resume", reason="no encoder could be opened (%s); the picture stays stopped" % result.value_nick)
+            return
+        if pacing == "on-commit":
+            # The compositor's thread still holds that same frame. A second watch on the pad
+            # sees it once the first lets it go, and throws it away: it has been encoded.
+            picture["held_pts"] = held.pts if held is not None else None
+            compositor_pad.add_probe(Gst.PadProbeType.BUFFER, on_held_frame)
+            compositor_pad.remove_probe(picture["probe"])
+
+    def on_held_frame(pad, info):
+        if info.get_buffer().pts == picture.get("held_pts"):
+            picture["held_pts"] = None
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.REMOVE
+
+    def on_control(fd, condition):
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not data:
+            return False  # Nobody is going to tell this program anything; it goes on as it is.
+        control["text"] += data.decode(errors="replace")
+        *lines, control["text"] = control["text"].split("\n")
+        for word in (line.strip() for line in lines):
+            if word == "pause":
+                stop_picture(True if picture["state"] == "running" else picture["offered"])
+            elif word == "detach":
+                stop_picture(False)
+            elif word == "resume":
+                resume_picture()
+            elif word == "close":
+                # Taken by the compositor the way it takes input: an event that travels up from
+                # its source pad. A plugin without the patch does not know it and says so.
+                asked = compositor_pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, Gst.Structure.new_empty("CloseWindows")))
+                log.write('{"kind":"close","t_ns":%d,"asked":%d}\n' % (time.monotonic_ns(), 1 if asked else 0))
+                say("close", asked=bool(asked))
+            elif word:
+                print(f"note: {word!r} is not something this program can be told", file=sys.stderr)
+        return True
+
+    control = {"text": ""}
+    os.set_blocking(sys.stdin.fileno(), False)
+    GLib.io_add_watch(sys.stdin.fileno(), GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN | GLib.IOCondition.HUP, on_control)
 
     GLib.timeout_add(1000, every_second)
     if args.input:
