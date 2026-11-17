@@ -22,10 +22,20 @@ pub enum Request {
     /// May I send you what a person does with keyboard and pointer, for the
     /// application you are showing me? Answered with [`Response::InputOpen`];
     /// needs the permission to control.
-    InputOpen,
+    ///
+    /// With `alive`, the caller asks to be answered whenever it sends an
+    /// empty [`Request::Input`], so that it can tell a connection that has
+    /// gone silent from one that is merely idle. A device that knows this
+    /// says so in its answer; one that does not ignores the field.
+    InputOpen {
+        #[serde(default, skip_serializing_if = "is_false")]
+        alive: bool,
+    },
     /// Keyboard and pointer input, after [`Request::InputOpen`] was granted
-    /// on this connection. Never answered: what a person types must not
-    /// wait for a round trip. An empty list keeps the connection open.
+    /// on this connection. Never answered when it carries events: what a
+    /// person types must not wait for a round trip. An empty list keeps the
+    /// connection open, and is answered with [`Response::InputAlive`] when
+    /// that was agreed on at [`Request::InputOpen`].
     Input {
         #[serde(deserialize_with = "istesso_proto::known_only")]
         events: Vec<InputEvent>,
@@ -46,8 +56,15 @@ pub enum Response {
     Status {
         status: HostStatus,
     },
-    /// Input is taken from now on.
-    InputOpen,
+    /// Input is taken from now on. With `alive`: and an empty
+    /// [`Request::Input`] is answered from now on, as was asked.
+    InputOpen {
+        #[serde(default, skip_serializing_if = "is_false")]
+        alive: bool,
+    },
+    /// Still here: the answer to an empty [`Request::Input`] on a
+    /// connection where that was agreed on.
+    InputAlive,
     Error {
         code: ErrorCode,
         message: String,
@@ -65,6 +82,10 @@ pub enum ErrorCode {
     Internal,
     #[serde(other)]
     Other,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 impl Response {
@@ -121,8 +142,58 @@ mod tests {
             }
         );
         assert_eq!(
-            serde_json::to_string(&Request::InputOpen).unwrap(),
+            serde_json::to_string(&Request::InputOpen { alive: false }).unwrap(),
             r#"{"type":"input_open"}"#
+        );
+    }
+
+    /// The two messages as the version before knew them: without `alive`.
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Earlier {
+        InputOpen,
+    }
+
+    #[test]
+    fn asking_to_be_answered_is_one_field_that_an_earlier_version_passes_over() {
+        // Not asked for, the messages are what they always were.
+        let plain = r#"{"type":"input_open"}"#;
+        assert_eq!(
+            serde_json::to_string(&Response::InputOpen { alive: false }).unwrap(),
+            plain
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(plain).unwrap(),
+            Request::InputOpen { alive: false }
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(plain).unwrap(),
+            Response::InputOpen { alive: false }
+        );
+        // Asked for, and agreed to.
+        let asking = r#"{"type":"input_open","alive":true}"#;
+        assert_eq!(
+            serde_json::to_string(&Request::InputOpen { alive: true }).unwrap(),
+            asking
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(asking).unwrap(),
+            Response::InputOpen { alive: true }
+        );
+        // An earlier version reads both as what it knows, and its own answer says
+        // nothing about it: that is "no".
+        assert_eq!(
+            serde_json::from_str::<Earlier>(asking).unwrap(),
+            Earlier::InputOpen
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&serde_json::to_string(&Earlier::InputOpen).unwrap())
+                .unwrap(),
+            Response::InputOpen { alive: false }
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::InputAlive).unwrap(),
+            r#"{"type":"input_alive"}"#
         );
     }
 

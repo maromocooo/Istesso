@@ -9,6 +9,15 @@ use crate::channel::{Channel, LocalKeys};
 use crate::message::{ErrorCode, Request, Response};
 use crate::{Error, Result};
 
+/// Ends a [`Session`] from another thread.
+pub struct HangUp(TcpStream);
+
+impl HangUp {
+    pub fn hang_up(&self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// A conversation that a paired device opened with this one.
 pub struct Session {
     channel: Channel<TcpStream>,
@@ -58,6 +67,25 @@ impl Session {
 
     pub fn allows(&self, permission: Permission) -> bool {
         self.peer.permissions.contains(&permission)
+    }
+
+    /// Changes how long to wait for the caller's next message from now on.
+    pub fn set_wait(&self, timeout: Duration) -> Result<()> {
+        let stream = self.channel.stream();
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|_| stream.set_write_timeout(Some(timeout)))
+            .map_err(Error::from_io)
+    }
+
+    /// A handle that ends this conversation from another thread: whoever
+    /// waits in [`Session::next_request`] is told that the caller is done.
+    pub fn hang_up_handle(&self) -> Result<HangUp> {
+        self.channel
+            .stream()
+            .try_clone()
+            .map(HangUp)
+            .map_err(Error::from_io)
     }
 
     /// Waits for the next request. `Ok(None)` means the caller is done: it
