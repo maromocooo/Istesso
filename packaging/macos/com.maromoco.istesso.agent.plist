@@ -2,11 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Installed by the pkg as /Library/LaunchAgents/dev.istesso.agent.plist (root:wheel, 0644).
+    <!-- Installed by the pkg as /Library/LaunchAgents/com.maromoco.istesso.agent.plist (root:wheel, 0644).
          It runs per user, inside the graphical login session: screen recording and the
          Local Network permission belong to that session. -->
     <key>Label</key>
-    <string>dev.istesso.agent</string>
+    <string>com.maromoco.istesso.agent</string>
 
     <!-- The bundle's own executable, so that the permissions attach to the bundle.
          build-pkg.sh rewrites the path when the bundle is not called Istesso.app. -->
@@ -19,7 +19,7 @@
     <!-- Lets System Settings show the agent under the app, not as an unnamed item. -->
     <key>AssociatedBundleIdentifiers</key>
     <array>
-        <string>dev.istesso.app</string>
+        <string>com.maromoco.istesso</string>
     </array>
 
     <!-- Start when the user logs in; start again if it exits with an error.

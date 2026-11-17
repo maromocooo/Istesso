@@ -7,7 +7,7 @@ M9（配布と公開）の下ごしらえです。設計は [docs/m9-plan.md](..
 | ファイル | 何か | 使い方 |
 |---|---|---|
 | `macos/build-pkg.sh` | ビルド済みの `.app` から `.pkg` を作る | `packaging/macos/build-pkg.sh <Istesso.app> --version 0.1.0 --out dist` |
-| `macos/dev.istesso.agent.plist` | launchd のエージェント（ログイン時に `istesso agent` を起動） | `build-pkg.sh` が `/Library/LaunchAgents/` に入る形で包む |
+| `macos/com.maromoco.istesso.agent.plist` | launchd のエージェント（ログイン時に `istesso agent` を起動） | `build-pkg.sh` が `/Library/LaunchAgents/` に入る形で包む |
 | `macos/pkg-scripts/` | `.pkg` の前後の処理（エージェントを止める、起動する） | `build-pkg.sh` が使う |
 | `macos/uninstall.sh` | 入れたものを外す | `packaging/macos/uninstall.sh`（何をするか表示するだけ）。実行は `--yes` |
 | `ubuntu/build-deb.sh` | ビルド済みのプログラムから `.deb` を作る | `packaging/ubuntu/build-deb.sh --version 0.1.0 --out dist target/release/istesso` |
@@ -15,6 +15,10 @@ M9（配布と公開）の下ごしらえです。設計は [docs/m9-plan.md](..
 | `ubuntu/etc/40-istesso-limits.conf` | グループ `istesso` にリアルタイム優先度と nice だけを許す | `.deb` が `/etc/security/limits.d/` に入れる |
 | `ubuntu/etc/70-istesso-usb.rules` | 対応 USB 機器をグループ `plugdev` に開く udev の決まり | `.deb` が `/usr/lib/udev/rules.d/` に入れる |
 | `ubuntu/debian/` | `.deb` の control、postinst、postrm | `build-deb.sh` が使う |
+
+## 名前と識別子
+
+バンドル ID `com.maromoco.istesso`、launchd のラベル `com.maromoco.istesso.agent`、pkg の識別子 `com.maromoco.istesso.pkg`、Linux のパッケージ `istesso`、グループ `istesso`。一覧と、変えたときの代償は [m9-plan.md](../docs/m9-plan.md) の 0.1 にあります。許可がこの識別子に結びつくので、変えません。
 
 ## macOS の署名（環境変数）
 

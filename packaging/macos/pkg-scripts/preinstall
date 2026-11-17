@@ -6,7 +6,7 @@ user=$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)
 if [ -n "$user" ] && [ "$user" != "root" ]; then
     uid=$(/usr/bin/id -u "$user" 2>/dev/null || true)
     if [ -n "$uid" ]; then
-        /bin/launchctl bootout "gui/$uid/dev.istesso.agent" >/dev/null 2>&1 || true
+        /bin/launchctl bootout "gui/$uid/com.maromoco.istesso.agent" >/dev/null 2>&1 || true
     fi
 fi
 exit 0

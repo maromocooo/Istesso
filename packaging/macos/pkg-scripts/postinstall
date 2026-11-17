@@ -4,7 +4,7 @@
 # It does not touch the permission database, the user's files or keys. It never fails the
 # installation.
 user=$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)
-plist=/Library/LaunchAgents/dev.istesso.agent.plist
+plist=/Library/LaunchAgents/com.maromoco.istesso.agent.plist
 if [ -n "$user" ] && [ "$user" != "root" ] && [ -f "$plist" ]; then
     uid=$(/usr/bin/id -u "$user" 2>/dev/null || true)
     if [ -n "$uid" ]; then

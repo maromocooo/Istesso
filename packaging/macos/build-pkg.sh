@@ -20,8 +20,8 @@ set -euo pipefail
 export COPYFILE_DISABLE=1
 
 app_dir_default="Applications"
-label="dev.istesso.agent"
-pkg_id="dev.istesso.pkg"
+label="com.maromoco.istesso.agent"
+pkg_id="com.maromoco.istesso.pkg"
 
 usage() {
     sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
@@ -61,8 +61,8 @@ if [ -z "$version" ]; then
 fi
 [ -n "$version" ] || die "no version: give --version or set CFBundleShortVersionString"
 case "$version" in *[!0-9A-Za-z.+-]*) die "odd characters in the version" ;; esac
-if [ "$bundle_id" != "dev.istesso.app" ]; then
-    echo "warning: the bundle identifier is $bundle_id; the launchd plist names dev.istesso.app in AssociatedBundleIdentifiers" >&2
+if [ "$bundle_id" != "com.maromoco.istesso" ]; then
+    echo "warning: the bundle identifier is $bundle_id; the launchd plist names com.maromoco.istesso in AssociatedBundleIdentifiers" >&2
 fi
 
 app_name=$(basename "$bundle")

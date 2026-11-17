@@ -3,7 +3,7 @@
 #
 # Usage: packaging/macos/uninstall.sh [--yes] [--reset-permissions] [--purge-data]
 #   --yes                 really do it
-#   --reset-permissions   also forget the permissions granted to dev.istesso.app (tccutil)
+#   --reset-permissions   also forget the permissions granted to com.maromoco.istesso (tccutil)
 #   --purge-data          also remove this user's keys, paired devices and caches
 #
 # Files in /Applications and /Library belong to root: run the script as root when it says
@@ -24,9 +24,9 @@ for arg in "$@"; do
     esac
 done
 
-label="dev.istesso.agent"
-bundle_id="dev.istesso.app"
-pkg_id="dev.istesso.pkg"
+label="com.maromoco.istesso.agent"
+bundle_id="com.maromoco.istesso"
+pkg_id="com.maromoco.istesso.pkg"
 
 # The only paths this script ever removes. Nothing is taken from the environment but $HOME.
 system_paths=(
