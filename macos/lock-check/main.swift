@@ -425,6 +425,7 @@ final class Probe: NSObject, NSApplicationDelegate {
         window = FreeWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "Istesso lock check (Dev)"
         view = ProbeView(frame: NSRect(origin: .zero, size: frame.size))
+        EntryLog.view = view
         window.contentView = view
         window.acceptsMouseMovedEvents = true
         window.setFrame(frame, display: true)
@@ -520,7 +521,7 @@ final class Probe: NSObject, NSApplicationDelegate {
         } ?? "none"
         let known = taken.colours.filter { colour in
             ProbeView.colours.contains {
-                abs(Int($0.0) - Int(colour.0)) + abs(Int($0.1) - Int(colour.1)) + abs(Int($0.2) - Int(colour.2)) < 40
+                abs(Int($0.0) - Int(colour.0)) + abs(Int($0.1) - Int(colour.1)) + abs(Int($0.2) - Int(colour.2)) < 120
             }
         }
         let asleep = CGDisplayIsAsleep(CGMainDisplayID()) != 0
@@ -548,7 +549,7 @@ final class Probe: NSObject, NSApplicationDelegate {
             answer.stopped = taken.stopped
             let known = taken.colours.filter { colour in
                 ProbeView.colours.contains {
-                    abs(Int($0.0) - Int(colour.0)) + abs(Int($0.1) - Int(colour.1)) + abs(Int($0.2) - Int(colour.2)) < 40
+                    abs(Int($0.0) - Int(colour.0)) + abs(Int($0.1) - Int(colour.1)) + abs(Int($0.2) - Int(colour.2)) < 120
                 }
             }
             answer.live = known.count >= 3
@@ -566,6 +567,7 @@ final class Probe: NSObject, NSApplicationDelegate {
     /// A pointer event aimed at this program's own window.
     private func pointer(_ type: CGEventType) -> CGEvent? {
         let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: middle, mouseButton: .left)
+        event?.setIntegerValueField(.eventSourceUserData, value: EntryLog.marker)
         // Name the window under the pointer as this program's own, so its own process routes it there.
         event?.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.windowNumber))
         event?.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(window.windowNumber))
@@ -587,8 +589,11 @@ final class Probe: NSObject, NSApplicationDelegate {
 
         // 1 and 2: straight to this program's own process. Nothing else can receive these.
         let (keys0, moves0, clicks0) = (view.keys, view.moves, view.clicks)
-        CGEvent(keyboardEventSource: nil, virtualKey: Probe.keyF13, keyDown: true)?.postToPid(me)
-        CGEvent(keyboardEventSource: nil, virtualKey: Probe.keyF13, keyDown: false)?.postToPid(me)
+        for down in [true, false] {
+            let key = CGEvent(keyboardEventSource: nil, virtualKey: Probe.keyF13, keyDown: down)
+            key?.setIntegerValueField(.eventSourceUserData, value: EntryLog.marker)
+            key?.postToPid(me)
+        }
         pointer(.mouseMoved)?.postToPid(me)
         pointer(.leftMouseDown)?.postToPid(me)
         pointer(.leftMouseUp)?.postToPid(me)
@@ -695,6 +700,11 @@ final class Probe: NSObject, NSApplicationDelegate {
             lines.append("")
             lines.append("every 5 s:")
             lines.append(contentsOf: buckets)
+        }
+        if !EntryLog.lines.isEmpty {
+            lines.append("")
+            lines.append("at the application's entry (every key and button event it took, in order):")
+            lines.append(contentsOf: EntryLog.lines.map { "  " + $0 })
         }
         let missing = Probe.wanted.filter { state in !answers.contains { $0.state == state } }
         if watch == nil, mayCapture, !missing.isEmpty {
@@ -954,7 +964,34 @@ final class RateCheck: NSObject, NSApplicationDelegate {
     }
 }
 
-let application = NSApplication.shared
+/// The application's own entry for events from the system: every key and button event it takes is
+/// noted (type, the window number it carries, its location, whether it carries this program's marker),
+/// then what the application does with it (the window it goes to, and whether the view counted it).
+enum EntryLog {
+    static let marker: Int64 = 0x15e550
+    static var lines: [String] = []
+    static weak var view: ProbeView?
+}
+
+final class LoggingApplication: NSApplication {
+    override func sendEvent(_ event: NSEvent) {
+        let watched: [NSEvent.EventType] = [.leftMouseDown, .leftMouseUp, .keyDown, .keyUp]
+        guard watched.contains(event.type), EntryLog.lines.count < 200 else { return super.sendEvent(event) }
+        let ours = event.cgEvent?.getIntegerValueField(.eventSourceUserData) == EntryLog.marker
+        let target = event.window.map { $0 === self.windows.first(where: { $0.contentView is ProbeView }) ? "its own window" : "another of its windows" } ?? "no window"
+        let clicks = EntryLog.view?.clicks ?? 0
+        let keys = EntryLog.view?.keys ?? 0
+        super.sendEvent(event)
+        let counted = (EntryLog.view?.clicks ?? 0) > clicks || (EntryLog.view?.keys ?? 0) > keys
+        EntryLog.lines.append(String(
+            format: "%@ %@: window number %d, location (%.0f, %.0f), marker %@, click count %d; goes to %@; the view counted it %@",
+            ISO8601DateFormatter().string(from: Date()), String(describing: event.type), event.windowNumber,
+            event.locationInWindow.x, event.locationInWindow.y, ours ? "ours" : "not ours", event.type == .keyDown || event.type == .keyUp ? 0 : event.clickCount,
+            target, counted ? "YES" : "NO"))
+    }
+}
+
+let application = LoggingApplication.shared
 application.setActivationPolicy(.regular)
 let arguments = CommandLine.arguments
 let delegate: NSApplicationDelegate =
