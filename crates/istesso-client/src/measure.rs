@@ -55,6 +55,18 @@ pub const LET_GO_AFTER: Duration = Duration::from_secs(2);
 /// was in hand.
 pub type Hand = Box<dyn Fn(Vec<InputEvent>, Mark) + Send>;
 
+/// A hand that also tells: `came` is called on the listening thread each
+/// time events were handed on, after they were. For the application to
+/// know that input is going on when it comes this way and not through its
+/// window (the switch that keeps a core awake, ADR 0018). The events do not
+/// wait for it.
+pub fn telling(hand: Hand, came: impl Fn() + Send + 'static) -> Hand {
+    Box::new(move |events, mark| {
+        hand(events, mark);
+        came();
+    })
+}
+
 /// The way in, open. Closed, and its socket removed, when dropped.
 pub struct MeasureKeys {
     stop: Arc<AtomicBool>,
@@ -794,6 +806,45 @@ mod tests {
             .send_to(&serde_json::to_vec(&up).unwrap(), &socket)
             .is_err());
         assert!(taken.recv_timeout(Duration::from_millis(50)).is_err());
+        fs::remove_dir_all(place).unwrap();
+    }
+
+    #[test]
+    fn what_came_through_the_way_in_is_told_once_it_was_handed_on() {
+        let place = place("told");
+        let dir = place.join("keys");
+        let (handed, taken) = mpsc::channel();
+        let told = Arc::new(AtomicU64::new(0));
+        let (counts, seen) = (told.clone(), told.clone());
+        let keys = MeasureKeys::open(
+            &dir,
+            telling(
+                Box::new(move |events, _| {
+                    // Not told before the events were handed on.
+                    let _ = handed.send((events, seen.load(Ordering::SeqCst)));
+                }),
+                move || {
+                    counts.fetch_add(1, Ordering::SeqCst);
+                },
+            ),
+            false,
+        )
+        .unwrap();
+        let writer = UnixDatagram::unbound().unwrap();
+        for (nth, pressed) in [true, false].into_iter().enumerate() {
+            let key = InputEvent::Key { code: 30, pressed };
+            writer
+                .send_to(&serde_json::to_vec(&key).unwrap(), keys.socket())
+                .unwrap();
+            let (events, told_before) = taken.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(events, [key]);
+            assert_eq!(told_before, nth as u64);
+        }
+        // What is not an event is handed to nobody, and nothing is told for it.
+        writer.send_to(b"not an event", keys.socket()).unwrap();
+        // Closed: the listening thread has ended, and with it everything it would tell.
+        drop(keys);
+        assert_eq!(told.load(Ordering::SeqCst), 2);
         fs::remove_dir_all(place).unwrap();
     }
 }

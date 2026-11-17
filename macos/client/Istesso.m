@@ -27,6 +27,15 @@
 //                                                 interactive class
 //                               latency-critical  the system is told that this program's work is
 //                                                 latency critical for as long as it runs
+//                               awake-spin        one thread keeps a fast core busy while the window
+//                                                 is in front and input is going on (awake.h)
+//                               awake-tick        the same, with a thread that wakes a thousand
+//                                                 times a second instead of one that never rests
+//                               awake-session     with one of the two: from start to end, whatever
+//                                                 the window and the person do
+//                               usage             nothing is switched: the frame log says at start
+//                                                 and end what the process used (processor time,
+//                                                 energy as the system bills it)
 //   --command-key super       send the Command keys as Super instead of Control
 //   --config DIR              this device's identity and list of paired devices (default: where
 //                             `istesso` keeps them; ISTESSO_CONFIG_DIR works as well)
@@ -56,7 +65,9 @@
 // there, and in the frame log: {"kind":"reconnections","t_ns":T,"at":"start"|"cut"|"end",
 // "picture":N,"input":M} (M is -1 when no input is sent). The last such line has the counts.
 // The other lines are those of the prototype, and: {"kind":"wake",...} with the switches that are
-// on, {"kind":"input","t_ns":T,"event":"open"|"cut"|"back"|"over","reconnections":N}.
+// on, {"kind":"input","t_ns":T,"event":"open"|"cut"|"back"|"over","reconnections":N}, and with
+// --wake awake-spin or awake-tick {"kind":"awake","t_ns":T,"on":1|0} for when a core was kept
+// awake and {"kind":"awake","t_ns":T,"in_front":1|0} for when the window was the one in front.
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
@@ -64,6 +75,8 @@
 #import <IOSurface/IOSurface.h>
 #import <IOKit/hidsystem/IOLLEvent.h>
 #include <errno.h>
+#include <libproc.h>
+#include <mach/mach_time.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <signal.h>
@@ -71,6 +84,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
+#include "awake.h"
 #include "istesso_client.h"
 #include "istesso_media.h"
 
@@ -124,6 +139,34 @@ static void log_clock(void) {
     fprintf(frame_log, "{\"kind\":\"clock\",\"mono_ns\":%llu,\"unix_ns\":%llu}\n",
             (unsigned long long)(before + (after - before) / 2),
             (unsigned long long)day.tv_sec * 1000000000ULL + (unsigned long long)day.tv_nsec);
+}
+
+// ---- What the process used (--wake usage) ----
+//
+// For reading what a switch costs (the one that keeps a core awake, awake.h) without root: the
+// system tells any program about itself how long it had the processor, how much of that on the
+// fast cores, and the energy it bills to the process. Written at the start and at the end; the
+// difference is the session's. It changes nothing else. (The system's own figure for this
+// process: it is not the power of the whole Mac.)
+static bool wake_usage = false;
+
+static void log_usage(const char *at) {
+    if (frame_log == NULL) {
+        return;
+    }
+    struct rusage_info_v6 used;
+    memset(&used, 0, sizeof used);
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&used) != 0) {
+        fprintf(frame_log, "{\"kind\":\"wake_effect\",\"t_ns\":%llu,\"usage\":\"%s\",\"read\":0}\n", (unsigned long long)now_ns(), at);
+        return;
+    }
+    // The times are in the units of the system's clock, not in nanoseconds.
+    mach_timebase_info_data_t base;
+    mach_timebase_info(&base);
+    double ms = (double)base.numer / base.denom / 1e6;
+    fprintf(frame_log, "{\"kind\":\"wake_effect\",\"t_ns\":%llu,\"usage\":\"%s\",\"read\":1,\"cpu_ms\":%.1f,\"fast_cpu_ms\":%.1f,\"energy_mj\":%.1f,\"fast_energy_mj\":%.1f}\n",
+            (unsigned long long)now_ns(), at, (used.ri_user_time + used.ri_system_time) * ms,
+            (used.ri_user_ptime + used.ri_system_ptime) * ms, used.ri_energy_nj / 1e6, used.ri_penergy_nj / 1e6);
 }
 
 
@@ -1262,7 +1305,12 @@ static bool start_frame_log(const char *path) {
 #ifdef ISTESSO_MEASURING
     fprintf(frame_log, ",\"keys_qos\":%d", wake_keys_qos);
 #endif
+    fprintf(frame_log, ",\"awake_spin\":%d,\"awake_tick\":%d,\"awake_session\":%d,\"usage\":%d", awake_form == AWAKE_SPIN,
+            awake_form == AWAKE_TICK, awake_whole_session, wake_usage);
     fprintf(frame_log, "}\n");
+    if (wake_usage) {
+        log_usage("start");
+    }
     log_clock();
     // The log reaches the disk twice a second, and once more when the program ends.
     static dispatch_source_t timer;
@@ -1284,6 +1332,7 @@ static void finish(void) {
         return;
     }
     finished = true;
+    awake_finish();
 #ifdef ISTESSO_MEASURING
     if (measure_keys != NULL) {
         if (frame_log != NULL) {
@@ -1305,6 +1354,9 @@ static void finish(void) {
         istesso_input_close(closing);
     }
     if (frame_log != NULL) {
+        if (wake_usage) {
+            log_usage("end");
+        }
         log_clock();
         log_reconnections("end");
         fflush(frame_log);
@@ -1319,6 +1371,9 @@ static void finish(void) {
 static void send_input(const IstessoInputEvent *events, size_t count) {
     if (input != NULL && count > 0) {
         istesso_input_send(input, events, count);
+        if (awake_form != AWAKE_OFF) {
+            awake_input();
+        }
     }
 }
 
@@ -1781,6 +1836,40 @@ static void first_picture_is_there(void) {
 
 @end
 
+// ---- Keeping a fast core awake (awake.h): whether the window is the one in front ----
+
+// The application is the active one and the window takes the keys. Looked at on the window's
+// thread whenever either changes; the log says each change, also with awake-session, where
+// nothing depends on it (it shows whether the rule could have held in that layout).
+static void awake_look(bool first) {
+    bool front = NSApp.active && the_window != nil && the_window.keyWindow;
+    if ((awake_set_in_front(front) || first) && frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"awake\",\"t_ns\":%llu,\"in_front\":%d}\n", (unsigned long long)now_ns(), front);
+    }
+}
+
+static void awake_watch_the_window(void) {
+    NSNotificationCenter *centre = NSNotificationCenter.defaultCenter;
+    for (NSNotificationName name in @[NSApplicationDidBecomeActiveNotification, NSApplicationDidResignActiveNotification]) {
+        [centre addObserverForName:name object:NSApp queue:nil usingBlock:^(NSNotification *note) {
+            awake_look(false);
+        }];
+    }
+    for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification]) {
+        [centre addObserverForName:name object:the_window queue:nil usingBlock:^(NSNotification *note) {
+            awake_look(false);
+        }];
+    }
+    awake_look(true);
+}
+
+#ifdef ISTESSO_MEASURING
+// Called on the thread of the measurement's way in, after it handed keys to the input's thread.
+static void awake_came_through_the_way_in(void *context) {
+    awake_input();
+}
+#endif
+
 static void usage(void) {
     fprintf(stderr,
             "usage: Istesso --address ADDRESS:PORT [--host NAME] [--input-address ADDRESS[:PORT]] [--size WxH] [--position X,Y]\n"
@@ -1883,15 +1972,26 @@ int main(int argc, char *argv[]) {
                         wake_input_qos = true;
                     } else if (strcmp(each, "latency-critical") == 0) {
                         wake_latency_critical = true;
+                    } else if (strcmp(each, "awake-spin") == 0 || strcmp(each, "awake-tick") == 0) {
+                        int form = strcmp(each, "awake-spin") == 0 ? AWAKE_SPIN : AWAKE_TICK;
+                        if (awake_form != AWAKE_OFF && awake_form != form) {
+                            fprintf(stderr, "error: --wake takes awake-spin or awake-tick, not both\n");
+                            return 2;
+                        }
+                        awake_form = form;
+                    } else if (strcmp(each, "awake-session") == 0) {
+                        awake_whole_session = true;
+                    } else if (strcmp(each, "usage") == 0) {
+                        wake_usage = true;
 #ifdef ISTESSO_MEASURING
                     } else if (strcmp(each, "keys-qos") == 0) {
                         wake_keys_qos = true;
 #endif
                     } else if (*each != '\0') {
 #ifdef ISTESSO_MEASURING
-                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical and keys-qos, not %s\n", each);
+                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical, awake-spin, awake-tick, awake-session, usage and keys-qos, not %s\n", each);
 #else
-                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos and latency-critical, not %s\n", each);
+                        fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos, latency-critical, awake-spin, awake-tick, awake-session and usage, not %s\n", each);
 #endif
                         return 2;
                     }
@@ -1904,6 +2004,10 @@ int main(int argc, char *argv[]) {
         }
         if (channel_address == NULL) {
             usage();
+            return 2;
+        }
+        if (awake_whole_session && awake_form == AWAKE_OFF) {
+            fprintf(stderr, "error: --wake awake-session goes with awake-spin or awake-tick\n");
             return 2;
         }
 
@@ -1979,6 +2083,15 @@ int main(int argc, char *argv[]) {
         if (frame_log_path != NULL && !start_frame_log(frame_log_path)) {
             return 1;
         }
+        if (awake_form != AWAKE_OFF) {
+            // Before anything can hand input on. Without the switch: no thread, nothing watched.
+            awake_log = frame_log;
+            awake_watch_the_window();
+            if (!awake_start()) {
+                fprintf(stderr, "error: cannot start the thread that keeps a core awake\n");
+                return 1;
+            }
+        }
         // Asked to stop from outside: as when the person quits.
         static dispatch_source_t stop[2];
         int signals[2] = {SIGTERM, SIGINT};
@@ -2009,7 +2122,10 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             // Not started without it: a measurement would begin with nowhere to write its keys.
-            measure_keys = istesso_measure_keys_open(input, measure_keys_dir, wake_keys_qos ? ISTESSO_INPUT_INTERACTIVE : 0);
+            // With the switch that keeps a core awake, the keys that come this way count as
+            // input going on, as the window's do. Without it nothing is told.
+            measure_keys = istesso_measure_keys_open(input, measure_keys_dir, wake_keys_qos ? ISTESSO_INPUT_INTERACTIVE : 0,
+                                                     awake_form != AWAKE_OFF ? awake_came_through_the_way_in : NULL, NULL);
             if (measure_keys == NULL) {
                 fprintf(stderr, "error: the measurement's keys: %s\n", istesso_client_last_error());
                 istesso_input_close(input);

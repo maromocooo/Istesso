@@ -127,8 +127,14 @@ void istesso_input_close(IstessoInput *input);
  * Keys and buttons that came through the way in and are still down when nothing has come for
  * two seconds are let go on the host (a measuring program that died), and counted.
  *
+ * `came`: NULL, or a function that is called on the listening thread with `context` each time
+ * what came through the way in was handed to the input's thread, after it was. It tells the
+ * application that input is going on when it does not come through its window (the switch that
+ * keeps a core awake, ADR 0018). With NULL the keys go exactly as without such a function.
+ *
  * Closed before `input` is.
  */
+typedef void (*IstessoMeasureKeysCame)(void *context);
 typedef struct IstessoMeasureKeys IstessoMeasureKeys;
 typedef struct IstessoMeasureKeysState {
     uint64_t let_go;      /* keys and buttons let go because nothing came any more */
@@ -136,7 +142,8 @@ typedef struct IstessoMeasureKeysState {
                            * 2 asked for and not in effect */
     uint32_t reserved;
 } IstessoMeasureKeysState;
-IstessoMeasureKeys *istesso_measure_keys_open(const IstessoInput *input, const char *dir, uint32_t flags);
+IstessoMeasureKeys *istesso_measure_keys_open(const IstessoInput *input, const char *dir, uint32_t flags,
+                                              IstessoMeasureKeysCame came, void *context);
 int32_t istesso_measure_keys_state(const IstessoMeasureKeys *keys, IstessoMeasureKeysState *state);
 void istesso_measure_keys_close(IstessoMeasureKeys *keys);
 #endif

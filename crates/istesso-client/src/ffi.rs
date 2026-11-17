@@ -292,28 +292,55 @@ pub struct IstessoMeasureKeysState {
     pub reserved: u32,
 }
 
+/// Called on the thread that listens at the way in, each time what came
+/// through it was handed on.
+#[cfg(feature = "measure-keys")]
+pub type IstessoMeasureKeysCame = Option<unsafe extern "C" fn(context: *mut c_void)>;
+
 /// Opens `<dir>/measure-keys.sock`: what is written there goes to the host
 /// as what the person does in the window goes. Null when it cannot be
 /// opened as it must be (the folder for its owner alone); the reason is in
 /// `istesso_client_last_error`.
 ///
+///
+/// `came`, if given, is called on the listening thread with `context` each
+/// time something that came through the way in was handed to the input's
+/// thread, after it was: the application's way to know that input is going
+/// on when it does not come through its window. Without it the keys go as
+/// they went before there was such a function.
+///
 /// # Safety
 /// `input` came from `istesso_input_open` and has not been closed; `dir` is
-/// a C string. The result is closed before `input` is.
+/// a C string. The result is closed before `input` is. `came`, if given, may
+/// be called on another thread with `context` until the result is closed.
 #[cfg(feature = "measure-keys")]
 #[no_mangle]
 pub unsafe extern "C" fn istesso_measure_keys_open(
     input: *const IstessoInput,
     dir: *const c_char,
     flags: u32,
+    came: IstessoMeasureKeysCame,
+    context: *mut c_void,
 ) -> *mut IstessoMeasureKeys {
     // SAFETY: the caller's promises.
     let opened = unsafe { text(dir) }.and_then(|dir| {
         let dir = dir.ok_or("no folder for the measurement's keys was named")?;
         let input = unsafe { input.as_ref() }.ok_or("there is no input to hand the keys to")?;
+        let hand = input.input.hand();
+        let hand = match came {
+            Some(came) => {
+                let context = Context(context);
+                crate::measure::telling(hand, move || {
+                    let context = &context;
+                    // SAFETY: the caller's function, with the caller's own pointer.
+                    unsafe { came(context.0) }
+                })
+            }
+            None => hand,
+        };
         crate::measure::MeasureKeys::open(
             std::path::Path::new(&dir),
-            input.input.hand(),
+            hand,
             flags & FLAG_INTERACTIVE != 0,
         )
     });

@@ -112,6 +112,8 @@ mkdir -p build
 ./check-test.sh
 # What goes to the other side for which key is tested first: it needs no window.
 cc -Wall -Wextra -o build/keys-test ../gst-viewer/keys-test.c && build/keys-test
+# When a fast core is kept awake (a measuring switch, ADR 0018): the rule, tested without a window.
+cc -Wall -Wextra -o build/awake-test awake-test.c && build/awake-test
 # The picture's and the input's connections come from the Rust crate istesso-client, linked statically.
 # (The measuring build's library goes to a folder of its own: the two are never mixed up.)
 (cd ../.. && cargo build --release -p istesso-client $features $target)
