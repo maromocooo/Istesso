@@ -15,6 +15,9 @@
 //!   yet — where encoded frames go (the transport of ADR 0015), and where
 //!   pictures come from (a generated picture now; a window once capture may
 //!   be used).
+//! * [`confine`]: where an input for a remote session may be delivered — to
+//!   the session's application and nowhere else. The decision alone, tested
+//!   without the permission; the posting obeys it.
 //! * [`input`], [`keys`]: input for the application, from what the other
 //!   device sent to what the Mac is told. The arithmetic is tested; handing
 //!   an event to the system needs the Accessibility permission and has not
@@ -32,6 +35,7 @@
 //! refuses and says where it is granted.
 
 pub mod annexb;
+pub mod confine;
 pub mod contract;
 pub mod input;
 pub mod keys;
