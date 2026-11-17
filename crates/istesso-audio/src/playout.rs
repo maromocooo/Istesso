@@ -364,6 +364,14 @@ impl<R: Resample> Playout<R> {
         }
     }
 
+    /// Gives back what outlives a playout: the queue it reads, its counts
+    /// and where its waits go. When the output device is replaced by one
+    /// with another rate, a new playout is made of these; what is in the
+    /// queue stays there, and the counts go on.
+    pub fn into_parts(self) -> (Reader, Arc<PlayoutStats>, Option<Producer<WaitEvent>>) {
+        (self.reader, self.stats, self.waits)
+    }
+
     pub fn state(&self) -> State {
         self.state
     }
@@ -945,6 +953,36 @@ mod tests {
         frame: u64,
         /// Everything that was played.
         played: Vec<f32>,
+    }
+
+    #[test]
+    fn a_playout_that_is_taken_apart_keeps_what_is_in_the_queue() {
+        let (mut writer, reader) = crate::fifo::queue(2, 48_000);
+        let samples = vec![0.25f32; 256 * 2];
+        for packet in 0..10u64 {
+            assert!(writer.push_audio(256, &samples, packet == 0, packet * 256, 0, 0));
+        }
+        let stats = Arc::new(PlayoutStats::default());
+        let first = Playout::new(
+            PlayoutConfig::new(2, 48_000.0, 48_000.0, 0.040),
+            reader,
+            Sinc::new(48_000.0, 48_000.0, 2, 64, 1.01).unwrap(),
+            stats.clone(),
+            None,
+        );
+        let (reader, stats_again, waits) = first.into_parts();
+        assert_eq!(reader.available(), 10 * 256);
+        assert!(Arc::ptr_eq(&stats, &stats_again));
+        assert!(waits.is_none());
+        // The same queue under a playout for a device with another rate.
+        let second = Playout::new(
+            PlayoutConfig::new(2, 48_000.0, 44_100.0, 0.040),
+            reader,
+            Sinc::new(48_000.0, 44_100.0, 2, 64, 1.01).unwrap(),
+            stats_again,
+            None,
+        );
+        assert_eq!(second.state(), State::Waiting);
     }
 
     fn counting_rig() -> Rig<Counting> {

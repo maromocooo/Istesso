@@ -849,6 +849,67 @@ mod mac {
         )
     }
 
+    /// What the device's callback plays from and where it leaves what it
+    /// would have played.
+    struct Voice {
+        playout: Playout<Sinc>,
+        record_in: istesso_audio::rtrb::Producer<f32>,
+    }
+
+    /// Starts `output` with the callback that plays from `voice`.
+    fn start_output(
+        output: &mut Output,
+        channels: usize,
+        audible: bool,
+        voice: Arc<Mutex<Option<Voice>>>,
+        seen: Arc<Callbacks>,
+    ) -> Result<(), String> {
+        let device_rate = output.device().sample_rate;
+        let mut turn_before: Option<(u64, u64)> = None;
+        output
+            .start(channels, move |frames, out, now_ns| {
+                let began_ns = clock::now_ns();
+                // The playout is here unless it is just being handed to
+                // another device; then this turn is silence.
+                match voice.try_lock().ok().as_deref_mut() {
+                    Some(Some(voice)) => {
+                        voice.playout.render(frames, out, now_ns);
+                        let _ = voice.record_in.push_partial_slice(out);
+                    }
+                    _ => out.fill(0.0),
+                }
+                // Unless the person asked to hear it, the device gets
+                // silence, and with it the clock of the device still drives
+                // the playout.
+                if !audible {
+                    out.fill(0.0);
+                }
+                // Was this program late, or did the device not come? How
+                // long the work here took, and whether the frames of this
+                // callback are due when those of the last one end.
+                let lasts_ns = (frames as f64 / device_rate * 1e9) as u64;
+                let took_ns = clock::now_ns().saturating_sub(began_ns);
+                seen.took_max_us
+                    .fetch_max(took_ns / 1000, Ordering::Relaxed);
+                if took_ns > lasts_ns / 2 {
+                    seen.took_long.fetch_add(1, Ordering::Relaxed);
+                }
+                note_turn(&seen, now_ns, turn_before);
+                turn_before = Some((now_ns, lasts_ns));
+                let lead_us = (now_ns as i64 - began_ns as i64) / 1000;
+                if lead_us <= 0 {
+                    seen.late.fetch_add(1, Ordering::Relaxed);
+                }
+                seen.count.fetch_add(1, Ordering::Relaxed);
+                seen.frames_min.fetch_min(frames as u64, Ordering::Relaxed);
+                seen.frames_max.fetch_max(frames as u64, Ordering::Relaxed);
+                seen.lead_min_us.fetch_min(lead_us, Ordering::Relaxed);
+                seen.lead_max_us.fetch_max(lead_us, Ordering::Relaxed);
+                seen.lead_sum_us.fetch_add(lead_us, Ordering::Relaxed);
+            })
+            .map_err(|e| e.to_string())
+    }
+
     pub fn play(options: PlayOptions) -> Result<(), String> {
         if !(5.0..=2000.0).contains(&options.latency_ms) {
             return Err("the wait is between 5 and 2000 milliseconds".to_string());
@@ -1024,7 +1085,7 @@ mod mac {
         };
 
         let mut output = Output::open(options.output.as_deref()).map_err(|e| e.to_string())?;
-        let device = output.device().clone();
+        let mut device = output.device().clone();
         let cfg = PlayoutConfig::new(
             channels,
             stream_rate,
@@ -1034,11 +1095,11 @@ mod mac {
         let resampler = Sinc::new(stream_rate, device.sample_rate, channels, 64, 1.01)?;
         let stats = Arc::new(PlayoutStats::default());
         let (waits_in, mut waits_out) = RingBuffer::<WaitEvent>::new(1 << 16);
-        let mut playout = Playout::new(cfg, queue_out, resampler, stats.clone(), Some(waits_in));
+        let playout = Playout::new(cfg, queue_out, resampler, stats.clone(), Some(waits_in));
 
         // What would have been played goes to a thread that keeps it. Room
         // for ten seconds: that thread is an ordinary one and may be held up.
-        let (mut record_in, mut record_out) =
+        let (record_in, mut record_out) =
             RingBuffer::<f32>::new((device.sample_rate as usize) * channels * 10);
         let callbacks = Arc::new(Callbacks {
             frames_min: AtomicU64::new(u64::MAX),
@@ -1076,48 +1137,33 @@ mod mac {
 
         // The device's own word on turns that were not made in time, and
         // the system's on its devices being rearranged.
-        let overloads = output.count_overloads().ok();
+        let overload_counts = std::cell::RefCell::new(
+            output
+                .count_overloads()
+                .ok()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        let overloads_now = || {
+            overload_counts
+                .borrow()
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .sum::<u64>()
+        };
         let audible = options.audible;
         let rearranged = istesso_audio::mac::watch_devices().ok();
         let mut rearranged_seen = (0u64, 0u64);
-        let seen = callbacks.clone();
-        let device_rate = device.sample_rate;
-        let mut turn_before: Option<(u64, u64)> = None;
-        output
-            .start(channels, move |frames, out, now_ns| {
-                let began_ns = clock::now_ns();
-                playout.render(frames, out, now_ns);
-                let _ = record_in.push_partial_slice(out);
-                // Unless the person asked to hear it, the device gets
-                // silence, and with it the clock of the device still drives
-                // the playout.
-                if !audible {
-                    out.fill(0.0);
-                }
-                // Was this program late, or did the device not come? How
-                // long the work here took, and whether the frames of this
-                // callback are due when those of the last one end.
-                let lasts_ns = (frames as f64 / device_rate * 1e9) as u64;
-                let took_ns = clock::now_ns().saturating_sub(began_ns);
-                seen.took_max_us
-                    .fetch_max(took_ns / 1000, Ordering::Relaxed);
-                if took_ns > lasts_ns / 2 {
-                    seen.took_long.fetch_add(1, Ordering::Relaxed);
-                }
-                note_turn(&seen, now_ns, turn_before);
-                turn_before = Some((now_ns, lasts_ns));
-                let lead_us = (now_ns as i64 - began_ns as i64) / 1000;
-                if lead_us <= 0 {
-                    seen.late.fetch_add(1, Ordering::Relaxed);
-                }
-                seen.count.fetch_add(1, Ordering::Relaxed);
-                seen.frames_min.fetch_min(frames as u64, Ordering::Relaxed);
-                seen.frames_max.fetch_max(frames as u64, Ordering::Relaxed);
-                seen.lead_min_us.fetch_min(lead_us, Ordering::Relaxed);
-                seen.lead_max_us.fetch_max(lead_us, Ordering::Relaxed);
-                seen.lead_sum_us.fetch_add(lead_us, Ordering::Relaxed);
-            })
-            .map_err(|e| e.to_string())?;
+        // The playout is shared with the device's callback, so that it can
+        // be handed to another device when the default output changes.
+        let voice = Arc::new(Mutex::new(Some(Voice { playout, record_in })));
+        start_output(
+            &mut output,
+            channels,
+            audible,
+            voice.clone(),
+            callbacks.clone(),
+        )?;
         eprintln!(
             "Playing {} an output at {} Hz ({} frames at a time); the stream is {} Hz, {} channels.",
             if audible { "into" } else { "silently into" },
@@ -1183,10 +1229,7 @@ mod mac {
                         .map_or(0, |c| c.default_output.load(Ordering::Relaxed))
                         as f64,
                 ),
-                (
-                    "device_overloads",
-                    overloads.as_ref().map_or(0, |c| c.load(Ordering::Relaxed)) as f64,
-                ),
+                ("device_overloads", overloads_now() as f64),
                 (
                     "missed_device_turns",
                     callbacks.missed_turns.load(Ordering::Relaxed) as f64,
@@ -1275,11 +1318,71 @@ mod mac {
                         changes.devices.load(Ordering::Relaxed),
                     );
                     if now.0 != rearranged_seen.0 {
+                        let at = begin.elapsed().as_secs_f64();
                         eprintln!(
-                            "{:>7.1} s since the start: the default output changed ({} so far); this player stays on the device it opened",
-                            begin.elapsed().as_secs_f64(),
+                            "{at:>7.1} s since the start: the default output changed ({} so far)",
                             now.0
                         );
+                        // A player that was not told which device to use
+                        // goes with the default one.
+                        let next = match &options.output {
+                            None => Output::open(None).map_err(|e| e.to_string()),
+                            Some(_) => Err("it was told which output to use".to_string()),
+                        };
+                        match next {
+                            Ok(next) if next.device().id == device.id => {}
+                            Ok(mut next) => {
+                                let to = next.device().clone();
+                                let resampler =
+                                    Sinc::new(stream_rate, to.sample_rate, channels, 64, 1.01)?;
+                                output.stop();
+                                let old = voice
+                                    .lock()
+                                    .map_err(|_| "the playout was lost".to_string())?
+                                    .take()
+                                    .ok_or("the playout was lost")?;
+                                let (reader, counts, waits) = old.playout.into_parts();
+                                let cfg = PlayoutConfig::new(
+                                    channels,
+                                    stream_rate,
+                                    to.sample_rate,
+                                    options.latency_ms * 1e-3,
+                                );
+                                *voice.lock().map_err(|_| "the playout was lost".to_string())? =
+                                    Some(Voice {
+                                        playout: Playout::new(cfg, reader, resampler, counts, waits),
+                                        record_in: old.record_in,
+                                    });
+                                start_output(
+                                    &mut next,
+                                    channels,
+                                    audible,
+                                    voice.clone(),
+                                    callbacks.clone(),
+                                )?;
+                                if let Ok(count) = next.count_overloads() {
+                                    overload_counts.borrow_mut().push(count);
+                                }
+                                if to.sample_rate != device.sample_rate {
+                                    // What would have been played is looked
+                                    // at anew at the new rate.
+                                    watch = (options.tone_hz > 0.0).then(|| {
+                                        probe::ToneWatch::new(to.sample_rate, options.tone_hz, 60.0)
+                                    });
+                                }
+                                output = next;
+                                device = to;
+                                eprintln!(
+                                    "{:>7.1} s since the start: playing into the new default output at {} Hz ({} frames at a time)",
+                                    begin.elapsed().as_secs_f64(),
+                                    device.sample_rate,
+                                    device.buffer_frames
+                                );
+                            }
+                            Err(why) => eprintln!(
+                                "{at:>7.1} s since the start: staying on the output opened before: {why}"
+                            ),
+                        }
                     }
                     if now.1 != rearranged_seen.1 {
                         eprintln!(
@@ -1406,7 +1509,7 @@ mod mac {
                 "step_max_ms": callbacks.step_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
                 // What the device itself said: turns not made in time, by
                 // any program playing into it. `null` if it does not say.
-                "device_overloads": overloads.as_ref().map(|count| count.load(Ordering::Relaxed)),
+                "device_overloads": overloads_now(),
             },
             // How much later than asked a thread of this process that only
             // sleeps was woken: the longest, and how often by 10 ms or more.
