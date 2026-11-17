@@ -541,6 +541,8 @@ impl Stage {
     /// Stops everything. A frame that waits at the gate is let go first.
     pub fn stop(&mut self) {
         self.shared.gate.quit();
+        // And none goes on while the encoder's side is taken apart.
+        self.shared.gate.shut();
         self.take_encoder_out();
         let _ = self.pipeline.set_state(gst::State::Null);
     }

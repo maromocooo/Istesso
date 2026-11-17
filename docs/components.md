@@ -24,6 +24,7 @@
 | libc | OS の呼び出し。映像の経路（`istesso-media`、[ADR 0015](adr/0015-media-transport.md)）が、接続と合図を同時に待つこと（`poll`）、計測の道具と同じ時計を読むこと、受信スレッドの優先度を上げることに使う。これまでも、ほかのクレートの依存として入っていた | MIT OR Apache-2.0 | <https://github.com/rust-lang/libc> |
 | winit、softbuffer | テストアプリ（`istesso-flash`）の窓と描画。`istesso` 本体には入らない | Apache-2.0、MIT OR Apache-2.0 | <https://github.com/rust-windowing/winit>、<https://github.com/rust-windowing/softbuffer> |
 | glutin、glutin-winit、glow | テストアプリが GPU で描くときの OpenGL（`--draw gpu`）。`istesso` 本体には入らない | Apache-2.0、MIT、MIT OR Apache-2.0 OR Zlib | <https://github.com/rust-windowing/glutin>、<https://github.com/grovesNL/glow> |
+| gstreamer、gstreamer-app（0.24）と、その下の glib、各 `-sys` クレート | Linux の自前のホスト（`istesso-host-linux`、[ADR 0019](adr/0019-own-host.md)）が、入っている GStreamer を Rust から呼ぶための束縛。GStreamer そのものは、下の「条件つきで使える」のとおり、動的リンクで使う。既定では切ってある feature（`pipeline`）の中だけにある。0.24 にしているのは、0.25 が、このワークスペースより新しい Rust を求めるため。同じわけで、kstring を 2.0.2 に固定している | MIT OR Apache-2.0（束縛）、MIT（`-sys` と glib）。target-lexicon は Apache-2.0 WITH LLVM-exception。**`cargo deny check licenses` は、まだ通していない**（ホストの再起動のあとに通す） | <https://gitlab.freedesktop.org/gstreamer/gstreamer-rs> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。使うのは、コンポジターの本体（gst-wayland-display の `wayland-display-core`）です。元のコミットに小さな修正を重ね、修正は元のプロジェクトに提案できる形に保ちます（[ADR 0009](adr/0009-host-compositor.md)）。入力はコンポジターに直接渡すので、仮想入力（inputtino）は、ゲームパッドが要るようになるまで使いません。
