@@ -77,6 +77,11 @@
 // ---- The switches for measuring (--wake) ----
 
 static bool wake_picture_qos = false, wake_picture_realtime = false, wake_input_qos = false, wake_latency_critical = false;
+#ifdef ISTESSO_MEASURING
+// The thread that takes the measurement's keys stands where the window's thread does for a
+// person's keys; this gives it that thread's scheduling.
+static bool wake_keys_qos = false;
+#endif
 static id<NSObject> wake_activity = nil;
 
 static FILE *frame_log = NULL;
@@ -329,6 +334,8 @@ static void show_cursor(uint32_t shape, CGImageRef image, CGSize pixels, CGPoint
 static CALayer *dim_layer = nil;
 static CALayer *note_box = nil;
 static CATextLayer *note_layer = nil;
+// No picture has been shown yet: the window is up and says so.
+static BOOL before_first_picture = YES;
 // The line is up: no key or button press is passed on.
 static BOOL picture_stale = NO;
 // The connection was cut and the picture is not back yet.
@@ -425,6 +432,9 @@ static void mark_the_picture(NSString *text) {
 
 // What the line says while something is being made again.
 static NSString *away_line(void) {
+    if (before_first_picture) {
+        return @"Connecting. What you type now does not arrive.";
+    }
     return input_away && !input_was_open && !cut_pending
         ? @"Input is not available yet. What you type now does not arrive."
         : @"Reconnecting. What you type now does not arrive.";
@@ -568,6 +578,17 @@ static void input_went_away(uint64_t t) {
     });
 }
 
+// Somebody presses a key or a button while the input is away and the line is not up yet: it
+// comes up at once, and this press is not passed on either.
+static void mark_at_once_for_the_input(void) {
+    if (picture_over) {
+        return;
+    }
+    away_generation++;  // The half second is not waited for.
+    held_back_count += presses_since(away_noticed_ns);
+    mark_the_picture(away_line());
+}
+
 // The input's conversation is open (again).
 static void input_is_there(void) {
     input_was_open = YES;
@@ -649,7 +670,7 @@ static const char *channel_address = NULL;
 // The paired host, when one was named, and where this device keeps its identity (NULL: the usual place).
 static const char *host_name = NULL, *config_dir = NULL;
 static bool check_pretend_typing = false;
-static void show_the_window(void);
+static void first_picture_is_there(void);
 // The parameter sets VideoToolbox was last set up with: VPS, SPS, PPS.
 static uint8_t *channel_sets[3];
 static size_t channel_set_sizes[3];
@@ -915,10 +936,10 @@ static void *channel_thread(void *unused) {
         if (got == 1) {
             on_channel_frame(watch, &frame);
             if (!shown && !vt_needs_key_frame) {
-                // The first picture is on the layer: the window is shown from here on.
+                // The first picture is on the layer.
                 shown = true;
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    show_the_window();
+                    first_picture_is_there();
                 });
             }
             if (back_pending && !vt_needs_key_frame) {
@@ -1057,8 +1078,12 @@ static bool start_frame_log(const char *path) {
     clock_gettime(CLOCK_REALTIME, &day);
     fprintf(frame_log, "{\"kind\":\"header\",\"side\":\"client\",\"tool\":\"istesso-client\",\"version\":\"0.0.1\"" MEASURING_HEADER ",\"started_unix_ms\":%llu}\n",
             (unsigned long long)day.tv_sec * 1000ULL + (unsigned long long)day.tv_nsec / 1000000ULL);
-    fprintf(frame_log, "{\"kind\":\"wake\",\"picture_qos\":%d,\"picture_realtime\":%d,\"input_qos\":%d,\"latency_critical\":%d}\n",
+    fprintf(frame_log, "{\"kind\":\"wake\",\"picture_qos\":%d,\"picture_realtime\":%d,\"input_qos\":%d,\"latency_critical\":%d",
             wake_picture_qos, wake_picture_realtime, wake_input_qos, wake_latency_critical);
+#ifdef ISTESSO_MEASURING
+    fprintf(frame_log, ",\"keys_qos\":%d", wake_keys_qos);
+#endif
+    fprintf(frame_log, "}\n");
     log_clock();
     // The log reaches the disk twice a second, and once more when the program ends.
     static dispatch_source_t timer;
@@ -1082,6 +1107,14 @@ static void finish(void) {
     finished = true;
 #ifdef ISTESSO_MEASURING
     if (measure_keys != NULL) {
+        if (frame_log != NULL) {
+            // Keys a measuring program left down and that were let go for it: a run with
+            // any is not a clean run.
+            IstessoMeasureKeysState stands = {0};
+            istesso_measure_keys_state(measure_keys, &stands);
+            fprintf(frame_log, "{\"kind\":\"measure_keys\",\"t_ns\":%llu,\"at\":\"close\",\"let_go\":%llu}\n",
+                    (unsigned long long)now_ns(), (unsigned long long)stands.let_go);
+        }
         // Before the input: nothing may be handed to an input that is closed.
         istesso_measure_keys_close(measure_keys);
         measure_keys = NULL;
@@ -1135,6 +1168,16 @@ static void on_input_told(void *context, int32_t event, uint64_t cuts, double af
         fprintf(stderr, "note: the host does not take input yet; asking again\n");
     }
     dispatch_async(dispatch_get_main_queue(), ^{
+        static BOOL effect_said = NO;
+        if (!effect_said && input != NULL && frame_log != NULL) {
+            // What became of --wake input-qos: 0 not asked for, 1 in effect, 2 asked for
+            // and not in effect.
+            effect_said = YES;
+            IstessoInputState stands = {0};
+            istesso_input_state(input, &stands);
+            fprintf(frame_log, "{\"kind\":\"wake_effect\",\"t_ns\":%llu,\"input_qos\":%u}\n", (unsigned long long)now_ns(),
+                    stands.interactive);
+        }
         input_stands = event == ISTESSO_INPUT_OVER ? 2 : event == ISTESSO_INPUT_NOT_YET ? 0 : 1;
         switch (event) {
             case ISTESSO_INPUT_OPEN:
@@ -1306,6 +1349,9 @@ static NSCursor *empty_cursor(void) {
 - (void)keyDown:(NSEvent *)event {
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
+    if (input_away && !picture_stale) {
+        mark_at_once_for_the_input();
+    }
     size_t count = keys_key_down(&_keys, event.keyCode, event.modifierFlags, event.isARepeat, changes);
     if (picture_stale) {
         // Not pressed on the other side while the picture is not the host's of this moment.
@@ -1367,6 +1413,9 @@ static NSCursor *empty_cursor(void) {
 - (void)button:(unsigned)code pressed:(BOOL)pressed event:(NSEvent *)event {
     [self pointer:event];
     unsigned bit = 1u << (code - 0x110);
+    if (pressed && input_away && !picture_stale) {
+        mark_at_once_for_the_input();
+    }
     if (pressed && picture_stale) {
         // Not pressed on the other side while the picture is not the host's of this moment.
         held_back_count++;
@@ -1440,16 +1489,16 @@ static bool window_sized = false;  // --size was given
 static NSPoint window_at;          // top left, in points from the top left of the main display
 static NSRect window_display;      // the display to cover, with --whole-display
 
-// The first picture has been decoded: the window is given the picture's size, unless one was
-// asked for, and shown.
-static void show_the_window(void) {
-    if (the_window == nil || the_window.visible) {
-        return;
-    }
+// Puts the window where it belongs, in the size that was asked for; without one, in the
+// picture's size once there is a picture, and in a size of its own before that.
+static void place_the_window(void) {
     double main_height = NSScreen.screens.firstObject.frame.size.height;
     if (window_whole_display) {
         [the_window setFrame:window_display display:YES];
     } else {
+        if (!window_sized && (picture_width <= 0 || picture_height <= 0)) {
+            [the_window setContentSize:NSMakeSize(960, 540)];
+        }
         if (!window_sized && picture_width > 0 && picture_height > 0) {
             // One pixel of the picture to one pixel of the display the window goes to.
             CGFloat scale = 1;
@@ -1464,8 +1513,39 @@ static void show_the_window(void) {
         // Moved after it has its size: coordinates count from the top left of the main display.
         [the_window setFrameTopLeftPoint:NSMakePoint(window_at.x, main_height - window_at.y)];
     }
+}
+
+// At the start, before anything has come from the host: the window is there and says what it
+// is doing. An application that waits for a host that is not there, or that was refused, is
+// not an icon without a window and without a word.
+static void show_the_window(void) {
+    if (the_window == nil || the_window.visible) {
+        return;
+    }
+    place_the_window();
+    show_note(@"Connecting.");
+    // Key, so that what the person types goes to this window as soon as the application is
+    // the active one: it is the application's only window. This does not make the
+    // application active and takes nothing from the one in front. (The prototype was a tool
+    // started from a shell and only came to the front; it took the keyboard at the first
+    // click.) To the front also when the application is not the active one, as the
+    // prototype's window came.
     [the_window makeKeyAndOrderFront:nil];
     [the_window orderFrontRegardless];
+}
+
+// The first picture has been decoded: the window takes the picture's size, unless one was
+// asked for, and the word about connecting goes.
+static void first_picture_is_there(void) {
+    if (!before_first_picture) {
+        return;
+    }
+    before_first_picture = NO;
+    if (the_window != nil) {
+        place_the_window();
+    }
+    // A line that is up for the input stays, with its own words.
+    show_note(picture_stale && !picture_over ? away_line() : nil);
 }
 
 @interface IstessoApplication : NSObject <NSApplicationDelegate, NSWindowDelegate>
@@ -1512,7 +1592,8 @@ static void usage(void) {
             "               [--whole-display] [--title TEXT] [--frame-log FILE] [--input-timings FILE] [--wake NAME,...]\n"
             "               [--command-key super] [--config DIR] [--on-top]\n"
 #ifdef ISTESSO_MEASURING
-            "               [--measure-keys FOLDER]   (a measuring build: keys written to FOLDER/measure-keys.sock go to the host)\n"
+            "               [--measure-keys FOLDER]   (a measuring build: keys written to FOLDER/measure-keys.sock go to the host;\n"
+            "                                          --wake also knows keys-qos, for the thread that takes them)\n"
 #endif
             );
 }
@@ -1599,6 +1680,10 @@ int main(int argc, char *argv[]) {
                         wake_input_qos = true;
                     } else if (strcmp(each, "latency-critical") == 0) {
                         wake_latency_critical = true;
+#ifdef ISTESSO_MEASURING
+                    } else if (strcmp(each, "keys-qos") == 0) {
+                        wake_keys_qos = true;
+#endif
                     } else if (*each != '\0') {
                         fprintf(stderr, "error: --wake knows picture-qos, picture-realtime, input-qos and latency-critical, not %s\n", each);
                         return 2;
@@ -1705,14 +1790,18 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             // Not started without it: a measurement would begin with nowhere to write its keys.
-            measure_keys = istesso_measure_keys_open(input, measure_keys_dir);
+            measure_keys = istesso_measure_keys_open(input, measure_keys_dir, wake_keys_qos ? ISTESSO_INPUT_INTERACTIVE : 0);
             if (measure_keys == NULL) {
                 fprintf(stderr, "error: the measurement's keys: %s\n", istesso_client_last_error());
                 istesso_input_close(input);
                 return 1;
             }
             if (frame_log != NULL) {
-                fprintf(frame_log, "{\"kind\":\"measure_keys\",\"t_ns\":%llu}\n", (unsigned long long)now_ns());
+                // `keys_qos`: 0 not asked for, 1 in effect, 2 asked for and not in effect.
+                IstessoMeasureKeysState stands = {0};
+                istesso_measure_keys_state(measure_keys, &stands);
+                fprintf(frame_log, "{\"kind\":\"measure_keys\",\"t_ns\":%llu,\"at\":\"open\",\"keys_qos\":%u}\n",
+                        (unsigned long long)now_ns(), stands.interactive);
             }
         }
 #endif
@@ -1721,6 +1810,8 @@ int main(int argc, char *argv[]) {
         counted_window = window;
         counted_title = [window.title copy];
         show_counts();
+        // The window is there from the start, with a word about what it waits for.
+        show_the_window();
         if (!use_channel(view)) {
             fprintf(stderr, "error: cannot start the thread that receives\n");
             return 1;
