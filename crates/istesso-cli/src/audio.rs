@@ -1621,6 +1621,7 @@ mod record {
         }
 
         /// A break of this length is going on or just ended.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(super) fn note_gap(&mut self, ms: f64) {
             for period in &mut self.periods {
                 period.longest_gap_ms = period.longest_gap_ms.max(ms);
@@ -1628,6 +1629,7 @@ mod record {
         }
 
         /// The delay from the capture to the hand-over, as it is now.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(super) fn note_delay(&mut self, ms: f64) {
             for period in &mut self.periods {
                 if period.delays_ms.len() < 100_000 {
