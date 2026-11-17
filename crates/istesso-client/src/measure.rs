@@ -168,6 +168,9 @@ fn has_further_rights(_folder: &fs::File) -> io::Result<bool> {
 
 /// What lies in the folder under the socket's name, itself (a link is not
 /// followed): its kind and rights, and whose it is. `None` when nothing.
+// The kind-and-rights field is 16 bits wide on the Mac and 32 on Linux: the conversion is
+// needed on the one and is none on the other.
+#[allow(clippy::unnecessary_cast)]
 fn in_folder(folder: &fs::File) -> io::Result<Option<(u32, u32)>> {
     // SAFETY: an open descriptor, a C string, and room for the answer.
     unsafe {
@@ -188,6 +191,7 @@ fn in_folder(folder: &fs::File) -> io::Result<Option<(u32, u32)>> {
     }
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn is_socket(mode: u32) -> bool {
     mode & libc::S_IFMT as u32 == libc::S_IFSOCK as u32
 }
