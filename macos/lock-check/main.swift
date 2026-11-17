@@ -31,7 +31,8 @@
 //   1. F13 down and up (a key that types nothing and has no sound) to ITS OWN PROCESS ONLY
 //      (CGEventPostToPid with its own pid). Never to the session tap.
 //   2. A pointer move and a left click at the middle of ITS OWN WINDOW, to ITS OWN PROCESS ONLY
-//      (CGEventPostToPid), the window under the pointer named as its own window.
+//      (CGEventPostToPid). The move names its own window as the one under the pointer; the press and
+//      release are made with NSEvent.mouseEvent(...windowNumber: its own window...) and its cgEvent.
 //   3. The same pointer move and click at the SESSION TAP, only if the rule of
 //      crates/istesso-host-macos/src/confine.rs allows it: the screen is NOT locked, this program
 //      is frontmost, and the topmost window under the point is its own. Otherwise not posted, and
@@ -578,6 +579,18 @@ final class Probe: NSObject, NSApplicationDelegate {
         return event
     }
 
+    /// A press or release made for this program's own window, through public AppKit calls only.
+    /// The location is the middle of its content, in the window's own coordinates.
+    private func windowClick(_ type: NSEvent.EventType) -> CGEvent? {
+        let inWindow = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+        let event = NSEvent.mouseEvent(
+            with: type, location: inWindow, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)
+        let made = event?.cgEvent
+        made?.setIntegerValueField(.eventSourceUserData, value: EntryLog.marker)
+        return made
+    }
+
     private func input(into answer: Answer) {
         var answer = answer
         guard mayPost else { return finish(answer) }
@@ -595,8 +608,12 @@ final class Probe: NSObject, NSApplicationDelegate {
             key?.postToPid(me)
         }
         pointer(.mouseMoved)?.postToPid(me)
-        pointer(.leftMouseDown)?.postToPid(me)
-        pointer(.leftMouseUp)?.postToPid(me)
+        // Variant 1 (announced 2026-11-17): the press and release are made as AppKit events that
+        // carry this program's own window number (NSEvent.mouseEvent(with:...windowNumber:...),
+        // AppKit NSEvent.h), turned into Core Graphics events with NSEvent.cgEvent (NSEvent.h:
+        // "returns a CGEventRef corresponding to the NSEvent") and posted to its own process only.
+        windowClick(.leftMouseDown)?.postToPid(me)
+        windowClick(.leftMouseUp)?.postToPid(me)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
             answer.direct = (self.view.keys > keys0, self.view.moves > moves0, self.view.clicks > clicks0)
             answer.sinceKeyAfter = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
