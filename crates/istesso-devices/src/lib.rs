@@ -21,6 +21,7 @@ pub mod record;
 pub mod registry;
 pub mod session;
 pub mod software;
+pub mod text;
 pub mod transport;
 pub mod udev;
 

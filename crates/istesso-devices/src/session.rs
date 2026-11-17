@@ -15,6 +15,7 @@ use istesso_device_api::{
 use crate::guard::allows;
 use crate::picture::{convert, Rgba};
 use crate::record::{event_text, hex};
+use crate::text::{escape, info_name, printable, INFO_VALUE_LIMIT};
 use crate::transport::Transport;
 
 /// Why the session could not do what it was asked.
@@ -43,6 +44,28 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// What the system said went wrong with the device. The text comes from
+/// outside the program, so it is made printable before it goes anywhere.
+fn outside_error(text: String) -> IoError {
+    IoError::Device(printable(&text))
+}
+
+/// A notice as the framework passes it on.
+///
+/// The text of an info may come straight from the device. It is escaped
+/// here, once, for everything that reads notices afterwards: the recording,
+/// the terminal, later the other machines. Notices made of numbers need
+/// nothing.
+fn collected(event: Event) -> Event {
+    match event {
+        Event::Info { name, value } => Event::Info {
+            name: info_name(&name),
+            value: escape(&value, INFO_VALUE_LIMIT),
+        },
+        other => other,
+    }
+}
 
 /// What happened during one call into the adapter, in order.
 enum Effect {
@@ -79,7 +102,7 @@ impl<T: Transport> Hid for Port<'_, T> {
             return Err(self.refuse("out", report));
         }
         self.note(|| format!("out {}", hex(report)));
-        self.transport.write(report).map_err(IoError::Device)
+        self.transport.write(report).map_err(outside_error)
     }
 
     fn send_feature(&mut self, report: &[u8]) -> Result<(), IoError> {
@@ -87,7 +110,7 @@ impl<T: Transport> Hid for Port<'_, T> {
             return Err(self.refuse("set", report));
         }
         self.note(|| format!("set {}", hex(report)));
-        self.transport.send_feature(report).map_err(IoError::Device)
+        self.transport.send_feature(report).map_err(outside_error)
     }
 
     fn get_feature(&mut self, id: u8, buffer: &mut [u8]) -> Result<usize, IoError> {
@@ -97,7 +120,7 @@ impl<T: Transport> Hid for Port<'_, T> {
         let n = self
             .transport
             .get_feature(id, buffer)
-            .map_err(IoError::Device)?;
+            .map_err(outside_error)?;
         let n = n.min(buffer.len());
         self.note(|| format!("get {id:02x} -> {}", hex(&buffer[..n])));
         Ok(n)
@@ -223,6 +246,7 @@ impl<T: Transport> Session<T> {
                     }
                 }
                 Effect::Event(event) => {
+                    let event = collected(event);
                     if let Some(log) = &mut self.log {
                         log.push(format!("event {}", event_text(&event)));
                     }
@@ -234,7 +258,7 @@ impl<T: Transport> Session<T> {
             }
         }
         if let (Err(error), Some(log)) = (&result, &mut self.log) {
-            log.push(format!("error {error}"));
+            log.push(format!("error {}", printable(&error.to_string())));
         }
         result.map_err(Error::Adapter)
     }
@@ -266,7 +290,7 @@ impl<T: Transport> Session<T> {
         let n = self
             .transport
             .read(&mut buffer, timeout_ms)
-            .map_err(Error::Device)?;
+            .map_err(|error| Error::Device(printable(&error)))?;
         if n == 0 {
             return Ok(false);
         }
