@@ -13,12 +13,13 @@
 //!   inside that (real) `.istesso` folder.
 //! - On Unix, every folder from the boundary down to the file's real folder
 //!   must belong to this user or to root, and the file to this user; none of
-//!   them may be writable by group or others, and none may carry an access
+//!   them may be writable by others, nor by their group unless that group
+//!   cannot hold anyone but this user (see `accounts`), and none may carry an access
 //!   control list (ACL) at all, since an ACL can grant writing beyond the
 //!   mode bits.
 //! - Every folder above the boundary, up to the root of the file system,
-//!   must belong to this user or to root and must not be writable by group
-//!   or others unless its sticky bit is set (in a sticky folder no one can
+//!   must belong to this user or to root and must not be writable by others
+//!   (nor by a group that may hold someone else) unless its sticky bit is set (in a sticky folder no one can
 //!   rename or remove another user's entries, so a project under a shared
 //!   temporary folder is judged by its own folders). Otherwise someone could
 //!   swap the whole project for a tree of their own. ACLs are not refused up
@@ -36,6 +37,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::accounts::AccountDb;
 use crate::tasks::TASKS_FILE;
 
 /// A task file that may be used.
@@ -54,12 +56,20 @@ pub struct Found {
 pub enum FindError {
     /// The file or a folder leading to it belongs to another user.
     NotOwned { path: PathBuf },
-    /// The file or a folder leading to it can be written by group or others.
+    /// The file or a folder leading to it can be written by others.
     Writable { path: PathBuf },
+    /// The file or a folder (`above`: one above the project's root) can be
+    /// written by its group, and the group may hold someone else.
+    GroupWritable {
+        path: PathBuf,
+        group: String,
+        why: String,
+        above: bool,
+    },
     /// A folder above the project's root belongs to another user.
     AboveNotOwned { path: PathBuf },
-    /// A folder above the project's root can be written by group or others
-    /// and is not sticky.
+    /// A folder above the project's root can be written by others and is
+    /// not sticky.
     AboveWritable { path: PathBuf },
     /// The file or a folder leading to it carries an access control list.
     HasAcl { path: PathBuf },
@@ -83,6 +93,26 @@ impl fmt::Display for FindError {
             FindError::Writable { path } => write!(
                 f,
                 "{} is not used: others can write to it, {run_as_you} (`chmod go-w` it if that is not meant)",
+                path.display()
+            ),
+            FindError::GroupWritable {
+                path,
+                group,
+                why,
+                above: false,
+            } => write!(
+                f,
+                "{} is not used: its group `{group}` can write to it and may hold other users ({why}), {run_as_you} (`chmod go-w` it if that is not meant)",
+                path.display()
+            ),
+            FindError::GroupWritable {
+                path,
+                group,
+                why,
+                above: true,
+            } => write!(
+                f,
+                "the project is not used: the group `{group}` can write to {}, a folder above it, and may hold other users ({why}), who could replace the project with their own, {run_as_you} (`chmod go-w` it, or set its sticky bit, if that is not meant)",
                 path.display()
             ),
             FindError::AboveNotOwned { path } => write!(
@@ -130,6 +160,16 @@ pub fn find_tasks(start: &Path) -> Result<Option<Found>, FindError> {
 /// Looks for `.istesso/tasks.json` in `start` and its parents up to the
 /// project's boundary (see the module's description), checks it and reads it.
 pub fn find_tasks_within(start: &Path, home: Option<&Path>) -> Result<Option<Found>, FindError> {
+    find_tasks_with(start, home, &AccountDb::system())
+}
+
+/// [`find_tasks_within`] with the account databases given, which decide
+/// whether a group-writable item's group can hold anyone else.
+pub(crate) fn find_tasks_with(
+    start: &Path,
+    home: Option<&Path>,
+    accounts: &AccountDb,
+) -> Result<Option<Found>, FindError> {
     let start = start.canonicalize().map_err(|e| unreadable(start, e))?;
     let home = home.and_then(|h| h.canonicalize().ok());
     let Some(boundary) = project_boundary(&start, home.as_deref()) else {
@@ -150,12 +190,12 @@ pub fn find_tasks_within(start: &Path, home: Option<&Path>) -> Result<Option<Fou
             if !step.starts_with(&boundary) {
                 break;
             }
-            check_folder(step)?;
+            check_folder(step, accounts)?;
         }
         for above in boundary.ancestors().skip(1) {
-            check_above(above)?;
+            check_above(above, accounts)?;
         }
-        let text = read_checked(&real)?;
+        let text = read_checked(&real, accounts)?;
         return Ok(Some(Found {
             file: real,
             root: dir.to_path_buf(),
@@ -203,10 +243,41 @@ fn inside(path: &Path, allowed: &Path) -> Result<PathBuf, FindError> {
     Ok(real)
 }
 
-/// A folder on the way to the file: this user's or root's, not writable by
-/// group or others, without an ACL.
+/// Refuses an item that others can write, or that its group can write when
+/// the group may hold anyone but this user (see `accounts`).
 #[cfg(unix)]
-fn check_folder(path: &Path) -> Result<(), FindError> {
+fn check_writers(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    accounts: &AccountDb,
+    above: bool,
+) -> Result<(), FindError> {
+    use std::os::unix::fs::MetadataExt;
+    let path = path.to_path_buf();
+    if meta.mode() & 0o002 != 0 {
+        return Err(if above {
+            FindError::AboveWritable { path }
+        } else {
+            FindError::Writable { path }
+        });
+    }
+    if meta.mode() & 0o020 != 0 {
+        if let Err(why) = crate::accounts::group_is_private(meta.gid(), effective_uid(), accounts) {
+            return Err(FindError::GroupWritable {
+                path,
+                group: accounts.group_name(meta.gid()),
+                why,
+                above,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A folder on the way to the file: this user's or root's, not writable by
+/// others nor by a group that may hold someone else, without an ACL.
+#[cfg(unix)]
+fn check_folder(path: &Path, accounts: &AccountDb) -> Result<(), FindError> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).map_err(|e| unreadable(path, e))?;
     if !meta.is_dir() {
@@ -220,23 +291,20 @@ fn check_folder(path: &Path) -> Result<(), FindError> {
             path: path.to_path_buf(),
         });
     }
-    if meta.mode() & 0o022 != 0 {
-        return Err(FindError::Writable {
-            path: path.to_path_buf(),
-        });
-    }
+    check_writers(path, &meta, accounts, false)?;
     check_no_acl(path)
 }
 
 #[cfg(not(unix))]
-fn check_folder(_path: &Path) -> Result<(), FindError> {
+fn check_folder(_path: &Path, _accounts: &AccountDb) -> Result<(), FindError> {
     Ok(())
 }
 
 /// A folder above the project's root: this user's or root's, and not
-/// writable by group or others unless sticky. Its ACL is not looked at.
+/// writable by others nor by a group that may hold someone else, unless
+/// sticky. Its ACL is not looked at.
 #[cfg(unix)]
-fn check_above(path: &Path) -> Result<(), FindError> {
+fn check_above(path: &Path, accounts: &AccountDb) -> Result<(), FindError> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).map_err(|e| unreadable(path, e))?;
     let uid = meta.uid();
@@ -245,22 +313,19 @@ fn check_above(path: &Path) -> Result<(), FindError> {
             path: path.to_path_buf(),
         });
     }
-    let sticky = meta.mode() & 0o1000 != 0;
-    if meta.mode() & 0o022 != 0 && !sticky {
-        return Err(FindError::AboveWritable {
-            path: path.to_path_buf(),
-        });
+    if meta.mode() & 0o1000 != 0 {
+        return Ok(());
     }
-    Ok(())
+    check_writers(path, &meta, accounts, true)
 }
 
 #[cfg(not(unix))]
-fn check_above(_path: &Path) -> Result<(), FindError> {
+fn check_above(_path: &Path, _accounts: &AccountDb) -> Result<(), FindError> {
     Ok(())
 }
 
 /// Opens the file once, checks the open handle, and reads from it.
-fn read_checked(path: &Path) -> Result<String, FindError> {
+fn read_checked(path: &Path, accounts: &AccountDb) -> Result<String, FindError> {
     let mut file = std::fs::File::open(path).map_err(|e| unreadable(path, e))?;
     let meta = file.metadata().map_err(|e| unreadable(path, e))?;
     if !meta.is_file() {
@@ -276,13 +341,11 @@ fn read_checked(path: &Path) -> Result<String, FindError> {
                 path: path.to_path_buf(),
             });
         }
-        if meta.mode() & 0o022 != 0 {
-            return Err(FindError::Writable {
-                path: path.to_path_buf(),
-            });
-        }
+        check_writers(path, &meta, accounts, false)?;
         check_no_acl(path)?;
     }
+    #[cfg(not(unix))]
+    let _ = accounts;
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|e| unreadable(path, e))?;
@@ -385,8 +448,18 @@ mod tests {
             Base(dir.canonicalize().unwrap())
         }
 
+        /// Searches with account databases that cannot be read, so that a
+        /// group-writable item always counts as shared, whatever machine
+        /// the test runs on.
         fn find(&self, start: &str) -> Result<Option<Found>, FindError> {
-            find_tasks_within(&self.0.join(start), Some(&self.0))
+            find_tasks_with(&self.0.join(start), Some(&self.0), &AccountDb::default())
+        }
+
+        /// Searches with databases in which the group of the project's task
+        /// file is this user's private group.
+        fn find_private(&self, start: &str, gid: u32) -> Result<Option<Found>, FindError> {
+            let db = crate::accounts::tests::private_db(effective_uid(), gid);
+            find_tasks_with(&self.0.join(start), Some(&self.0), &db)
         }
 
         fn found(&self, start: &str) -> PathBuf {
@@ -511,18 +584,31 @@ mod tests {
         let file = base.tasks("proj");
         assert_eq!(base.found("proj"), file);
 
-        for mode in [0o666, 0o664, 0o646] {
+        for mode in [0o666, 0o646] {
             set_mode(&file, mode);
             let err = base.find("proj").unwrap_err();
             assert_eq!(err, FindError::Writable { path: file.clone() }, "{mode:o}");
             assert!(err.to_string().contains("others can write"));
         }
+        // Group-writable, and the group may hold someone else.
+        set_mode(&file, 0o664);
+        let err = base.find("proj").unwrap_err();
+        assert!(
+            matches!(&err, FindError::GroupWritable { path, above: false, .. } if *path == file),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("chmod go-w"));
         set_mode(&file, 0o644);
 
         // Every folder from the boundary down: `.istesso`, a folder the file
         // is linked into, and the project's root.
         let folder = file.parent().unwrap().to_path_buf();
         set_mode(&folder, 0o775);
+        assert!(matches!(
+            base.find("proj").unwrap_err(),
+            FindError::GroupWritable { path, .. } if path == folder
+        ));
+        set_mode(&folder, 0o757);
         assert_eq!(
             base.find("proj").unwrap_err(),
             FindError::Writable {
@@ -548,14 +634,14 @@ mod tests {
         base.project("proj");
         let file = base.tasks("proj");
         assert_eq!(std::fs::metadata(&file).unwrap().uid(), effective_uid());
-        assert_eq!(read_checked(&file).unwrap(), TEXT);
+        assert_eq!(read_checked(&file, &AccountDb::default()).unwrap(), TEXT);
         assert_eq!(base.found("proj"), file);
         // Files and folders of another user. Creating one needs root, so the
         // checks are tried on what root owns. A folder of root is allowed on
         // the way; a file of root is not.
         if effective_uid() != 0 {
             assert!(matches!(
-                read_checked(Path::new("/etc/hosts")),
+                read_checked(Path::new("/etc/hosts"), &AccountDb::default()),
                 Err(FindError::NotOwned { .. })
             ));
         }
@@ -705,13 +791,12 @@ mod tests {
         let outer = base.0.join("outer");
         set_mode(&outer, 0o775);
         let err = base.find("outer/proj").unwrap_err();
-        assert_eq!(
-            err,
-            FindError::AboveWritable {
-                path: outer.clone()
-            }
+        assert!(
+            matches!(&err, FindError::GroupWritable { path, above: true, .. } if *path == outer),
+            "{err:?}"
         );
         assert!(err.to_string().contains("a folder above it"));
+        assert!(err.to_string().contains("chmod go-w"));
         set_mode(&outer, 0o757);
         assert!(matches!(
             base.find("outer/proj"),
@@ -763,5 +848,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.file, file);
+    }
+
+    /// The person's case: under umask 002 a folder is made 775 and a file
+    /// 664. With the user's private group (named like the user, no members,
+    /// no one else's primary group) they are accepted; with any other answer
+    /// about the group, refused.
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_items_of_the_user_s_private_group_are_accepted() {
+        use std::os::unix::fs::MetadataExt;
+        let base = Base::new("umask-002");
+        base.project("outer/proj");
+        let file = base.tasks("outer/proj");
+        for folder in ["outer", "outer/proj", "outer/proj/.istesso"] {
+            set_mode(&base.0.join(folder), 0o775);
+        }
+        set_mode(&file, 0o664);
+        let gid = std::fs::metadata(&file).unwrap().gid();
+        for folder in ["outer", "outer/proj", "outer/proj/.istesso"] {
+            assert_eq!(std::fs::metadata(base.0.join(folder)).unwrap().gid(), gid);
+        }
+        assert_eq!(
+            base.find_private("outer/proj", gid).unwrap().unwrap().file,
+            file
+        );
+
+        let start = base.0.join("outer/proj");
+        let uid = effective_uid();
+        let find = |db: &AccountDb| find_tasks_with(&start, Some(&base.0), db);
+        let refused = |db: &AccountDb| {
+            let err = find(db).unwrap_err();
+            assert!(matches!(err, FindError::GroupWritable { .. }), "{err:?}");
+            err
+        };
+        // A group with another member.
+        let mut db = crate::accounts::tests::private_db(uid, gid);
+        db.group = Some(format!("me:x:{gid}:guest\n"));
+        assert!(refused(&db).to_string().contains("guest"));
+        // A group that is another account's primary group.
+        let mut db = crate::accounts::tests::private_db(uid, gid);
+        db.passwd = Some(format!(
+            "me:x:{uid}:{gid}::/nonexistent:/bin/sh\nguest:x:{}:{gid}::/nonexistent:/bin/sh\n",
+            uid.wrapping_add(1)
+        ));
+        refused(&db);
+        // Databases that cannot be read.
+        let err = refused(&AccountDb::default());
+        assert!(err.to_string().contains("cannot be read"));
+        // `o+w` stays refused, whatever the group.
+        let db = crate::accounts::tests::private_db(uid, gid);
+        set_mode(&file, 0o666);
+        assert_eq!(
+            find(&db).unwrap_err(),
+            FindError::Writable { path: file.clone() }
+        );
+        set_mode(&file, 0o664);
+        set_mode(&base.0.join("outer"), 0o777);
+        assert_eq!(
+            find(&db).unwrap_err(),
+            FindError::AboveWritable {
+                path: base.0.join("outer")
+            }
+        );
     }
 }

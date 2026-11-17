@@ -12,6 +12,7 @@
 //!
 //! Nothing in this crate talks to other machines or reads this device's keys.
 
+mod accounts;
 pub mod choices;
 pub mod decide;
 pub mod exec;
