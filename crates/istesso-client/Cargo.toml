@@ -1,0 +1,28 @@
+[package]
+name = "istesso-client"
+description = "What the Mac client is made of besides its window: the picture's and the input's connections, in one library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# The application (macos/client) links the static library: it holds this crate's C interface
+# (include/istesso_client.h) and, with it, the one of istesso-media (istesso_media.h), so that
+# the application links one Rust library and not two.
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+istesso-proto.workspace = true
+istesso-link.workspace = true
+istesso-agent.workspace = true
+istesso-media = { path = "../istesso-media" }
+
+# The scheduling of the input's thread. As in istesso-media: not through the workspace table yet.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+istesso-pair.workspace = true
+serde_json.workspace = true
