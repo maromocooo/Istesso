@@ -40,8 +40,15 @@ pub const SOCKET_NAME: &str = "measure-keys.sock";
 
 /// A measuring program that died with keys down would leave them down on
 /// the host. When nothing has come through the way in for this long, what
-/// came through it and is still down is let go, and counted. (A verdict
-/// presses and releases within a twentieth of a second.)
+/// came through it and is still down is let go, and counted.
+///
+/// A verdict presses and releases within a twentieth of a second, so this
+/// never touches a key of a run that goes as it should. The count says how
+/// many keys and buttons were let go here; it does not say that a key was
+/// stuck on the host. After a cut of the input's conversation it can be
+/// above nothing although the host had let go of everything by itself: the
+/// keys are counted by what came through the way in, not by what the host
+/// holds.
 pub const LET_GO_AFTER: Duration = Duration::from_secs(2);
 
 /// Where what arrived is handed on: the events, and when the first of them
@@ -110,7 +117,13 @@ fn folder_of_the_users_alone(dir: &Path, user: u32) -> Result<fs::File, String> 
             dir.display()
         ));
     }
-    if has_further_rights(&folder) {
+    let listed = has_further_rights(&folder).map_err(|e| {
+        format!(
+            "cannot tell whether {} has a list of further rights (an ACL): {e}",
+            dir.display()
+        )
+    })?;
+    if listed {
         return Err(format!(
             "{} has a list of further rights (an ACL); only a folder without one is taken",
             dir.display()
@@ -120,9 +133,10 @@ fn folder_of_the_users_alone(dir: &Path, user: u32) -> Result<fs::File, String> 
 }
 
 /// Whether the system keeps an access control list for what is open: it
-/// can let others in whatever the rights say.
+/// can let others in whatever the rights say. When that cannot be told, the
+/// folder is not taken: `Err`.
 #[cfg(target_os = "macos")]
-fn has_further_rights(folder: &fs::File) -> bool {
+fn has_further_rights(folder: &fs::File) -> io::Result<bool> {
     extern "C" {
         fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
         fn acl_free(object: *mut libc::c_void) -> libc::c_int;
@@ -132,18 +146,24 @@ fn has_further_rights(folder: &fs::File) -> bool {
     unsafe {
         let list = acl_get_fd_np(folder.as_raw_fd(), ACL_TYPE_EXTENDED);
         if list.is_null() {
-            return false;
+            // "Nothing there" is how the system says that there is no list. Anything
+            // else is a failure to look.
+            let failure = io::Error::last_os_error();
+            return match failure.raw_os_error() {
+                Some(libc::ENOENT) => Ok(false),
+                _ => Err(failure),
+            };
         }
         acl_free(list);
-        true
+        Ok(true)
     }
 }
 
 /// The measuring build is made for the Mac. Elsewhere this module is only
 /// compiled for its tests, and such a list is not looked for.
 #[cfg(not(target_os = "macos"))]
-fn has_further_rights(_folder: &fs::File) -> bool {
-    false
+fn has_further_rights(_folder: &fs::File) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// What lies in the folder under the socket's name, itself (a link is not

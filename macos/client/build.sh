@@ -55,6 +55,18 @@ has_way_in() {
     done
     return 1
 }
+# Whether a file holds all of it, as a measuring build must: one mark alone is not enough to
+# say that the search sees what it looks for.
+has_whole_way_in() {
+    if [ ! -f "$1" ] || [ ! -r "$1" ]; then
+        echo "error: cannot read $1: it was not looked into"
+        exit 1
+    fi
+    for mark in $marks; do
+        grep -a -q -F -e "$mark" "$1" || return 1
+    done
+    return 0
+}
 no_way_in() {
     if has_way_in "$1"; then
         echo "error: $1 contains the measurement's way in for keys; it must not be handed out"
@@ -111,8 +123,8 @@ clang -fobjc-arc -O2 -Wall $define -o "$app/Contents/MacOS/$EXECUTABLE.new" Iste
     -framework Cocoa -framework QuartzCore -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface
 # Before it gets its name and its signature: which of the two it is, by what is in it.
 if [ "$what" = measuring ]; then
-    has_way_in "$app/Contents/MacOS/$EXECUTABLE.new" \
-        || { echo "error: the measuring build has no way in (or the search does not find it)"; exit 1; }
+    has_whole_way_in "$app/Contents/MacOS/$EXECUTABLE.new" \
+        || { echo "error: the measuring build has no way in, or the search does not find every mark of it ($marks)"; exit 1; }
 else
     no_way_in "$app/Contents/MacOS/$EXECUTABLE.new"
 fi
