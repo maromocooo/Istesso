@@ -42,6 +42,10 @@ typedef struct IstessoInputState {
     uint32_t over;     /* 1 once the host does not take input from here any more */
     uint32_t interactive; /* the thread's scheduling as work a person is waiting for:
                            * 0 not asked for, 1 in effect, 2 asked for and not in effect */
+    uint32_t failure;     /* while there is no conversation: in what way the latest attempt to
+                           * reach the host failed, one of ISTESSO_MEDIA_FAILURE_* (istesso_media.h);
+                           * 0 otherwise */
+    uint32_t reserved;
 } IstessoInputState;
 
 /* What happened to the conversation: the `event` of IstessoInputTold. */
@@ -51,16 +55,20 @@ typedef struct IstessoInputState {
 #define ISTESSO_INPUT_OVER 4 /* refused for good, with `why` in a sentence: the refusal is about
                               * rights or about a request the host does not know; nothing is
                               * tried after it */
-#define ISTESSO_INPUT_NOT_YET 5 /* no conversation yet, with `why`: the host could not be reached
-                                 * or has nothing that takes input at the moment; it is asked
-                                 * again. Told once, before ISTESSO_INPUT_OPEN */
+#define ISTESSO_INPUT_NOT_YET 5 /* no conversation yet: the host could not be reached or has
+                                 * nothing that takes input at the moment; it is asked again.
+                                 * `failure` says in what way the attempt failed, one of
+                                 * ISTESSO_MEDIA_FAILURE_* (a word for a log: it names no
+                                 * address); `why` says it in a sentence, which may name one.
+                                 * Told when the first attempt fails, and again when a later
+                                 * one fails in another way; before ISTESSO_INPUT_OPEN */
 
 /*
  * Called on the input's thread, never on the caller's. `cuts` is the count so far. `why` is
  * NULL or valid during the call.
  */
 typedef void (*IstessoInputTold)(void *context, int32_t event, uint64_t cuts, double after_ms,
-                                 const char *why);
+                                 int32_t failure, const char *why);
 
 /* For `flags`: the input's thread asks to be scheduled as work a person is waiting for. */
 #define ISTESSO_INPUT_INTERACTIVE 1u

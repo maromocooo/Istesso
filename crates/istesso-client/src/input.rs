@@ -21,6 +21,7 @@ use istesso_agent::relay::{
     RETRY_SLOWLY, SOON_FOR,
 };
 use istesso_agent::{ConnectFailure, PassLog};
+use istesso_media::Failure;
 use istesso_proto::InputEvent;
 
 /// How long closing waits for the thread. It looks up at once when it is
@@ -39,8 +40,11 @@ pub enum Told {
     /// There is no conversation yet, and the host is asked again: it could
     /// not be reached, or said that nothing on it takes input at the moment
     /// (the application was opened before the host's side was up). Told
-    /// once, with the reason of the first attempt that failed.
-    NotYet { why: String },
+    /// with the reason of the attempt that failed, when the first attempt
+    /// fails and again whenever a later one fails in another way.
+    /// `failure` is that way in a word that names no address (the reason's
+    /// sentence may name one, and is not for a log).
+    NotYet { why: String, failure: Failure },
     /// It was cut; it is being opened again.
     Cut,
     /// It is back, this long after it was cut.
@@ -65,6 +69,9 @@ pub struct State {
     /// Whether the thread is scheduled as work a person is waiting for:
     /// `None` when that was not asked for, otherwise whether it took effect.
     pub interactive: Option<bool>,
+    /// While there is no conversation: in what way the latest attempt to
+    /// reach the host failed.
+    pub failure: Option<Failure>,
 }
 
 struct Batch {
@@ -228,6 +235,15 @@ pub(crate) fn take(events: &mut Vec<InputEvent>, event: InputEvent) {
     }
 }
 
+/// In what way an attempt to reach the host failed, in a word without an
+/// address.
+fn way_of(failure: &ConnectFailure) -> Failure {
+    match failure {
+        ConnectFailure::Link(err) => Failure::of_link(err),
+        ConnectFailure::Here(_) => Failure::Other,
+    }
+}
+
 /// Keeps what is held and where the pointer is, as far as the events say,
 /// while there is no line to keep it yet.
 fn keep(events: &[InputEvent], held: &mut BTreeSet<u32>, pointer: &mut Option<(i32, i32)>) {
@@ -264,7 +280,15 @@ fn run(
         let mut connect = make_connect();
         let shared = shared.clone();
         Box::new(move |within| {
-            let client = connect(within)?;
+            let client = connect(within).inspect_err(|failure| {
+                // Kept for whoever asks how the input stands, also while the line
+                // itself is trying again after a cut.
+                shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .failure = Some(way_of(failure));
+            })?;
             if shared.stop.load(Ordering::SeqCst) {
                 return Err(ConnectFailure::Here("closed meanwhile".into()));
             }
@@ -275,8 +299,10 @@ fn run(
     let mut first = make_connect();
     let mut due = Instant::now();
     let mut over = false;
-    // Since when the first conversation has been asked for in vain.
+    // Since when the first conversation has been asked for in vain, and in what way the
+    // attempt failed that was last told of.
     let mut in_vain_since: Option<Instant> = None;
+    let mut told_way: Option<Failure> = None;
     // Before the first conversation: the modifiers that are held and where the
     // pointer is. What is handed over then is gone, but when the conversation opens
     // the host is brought in line with these, as it is after a cut.
@@ -336,8 +362,24 @@ fn run(
                 continue;
             }
             let opened = first(FIRST_WITHIN)
-                .map_err(|failure| (after_failure(&failure), failure.to_string()))
-                .and_then(|client| InputLine::open(client, make_connect()));
+                .map_err(|failure| {
+                    (
+                        after_failure(&failure),
+                        failure.to_string(),
+                        way_of(&failure),
+                    )
+                })
+                .and_then(|client| {
+                    // The host was reached and greeted. Either it answered that nothing
+                    // takes input there at the moment, or the question got no answer.
+                    InputLine::open(client, make_connect()).map_err(|(again, why)| {
+                        let way = match again {
+                            Again::Slowly => Failure::NotReady,
+                            _ => Failure::NoAnswer,
+                        };
+                        (again, why, way)
+                    })
+                });
             match opened {
                 Ok(opened) => {
                     let answered = opened.is_answered();
@@ -366,29 +408,28 @@ fn run(
                     set(&|state| {
                         state.open = true;
                         state.answered = answered;
+                        state.failure = None;
                     });
                     if let Some(passing) = passing {
                         passing.reconnection("open", 0);
                     }
                     tell(&Told::Open, 0);
                 }
-                Err((Again::Never, why)) => {
+                Err((Again::Never, why, _)) => {
                     over = true;
                     set(&|state| state.over = Some(why.clone()));
                     tell(&Told::Over { why }, 0);
                 }
                 // A state that passes: asked again, at the pace the line uses for
                 // coming back after a cut.
-                Err((again, why)) => {
+                Err((again, why, way)) => {
                     let now = Instant::now();
-                    let since = match in_vain_since {
-                        Some(since) => since,
-                        None => {
-                            in_vain_since = Some(now);
-                            tell(&Told::NotYet { why }, 0);
-                            now
-                        }
-                    };
+                    let since = *in_vain_since.get_or_insert(now);
+                    set(&|state| state.failure = Some(way));
+                    if told_way != Some(way) {
+                        told_way = Some(way);
+                        tell(&Told::NotYet { why, failure: way }, 0);
+                    }
                     let fresh = now.saturating_duration_since(since) < SOON_FOR;
                     due = now
                         + match again {
@@ -442,6 +483,7 @@ fn run(
                 set(&|state| {
                     state.open = is_open;
                     state.answered = answered;
+                    state.failure = None;
                 });
                 if let Some(passing) = passing {
                     passing.reconnection("back", cuts);

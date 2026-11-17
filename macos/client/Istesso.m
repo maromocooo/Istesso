@@ -86,6 +86,31 @@ static id<NSObject> wake_activity = nil;
 
 static FILE *frame_log = NULL;
 
+// In what way an attempt to reach the host failed (ISTESSO_MEDIA_FAILURE_*), as the log says it.
+static const char *failure_word(uint32_t failure) {
+    static const char *const words[] = {"none", "refused", "unreachable", "timed_out", "no_answer", "not_ready", "other"};
+    return failure < sizeof words / sizeof *words ? words[failure] : "other";
+}
+
+static uint64_t now_ns(void);
+
+// While the picture has no connection: writes to the log in what way the host cannot be
+// reached, once for each way. "refused" (the machine answered, nothing listens) is not
+// "unreachable" (no way to it from this Mac). Called when no frame came, never for a frame.
+static void say_the_way(IstessoMediaWatch *watch, uint32_t *said) {
+    IstessoMediaWatchState stands;
+    memset(&stands, 0, sizeof stands);
+    istesso_media_watch_state(watch, &stands);
+    if (stands.failure == *said) {
+        return;
+    }
+    *said = stands.failure;
+    if (stands.failure != 0 && frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"not_yet\",\"why\":\"%s\"}\n",
+                (unsigned long long)now_ns(), failure_word(stands.failure));
+    }
+}
+
 // Nanoseconds of mach absolute time: the clock ScreenCaptureKit stamps frames with.
 static uint64_t now_ns(void) {
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -987,6 +1012,7 @@ static void *channel_thread(void *unused) {
     }
     uint64_t began = now_ns(), cut_at = 0;
     bool ever = false, said_unreachable = false, back_pending = false, shown = false;
+    uint32_t said_failure = 0;
     for (;;) {
         IstessoMediaFrame frame;
         int32_t got = istesso_media_watch_next(watch, 250, &frame);
@@ -1024,6 +1050,7 @@ static void *channel_thread(void *unused) {
             fprintf(stderr, "note: the picture's connection was cut; connecting again\n");
             log_stream("ended");
             log_reconnections("cut");
+            say_the_way(watch, &said_failure);
             uint64_t t = cut_at;
             dispatch_async(dispatch_get_main_queue(), ^{
                 show_counts();
@@ -1038,6 +1065,7 @@ static void *channel_thread(void *unused) {
                 exit(1);
             }
             ever = true;
+            said_failure = 0;
             if (frame_log != NULL) {
                 fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"connected\",\"again\":%u,\"silent_ms\":%llu}\n",
                         (unsigned long long)now_ns(), state.again, (unsigned long long)state.silent_ms);
@@ -1062,11 +1090,15 @@ static void *channel_thread(void *unused) {
                 picture_is_over(why);
             });
             return NULL;
-        } else if (!ever && !said_unreachable && now_ns() - began > 1000000000ULL) {
-            // Said once; the sentence holds no address.
-            said_unreachable = true;
-            fprintf(stderr, "note: no picture from the host yet; trying again\n");
-            log_stream("unreachable");
+        } else {
+            // Nothing came in a quarter of a second.
+            say_the_way(watch, &said_failure);
+            if (!ever && !said_unreachable && now_ns() - began > 1000000000ULL) {
+                // Said once; the sentence holds no address.
+                said_unreachable = true;
+                fprintf(stderr, "note: no picture from the host yet; trying again\n");
+                log_stream("unreachable");
+            }
         }
     }
     return NULL;
@@ -1216,14 +1248,19 @@ static void send_one(uint32_t kind, int32_t a, int32_t b) {
 }
 
 // Called on the input's thread for what happens to its conversation with the host.
-static void on_input_told(void *context, int32_t event, uint64_t cuts, double after_ms, const char *why) {
+static void on_input_told(void *context, int32_t event, uint64_t cuts, double after_ms, int32_t failure, const char *why) {
     static const char *const names[] = {"", "open", "cut", "back", "over", "not_yet"};
     const char *name = event >= 1 && event <= 5 ? names[event] : "other";
     uint64_t t = now_ns();
     atomic_store(&input_cuts, (long)cuts);
     if (frame_log != NULL) {
-        fprintf(frame_log, "{\"kind\":\"input\",\"t_ns\":%llu,\"event\":\"%s\",\"reconnections\":%llu,\"after_ms\":%.1f}\n",
+        fprintf(frame_log, "{\"kind\":\"input\",\"t_ns\":%llu,\"event\":\"%s\",\"reconnections\":%llu,\"after_ms\":%.1f",
                 (unsigned long long)now_ns(), name, (unsigned long long)cuts, after_ms);
+        if (failure != 0) {
+            // In what way the attempt failed, in a word that names no address.
+            fprintf(frame_log, ",\"why\":\"%s\"", failure_word((uint32_t)failure));
+        }
+        fprintf(frame_log, "}\n");
     }
     if (event == ISTESSO_INPUT_CUT) {
         fprintf(stderr, "note: the input's conversation with the host was cut; opening it again\n");
@@ -1231,8 +1268,9 @@ static void on_input_told(void *context, int32_t event, uint64_t cuts, double af
         // The sentence holds no address and no key.
         fprintf(stderr, "note: the host does not take input from here: %s\n", why != NULL ? why : "");
     } else if (event == ISTESSO_INPUT_NOT_YET) {
-        // Without the reason: when the host could not be reached, it names an address.
-        fprintf(stderr, "note: the host does not take input yet; asking again\n");
+        // Without the reason's sentence: when the host could not be reached, it names an
+        // address. The way it failed, in a word, does not.
+        fprintf(stderr, "note: the host does not take input yet (%s); asking again\n", failure_word((uint32_t)failure));
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         static BOOL effect_said = NO;
