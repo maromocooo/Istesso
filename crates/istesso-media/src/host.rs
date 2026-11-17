@@ -718,6 +718,13 @@ impl Shared {
         if !watcher.confirmed_lately() {
             return Ok(Sealed::Nothing);
         }
+        // Nothing is sealed behind a packet whose rest still waits for the connection:
+        // it would wait with it, and move that packet's deadline. Every caller looks
+        // first; a debug build, which the tests are, checks that they did.
+        debug_assert!(
+            line.unsent_since.is_none(),
+            "a packet was sealed behind one that still waits for the connection"
+        );
         // Sealing writes into memory; only `push` touches the connection.
         line.channel.send(packet)?;
         if line.channel.stream().push()? {

@@ -1015,7 +1015,9 @@ fn a_viewer_that_takes_nothing_is_cut_off_and_holds_no_frame_up() {
     let _channel = pair.raw_watching();
     let frame = picture(1 << 18, 1);
     let began = Instant::now();
-    let (mut longest, mut full_at, mut sent) = (Duration::ZERO, None, 0);
+    let (mut longest, mut sent) = (Duration::ZERO, 0);
+    // When a frame's rest was left waiting for the connection.
+    let mut left_waiting: Vec<Instant> = Vec::new();
     while pair.host.viewers() > 0 {
         assert!(began.elapsed() < Duration::from_secs(20), "still a viewer");
         let sending = Instant::now();
@@ -1023,20 +1025,78 @@ fn a_viewer_that_takes_nothing_is_cut_off_and_holds_no_frame_up() {
         longest = longest.max(sending.elapsed());
         if result.queued > 0 {
             // Its connection is full: the rest of this frame has until the
-            // deadline, and nothing more is sealed for it meanwhile.
-            assert!(full_at.is_none(), "a second frame was begun");
-            full_at = Some(Instant::now());
+            // deadline, and nothing more is sealed for it meanwhile (the
+            // host checks that itself in a debug build, which this is).
+            //
+            // It may happen more than once. A system can take the rest
+            // after all without the viewer having read anything, by giving
+            // the connection more room; then the frame is out, within its
+            // time, and the next one is begun. What may not happen is that
+            // a frame's rest outlives its deadline and the viewer stays.
+            if let Some(before) = left_waiting.last() {
+                let apart = before.elapsed();
+                assert!(
+                    apart < Duration::from_millis(350),
+                    "a frame's rest waited {apart:?} and the viewer was kept"
+                );
+            }
+            left_waiting.push(Instant::now());
         }
         sent += result.viewers;
         std::thread::sleep(Duration::from_millis(2));
     }
-    // No frame waited for the viewer; the viewer was given its time, once.
+    // No frame waited for the viewer. The frame whose rest the connection
+    // never took was given its time, once, and then the viewer was let go.
     assert!(longest < Duration::from_millis(150), "{longest:?}");
-    let given = full_at.expect("the connection never filled").elapsed();
+    let given = left_waiting
+        .last()
+        .expect("the connection never filled")
+        .elapsed();
     assert!(given >= Duration::from_millis(180), "{given:?}");
     assert!(given < Duration::from_millis(700), "{given:?}");
     assert!(sent >= 1);
     pair.until(|| pair.said("stopped showing the picture to air"));
+}
+
+#[test]
+fn a_frame_whose_rest_gets_out_in_time_is_followed_by_the_next_with_a_deadline_of_its_own() {
+    let pair = pair();
+    let channel = pair.raw_watching();
+    let frame = picture(1 << 18, 1);
+    let send_until_one_waits = || {
+        let began = Instant::now();
+        loop {
+            assert!(began.elapsed() < Duration::from_secs(10), "it never filled");
+            assert_eq!(pair.host.viewers(), 1, "the viewer was let go too early");
+            if pair.host.send_frame(&frame, 0, 0, true).unwrap().queued > 0 {
+                return Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    // The viewer reads nothing until a frame's rest waits for its connection ...
+    send_until_one_waits();
+    // ... and then takes everything there is, well within that frame's time: the rest
+    // gets out. (A system that gives a connection more room does the same without the
+    // viewer having read anything.)
+    let mut stream = channel.stream();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    let mut buffer = vec![0u8; 1 << 16];
+    let drained = Instant::now();
+    while drained.elapsed() < Duration::from_millis(100) {
+        let _ = stream.read(&mut buffer);
+    }
+    // The viewer is still shown the picture, and the next frame is begun.
+    assert_eq!(pair.host.viewers(), 1);
+    // It stops reading again. The frame that waits now has its own time, counted from
+    // when it began to wait, and then the viewer is let go.
+    let waits_since = send_until_one_waits();
+    pair.until(|| pair.host.viewers() == 0);
+    let given = waits_since.elapsed();
+    assert!(given >= Duration::from_millis(180), "{given:?}");
+    assert!(given < Duration::from_millis(700), "{given:?}");
 }
 
 #[test]
