@@ -392,7 +392,7 @@ impl Session {
         match heard {
             Heard::Cursor(cursor) => {
                 if self.cursor_told {
-                    let cursor = self.by_name_where_it_can(cursor);
+                    let (cursor, name, from) = self.by_name_where_it_can(cursor);
                     let accepted = self.door.cursor(&cursor);
                     let (shape, image) = match &cursor {
                         CursorSeen::Hidden => ("hidden", None),
@@ -409,7 +409,14 @@ impl Session {
                             Some([*width, *height, *hotspot_x, *hotspot_y, *scale]),
                         ),
                     };
-                    self.log.line(line::cursor(now, shape, image, accepted));
+                    self.log.line(line::cursor(
+                        now,
+                        shape,
+                        name.as_deref(),
+                        from,
+                        image,
+                        accepted,
+                    ));
                 }
             }
             Heard::Windows(count) => {
@@ -460,26 +467,40 @@ impl Session {
     /// Turns a cursor into what travels: the name of its shape where the
     /// device has a cursor of its own for it, an image otherwise (see
     /// [`cursor`]). On the thread that hears the bus; never on a frame's path.
-    fn by_name_where_it_can(&self, seen: CursorSeen) -> CursorSeen {
-        let Some(book) = &self.cursors else {
-            return seen;
-        };
+    ///
+    /// With it, for the frame log: the shape's name where it has one, and
+    /// who decided what travels, the application (its name, its image) or
+    /// the host's theme (its image known as a shape's, a name drawn as the
+    /// theme draws it).
+    fn by_name_where_it_can(
+        &self,
+        seen: CursorSeen,
+    ) -> (CursorSeen, Option<String>, Option<&'static str>) {
+        const APPLICATION: Option<&str> = Some("application");
+        const THEME: Option<&str> = Some("theme");
+        let book = self.cursors.as_ref();
         match seen {
-            CursorSeen::Hidden => CursorSeen::Hidden,
-            CursorSeen::Named(name) if cursor::travels_as_name(&name) => CursorSeen::Named(name),
+            CursorSeen::Hidden => (CursorSeen::Hidden, None, None),
+            CursorSeen::Named(name) if book.is_none() || cursor::travels_as_name(&name) => {
+                (CursorSeen::Named(name.clone()), Some(name), APPLICATION)
+            }
             // A shape the set does not have: as the theme draws it. Where no
             // theme has it, the name goes: a device that knows it shows its
             // own, one that does not shows its arrow.
-            CursorSeen::Named(name) => match book.image_of(&name, 24) {
-                Some(image) => CursorSeen::Image {
-                    width: image.width,
-                    height: image.height,
-                    hotspot_x: image.hotspot_x,
-                    hotspot_y: image.hotspot_y,
-                    scale: 1,
-                    pixels: image.rgba,
-                },
-                None => CursorSeen::Named(name),
+            CursorSeen::Named(name) => match book.and_then(|book| book.image_of(&name, 24)) {
+                Some(image) => (
+                    CursorSeen::Image {
+                        width: image.width,
+                        height: image.height,
+                        hotspot_x: image.hotspot_x,
+                        hotspot_y: image.hotspot_y,
+                        scale: 1,
+                        pixels: image.rgba,
+                    },
+                    Some(name),
+                    THEME,
+                ),
+                None => (CursorSeen::Named(name.clone()), Some(name), APPLICATION),
             },
             CursorSeen::Image {
                 width,
@@ -496,16 +517,24 @@ impl Session {
                     hotspot_y,
                     rgba: pixels,
                 };
-                match book.name_of(&image) {
-                    Some(name) => CursorSeen::Named(name.to_string()),
-                    None => CursorSeen::Image {
-                        width,
-                        height,
-                        hotspot_x,
-                        hotspot_y,
-                        scale,
-                        pixels: image.rgba,
-                    },
+                match book.and_then(|book| book.name_of(&image)) {
+                    Some(name) => (
+                        CursorSeen::Named(name.to_string()),
+                        Some(name.to_string()),
+                        THEME,
+                    ),
+                    None => (
+                        CursorSeen::Image {
+                            width,
+                            height,
+                            hotspot_x,
+                            hotspot_y,
+                            scale,
+                            pixels: image.rgba,
+                        },
+                        None,
+                        APPLICATION,
+                    ),
                 }
             }
         }
@@ -988,6 +1017,31 @@ mod tests {
         assert_eq!(calls[2], r#"cursor Named("pointer")"#);
         assert_eq!(calls[3], r#"cursor Named("crosshair")"#);
         assert_eq!(calls[4], "cursor Hidden");
+
+        // For the frame log: the name, and who decided what travels.
+        std::fs::write(cursors.join("zoom-in"), &file).unwrap();
+        let told = |seen: CursorSeen| {
+            let (travels, name, from) = set.session.by_name_where_it_can(seen);
+            (matches!(travels, CursorSeen::Image { .. }), name, from)
+        };
+        assert_eq!(
+            told(image(vec![10, 20, 30, 255])),
+            (false, Some("text".to_string()), Some("theme"))
+        );
+        assert_eq!(
+            told(image(vec![11, 20, 30, 255])),
+            (true, None, Some("application"))
+        );
+        assert_eq!(
+            told(CursorSeen::Named("pointer".into())),
+            (false, Some("pointer".to_string()), Some("application"))
+        );
+        // A name outside the set that a theme has an image for: the image, under its name.
+        assert_eq!(
+            told(CursorSeen::Named("zoom-in".into())),
+            (true, Some("zoom-in".to_string()), Some("theme"))
+        );
+        assert_eq!(told(CursorSeen::Hidden), (false, None, None));
         set.session.stop();
         let _ = std::fs::remove_dir_all(&icons);
     }

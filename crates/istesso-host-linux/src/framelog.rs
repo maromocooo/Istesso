@@ -276,16 +276,35 @@ pub mod line {
         )
     }
 
-    /// A cursor the compositor reported, and whether the library took it.
-    /// `image`: width, height, hot spot and scale, for a cursor with an image.
-    pub fn cursor(t_ns: u64, shape: &str, image: Option<[u32; 5]>, accepted: bool) -> String {
+    /// A cursor the compositor reported, as it was handed on, and whether
+    /// the library took it. `name`: the shape's name, where it has one.
+    /// `from`: who decided what travels: "application" (the name it said, or
+    /// the image it handed in) or "theme" (an image that is the host's
+    /// theme's went by its name, or a name the device has no cursor for went
+    /// as the theme's image). `image`: width, height, hot spot and scale,
+    /// for a cursor that travels as an image.
+    pub fn cursor(
+        t_ns: u64,
+        shape: &str,
+        name: Option<&str>,
+        from: Option<&str>,
+        image: Option<[u32; 5]>,
+        accepted: bool,
+    ) -> String {
+        let text = |field: &str, value: Option<&str>| {
+            value.map_or(String::new(), |value| {
+                format!(r#","{field}":{}"#, serde_json::Value::from(value))
+            })
+        };
         let detail = image.map_or(String::new(), |[width, height, x, y, scale]| {
             format!(
                 r#","width":{width},"height":{height},"hotspot_x":{x},"hotspot_y":{y},"scale":{scale}"#
             )
         });
         format!(
-            r#"{{"kind":"cursor","t_ns":{t_ns},"shape":"{shape}"{detail},"accepted":{}}}"#,
+            r#"{{"kind":"cursor","t_ns":{t_ns},"shape":"{shape}"{}{}{detail},"accepted":{}}}"#,
+            text("name", name),
+            text("from", from),
             u8::from(accepted)
         )
     }
@@ -377,12 +396,28 @@ mod tests {
             r#"{"kind":"key_request","t_ns":9,"made":1,"by":"client"}"#
         );
         assert_eq!(
-            line::cursor(9, "image", Some([24, 24, 4, 2, 1]), true),
+            line::cursor(9, "image", None, None, Some([24, 24, 4, 2, 1]), true),
             r#"{"kind":"cursor","t_ns":9,"shape":"image","width":24,"height":24,"hotspot_x":4,"hotspot_y":2,"scale":1,"accepted":1}"#
         );
         assert_eq!(
-            line::cursor(9, "hidden", None, true),
+            line::cursor(9, "hidden", None, None, None, true),
             r#"{"kind":"cursor","t_ns":9,"shape":"hidden","accepted":1}"#
+        );
+        // What travels by name says the name, and who decided on it.
+        assert_eq!(
+            line::cursor(9, "named", Some("text"), Some("theme"), None, true),
+            r#"{"kind":"cursor","t_ns":9,"shape":"named","name":"text","from":"theme","accepted":1}"#
+        );
+        assert_eq!(
+            line::cursor(
+                9,
+                "image",
+                Some("zoom-in"),
+                Some("theme"),
+                Some([24, 24, 4, 2, 1]),
+                false
+            ),
+            r#"{"kind":"cursor","t_ns":9,"shape":"image","name":"zoom-in","from":"theme","width":24,"height":24,"hotspot_x":4,"hotspot_y":2,"scale":1,"accepted":0}"#
         );
         assert_eq!(
             line::windows(9, 2),
