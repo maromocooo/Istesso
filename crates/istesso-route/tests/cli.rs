@@ -21,6 +21,15 @@ struct Project {
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+fn set_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let _ = (path, mode);
+}
+
 impl Project {
     fn new(name: &str) -> Project {
         let base = std::env::temp_dir().join(format!(
@@ -33,14 +42,16 @@ impl Project {
         std::fs::create_dir_all(root.join(".istesso")).unwrap();
         std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
         std::fs::create_dir_all(base.join("home")).unwrap();
+        // The project's root: the search for the task file stops here.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".istesso/tasks.json"), TASKS).unwrap();
         let script = root.join("mark.sh");
         std::fs::write(&script, "#!/bin/sh\npwd > marker\nexit 3\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // Whatever the umask: the task file and its folder must not be
+        // writable by others, or they are refused.
+        set_mode(&root.join(".istesso"), 0o755);
+        set_mode(&root.join(".istesso/tasks.json"), 0o644);
+        set_mode(&script, 0o755);
         Project { base }
     }
 
@@ -471,4 +482,37 @@ fn run_does_not_run_on_another_machine() {
     let run = project.with_hosts("hosts-two.json", &["build", "windows"]);
     assert_eq!(run.code, exit::NOBODY);
     assert!(!project.root().join("marker").exists());
+}
+
+#[test]
+fn task_files_that_cannot_be_trusted_are_not_used() {
+    let project = Project::new("trust");
+    // A task file above the project's root is not taken: a project inside
+    // the project folder, with its own `.git` and no task file.
+    let inner = project.root().join("sub/deeper");
+    std::fs::create_dir_all(inner.join(".git")).unwrap();
+    let hosts = format!("{FIXTURES}/hosts-two.json");
+    let run = Run::of(
+        project
+            .command_in(&inner, &["build", "test", "--hosts", &hosts])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert!(run.stderr.contains("no .istesso/tasks.json"));
+    assert!(!project.root().join("marker").exists());
+
+    // A task file others can write is refused, and nothing runs.
+    #[cfg(unix)]
+    {
+        let file = project.root().join(".istesso/tasks.json");
+        set_mode(&file, 0o666);
+        let run = project.with_hosts("hosts-two.json", &["build", "test"]);
+        assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+        assert!(run.stderr.contains("others can write"));
+        assert!(!project.root().join("marker").exists());
+        set_mode(&file, 0o644);
+        let run = project.with_hosts("hosts-two.json", &["build", "test"]);
+        assert_eq!(run.code, 3, "{}", run.all());
+    }
 }

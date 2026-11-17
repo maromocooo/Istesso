@@ -188,12 +188,19 @@ fn project() -> Result<Project, Fail> {
             format!("the current folder cannot be read: {e}"),
         )
     })?;
-    let (file, root) = find_tasks(&here).ok_or_else(|| {
-        fail(
-            exit::UNREADABLE,
-            format!("no {TASKS_FILE} in this folder or its parents"),
-        )
-    })?;
+    // A refused task file ends with the same code as an unreadable one (73):
+    // every code of the plan's range is taken.
+    let (file, root) = find_tasks(&here)
+        .map_err(|e| fail(exit::UNREADABLE, e.to_string()))?
+        .ok_or_else(|| {
+            fail(
+                exit::UNREADABLE,
+                format!(
+                    "no {TASKS_FILE} in this folder or its parents up to the project's root \
+                     (the first folder with .git; without one, this folder only)"
+                ),
+            )
+        })?;
     let text = std::fs::read_to_string(&file).map_err(|e| {
         fail(
             exit::UNREADABLE,
