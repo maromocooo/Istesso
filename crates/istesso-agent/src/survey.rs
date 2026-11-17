@@ -149,6 +149,90 @@ pub fn refresh_peers(paths: &Paths, options: &SurveyOptions) -> Result<Vec<HostV
     Ok(views.collect())
 }
 
+/// Opens a conversation with one paired device, named as for
+/// `istesso peers` (its name, or the beginning of its id). The addresses
+/// tried are those remembered for it; `istesso hosts` finds them.
+pub fn connect_peer(paths: &Paths, who: &str, timeout: Duration) -> Result<Client, String> {
+    connect_peer_at(paths, who, None, timeout)
+}
+
+/// As [`connect_peer`]. With `address`, the device is tried at that address
+/// only (the agent's usual port unless one is given): for when the way the
+/// conversation takes matters, a measurement over a cable say, and the
+/// device is remembered at more than one address. It still has to be the
+/// paired device that answers there.
+pub fn connect_peer_at(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    timeout: Duration,
+) -> Result<Client, String> {
+    connect_peer_or_say_why(paths, who, address, timeout).map_err(|e| e.to_string())
+}
+
+/// Why a conversation with a paired device could not be opened.
+#[derive(Debug)]
+pub enum ConnectFailure {
+    /// Something on this device is in the way, and the other one was not
+    /// asked: no identity, a list of paired devices that cannot be read,
+    /// nobody of that name in it, no address known.
+    Here(String),
+    /// The other device was not reached, or it refused.
+    Link(istesso_link::Error),
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectFailure::Here(why) => f.write_str(why),
+            ConnectFailure::Link(err) => err.fmt(f),
+        }
+    }
+}
+
+/// As [`connect_peer_at`], for a caller that decides by the kind of failure
+/// what to do next: a device that is asleep is asked again, one that says
+/// that it is not paired with this one is not.
+pub fn connect_peer_or_say_why(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    timeout: Duration,
+) -> Result<Client, ConnectFailure> {
+    let here = |e: &dyn std::fmt::Display| ConnectFailure::Here(e.to_string());
+    let identity = Identity::load_or_create(&paths.identity()).map_err(|e| here(&e))?;
+    let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| here(&e))?);
+    let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| here(&e))?);
+    let peer = peers
+        .find(who)
+        .map_err(|e| here(&e))?
+        .ok_or_else(|| ConnectFailure::Here(format!("no paired device matches {who:?}")))?
+        .clone();
+    let candidates = match address {
+        Some(address) if address.parse::<std::net::IpAddr>().is_ok() => {
+            // A bare address: IPv6 goes into brackets where a port follows.
+            let host = if address.contains(':') {
+                format!("[{address}]")
+            } else {
+                address.to_string()
+            };
+            vec![format!("{host}:{DEFAULT_PORT}")]
+        }
+        Some(address) => vec![address.to_string()],
+        None => cache::load(paths, &peer.id)
+            .map(|snapshot| snapshot.addresses)
+            .unwrap_or_default(),
+    };
+    if candidates.is_empty() {
+        return Err(ConnectFailure::Here(
+            "no address is known for this device yet: run `istesso hosts` once".into(),
+        ));
+    }
+    connect_any(candidates, keys, peers, &peer.id, timeout)
+        .map(|(client, _)| client)
+        .map_err(ConnectFailure::Link)
+}
+
 /// True when something accepts connections on the agent port of this
 /// machine.
 pub fn local_agent_running(port: u16) -> bool {
@@ -409,6 +493,7 @@ mod tests {
                 discovery: false,
                 refresh_peers: None,
                 verbose: false,
+                ..AgentOptions::default()
             })
         }
 
@@ -457,6 +542,7 @@ mod tests {
                         Request::Status => Response::Status {
                             status: HostStatus::default(),
                         },
+                        Request::InputOpen { .. } | Request::Input { .. } => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;
@@ -479,10 +565,18 @@ mod tests {
         }
     }
 
-    /// An address on this machine where nothing listens.
+    /// An address on this machine where nothing listens, and where nothing
+    /// will: the port of a connection's calling end. It is taken for as long
+    /// as that connection lives, so no other test that asks for a free port
+    /// while this one runs is handed it (a port that was only let go of
+    /// could be, a moment later).
     fn dead_address() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
+        let caller = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let addr = caller.local_addr().unwrap();
+        // Kept until the tests are over.
+        std::mem::forget((listener, caller));
+        addr
     }
 
     #[test]
@@ -704,6 +798,7 @@ mod tests {
             discovery: true,
             refresh_peers: None,
             verbose: false,
+            ..AgentOptions::default()
         };
         let ubuntu_addr = ubuntu.start_agent_with(&options);
         air.start_agent_with(&options);

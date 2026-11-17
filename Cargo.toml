@@ -17,6 +17,7 @@ istesso-catalog = { path = "crates/istesso-catalog" }
 istesso-pair = { path = "crates/istesso-pair" }
 istesso-link = { path = "crates/istesso-link" }
 istesso-agent = { path = "crates/istesso-agent" }
+istesso-measure = { path = "crates/istesso-measure" }
 
 # Third-party crates. Every dependency must pass the licence allowlist in deny.toml.
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +37,14 @@ if-addrs = "0.15"
 mdns-sd = { version = "0.21", default-features = false }
 unicode-width = "0.2"
 zeroize = "1"
+# Window and pixels for the test application (istesso-flash) only. X11 and Wayland are loaded at
+# run time, so building needs no system headers. No client-side decorations: inside the
+# streaming compositor the window is borderless, and elsewhere the window manager draws them.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+glutin = { version = "0.32", default-features = false, features = ["egl", "wayland", "x11"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland", "x11"] }
+glow = "0.18"
 
 [profile.release]
 lto = "thin"
