@@ -63,10 +63,32 @@ typedef struct IstessoMediaFrame {
     uint32_t reserved;
 } IstessoMediaFrame;
 
+/*
+ * What the pointer's cursor looks like on the host. The host does not draw it into the frames
+ * then; the client draws it where its own pointer is. The image comes from whatever application
+ * runs on the host: neither end takes one whose sides are not between 1 and 256 pixels, whose
+ * hot spot is not inside it, or whose bytes are not as many as its size says.
+ */
+typedef struct IstessoMediaCursor {
+    uint32_t shape;       /* 0: the application has hidden the pointer, nothing is drawn.
+                             1: a cursor there is no image of; the client shows one of its own.
+                             2: an image */
+    uint32_t width;       /* size of the image in pixels (shape 2) */
+    uint32_t height;
+    uint32_t hotspot_x;   /* the pixel of the image that lies on the pointer's position */
+    uint32_t hotspot_y;
+    uint32_t scale;       /* pixels of the image to one pixel of the picture */
+    const uint8_t *pixels; /* four bytes a pixel: red, green, blue, alpha, the colours multiplied
+                              by alpha; rows from the top. NULL unless shape is 2 */
+    size_t pixels_len;
+    const char *name;     /* the cursor's name when shape is 1; may be NULL */
+} IstessoMediaCursor;
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(IstessoMediaStreamInfo) == 24, "IstessoMediaStreamInfo differs from src/ffi.rs");
 _Static_assert(sizeof(IstessoMediaSent) == 24, "IstessoMediaSent differs from src/ffi.rs");
 _Static_assert(sizeof(void *) != 8 || sizeof(IstessoMediaFrame) == 72, "IstessoMediaFrame differs from src/ffi.rs");
+_Static_assert(sizeof(void *) != 8 || sizeof(IstessoMediaCursor) == 48, "IstessoMediaCursor differs from src/ffi.rs");
 #endif
 
 typedef struct IstessoMediaHost IstessoMediaHost;
@@ -105,6 +127,14 @@ int32_t istesso_media_host_send(const IstessoMediaHost *host, const uint8_t *dat
  */
 int32_t istesso_media_host_key_frame_wanted(const IstessoMediaHost *host);
 
+/*
+ * Says what the pointer's cursor looks like from now on. A viewer is told the latest cursor
+ * only, at most once in a frame's interval, and behind any frame that is on its way to it; a
+ * viewer that connects later is told what the cursor is then. 0, or -1 when the cursor is one
+ * that may not travel (see IstessoMediaCursor); it then reaches nobody.
+ */
+int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const IstessoMediaCursor *cursor);
+
 /* Devices that are being shown the picture now. */
 uint32_t istesso_media_host_viewers(const IstessoMediaHost *host);
 
@@ -126,13 +156,22 @@ IstessoMediaClient *istesso_media_client_connect(const char *config_dir, const c
 int32_t istesso_media_client_info(const IstessoMediaClient *client, IstessoMediaStreamInfo *info);
 
 /*
- * Waits for the next frame, for `wait_ms` at most. 1: `frame` is filled in. 0: none came in
+ * Waits for the next frame, for `wait_ms` at most. 1: `frame` is filled in. 2: the host has
+ * said what the cursor is; fetch it with istesso_media_client_cursor(). 0: nothing came in
  * that time (the picture stands still). -1: the connection is over (the host ended it, said
  * nothing for three seconds, or the pairing was removed); close the client and connect again.
  * One thread calls this.
  */
 int32_t istesso_media_client_next(const IstessoMediaClient *client, uint32_t wait_ms,
                                   IstessoMediaFrame *frame);
+
+/*
+ * What the host last said the cursor is. 1: `cursor` is filled in; what its pointers point to
+ * stays valid until the next call with the same client. 0: the host has not said (a host that
+ * draws the cursor into its frames never does). -1: no client. One thread calls this, the one
+ * that calls istesso_media_client_next().
+ */
+int32_t istesso_media_client_cursor(const IstessoMediaClient *client, IstessoMediaCursor *cursor);
 
 /*
  * The picture cannot be decoded from here on: have the host send a key frame. From any

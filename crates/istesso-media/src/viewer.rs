@@ -15,7 +15,9 @@ use istesso_pair::{Peer, PeerStore};
 
 use crate::clock;
 use crate::timed::{wait_for, Ready, Timed, Wake};
-use crate::wire::{self, Ask, Codec, ErrorCode, Header, Kind, Reply, StreamInfo, WireError};
+use crate::wire::{
+    self, Ask, Codec, Cursor, ErrorCode, Header, Kind, Reply, StreamInfo, WireError,
+};
 use crate::{Error, Result};
 
 /// How long one read may take once a frame has begun to arrive. A frame
@@ -37,6 +39,30 @@ pub struct Viewer {
     last_heard: Instant,
     /// The packet handed out last.
     packet: Vec<u8>,
+    /// The packet that said what the cursor is, and where in it that is said. Kept apart
+    /// from the frames, which come and go while the cursor stays.
+    cursor_packet: Vec<u8>,
+    cursor_at: Option<std::ops::Range<usize>>,
+}
+
+/// What a host sends a viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event<'a> {
+    Frame(Frame<'a>),
+    /// The pointer's cursor looks like this from now on. The viewer draws it where its own
+    /// pointer is; the host does not draw it into the frames.
+    Cursor(Cursor<'a>),
+}
+
+/// What [`Viewer::pull`] found, without the bytes.
+enum Pulled {
+    Frame {
+        header: Header,
+        at: std::ops::Range<usize>,
+        first_ns: u64,
+        whole_ns: u64,
+    },
+    Cursor,
 }
 
 struct Asking {
@@ -147,6 +173,8 @@ impl Viewer {
             }),
             last_heard: Instant::now(),
             packet: Vec::new(),
+            cursor_packet: Vec::new(),
+            cursor_at: None,
         })
     }
 
@@ -165,14 +193,78 @@ impl Viewer {
         Asker(self.asking.clone())
     }
 
+    /// What the host last said the cursor is. `None` until it has said so: a host that
+    /// draws the cursor into its frames never does.
+    pub fn cursor(&self) -> Option<Cursor<'_>> {
+        let at = self.cursor_at.clone()?;
+        wire::decode_cursor(&self.cursor_packet[at]).ok()
+    }
+
     /// Waits for the next frame, for `wait` at most. `Ok(None)` means that
     /// none came in that time, which is what happens while the picture
     /// stands still. An error means that the connection is over: the host
     /// has ended it, has said nothing for too long, or sent something that
     /// cannot be read. The viewer is then dropped, and a new one connects.
+    ///
+    /// What the host says about the cursor meanwhile is kept for
+    /// [`Viewer::cursor`]; [`Viewer::next`] hands it over as it comes.
     pub fn next_frame(&mut self, wait: Duration) -> Result<Option<Frame<'_>>> {
         let until = Instant::now() + wait;
-        let (header, at, first_ns, whole_ns) = loop {
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.pull(left)? {
+                Some(Pulled::Frame {
+                    header,
+                    at,
+                    first_ns,
+                    whole_ns,
+                }) => return Ok(Some(self.frame(header, at, first_ns, whole_ns))),
+                Some(Pulled::Cursor) => continue,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Waits for the next thing the host sends, a frame or what the cursor
+    /// is, for `wait` at most. Otherwise as [`Viewer::next_frame`].
+    pub fn next(&mut self, wait: Duration) -> Result<Option<Event<'_>>> {
+        Ok(match self.pull(wait)? {
+            Some(Pulled::Frame {
+                header,
+                at,
+                first_ns,
+                whole_ns,
+            }) => Some(Event::Frame(self.frame(header, at, first_ns, whole_ns))),
+            Some(Pulled::Cursor) => self.cursor().map(Event::Cursor),
+            None => None,
+        })
+    }
+
+    fn frame(
+        &self,
+        header: Header,
+        at: std::ops::Range<usize>,
+        first_ns: u64,
+        whole_ns: u64,
+    ) -> Frame<'_> {
+        let data = &self.packet[at];
+        Frame {
+            data,
+            key_frame: header.key_frame,
+            discontinuity: header.discontinuity,
+            seq: header.seq,
+            pts_ns: header.pts_ns,
+            encoded_ns: header.encoded_ns,
+            first_ns,
+            whole_ns,
+            messages: wire::channel_messages(data.len()),
+        }
+    }
+
+    /// Receives until a frame or a cursor has come, for `wait` at most.
+    fn pull(&mut self, wait: Duration) -> Result<Option<Pulled>> {
+        let until = Instant::now() + wait;
+        loop {
             if self.asking.key_frame.swap(false, Ordering::SeqCst) {
                 self.asking.wake.clear();
                 let ask = serde_json::to_vec(&Ask::KeyFrame).map_err(|_| Error::Malformed)?;
@@ -202,35 +294,33 @@ impl Viewer {
             self.last_heard = Instant::now();
             match wire::decode(&self.packet) {
                 Ok((header, at)) => match header.kind {
-                    Kind::Frame => break (header, at, first_ns, whole_ns),
+                    Kind::Frame => {
+                        return Ok(Some(Pulled::Frame {
+                            header,
+                            at,
+                            first_ns,
+                            whole_ns,
+                        }))
+                    }
                     Kind::Idle => continue,
                     Kind::End => return Err(Error::Ended),
+                    Kind::Cursor => {
+                        // The image is whatever an application on the host handed in: it
+                        // is taken only if its numbers fit its length and the limits.
+                        // One that does not is passed over, and the cursor stays as it
+                        // was.
+                        if wire::decode_cursor(&self.packet[at.clone()]).is_ok() {
+                            std::mem::swap(&mut self.packet, &mut self.cursor_packet);
+                            self.cursor_at = Some(at);
+                            return Ok(Some(Pulled::Cursor));
+                        }
+                    }
                 },
                 // A kind of packet that a later version sends: passed over.
                 Err(WireError::Kind(_)) => continue,
                 Err(err) => return Err(err.into()),
             }
-        };
-        let Header {
-            key_frame,
-            discontinuity,
-            seq,
-            pts_ns,
-            encoded_ns,
-            ..
-        } = header;
-        let data = &self.packet[at];
-        Ok(Some(Frame {
-            data,
-            key_frame,
-            discontinuity,
-            seq,
-            pts_ns,
-            encoded_ns,
-            first_ns,
-            whole_ns,
-            messages: wire::channel_messages(data.len()),
-        }))
+        }
     }
 }
 

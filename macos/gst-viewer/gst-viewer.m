@@ -85,6 +85,21 @@
 //   ISTESSO_RECEIVE_REALTIME   set: the thread that receives and decodes is scheduled the way the
 //                              threads of the sound system are (off unless set, so that what it
 //                              changes can be measured)
+// The cursor. A host that was started with --cursor leaves the pointer's cursor out of the
+// picture and says over the same connection what it looks like. This program then draws that
+// image itself, in a layer above the picture, where the Mac's own pointer is inside the view: the
+// cursor follows the hand at once instead of trailing it by the picture's way. The image is
+// scaled as the picture is. The Mac's own cursor is not shown over the view while the window is
+// the one being typed into (public AppKit: a cursor rectangle with an empty cursor); outside the
+// view, and while another window is, it is as always, and the layer is not shown. When the host
+// says that the application has hidden the pointer, nothing is drawn; when it has no image of the
+// cursor, the Mac's own is shown. Where the pointer is goes to the host as before (INPUT_SOCKET).
+//   ISTESSO_CURSOR_AT=X,Y      for checks that must not touch the pointer: draw the cursor at this
+//                              place of the view (points from its top left) whatever the pointer
+//                              does and whichever window is key
+// The frame log gets {"kind":"cursor","t_ns":T,"shape":0|1|2,"width":W,"height":H,
+// "hotspot_x":X,"hotspot_y":Y,"scale":S} for every cursor the host tells (0 hidden, 1 no image,
+// 2 an image).
 // The frame log keeps its lines, and two of them mean something a little different:
 //   {"kind":"arrived","rtp":S,"first_ns":T,"last_ns":T,"packets":N,"bytes":N,"key":K,"host_encoded_ns":E}
 //                              S is the frame's sequence number, not an RTP timestamp; first_ns
@@ -550,6 +565,45 @@ static GstFlowReturn on_access_unit(GstAppSink *sink, gpointer user_data) {
     return GST_FLOW_OK;
 }
 
+// ---- The cursor, drawn here ----
+//
+// What the host said last, and where the pointer is. Only touched on the main thread.
+
+static CALayer *cursor_layer = nil;
+// 0 hidden, 1 no image (the Mac's own cursor), 2 an image. Until the host has said anything the
+// Mac's own cursor is shown, as it is with a host that draws the cursor into the picture.
+static uint32_t cursor_shape = 1;
+static CGSize cursor_pixels;   // size of the image in its own pixels
+static CGPoint cursor_hot;     // the pixel of it that lies on the pointer's position
+static CGFloat cursor_scale = 1;  // pixels of the image to one pixel of the picture
+// ISTESSO_CURSOR_AT: a place of the view to draw the cursor at, for checks.
+static BOOL cursor_pinned = NO;
+static NSPoint cursor_pin;
+// The view that shows the picture, when it is one that knows about the cursor.
+static NSView *cursor_view = nil;
+
+@interface NSView (IstessoCursor)
+- (void)cursorChanged;
+@end
+
+// Takes over what the host said the cursor is. `image` may be NULL; it is released here.
+static void show_cursor(uint32_t shape, CGImageRef image, CGSize pixels, CGPoint hot, CGFloat scale) {
+    cursor_shape = shape;
+    cursor_pixels = pixels;
+    cursor_hot = hot;
+    cursor_scale = scale > 0 ? scale : 1;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    cursor_layer.contents = shape == 2 ? (__bridge id)image : nil;
+    [CATransaction commit];
+    if (image != NULL) {
+        CGImageRelease(image);
+    }
+    if ([cursor_view respondsToSelector:@selector(cursorChanged)]) {
+        [cursor_view cursorChanged];
+    }
+}
+
 // ---- Frames from the encrypted channel ----
 //
 // One thread connects to the host, is handed whole frames by the library, and decodes each one
@@ -739,6 +793,47 @@ static void on_channel_frame(IstessoMediaClient *client, const IstessoMediaFrame
     }
 }
 
+// The host has said what the cursor is. The library has checked it; it is checked once more
+// before a picture is made of it, and handed to the main thread.
+static void on_channel_cursor(const IstessoMediaCursor *cursor) {
+    if (frame_log != NULL) {
+        fprintf(frame_log,
+                "{\"kind\":\"cursor\",\"t_ns\":%llu,\"shape\":%u,\"width\":%u,\"height\":%u,\"hotspot_x\":%u,\"hotspot_y\":%u,"
+                "\"scale\":%u}\n",
+                (unsigned long long)now_ns(), cursor->shape, cursor->width, cursor->height, cursor->hotspot_x, cursor->hotspot_y,
+                cursor->scale);
+    }
+    CGImageRef image = NULL;
+    uint32_t shape = cursor->shape;
+    if (shape == 2) {
+        gboolean fits = cursor->width >= 1 && cursor->width <= 256 && cursor->height >= 1 && cursor->height <= 256
+            && cursor->hotspot_x < cursor->width && cursor->hotspot_y < cursor->height && cursor->scale >= 1 && cursor->pixels != NULL
+            && cursor->pixels_len == (size_t)cursor->width * cursor->height * 4;
+        if (fits) {
+            // Copied: the library keeps the bytes only until the cursor changes again.
+            CFDataRef bytes = CFDataCreate(kCFAllocatorDefault, cursor->pixels, (CFIndex)cursor->pixels_len);
+            CGDataProviderRef provider = CGDataProviderCreateWithCFData(bytes);
+            CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            image = CGImageCreate(cursor->width, cursor->height, 8, 32, (size_t)cursor->width * 4, space,
+                                  (CGBitmapInfo)kCGImageAlphaPremultipliedLast, provider, NULL, false, kCGRenderingIntentDefault);
+            CGColorSpaceRelease(space);
+            CGDataProviderRelease(provider);
+            CFRelease(bytes);
+        }
+        if (image == NULL) {
+            shape = 1;  // No picture of it after all: the Mac's own cursor.
+        }
+    } else if (shape > 2) {
+        shape = 1;
+    }
+    CGSize pixels = CGSizeMake(cursor->width, cursor->height);
+    CGPoint hot = CGPointMake(cursor->hotspot_x, cursor->hotspot_y);
+    CGFloat scale = cursor->scale;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        show_cursor(shape, image, pixels, hot, scale);
+    });
+}
+
 static void log_stream(const char *event) {
     if (frame_log != NULL) {
         fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"%s\"}\n", (unsigned long long)now_ns(), event);
@@ -786,6 +881,11 @@ static void *channel_thread(void *unused) {
             }
             if (got == 1) {
                 on_channel_frame(client, &frame);
+            } else if (got == 2) {
+                IstessoMediaCursor cursor;
+                if (istesso_media_client_cursor(client, &cursor) == 1) {
+                    on_channel_cursor(&cursor);
+                }
             }
         }
         fprintf(stderr, "note: the picture's connection is over: %s; connecting again\n", istesso_media_last_error());
@@ -802,6 +902,19 @@ static gboolean use_channel(NSView *view) {
     vt_layer = view.layer;
     vt_layer.contentsGravity = kCAGravityResize;
     vt_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    // The cursor lies above the picture, and is only shown once the host has said what it is.
+    cursor_layer = [CALayer layer];
+    cursor_layer.zPosition = 10;
+    cursor_layer.hidden = YES;
+    cursor_layer.contentsGravity = kCAGravityResize;
+    [vt_layer addSublayer:cursor_layer];
+    cursor_view = view;
+    const char *pin = getenv("ISTESSO_CURSOR_AT");
+    double pin_x = 0, pin_y = 0;
+    if (pin != NULL && sscanf(pin, "%lf,%lf", &pin_x, &pin_y) == 2) {
+        cursor_pinned = YES;
+        cursor_pin = NSMakePoint(pin_x, pin_y);
+    }
     pthread_t thread;
     return pthread_create(&thread, NULL, channel_thread, NULL) == 0;
 }
@@ -934,6 +1047,73 @@ static BOOL command_is_control = YES;
 @implementation InputView {
     Keys _keys;          // keys that are down on the other side
     double _scroll[2];   // parts of a pixel not yet passed on
+    BOOL _inside;        // the pointer is over the view
+    NSPoint _at;         // where, in the view's own coordinates (from its bottom left)
+}
+
+// A cursor that shows nothing: over the view the cursor is the one drawn into the layer.
+static NSCursor *empty_cursor(void) {
+    static NSCursor *cursor = nil;
+    if (cursor == nil) {
+        cursor = [[NSCursor alloc] initWithImage:[[NSImage alloc] initWithSize:NSMakeSize(16, 16)] hotSpot:NSZeroPoint];
+    }
+    return cursor;
+}
+
+// The Mac's own cursor is left as it is unless the host has an image of the cursor, or says
+// that the application has hidden it. Cursor rectangles only work in the key window, which is
+// what is wanted: over a window that is not being used the Mac's cursor stays.
+- (void)resetCursorRects {
+    if (cursor_layer != nil && cursor_shape != 1) {
+        [self addCursorRect:self.bounds cursor:empty_cursor()];
+    } else {
+        [super resetCursorRects];
+    }
+}
+
+// Puts the cursor's layer where the pointer is, at the picture's scale, or takes it away.
+- (void)placeCursor {
+    if (cursor_layer == nil) {
+        return;
+    }
+    BOOL here = cursor_pinned || (_inside && self.window.isKeyWindow);
+    BOOL show = here && cursor_shape == 2 && picture_width > 0 && self.bounds.size.width > 0;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (show) {
+        NSPoint at = cursor_pinned ? NSMakePoint(cursor_pin.x, self.bounds.size.height - cursor_pin.y) : _at;
+        // Points of the view to one pixel of the cursor's image.
+        CGFloat each = self.bounds.size.width / picture_width / cursor_scale;
+        CGFloat width = cursor_pixels.width * each, height = cursor_pixels.height * each;
+        // The hot spot lies on the pointer; the view counts upwards, the image downwards.
+        cursor_layer.frame = CGRectMake(at.x - cursor_hot.x * each, at.y + cursor_hot.y * each - height, width, height);
+    }
+    cursor_layer.hidden = !show;
+    [CATransaction commit];
+}
+
+// The host has said that the cursor is something else.
+- (void)cursorChanged {
+    [self.window invalidateCursorRectsForView:self];
+    [self placeCursor];
+}
+
+- (void)pointerIsAt:(NSEvent *)event inside:(BOOL)inside {
+    _at = [self convertPoint:event.locationInWindow fromView:nil];
+    _inside = inside;
+    [self placeCursor];
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    [self pointerIsAt:event inside:YES];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [self pointerIsAt:event inside:NO];
+}
+
+- (void)windowIsKeyOrNot {
+    [self placeCursor];
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -952,13 +1132,17 @@ static BOOL command_is_control = YES;
     self.window.acceptsMouseMovedEvents = YES;
     [self addTrackingArea:[[NSTrackingArea alloc]
                               initWithRect:NSZeroRect
-                                   options:NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                   options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
+                                           | NSTrackingInVisibleRect
                                      owner:self
                                   userInfo:nil]];
     [NSNotificationCenter.defaultCenter addObserver:self
                                            selector:@selector(letGo)
                                                name:NSWindowDidResignKeyNotification
                                              object:self.window];
+    for (NSNotificationName name in @[NSWindowDidResignKeyNotification, NSWindowDidBecomeKeyNotification]) {
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(windowIsKeyOrNot) name:name object:self.window];
+    }
 }
 
 - (void)send:(const KeyChange *)changes count:(size_t)count {
@@ -1001,6 +1185,8 @@ static BOOL command_is_control = YES;
 }
 
 - (void)pointer:(NSEvent *)event {
+    // The cursor is drawn here first: it does not wait for anything.
+    [self pointerIsAt:event inside:NSPointInRect([self convertPoint:event.locationInWindow fromView:nil], self.bounds)];
     if (picture_width <= 0 || picture_height <= 0) {
         return;
     }
@@ -1091,6 +1277,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE [FRAME_LOG [KEY_REQUEST_PORT [INPUT_SOCKET]]]\n");
             return 2;
         }
+        channel_address = getenv("ISTESSO_CHANNEL");
         if (argc == 10) {
             if (strlen(argv[9]) >= sizeof input_to.sun_path) {
                 fprintf(stderr, "error: the path of INPUT_SOCKET is too long\n");
@@ -1104,7 +1291,6 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-        channel_address = getenv("ISTESSO_CHANNEL");
         if (argc >= 9 && channel_address == NULL) {
             int port = atoi(argv[8]);
             if (port < 1 || port > 65535) {
@@ -1158,8 +1344,9 @@ int main(int argc, char *argv[]) {
         }
         const char *command_key = getenv("ISTESSO_COMMAND_KEY");
         command_is_control = command_key == NULL || strcmp(command_key, "super") != 0;
-        NSView *view = input_socket >= 0 ? [[InputView alloc] initWithFrame:NSMakeRect(0, 0, width, height)]
-                                         : [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+        // The view that follows the pointer: to pass it on, and, with the channel, to draw the cursor.
+        NSView *view = input_socket >= 0 || channel_address != NULL ? [[InputView alloc] initWithFrame:NSMakeRect(0, 0, width, height)]
+                                                                    : [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         window.contentView = view;
         if (input_socket >= 0) {
             [window makeFirstResponder:view];

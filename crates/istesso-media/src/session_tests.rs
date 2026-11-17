@@ -10,8 +10,8 @@ use istesso_link::{Channel, Error as LinkError, LocalKeys};
 use istesso_pair::{Identity, Permission};
 
 use crate::testing::TempPeers;
-use crate::wire::{self, Ask, Chroma, Codec, Colour, Reply, StreamInfo};
-use crate::{Error, Host, Viewer};
+use crate::wire::{self, Ask, Chroma, Codec, Colour, Cursor, CursorImage, Reply, StreamInfo};
+use crate::{Error, Event, Host, Viewer};
 
 const SOON: Duration = Duration::from_secs(5);
 
@@ -670,10 +670,10 @@ fn a_picture_that_stands_still_is_not_a_broken_connection() {
     assert!(matches!(nothing, Ok(None)), "{:?}", nothing.err());
     assert!(began.elapsed() >= Duration::from_millis(3400));
     assert_eq!(pair.host.viewers(), 1);
-    assert_eq!(
-        pair.host.send_frame(b"moved", 1, 1, false).unwrap().viewers,
-        1
-    );
+    // A frame that comes in the very moment the viewer is being told that the picture
+    // stands still goes on without it, and the next one is a key frame; either way the
+    // picture moves again.
+    pair.until(|| pair.host.send_frame(b"moved", 1, 1, true).unwrap().viewers == 1);
     assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"moved");
 }
 
@@ -999,4 +999,456 @@ fn a_viewer_that_lost_its_right_gets_nothing_more_however_many_devices_connect()
     let last = air.last().unwrap().saturating_duration_since(taken);
     assert!(last < Duration::from_millis(1100), "{last:?}");
     air.finish();
+}
+
+// ---- The cursor ----
+
+fn arrow(pixels: &[u8]) -> Cursor<'_> {
+    Cursor::Image(CursorImage {
+        width: 24,
+        height: 16,
+        hotspot_x: 3,
+        hotspot_y: 5,
+        scale: 1,
+        rgba: pixels,
+    })
+}
+
+/// What a viewer was handed, in the order it came: `f` for a frame, `c` for a cursor.
+fn events(viewer: &mut Viewer, count: usize) -> (String, Vec<Vec<u8>>) {
+    let (mut order, mut cursors) = (String::new(), Vec::new());
+    while order.len() < count {
+        match viewer.next(SOON).unwrap().expect("something in time") {
+            Event::Frame(_) => order.push('f'),
+            Event::Cursor(cursor) => {
+                order.push('c');
+                cursors.push(match cursor {
+                    Cursor::Hidden => b"hidden".to_vec(),
+                    Cursor::Named(name) => name.as_bytes().to_vec(),
+                    Cursor::Image(image) => image.rgba.to_vec(),
+                });
+            }
+        }
+    }
+    (order, cursors)
+}
+
+#[test]
+fn the_cursor_reaches_a_viewer_and_a_viewer_that_comes_later() {
+    let pair = pair();
+    let pixels = picture(24 * 16 * 4, 7);
+    // Set before anybody watches.
+    pair.host.set_cursor(&arrow(&pixels)).unwrap();
+    let mut viewer = pair.watching();
+    assert!(viewer.cursor().is_none());
+    // The viewer is told what the cursor is without a frame having to go out.
+    let (order, cursors) = events(&mut viewer, 1);
+    assert_eq!(order, "c");
+    assert_eq!(cursors[0], pixels);
+    assert_eq!(viewer.cursor(), Some(arrow(&pixels)));
+
+    // The application hides the pointer, and shows one there is no image of.
+    std::thread::sleep(Duration::from_millis(30));
+    pair.host.set_cursor(&Cursor::Hidden).unwrap();
+    assert_eq!(events(&mut viewer, 1).1[0], b"hidden");
+    assert_eq!(viewer.cursor(), Some(Cursor::Hidden));
+    std::thread::sleep(Duration::from_millis(30));
+    pair.host.set_cursor(&Cursor::Named("default")).unwrap();
+    assert_eq!(events(&mut viewer, 1).1[0], b"default");
+
+    // Frames go on as before, and a viewer that only wants frames gets only frames; what
+    // the cursor is, is kept for it. (A frame that comes in the very moment the viewer's
+    // own thread is telling it the cursor goes on without that viewer, by design; so the
+    // test lets that thread finish before it hands a frame over.)
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"key");
+    std::thread::sleep(Duration::from_millis(60));
+    pair.host.set_cursor(&arrow(&pixels)).unwrap();
+    pair.until(|| {
+        matches!(viewer.next_frame(Duration::from_millis(20)), Ok(None))
+            && viewer.cursor() == Some(arrow(&pixels))
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        pair.host.send_frame(b"next", 1, 1, false).unwrap().viewers,
+        1
+    );
+    assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"next");
+    assert_eq!(viewer.cursor(), Some(arrow(&pixels)));
+}
+
+#[test]
+fn a_cursor_that_may_not_travel_is_refused_and_reaches_nobody() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    let pixels = vec![0u8; 257 * 257 * 4];
+    let image = |width: u16, height: u16, hotspot: (u16, u16), len: usize| {
+        Cursor::Image(CursorImage {
+            width,
+            height,
+            hotspot_x: hotspot.0,
+            hotspot_y: hotspot.1,
+            scale: 1,
+            rgba: &pixels[..len],
+        })
+    };
+    let refused = [
+        // Larger than any cursor may be.
+        image(257, 16, (0, 0), 257 * 16 * 4),
+        image(16, 257, (0, 0), 257 * 16 * 4),
+        // Of no size.
+        image(0, 16, (0, 0), 0),
+        image(16, 0, (0, 0), 0),
+        // Not as many bytes as its size says.
+        image(16, 16, (0, 0), 16 * 16 * 4 - 1),
+        image(16, 16, (0, 0), 16 * 16 * 4 + 4),
+        // Its hot spot outside it.
+        image(16, 16, (16, 0), 16 * 16 * 4),
+        image(16, 16, (0, 16), 16 * 16 * 4),
+    ];
+    for cursor in &refused {
+        let result = pair.host.set_cursor(cursor);
+        assert!(
+            matches!(result, Err(Error::Wire(wire::WireError::Cursor))),
+            "{:?}",
+            result.err()
+        );
+    }
+    // Nothing of it went out: the next thing the viewer gets is the frame.
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(events(&mut viewer, 1).0, "f");
+    assert!(viewer.cursor().is_none());
+    // One that fits is taken.
+    pair.host
+        .set_cursor(&image(16, 16, (15, 15), 16 * 16 * 4))
+        .unwrap();
+    assert_eq!(events(&mut viewer, 1).0, "c");
+}
+
+#[test]
+fn a_viewer_passes_over_a_cursor_that_does_not_add_up_and_kinds_it_does_not_know() {
+    // Something that answers like a host and then sends what no host of this version
+    // would: cursors whose numbers do not fit, and a kind of packet from a later version.
+    let studio = Identity::generate();
+    let air = Identity::generate();
+    let air_peers = TempPeers::trusting(&[("studio", &studio)]);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let odd = std::thread::spawn(move || {
+        let keys = LocalKeys::new(&studio).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut channel = Channel::respond(stream, &keys, |_| true).unwrap();
+        channel.recv().unwrap();
+        let reply = Reply::Stream {
+            version: 1,
+            info: info(),
+        };
+        channel.send(&serde_json::to_vec(&reply).unwrap()).unwrap();
+
+        let mut good = Vec::new();
+        wire::encode_cursor(&Cursor::Named("default"), 0, &mut good).unwrap();
+        let body = |change: &dyn Fn(&mut Vec<u8>)| {
+            let mut packet = good.clone();
+            change(&mut packet);
+            // The header's length of what follows has to be right, or the packet as a
+            // whole is refused before the cursor is looked at.
+            let len = (packet.len() - wire::HEADER_LEN) as u32;
+            packet[32..36].copy_from_slice(&len.to_le_bytes());
+            packet
+        };
+        let at = wire::HEADER_LEN;
+        let packets = [
+            // An image of 300 by 300 that brings no pixels at all.
+            body(&|p| {
+                p[at] = 2;
+                p[at + 4..at + 6].copy_from_slice(&300u16.to_le_bytes());
+                p[at + 6..at + 8].copy_from_slice(&300u16.to_le_bytes());
+                p.truncate(at + 16);
+            }),
+            // An image of 16 by 16 with half its pixels.
+            body(&|p| {
+                p[at] = 2;
+                p[at + 4..at + 6].copy_from_slice(&16u16.to_le_bytes());
+                p[at + 6..at + 8].copy_from_slice(&16u16.to_le_bytes());
+                p[at + 12..at + 14].copy_from_slice(&1u16.to_le_bytes());
+                p.truncate(at + 16);
+                p.extend_from_slice(&[0; 16 * 8 * 4]);
+            }),
+            // An image whose hot spot is outside it.
+            body(&|p| {
+                p[at] = 2;
+                p[at + 4..at + 6].copy_from_slice(&4u16.to_le_bytes());
+                p[at + 6..at + 8].copy_from_slice(&4u16.to_le_bytes());
+                p[at + 8..at + 10].copy_from_slice(&4u16.to_le_bytes());
+                p[at + 12..at + 14].copy_from_slice(&1u16.to_le_bytes());
+                p.truncate(at + 16);
+                p.extend_from_slice(&[0; 4 * 4 * 4]);
+            }),
+            // Cut off inside its fixed part.
+            body(&|p| p.truncate(at + 7)),
+            // A kind of packet this version does not know.
+            body(&|p| p[1] = 9),
+        ];
+        for packet in &packets {
+            channel.send(packet).unwrap();
+        }
+        let mut frame = Vec::new();
+        let header = wire::Header {
+            kind: wire::Kind::Frame,
+            key_frame: true,
+            discontinuity: false,
+            seq: 0,
+            pts_ns: 0,
+            encoded_ns: 0,
+        };
+        wire::encode(&header, b"key", &mut frame);
+        channel.send(&frame).unwrap();
+        channel.send(&good).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let keys = LocalKeys::new(&air).unwrap();
+    let mut viewer = Viewer::connect(addr, &keys, &air_peers.open(), None, SOON).unwrap();
+    // None of the odd ones is handed over, none of them ends the stream, and the
+    // cursor stays what it was: unknown.
+    match viewer.next(SOON).unwrap().unwrap() {
+        Event::Frame(frame) => assert_eq!(frame.data, b"key"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert!(viewer.cursor().is_none());
+    assert_eq!(
+        viewer.next(SOON).unwrap(),
+        Some(Event::Cursor(Cursor::Named("default")))
+    );
+    drop(viewer);
+    odd.join().unwrap();
+}
+
+#[test]
+fn a_cursor_that_changes_all_the_time_does_not_flood_the_connection_or_hold_frames_up() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    // The viewer takes what comes, as a viewer does, and counts: frames, cursors, and
+    // the number written into the last cursor it was told.
+    let done = Arc::new(Mutex::new(None::<u32>));
+    let receiving = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let (mut frames, mut cursors, mut last) = (0usize, 0u32, 0u32);
+            loop {
+                match viewer.next(Duration::from_millis(20)).unwrap() {
+                    Some(Event::Frame(_)) => frames += 1,
+                    Some(Event::Cursor(Cursor::Image(image))) => {
+                        cursors += 1;
+                        let number = u32::from_le_bytes(image.rgba[..4].try_into().unwrap());
+                        // Only ever a newer one.
+                        assert!(number > last, "{number} after {last}");
+                        last = number;
+                    }
+                    Some(Event::Cursor(other)) => panic!("unexpected: {other:?}"),
+                    None => {}
+                }
+                if done.lock().unwrap().is_some_and(|set| set == last) {
+                    return (frames, cursors, last);
+                }
+            }
+        })
+    };
+    // For a second, an application sets a new cursor twenty times for every frame that
+    // goes out.
+    let began = Instant::now();
+    let (mut set, mut frames, mut longest) = (0u32, 1usize, Duration::ZERO);
+    let mut pixels = vec![0u8; 64 * 64 * 4];
+    while began.elapsed() < Duration::from_secs(1) {
+        for _ in 0..20 {
+            set += 1;
+            pixels[..4].copy_from_slice(&set.to_le_bytes());
+            let cursor = Cursor::Image(CursorImage {
+                width: 64,
+                height: 64,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                scale: 1,
+                rgba: &pixels,
+            });
+            pair.host.set_cursor(&cursor).unwrap();
+        }
+        let sending = Instant::now();
+        let sent = pair.host.send_frame(b"delta", 0, 0, false).unwrap();
+        assert_eq!(sent.viewers, 1, "frame {frames}");
+        longest = longest.max(sending.elapsed());
+        frames += 1;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(set >= 400, "only {set} cursors were set");
+    *done.lock().unwrap() = Some(set);
+    // Every frame arrives; the viewer ends with the cursor that was set last; and it was
+    // told the cursor far less often than it was set: at most once in a frame's interval
+    // (85 a second here).
+    let (got_frames, got_cursors, last) = receiving.join().unwrap();
+    assert_eq!(got_frames, frames);
+    assert_eq!(last, set);
+    assert!(got_cursors <= 100, "{got_cursors} cursors in a second");
+    assert!(got_cursors < set / 4, "{got_cursors} of {set}");
+    assert!(longest < Duration::from_millis(100), "{longest:?}");
+}
+
+#[test]
+fn a_viewer_that_takes_nothing_is_not_sent_cursor_after_cursor() {
+    let pair = pair();
+    // Connected, and never reading.
+    let _channel = pair.raw_watching();
+    let pixels = vec![9u8; 256 * 256 * 4];
+    let large = Cursor::Image(CursorImage {
+        width: 256,
+        height: 256,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        scale: 1,
+        rgba: &pixels,
+    });
+    // As large as a cursor may be, again and again: once the connection is full, the
+    // viewer has the one deadline every packet has, and is cut off.
+    let began = Instant::now();
+    while pair.host.viewers() > 0 {
+        assert!(began.elapsed() < Duration::from_secs(20), "still a viewer");
+        let setting = Instant::now();
+        pair.host.set_cursor(&large).unwrap();
+        assert!(setting.elapsed() < Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    pair.until(|| pair.said("stopped showing the picture to air"));
+}
+
+#[test]
+fn a_frame_does_not_wait_for_a_viewer_whose_own_thread_holds_its_connection() {
+    let pair = pair();
+    let book = pair.another_device("book");
+    let good = receive(pair.connect_as(&book).unwrap());
+    pair.until(|| pair.host.viewers() == 1);
+    let held = receive(pair.connect().unwrap());
+    pair.until(|| pair.host.viewers() == 2);
+    assert!(pair.host.key_frame_wanted());
+
+    // A frame every five milliseconds, each a key frame so that both can take every one.
+    // After a while the thread of one viewer takes that viewer's connection for fifty
+    // milliseconds without having said that it would be long, which no code does.
+    let began = Instant::now();
+    let (mut longest, mut frames, mut missed, mut asked) = (Duration::ZERO, 0, 0, false);
+    let mut handed = Vec::new();
+    while began.elapsed() < Duration::from_millis(400) {
+        if !asked && began.elapsed() >= Duration::from_millis(100) {
+            pair.host.hold_the_line_of("air", Duration::from_millis(50));
+            asked = true;
+        }
+        let sending = Instant::now();
+        handed.push(sending);
+        let sent = pair.host.send_frame(b"key", 0, 0, true).unwrap();
+        longest = longest.max(sending.elapsed());
+        frames += 1;
+        missed += usize::from(sent.viewers < 2);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // No frame waited for the connection that was held: each gave it a fraction of a
+    // millisecond and went on.
+    assert!(longest < Duration::from_millis(20), "{longest:?}");
+    // The viewer whose connection was held missed frames meanwhile, and only that one.
+    assert!(missed >= 2, "{missed} frames went past the held viewer");
+    pair.until(|| good.count() == frames);
+    pair.until(|| held.count() == frames - missed);
+    // The other viewer got its frames as far apart as they were handed over (this
+    // test's own pauses, which a busy machine stretches), and no further.
+    let widest = |times: &[Instant]| {
+        times
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap()
+    };
+    let (arrived, sent) = (widest(&good.finish()), widest(&handed));
+    assert!(
+        arrived < sent + Duration::from_millis(20),
+        "{arrived:?} apart, handed over {sent:?} apart"
+    );
+    // Having missed frames, it began again with a key frame, which the host asked for.
+    assert!(pair.host.key_frame_wanted());
+    held.finish();
+}
+
+#[test]
+fn a_viewer_that_lost_its_right_is_not_told_the_cursor_either() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    let cursor = |pixels: &[u8]| -> Result<(), Error> {
+        pair.host.set_cursor(&Cursor::Image(CursorImage {
+            width: 16,
+            height: 16,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            scale: 1,
+            rgba: pixels,
+        }))
+    };
+    cursor(&pixels).unwrap();
+    assert_eq!(events(&mut viewer, 1).0, "c");
+
+    // The thread that looks the viewers up is stuck, and the right is taken away. The
+    // application goes on changing its cursor; no frame goes out.
+    pair.host.pause_recheck(true);
+    pair.studio_peers.allow("air", &[Permission::Control]);
+    let taken = Instant::now();
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let receiving = {
+        let told = told.clone();
+        std::thread::spawn(move || loop {
+            match viewer.next(Duration::from_millis(50)) {
+                Ok(Some(Event::Cursor(_))) => told.lock().unwrap().push(Instant::now()),
+                Ok(_) if Arc::strong_count(&told) == 1 => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        })
+    };
+    let mut number = 0u32;
+    while taken.elapsed() < Duration::from_millis(2500) {
+        number += 1;
+        pixels[..4].copy_from_slice(&number.to_le_bytes());
+        cursor(&pixels).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let times = told.lock().unwrap().clone();
+    drop(told);
+    receiving.join().unwrap();
+    // It was told for as long as its last look-up was good for, and not after.
+    let last = times
+        .last()
+        .expect("never told")
+        .saturating_duration_since(taken);
+    assert!(last > Duration::from_millis(300), "{last:?}");
+    assert!(last < Duration::from_millis(1100), "{last:?}");
+}
+
+#[test]
+fn nobody_is_told_the_cursor_while_the_list_of_paired_devices_cannot_be_read() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    pair.host.set_cursor(&Cursor::Named("before")).unwrap();
+    assert_eq!(events(&mut viewer, 1).1[0], b"before");
+
+    std::fs::write(pair.studio_peers.path(), "{ not a list").unwrap();
+    pair.until(|| pair.host.viewers() == 0);
+    // The cursor changes; there is nobody it may be told to, and nobody gets in.
+    pair.host.set_cursor(&Cursor::Named("after")).unwrap();
+    assert!(pair.connect().is_err());
+    let over = loop {
+        match viewer.next(SOON) {
+            Ok(Some(Event::Cursor(cursor))) => assert_ne!(cursor, Cursor::Named("after")),
+            Ok(Some(Event::Frame(_))) => panic!("a frame"),
+            Ok(None) => panic!("the viewer was left waiting"),
+            Err(err) => break err,
+        }
+    };
+    assert!(matches!(over, Error::Link(LinkError::Closed)), "{over}");
 }

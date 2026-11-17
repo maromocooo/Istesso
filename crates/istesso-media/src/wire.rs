@@ -8,7 +8,7 @@
 //! ```text
 //!   offset  bytes  content
 //!   0       1      version of this layout (1)
-//!   1       1      kind: 1 frame, 2 nothing to show at the moment, 3 end
+//!   1       1      kind: 1 frame, 2 nothing to show at the moment, 3 end, 4 the cursor
 //!   2       2      length of the header (40 in this version)
 //!   4       4      flags: bit 0, a key frame; bit 1, does not follow on from
 //!                  the frame sent before it on this connection
@@ -19,6 +19,31 @@
 //!   36      4      reserved, 0
 //!   40      n      the encoded frame
 //! ```
+//!
+//! A packet of kind 4 says what the pointer's cursor looks like, so that the viewer can draw
+//! it itself where its own pointer is (ADR 0015, "カーソル"). In place of the encoded frame it
+//! carries:
+//!
+//! ```text
+//!   offset  bytes  content
+//!   0       1      shape: 0 hidden, 1 a cursor there is no image of, 2 an image
+//!   1       1      reserved, 0
+//!   2       2      length of this fixed part (16 in this version)
+//!   4       2      width of the image in pixels (0 unless an image)
+//!   6       2      height
+//!   8       2      hot spot, x: the pixel of the image that lies on the pointer's position
+//!   10      2      hot spot, y
+//!   12      2      scale: pixels of the image to one pixel of the picture
+//!   14      2      length of the name in bytes (shape 1 only)
+//!   16      n      the name (UTF-8), or the pixels: four bytes each, red, green, blue,
+//!                  alpha, the colours multiplied by alpha, rows from the top
+//! ```
+//!
+//! The image comes from whatever application runs on the host. Neither end takes its numbers
+//! on trust: a cursor is only written, and only read, when its sides are between 1 and 256
+//! pixels, its hot spot lies inside it, and what follows the fixed part is exactly as long as
+//! the numbers say. A viewer that does not know kind 4 passes the packet over, like any kind
+//! it does not know.
 //!
 //! All numbers are little-endian. A reader goes by the length of the header
 //! that the packet states and skips what lies between the fields it knows and
@@ -39,6 +64,14 @@ pub const HEADER_LEN: usize = 40;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Largest message a viewer may send once it has been answered.
 pub const MAX_ASK_BYTES: usize = 1024;
+/// Most pixels a cursor's image may have along one side.
+pub const MAX_CURSOR_SIDE: u16 = 256;
+/// Most pixels of a cursor's image to one pixel of the picture.
+pub const MAX_CURSOR_SCALE: u16 = 8;
+/// Longest name of a cursor there is no image of, in bytes.
+pub const MAX_CURSOR_NAME: usize = 64;
+/// Bytes in front of a cursor's name or pixels, as this version writes them.
+pub const CURSOR_FIXED_LEN: usize = 16;
 
 const FLAG_KEY_FRAME: u32 = 1;
 const FLAG_DISCONTINUITY: u32 = 2;
@@ -139,6 +172,59 @@ pub enum Kind {
     Idle,
     /// The host stops sending on this connection.
     End,
+    /// What the pointer's cursor looks like from now on ([`Cursor`]).
+    Cursor,
+}
+
+/// What the pointer's cursor looks like on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cursor<'a> {
+    /// The application under the pointer has hidden it: nothing is drawn.
+    Hidden,
+    /// A cursor the host has no image of. The viewer shows a cursor of its own.
+    Named(&'a str),
+    Image(CursorImage<'a>),
+}
+
+/// A cursor's image, as an application on the host drew it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorImage<'a> {
+    pub width: u16,
+    pub height: u16,
+    /// The pixel of the image that lies on the pointer's position.
+    pub hotspot_x: u16,
+    pub hotspot_y: u16,
+    /// Pixels of the image to one pixel of the picture.
+    pub scale: u16,
+    /// Four bytes a pixel: red, green, blue, alpha, the colours multiplied by alpha.
+    pub rgba: &'a [u8],
+}
+
+impl Cursor<'_> {
+    /// Whether the cursor is one that may travel: an image no larger than the limit, with
+    /// its hot spot inside it and exactly as many bytes as its size says; a name of a
+    /// reasonable length.
+    pub fn check(&self) -> Result<(), WireError> {
+        match self {
+            Cursor::Hidden => Ok(()),
+            Cursor::Named(name) if name.len() <= MAX_CURSOR_NAME => Ok(()),
+            Cursor::Named(_) => Err(WireError::Cursor),
+            Cursor::Image(image) => {
+                let sides = 1..=MAX_CURSOR_SIDE;
+                let fits = sides.contains(&image.width)
+                    && sides.contains(&image.height)
+                    && image.hotspot_x < image.width
+                    && image.hotspot_y < image.height
+                    && (1..=MAX_CURSOR_SCALE).contains(&image.scale)
+                    && image.rgba.len() == usize::from(image.width) * usize::from(image.height) * 4;
+                if fits {
+                    Ok(())
+                } else {
+                    Err(WireError::Cursor)
+                }
+            }
+        }
+    }
 }
 
 /// The fixed part of every packet.
@@ -181,6 +267,11 @@ pub enum WireError {
     Kind(u8),
     #[error("the packet's lengths do not add up, or its frame is too large")]
     Length,
+    #[error(
+        "the cursor is not one that may travel: too large, of no size, its hot spot outside \
+         it, or not as long as its size says"
+    )]
+    Cursor,
 }
 
 /// Writes one packet into `out`, replacing what was there.
@@ -192,6 +283,7 @@ pub fn encode(header: &Header, frame: &[u8], out: &mut Vec<u8>) {
         Kind::Frame => 1,
         Kind::Idle => 2,
         Kind::End => 3,
+        Kind::Cursor => 4,
     });
     out.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
     out.extend_from_slice(&flags(header).to_le_bytes());
@@ -258,6 +350,7 @@ pub fn decode(packet: &[u8]) -> Result<(Header, std::ops::Range<usize>), WireErr
         1 => Kind::Frame,
         2 => Kind::Idle,
         3 => Kind::End,
+        4 => Kind::Cursor,
         other => return Err(WireError::Kind(other)),
     };
     let flags = quad(4);
@@ -270,6 +363,70 @@ pub fn decode(packet: &[u8]) -> Result<(Header, std::ops::Range<usize>), WireErr
         encoded_ns: u64::from_le_bytes(word(24)),
     };
     Ok((header, header_len..packet.len()))
+}
+
+/// Writes one packet that says what the cursor is into `out`, replacing what was there. A
+/// cursor that may not travel ([`Cursor::check`]) is not written.
+pub fn encode_cursor(cursor: &Cursor, seq: u64, out: &mut Vec<u8>) -> Result<(), WireError> {
+    cursor.check()?;
+    let mut body = Vec::with_capacity(CURSOR_FIXED_LEN);
+    let (shape, image, name): (u8, Option<&CursorImage>, &str) = match cursor {
+        Cursor::Hidden => (0, None, ""),
+        Cursor::Named(name) => (1, None, name),
+        Cursor::Image(image) => (2, Some(image), ""),
+    };
+    body.push(shape);
+    body.push(0);
+    body.extend_from_slice(&(CURSOR_FIXED_LEN as u16).to_le_bytes());
+    for number in [
+        image.map_or(0, |image| image.width),
+        image.map_or(0, |image| image.height),
+        image.map_or(0, |image| image.hotspot_x),
+        image.map_or(0, |image| image.hotspot_y),
+        image.map_or(0, |image| image.scale),
+        name.len() as u16,
+    ] {
+        body.extend_from_slice(&number.to_le_bytes());
+    }
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(image.map_or(&[][..], |image| image.rgba));
+    encode(&Header::without_frame(Kind::Cursor, seq), &body, out);
+    Ok(())
+}
+
+/// Reads what a packet of kind [`Kind::Cursor`] carries in place of a frame. Nothing is
+/// taken from the numbers in it before they have been checked against its real length and
+/// against the limits, and nothing is copied: the result points into `body`.
+pub fn decode_cursor(body: &[u8]) -> Result<Cursor<'_>, WireError> {
+    if body.len() < CURSOR_FIXED_LEN {
+        return Err(WireError::Cursor);
+    }
+    let number = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
+    let fixed = usize::from(number(2));
+    if fixed < CURSOR_FIXED_LEN || fixed > body.len() {
+        return Err(WireError::Cursor);
+    }
+    // Fields a later version adds lie between the fixed part this version knows and the
+    // name or the pixels, and are passed over.
+    let rest = &body[fixed..];
+    let name_len = usize::from(number(14));
+    let cursor = match body[0] {
+        0 if rest.is_empty() => Cursor::Hidden,
+        1 if rest.len() == name_len => {
+            Cursor::Named(std::str::from_utf8(rest).map_err(|_| WireError::Cursor)?)
+        }
+        2 => Cursor::Image(CursorImage {
+            width: number(4),
+            height: number(6),
+            hotspot_x: number(8),
+            hotspot_y: number(10),
+            scale: number(12),
+            rgba: rest,
+        }),
+        _ => return Err(WireError::Cursor),
+    };
+    cursor.check()?;
+    Ok(cursor)
 }
 
 /// How many messages of the encrypted channel a frame of `frame_len` bytes
@@ -428,6 +585,206 @@ mod tests {
         // A request of a kind this version does not know is not one of ours.
         assert!(serde_json::from_str::<Ask>(r#"{"type":"teleport"}"#).is_err());
         assert!(serde_json::from_str::<Ask>(r#"{"type":"key_frame","why":"x"}"#).is_ok());
+    }
+
+    fn arrow() -> Vec<u8> {
+        (0..24 * 16 * 4).map(|i| (i % 249) as u8).collect()
+    }
+
+    fn image(rgba: &[u8]) -> CursorImage<'_> {
+        CursorImage {
+            width: 24,
+            height: 16,
+            hotspot_x: 3,
+            hotspot_y: 5,
+            scale: 1,
+            rgba,
+        }
+    }
+
+    /// What a cursor's packet carries in place of a frame.
+    fn cursor_body(cursor: &Cursor) -> Vec<u8> {
+        let mut packet = Vec::new();
+        encode_cursor(cursor, 9, &mut packet).unwrap();
+        let (header, at) = decode(&packet).unwrap();
+        assert_eq!((header.kind, header.seq), (Kind::Cursor, 9));
+        packet[at].to_vec()
+    }
+
+    #[test]
+    fn a_cursor_comes_back_as_it_was_written() {
+        let pixels = arrow();
+        for cursor in [
+            Cursor::Hidden,
+            Cursor::Named("default"),
+            Cursor::Named(""),
+            Cursor::Image(image(&pixels)),
+            Cursor::Image(CursorImage {
+                width: 256,
+                height: 256,
+                hotspot_x: 255,
+                hotspot_y: 255,
+                scale: 8,
+                rgba: &vec![7u8; 256 * 256 * 4],
+            }),
+        ] {
+            let body = cursor_body(&cursor);
+            assert_eq!(decode_cursor(&body).unwrap(), cursor);
+        }
+        assert_eq!(
+            cursor_body(&Cursor::Image(image(&pixels))).len(),
+            16 + 24 * 16 * 4
+        );
+    }
+
+    #[test]
+    fn a_cursor_that_is_too_large_or_of_no_size_is_neither_written_nor_read() {
+        let pixels = vec![0u8; 257 * 257 * 4];
+        for (width, height) in [
+            (257u16, 16u16),
+            (16, 257),
+            (0, 16),
+            (16, 0),
+            (0, 0),
+            (u16::MAX, 1),
+        ] {
+            let odd = Cursor::Image(CursorImage {
+                width,
+                height,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                scale: 1,
+                rgba: &pixels[..usize::from(width) * usize::from(height) * 4 % (pixels.len() + 1)],
+            });
+            assert_eq!(
+                encode_cursor(&odd, 0, &mut Vec::new()),
+                Err(WireError::Cursor)
+            );
+            // The same numbers in a packet that somebody else wrote.
+            let mut body = cursor_body(&Cursor::Image(image(&arrow())));
+            body[4..6].copy_from_slice(&width.to_le_bytes());
+            body[6..8].copy_from_slice(&height.to_le_bytes());
+            body.truncate(16);
+            body.resize(
+                16 + usize::from(width) * usize::from(height) * 4 % (1 << 20),
+                0,
+            );
+            assert_eq!(
+                decode_cursor(&body),
+                Err(WireError::Cursor),
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_whose_length_does_not_fit_its_size_is_neither_written_nor_read() {
+        let pixels = arrow();
+        for len in [pixels.len() - 1, pixels.len() - 4, 0] {
+            let short = Cursor::Image(image(&pixels[..len]));
+            assert_eq!(
+                encode_cursor(&short, 0, &mut Vec::new()),
+                Err(WireError::Cursor)
+            );
+        }
+        let body = cursor_body(&Cursor::Image(image(&pixels)));
+        assert_eq!(
+            decode_cursor(&body[..body.len() - 1]),
+            Err(WireError::Cursor)
+        );
+        let mut longer = body.clone();
+        longer.push(0);
+        assert_eq!(decode_cursor(&longer), Err(WireError::Cursor));
+        // Sides that claim more than is there: nothing is read beyond the body.
+        let mut wider = body.clone();
+        wider[4..6].copy_from_slice(&25u16.to_le_bytes());
+        assert_eq!(decode_cursor(&wider), Err(WireError::Cursor));
+        // Cut off inside the fixed part, and a fixed part that claims to be longer than the body.
+        assert_eq!(decode_cursor(&body[..15]), Err(WireError::Cursor));
+        assert_eq!(decode_cursor(&[]), Err(WireError::Cursor));
+        let mut claims = body.clone();
+        claims[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(decode_cursor(&claims), Err(WireError::Cursor));
+        let mut claims = body;
+        claims[2..4].copy_from_slice(&15u16.to_le_bytes());
+        assert_eq!(decode_cursor(&claims), Err(WireError::Cursor));
+    }
+
+    #[test]
+    fn a_cursor_with_its_hot_spot_outside_or_a_strange_scale_is_neither_written_nor_read() {
+        let pixels = arrow();
+        for (x, y, scale) in [
+            (24u16, 0u16, 1u16),
+            (0, 16, 1),
+            (u16::MAX, 0, 1),
+            (0, 0, 0),
+            (0, 0, 9),
+        ] {
+            let odd = Cursor::Image(CursorImage {
+                hotspot_x: x,
+                hotspot_y: y,
+                scale,
+                ..image(&pixels)
+            });
+            assert_eq!(
+                encode_cursor(&odd, 0, &mut Vec::new()),
+                Err(WireError::Cursor)
+            );
+            let mut body = cursor_body(&Cursor::Image(image(&pixels)));
+            body[8..10].copy_from_slice(&x.to_le_bytes());
+            body[10..12].copy_from_slice(&y.to_le_bytes());
+            body[12..14].copy_from_slice(&scale.to_le_bytes());
+            assert_eq!(
+                decode_cursor(&body),
+                Err(WireError::Cursor),
+                "{x},{y} x{scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_cursors_that_do_not_add_up_are_not_read() {
+        // A shape this version does not know.
+        let mut body = cursor_body(&Cursor::Hidden);
+        body[0] = 3;
+        assert_eq!(decode_cursor(&body), Err(WireError::Cursor));
+        // A hidden cursor that brings something along.
+        let mut body = cursor_body(&Cursor::Hidden);
+        body.push(1);
+        assert_eq!(decode_cursor(&body), Err(WireError::Cursor));
+        // A name that is longer or shorter than it says, is too long, or is no text.
+        let named = cursor_body(&Cursor::Named("text"));
+        assert_eq!(
+            decode_cursor(&named[..named.len() - 1]),
+            Err(WireError::Cursor)
+        );
+        let mut no_text = named.clone();
+        no_text[16] = 0xff;
+        assert_eq!(decode_cursor(&no_text), Err(WireError::Cursor));
+        let long = "x".repeat(MAX_CURSOR_NAME + 1);
+        assert_eq!(
+            encode_cursor(&Cursor::Named(&long), 0, &mut Vec::new()),
+            Err(WireError::Cursor)
+        );
+        let mut body = named;
+        body[14..16].copy_from_slice(&((MAX_CURSOR_NAME + 1) as u16).to_le_bytes());
+        body.truncate(16);
+        body.extend_from_slice(long.as_bytes());
+        assert_eq!(decode_cursor(&body), Err(WireError::Cursor));
+    }
+
+    #[test]
+    fn fields_a_later_version_adds_to_a_cursor_are_passed_over() {
+        let pixels = arrow();
+        let body = cursor_body(&Cursor::Image(image(&pixels)));
+        let mut longer = body[..16].to_vec();
+        longer[2..4].copy_from_slice(&20u16.to_le_bytes());
+        longer.extend_from_slice(&[0xee; 4]);
+        longer.extend_from_slice(&body[16..]);
+        assert_eq!(
+            decode_cursor(&longer).unwrap(),
+            Cursor::Image(image(&pixels))
+        );
     }
 
     #[test]

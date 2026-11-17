@@ -21,8 +21,8 @@ use istesso_agent::Paths;
 use istesso_link::LocalKeys;
 use istesso_pair::{Identity, PeerStore};
 
-use crate::wire::{Chroma, Codec, Colour, StreamInfo};
-use crate::{clock, realtime, Asker, Error, Host, Result, Viewer};
+use crate::wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, WireError};
+use crate::{clock, realtime, Asker, Error, Event, Host, Result, Viewer};
 
 /// What a host tells its viewers about the picture.
 #[repr(C)]
@@ -113,6 +113,25 @@ pub struct IstessoMediaFrame {
     pub reserved: u32,
 }
 
+/// What the pointer's cursor looks like on the host.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IstessoMediaCursor {
+    /// 0: hidden. 1: a cursor there is no image of. 2: an image.
+    pub shape: u32,
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: u32,
+    pub hotspot_y: u32,
+    pub scale: u32,
+    /// The image: four bytes a pixel, red, green, blue, alpha, the colours multiplied by
+    /// alpha. Null unless `shape` is 2.
+    pub pixels: *const u8,
+    pub pixels_len: usize,
+    /// The cursor's name when `shape` is 1, a C string. May be null.
+    pub name: *const c_char,
+}
+
 pub struct IstessoMediaHost {
     host: Host,
 }
@@ -123,6 +142,8 @@ pub struct IstessoMediaClient {
     viewer: Mutex<Viewer>,
     asker: Asker,
     info: StreamInfo,
+    /// The name of the cursor handed out last, as a C string.
+    cursor_name: Mutex<CString>,
 }
 
 thread_local! {
@@ -299,6 +320,60 @@ pub unsafe extern "C" fn istesso_media_host_send(
 }
 
 /// # Safety
+/// `host` as above; `cursor` points to a cursor whose `pixels` point to `pixels_len`
+/// bytes and whose `name` is null or a C string.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_set_cursor(
+    host: *const IstessoMediaHost,
+    cursor: *const IstessoMediaCursor,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let (Some(host), Some(cursor)) = (unsafe { host.as_ref() }, unsafe { cursor.as_ref() }) else {
+        remember("no host, or no cursor, was given");
+        return -1;
+    };
+    // SAFETY: a C string or null by the caller's promise.
+    let name = match unsafe { text(cursor.name) } {
+        Ok(name) => name.unwrap_or_default(),
+        Err(err) => {
+            remember(err);
+            return -1;
+        }
+    };
+    let pixels: &[u8] = if cursor.pixels.is_null() || cursor.pixels_len == 0 {
+        &[]
+    } else {
+        // SAFETY: `pixels` points to `pixels_len` bytes by the caller's promise.
+        unsafe { std::slice::from_raw_parts(cursor.pixels, cursor.pixels_len) }
+    };
+    // Numbers that do not fit the wire's sixteen bits are too large for any cursor.
+    let small = |number: u32| u16::try_from(number).map_err(|_| Error::Wire(WireError::Cursor));
+    let result = (|| {
+        let now = match cursor.shape {
+            0 => Cursor::Hidden,
+            1 => Cursor::Named(&name),
+            2 => Cursor::Image(CursorImage {
+                width: small(cursor.width)?,
+                height: small(cursor.height)?,
+                hotspot_x: small(cursor.hotspot_x)?,
+                hotspot_y: small(cursor.hotspot_y)?,
+                scale: small(cursor.scale)?,
+                rgba: pixels,
+            }),
+            _ => return Err(Error::Wire(WireError::Cursor)),
+        };
+        host.host.set_cursor(&now)
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            remember(err);
+            -1
+        }
+    }
+}
+
+/// # Safety
 /// `host` as above.
 #[no_mangle]
 pub unsafe extern "C" fn istesso_media_host_key_frame_wanted(host: *const IstessoMediaHost) -> i32 {
@@ -346,6 +421,7 @@ pub unsafe extern "C" fn istesso_media_client_connect(
             asker: viewer.asker(),
             info: *viewer.info(),
             viewer: Mutex::new(viewer),
+            cursor_name: Mutex::new(CString::default()),
         })),
         Err(err) => {
             remember(err);
@@ -386,8 +462,10 @@ pub unsafe extern "C" fn istesso_media_client_next(
         return -1;
     };
     let mut viewer = client.viewer.lock().unwrap_or_else(|e| e.into_inner());
-    match viewer.next_frame(Duration::from_millis(wait_ms.into())) {
-        Ok(Some(got)) => {
+    match viewer.next(Duration::from_millis(wait_ms.into())) {
+        // What the cursor is now is fetched with `istesso_media_client_cursor`.
+        Ok(Some(Event::Cursor(_))) => 2,
+        Ok(Some(Event::Frame(got))) => {
             // SAFETY: not null, and room for the result by the caller's
             // promise. The bytes belong to the viewer, which lives until
             // the client is closed and keeps them until its next frame.
@@ -414,6 +492,60 @@ pub unsafe extern "C" fn istesso_media_client_next(
             -1
         }
     }
+}
+
+/// # Safety
+/// `client` as above; `cursor` points to room for the result. What its pointers point to
+/// stays valid until the next call with this client.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_client_cursor(
+    client: *const IstessoMediaClient,
+    cursor: *mut IstessoMediaCursor,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let (Some(client), false) = (unsafe { client.as_ref() }, cursor.is_null()) else {
+        return -1;
+    };
+    let viewer = client.viewer.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(now) = viewer.cursor() else {
+        return 0;
+    };
+    let mut out = IstessoMediaCursor {
+        shape: 0,
+        width: 0,
+        height: 0,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        scale: 0,
+        pixels: std::ptr::null(),
+        pixels_len: 0,
+        name: std::ptr::null(),
+    };
+    match now {
+        Cursor::Hidden => {}
+        Cursor::Named(name) => {
+            let mut kept = client.cursor_name.lock().unwrap_or_else(|e| e.into_inner());
+            *kept = CString::new(name.replace('\0', " ")).unwrap_or_default();
+            out.shape = 1;
+            // The string lives in the client, which outlives this call.
+            out.name = kept.as_ptr();
+        }
+        Cursor::Image(image) => {
+            out.shape = 2;
+            out.width = image.width.into();
+            out.height = image.height.into();
+            out.hotspot_x = image.hotspot_x.into();
+            out.hotspot_y = image.hotspot_y.into();
+            out.scale = image.scale.into();
+            // The bytes belong to the viewer, which keeps them until the host says
+            // that the cursor has changed.
+            out.pixels = image.rgba.as_ptr();
+            out.pixels_len = image.rgba.len();
+        }
+    }
+    // SAFETY: not null, and room for the result by the caller's promise.
+    unsafe { *cursor = out };
+    1
 }
 
 /// # Safety
@@ -542,6 +674,126 @@ mod tests {
         assert_eq!(std::mem::size_of::<IstessoMediaFrame>(), 72);
         assert_eq!(std::mem::offset_of!(IstessoMediaFrame, first_ns), 40);
         assert_eq!(std::mem::offset_of!(IstessoMediaFrame, key_frame), 56);
+        assert_eq!(std::mem::size_of::<IstessoMediaCursor>(), 48);
+        assert_eq!(std::mem::offset_of!(IstessoMediaCursor, pixels), 24);
+    }
+
+    #[test]
+    fn a_cursor_travels_through_the_c_interface_and_one_that_may_not_is_refused() {
+        let dirs = Dirs::new("cursor");
+        let bind = CString::new("127.0.0.1:0").unwrap();
+        let pixels: Vec<u8> = (0..32 * 32 * 4u32).map(|i| (i % 241) as u8).collect();
+        let arrow = IstessoMediaCursor {
+            shape: 2,
+            width: 32,
+            height: 32,
+            hotspot_x: 4,
+            hotspot_y: 6,
+            scale: 2,
+            pixels: pixels.as_ptr(),
+            pixels_len: pixels.len(),
+            name: std::ptr::null(),
+        };
+        // SAFETY: C strings, a description and cursors that outlive the calls; the
+        // handles are closed once, at the end.
+        unsafe {
+            let host = istesso_media_host_listen(c(&dirs.host()).as_ptr(), bind.as_ptr(), &INFO);
+            assert!(!host.is_null(), "{}", last_error());
+            // Refused, each of them, and said why.
+            for odd in [
+                IstessoMediaCursor {
+                    width: 257,
+                    ..arrow
+                },
+                IstessoMediaCursor { height: 0, ..arrow },
+                IstessoMediaCursor {
+                    width: 70_000,
+                    ..arrow
+                },
+                IstessoMediaCursor {
+                    pixels_len: pixels.len() - 4,
+                    ..arrow
+                },
+                IstessoMediaCursor {
+                    hotspot_x: 32,
+                    ..arrow
+                },
+                IstessoMediaCursor { scale: 0, ..arrow },
+                IstessoMediaCursor { shape: 7, ..arrow },
+            ] {
+                assert_eq!(istesso_media_host_set_cursor(host, &odd), -1);
+                assert!(last_error().contains("may travel"), "{}", last_error());
+            }
+            assert_eq!(
+                istesso_media_host_set_cursor(host, &arrow),
+                0,
+                "{}",
+                last_error()
+            );
+
+            let addr =
+                CString::new(format!("127.0.0.1:{}", istesso_media_host_port(host))).unwrap();
+            let client = istesso_media_client_connect(
+                c(&dirs.device()).as_ptr(),
+                addr.as_ptr(),
+                std::ptr::null(),
+                5000,
+            );
+            assert!(!client.is_null(), "{}", last_error());
+            let mut got = std::mem::zeroed::<IstessoMediaCursor>();
+            // Nothing is known about the cursor until the host has said so.
+            assert_eq!(istesso_media_client_cursor(client, &mut got), 0);
+            let mut frame = std::mem::zeroed::<IstessoMediaFrame>();
+            assert_eq!(istesso_media_client_next(client, 5000, &mut frame), 2);
+            assert_eq!(istesso_media_client_cursor(client, &mut got), 1);
+            assert_eq!(
+                (
+                    got.shape,
+                    got.width,
+                    got.height,
+                    got.hotspot_x,
+                    got.hotspot_y,
+                    got.scale
+                ),
+                (2, 32, 32, 4, 6, 2)
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(got.pixels, got.pixels_len),
+                &pixels[..]
+            );
+
+            std::thread::sleep(Duration::from_millis(30));
+            let name = CString::new("text").unwrap();
+            let named = IstessoMediaCursor {
+                shape: 1,
+                name: name.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            assert_eq!(
+                istesso_media_host_set_cursor(host, &named),
+                0,
+                "{}",
+                last_error()
+            );
+            assert_eq!(istesso_media_client_next(client, 5000, &mut frame), 2);
+            assert_eq!(istesso_media_client_cursor(client, &mut got), 1);
+            assert_eq!(got.shape, 1);
+            assert_eq!(CStr::from_ptr(got.name).to_str().unwrap(), "text");
+            assert!(got.pixels.is_null());
+
+            std::thread::sleep(Duration::from_millis(30));
+            let hidden = IstessoMediaCursor {
+                shape: 0,
+                ..std::mem::zeroed()
+            };
+            assert_eq!(istesso_media_host_set_cursor(host, &hidden), 0);
+            assert_eq!(istesso_media_client_next(client, 5000, &mut frame), 2);
+            assert_eq!(istesso_media_client_cursor(client, &mut got), 1);
+            assert_eq!(got.shape, 0);
+
+            istesso_media_client_close(client);
+            istesso_media_host_close(host);
+        }
     }
 
     #[test]
