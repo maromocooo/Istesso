@@ -626,6 +626,66 @@ static void picture_is_over(int32_t why) {
     log_held_back(YES);
 }
 
+#ifdef ISTESSO_CHECKS
+// ---- For looking, without a person at the keyboard ----
+//
+// Only in an executable built for a check (-DISTESSO_CHECKS=1): neither the application nor the
+// measuring build is built with it. A key press cannot be put into another program's window
+// without the system's permission to control the computer, and a check must not ask for it. So
+// here the application presses for itself: it makes the event a key press is and hands it to
+// its own view's key handler, the one the window server would call. Whatever the handler
+// passes on goes the usual way. And it can show its own menu inside its window.
+static double check_press_when_cut_ms = -1, check_menu_at_s = -1;
+static double check_press_at_s[8];
+static int check_presses = 0;
+
+// The A key goes down in the window and comes up 40 ms later.
+static void check_press(void) {
+    NSView *view = cursor_view;
+    if (view == nil || ![view respondsToSelector:@selector(holdBack)]) {
+        return;
+    }
+    NSEvent * (^key)(NSEventType) = ^NSEvent *(NSEventType type) {
+        return [NSEvent keyEventWithType:type
+                                location:NSZeroPoint
+                           modifierFlags:0
+                               timestamp:NSProcessInfo.processInfo.systemUptime
+                            windowNumber:view.window.windowNumber
+                                 context:nil
+                              characters:@"a"
+             charactersIgnoringModifiers:@"a"
+                               isARepeat:NO
+                                 keyCode:0];
+    };
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"check\",\"t_ns\":%llu,\"event\":\"press\",\"line_up\":%d,\"input_away\":%d,\"view_only\":%d}\n",
+                (unsigned long long)now_ns(), picture_stale ? 1 : 0, input_away ? 1 : 0, view_only ? 1 : 0);
+    }
+    [view keyDown:key(NSEventTypeKeyDown)];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        [view keyUp:key(NSEventTypeKeyUp)];
+    });
+}
+
+// The application's own menu, opened inside the window for a second and a half.
+static void check_show_menu(void) {
+    NSMenu *menu = NSApp.mainMenu.itemArray.firstObject.submenu;
+    NSView *view = cursor_view;
+    if (menu == nil || view == nil) {
+        return;
+    }
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"check\",\"t_ns\":%llu,\"event\":\"menu\",\"items\":%ld,\"first\":\"%s\",\"shortcut\":\"%s\"}\n",
+                (unsigned long long)now_ns(), (long)menu.numberOfItems, menu.itemArray.firstObject.title.UTF8String,
+                menu.itemArray.firstObject.keyEquivalent.UTF8String);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [menu cancelTracking];
+    });
+    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(20, view.bounds.size.height - 20) inView:view];
+}
+#endif
+
 // The input's conversation is not there: it was cut, or it has not been open yet and the host
 // is asked again. The picture may well be running; what is typed does not arrive.
 static void input_went_away(uint64_t t) {
@@ -635,6 +695,17 @@ static void input_went_away(uint64_t t) {
     input_away = YES;
     away_noticed_ns = t;
     unsigned long generation = ++away_generation;
+#ifdef ISTESSO_CHECKS
+    if (check_press_when_cut_ms >= 0 && input_was_open) {
+        // A key is pressed this long after the input's conversation was cut: before the half
+        // second is over, the line must come up for it at once.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(check_press_when_cut_ms * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            if (input_away && generation == away_generation) {
+                check_press();
+            }
+        });
+    }
+#endif
     if (picture_stale) {
         return;  // The line is up for the picture: it stays until both are back.
     }
@@ -1776,6 +1847,14 @@ int main(int argc, char *argv[]) {
 #endif
             } else if (strcmp(name, "--command-key") == 0) {
                 command_is_control = strcmp(value, "super") != 0;
+#ifdef ISTESSO_CHECKS
+            } else if (strcmp(name, "--check-press-when-cut") == 0) {
+                check_press_when_cut_ms = atof(value);
+            } else if (strcmp(name, "--check-press-at") == 0 && check_presses < 8) {
+                check_press_at_s[check_presses++] = atof(value);
+            } else if (strcmp(name, "--check-menu-at") == 0) {
+                check_menu_at_s = atof(value);
+#endif
             } else if (strcmp(name, "--check-cursor-at") == 0) {
                 double pin_x = 0, pin_y = 0;
                 if (sscanf(value, "%lf,%lf", &pin_x, &pin_y) != 2) {
@@ -1954,6 +2033,26 @@ int main(int argc, char *argv[]) {
             // brings the mark up at once and is not passed on.
             input_went_away(now_ns());
         }
+#ifdef ISTESSO_CHECKS
+        // A press whenever the check's script says so (SIGUSR1).
+        signal(SIGUSR1, SIG_IGN);
+        static dispatch_source_t press_now;
+        press_now = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
+        dispatch_source_set_event_handler(press_now, ^{
+            check_press();
+        });
+        dispatch_resume(press_now);
+        for (int i = 0; i < check_presses; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(check_press_at_s[i] * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                check_press();
+            });
+        }
+        if (check_menu_at_s >= 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(check_menu_at_s * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                check_show_menu();
+            });
+        }
+#endif
         [NSApp run];
         finish();
     }

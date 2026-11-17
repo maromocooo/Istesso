@@ -128,6 +128,12 @@ if [ "$what" = measuring ]; then
 else
     no_way_in "$app/Contents/MacOS/$EXECUTABLE.new"
 fi
+# Neither build holds what is only for looking without a person (-DISTESSO_CHECKS: the program
+# pressing a key for itself). This script never sets it; this makes sure nothing else did.
+if grep -a -q -F -e "check-press-when-cut" "$app/Contents/MacOS/$EXECUTABLE.new"; then
+    echo "error: the executable was built with the checks' hooks; it is for looking only"
+    exit 1
+fi
 mv -f "$app/Contents/MacOS/$EXECUTABLE.new" "$app/Contents/MacOS/$EXECUTABLE"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
