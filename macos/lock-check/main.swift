@@ -12,6 +12,12 @@
 //     own window for 4 s, then sends input ONLY to itself, as listed below, and counts what its
 //     own window received. Quits once the three locked states are tried, or after <n> minutes.
 //
+//   open "Istesso Lock Check Dev.app" --args --watch <seconds> [--report <file> --declare-every <s>]
+//     One run in whatever state the Mac is in: capture runs the whole time and every 5 s the report
+//     gets complete and idle frames, whether the picture follows the window, the lock state and
+//     whether the main display reads asleep. The same confined input as above is sent once 4 s in
+//     and once 15 s before the end.
+//
 //   open "Istesso Lock Check Dev.app" --args --rate [capture settings]
 //   open "Istesso Lock Check Dev.app" --args --virtual-display 3440x1440@85 [capture settings]
 //     How fast frames come, on the real screen or on a virtual display (private CGVirtualDisplay,
@@ -383,8 +389,13 @@ final class Probe: NSObject, NSApplicationDelegate {
     private var quitReason: String?
     private var mayCapture = false
     private var mayPost = false
+    /// `--watch <seconds>`: one continuous run instead of one trial per state.
+    private let watch: Double?
+    private var buckets: [String] = []
+    private var watchStart = Date()
 
     init(arguments: [String]) {
+        watch = argument(arguments, "--watch").flatMap(Double.init).flatMap { $0 >= 30 ? $0 : nil }
         minutes = argument(arguments, "--minutes").flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil } ?? 60
         holdDisplay = !arguments.contains("--no-hold")
         report = reportURL(arguments, default: "lock-check-report.txt")
@@ -424,7 +435,11 @@ final class Probe: NSObject, NSApplicationDelegate {
                 self.captureProblem = problem
                 self.view.status = problem ?? "capturing; try each state"
                 self.write()
-                Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in self.tick() }
+                if let seconds = self.watch {
+                    self.startWatch(seconds)
+                } else {
+                    Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in self.tick() }
+                }
             }
         }
     }
@@ -449,6 +464,41 @@ final class Probe: NSObject, NSApplicationDelegate {
         case (true, false): return "locked, display awake"
         case (true, true): return "locked, display asleep"
         }
+    }
+
+    /// The continuous run: colour changes twice a second, a 5 s summary, input early and late.
+    private func startWatch(_ seconds: Double) {
+        watchStart = Date()
+        _ = capture.take()
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in self.view.advance() }
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.bucket() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            self.input(into: Answer(state: String(format: "watch, input at %.0f s", Date().timeIntervalSince(self.watchStart))))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds - 15) {
+            self.input(into: Answer(state: String(format: "watch, input at %.0f s", Date().timeIntervalSince(self.watchStart))))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            self.bucket()
+            self.quit("the watch is over")
+        }
+    }
+
+    private func bucket() {
+        let taken = capture.take()
+        let known = taken.colours.filter { colour in
+            ProbeView.colours.contains {
+                abs(Int($0.0) - Int(colour.0)) + abs(Int($0.1) - Int(colour.1)) + abs(Int($0.2) - Int(colour.2)) < 40
+            }
+        }
+        let asleep = CGDisplayIsAsleep(CGMainDisplayID()) != 0
+        buckets.append(String(
+            format: "  %5.1f s (%@): complete %d, idle %d, follows the window %@, lock %@, main display reads %@%@",
+            Date().timeIntervalSince(watchStart), ISO8601DateFormatter().string(from: Date()),
+            taken.complete, taken.statuses["idle"] ?? 0, known.count >= 3 ? "YES" : "NO",
+            lockState().rawValue, asleep ? "asleep" : "awake",
+            taken.stopped.map { "; the capture stopped: \($0)" } ?? ""))
+        write()
     }
 
     private func tick() {
@@ -546,7 +596,7 @@ final class Probe: NSObject, NSApplicationDelegate {
         running = false
         view.status = "tried: " + answers.map { $0.state }.joined(separator: "; ")
         write()
-        if Probe.wanted.allSatisfy({ state in answers.contains { $0.state == state } }) {
+        if watch == nil, Probe.wanted.allSatisfy({ state in answers.contains { $0.state == state } }) {
             quit("all three locked states tried")
         }
     }
@@ -584,8 +634,10 @@ final class Probe: NSObject, NSApplicationDelegate {
         for answer in answers {
             lines.append("")
             lines.append("state: \(answer.state)")
-            lines.append("  picture captured: \(yes(answer.frames > 0)) (\(answer.frames) frames in 4 s)")
-            lines.append("  picture follows the window: \(yes(answer.live))")
+            if watch == nil {
+                lines.append("  picture captured: \(yes(answer.frames > 0)) (\(answer.frames) frames in 4 s)")
+                lines.append("  picture follows the window: \(yes(answer.live))")
+            }
             if let stopped = answer.stopped { lines.append("  the capture stopped: \(stopped)") }
             guard answer.inputTried else { continue }
             lines.append("  lock state read: \(answer.lock.rawValue)")
@@ -606,8 +658,13 @@ final class Probe: NSObject, NSApplicationDelegate {
                 lines.append("  session tap (allowed by the rule): move \(yes(answer.tap.move)), click \(yes(answer.tap.click))")
             }
         }
+        if watch != nil {
+            lines.append("")
+            lines.append("every 5 s:")
+            lines.append(contentsOf: buckets)
+        }
         let missing = Probe.wanted.filter { state in !answers.contains { $0.state == state } }
-        if mayCapture, !missing.isEmpty {
+        if watch == nil, mayCapture, !missing.isEmpty {
             lines.append("")
             lines.append("not tried yet: " + missing.joined(separator: "; "))
         }
