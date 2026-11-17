@@ -20,7 +20,7 @@ use istesso_agent::relay::{
     after_failure, Again, Connect, Happened, InputLine, LISTEN_EVERY, MODIFIERS, RETRY,
     RETRY_SLOWLY, SOON_FOR,
 };
-use istesso_agent::PassLog;
+use istesso_agent::{ConnectFailure, PassLog};
 use istesso_proto::InputEvent;
 
 /// How long closing waits for the thread. It looks up at once when it is
@@ -249,12 +249,27 @@ fn keep(events: &[InputEvent], held: &mut BTreeSet<u32>, pointer: &mut Option<(i
 fn run(
     taken: mpsc::Receiver<Handed>,
     make_connect: MakeConnect,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     passing: Option<&PassLog>,
     tell: &dyn Fn(&Told, u64),
 ) {
     let set = |change: &dyn Fn(&mut State)| {
         change(&mut shared.state.lock().unwrap_or_else(|e| e.into_inner()));
+    };
+    // A thread that has been told to stop does not ask the host for anything any more.
+    // Closing does not wait for an attempt to reach the host; when such an attempt gets
+    // through afterwards, the conversation is dropped as it is, without the request to
+    // send input: that request would take this device's input over once more, for nobody.
+    let make_connect = || -> Connect {
+        let mut connect = make_connect();
+        let shared = shared.clone();
+        Box::new(move |within| {
+            let client = connect(within)?;
+            if shared.stop.load(Ordering::SeqCst) {
+                return Err(ConnectFailure::Here("closed meanwhile".into()));
+            }
+            Ok(client)
+        })
     };
     let mut line: Option<InputLine> = None;
     let mut first = make_connect();
@@ -327,6 +342,14 @@ fn run(
                 Ok(opened) => {
                     let answered = opened.is_answered();
                     line = Some(opened);
+                    // What was handed over while the conversation was being opened was
+                    // typed before there was one: it is gone like everything before it,
+                    // and only kept track of.
+                    while let Ok(handed) = taken.try_recv() {
+                        if let Handed::Events(batch) = handed {
+                            keep(&batch.events, &mut held, &mut pointer);
+                        }
+                    }
                     // The host has nothing down for this device. What is held here is
                     // in line again, as after a cut: the modifiers go down and the
                     // pointer is where it is; nothing else is pressed.

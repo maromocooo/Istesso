@@ -768,6 +768,145 @@ mod tests {
         (at, held)
     }
 
+    /// A door in front of the agent that takes a caller in at once and lets nothing
+    /// through for `wait`: the caller is in the middle of opening its conversation for
+    /// that long, and then it opens.
+    fn door_that_is_slow(to: std::net::SocketAddr, wait: Duration) -> std::net::SocketAddr {
+        let door = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = door.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for near in door.incoming().map_while(Result::ok) {
+                std::thread::spawn(move || {
+                    std::thread::sleep(wait);
+                    let Ok(far) = std::net::TcpStream::connect(to) else {
+                        return;
+                    };
+                    for (mut from, mut to) in [
+                        (near.try_clone().unwrap(), far.try_clone().unwrap()),
+                        (far, near),
+                    ] {
+                        std::thread::spawn(move || {
+                            let _ = std::io::copy(&mut from, &mut to);
+                            let _ = to.shutdown(std::net::Shutdown::Both);
+                        });
+                    }
+                });
+            }
+        });
+        at
+    }
+
+    #[test]
+    fn what_is_typed_while_the_first_conversation_is_being_opened_is_not_sent_when_it_opens() {
+        let pair = Pair::new();
+        let door = door_that_is_slow(pair.addr, Duration::from_millis(500));
+        let heard: Heard = Mutex::new(Vec::new());
+        let (dir, address) = (c_path(&pair.root.join("d")), c(&door.to_string()));
+        let key = |code: i32, pressed: i32| IstessoInputEvent {
+            kind: 1,
+            a: code,
+            b: pressed,
+        };
+        // SAFETY: as in the tests above.
+        unsafe {
+            let input = istesso_input_open(
+                dir.as_ptr(),
+                c("a host").as_ptr(),
+                address.as_ptr(),
+                std::ptr::null(),
+                0,
+                Some(hear),
+                &heard as *const Heard as *mut c_void,
+            );
+            assert!(!input.is_null());
+            // In the middle of the first attempt, which will get through: a letter is
+            // typed, and Shift goes down and stays down.
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(heard.lock().unwrap().is_empty());
+            let during = [key(30, 1), key(30, 0), key(42, 1)];
+            istesso_input_send(input, during.as_ptr(), during.len());
+            until("the conversation", || {
+                heard.lock().unwrap().iter().any(|told| told.0 == 1)
+            });
+            // It opened at the first attempt: nothing was said about waiting.
+            assert_eq!(heard.lock().unwrap().len(), 1);
+            let wait = Duration::from_secs(3);
+            // Shift is down on the host, as it is here. The letter is not typed later.
+            assert_eq!(
+                pair.handed_over(wait).unwrap(),
+                r#"{"kind":"key","code":42,"pressed":true}"#
+            );
+            istesso_input_send(input, &key(42, 0), 1);
+            assert_eq!(
+                pair.handed_over(wait).unwrap(),
+                r#"{"kind":"key","code":42,"pressed":false}"#
+            );
+            assert!(pair.handed_over(Duration::from_millis(200)).is_none());
+            istesso_input_close(input);
+        }
+    }
+
+    #[test]
+    fn an_attempt_that_gets_through_after_closing_does_not_ask_the_host_for_input() {
+        let pair = Pair::new();
+        // A first input of this device, open and looked after.
+        let first_heard: Heard = Mutex::new(Vec::new());
+        let (dir, direct) = (c_path(&pair.root.join("d")), c(&pair.addr.to_string()));
+        let open = |address: &CString, heard: &Heard| {
+            // SAFETY: as in the tests above.
+            unsafe {
+                istesso_input_open(
+                    dir.as_ptr(),
+                    c("a host").as_ptr(),
+                    address.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    Some(hear),
+                    heard as *const Heard as *mut c_void,
+                )
+            }
+        };
+        let first = open(&direct, &first_heard);
+        until("the first input's conversation", || {
+            first_heard.lock().unwrap().iter().any(|told| told.0 == 1)
+        });
+        let cut = || first_heard.lock().unwrap().iter().any(|told| told.0 == 2);
+        let door = c(&door_that_is_slow(pair.addr, Duration::from_millis(500)).to_string());
+
+        // A second input of the same device whose attempt gets through and is not
+        // closed: the host gives the device's input to it, and the first one is cut.
+        // (That is what the rest of this test must not see.)
+        let other_heard: Heard = Mutex::new(Vec::new());
+        let other = open(&door, &other_heard);
+        until("the second input to take over", cut);
+        // SAFETY: opened above, closed once.
+        unsafe { istesso_input_close(other) };
+        until("the first input to be back", || {
+            first_heard.lock().unwrap().iter().any(|told| told.0 == 3)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        first_heard.lock().unwrap().clear();
+
+        // Again, and this time it is closed in the middle of the attempt. The attempt
+        // gets through a little later: the host is not asked for input, and the first
+        // input is left alone.
+        let closed_heard: Heard = Mutex::new(Vec::new());
+        let closed = open(&door, &closed_heard);
+        std::thread::sleep(Duration::from_millis(150));
+        // SAFETY: opened above, closed once.
+        unsafe { istesso_input_close(closed) };
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(!cut(), "{:?}", first_heard.lock().unwrap());
+        assert!(closed_heard.lock().unwrap().is_empty());
+        let mut state = IstessoInputState::default();
+        // SAFETY: open, and room for the result.
+        unsafe {
+            assert_eq!(istesso_input_state(first, &mut state), 0);
+            assert_eq!(state.open, 1);
+            istesso_input_close(first);
+        }
+    }
+
     #[test]
     fn a_first_question_that_is_not_answered_in_time_is_asked_again() {
         let pair = Pair::new();
