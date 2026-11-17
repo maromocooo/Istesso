@@ -15,3 +15,23 @@ publish.workspace = true
 istesso-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# The part that drives GStreamer and sends the picture. Off unless asked for: it needs
+# GStreamer's development files to build, and the graphics card and the compositor plugin of
+# the host to run. Build it on the host with `--features pipeline`.
+# GStreamer itself is LGPL and is used as the library that is installed, linked dynamically
+# (docs/components.md); these crates are its Rust bindings.
+gstreamer = { version = "0.24", optional = true }
+gstreamer-app = { version = "0.24", optional = true }
+istesso-media = { path = "../istesso-media", optional = true }
+istesso-agent = { workspace = true, optional = true }
+istesso-pair = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+pipeline = ["dep:gstreamer", "dep:gstreamer-app", "dep:istesso-media", "dep:istesso-agent", "dep:istesso-pair", "dep:libc"]
+
+[[bin]]
+name = "istesso-host-linux"
+path = "src/main.rs"
+required-features = ["pipeline"]

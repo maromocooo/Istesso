@@ -18,4 +18,6 @@ pub mod framelog;
 pub mod gate;
 pub mod input;
 pub mod picture;
+#[cfg(feature = "pipeline")]
+pub mod stage;
 pub mod words;
