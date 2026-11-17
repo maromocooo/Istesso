@@ -11,6 +11,12 @@
 //   to the key: pressed before it and let go after it.
 // - While Command is held macOS does not say when another key comes up again, so such a key is
 //   pressed and let go at once.
+//
+// And one thing is here because it is about the same keys: what is passed on while the picture is
+// not the other side's picture of this moment (its connection was cut and is being made again).
+// Nothing is pressed over there then: keys_hold_back() takes the presses out of what an event
+// caused and leaves the releases. When the picture is back, keys_fall_in_line() brings the
+// modifiers over there in line with what is held on this keyboard (docs/adr/0015-media-transport.md).
 #ifndef ISTESSO_KEYS_H
 #define ISTESSO_KEYS_H
 
@@ -162,6 +168,61 @@ static inline size_t keys_flags_changed(Keys *keys, unsigned short key, unsigned
         return keys_set(keys, code, false, out, count);
     }
     return 0;
+}
+
+// The picture is not the other side's of this moment: of the `count` changes an event caused,
+// only letting go is passed on. A key that was to go down stays up over there, and is noted as
+// up here, so that its release is no news later; a key that was lent to such a press (down and
+// up within the same event) is not let go either, having never gone down. Returns how many
+// changes are left in `out`; `*dropped` is set when a press was among those taken out.
+static inline size_t keys_hold_back(Keys *keys, KeyChange *out, size_t count, bool *dropped) {
+    unsigned taken[KEYS_MOST];
+    size_t takens = 0, left = 0;
+    for (size_t i = 0; i < count; i++) {
+        bool was_taken = false;
+        for (size_t j = 0; j < takens; j++) {
+            was_taken = was_taken || taken[j] == out[i].code;
+        }
+        if (out[i].pressed) {
+            if (out[i].code < 256) {
+                keys->down[out[i].code] = false;
+            }
+            if (!was_taken && takens < KEYS_MOST) {
+                taken[takens++] = out[i].code;
+            }
+            *dropped = true;
+        } else if (!was_taken) {
+            out[left++] = out[i];
+        }
+    }
+    return left;
+}
+
+// The picture is back. The modifiers on the other side are brought in line with the ones held on
+// this keyboard now (`flags` as an event has them): one that is held and is not down over there
+// goes down, one that is down over there and is not held comes up. Other keys are left as they
+// are: pressing a letter again would type it. `out` has room for 8 changes.
+static inline size_t keys_fall_in_line(Keys *keys, unsigned long flags, KeyChange *out) {
+    bool command = (flags & KEYS_FLAG_COMMAND) != 0;
+    const struct {
+        bool held;
+        unsigned left, right;
+    } modifiers[4] = {
+        {(flags & KEYS_FLAG_SHIFT) != 0, 42, 54},
+        {(flags & KEYS_FLAG_CONTROL) != 0 || (command && keys->command_is_control), 29, 97},
+        {(flags & KEYS_FLAG_OPTION) != 0, 56, 100},
+        {command && !keys->command_is_control, 125, 126},
+    };
+    size_t count = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!modifiers[i].held) {
+            count = keys_set(keys, modifiers[i].left, false, out, count);
+            count = keys_set(keys, modifiers[i].right, false, out, count);
+        } else if (!keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
+            count = keys_set(keys, modifiers[i].left, true, out, count);
+        }
+    }
+    return count;
 }
 
 // The window is no longer the one that is typed into: no key stays down on the other side.

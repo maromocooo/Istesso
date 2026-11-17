@@ -23,9 +23,9 @@ pub mod message;
 pub mod server;
 
 pub use channel::{Channel, LocalKeys};
-pub use client::Client;
+pub use client::{Client, InputAnswer};
 pub use message::{ErrorCode, Request, Response};
-pub use server::Session;
+pub use server::{HangUp, Session};
 
 /// Port the agent listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 47801;

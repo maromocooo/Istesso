@@ -93,6 +93,24 @@ _Static_assert(sizeof(void *) != 8 || sizeof(IstessoMediaCursor) == 48, "Istesso
 
 typedef struct IstessoMediaHost IstessoMediaHost;
 typedef struct IstessoMediaClient IstessoMediaClient;
+typedef struct IstessoMediaWatch IstessoMediaWatch;
+
+/* How a lasting viewer stands: istesso_media_watch_state(). */
+typedef struct IstessoMediaWatchState {
+    uint64_t cuts;      /* how often the connection was cut and taken up again, or is being */
+    uint64_t silent_ms; /* at the last "connected": for how long the host had not been heard */
+    uint32_t again;     /* at the last "connected": 1 when it was a connection again after a cut */
+    int32_t why;        /* once it is over, one of ISTESSO_MEDIA_OVER_*; 0 before */
+} IstessoMediaWatchState;
+
+/* Why a lasting viewer is over and does not connect again. */
+#define ISTESSO_MEDIA_OVER_ENDED 1       /* the host said that the stream is over */
+#define ISTESSO_MEDIA_OVER_NOT_SHOWN 2   /* the host shows the picture to another device, or to none */
+#define ISTESSO_MEDIA_OVER_SET_ASIDE 3   /* the host has put the picture aside for the time being */
+#define ISTESSO_MEDIA_OVER_NOT_PAIRED 4  /* the two devices are not paired any more */
+#define ISTESSO_MEDIA_OVER_FORBIDDEN 5   /* this device may not look at the host */
+#define ISTESSO_MEDIA_OVER_UNSUPPORTED 6 /* the host sends something this version cannot show */
+#define ISTESSO_MEDIA_OVER_OTHER 7       /* refused otherwise; istesso_media_last_error() says how */
 
 /* ---- Host: the device that shows its picture ---- */
 
@@ -104,6 +122,27 @@ typedef struct IstessoMediaClient IstessoMediaClient;
  */
 IstessoMediaHost *istesso_media_host_listen(const char *config_dir, const char *bind,
                                             const IstessoMediaStreamInfo *info);
+
+/*
+ * The same, for the picture of a streaming session: nobody is shown it until
+ * istesso_media_host_admit() names a device.
+ */
+IstessoMediaHost *istesso_media_host_listen_closed(const char *config_dir, const char *bind,
+                                                   const IstessoMediaStreamInfo *info);
+
+/*
+ * Says which one paired device is shown the picture from now on: the one with this id and
+ * this public key, both as the list of paired devices has them (`istesso peers list --json`).
+ * Both NULL: nobody. Any other viewer is cut off before this returns, and whoever else
+ * connects is refused. Being paired and allowed to look is still checked underneath, at every
+ * connection and while the stream runs. 0, or -1 when only one of the two was given or a text
+ * could not be read; then nobody is admitted.
+ */
+int32_t istesso_media_host_admit(const IstessoMediaHost *host, const char *device_id,
+                                 const char *public_key);
+
+/* Back to every paired device that may look and connects: what a host does that was never told. */
+int32_t istesso_media_host_admit_paired(const IstessoMediaHost *host);
 
 /* The port the host listens on (of use after asking for port 0). */
 uint16_t istesso_media_host_port(const IstessoMediaHost *host);
@@ -166,7 +205,8 @@ int32_t istesso_media_client_info(const IstessoMediaClient *client, IstessoMedia
  * Waits for the next frame, for `wait_ms` at most. 1: `frame` is filled in. 2: the host has
  * said what the cursor is; fetch it with istesso_media_client_cursor(). 0: nothing came in
  * that time (the picture stands still). -1: the connection is over (the host ended it, said
- * nothing for three seconds, or the pairing was removed); close the client and connect again.
+ * nothing for a second, or the pairing was removed); close the client. A program that wants
+ * the picture back after a cut uses istesso_media_watch_open() instead.
  * One thread calls this.
  */
 int32_t istesso_media_client_next(const IstessoMediaClient *client, uint32_t wait_ms,
@@ -189,6 +229,54 @@ void istesso_media_client_ask_key_frame(const IstessoMediaClient *client);
 
 /* Closes the connection. No other thread may be using `client`. */
 void istesso_media_client_close(IstessoMediaClient *client);
+
+/* ---- A viewer that lasts: it connects again when its connection is cut ---- */
+
+/*
+ * A connection can end while both ends are alive (a network may stop delivering on it without
+ * a word). This viewer then connects again by itself: at once, then four times a second, and
+ * once a second when the host has been away for ten seconds. It does so only when nobody said
+ * why the connection ended. When the host said that the stream is over, that the picture is
+ * for another device or put aside, or refused this device, it is over, and stays so.
+ *
+ * `addr` and `peer` as for istesso_media_client_connect(). Nothing is connected here: the
+ * first call of istesso_media_watch_next() does that. Later connections are made only to the
+ * device the first one reached. NULL when no address was given or it cannot be read.
+ */
+IstessoMediaWatch *istesso_media_watch_open(const char *config_dir, const char *addr,
+                                            const char *peer);
+
+/*
+ * Waits for the next thing, for `wait_ms` at most (an attempt to connect may take longer:
+ * three seconds the first time, one second after a cut).
+ *    1: `frame` is filled in.
+ *    2: the host has said what the cursor is; fetch it with istesso_media_watch_cursor().
+ *    0: nothing came in that time.
+ *    3: the connection was cut (it failed, or the host said nothing for a second) and is being
+ *       made again. What is on the screen is not the host's picture of this moment any more.
+ *    4: connected, the first time or again; istesso_media_watch_info() says what the host
+ *       sends now, and the first frame that follows is a key frame.
+ *   -1: it is over and is not tried again; istesso_media_watch_state() says why, and
+ *       istesso_media_last_error() in a sentence.
+ * One thread calls this.
+ */
+int32_t istesso_media_watch_next(const IstessoMediaWatch *watch, uint32_t wait_ms,
+                                 IstessoMediaFrame *frame);
+
+/* What the host said about its picture on the connection there is. 0, or -1 without one. */
+int32_t istesso_media_watch_info(const IstessoMediaWatch *watch, IstessoMediaStreamInfo *info);
+
+/* As istesso_media_client_cursor(), on the connection there is. */
+int32_t istesso_media_watch_cursor(const IstessoMediaWatch *watch, IstessoMediaCursor *cursor);
+
+/* How it stands. From any thread. 0, or -1. */
+int32_t istesso_media_watch_state(const IstessoMediaWatch *watch, IstessoMediaWatchState *state);
+
+/* As istesso_media_client_ask_key_frame(). From any thread. */
+void istesso_media_watch_ask_key_frame(const IstessoMediaWatch *watch);
+
+/* Closes the connection, if there is one. No other thread may be using `watch`. */
+void istesso_media_watch_close(IstessoMediaWatch *watch);
 
 /* ---- For both ---- */
 

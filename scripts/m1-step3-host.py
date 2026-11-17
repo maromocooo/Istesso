@@ -65,6 +65,12 @@ input, and is told things in lines of JSON on standard output, each with the key
               still. Answered with {"istesso":"paused","offered":true,"took_ms":T}
     detach    the same, and with --to-channel every viewer is cut off and no caller is taken
               until `resume`. Answered with {"istesso":"paused","offered":false,"took_ms":T}
+    admit ID PUBLIC_KEY, admit nobody
+              with --to-channel: the one paired device that is shown the picture from now on,
+              by its id and its public key, or nobody. Any other viewer is cut off at once and
+              any other caller refused. Answered with {"istesso":"admitted","device":ID} or
+              {"istesso":"admitted","device":null}. A pipeline started with --admit nobody
+              shows its picture to nobody before the first `admit`
     resume    open an encoder again and go on; the first frame is a key frame. With
               --to-channel the picture is offered again. Answered with {"istesso":"resumed",
               "opened_ms":T,"encoded_ms":T,"written_ms":T,"key":1} once the first frame is out
@@ -157,9 +163,17 @@ def open_channel(args, bind, width, height):
     media.istesso_media_host_close.argtypes = [ctypes.c_void_p]
     media.istesso_media_last_error.restype = ctypes.c_char_p
     media.istesso_media_last_error.argtypes = []
+    listen = media.istesso_media_host_listen
+    media.istesso_media_host_admit.restype = ctypes.c_int32
+    media.istesso_media_host_admit.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+    if args.admit == "nobody":
+        # The picture of a session: for nobody until its runner names a device.
+        listen = media.istesso_media_host_listen_closed
+        listen.restype = ctypes.c_void_p
+        listen.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(MediaStreamInfo)]
     # H.265 (1), with all of its colour or a quarter of it, said to be sRGB (1) or nothing said (0).
     info = MediaStreamInfo(1, width, height, args.fps, int(args.chroma), 1 if args.colour == "srgb" else 0)
-    host = media.istesso_media_host_listen(args.config_dir.encode() if args.config_dir else None, bind.encode(), ctypes.byref(info))
+    host = listen(args.config_dir.encode() if args.config_dir else None, bind.encode(), ctypes.byref(info))
     if not host:
         print(f"error: cannot listen for paired devices: {media.istesso_media_last_error().decode()}", file=sys.stderr)
         return media, None
@@ -231,6 +245,14 @@ def main():
         metavar="PATH",
         help="with --input: the socket to take the input on, for a pipeline that runs next to another one "
         "($XDG_RUNTIME_DIR/istesso/input.sock, where `istesso agent` hands input over, unless given)",
+    )
+    parser.add_argument(
+        "--admit",
+        choices=["paired", "nobody"],
+        default="paired",
+        help="with --to-channel: who is shown the picture at the start. paired: every paired device that may look and "
+        "connects, as a measuring pipeline wants it. nobody: the picture of a streaming session, which is for the one "
+        "device its runner names with `admit` on standard input",
     )
     parser.add_argument(
         "--cursor",
@@ -707,6 +729,20 @@ def main():
             return Gst.PadProbeReturn.DROP
         return Gst.PadProbeReturn.REMOVE
 
+    def admit(who):
+        # Which one device is shown the picture: `admit ID PUBLIC_KEY`, or `admit nobody`. A
+        # session is shown to one device at a time; its runner says which. Whoever else
+        # watches is cut off at once, and whoever else connects is refused.
+        if not channel:
+            return
+        if len(who) == 2:
+            failed = media.istesso_media_host_admit(host, who[0].encode(), who[1].encode()) != 0
+            say("admitted", device=None if failed else who[0])
+        else:
+            # `nobody`, or half a device, which is nobody as well.
+            media.istesso_media_host_admit(host, None, None)
+            say("admitted", device=None)
+
     def on_control(fd, condition):
         try:
             data = os.read(fd, 4096)
@@ -731,6 +767,8 @@ def main():
                 asked = compositor_pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, Gst.Structure.new_empty("CloseWindows")))
                 log.write('{"kind":"close","t_ns":%d,"asked":%d}\n' % (time.monotonic_ns(), 1 if asked else 0))
                 say("close", asked=bool(asked))
+            elif word.split()[:1] == ["admit"]:
+                admit(word.split()[1:])
             elif word:
                 print(f"note: {word!r} is not something this program can be told", file=sys.stderr)
         return True

@@ -14,6 +14,8 @@
 //!   look at this host, and looks the device up again while it sends.
 //! * [`viewer`]: the receiving end. Hands over whole frames, and asks for a
 //!   key frame.
+//! * [`rejoin`]: a viewer that connects again when its connection is cut,
+//!   and when it does not.
 //! * [`clock`]: the clock the times in a frame's record are read from.
 //! * [`realtime`]: scheduling for the thread that receives.
 //! * `ffi`: the same behind a C interface (`include/istesso_media.h`), for
@@ -29,6 +31,8 @@ mod ffi;
 #[cfg(unix)]
 pub mod host;
 pub mod realtime;
+#[cfg(unix)]
+pub mod rejoin;
 #[cfg(all(test, unix))]
 mod session_tests;
 #[cfg(unix)]
@@ -38,7 +42,9 @@ pub mod viewer;
 pub mod wire;
 
 #[cfg(unix)]
-pub use host::Host;
+pub use host::{Admit, Host};
+#[cfg(unix)]
+pub use rejoin::{Lasting, LastingAsker, Step};
 #[cfg(unix)]
 pub use viewer::{Asker, Event, Frame, Viewer};
 pub use wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, DEFAULT_PORT};
@@ -68,6 +74,12 @@ pub enum Error {
     Silent,
     #[error("the host has stopped sending")]
     Ended,
+    #[error("the host shows this picture to another device now, or to none")]
+    NotShown,
+    #[error("the host has put the picture aside for the time being")]
+    SetAside,
+    #[error("the host shows its picture to as many devices as it can")]
+    Busy,
     #[error("this device has no identity yet; pair it with the other one first")]
     NoIdentity,
     #[error("I/O error: {0}")]
@@ -75,6 +87,56 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// What a viewer does about a connection that has ended, or could not be
+/// made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Again {
+    /// Connect again at once, and then at short intervals: the connection
+    /// was cut and nobody said why. A network may drop a connection that
+    /// both ends still believe in.
+    Soon,
+    /// Connect again, but at leisure: the host said that it cannot take
+    /// this device at the moment, or something on this device is in the
+    /// way that may pass.
+    Slowly,
+    /// Do not connect again: the host said that it is over, or refused,
+    /// and asking again changes nothing.
+    Never,
+}
+
+impl Error {
+    /// What a viewer does after this error. Only a connection that ended
+    /// without a word is taken up again: when the host said why it stops,
+    /// or refused this device, the answer would be the same the next time,
+    /// and a device that takes a picture back from the one it was moved to
+    /// would never stop doing so.
+    pub fn again(&self) -> Again {
+        use istesso_link::Error as Link;
+        match self {
+            // Not paired any more, on either side, or another device than
+            // the one this viewer began with.
+            Error::Link(Link::UnknownPeer | Link::NotTrusted | Link::WrongPeer { .. }) => {
+                Again::Never
+            }
+            // Another version of the control channel altogether.
+            Error::Link(Link::Version { .. }) => Again::Never,
+            Error::Forbidden
+            | Error::Refused(_)
+            | Error::Unsupported(_)
+            | Error::Ended
+            | Error::NotShown
+            | Error::SetAside
+            | Error::NoIdentity => Again::Never,
+            Error::Busy | Error::Pair(_) => Again::Slowly,
+            // Everything else is a connection that failed, fell silent, or
+            // carried something that could not be read.
+            Error::Link(_) | Error::Wire(_) | Error::Malformed | Error::Silent | Error::Io(_) => {
+                Again::Soon
+            }
+        }
+    }
+}
 
 #[cfg(all(test, unix))]
 pub(crate) mod testing {

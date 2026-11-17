@@ -80,7 +80,18 @@
 // channel's kind of channel (docs/adr/0015-media-transport.md). They go to VideoToolbox as
 // above. PIPELINE is then not used ("-" will do), and neither is KEY_REQUEST_PORT: key frames
 // are asked for over the same connection, and only when a frame could not be decoded, because
-// frames do not get lost on that way. When the connection ends, the program connects again.
+// frames do not get lost on that way.
+// When the connection is cut (it fails, or the host says nothing for a second), the program
+// connects again by itself: at once, then four times a second. It does not when the host said
+// why the stream ends or refused this device (the session is over, the picture is for another
+// device or put aside, the pairing or the right to look is gone): then the window says so and
+// stays as it is. While the connection is being made again the window keeps the last picture.
+// After half a second, or at once when keys or buttons were pressed in the second before, the
+// picture is dimmed and a line says that what is typed does not arrive: from then until the
+// picture is back no key or button press is passed on (what was held is let go on the other
+// side when the line comes up). Nothing typed meanwhile is sent later. When the picture is
+// back the modifiers that are held are pressed again, and a line stays for three seconds if
+// anything was not passed on.
 //   ISTESSO_CHANNEL_PEER       optional: the name or id of the paired device that has to answer
 //   ISTESSO_RECEIVE_REALTIME   set: the thread that receives and decodes is scheduled the way the
 //                              threads of the sound system are (off unless set, so that what it
@@ -97,6 +108,10 @@
 //   ISTESSO_CURSOR_AT=X,Y      for checks that must not touch the pointer: draw the cursor at this
 //                              place of the view (points from its top left) whatever the pointer
 //                              does and whichever window is key
+//   ISTESSO_PRETEND_TYPING     for checks that must not touch the keyboard: behave as if a key
+//                              were pressed ten times a second, as far as the line about a cut
+//                              connection goes (it comes at once, and counts what was not passed
+//                              on). Nothing is sent anywhere for it
 // The frame log gets {"kind":"cursor","t_ns":T,"shape":0|1|2,"width":W,"height":H,
 // "hotspot_x":X,"hotspot_y":Y,"scale":S} for every cursor the host tells (0 hidden, 1 no image,
 // 2 an image).
@@ -108,7 +123,20 @@
 //                              the messages of the encrypted channel it came in; E is when the
 //                              host's encoder had finished it, on the HOST's clock
 //   {"kind":"key_request","t_ns":T,"sent":1}   asked for over the connection
-//   {"kind":"stream","t_ns":T,"event":"connected"|"ended"|"unreachable"}   the connection's life
+//   {"kind":"stream","t_ns":T,"event":E,...}   the connection's life. E is "connected" (with
+//                              "again":0|1 and, after a cut, "silent_ms": for how long the host had
+//                              not been heard), "ended" (cut; it is being made again), "back" (the
+//                              first picture after a cut is decoded; "gap_ms" since the cut was
+//                              noticed), "unreachable" (no host there yet), "over" (not tried
+//                              again; "why" is one of ISTESSO_MEDIA_OVER_*)
+//   {"kind":"reconnections","t_ns":T,"at":"start"|"cut"|"end","picture":N}   how often the
+//                              picture's connection was cut so far: written when the log begins
+//                              (0), at every cut, and when the program is asked to stop. The
+//                              last such line has the count. A log without any was written
+//                              without the channel, where nothing is counted: that is not 0.
+//   {"kind":"held_back","t_ns":T,"marked":0|1,"dropped":N,"in_doubt":M}   when the picture is back
+//                              or over: whether the line was shown, how many presses were not
+//                              passed on, and how many were passed on in the second before the cut
 // Both ways write {"kind":"to_decoder","pts":P,"t_ns":T} when an access unit is handed to
 // VideoToolbox.
 //
@@ -129,7 +157,10 @@
 #include <gst/net/gstnetaddressmeta.h>
 #include <gst/video/video.h>
 #include <gst/video/videooverlay.h>
+#include <errno.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <time.h>
 #include "istesso_media.h"
 
@@ -604,6 +635,246 @@ static void show_cursor(uint32_t shape, CGImageRef image, CGSize pixels, CGPoint
     }
 }
 
+// ---- When the connection is cut ----
+//
+// What the window shows while the picture is not the host's picture of this moment, and what is
+// passed on of the keyboard and the pointer meanwhile. Only touched on the main thread.
+
+static CALayer *dim_layer = nil;
+static CALayer *note_box = nil;
+static CATextLayer *note_layer = nil;
+// The line is up: no key or button press is passed on.
+static BOOL picture_stale = NO;
+// The connection was cut and the picture is not back yet.
+static BOOL cut_pending = NO;
+static guint64 cut_noticed_ns = 0;
+static unsigned long cut_generation = 0, note_generation = 0;
+// Presses that were not passed on since the cut, and presses that were passed on in the second
+// before it was noticed: whether those arrived, nobody knows.
+static unsigned long held_back_count = 0, in_doubt_count = 0;
+// When keys and buttons were last pressed and passed on.
+static guint64 press_times[32];
+static unsigned long press_count = 0;
+
+@interface NSView (IstessoHeldBack)
+- (void)holdBack;
+- (void)fallInLine;
+@end
+
+static void note_press(void) {
+    press_times[press_count++ % 32] = now_ns();
+}
+
+static unsigned long presses_since(guint64 t) {
+    unsigned long count = 0, kept = press_count < 32 ? press_count : 32;
+    for (unsigned long i = 0; i < kept; i++) {
+        count += press_times[i] >= t ? 1 : 0;
+    }
+    return count;
+}
+
+// Shows one line in the middle of the picture, or takes it away (nil).
+static void show_note(NSString *text) {
+    note_generation++;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (text == nil || cursor_view == nil || note_box == nil) {
+        note_box.hidden = YES;
+    } else {
+        NSFont *font = [NSFont systemFontOfSize:14 weight:NSFontWeightMedium];
+        CGSize room = cursor_view.bounds.size;
+        CGFloat most = MIN(room.width - 40, 560);
+        NSRect fit = [text boundingRectWithSize:NSMakeSize(most - 28, 400)
+                                        options:NSStringDrawingUsesLineFragmentOrigin
+                                     attributes:@{NSFontAttributeName : font}];
+        CGFloat width = ceil(fit.size.width) + 28, height = ceil(fit.size.height) + 20;
+        note_box.frame = CGRectMake(floor((room.width - width) / 2), floor((room.height - height) / 2), width, height);
+        note_layer.frame = CGRectMake(14, 10, width - 28, height - 20);
+        note_layer.font = (__bridge CFTypeRef)font;
+        note_layer.fontSize = 14;
+        note_layer.contentsScale = cursor_view.window != nil ? cursor_view.window.backingScaleFactor : 2;
+        note_layer.string = text;
+        note_box.hidden = NO;
+    }
+    [CATransaction commit];
+}
+
+static void set_dim(BOOL on) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (cursor_view != nil) {
+        dim_layer.frame = cursor_view.bounds;
+    }
+    dim_layer.hidden = !on;
+    [CATransaction commit];
+}
+
+static void log_held_back(BOOL marked) {
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"held_back\",\"t_ns\":%llu,\"marked\":%d,\"dropped\":%lu,\"in_doubt\":%lu}\n",
+                (unsigned long long)now_ns(), marked ? 1 : 0, held_back_count, in_doubt_count);
+    }
+}
+
+// The line comes up: from here on nothing is pressed on the other side, and what is held there
+// is let go, so that a key that is held does not go on typing into a picture nobody sees.
+static void mark_the_picture(NSString *text) {
+    BOOL was = picture_stale;
+    picture_stale = YES;
+    set_dim(YES);
+    show_note(text);
+    if (!was && [cursor_view respondsToSelector:@selector(holdBack)]) {
+        [cursor_view holdBack];
+    }
+    if ([cursor_view respondsToSelector:@selector(cursorChanged)]) {
+        [cursor_view cursorChanged];  // The Mac's own cursor again.
+    }
+}
+
+// The connection was cut and is being made again.
+static void picture_was_cut(guint64 t) {
+    if (cut_pending) {
+        return;
+    }
+    cut_pending = YES;
+    cut_noticed_ns = t;
+    unsigned long generation = ++cut_generation;
+    held_back_count = 0;
+    in_doubt_count = presses_since(t > 1000000000ULL ? t - 1000000000ULL : 0);
+    NSString *line = @"Reconnecting. What you type now does not arrive.";
+    if (in_doubt_count > 0) {
+        // Somebody is typing: said at once.
+        mark_the_picture(line);
+        return;
+    }
+    // Most cuts are over before anybody could read a line; one that is not is said.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if (cut_pending && generation == cut_generation) {
+            mark_the_picture(line);
+        }
+    });
+}
+
+// The first picture after a cut is on the screen.
+static void picture_is_back(void) {
+    if (!cut_pending) {
+        return;
+    }
+    cut_pending = NO;
+    cut_generation++;
+    BOOL was_marked = picture_stale;
+    picture_stale = NO;
+    set_dim(NO);
+    log_held_back(was_marked);
+    if (was_marked && [cursor_view respondsToSelector:@selector(fallInLine)]) {
+        [cursor_view fallInLine];
+    }
+    if ([cursor_view respondsToSelector:@selector(cursorChanged)]) {
+        [cursor_view cursorChanged];
+    }
+    if (!was_marked || held_back_count + in_doubt_count == 0) {
+        show_note(nil);
+        return;
+    }
+    // What was typed is gone, and the person is told so for long enough to read it.
+    NSString *line;
+    if (held_back_count > 0 && in_doubt_count > 0) {
+        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) during the cut did not arrive, and %lu just before it "
+                                          @"may not have.",
+                                          held_back_count, in_doubt_count];
+    } else if (held_back_count > 0) {
+        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) during the cut did not arrive.", held_back_count];
+    } else {
+        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) just before it may not have arrived.", in_doubt_count];
+    }
+    show_note(line);
+    unsigned long generation = note_generation;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (generation == note_generation) {
+            show_note(nil);
+        }
+    });
+}
+
+// It is over, and the host said why or refused: nothing is tried again. The window stays, with
+// the last picture dimmed and the reason, until the person closes it.
+static void picture_is_over(int32_t why) {
+    cut_pending = NO;
+    cut_generation++;
+    NSString *line;
+    switch (why) {
+        case ISTESSO_MEDIA_OVER_ENDED: line = @"The session has ended."; break;
+        case ISTESSO_MEDIA_OVER_NOT_SHOWN: line = @"The host shows this to another device now."; break;
+        case ISTESSO_MEDIA_OVER_SET_ASIDE: line = @"The host has put this session aside."; break;
+        case ISTESSO_MEDIA_OVER_NOT_PAIRED: line = @"This device is not paired with the host any more."; break;
+        case ISTESSO_MEDIA_OVER_FORBIDDEN: line = @"This device may not look at the host."; break;
+        case ISTESSO_MEDIA_OVER_UNSUPPORTED: line = @"The host sends its picture in a form this program cannot show."; break;
+        default: line = @"The host does not show its picture to this device."; break;
+    }
+    mark_the_picture(line);
+    log_held_back(YES);
+}
+
+// ---- How often the connections were cut, where a person sees it ----
+//
+// The window's title says it for as long as the program runs: "... picture 0, input 0". The
+// picture's count is this program's own. The input's is the relay's, which writes it into a
+// small file next to its socket (SOCKET.state: its process id and the count); "input not
+// counted" when there is no relay that counts. Without the channel the title is left alone.
+
+static atomic_ulong picture_cuts;
+// The input's count as the relay says it; -1 when no relay that counts is running.
+static long input_cuts = -1;
+static NSWindow *counted_window = nil;
+static NSString *counted_title = nil;
+
+static void log_reconnections(const char *at) {
+    if (frame_log != NULL) {
+        fprintf(frame_log, "{\"kind\":\"reconnections\",\"t_ns\":%llu,\"at\":\"%s\",\"picture\":%lu}\n",
+                (unsigned long long)now_ns(), at, atomic_load(&picture_cuts));
+    }
+}
+
+// On the main thread.
+static void show_counts(void) {
+    if (counted_window == nil) {
+        return;
+    }
+    NSString *input = input_cuts < 0 ? @"input not counted" : [NSString stringWithFormat:@"input %ld", input_cuts];
+    counted_window.title =
+        [NSString stringWithFormat:@"%@ \u2014 reconnections: picture %lu, %@", counted_title, atomic_load(&picture_cuts), input];
+}
+
+// Looks once a second at what the relay says about its own connection, off the main thread:
+// reading a file must never hold up a key on its way out.
+static void watch_relay_state(const char *socket_path) {
+    NSString *path = [NSString stringWithFormat:@"%s.state", socket_path];
+    static dispatch_source_t timer;
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    dispatch_source_set_event_handler(timer, ^{
+        long now = -1;
+        FILE *file = fopen(path.fileSystemRepresentation, "r");
+        if (file != NULL) {
+            long pid = 0, count = -1;
+            // Only a relay that still runs counts: a file left by an earlier one says nothing.
+            if (fscanf(file, "{\"pid\":%ld,\"input\":%ld}", &pid, &count) == 2 && pid > 0 && count >= 0
+                && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
+                now = count;
+            }
+            fclose(file);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (now != input_cuts) {
+                input_cuts = now;
+                show_counts();
+            }
+        });
+    });
+    dispatch_resume(timer);
+}
+
 // ---- Frames from the encrypted channel ----
 //
 // One thread connects to the host, is handed whole frames by the library, and decodes each one
@@ -705,20 +976,20 @@ static gboolean channel_configure(const NalUnit *sets[3]) {
     return vt_start_session(channel_info.chroma == 444, vt_srgb ? "srgb" : "-");
 }
 
-static void channel_ask_for_key_frame(IstessoMediaClient *client, guint64 t) {
+static void channel_ask_for_key_frame(IstessoMediaWatch *watch, guint64 t) {
     // Once, and again every half second for as long as none has come.
     if (channel_asked_ns != 0 && t - channel_asked_ns < 500 * 1000 * 1000ULL) {
         return;
     }
     channel_asked_ns = t;
-    istesso_media_client_ask_key_frame(client);
+    istesso_media_watch_ask_key_frame(watch);
     if (frame_log != NULL) {
         fprintf(frame_log, "{\"kind\":\"key_request\",\"t_ns\":%llu,\"sent\":1}\n", (unsigned long long)t);
     }
 }
 
 // One frame has arrived, whole: decode it now, on the thread that received it.
-static void on_channel_frame(IstessoMediaClient *client, const IstessoMediaFrame *frame) {
+static void on_channel_frame(IstessoMediaWatch *watch, const IstessoMediaFrame *frame) {
     if (frame_log != NULL) {
         fprintf(frame_log,
                 "{\"kind\":\"arrived\",\"rtp\":%llu,\"first_ns\":%llu,\"last_ns\":%llu,\"packets\":%u,\"bytes\":%zu,\"key\":%u,"
@@ -746,7 +1017,7 @@ static void on_channel_frame(IstessoMediaClient *client, const IstessoMediaFrame
     }
     if (vt_session == NULL || total == 0 || (vt_needs_key_frame && !frame->key_frame)) {
         vt_needs_key_frame = TRUE;
-        channel_ask_for_key_frame(client, now_ns());
+        channel_ask_for_key_frame(watch, now_ns());
         return;
     }
     CMBlockBufferRef block = NULL;
@@ -781,7 +1052,7 @@ static void on_channel_frame(IstessoMediaClient *client, const IstessoMediaFrame
     }
     vt_needs_key_frame = status != noErr;
     if (vt_needs_key_frame) {
-        channel_ask_for_key_frame(client, now_ns());
+        channel_ask_for_key_frame(watch, now_ns());
     } else if (frame->key_frame) {
         channel_asked_ns = 0;
     }
@@ -840,7 +1111,8 @@ static void log_stream(const char *event) {
     }
 }
 
-// Connects, receives and decodes, and connects again when the connection has ended.
+// Receives and decodes. The library connects, and connects again when the connection is cut;
+// here the window is told what to show meanwhile.
 static void *channel_thread(void *unused) {
     if (getenv("ISTESSO_RECEIVE_REALTIME") != NULL) {
         // Work once per frame (85 a second), a few milliseconds of it, to be done well within the frame.
@@ -852,46 +1124,87 @@ static void *channel_thread(void *unused) {
             fprintf(stderr, "note: the receiving thread was not given real-time scheduling\n");
         }
     }
-    gboolean reachable = TRUE;
+    IstessoMediaWatch *watch = istesso_media_watch_open(NULL, channel_address, getenv("ISTESSO_CHANNEL_PEER"));
+    if (watch == NULL) {
+        fprintf(stderr, "error: %s\n", istesso_media_last_error());
+        exit(2);
+    }
+    guint64 began = now_ns(), cut_at = 0;
+    gboolean ever = FALSE, said_unreachable = FALSE, back_pending = FALSE;
     for (;;) {
-        IstessoMediaClient *client = istesso_media_client_connect(NULL, channel_address, getenv("ISTESSO_CHANNEL_PEER"), 3000);
-        if (client == NULL) {
-            if (reachable) {
-                // Said once for each time the host goes away; the sentence holds no address.
-                fprintf(stderr, "note: no picture from the host: %s; trying again\n", istesso_media_last_error());
-                log_stream("unreachable");
-                reachable = FALSE;
-            }
-            usleep(500 * 1000);
-            continue;
-        }
-        reachable = TRUE;
-        if (istesso_media_client_info(client, &channel_info) != 0 || channel_info.codec != 1) {
-            fprintf(stderr, "error: the host sends its picture in a form this program cannot decode\n");
-            exit(1);
-        }
-        log_stream("connected");
-        vt_needs_key_frame = TRUE;
-        channel_asked_ns = 0;
-        for (;;) {
-            IstessoMediaFrame frame;
-            int32_t got = istesso_media_client_next(client, 250, &frame);
-            if (got < 0) {
-                break;
-            }
-            if (got == 1) {
-                on_channel_frame(client, &frame);
-            } else if (got == 2) {
-                IstessoMediaCursor cursor;
-                if (istesso_media_client_cursor(client, &cursor) == 1) {
-                    on_channel_cursor(&cursor);
+        IstessoMediaFrame frame;
+        int32_t got = istesso_media_watch_next(watch, 250, &frame);
+        if (got == 1) {
+            on_channel_frame(watch, &frame);
+            if (back_pending && !vt_needs_key_frame) {
+                // The first picture after the cut has been decoded and handed to the layer.
+                back_pending = FALSE;
+                guint64 t = now_ns();
+                if (frame_log != NULL) {
+                    fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"back\",\"gap_ms\":%.1f}\n",
+                            (unsigned long long)t, (double)(t - cut_at) / 1e6);
                 }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    picture_is_back();
+                });
             }
+        } else if (got == 2) {
+            IstessoMediaCursor cursor;
+            if (istesso_media_watch_cursor(watch, &cursor) == 1) {
+                on_channel_cursor(&cursor);
+            }
+        } else if (got == 3) {
+            // Cut, and nobody said why: the library is connecting again.
+            cut_at = now_ns();
+            back_pending = TRUE;
+            atomic_fetch_add(&picture_cuts, 1);
+            fprintf(stderr, "note: the picture's connection was cut; connecting again\n");
+            log_stream("ended");
+            log_reconnections("cut");
+            guint64 t = cut_at;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                show_counts();
+                picture_was_cut(t);
+            });
+        } else if (got == 4) {
+            IstessoMediaWatchState state;
+            memset(&state, 0, sizeof state);
+            istesso_media_watch_state(watch, &state);
+            if (istesso_media_watch_info(watch, &channel_info) != 0 || channel_info.codec != 1) {
+                fprintf(stderr, "error: the host sends its picture in a form this program cannot decode\n");
+                exit(1);
+            }
+            ever = TRUE;
+            if (frame_log != NULL) {
+                fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"connected\",\"again\":%u,\"silent_ms\":%llu}\n",
+                        (unsigned long long)now_ns(), state.again, (unsigned long long)state.silent_ms);
+            }
+            // A new connection begins with a key frame, and the decoder begins anew with it.
+            vt_needs_key_frame = TRUE;
+            channel_asked_ns = 0;
+        } else if (got < 0) {
+            // Over: the host said why, or refused. Not tried again.
+            IstessoMediaWatchState state;
+            memset(&state, 0, sizeof state);
+            istesso_media_watch_state(watch, &state);
+            fprintf(stderr, "note: no picture any more: %s\n", istesso_media_last_error());
+            if (frame_log != NULL) {
+                fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"over\",\"why\":%d}\n",
+                        (unsigned long long)now_ns(), state.why);
+                log_reconnections("end");
+                fflush(frame_log);
+            }
+            int32_t why = state.why;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                picture_is_over(why);
+            });
+            return NULL;
+        } else if (!ever && !said_unreachable && now_ns() - began > 1000000000ULL) {
+            // Said once; the sentence holds no address.
+            said_unreachable = TRUE;
+            fprintf(stderr, "note: no picture from the host yet; trying again\n");
+            log_stream("unreachable");
         }
-        fprintf(stderr, "note: the picture's connection is over: %s; connecting again\n", istesso_media_last_error());
-        log_stream("ended");
-        istesso_media_client_close(client);
-        usleep(200 * 1000);
     }
     return NULL;
 }
@@ -909,11 +1222,42 @@ static gboolean use_channel(NSView *view) {
     cursor_layer.contentsGravity = kCAGravityResize;
     [vt_layer addSublayer:cursor_layer];
     cursor_view = view;
+    // Above both: what is shown while the connection is being made again, or when it is over.
+    dim_layer = [CALayer layer];
+    dim_layer.zPosition = 20;
+    dim_layer.hidden = YES;
+    dim_layer.backgroundColor = CGColorCreateGenericGray(0, 0.5);
+    [vt_layer addSublayer:dim_layer];
+    note_box = [CALayer layer];
+    note_box.zPosition = 30;
+    note_box.hidden = YES;
+    note_box.cornerRadius = 8;
+    note_box.backgroundColor = CGColorCreateGenericGray(0.08, 0.92);
+    note_layer = [CATextLayer layer];
+    note_layer.wrapped = YES;
+    note_layer.alignmentMode = kCAAlignmentCenter;
+    note_layer.foregroundColor = CGColorGetConstantColor(kCGColorWhite);
+    [note_box addSublayer:note_layer];
+    [vt_layer addSublayer:note_box];
     const char *pin = getenv("ISTESSO_CURSOR_AT");
     double pin_x = 0, pin_y = 0;
     if (pin != NULL && sscanf(pin, "%lf,%lf", &pin_x, &pin_y) == 2) {
         cursor_pinned = YES;
         cursor_pin = NSMakePoint(pin_x, pin_y);
+    }
+    if (getenv("ISTESSO_PRETEND_TYPING") != NULL) {
+        static dispatch_source_t typing;
+        typing = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(typing, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC / 10, NSEC_PER_SEC / 100);
+        dispatch_source_set_event_handler(typing, ^{
+            // As a key press would be: noted when it would be passed on, counted when not.
+            if (picture_stale) {
+                held_back_count++;
+            } else {
+                note_press();
+            }
+        });
+        dispatch_resume(typing);
     }
     pthread_t thread;
     return pthread_create(&thread, NULL, channel_thread, NULL) == 0;
@@ -1003,6 +1347,9 @@ static gboolean start_frame_log(GstElement *pipeline, const char *path, gboolean
         stop[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, signals[i], 0, dispatch_get_main_queue());
         dispatch_source_set_event_handler(stop[i], ^{
             log_clock();
+            if (channel_address != NULL) {
+                log_reconnections("end");
+            }
             fflush(frame_log);
             exit(0);
         });
@@ -1046,6 +1393,7 @@ static BOOL command_is_control = YES;
 
 @implementation InputView {
     Keys _keys;          // keys that are down on the other side
+    unsigned _buttons;   // buttons that are down on the other side (bit 0: left, 1: right, 2: other)
     double _scroll[2];   // parts of a pixel not yet passed on
     BOOL _inside;        // the pointer is over the view
     NSPoint _at;         // where, in the view's own coordinates (from its bottom left)
@@ -1064,7 +1412,7 @@ static NSCursor *empty_cursor(void) {
 // that the application has hidden it. Cursor rectangles only work in the key window, which is
 // what is wanted: over a window that is not being used the Mac's cursor stays.
 - (void)resetCursorRects {
-    if (cursor_layer != nil && cursor_shape != 1) {
+    if (cursor_layer != nil && cursor_shape != 1 && !picture_stale) {
         [self addCursorRect:self.bounds cursor:empty_cursor()];
     } else {
         [super resetCursorRects];
@@ -1077,7 +1425,9 @@ static NSCursor *empty_cursor(void) {
         return;
     }
     BOOL here = cursor_pinned || (_inside && self.window.isKeyWindow);
-    BOOL show = here && cursor_shape == 2 && picture_width > 0 && self.bounds.size.width > 0;
+    // Not while the picture is being reconnected: the cursor is the host's, and the host's
+    // picture is not there.
+    BOOL show = here && !picture_stale && cursor_shape == 2 && picture_width > 0 && self.bounds.size.width > 0;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     if (show) {
@@ -1157,10 +1507,40 @@ static NSCursor *empty_cursor(void) {
     [self send:changes count:keys_let_go(&_keys, changes)];
 }
 
+// The line that says "what you type does not arrive" has come up: whatever is held on the other
+// side is let go there, keys and buttons. From here until the picture is back nothing is pressed.
+- (void)holdBack {
+    [self letGo];
+    for (unsigned i = 0; i < 3; i++) {
+        if (_buttons & (1u << i)) {
+            send_input("{\"kind\":\"button\",\"code\":%u,\"pressed\":false}", 0x110 + i);
+        }
+    }
+    _buttons = 0;
+}
+
+// The picture is back: the modifiers held on this keyboard are held on the other side again.
+// Buttons stay up there; one that is still held here counts as not held until it is let go
+// (pressing it over there now would begin a click or a drag where the pointer happens to be).
+- (void)fallInLine {
+    KeyChange changes[KEYS_MOST];
+    _keys.command_is_control = command_is_control;
+    [self send:changes count:keys_fall_in_line(&_keys, NSEvent.modifierFlags, changes)];
+}
+
 - (void)keyDown:(NSEvent *)event {
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
-    [self send:changes count:keys_key_down(&_keys, event.keyCode, event.modifierFlags, event.isARepeat, changes)];
+    size_t count = keys_key_down(&_keys, event.keyCode, event.modifierFlags, event.isARepeat, changes);
+    if (picture_stale) {
+        // Not pressed on the other side while the picture is not the host's of this moment.
+        bool dropped = false;
+        count = keys_hold_back(&_keys, changes, count, &dropped);
+        held_back_count += dropped ? 1 : 0;
+    } else if (count > 0) {
+        note_press();
+    }
+    [self send:changes count:count];
 }
 
 - (void)keyUp:(NSEvent *)event {
@@ -1181,7 +1561,13 @@ static NSCursor *empty_cursor(void) {
 - (void)flagsChanged:(NSEvent *)event {
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
-    [self send:changes count:keys_flags_changed(&_keys, event.keyCode, event.modifierFlags, changes)];
+    size_t count = keys_flags_changed(&_keys, event.keyCode, event.modifierFlags, changes);
+    if (picture_stale) {
+        // A modifier by itself is not something typed: not counted, and not pressed.
+        bool dropped = false;
+        count = keys_hold_back(&_keys, changes, count, &dropped);
+    }
+    [self send:changes count:count];
 }
 
 - (void)pointer:(NSEvent *)event {
@@ -1205,6 +1591,19 @@ static NSCursor *empty_cursor(void) {
 
 - (void)button:(unsigned)code pressed:(BOOL)pressed event:(NSEvent *)event {
     [self pointer:event];
+    unsigned bit = 1u << (code - 0x110);
+    if (pressed && picture_stale) {
+        // Not pressed on the other side while the picture is not the host's of this moment.
+        held_back_count++;
+        return;
+    }
+    if (!pressed && !(_buttons & bit)) {
+        return;  // It never went down over there, or was let go there already.
+    }
+    _buttons = pressed ? (_buttons | bit) : (_buttons & ~bit);
+    if (pressed) {
+        note_press();
+    }
     send_input("{\"kind\":\"button\",\"code\":%u,\"pressed\":%s}", code, pressed ? "true" : "false");
 }
 
@@ -1229,6 +1628,11 @@ static NSCursor *empty_cursor(void) {
     _scroll[0] -= event.scrollingDeltaX * scale;
     _scroll[1] -= event.scrollingDeltaY * scale;
     int dx = (int)_scroll[0], dy = (int)_scroll[1];
+    if (picture_stale) {
+        // Scrolling a picture that is not there moves something nobody sees.
+        _scroll[0] = _scroll[1] = 0;
+        return;
+    }
     if (dx != 0 || dy != 0) {
         _scroll[0] -= dx;
         _scroll[1] -= dy;
@@ -1367,6 +1771,14 @@ int main(int argc, char *argv[]) {
             // with VideoToolbox behind a pipeline.
             if (argc >= 8 && strcmp(argv[7], "-") != 0 && !start_frame_log(NULL, argv[7], TRUE)) {
                 return 1;
+            }
+            // How often the connections were cut is counted from here, and always shown.
+            log_reconnections("start");
+            counted_window = window;
+            counted_title = [window.title copy];
+            show_counts();
+            if (input_socket >= 0) {
+                watch_relay_state(argv[9]);
             }
             if (!use_channel(view)) {
                 fprintf(stderr, "error: cannot start the thread that receives\n");

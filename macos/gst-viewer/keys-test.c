@@ -90,6 +90,50 @@ int main(void) {
     EXPECT("Caps Lock is a press and a release", keys_flags_changed(&keys, CAPS, 0, out), 58, -58);
     EXPECT_NOTHING("a key that does not exist", keys_key_down(&keys, 0x7F, 0, false, out));
 
+    // While the picture is being reconnected nothing is pressed on the other side.
+    bool dropped = false;
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    EXPECT_NOTHING("a letter typed during a cut is not passed on",
+                   keys_hold_back(&keys, out, keys_key_down(&keys, A, 0, false, out), &dropped));
+    if (!dropped) {
+        failures++;
+        printf("FAILED: a press that was not passed on is said to have been dropped\n");
+    }
+    EXPECT_NOTHING("and its release is no news", keys_key_up(&keys, A, out));
+    EXPECT_NOTHING("a hotkey during a cut: neither the key nor the modifier lent to it",
+                   keys_hold_back(&keys, out, keys_key_down(&keys, A, KEYS_FLAG_COMMAND, false, out), &dropped));
+    EXPECT_NOTHING("nothing is down after it", keys_let_go(&keys, out));
+
+    // A key that went down before the cut comes up during it: that is passed on.
+    EXPECT("a letter goes down before the cut", keys_key_down(&keys, A, 0, false, out), 30);
+    dropped = false;
+    EXPECT("and comes up during it", keys_hold_back(&keys, out, keys_key_up(&keys, A, out), &dropped), -30);
+    if (dropped) {
+        failures++;
+        printf("FAILED: letting go is not a press that was dropped\n");
+    }
+
+    // Shift pressed during the cut is not passed on; when the picture is back and Shift is
+    // still held, it goes down then.
+    EXPECT_NOTHING("Shift pressed during a cut",
+                   keys_hold_back(&keys, out,
+                                  keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out), &dropped));
+    EXPECT("the picture is back and Shift is held", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out), 42);
+    EXPECT_NOTHING("in line already", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out));
+    EXPECT("a letter under it is plain again", keys_key_down(&keys, A, KEYS_FLAG_SHIFT, false, out), 30);
+    // Shift was let go while nobody was told (the window lost the keyboard meanwhile, say).
+    EXPECT("Shift is not held any more: it comes up, the letter stays", keys_fall_in_line(&keys, 0, out), -42);
+    EXPECT("the letter comes up by itself", keys_key_up(&keys, A, out), -30);
+
+    // Command goes over as Control, and falls in line as Control.
+    EXPECT("Command held when the picture is back", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, out), 29);
+    EXPECT_NOTHING("Control and Command are one key over there", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_CONTROL, out));
+    EXPECT("both let go", keys_fall_in_line(&keys, 0, out), -29);
+    keys.command_is_control = false;
+    EXPECT("Command as Super", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, out), 125);
+    EXPECT("and let go", keys_fall_in_line(&keys, 0, out), -125);
+
     if (failures == 0) {
         printf("keys: all tests passed\n");
     }
