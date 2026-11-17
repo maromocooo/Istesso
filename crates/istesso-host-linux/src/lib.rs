@@ -22,5 +22,7 @@ pub mod options;
 pub mod picture;
 pub mod render;
 #[cfg(feature = "pipeline")]
+pub mod session;
+#[cfg(feature = "pipeline")]
 pub mod stage;
 pub mod words;
