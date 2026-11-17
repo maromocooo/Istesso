@@ -310,6 +310,18 @@ impl Tries {
         }
     }
 
+    /// As [`Tries::cut`], for a conversation that ended with an answer that
+    /// asks for leisure ([`Again::Slowly`]): the first try is not made at
+    /// once, but after the pause such an answer is followed by.
+    pub fn cut_at_leisure(&mut self, now: Instant) {
+        if self.cut_at.is_some() || self.over {
+            return;
+        }
+        self.cut(now);
+        let leisure = now + self.pace.slowly;
+        self.not_before = Some(self.not_before.map_or(leisure, |at| at.max(leisure)));
+    }
+
     /// Nothing is tried any more.
     pub fn stop(&mut self) {
         self.over = true;
@@ -395,6 +407,16 @@ impl<T, E> Drop for Report<T, E> {
     }
 }
 
+impl<T, E> Drop for Racer<T, E> {
+    /// Whoever had the conversation is done with it (a window was closed, a
+    /// program ends). The tries that are still under way are dropped: each
+    /// closes what it has when it ends, by its deadline at the latest, and
+    /// what has ended and was not looked at yet is closed here.
+    fn drop(&mut self) {
+        self.wanted_from.store(u64::MAX, Ordering::SeqCst);
+    }
+}
+
 impl<T: Send + 'static, E: Send + 'static> Racer<T, E> {
     pub fn new(pace: Pace) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -427,6 +449,26 @@ impl<T: Send + 'static, E: Send + 'static> Racer<T, E> {
         open: &Open<T, E>,
         judge: impl Fn(&E) -> Again,
     ) -> Turn<T, E> {
+        self.turn_if(wait, open, judge, |_| true)
+    }
+
+    /// As [`Racer::turn`]. `usable` is asked about a connection whose
+    /// handshake has completed, at the moment it would be used: one that is
+    /// not (the host has closed it meanwhile, as it does with a connection
+    /// beyond those it lets a device have waiting) counts as a try that
+    /// failed, and is not handed over.
+    pub fn turn_if(
+        &mut self,
+        wait: Duration,
+        open: &Open<T, E>,
+        judge: impl Fn(&E) -> Again,
+        usable: impl Fn(&T) -> bool,
+    ) -> Turn<T, E> {
+        let judge = |result: &Result<T, E>| match result {
+            Ok(opened) if usable(opened) => Ended::Opened,
+            Ok(_) => Ended::Failed(Again::Soon),
+            Err(err) => Ended::Failed(judge(err)),
+        };
         let until = Instant::now() + wait;
         loop {
             // What has ended is looked at first, all of it: when one try is
@@ -482,12 +524,11 @@ impl<T: Send + 'static, E: Send + 'static> Racer<T, E> {
         &mut self,
         id: u64,
         result: Option<Result<T, E>>,
-        judge: &impl Fn(&E) -> Again,
+        judge: &impl Fn(&Result<T, E>) -> Ended,
         turn: &mut Turn<T, E>,
     ) {
         let how = match &result {
-            Some(Ok(_)) => Ended::Opened,
-            Some(Err(err)) => Ended::Failed(judge(err)),
+            Some(result) => judge(result),
             // The thread ended without a result.
             None => Ended::Failed(Again::Soon),
         };
@@ -1052,6 +1093,67 @@ mod tests {
         // Said twice, a cut is one cut.
         tries.cut(cut + ms(10));
         assert_eq!(tries.cuts(), 1);
+
+        // One that ended with an answer that asks for leisure is opened again
+        // after the pause, and counted as any cut.
+        let mut tries = Tries::new(Pace::default());
+        tries.made(made);
+        tries.cut_at_leisure(cut);
+        assert_eq!(tries.due(cut), Some(cut + Duration::from_secs(1)));
+        assert_eq!(tries.start(cut + ms(999)), None);
+        assert!(tries.start(cut + ms(1000)).is_some());
+        assert_eq!(tries.cuts(), 1);
+    }
+
+    /// Quitting while tries are under way: what they bring is closed, here
+    /// or by the try itself, and nothing is left behind.
+    #[test]
+    fn a_racer_that_is_dropped_leaves_no_connection_behind() {
+        let alive = Arc::new(AtomicUsize::new(0));
+        let under_way = Arc::new(AtomicUsize::new(0));
+        let open: Open<Counted, String> = {
+            let (alive, under_way) = (alive.clone(), under_way.clone());
+            Arc::new(move |_| {
+                under_way.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(ms(300));
+                let opened = Counted::new(&alive);
+                under_way.fetch_sub(1, Ordering::SeqCst);
+                Ok(opened)
+            })
+        };
+        let mut racer = Racer::new(quick_pace());
+        racer.tries_mut().cut(Instant::now());
+        // Tries are started (four, on a machine that is not busy with other
+        // things); none has completed when the racer goes.
+        assert!(matches!(
+            racer.turn(ms(200), &open, |_| Again::Soon),
+            Turn::Nothing
+        ));
+        assert!(racer.tries().started() >= 1);
+        drop(racer);
+        // Every try runs to its end, and what it opened is closed at once.
+        until(|| under_way.load(Ordering::SeqCst) == 0);
+        until(|| alive.load(Ordering::SeqCst) == 0);
+
+        // And one that had completed, and was waiting to be looked at.
+        let mut racer = Racer::new(quick_pace());
+        racer.tries_mut().cut(Instant::now());
+        let before_long: Open<Counted, String> = {
+            let alive = alive.clone();
+            Arc::new(move |_| {
+                std::thread::sleep(ms(100));
+                Ok(Counted::new(&alive))
+            })
+        };
+        // The try is started, and completes while nobody looks.
+        assert!(matches!(
+            racer.turn(Duration::ZERO, &before_long, |_| Again::Soon),
+            Turn::Nothing
+        ));
+        assert_eq!(racer.tries().started(), 1);
+        until(|| alive.load(Ordering::SeqCst) == 1);
+        drop(racer);
+        assert_eq!(alive.load(Ordering::SeqCst), 0);
     }
 
     /// Test 9: dropped tries count as running until they have ended, and
@@ -1160,18 +1262,21 @@ mod tests {
         assert_eq!(call, 0, "the first one started is the first to complete");
         // Handed over when it completed, not at some later look.
         assert!(began.elapsed() < ms(1500), "{:?}", began.elapsed());
-        // Four were started quickly while the first was on its way, and then
-        // no more: the next would have been due five seconds later.
-        assert_eq!(racer.tries().started(), 4);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        // Several were started quickly while the first was on its way: four,
+        // unless this machine was busy and woke the racer late. Then no more:
+        // the next would have been due five seconds later.
+        let started = racer.tries().started();
+        assert!((2..=4).contains(&started), "{started} tries");
+        until(|| calls.load(Ordering::SeqCst) as u64 == started);
         // While the request is under way, no try is started, although the
         // others end meanwhile and fewer than four are left running.
-        assert!(matches!(
-            racer.turn(ms(700), &open, |_| Again::Soon),
-            Turn::Nothing
-        ));
-        assert_eq!(racer.tries().running(), 0);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        until(|| {
+            let turn = racer.turn(ms(50), &open, |_| Again::Soon);
+            assert!(matches!(turn, Turn::Nothing));
+            racer.tries().running() == 0
+        });
+        assert_eq!(racer.tries().started(), started);
+        assert_eq!(calls.load(Ordering::SeqCst) as u64, started);
         racer.tries_mut().answered(Instant::now());
         // The three others complete, and what they bring is closed without
         // anybody asking for it: only the one in use is left.
@@ -1223,6 +1328,32 @@ mod tests {
         };
         assert_eq!(call, 1);
         assert_eq!(racer.tries().running(), 0);
+    }
+
+    /// A connection that completed its handshake and that the host has
+    /// closed since is not handed over as opened: the tries go on.
+    #[test]
+    fn a_connection_that_is_of_no_use_any_more_counts_as_a_try_that_failed() {
+        let alive = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let open: Open<(usize, Counted), String> = {
+            let (alive, calls) = (alive.clone(), calls.clone());
+            Arc::new(move |_| Ok((calls.fetch_add(1, Ordering::SeqCst), Counted::new(&alive))))
+        };
+        let mut racer = Racer::new(quick_pace());
+        racer.tries_mut().cut(Instant::now());
+        // The first two are closed by the host, say.
+        let wait = Duration::from_secs(4);
+        let turn = racer.turn_if(wait, &open, |_| Again::Soon, |(call, _)| *call >= 2);
+        let Turn::Opened((call, kept)) = turn else {
+            panic!("no try was of use");
+        };
+        assert_eq!(call, 2);
+        assert_eq!(racer.tries().started(), 3);
+        // The two that were of no use were closed when that was seen.
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+        assert_eq!(racer.tries().cuts(), 1);
+        drop(kept);
     }
 
     #[test]

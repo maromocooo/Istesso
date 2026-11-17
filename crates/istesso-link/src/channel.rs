@@ -234,6 +234,21 @@ impl Channel<TcpStream> {
         })
     }
 
+    /// As [`Channel::recv`], with the whole message there by `by`, however
+    /// slowly the other device sends it: every read is given what is left
+    /// of the time, not a wait of its own. A device that sends a byte now
+    /// and then gets no further than one that sends nothing.
+    ///
+    /// Afterwards the connection's wait for a read is whatever was left at
+    /// the last one: whoever goes on reading sets it anew.
+    pub fn recv_by(&mut self, by: Instant) -> Result<Vec<u8>> {
+        let mut hurried = Hurried {
+            stream: &self.stream,
+            until: by,
+        };
+        receive(&mut hurried, &mut self.transport, &mut self.scratch)
+    }
+
     /// Opens a channel as the answering side, as [`Channel::respond`] does,
     /// with the whole handshake over `within` this time, however slowly the
     /// other device sends. Until it is over nobody knows who is calling: a
@@ -402,41 +417,52 @@ impl<S: Read + Write> Channel<S> {
     /// Waits for the next message. [`Error::Closed`] means the other end hung
     /// up.
     pub fn recv(&mut self) -> Result<Vec<u8>> {
-        let mut plain: Vec<u8> = Vec::new();
-        let mut expected: Option<usize> = None;
-        loop {
-            let frame = read_frame(&mut self.stream, MAX_FRAME)?;
-            let n = self
-                .transport
-                .read_message(&frame, &mut self.scratch)
-                .map_err(Error::crypto)?;
-            if n == 0 {
-                return Err(Error::Malformed);
-            }
-            plain.extend_from_slice(&self.scratch[..n]);
+        receive(&mut self.stream, &mut self.transport, &mut self.scratch)
+    }
+}
 
-            let total = match expected {
-                Some(total) => total,
-                None => {
-                    if plain.len() < 4 {
-                        return Err(Error::Malformed);
-                    }
-                    let len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
-                    if len > MAX_MESSAGE {
-                        return Err(Error::TooLarge);
-                    }
-                    expected = Some(4 + len);
-                    4 + len
+/// Reads one message from `stream` and opens it. What [`Channel::recv`]
+/// does; apart from it only so that the same reading can be given one
+/// deadline for all of it ([`Channel::recv_by`]). Nothing differs but the
+/// waiting.
+fn receive<R: Read>(
+    stream: &mut R,
+    transport: &mut snow::TransportState,
+    scratch: &mut [u8],
+) -> Result<Vec<u8>> {
+    let mut plain: Vec<u8> = Vec::new();
+    let mut expected: Option<usize> = None;
+    loop {
+        let frame = read_frame(stream, MAX_FRAME)?;
+        let n = transport
+            .read_message(&frame, scratch)
+            .map_err(Error::crypto)?;
+        if n == 0 {
+            return Err(Error::Malformed);
+        }
+        plain.extend_from_slice(&scratch[..n]);
+
+        let total = match expected {
+            Some(total) => total,
+            None => {
+                if plain.len() < 4 {
+                    return Err(Error::Malformed);
                 }
-            };
-            match plain.len().cmp(&total) {
-                Ordering::Less => continue,
-                Ordering::Equal => {
-                    plain.drain(..4);
-                    return Ok(plain);
+                let len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+                if len > MAX_MESSAGE {
+                    return Err(Error::TooLarge);
                 }
-                Ordering::Greater => return Err(Error::Malformed),
+                expected = Some(4 + len);
+                4 + len
             }
+        };
+        match plain.len().cmp(&total) {
+            Ordering::Less => continue,
+            Ordering::Equal => {
+                plain.drain(..4);
+                return Ok(plain);
+            }
+            Ordering::Greater => return Err(Error::Malformed),
         }
     }
 }

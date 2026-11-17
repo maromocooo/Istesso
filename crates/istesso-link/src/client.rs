@@ -199,6 +199,38 @@ impl Client {
         }
     }
 
+    /// As [`Client::open_input_alive`], with the whole answer there by
+    /// `by`, however slowly it comes. Afterwards each wait for the other
+    /// device may take `then`.
+    pub fn open_input_alive_by(&mut self, by: Instant, then: Duration) -> Result<InputAnswer> {
+        let bytes = serde_json::to_vec(&Request::InputOpen { alive: true })
+            .map_err(|_| Error::Malformed)?;
+        let left = by
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(Error::Timeout)?;
+        self.channel
+            .stream()
+            .set_write_timeout(Some(left))
+            .map_err(Error::from_io)?;
+        self.channel.send(&bytes)?;
+        let answer = self.channel.recv_by(by);
+        self.set_timeout(then)?;
+        match serde_json::from_slice(&answer?).map_err(|_| Error::Malformed)? {
+            Response::InputOpen { alive } => Ok(InputAnswer::Open { alive }),
+            Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Whether the other device has closed this conversation already, as
+    /// far as that can be seen without waiting. A host that has as many
+    /// connections of this device waiting as it holds closes a further one
+    /// right after the handshake; such a connection is not one to ask on.
+    pub fn closed_by_peer(&self) -> bool {
+        matches!(self.something_has_arrived(), Err(Error::Closed))
+    }
+
     /// Whether the other device has said "still here" since this was last
     /// asked. Takes what has arrived and waits for nothing: sending input
     /// is never held up by it. An error means that the connection is over.

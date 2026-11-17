@@ -109,6 +109,41 @@ impl Session {
         }
     }
 
+    /// As [`Session::next_request`], for the first request of a
+    /// conversation: it has to be there, whole, by `by`, however slowly the
+    /// caller sends it, and whatever the caller sends before it. A request
+    /// this version does not know is answered and does not add to the time;
+    /// a byte now and then does not either. `Ok(None)` means that the time
+    /// is up or the caller is gone. Afterwards each wait for the caller may
+    /// take `then`.
+    ///
+    /// Until its first request a paired device has asked for nothing, and
+    /// holds one of a few places ([`crate::waiting`]): it must not be able
+    /// to hold it for longer than it was given.
+    pub fn first_request_by(
+        &mut self,
+        by: std::time::Instant,
+        then: Duration,
+    ) -> Result<Option<Request>> {
+        loop {
+            let bytes = match self.channel.recv_by(by) {
+                Ok(bytes) => bytes,
+                Err(Error::Closed | Error::Timeout) => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            match serde_json::from_slice::<Request>(&bytes) {
+                Ok(request) => {
+                    self.set_wait(then)?;
+                    return Ok(Some(request));
+                }
+                Err(_) => self.respond(&Response::error(
+                    ErrorCode::Unsupported,
+                    "this version of istesso does not know that request",
+                ))?,
+            }
+        }
+    }
+
     pub fn respond(&mut self, response: &Response) -> Result<()> {
         let bytes = serde_json::to_vec(response).map_err(|_| Error::Malformed)?;
         self.channel.send(&bytes)
@@ -369,5 +404,96 @@ mod tests {
         let _client = Client::connect(addr, &keys, &air_trusts.store, None, TIMEOUT).unwrap();
         // The client says nothing; the host gives up on its own.
         assert!(matches!(host.join().unwrap(), Ok(None)));
+    }
+
+    /// The first request has one time for all of it. A paired caller that
+    /// sends requests this version does not know, each well inside a single
+    /// wait, is answered every time, and is let go of when the time is up;
+    /// one that then asks properly would have been served, and a later wait
+    /// is as long as it was said to be.
+    #[test]
+    fn the_first_request_has_one_deadline_whatever_comes_before_it() {
+        use std::time::Instant;
+
+        let air = Identity::generate();
+        let studio = Identity::generate();
+        let air_trusts = TempStore::trusting(&[("Mac Studio", &studio)]);
+        let studio_trusts = TempStore::trusting(&[("MacBook Air", &air)]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = thread::spawn(move || {
+            let keys = LocalKeys::new(&studio).unwrap();
+            let mut waited = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut session =
+                    Session::accept(stream, &keys, &studio_trusts.store, TIMEOUT).unwrap();
+                let began = Instant::now();
+                let by = began + Duration::from_secs(1);
+                let first = session.first_request_by(by, Duration::from_millis(900));
+                waited.push((first, began.elapsed()));
+                // A caller that asked in time is a conversation from there on.
+                if let Some((Ok(Some(_)), _)) = waited.last() {
+                    session.respond(&Response::Pong).unwrap();
+                    let began = Instant::now();
+                    assert!(matches!(session.next_request(), Ok(None)));
+                    waited.push((Ok(None), began.elapsed()));
+                }
+            }
+            waited
+        });
+
+        let keys = LocalKeys::new(&air).unwrap();
+        let connect = || {
+            let stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            Channel::initiate(stream, &keys, |key| {
+                air_trusts
+                    .store
+                    .find_by_key(key)
+                    .map(|_| ())
+                    .ok_or(Error::UnknownPeer)
+            })
+            .unwrap()
+        };
+        // The first caller never asks anything this version knows.
+        let mut junk = connect();
+        let began = Instant::now();
+        let mut answered = 0;
+        while began.elapsed() < Duration::from_secs(4) {
+            if junk.send(br#"{"type":"teleport"}"#).is_err() {
+                break;
+            }
+            match junk.recv() {
+                Ok(_) => answered += 1,
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(60));
+        }
+        assert!(answered >= 2, "{answered} answers");
+        // The second asks after a junk request, in time, and then says nothing.
+        let mut proper = connect();
+        proper.send(br#"{"type":"teleport"}"#).unwrap();
+        proper.recv().unwrap();
+        proper.send(br#"{"type":"ping"}"#).unwrap();
+        let answer: Response = serde_json::from_slice(&proper.recv().unwrap()).unwrap();
+        assert_eq!(answer, Response::Pong);
+
+        let waited = host.join().unwrap();
+        let (first, took) = &waited[0];
+        assert!(matches!(first, Ok(None)), "{first:?}");
+        assert!(
+            *took >= Duration::from_millis(900) && *took < Duration::from_millis(2500),
+            "the first request was waited for {took:?}"
+        );
+        let (second, _) = &waited[1];
+        assert!(matches!(second, Ok(Some(Request::Ping))), "{second:?}");
+        // The wait after the first request is the one that was asked for.
+        let (_, silent) = &waited[2];
+        assert!(
+            *silent >= Duration::from_millis(800) && *silent < Duration::from_millis(2500),
+            "the next request was waited for {silent:?}"
+        );
     }
 }
