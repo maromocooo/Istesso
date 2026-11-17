@@ -396,9 +396,10 @@ fn open_there(
         Progress::Paused(_) => {
             stopped = true;
             eprintln!(
-                "The picture of {name} is stopped: {host} makes as many pictures at once as \
-                 it can, and other windows were turned to after this one. {name} runs on. \
-                 Turn to its window to bring the picture back."
+                "The picture of {name} is stopped: {host} can make no more pictures at once \
+                 for now, and the windows that were turned to last come first. {name} runs \
+                 on. Turn to its window to bring the picture back; if {host} can make none \
+                 at all, it tries again by itself."
             )
         }
         Progress::Resumed if stopped => {

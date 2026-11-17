@@ -1335,6 +1335,37 @@ fn a_single_window_whose_encoder_is_refused_waits_and_tries_again() {
 }
 
 #[test]
+fn a_refusal_from_a_window_that_holds_no_encoder_changes_nothing() {
+    let host = host();
+    let first = host.running().id;
+    let second = session(host.start_as(&host.laptop, "paint.desktop")).id;
+    host.follow_until(&second, SessionState::Running);
+    // The second window cannot be seen: it holds no encoder.
+    let hidden = session(host.ask(
+        &host.laptop,
+        Request::SessionShow {
+            session: second.clone(),
+            attachment: 1,
+            visible: false,
+        },
+    ));
+    assert_eq!(hidden.paused, Some(PauseReason::Hidden));
+    host.journal.wait_for("runner pause", 1);
+    // Its runner says, late, that the encoder was refused. The host does
+    // not count fewer pictures for that: the first window keeps its own.
+    host.runner.say(StreamEvent::Said(RunnerEvent::NoEncoder {
+        message: String::new(),
+    }));
+    std::thread::sleep(Duration::from_millis(150));
+    let paused = |id: &SessionId| host.sessions.host_look(id).unwrap().info.paused;
+    assert_eq!(
+        (paused(&first), paused(&second)),
+        (None, Some(PauseReason::Hidden))
+    );
+    assert_eq!(host.journal.count("runner pause"), 1);
+}
+
+#[test]
 fn a_session_can_be_there_and_hold_no_encoder() {
     let host = host();
     let id = host.running().id;

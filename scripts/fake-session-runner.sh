@@ -17,6 +17,9 @@
 #
 #   ISTESSO_FAKE_RUNNER_FAIL_AFTER=<seconds>   end with an error that long after `ready`, the
 #                                              way a runner does whose stream broke
+#   ISTESSO_FAKE_RUNNER_NO_ENCODER_AFTER=<seconds>
+#                                              say that long after `ready` that the encoder was
+#                                              refused, once, and go on
 set -u
 
 field() {  # the text of "name":"..." in a line
@@ -46,6 +49,14 @@ if [ -n "${ISTESSO_FAKE_RUNNER_FAIL_AFTER:-}" ]; then
     exit 1
 fi
 
+if [ -n "${ISTESSO_FAKE_RUNNER_NO_ENCODER_AFTER:-}" ]; then
+    (
+        sleep "$ISTESSO_FAKE_RUNNER_NO_ENCODER_AFTER"
+        echo "fake runner: the encoder is refused, on purpose; no picture is made for now" >&2
+        echo '{"v":1,"event":"no_encoder","message":"refused on purpose"}'
+    ) &
+fi
+
 application=
 attachment=1
 # Until the agent closes the input: that is how a runner is told that the session is over.
@@ -68,7 +79,7 @@ while IFS= read -r line; do
         echo "fake runner: no picture is made for now; the encoder is given back" >&2
         ;;
     *'"cmd":"resume"'*)
-        echo "fake runner: the picture is made again" >&2
+        echo "fake runner: the picture is made again; the encoder is opened anew" >&2
         ;;
     *'"cmd":"close"'*)
         if [ -n "$application" ]; then

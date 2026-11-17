@@ -16,8 +16,8 @@
 #   M3_HOST_DIR='$HOME/.cache/istesso-m3-wip'       on the host
 #   M3_WORK=<directory>                             for the client's files; made if missing
 #
-#   scripts/m3-trial.sh [leave] [unsaved] [lost] [host] [slots] [nobody] [broken]
-#                                                   (all seven when none is named)
+#   scripts/m3-trial.sh [leave] [unsaved] [lost] [host] [slots] [refused] [nobody] [broken]
+#                                                   (all eight when none is named)
 #
 # Every part takes well under a minute. The script ends with the number of checks that failed.
 # Taking a pairing away is not tried here, because that would change the list of paired
@@ -32,7 +32,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${M3_BIN:-$HERE/target/debug/istesso}
 WORK=${M3_WORK:-${TMPDIR:-/tmp}/istesso-m3-trial}
 VIEWER=$HERE/scripts/fake-viewer.sh
-[ $# -gt 0 ] || set -- leave unsaved lost host slots nobody broken
+[ $# -gt 0 ] || set -- leave unsaved lost host slots refused nobody broken
 
 mkdir -p "$WORK"
 export ISTESSO_CACHE_DIR="$WORK/cache"
@@ -64,12 +64,14 @@ nothing_listed() { sessions | grep -q "No application"; }
 sessions() { "$BIN" sessions 2>/dev/null; }
 session_of() { sessions | awk -v app="$1" 'index($0, app) { print $1; exit }'; }
 agent=none
-agent_as() {  # plain, scarce, broken or bare: has the trial agent run that way
+agent_as() {  # plain, scarce, refused, broken or bare: has the trial agent run that way
     [ "$agent" = "$1" ] && return 0
     case $1 in
     plain) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run' ;;
     # It has one encoder to give.
     scarce) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run ISTESSO_ENCODER_SLOTS=1' ;;
+    # Its runner is refused the encoder four seconds after it started, and goes on.
+    refused) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run ISTESSO_FAKE_RUNNER_NO_ENCODER_AFTER=4' ;;
     # Its runner gives up three seconds after it started.
     broken) how='XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache ISTESSO_RUNTIME_DIR=$D/run ISTESSO_FAKE_RUNNER_FAIL_AFTER=3' ;;
     # What a machine offers that was switched on a moment ago and that nobody has logged in
@@ -77,12 +79,22 @@ agent_as() {  # plain, scarce, broken or bare: has the trial agent run that way
     bare) how='env -i HOME=$HOME PATH=/usr/bin:/bin XDG_DATA_HOME=$D/data ISTESSO_CACHE_DIR=$D/cache' ;;
     *) return 1 ;;
     esac
-    on_host 'cd $D && { [ -f agent.pid ] && kill "$(cat agent.pid)" 2>/dev/null; sleep 0.3; : > agent.log; : > notes/saved; : > notes/unsaved;
+    stop_agent
+    on_host 'cd $D && { sleep 0.3; : > agent.log; : > notes/saved; : > notes/unsaved;
         '"$how"' nohup src/target/debug/istesso agent --port '"$PORT"' --bind :: \
             --no-discovery --session-runner $D/src/scripts/fake-session-runner.sh > agent.log 2>&1 < /dev/null &
         echo $! > agent.pid
         for _ in 1 2 3 4 5 6 7 8 9 10; do grep -q "Answering paired devices" agent.log && break; sleep 0.3; done
-        grep -q "Answering paired devices" agent.log; }' && agent=$1
+        grep -q "Answering paired devices" agent.log || { echo "  the trial agent said: $(tail -n 2 agent.log)" >&2; false; }; }' && agent=$1
+}
+stop_agent() {  # stops the trial agent, and nothing else
+    # The number in the file is only trusted while it names the agent of this trial: a number
+    # that was left behind can belong to another process by now.
+    on_host 'cd $D && { pid=$(cat agent.pid 2>/dev/null)
+        if [ -n "$pid" ] && tr "\0" " " < /proc/$pid/cmdline 2>/dev/null | grep -q -- "istesso agent --port '"$PORT"' "; then
+            kill "$pid" 2>/dev/null
+        fi
+        : > agent.pid; }'
 }
 host_cli() {  # plain or bare, then a command: runs it on the host, as the person there would from a login
     case $1 in
@@ -249,6 +261,26 @@ for part in "$@"; do
         done
         check "both are ended afterwards" nothing_listed
         ;;
+    refused)
+        echo "== the encoder is refused in the middle of a run =="
+        check "the trial agent starts again, with a runner that is refused the encoder after 4 seconds" agent_as refused
+        "$BIN" open "istesso m3 saved" --viewer "$VIEWER" > "$WORK/refused-1.txt" 2>&1 &
+        cli=$!
+        check "the application starts and is shown" wait_for "$WORK/refused-1.txt" "is running on" 20
+        check "the person is told that the picture is stopped" wait_for "$WORK/refused-1.txt" "The picture of Istesso M3 Saved is stopped" 10
+        check "the viewer is told as well" wait_for "$WORK/refused-1.txt" "fake viewer: the picture is stopped (no_slot)" 5
+        check "the agent wrote down what happened" on_host 'grep -q "the encoder was refused: refused on purpose" $D/agent.log'
+        sessions > "$WORK/refused-list.txt"
+        check "the session is as it was, shown here, with the reason" said "$WORK/refused-list.txt" "Istesso M3 Saved.*picture stopped: no encoder is free"
+        check "nothing ended: the application runs on the host" app_runs saved
+        check "the command is still there" kill -0 $cli
+        kill -INT $cli
+        wait $cli
+        for id in $(sessions | awk '/Istesso M3/ { print $1 }'); do
+            "$BIN" sessions stop "$id" --force > /dev/null 2>&1
+        done
+        check "it is ended afterwards" nothing_listed
+        ;;
     nobody)
         echo "== a host nobody is logged in at: no runtime directory, no desktop =="
         check "the trial agent starts in an empty environment" agent_as bare
@@ -278,6 +310,7 @@ for part in "$@"; do
 done
 
 echo "== cleaning up =="
-on_host '[ -f $D/agent.pid ] && kill "$(cat $D/agent.pid)" 2>/dev/null; echo "  the trial agent is stopped"'
+stop_agent
+echo "  the trial agent is stopped"
 echo "$failed checks failed"
 [ "$failed" -eq 0 ]

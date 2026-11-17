@@ -1326,21 +1326,35 @@ impl Inner {
     /// which stops the picture of the window that was turned to longest
     /// ago; that window's report says why, so that its client can tell
     /// the person.
+    ///
+    /// A session that holds no slot has nothing to be refused: nobody is
+    /// shown it, its window cannot be seen, or it was just told to stop.
+    /// What its runner says then changes nothing.
     fn encoder_refused(&self, job: &Job, why: &str) {
+        fn makes_a_picture(entry: &Entry) -> bool {
+            entry.ended_at.is_none()
+                && matches!(
+                    entry.info.state,
+                    SessionState::Starting | SessionState::Running
+                )
+                && !entry.hidden
+                && entry.info.paused.is_none()
+        }
         let makes = {
             let mut table = self.lock();
+            if !table.sessions.get(&job.id.0).is_some_and(makes_a_picture) {
+                drop(table);
+                (self.log)(format!(
+                    "session {}: its runner says that the encoder was refused, while the \
+                     session holds none; nothing changes",
+                    job.id
+                ));
+                return;
+            }
             let making = table
                 .sessions
                 .values()
-                .filter(|entry| {
-                    entry.ended_at.is_none()
-                        && matches!(
-                            entry.info.state,
-                            SessionState::Starting | SessionState::Running
-                        )
-                        && !entry.hidden
-                        && entry.info.paused.is_none()
-                })
+                .filter(|entry| makes_a_picture(entry))
                 .count();
             // The one that was refused counted as making a picture.
             let makes = making.saturating_sub(1);
