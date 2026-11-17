@@ -39,6 +39,11 @@ struct Args {
     #[arg(long, value_name = "TIMES", default_value_t = 0)]
     keep_when_asked: u32,
 
+    /// Open the first window only this long after the process started, as
+    /// an application does that is slow to start
+    #[arg(long, value_name = "MS")]
+    open_after: Option<u64>,
+
     /// Close the window without being asked, this long after it opened
     #[arg(long, value_name = "MS")]
     close_after: Option<u64>,
@@ -90,6 +95,8 @@ fn parse_size(text: &str) -> Result<(u32, u32), String> {
 /// Where the application is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    /// No window yet: the application is slow to start.
+    Before,
     /// The first window is shown.
     Splash,
     /// No window, and one is to come.
@@ -121,21 +128,36 @@ struct Life {
 impl Life {
     /// How it begins.
     fn begin(args: Args) -> (Self, Next) {
-        let (phase, time) = match args.splash {
-            Some(ms) => (Phase::Splash, Some(Duration::from_millis(ms))),
-            None => (Phase::Main, args.close_after.map(Duration::from_millis)),
-        };
-        let life = Life {
+        let mut life = Life {
             args,
-            phase,
+            phase: Phase::Before,
             asked: 0,
         };
-        (life, Next::Go(phase, time))
+        let next = match life.args.open_after {
+            Some(ms) => Next::Go(Phase::Before, Some(Duration::from_millis(ms))),
+            None => life.first_window(),
+        };
+        if let Next::Go(phase, _) = next {
+            life.phase = phase;
+        }
+        (life, next)
+    }
+
+    /// The first window there is: a splash, or the window itself.
+    fn first_window(&self) -> Next {
+        match self.args.splash {
+            Some(ms) => Next::Go(Phase::Splash, Some(Duration::from_millis(ms))),
+            None => Next::Go(
+                Phase::Main,
+                self.args.close_after.map(Duration::from_millis),
+            ),
+        }
     }
 
     /// The time the present phase was given is over.
     fn time_is_up(&mut self) -> Next {
         let next = match self.phase {
+            Phase::Before => self.first_window(),
             Phase::Splash => Next::Go(Phase::Gap, Some(Duration::from_millis(self.args.gap))),
             Phase::Gap => Next::Go(
                 Phase::Main,
@@ -206,6 +228,8 @@ impl App {
         let (width, height) = args.size;
         let attributes = Window::default_attributes()
             .with_title(args.title.clone())
+            // Inside a host's compositor the device draws the window's frame.
+            .with_decorations(false)
             .with_inner_size(LogicalSize::new(f64::from(width), f64::from(height)));
         let window = Rc::new(
             event_loop
@@ -260,6 +284,7 @@ impl App {
                 self.until = time.map(|time| Instant::now() + time);
                 let ms = time.map_or(0, |time| time.as_millis());
                 match phase {
+                    Phase::Before => println!("no window yet, for {ms} ms"),
                     Phase::Splash => {
                         self.open(event_loop)?;
                         println!("first window open, for {ms} ms");
@@ -434,6 +459,16 @@ mod tests {
         );
         assert_eq!(life.time_is_up(), Next::Go(Phase::Main, None));
         assert_eq!(life.asked_to_close(), Some(Next::End));
+        // A slow start comes before either.
+        let (mut life, first) = self::life(&["--open-after", "8000", "--splash", "700"]);
+        assert_eq!(
+            first,
+            Next::Go(Phase::Before, Some(Duration::from_millis(8000)))
+        );
+        assert_eq!(
+            life.time_is_up(),
+            Next::Go(Phase::Splash, Some(Duration::from_millis(700)))
+        );
         // A splash that is closed takes the rest with it.
         let (mut life, _) = self::life(&["--splash", "700"]);
         assert_eq!(life.asked_to_close(), Some(Next::End));

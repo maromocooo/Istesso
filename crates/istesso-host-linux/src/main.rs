@@ -491,6 +491,20 @@ fn run(mut setup: Setup, display: Display) -> Result<(), String> {
         })?);
     }
 
+    // Whether the compositor has made a frame. It makes its output for its
+    // first frame, and a window whose first commit comes before there is an
+    // output is never told its size and never shown. A runner says `ready`
+    // only after that. Looked at once: the probe takes itself off the pad
+    // with the first frame, and nothing stays on the frames' path.
+    let first_frame = Arc::new(AtomicBool::new(false));
+    if let Some(pad) = stage.compositor().static_pad("src") {
+        let seen = first_frame.clone();
+        pad.add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+            seen.store(true, Ordering::SeqCst);
+            gstreamer::PadProbeReturn::Remove
+        });
+    }
+
     let tongue = if setup.runner {
         Tongue::Runner { display, port }
     } else {
@@ -540,10 +554,13 @@ fn run(mut setup: Setup, display: Display) -> Result<(), String> {
         session.heard(Heard::Environment(Vec::new()));
     }
     if setup.runner {
-        // Ready once the compositor has said how an application gets into it.
+        // Ready once the compositor has said how an application gets into
+        // it, and has made its first frame: from then on it can place a window.
         let began = Instant::now();
-        while session.environment().is_none() && outcome.is_ok() {
-            match told.recv_timeout(READY_WITHIN.saturating_sub(began.elapsed())) {
+        while (session.environment().is_none() || !first_frame.load(Ordering::SeqCst))
+            && outcome.is_ok()
+        {
+            match told.recv_timeout(TICK) {
                 Ok(Told::Heard(heard)) => {
                     if let Flow::End(end) = session.heard(heard) {
                         outcome = end.and(Err("the compositor ended before it was ready".into()));
@@ -551,9 +568,13 @@ fn run(mut setup: Setup, display: Display) -> Result<(), String> {
                 }
                 Ok(Told::Note(note)) => session.note(note),
                 Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) if began.elapsed() < READY_WITHIN => {}
                 Err(_) => {
-                    outcome =
-                        Err("the compositor did not say how an application gets into it".into())
+                    outcome = Err(if session.environment().is_none() {
+                        "the compositor did not say how an application gets into it".into()
+                    } else {
+                        "the compositor did not make a first frame".into()
+                    })
                 }
             }
         }

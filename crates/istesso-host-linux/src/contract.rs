@@ -138,6 +138,13 @@ pub enum Event {
     /// still has this many: it is asking something, or has decided to stay.
     /// Said once; the session goes on.
     StillOpen { windows: u32, after_s: u32 },
+    /// Added: the agent has said that the application is started, and it
+    /// has no window yet. A device can show that the application is opening.
+    Opening,
+    /// Added: so long after `opening` the application still has no window.
+    /// Said once; nothing is concluded here: the agent, which knows whether
+    /// the application's process lives, decides.
+    NoWindowYet { after_s: u32 },
 }
 
 /// The answer a device is given for where its picture comes from: the port
@@ -285,6 +292,14 @@ mod tests {
         assert_eq!(
             paused,
             serde_json::json!({"v": 1, "event": "paused", "took_ms": 41.5})
+        );
+        let opening: Value = serde_json::from_str(&write(&Event::Opening)).unwrap();
+        assert_eq!(opening, serde_json::json!({"v": 1, "event": "opening"}));
+        let none: Value =
+            serde_json::from_str(&write(&Event::NoWindowYet { after_s: 60 })).unwrap();
+        assert_eq!(
+            none,
+            serde_json::json!({"v": 1, "event": "no_window_yet", "after_s": 60})
         );
         let windows: Value = serde_json::from_str(&write(&Event::Windows { count: 2 })).unwrap();
         assert_eq!(

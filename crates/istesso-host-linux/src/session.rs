@@ -34,6 +34,12 @@ pub const LAST_WINDOW_WAIT_S: u32 = 5;
 /// for the end, and `empty` is said without the wait.
 pub const CLOSE_ANSWERED_WITHIN_S: u32 = 5;
 
+/// How long after a runner was told that the application is started it
+/// says that there is still no window (`no_window_yet`), in seconds. Until
+/// the first window nothing is taken for an end: an application may be
+/// slow to start, most of all the first time it runs.
+pub const FIRST_WINDOW_WAIT_S: u32 = 60;
+
 /// One key frame answers every request made within this long.
 const KEY_FRAME_EVERY_NS: u64 = 50_000_000;
 
@@ -132,6 +138,11 @@ pub struct Session {
     /// A runner's application has no window: when that is said to be the
     /// end (`empty`), unless a window comes first.
     empty_due_ns: Option<u64>,
+    /// Whether the application has had a window at all.
+    window_seen: bool,
+    /// The application is started and has had no window: when that is said
+    /// (`no_window_yet`), unless a window comes first.
+    first_window_due_ns: Option<u64>,
     environment: Option<Vec<(String, String)>>,
     /// A runner's lines that came up before it has said `ready`, in their
     /// order: an agent hears `ready` first. `None` once `ready` has been
@@ -178,6 +189,8 @@ impl Session {
             close_asked_ns: None,
             close_passed_ns: None,
             empty_due_ns: None,
+            window_seen: false,
+            first_window_due_ns: None,
             environment: None,
             held,
         };
@@ -379,8 +392,15 @@ impl Session {
                         );
                     }
                 }
-                // Applications come to the compositor by themselves.
-                Some(Command::Application { .. }) => {}
+                // Applications come to the compositor by themselves. Until
+                // this one has a window, a device can show that it is opening.
+                Some(Command::Application { .. }) => {
+                    if !self.window_seen && self.first_window_due_ns.is_none() {
+                        self.event(&Event::Opening);
+                        self.first_window_due_ns =
+                            Some((self.clock)() + u64::from(FIRST_WINDOW_WAIT_S) * 1_000_000_000);
+                    }
+                }
                 Some(Command::Start { .. }) => {
                     (self.remark)("note: the session has been started already".to_string());
                 }
@@ -468,6 +488,8 @@ impl Session {
                         if count > 0 {
                             // The application goes on: it was between two windows.
                             self.empty_due_ns = None;
+                            self.window_seen = true;
+                            self.first_window_due_ns = None;
                         } else if gone {
                             let asked_for = self.close_passed_ns.is_some_and(|passed| {
                                 now.saturating_sub(passed)
@@ -595,6 +617,17 @@ impl Session {
             // whose processes they are.
             self.empty_due_ns = None;
             self.event(&Event::Empty);
+        }
+        if self
+            .first_window_due_ns
+            .is_some_and(|due| (self.clock)() >= due)
+        {
+            // Said, and no more: whether the application still lives, and
+            // what follows, is the agent's to know and decide.
+            self.first_window_due_ns = None;
+            self.event(&Event::NoWindowYet {
+                after_s: FIRST_WINDOW_WAIT_S,
+            });
         }
         if let Some(asked) = self.close_asked_ns {
             let waited = (self.clock)().saturating_sub(asked);
@@ -969,6 +1002,49 @@ mod tests {
         let mut set = self::set(ENCODER, Tongue::Measure);
         set.session.heard(Heard::Windows(0));
         assert_eq!(set.said().len(), 1);
+        set.session.stop();
+    }
+
+    #[test]
+    fn until_its_first_window_an_application_is_opening_and_nothing_is_an_end() {
+        let mut set = ready_runner(ENCODER);
+        // The compositor begins with no window; that is no last window gone.
+        set.session.heard(Heard::Windows(0));
+        set.session
+            .line(r#"{"v":1,"cmd":"application","pid":4711}"#);
+        assert_eq!(events(&set), ["windows", "opening"]);
+        assert_eq!(set.session.empty_due_ns, None);
+        let due = set.session.first_window_due_ns.unwrap();
+        let wait = u64::from(FIRST_WINDOW_WAIT_S) * 1_000_000_000;
+        assert!(due > clock() + wait - 1_000_000_000 && due <= clock() + wait);
+        // Told twice, said once.
+        set.session
+            .line(r#"{"v":1,"cmd":"application","pid":4711}"#);
+        set.session.tick();
+        assert_eq!(events(&set).len(), 2);
+        // The long wait is over and there is still no window: said once, and
+        // neither `empty` nor anything else follows from it.
+        set.session.first_window_due_ns = Some(clock() - 1);
+        set.session.tick();
+        set.session.tick();
+        assert_eq!(events(&set)[2..], ["no_window_yet"]);
+        assert_eq!(set.said()[2]["after_s"], 60);
+        // A window that comes after all is a window like any other.
+        set.session.heard(Heard::Windows(1));
+        assert_eq!(events(&set)[3..], ["windows"]);
+        set.session.stop();
+
+        // A first window within the wait ends it without a word.
+        let mut set = ready_runner(ENCODER);
+        set.session
+            .line(r#"{"v":1,"cmd":"application","pid":4711}"#);
+        set.session.heard(Heard::Windows(1));
+        assert_eq!(set.session.first_window_due_ns, None);
+        // An application that is said to be started when its window is there
+        // already is not opening.
+        set.session
+            .line(r#"{"v":1,"cmd":"application","pid":4711}"#);
+        assert_eq!(events(&set), ["opening", "windows"]);
         set.session.stop();
     }
 

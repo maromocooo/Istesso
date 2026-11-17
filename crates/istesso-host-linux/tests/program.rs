@@ -203,7 +203,12 @@ fn a_runner_says_ready_answers_the_agent_s_lines_and_ends_when_the_agent_goes() 
     let port = ready["answer"]["channel_port"].as_u64().unwrap();
     assert!((47990..=47999).contains(&port), "{port}");
     assert!(socket.exists());
+    // The application is started and has no window yet: a device can say so.
     program.tell(r#"{"v":1,"cmd":"application","pid":1}"#);
+    assert_eq!(
+        program.json(),
+        serde_json::json!({"v": 1, "event": "opening"})
+    );
     program.tell(r#"{"v":1,"cmd":"pause"}"#);
     let paused = program.json();
     assert_eq!(paused["event"], "paused");
