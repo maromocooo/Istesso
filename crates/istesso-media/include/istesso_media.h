@@ -101,7 +101,20 @@ typedef struct IstessoMediaWatchState {
     uint64_t silent_ms; /* at the last "connected": for how long the host had not been heard */
     uint32_t again;     /* at the last "connected": 1 when it was a connection again after a cut */
     int32_t why;        /* once it is over, one of ISTESSO_MEDIA_OVER_*; 0 before */
+    uint32_t failure;   /* while there is no connection: why it was cut or why the latest attempt
+                         * failed, one of ISTESSO_MEDIA_FAILURE_*; 0 otherwise. Up to date after a
+                         * call of istesso_media_watch_next that brought no frame */
+    uint32_t reserved;
 } IstessoMediaWatchState;
+
+/* Why an attempt to reach the host failed, in a kind that names no address. */
+#define ISTESSO_MEDIA_FAILURE_REFUSED 1     /* the machine answered; nothing listens there */
+#define ISTESSO_MEDIA_FAILURE_UNREACHABLE 2 /* no way to the machine from here (no route, network
+                                             * down, or this machine does not let the program out) */
+#define ISTESSO_MEDIA_FAILURE_TIMED_OUT 3   /* connecting or the first exchange got no answer in time */
+#define ISTESSO_MEDIA_FAILURE_NO_ANSWER 4   /* reached and greeted, then silence or the end */
+#define ISTESSO_MEDIA_FAILURE_NOT_READY 5   /* the host said that it cannot do it right now */
+#define ISTESSO_MEDIA_FAILURE_OTHER 6
 
 /* Why a lasting viewer is over and does not connect again. */
 #define ISTESSO_MEDIA_OVER_ENDED 1       /* the host said that the stream is over */

@@ -170,6 +170,10 @@ pub struct IstessoMediaWatchState {
     /// At the last "connected": 1 when it was a connection again after a cut.
     pub again: u32,
     pub why: i32,
+    /// While there is no connection: why it was cut or why the latest
+    /// attempt failed, one of `ISTESSO_MEDIA_FAILURE_*`; 0 otherwise.
+    pub failure: u32,
+    pub reserved: u32,
 }
 
 /// The host said that the stream is over.
@@ -775,8 +779,13 @@ pub unsafe extern "C" fn istesso_media_watch_next(
     let mut lasting = watch.lasting.lock().unwrap_or_else(|e| e.into_inner());
     let stepped = lasting.next(Duration::from_millis(wait_ms.into()));
     let mut state = watch.state.lock().unwrap_or_else(|e| e.into_inner());
+    // Looked at when no frame came: this is not the frame's path.
+    let failure = |lasting: &Lasting| lasting.last_failure().map_or(0, |failure| failure as u32);
     match stepped {
-        Ok(None) => 0,
+        Ok(None) => {
+            state.failure = failure(&lasting);
+            0
+        }
         Ok(Some(Step::Event(Event::Frame(got)))) => {
             // SAFETY: not null, and room for the result by the caller's promise. The
             // bytes belong to the viewer, which keeps them until the next call.
@@ -787,11 +796,13 @@ pub unsafe extern "C" fn istesso_media_watch_next(
         Ok(Some(Step::Event(Event::Cursor(_)))) => 2,
         Ok(Some(Step::Cut)) => {
             state.cuts += 1;
+            state.failure = failure(&lasting);
             3
         }
         Ok(Some(Step::Connected { again, silent_for })) => {
             state.again = u32::from(again);
             state.silent_ms = silent_for.as_millis().min(u128::from(u64::MAX)) as u64;
+            state.failure = 0;
             4
         }
         Err(err) => {
@@ -1246,11 +1257,65 @@ mod tests {
     }
 
     #[test]
+    fn a_lasting_viewer_says_in_what_way_the_host_cannot_be_reached() {
+        let dirs = Dirs::new("away");
+        let device_dir = c(&dirs.device());
+        // A machine that is there, with nothing listening at the port: a listener that
+        // has just been closed. (Only looked at at once: the port may be given to
+        // somebody else later.)
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let nothing = CString::new(closed.local_addr().unwrap().to_string()).unwrap();
+        drop(closed);
+        // A machine that takes the connection and says nothing.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mute = CString::new(silent.local_addr().unwrap().to_string()).unwrap();
+        std::thread::spawn(move || {
+            let kept: Vec<_> = silent
+                .incoming()
+                .map_while(std::result::Result::ok)
+                .collect();
+            drop(kept);
+        });
+        // SAFETY: C strings that live through the calls, pointers to live values.
+        unsafe {
+            let mut frame = std::mem::zeroed::<IstessoMediaFrame>();
+            let mut state = IstessoMediaWatchState::default();
+
+            let watch =
+                istesso_media_watch_open(device_dir.as_ptr(), nothing.as_ptr(), std::ptr::null());
+            assert!(!watch.is_null(), "{}", last_error());
+            assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
+            assert_eq!(state.failure, 0, "nothing was tried yet");
+            assert_eq!(istesso_media_watch_next(watch, 50, &mut frame), 0);
+            assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
+            assert_eq!(state.failure, crate::Failure::Refused as u32);
+            // Not a cut: there never was a connection.
+            assert_eq!((state.cuts, state.why), (0, 0));
+            istesso_media_watch_close(watch);
+
+            let watch =
+                istesso_media_watch_open(device_dir.as_ptr(), mute.as_ptr(), std::ptr::null());
+            assert!(!watch.is_null(), "{}", last_error());
+            let began = std::time::Instant::now();
+            loop {
+                assert!(began.elapsed() < Duration::from_secs(10), "waited too long");
+                assert_eq!(istesso_media_watch_next(watch, 50, &mut frame), 0);
+                assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
+                if state.failure != 0 {
+                    break;
+                }
+            }
+            assert_eq!(state.failure, crate::Failure::TimedOut as u32);
+            istesso_media_watch_close(watch);
+        }
+    }
+
+    #[test]
     fn a_lasting_viewer_is_told_of_a_cut_comes_back_and_stops_when_the_host_says_so() {
         let dirs = Dirs::new("watch");
         let (host_dir, device_dir) = (c(&dirs.host()), c(&dirs.device()));
         let bind = CString::new("127.0.0.1:0").unwrap();
-        assert_eq!(std::mem::size_of::<IstessoMediaWatchState>(), 24);
+        assert_eq!(std::mem::size_of::<IstessoMediaWatchState>(), 32);
         // SAFETY: C strings that live through the calls, pointers to live values, and
         // handles used as the header says.
         unsafe {
@@ -1289,6 +1354,7 @@ mod tests {
             assert_eq!((info.width, info.height), (3440, 1440));
             assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
             assert_eq!((state.cuts, state.again, state.why), (0, 0, 0));
+            assert_eq!(state.failure, 0);
 
             let until_shown = || {
                 let began = std::time::Instant::now();
@@ -1317,10 +1383,15 @@ mod tests {
             );
             assert!(!second.is_null(), "{}", last_error());
             assert_eq!(next(&mut frame), 3);
+            // While it is cut the state says in what way: the host ended the
+            // connection without a word.
+            assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
+            assert_eq!(state.failure, crate::Failure::NoAnswer as u32);
             assert_eq!(next(&mut frame), 4);
             istesso_media_client_close(second);
             assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
             assert_eq!((state.cuts, state.again, state.why), (1, 1, 0));
+            assert_eq!(state.failure, 0);
             until_shown();
             // From any thread, with whichever connection there is.
             istesso_media_watch_ask_key_frame(watch);
