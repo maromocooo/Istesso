@@ -7,7 +7,7 @@
 //
 // Three checks, each in its own run (docs/m4-plan.md, 5c):
 //
-//   open "Istesso Lock Check Dev.app" [--args --report <file> --minutes <n> --no-hold]
+//   open "Istesso Lock Check Dev.app" [--args --report <file> --minutes <n> --no-hold --declare-every <s>]
 //     Step 0b. In each state (unlocked, locked, display asleep, right after wake) it captures its
 //     own window for 4 s, then sends input ONLY to itself, as listed below, and counts what its
 //     own window received. Quits once the three locked states are tried, or after <n> minutes.
@@ -47,9 +47,19 @@ import ScreenCaptureKit
 final class DisplayHold {
     private var assertion: IOPMAssertionID = 0
     private var held = false
+    private var timer: Timer?
+    /// Declare user activity again every this many seconds (0: only once). Off by default; for trying
+    /// whether the lock screen's own dimming needs it (scene A1 went dark while the assertion was held).
+    var declareEvery: Double = 0
 
     func start() {
         guard !held else { return }
+        if declareEvery > 0 {
+            timer = Timer.scheduledTimer(withTimeInterval: declareEvery, repeats: true) { _ in
+                var again: IOPMAssertionID = 0
+                _ = IOPMAssertionDeclareUserActivity("Istesso Lock Check Dev" as CFString, kIOPMUserActiveLocal, &again)
+            }
+        }
         var activity: IOPMAssertionID = 0
         _ = IOPMAssertionDeclareUserActivity("Istesso Lock Check Dev" as CFString, kIOPMUserActiveLocal, &activity)
         held = IOPMAssertionCreateWithName(
@@ -58,6 +68,8 @@ final class DisplayHold {
     }
 
     func stop() {
+        timer?.invalidate()
+        timer = nil
         if held { IOPMAssertionRelease(assertion) }
         held = false
     }
@@ -97,6 +109,24 @@ func sessionTapRefusal(lock: LockState, frontmost: Bool, topIsOwn: Bool?) -> Str
     }
 }
 
+/// The topmost non-transparent on-screen window containing `point`: its owner's pid and its layer.
+/// Reads only owner, layer, bounds and alpha, never names.
+func topWindow(at point: CGPoint) -> (pid: Int32, layer: Int)? {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+        return nil
+    }
+    for info in list {
+        let alpha = (info[kCGWindowAlpha as String] as? Double) ?? 1
+        guard alpha > 0.05,
+            let boundsInfo = info[kCGWindowBounds as String] as? NSDictionary,
+            let bounds = CGRect(dictionaryRepresentation: boundsInfo),
+            bounds.contains(point)
+        else { continue }
+        return ((info[kCGWindowOwnerPID as String] as? Int32) ?? -1, (info[kCGWindowLayer as String] as? Int) ?? 0)
+    }
+    return nil
+}
+
 /// Whether the topmost non-transparent on-screen window containing `point` (top-left origin) is one of
 /// this process's. Reads only owner, bounds and alpha, never names.
 func topWindowIsOwn(at point: CGPoint) -> Bool? {
@@ -130,6 +160,8 @@ final class ProbeView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
+    /// Take the first click even while the window is not active (scene A1 lost it otherwise).
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     func advance() {
         step += 1
@@ -325,6 +357,7 @@ struct Answer {
     var lock = LockState.unknown
     var direct = (key: false, move: false, click: false)
     var tap: (posted: Bool, refusal: String?, move: Bool, click: Bool) = (false, nil, false, false)
+    var onTop: (own: Bool, layer: Int)?
     var sinceKeyBefore = 0.0
     var sinceKeyAfter = 0.0
     var inputTried = false
@@ -355,6 +388,7 @@ final class Probe: NSObject, NSApplicationDelegate {
         minutes = argument(arguments, "--minutes").flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil } ?? 60
         holdDisplay = !arguments.contains("--no-hold")
         report = reportURL(arguments, default: "lock-check-report.txt")
+        hold.declareEvery = argument(arguments, "--declare-every").flatMap(Double.init) ?? 0
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -452,6 +486,10 @@ final class Probe: NSObject, NSApplicationDelegate {
         // Name the window under the pointer as this program's own, so its own process routes it there.
         event?.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.windowNumber))
         event?.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(window.windowNumber))
+        // A single click, as the window server would mark it at the session tap.
+        if type == .leftMouseDown || type == .leftMouseUp {
+            event?.setIntegerValueField(.mouseEventClickState, value: 1)
+        }
         return event
     }
 
@@ -479,6 +517,7 @@ final class Probe: NSObject, NSApplicationDelegate {
             let refusal = sessionTapRefusal(lock: lockState(), frontmost: self.frontmost,
                                             topIsOwn: topWindowIsOwn(at: self.middle))
             answer.tap.refusal = refusal
+            answer.onTop = topWindow(at: self.middle).map { ($0.pid == getpid(), $0.layer) }
             guard refusal == nil else { return self.finish(answer) }
             let (moves1, clicks1) = (self.view.moves, self.view.clicks)
             answer.tap.posted = true
@@ -524,7 +563,7 @@ final class Probe: NSObject, NSApplicationDelegate {
             "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)",
             "screen recording allowed: \(yes(mayCapture))",
             "sending input allowed (Accessibility): \(yes(mayPost))",
-            "display held awake while checking: \(yes(holdDisplay))",
+            "display held awake while checking: \(yes(holdDisplay))\(hold.declareEvery > 0 ? String(format: ", user activity declared every %.0f s", hold.declareEvery) : "")",
         ]
         if !mayCapture {
             lines.append("NOT RUN: allow this program under System Settings > Privacy & Security > Screen & System Audio Recording, then start it again")
@@ -545,6 +584,11 @@ final class Probe: NSObject, NSApplicationDelegate {
             lines.append("  direct to own process: key \(yes(answer.direct.key)), move \(yes(answer.direct.move)), click \(yes(answer.direct.click))")
             lines.append(String(format: "  session's last key event, seconds ago: %.2f before, %.2f after the direct key (a fall to near 0 would mean it entered the session stream)",
                                 answer.sinceKeyBefore, answer.sinceKeyAfter))
+            if let onTop = answer.onTop {
+                lines.append("  topmost window at the point: \(onTop.own ? "this program's" : "another process's"), layer \(onTop.layer)")
+            } else {
+                lines.append("  topmost window at the point: none")
+            }
             if let refusal = answer.tap.refusal {
                 lines.append("  session tap: not posted, \(refusal)")
             } else {
