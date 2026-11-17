@@ -82,6 +82,34 @@ const TICK: Duration = Duration::from_millis(100);
 /// for a moment. Longer than this, and the frame is not sent to that viewer.
 const LINE_WAIT: Duration = Duration::from_micros(300);
 
+/// Which of the paired devices that may look are shown the picture.
+///
+/// Being paired and allowed to look is checked underneath, as it always
+/// was, for every connection and while a stream runs. This narrows it: a
+/// session is shown to one device at a time, and whoever runs the session
+/// says which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admit {
+    /// Every one of them that connects. What a host does that was never
+    /// told otherwise.
+    Paired,
+    /// This one device: its id and its public key, as the list of paired
+    /// devices has them. Both have to match.
+    Only { id: String, public_key: String },
+    /// Nobody.
+    Nobody,
+}
+
+impl Admit {
+    fn lets_in(&self, peer: &Peer) -> bool {
+        match self {
+            Admit::Paired => true,
+            Admit::Only { id, public_key } => peer.id == *id && peer.public_key == *public_key,
+            Admit::Nobody => false,
+        }
+    }
+}
+
 /// A host that shows its picture to paired devices.
 pub struct Host {
     shared: Arc<Shared>,
@@ -110,6 +138,9 @@ struct Shared {
     peers_path: PathBuf,
     info: StreamInfo,
     watchers: Mutex<Watchers>,
+    /// Which paired devices are shown the picture. Taken after `watchers`
+    /// where both are held, and never the other way round.
+    admit: Mutex<Admit>,
     /// Callers that have not yet shown who they are and said what they
     /// want, and devices that are being shown the picture.
     pending: Arc<AtomicUsize>,
@@ -274,6 +305,20 @@ impl Host {
         info: StreamInfo,
         log: Log,
     ) -> Result<Self> {
+        Self::listen_admitting(addr, identity, peers_path, info, log, Admit::Paired)
+    }
+
+    /// The same, with who is shown the picture said before anybody can
+    /// connect: a host that belongs to a session starts with
+    /// [`Admit::Nobody`] and is told the device when there is one.
+    pub fn listen_admitting(
+        addr: SocketAddr,
+        identity: &Identity,
+        peers_path: PathBuf,
+        info: StreamInfo,
+        log: Log,
+        admit: Admit,
+    ) -> Result<Self> {
         let keys = LocalKeys::new(identity)?;
         let listener = TcpListener::bind(addr)?;
         // The listening thread looks up now and then, to see whether the
@@ -288,6 +333,7 @@ impl Host {
                 list: Vec::new(),
                 packet: Vec::new(),
             }),
+            admit: Mutex::new(admit),
             pending: Arc::new(AtomicUsize::new(0)),
             serving: Arc::new(AtomicUsize::new(0)),
             seq: AtomicU64::new(0),
@@ -327,6 +373,25 @@ impl Host {
     /// What viewers are told about the picture.
     pub fn info(&self) -> &StreamInfo {
         &self.shared.info
+    }
+
+    /// Says which paired devices are shown the picture from now on. A
+    /// viewer that is not among them is cut off before this returns: no
+    /// frame that is handed in afterwards goes to it. Whoever connects
+    /// later and is not among them is refused.
+    pub fn admit(&self, who: Admit) {
+        let shared = &*self.shared;
+        *shared.admit.lock().unwrap_or_else(|e| e.into_inner()) = who.clone();
+        let mut watchers = shared.watchers();
+        watchers.list.retain(|watcher| {
+            who.lets_in(&watcher.peer) || {
+                shared.close(
+                    watcher,
+                    &"the picture is for another device now, or for none",
+                );
+                false
+            }
+        });
     }
 
     /// Devices that are being shown the picture now.
@@ -566,6 +631,14 @@ impl Watcher {
 impl Shared {
     fn watchers(&self) -> MutexGuard<'_, Watchers> {
         self.watchers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether `peer` is among the devices that are shown the picture.
+    fn admits(&self, peer: &Peer) -> bool {
+        self.admit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lets_in(peer)
     }
 
     /// Ends a viewer's stream: nothing more is sent to it, and its thread
@@ -814,6 +887,19 @@ impl Shared {
                 "this device may not look at the host",
             );
         }
+        // Paired and allowed to look is not all: the picture of a session
+        // is for the device that is shown the session.
+        if !self.admits(&peer) {
+            (self.log)(format!(
+                "refused to show the picture to {}: it is for another device, or for none",
+                peer.name
+            ));
+            return refuse(
+                &mut channel,
+                ErrorCode::Forbidden,
+                "the host shows this picture to another device, or to none",
+            );
+        }
         // A paired device that may look, and has said what it wants: it
         // moves from the callers to the viewers. One device has one stream.
         drop(pending);
@@ -875,6 +961,11 @@ impl Shared {
             // Looked at with the viewers in hand, as `offer` empties the list with them in
             // hand: a caller that was on its way in when the offer ended does not get in.
             if self.stop.load(Ordering::SeqCst) || self.withheld.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // Who is shown the picture may have been said again while this
+            // device was being let in.
+            if !self.admits(&watcher.peer) {
                 return Ok(());
             }
             (self.log)(format!("showing the picture to {}", watcher.peer.name));

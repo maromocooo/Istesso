@@ -105,6 +105,27 @@ typedef struct IstessoMediaClient IstessoMediaClient;
 IstessoMediaHost *istesso_media_host_listen(const char *config_dir, const char *bind,
                                             const IstessoMediaStreamInfo *info);
 
+/*
+ * The same, for the picture of a streaming session: nobody is shown it until
+ * istesso_media_host_admit() names a device.
+ */
+IstessoMediaHost *istesso_media_host_listen_closed(const char *config_dir, const char *bind,
+                                                   const IstessoMediaStreamInfo *info);
+
+/*
+ * Says which one paired device is shown the picture from now on: the one with this id and
+ * this public key, both as the list of paired devices has them (`istesso peers list --json`).
+ * Both NULL: nobody. Any other viewer is cut off before this returns, and whoever else
+ * connects is refused. Being paired and allowed to look is still checked underneath, at every
+ * connection and while the stream runs. 0, or -1 when only one of the two was given or a text
+ * could not be read; then nobody is admitted.
+ */
+int32_t istesso_media_host_admit(const IstessoMediaHost *host, const char *device_id,
+                                 const char *public_key);
+
+/* Back to every paired device that may look and connects: what a host does that was never told. */
+int32_t istesso_media_host_admit_paired(const IstessoMediaHost *host);
+
 /* The port the host listens on (of use after asking for port 0). */
 uint16_t istesso_media_host_port(const IstessoMediaHost *host);
 
