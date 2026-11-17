@@ -159,8 +159,54 @@ pub enum ErrorCode {
     Forbidden,
     /// The host shows its picture to as many devices as it can.
     Busy,
+    /// The device is paired and may look, but it is not the one that is
+    /// shown this picture.
+    NotShown,
     #[serde(other)]
     Other,
+}
+
+/// Why a host stops sending on a connection of its own accord: the first
+/// byte of what a packet of the kind [`Kind::End`] carries.
+///
+/// Whatever it says, the viewer does not connect again by itself. The
+/// difference is in what a person is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// The stream is over: the application has ended, or the host has
+    /// stopped. Also what a packet without that byte means, and a byte
+    /// this version does not know.
+    Over,
+    /// This device is not shown the picture any more: another one is, or
+    /// nobody.
+    NotShown,
+    /// The picture is put aside for the time being and shown to nobody.
+    SetAside,
+}
+
+impl Ending {
+    fn byte(self) -> u8 {
+        match self {
+            Ending::Over => 0,
+            Ending::NotShown => 1,
+            Ending::SetAside => 2,
+        }
+    }
+}
+
+/// The packet that says a stream is over, and why.
+pub fn encode_end(why: Ending, seq: u64, out: &mut Vec<u8>) {
+    encode(&Header::without_frame(Kind::End, seq), &[why.byte()], out);
+}
+
+/// Why the stream is over, from what a packet of the kind [`Kind::End`]
+/// carries.
+pub fn decode_end(carried: &[u8]) -> Ending {
+    match carried.first() {
+        Some(1) => Ending::NotShown,
+        Some(2) => Ending::SetAside,
+        _ => Ending::Over,
+    }
 }
 
 /// What a packet is.
@@ -469,6 +515,23 @@ mod tests {
         assert_eq!(&packet[at], frame.as_slice());
         set_discontinuity(&mut packet, false);
         assert_eq!(decode(&packet).unwrap().0, frame_header());
+    }
+
+    #[test]
+    fn why_a_stream_is_over_travels_in_one_byte_and_an_unknown_reason_is_just_over() {
+        let mut packet = Vec::new();
+        for why in [Ending::Over, Ending::NotShown, Ending::SetAside] {
+            encode_end(why, 7, &mut packet);
+            let (header, at) = decode(&packet).unwrap();
+            assert_eq!(header.kind, Kind::End);
+            assert_eq!(decode_end(&packet[at]), why);
+        }
+        // A host of an earlier version says it without a reason, a later one may
+        // give a reason this version does not know.
+        encode(&Header::without_frame(Kind::End, 7), &[], &mut packet);
+        let (_, at) = decode(&packet).unwrap();
+        assert_eq!(decode_end(&packet[at]), Ending::Over);
+        assert_eq!(decode_end(&[200]), Ending::Over);
     }
 
     #[test]

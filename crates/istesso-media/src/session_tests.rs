@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use istesso_link::{Channel, Error as LinkError, LocalKeys};
 use istesso_pair::{Identity, Permission};
 
+use crate::rejoin::{Lasting, Step, AGAIN_WITHIN, RETRY};
 use crate::testing::TempPeers;
+use crate::viewer::SILENT_AFTER;
 use crate::wire::{self, Ask, Chroma, Codec, Colour, Cursor, CursorImage, Reply, StreamInfo};
 use crate::{Admit, Error, Event, Host, Viewer};
 
@@ -353,14 +355,14 @@ fn while_one_device_is_named_another_paired_device_is_refused() {
     pair.host.admit(only("air", &pair.air));
 
     // Paired, allowed to look, and not the one: refused, and told so.
-    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+    assert!(matches!(pair.connect_as(&pad), Err(Error::NotShown)));
     pair.until(|| pair.said("refused to show the picture to pad"));
     assert_eq!(pair.host.viewers(), 0);
     // The named device is shown the picture, and only it.
     let mut air = pair.watching();
     assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
     assert_eq!(take(&mut air).unwrap().unwrap().data, b"key");
-    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+    assert!(matches!(pair.connect_as(&pad), Err(Error::NotShown)));
     assert_eq!(pair.host.viewers(), 1);
 
     // The id alone is not the device: the key has to be its own as well.
@@ -372,8 +374,8 @@ fn while_one_device_is_named_another_paired_device_is_refused() {
     };
     pair.host.admit(Admit::Only { id, public_key });
     assert_eq!(pair.host.viewers(), 0);
-    assert!(matches!(pair.connect(), Err(Error::Forbidden)));
-    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+    assert!(matches!(pair.connect(), Err(Error::NotShown)));
+    assert!(matches!(pair.connect_as(&pad), Err(Error::NotShown)));
 }
 
 #[test]
@@ -399,9 +401,9 @@ fn naming_another_device_cuts_the_one_before_it_at_once() {
         Ok(None) => panic!("the first device was left waiting"),
         Err(err) => err,
     };
-    assert!(matches!(over, Error::Link(LinkError::Closed)), "{over}");
+    assert!(matches!(over, Error::NotShown), "{over}");
     // It does not get in again, and the other one does.
-    assert!(matches!(pair.connect(), Err(Error::Forbidden)));
+    assert!(matches!(pair.connect(), Err(Error::NotShown)));
     let mut second = pair.connect_as(&pad).unwrap();
     pair.until(|| pair.host.viewers() == 1);
     assert_eq!(pair.host.send_frame(b"key", 2, 2, true).unwrap().viewers, 1);
@@ -428,10 +430,10 @@ fn nobody_cuts_everybody_and_lets_nobody_in() {
                 Err(err) => break err,
             }
         };
-        assert!(matches!(over, Error::Link(LinkError::Closed)), "{over}");
+        assert!(matches!(over, Error::NotShown), "{over}");
     }
-    assert!(matches!(pair.connect(), Err(Error::Forbidden)));
-    assert!(matches!(pair.connect_as(&pad), Err(Error::Forbidden)));
+    assert!(matches!(pair.connect(), Err(Error::NotShown)));
+    assert!(matches!(pair.connect_as(&pad), Err(Error::NotShown)));
 
     // A host for a session begins like that, before anybody can connect.
     let studio = Identity::generate();
@@ -448,7 +450,7 @@ fn nobody_cuts_everybody_and_lets_nobody_in() {
     let keys = LocalKeys::new(&pair.air).unwrap();
     let trusting = TempPeers::trusting(&[("studio", &studio)]);
     let refused = Viewer::connect(closed.local_addr(), &keys, &trusting.open(), None, SOON);
-    assert!(matches!(refused, Err(Error::Forbidden)));
+    assert!(matches!(refused, Err(Error::NotShown)));
     // Told otherwise, it is as a host that was never told.
     closed.admit(Admit::Paired);
     assert!(Viewer::connect(closed.local_addr(), &keys, &trusting.open(), None, SOON).is_ok());
@@ -799,7 +801,7 @@ fn the_host_shows_its_picture_to_a_few_devices_and_no_more() {
         .collect();
     pair.until(|| pair.host.viewers() == crate::host::MAX_STREAMS);
     match pair.connect_as(&devices[crate::host::MAX_STREAMS]) {
-        Err(Error::Refused(why)) => assert!(why.contains("as many devices"), "{why}"),
+        Err(Error::Busy) => {}
         other => panic!("unexpected: {:?}", other.err()),
     }
     // All of them get the same frame.
@@ -859,8 +861,8 @@ fn a_host_that_says_nothing_is_taken_to_be_gone() {
     let began = Instant::now();
     let result = viewer.next_frame(Duration::from_secs(30));
     assert!(matches!(result, Err(Error::Silent)), "{:?}", result.err());
-    assert!(began.elapsed() >= Duration::from_millis(2900));
-    assert!(began.elapsed() < Duration::from_millis(4500));
+    assert!(began.elapsed() >= SILENT_AFTER - Duration::from_millis(100));
+    assert!(began.elapsed() < SILENT_AFTER + Duration::from_millis(1500));
     drop(viewer);
     silent.join().unwrap();
 }
@@ -1622,10 +1624,8 @@ fn a_picture_that_is_no_longer_offered_reaches_nobody_until_it_is_offered_again(
     assert_eq!(pair.host.viewers(), 0);
     assert!(began.elapsed() < Duration::from_millis(100));
     assert_eq!(pair.host.send_frame(b"key", 1, 1, true).unwrap().viewers, 0);
-    assert!(matches!(
-        take(&mut viewer),
-        Err(Error::Link(LinkError::Closed))
-    ));
+    // ... and told why, so that it does not knock again ...
+    assert!(matches!(take(&mut viewer), Err(Error::SetAside)));
     // ... and nobody gets in, paired or not; a caller is not even answered.
     assert!(pair.connect().is_err());
     assert_eq!(pair.host.viewers(), 0);
@@ -1640,4 +1640,449 @@ fn a_picture_that_is_no_longer_offered_reaches_nobody_until_it_is_offered_again(
         1
     );
     assert_eq!(take(&mut viewer).unwrap().unwrap().data, b"again");
+}
+
+// ---------------------------------------------------------------------------
+// A connection that is cut, and the viewer that comes back
+// ---------------------------------------------------------------------------
+
+/// Stands between a viewer and a host on the loopback and passes on what
+/// they say, until it is told to fall silent: then the connections there
+/// are stay open and carry nothing, in either direction, as a network does
+/// that drops a connection which both ends still believe in.
+struct Between {
+    addr: SocketAddr,
+    state: Arc<BetweenState>,
+}
+
+struct BetweenState {
+    /// Where the connections that come in are passed on to.
+    to: Mutex<SocketAddr>,
+    /// Connections numbered below this carry nothing any more.
+    silent_below: std::sync::atomic::AtomicU64,
+    accepted: std::sync::atomic::AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl Between {
+    fn new(to: SocketAddr) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(BetweenState {
+            to: Mutex::new(to),
+            silent_below: 0.into(),
+            accepted: 0.into(),
+            stop: false.into(),
+        });
+        let shared = state.clone();
+        std::thread::spawn(move || {
+            while !shared.stop.load(SeqCst) {
+                let Ok((near, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                let number = shared.accepted.fetch_add(1, SeqCst);
+                let Ok(far) = TcpStream::connect(*shared.to.lock().unwrap()) else {
+                    continue;
+                };
+                for (from, to) in [
+                    (near.try_clone().unwrap(), far.try_clone().unwrap()),
+                    (far, near),
+                ] {
+                    let shared = shared.clone();
+                    std::thread::spawn(move || pass_on(from, to, number, &shared));
+                }
+            }
+        });
+        Between { addr, state }
+    }
+
+    /// Every connection made so far carries nothing from now on. Later
+    /// ones are passed on as before.
+    fn fall_silent(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let so_far = self.state.accepted.load(SeqCst);
+        self.state.silent_below.store(so_far, SeqCst);
+    }
+
+    /// Connections that come in from now on reach another host.
+    fn lead_to(&self, to: SocketAddr) {
+        *self.state.to.lock().unwrap() = to;
+    }
+
+    fn connections(&self) -> u64 {
+        self.state
+            .accepted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Between {
+    fn drop(&mut self) {
+        self.state
+            .stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn pass_on(mut from: TcpStream, mut to: TcpStream, number: u64, state: &BetweenState) {
+    use std::sync::atomic::Ordering::SeqCst;
+    from.set_nonblocking(false).unwrap();
+    from.set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let mut buffer = [0u8; 16384];
+    while !state.stop.load(SeqCst) {
+        match from.read(&mut buffer) {
+            Ok(0) => break,
+            // Read, and gone: the sender is not held up, and nothing arrives.
+            Ok(_) if number < state.silent_below.load(SeqCst) => {}
+            Ok(n) => {
+                if to.write_all(&buffer[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    // A connection that fell silent is left as it is until the test is over:
+    // closing it would tell the two ends.
+    if number >= state.silent_below.load(SeqCst) {
+        let _ = to.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Pair {
+    /// A viewer of the device "air" that connects through `addr` and
+    /// connects again when it is cut.
+    fn lasting_through(&self, addr: SocketAddr) -> Lasting {
+        let keys = LocalKeys::new(&self.air).unwrap();
+        let list = self.air_peers.path();
+        Lasting::new(
+            Box::new(move |expected, within| {
+                // The list of paired devices is read for every connection, as a
+                // program does.
+                let peers = istesso_pair::PeerStore::open(&list)?;
+                Viewer::connect(addr, &keys, &peers, expected, within)
+            }),
+            None,
+        )
+    }
+
+    fn lasting(&self) -> Lasting {
+        self.lasting_through(self.addr)
+    }
+}
+
+/// What a lasting viewer handed over, kept beyond the next call.
+#[derive(Debug, PartialEq, Eq)]
+enum Stepped {
+    Frame { data: Vec<u8>, key_frame: bool },
+    Cursor,
+    Cut,
+    Connected { again: bool, silent_for: Duration },
+}
+
+/// The next thing a lasting viewer hands over within a few seconds.
+fn step(viewer: &mut Lasting) -> crate::Result<Stepped> {
+    let began = Instant::now();
+    loop {
+        assert!(began.elapsed() < SOON, "waited too long");
+        return Ok(match viewer.next(Duration::from_millis(50))? {
+            None => continue,
+            Some(Step::Event(Event::Frame(frame))) => Stepped::Frame {
+                data: frame.data.to_vec(),
+                key_frame: frame.key_frame,
+            },
+            Some(Step::Event(Event::Cursor(_))) => Stepped::Cursor,
+            Some(Step::Cut) => Stepped::Cut,
+            Some(Step::Connected { again, silent_for }) => Stepped::Connected { again, silent_for },
+        });
+    }
+}
+
+/// A lasting viewer that is connected and has been shown the first key frame.
+fn lasting_and_shown(pair: &Pair, viewer: &mut Lasting) {
+    assert!(matches!(
+        step(viewer).unwrap(),
+        Stepped::Connected { again: false, .. }
+    ));
+    pair.until(|| pair.host.viewers() == 1);
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(
+        step(viewer).unwrap(),
+        Stepped::Frame {
+            data: b"key".to_vec(),
+            key_frame: true
+        }
+    );
+}
+
+#[test]
+fn a_connection_that_falls_silent_is_taken_up_again_and_begins_with_a_key_frame() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    // The network stops delivering, and tells nobody.
+    let silent_from = Instant::now();
+    between.fall_silent();
+    // Frames the host sends meanwhile go nowhere.
+    assert_eq!(
+        pair.host.send_frame(b"lost", 1, 1, false).unwrap().viewers,
+        1
+    );
+
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    let noticed = silent_from.elapsed();
+    // A second of silence, not less and not much more.
+    assert!(
+        noticed >= SILENT_AFTER - Duration::from_millis(100),
+        "{noticed:?}"
+    );
+    assert!(
+        noticed < SILENT_AFTER + Duration::from_secs(1),
+        "{noticed:?}"
+    );
+
+    // It connects again at once, and is the same device to the host: the
+    // connection that went silent is closed there, and one stream is left.
+    let Stepped::Connected { again, silent_for } = step(&mut viewer).unwrap() else {
+        panic!("not connected again");
+    };
+    assert!(again);
+    assert!(silent_for >= SILENT_AFTER - Duration::from_millis(100));
+    assert!(silent_from.elapsed() < SILENT_AFTER + Duration::from_secs(1) + AGAIN_WITHIN);
+    assert_eq!(between.connections(), 2);
+    assert_eq!(viewer.cuts(), 1);
+    pair.until(|| pair.host.viewers() == 1);
+
+    // It is sent nothing but a key frame first, and the host has been told
+    // to make one.
+    pair.until(|| pair.host.key_frame_wanted());
+    assert_eq!(
+        pair.host.send_frame(b"delta", 2, 2, false).unwrap().viewers,
+        0
+    );
+    assert_eq!(
+        pair.host
+            .send_frame(b"key again", 3, 3, true)
+            .unwrap()
+            .viewers,
+        1
+    );
+    assert_eq!(
+        step(&mut viewer).unwrap(),
+        Stepped::Frame {
+            data: b"key again".to_vec(),
+            key_frame: true
+        }
+    );
+}
+
+#[test]
+fn a_picture_that_stands_still_is_not_a_cut() {
+    let pair = pair();
+    let mut viewer = pair.lasting();
+    lasting_and_shown(&pair, &mut viewer);
+    // Nothing is sent for well over the second: the host says twice a
+    // second that it has nothing, and the viewer stays.
+    let began = Instant::now();
+    while began.elapsed() < SILENT_AFTER * 2 {
+        assert!(viewer.next(Duration::from_millis(50)).unwrap().is_none());
+    }
+    assert_eq!(viewer.cuts(), 0);
+    assert_eq!(pair.host.viewers(), 1);
+}
+
+#[test]
+fn a_connection_that_is_closed_is_taken_up_again_without_waiting() {
+    let pair = pair();
+    let mut viewer = pair.lasting();
+    lasting_and_shown(&pair, &mut viewer);
+
+    // (A connection that has only just been made is not made again at once.)
+    std::thread::sleep(RETRY + Duration::from_millis(50));
+    // The same device connects from elsewhere (the program was started a
+    // second time, say): the host closes the earlier connection, and says
+    // nothing on it.
+    let other = pair.connect().unwrap();
+    let closed_at = Instant::now();
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    assert!(matches!(
+        step(&mut viewer).unwrap(),
+        Stepped::Connected { again: true, .. }
+    ));
+    // Well within the quarter of a second it has when the failure shows.
+    assert!(closed_at.elapsed() < RETRY, "{:?}", closed_at.elapsed());
+    drop(other);
+}
+
+#[test]
+fn a_viewer_whose_picture_goes_to_another_device_does_not_come_back() {
+    let pair = pair();
+    let pad = pair.another_device("pad");
+    let between = Between::new(pair.addr);
+    pair.host.admit(only("air", &pair.air));
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    pair.host.admit(only("pad", &pad));
+    // Told so on its connection, and that is the end of it.
+    assert!(matches!(step(&mut viewer), Err(Error::NotShown)));
+    assert!(viewer.next(Duration::from_millis(600)).is_err());
+    assert_eq!(between.connections(), 1, "it knocked again");
+    assert_eq!(viewer.cuts(), 0);
+}
+
+#[test]
+fn a_viewer_that_missed_the_word_asks_once_and_is_told_then() {
+    let pair = pair();
+    let pad = pair.another_device("pad");
+    let between = Between::new(pair.addr);
+    pair.host.admit(only("air", &pair.air));
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    // The connection goes silent just before the picture moves on, so the
+    // host's last word does not arrive.
+    between.fall_silent();
+    pair.host.admit(only("pad", &pad));
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    assert!(matches!(step(&mut viewer), Err(Error::NotShown)));
+    assert!(viewer.next(Duration::from_millis(600)).is_err());
+    assert_eq!(between.connections(), 2, "one question, and no more");
+}
+
+#[test]
+fn a_viewer_whose_picture_is_put_aside_does_not_come_back() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    pair.host.offer(false);
+    assert!(matches!(step(&mut viewer), Err(Error::SetAside)));
+    assert!(viewer.next(Duration::from_millis(600)).is_err());
+    assert_eq!(between.connections(), 1, "it knocked again");
+}
+
+#[test]
+fn a_viewer_whose_host_stops_does_not_come_back() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    let Pair { host, .. } = pair;
+    drop(host);
+    assert!(matches!(step(&mut viewer), Err(Error::Ended)));
+    assert!(viewer.next(Duration::from_millis(600)).is_err());
+    assert_eq!(between.connections(), 1, "it knocked again");
+}
+
+#[test]
+fn an_unpaired_viewer_is_told_nothing_asks_once_and_stops() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    pair.studio_peers.remove("air");
+    // The host says nothing to a device that is not paired any more: for
+    // the viewer the connection just ends.
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    let refused = step(&mut viewer).unwrap_err();
+    assert!(
+        matches!(refused, Error::Link(LinkError::NotTrusted)),
+        "{refused}"
+    );
+    assert!(viewer.next(Duration::from_millis(600)).is_err());
+    assert_eq!(between.connections(), 2, "one question, and no more");
+}
+
+#[test]
+fn a_viewer_that_may_not_look_any_more_asks_once_and_stops() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    pair.studio_peers.allow("air", &[Permission::Audio]);
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    assert!(matches!(step(&mut viewer), Err(Error::Forbidden)));
+    assert_eq!(between.connections(), 2, "one question, and no more");
+}
+
+#[test]
+fn another_paired_device_at_the_same_address_is_not_the_picture() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    // A second host that the device is paired with as well takes over the
+    // address (the network handed it out again, say).
+    let den = Identity::generate();
+    pair.air_peers
+        .open()
+        .add(crate::testing::peer("den", &den))
+        .unwrap();
+    let den_peers = TempPeers::trusting(&[("air", &pair.air)]);
+    let other = Host::listen(
+        "127.0.0.1:0".parse().unwrap(),
+        &den,
+        den_peers.path(),
+        info(),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+    between.lead_to(other.local_addr());
+    between.fall_silent();
+
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    let refused = step(&mut viewer).unwrap_err();
+    assert!(
+        matches!(refused, Error::Link(LinkError::WrongPeer { .. })),
+        "{refused}"
+    );
+    assert_eq!(other.viewers(), 0);
+}
+
+#[test]
+fn a_host_that_is_away_is_asked_again_until_it_is_back() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    let mut viewer = pair.lasting_through(between.addr);
+    lasting_and_shown(&pair, &mut viewer);
+
+    // Nothing answers where the connections are passed on to, for a while.
+    let nowhere = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    between.lead_to(nowhere);
+    between.fall_silent();
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    let began = Instant::now();
+    while began.elapsed() < Duration::from_millis(900) {
+        assert!(viewer.next(Duration::from_millis(50)).unwrap().is_none());
+    }
+    // A few attempts in that time, a quarter of a second apart.
+    let tried = between.connections() - 1;
+    assert!((3..=5).contains(&tried), "{tried} attempts");
+
+    between.lead_to(pair.addr);
+    assert!(matches!(
+        step(&mut viewer).unwrap(),
+        Stepped::Connected { again: true, .. }
+    ));
+    assert_eq!(viewer.cuts(), 1);
 }

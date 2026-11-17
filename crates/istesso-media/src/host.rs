@@ -30,7 +30,7 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ use istesso_pair::{Identity, Peer, PeerStore, Permission};
 
 use crate::clock;
 use crate::timed::{wait_for, Ready, Timed, Wake};
-use crate::wire::{self, Ask, Cursor, ErrorCode, Header, Kind, Reply, StreamInfo};
+use crate::wire::{self, Ask, Cursor, Ending, ErrorCode, Header, Kind, Reply, StreamInfo};
 use crate::{Error, Log, Result};
 
 /// Callers a host deals with at the same time that have not yet shown who
@@ -182,6 +182,10 @@ struct Watcher {
     /// The stream is over; nothing more is sent, and the viewer's thread
     /// ends.
     closed: AtomicBool,
+    /// Why, when this host ends the stream for a reason the viewer is to know (0: it is
+    /// not told; otherwise [`farewell`] of the reason). A viewer that is told does not
+    /// connect again.
+    farewell: AtomicU8,
     /// A frame was not sent to this viewer since the last one it got.
     missed: AtomicBool,
     /// Part of what was sealed for the viewer waits for its connection to
@@ -385,9 +389,10 @@ impl Host {
         let mut watchers = shared.watchers();
         watchers.list.retain(|watcher| {
             who.lets_in(&watcher.peer) || {
-                shared.close(
+                shared.close_saying(
                     watcher,
                     &"the picture is for another device now, or for none",
+                    Ending::NotShown,
                 );
                 false
             }
@@ -463,7 +468,11 @@ impl Host {
         shared.withheld.store(!offered, Ordering::SeqCst);
         if !offered {
             for watcher in shared.watchers().list.drain(..) {
-                shared.close(&watcher, &"the picture is no longer offered");
+                shared.close_saying(
+                    &watcher,
+                    &"the picture is no longer offered",
+                    Ending::SetAside,
+                );
             }
         }
     }
@@ -557,6 +566,25 @@ impl Drop for Host {
     }
 }
 
+/// How a reason for ending a stream is kept in a viewer's record: never 0, which says
+/// that the viewer is not told.
+fn farewell(said: Ending) -> u8 {
+    match said {
+        Ending::Over => 1,
+        Ending::NotShown => 2,
+        Ending::SetAside => 3,
+    }
+}
+
+fn said_in_farewell(kept: u8) -> Option<Ending> {
+    match kept {
+        1 => Some(Ending::Over),
+        2 => Some(Ending::NotShown),
+        3 => Some(Ending::SetAside),
+        _ => None,
+    }
+}
+
 fn reply(channel: &mut Channel<Timed>, reply: &Reply) -> Result<()> {
     let bytes = serde_json::to_vec(reply).map_err(|_| Error::Malformed)?;
     Ok(channel.send(&bytes)?)
@@ -643,6 +671,15 @@ impl Shared {
 
     /// Ends a viewer's stream: nothing more is sent to it, and its thread
     /// closes the connection.
+    /// Ends a viewer's stream as [`Shared::close`] does, and has its thread tell the
+    /// viewer why before the connection is closed, so that the viewer does not come
+    /// back by itself.
+    fn close_saying(&self, watcher: &Watcher, why: &dyn std::fmt::Display, said: Ending) {
+        // Set first: the thread that finds the stream closed looks for it.
+        watcher.farewell.store(farewell(said), Ordering::SeqCst);
+        self.close(watcher, why);
+    }
+
     fn close(&self, watcher: &Watcher, why: &dyn std::fmt::Display) {
         if !watcher.closed.swap(true, Ordering::SeqCst) {
             (self.log)(format!(
@@ -661,8 +698,24 @@ impl Shared {
     /// also the one gate. Nothing is sealed for a viewer whose stream has been closed, or
     /// that was not found in the list of paired devices, with the right to look, within
     /// the last second: such a viewer gets `Sealed::Nothing`, whatever the packet is.
+    ///
+    /// One packet passes a closed stream, and only through [`Shared::say_why`]: the word
+    /// that the stream is over and why. It carries nothing of the picture, and it too is
+    /// sealed only for a device that was found paired and allowed within the last second.
     fn seal(&self, watcher: &Watcher, line: &mut Line, packet: &[u8]) -> Result<Sealed> {
-        if watcher.closed.load(Ordering::SeqCst) || !watcher.confirmed_lately() {
+        if watcher.closed.load(Ordering::SeqCst) {
+            return Ok(Sealed::Nothing);
+        }
+        self.seal_for_the_confirmed(watcher, line, packet)
+    }
+
+    fn seal_for_the_confirmed(
+        &self,
+        watcher: &Watcher,
+        line: &mut Line,
+        packet: &[u8],
+    ) -> Result<Sealed> {
+        if !watcher.confirmed_lately() {
             return Ok(Sealed::Nothing);
         }
         // Sealing writes into memory; only `push` touches the connection.
@@ -896,7 +949,7 @@ impl Shared {
             ));
             return refuse(
                 &mut channel,
-                ErrorCode::Forbidden,
+                ErrorCode::NotShown,
                 "the host shows this picture to another device, or to none",
             );
         }
@@ -936,6 +989,7 @@ impl Shared {
             // caller, and about nobody else.
             confirmed_ns: AtomicU64::new(read_at),
             closed: AtomicBool::new(false),
+            farewell: AtomicU8::new(0),
             missed: AtomicBool::new(false),
             unsent: AtomicBool::new(false),
             busy: AtomicBool::new(false),
@@ -999,6 +1053,24 @@ impl Shared {
         closed
     }
 
+    /// Tells a viewer that its stream is over and why, as the last thing on its
+    /// connection. Best effort: the viewer may be gone already, and a viewer whose
+    /// connection still holds part of a frame is not told (the word would have to wait
+    /// behind the frame). One that is not told connects again and is answered then.
+    fn say_why(&self, watcher: &Watcher, said: Ending, packet: &mut Vec<u8>) {
+        // This may wait for the connection, so it is said first, as everywhere.
+        watcher.busy.store(true, Ordering::SeqCst);
+        let mut line = watcher.line();
+        if line.unsent_since.is_none() {
+            wire::encode_end(said, self.seq.load(Ordering::SeqCst), packet);
+            if let Ok(Sealed::Part) = self.seal_for_the_confirmed(watcher, &mut line, packet) {
+                let _ = line.channel.stream().push_by(Instant::now() + ASK_WAIT);
+            }
+        }
+        drop(line);
+        watcher.busy.store(false, Ordering::SeqCst);
+    }
+
     /// A viewer's thread, for as long as its stream lasts: reads what the
     /// viewer says, finishes what its connection did not take at once, and
     /// says that the picture stands still when it does.
@@ -1006,22 +1078,15 @@ impl Shared {
         let mut packet = Vec::new();
         loop {
             if self.stop.load(Ordering::SeqCst) {
-                // Best effort: the viewer may be gone already. This may wait for the
-                // connection, so it is said first, as everywhere.
-                watcher.busy.store(true, Ordering::SeqCst);
-                let mut line = watcher.line();
-                if line.unsent_since.is_none() {
-                    let seq = self.seq.load(Ordering::SeqCst);
-                    wire::encode(&Header::without_frame(Kind::End, seq), &[], &mut packet);
-                    if let Ok(Sealed::Part) = self.seal(watcher, &mut line, &packet) {
-                        let _ = line.channel.stream().push_by(Instant::now() + ASK_WAIT);
-                    }
-                }
-                drop(line);
-                watcher.busy.store(false, Ordering::SeqCst);
-                return;
+                return self.say_why(watcher, Ending::Over, &mut packet);
             }
             if watcher.closed.load(Ordering::SeqCst) {
+                // Closed for a reason the viewer is to know: it is told, so that it does
+                // not connect again. Closed for any other reason (not paired any more, a
+                // connection that failed), it is told nothing.
+                if let Some(said) = said_in_farewell(watcher.farewell.load(Ordering::SeqCst)) {
+                    self.say_why(watcher, said, &mut packet);
+                }
                 return;
             }
             #[cfg(test)]

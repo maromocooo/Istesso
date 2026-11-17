@@ -27,8 +27,11 @@ const FRAME_WAIT: Duration = Duration::from_secs(3);
 /// How long a single write to the host may take.
 const ASK_WAIT: Duration = Duration::from_secs(1);
 /// A host says something at least twice a second, a frame or that it has
-/// none. One that has said nothing for this long is taken to be gone.
-const SILENT_AFTER: Duration = Duration::from_secs(3);
+/// none. One that has said nothing for this long is taken to be gone: two
+/// of those words are missing then. A network may stop delivering on a
+/// connection that both ends still believe in, and this is the only way
+/// to notice. The same second as for sound.
+pub const SILENT_AFTER: Duration = Duration::from_secs(1);
 
 /// A connection to a host that shows this device its picture.
 pub struct Viewer {
@@ -55,7 +58,7 @@ pub enum Event<'a> {
 }
 
 /// What [`Viewer::pull`] found, without the bytes.
-enum Pulled {
+pub(crate) enum Pulled {
     Frame {
         header: Header,
         at: std::ops::Range<usize>,
@@ -151,11 +154,16 @@ impl Viewer {
         let answer = channel.recv()?;
         let info = match serde_json::from_slice::<Reply>(&answer).map_err(|_| Error::Malformed)? {
             Reply::Stream { info, .. } => info,
-            Reply::Error {
-                code: ErrorCode::Forbidden,
-                ..
-            } => return Err(Error::Forbidden),
-            Reply::Error { message, .. } => return Err(Error::Refused(message)),
+            Reply::Error { code, message } => {
+                return Err(match code {
+                    ErrorCode::Forbidden => Error::Forbidden,
+                    ErrorCode::NotShown => Error::NotShown,
+                    ErrorCode::Busy => Error::Busy,
+                    ErrorCode::Unsupported => Error::Unsupported(message),
+                    // A reason a later version gives: refused, whatever it is.
+                    ErrorCode::Other => Error::Refused(message),
+                });
+            }
         };
         if info.codec == Codec::Unknown {
             return Err(Error::Unsupported(
@@ -191,6 +199,31 @@ impl Viewer {
     /// A handle for asking for a key frame from another thread.
     pub fn asker(&self) -> Asker {
         Asker(self.asking.clone())
+    }
+
+    /// When the host was last heard: a frame, what the cursor is, or that
+    /// there is no picture to send.
+    pub fn last_heard(&self) -> Instant {
+        self.last_heard
+    }
+
+    /// [`Viewer::next`] in two steps, for a caller that has to let go of
+    /// the viewer in between: what came, without its bytes.
+    pub(crate) fn pull_for(&mut self, wait: Duration) -> Result<Option<Pulled>> {
+        self.pull(wait)
+    }
+
+    /// The second step: what was pulled last, with its bytes.
+    pub(crate) fn event_of(&self, pulled: Pulled) -> Option<Event<'_>> {
+        match pulled {
+            Pulled::Frame {
+                header,
+                at,
+                first_ns,
+                whole_ns,
+            } => Some(Event::Frame(self.frame(header, at, first_ns, whole_ns))),
+            Pulled::Cursor => self.cursor().map(Event::Cursor),
+        }
     }
 
     /// What the host last said the cursor is. `None` until it has said so: a host that
@@ -270,19 +303,22 @@ impl Viewer {
                 let ask = serde_json::to_vec(&Ask::KeyFrame).map_err(|_| Error::Malformed)?;
                 self.channel.send(&ask)?;
             }
-            if self.last_heard.elapsed() >= SILENT_AFTER {
-                return Err(Error::Silent);
-            }
+            // The host counts as silent only when nothing of it is there to be read:
+            // what arrived while nobody was asking is not silence.
             let left = until.saturating_duration_since(Instant::now());
+            let silent_in = SILENT_AFTER.saturating_sub(self.last_heard.elapsed());
             let ready = wait_for(
                 self.channel.stream().stream(),
                 Some(&self.asking.wake),
-                left.min(SILENT_AFTER),
+                left.min(silent_in),
             )?;
             match ready {
                 Ready::Woken => {
                     self.asking.wake.clear();
                     continue;
+                }
+                Ready::Neither if self.last_heard.elapsed() >= SILENT_AFTER => {
+                    return Err(Error::Silent)
                 }
                 Ready::Neither if left.is_zero() || Instant::now() >= until => return Ok(None),
                 Ready::Neither => continue,
@@ -303,7 +339,13 @@ impl Viewer {
                         }))
                     }
                     Kind::Idle => continue,
-                    Kind::End => return Err(Error::Ended),
+                    Kind::End => {
+                        return Err(match wire::decode_end(&self.packet[at]) {
+                            wire::Ending::Over => Error::Ended,
+                            wire::Ending::NotShown => Error::NotShown,
+                            wire::Ending::SetAside => Error::SetAside,
+                        })
+                    }
                     Kind::Cursor => {
                         // The image is whatever an application on the host handed in: it
                         // is taken only if its numbers fit its length and the limits.
