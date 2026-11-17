@@ -1063,19 +1063,16 @@ fn a_frame_whose_rest_gets_out_in_time_is_followed_by_the_next_with_a_deadline_o
     let pair = pair();
     let channel = pair.raw_watching();
     let frame = picture(1 << 18, 1);
-    let send_until_one_waits = || {
-        let began = Instant::now();
-        loop {
-            assert!(began.elapsed() < Duration::from_secs(10), "it never filled");
-            assert_eq!(pair.host.viewers(), 1, "the viewer was let go too early");
-            if pair.host.send_frame(&frame, 0, 0, true).unwrap().queued > 0 {
-                return Instant::now();
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    };
     // The viewer reads nothing until a frame's rest waits for its connection ...
-    send_until_one_waits();
+    let began = Instant::now();
+    loop {
+        assert!(began.elapsed() < Duration::from_secs(10), "it never filled");
+        assert_eq!(pair.host.viewers(), 1, "the viewer was let go too early");
+        if pair.host.send_frame(&frame, 0, 0, true).unwrap().queued > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
     // ... and then takes everything there is, well within that frame's time: the rest
     // gets out. (A system that gives a connection more room does the same without the
     // viewer having read anything.)
@@ -1090,11 +1087,36 @@ fn a_frame_whose_rest_gets_out_in_time_is_followed_by_the_next_with_a_deadline_o
     }
     // The viewer is still shown the picture, and the next frame is begun.
     assert_eq!(pair.host.viewers(), 1);
-    // It stops reading again. The frame that waits now has its own time, counted from
-    // when it began to wait, and then the viewer is let go.
-    let waits_since = send_until_one_waits();
-    pair.until(|| pair.host.viewers() == 0);
-    let given = waits_since.elapsed();
+    // It stops reading again. Frames go on as before. One whose rest waits now has a
+    // time of its own, counted from when it began to wait, and when that is over the
+    // viewer is let go. As in the test above, a rest may get out after all (the
+    // connection is given more room, or what the viewer has not read yet makes room on
+    // its way): then it is the next frame that waits, and the last one is the one that
+    // counts.
+    let began = Instant::now();
+    let mut left_waiting: Vec<Instant> = Vec::new();
+    while pair.host.viewers() > 0 {
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "still a viewer, long after it stopped reading again ({} frames were left waiting)",
+            left_waiting.len()
+        );
+        if pair.host.send_frame(&frame, 0, 0, true).unwrap().queued > 0 {
+            if let Some(before) = left_waiting.last() {
+                let apart = before.elapsed();
+                assert!(
+                    apart < Duration::from_millis(350),
+                    "a frame's rest waited {apart:?} and the viewer was kept"
+                );
+            }
+            left_waiting.push(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let given = left_waiting
+        .last()
+        .expect("the connection never filled again")
+        .elapsed();
     assert!(given >= Duration::from_millis(180), "{given:?}");
     assert!(given < Duration::from_millis(700), "{given:?}");
 }
