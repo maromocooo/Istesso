@@ -497,11 +497,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         // This program is not run for a while (the machine was busy, or asleep for a
-        // moment): for longer than an answer may take, and for much less than the two
-        // seconds after which the host lets go of a device that says nothing. The
-        // answer comes meanwhile and waits to be read.
+        // moment): for longer than silence may last. The host lets go of a device
+        // only after two seconds without a word, counted from the "still here" just
+        // said, so the conversation is still there, and the answer has come
+        // meanwhile and waits to be read.
         let stood_still_from = Instant::now();
-        std::thread::sleep(UNANSWERED_FOR + Duration::from_millis(300));
+        std::thread::sleep(SILENT_AFTER + Duration::from_millis(300));
         // The question is older now than an answer may be, counted by the clock. What
         // has arrived is looked at before that is believed: the line is not cut, and
         // the question it has open now, if any, is a new one.
