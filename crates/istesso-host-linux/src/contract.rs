@@ -129,6 +129,15 @@ pub enum Event {
     },
     /// Added: how many windows the application has, whenever that changes.
     Windows { count: u32 },
+    /// Added: the answer to `close`, which is also how an application is
+    /// ended (a device's "quit this application"): its windows were asked
+    /// to close, this many of them. `asked` false: this host cannot ask.
+    /// Nothing is ever closed by force.
+    CloseAsked { asked: bool, windows: u32 },
+    /// Added: so long after its windows were asked to close, the application
+    /// still has this many: it is asking something, or has decided to stay.
+    /// Said once; the session goes on.
+    StillOpen { windows: u32, after_s: u32 },
 }
 
 /// The answer a device is given for where its picture comes from: the port
@@ -281,6 +290,24 @@ mod tests {
         assert_eq!(
             windows,
             serde_json::json!({"v": 1, "event": "windows", "count": 2})
+        );
+        let asked: Value = serde_json::from_str(&write(&Event::CloseAsked {
+            asked: true,
+            windows: 2,
+        }))
+        .unwrap();
+        assert_eq!(
+            asked,
+            serde_json::json!({"v": 1, "event": "close_asked", "asked": true, "windows": 2})
+        );
+        let open: Value = serde_json::from_str(&write(&Event::StillOpen {
+            windows: 1,
+            after_s: 5,
+        }))
+        .unwrap();
+        assert_eq!(
+            open,
+            serde_json::json!({"v": 1, "event": "still_open", "windows": 1, "after_s": 5})
         );
         let resumed: Value = serde_json::from_str(&write(&Event::Resumed {
             opened_ms: 1.0,

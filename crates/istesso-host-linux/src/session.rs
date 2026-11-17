@@ -16,6 +16,10 @@ use crate::picture::{At, Picture, State, Told, Who, Works};
 use crate::stage::{CursorSeen, Handed, Heard, Note, Out, Stage, ToCompositor};
 use crate::words::{self, Answer, Word};
 
+/// How long after its windows were asked to close an application is said to
+/// be still open, in seconds.
+const STILL_OPEN_AFTER_S: u32 = 5;
+
 /// One key frame answers every request made within this long.
 const KEY_FRAME_EVERY_NS: u64 = 50_000_000;
 
@@ -106,6 +110,9 @@ pub struct Session {
     cursors: Option<Arc<cursor::Book>>,
     last_key_frame_ns: u64,
     windows: u32,
+    /// When the application's windows were asked to close, until they have
+    /// all gone or it has been said that they are still open.
+    close_asked_ns: Option<u64>,
     environment: Option<Vec<(String, String)>>,
 }
 
@@ -144,6 +151,7 @@ impl Session {
             cursors: begin.cursors,
             last_key_frame_ns: 0,
             windows: 0,
+            close_asked_ns: None,
             environment: None,
         };
         Ok((session, told))
@@ -308,8 +316,14 @@ impl Session {
                     });
                     self.resume();
                 }
+                // Also how an application is ended: every window it has is
+                // asked to close, and none is closed by force.
                 Some(Command::Close) => {
-                    if !self.close_windows() {
+                    let windows = self.windows;
+                    let asked = self.close_windows();
+                    self.event(&Event::CloseAsked { asked, windows });
+                    self.close_asked_ns = (asked && windows > 0).then(|| (self.clock)());
+                    if !asked {
                         (self.remark)(
                             "note: this compositor plugin cannot ask windows to close".to_string(),
                         );
@@ -382,6 +396,9 @@ impl Session {
                 self.log.line(line::windows(now, count));
                 let gone = count == 0 && self.windows > 0;
                 self.windows = count;
+                if count == 0 {
+                    self.close_asked_ns = None;
+                }
                 match self.tongue {
                     Tongue::Measure => {
                         (self.say)(words::write(&Answer::Windows { count }));
@@ -480,6 +497,19 @@ impl Session {
         if self.door.key_frame_wanted() {
             self.key_frame("client");
         }
+        if let Some(asked) = self.close_asked_ns {
+            let waited = (self.clock)().saturating_sub(asked);
+            if waited >= u64::from(STILL_OPEN_AFTER_S) * 1_000_000_000 {
+                // The application asks something, or stays: the session goes on.
+                self.close_asked_ns = None;
+                if self.windows > 0 && matches!(self.tongue, Tongue::Runner { .. }) {
+                    self.event(&Event::StillOpen {
+                        windows: self.windows,
+                        after_s: STILL_OPEN_AFTER_S,
+                    });
+                }
+            }
+        }
     }
 
     /// Makes a key frame, unless one was made a moment ago or there is no
@@ -566,7 +596,8 @@ mod tests {
 
     fn clock() -> u64 {
         static BEGAN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        BEGAN.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 1_000_000_000
+        // Well past nought, so that a test can speak of some seconds ago.
+        BEGAN.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 100_000_000_000
     }
 
     const COMPOSITOR: &str = "videotestsrc name=compositor is-live=true ! video/x-raw,width=32,height=32,framerate=100/1";
@@ -778,6 +809,45 @@ mod tests {
         let mut set = self::set(ENCODER, Tongue::Measure);
         set.session.heard(Heard::Windows(0));
         assert_eq!(set.said().len(), 1);
+        set.session.stop();
+    }
+
+    #[test]
+    fn ending_the_application_asks_its_windows_and_says_once_when_they_are_still_open() {
+        let mut set = set(ENCODER, runner());
+        set.session.heard(Heard::Windows(2));
+        // The stand-in for the compositor cannot be asked: that is said, and nothing is waited for.
+        set.session.line(r#"{"v":1,"cmd":"close"}"#);
+        let said = set.said();
+        assert_eq!(
+            said[1],
+            serde_json::json!({"v": 1, "event": "close_asked", "asked": false, "windows": 2})
+        );
+        assert_eq!(set.session.close_asked_ns, None);
+
+        // A compositor that was asked a moment ago: nothing is said yet.
+        set.session.close_asked_ns = Some(clock());
+        set.session.tick();
+        assert_eq!(set.said().len(), 2);
+        // Asked more than five seconds ago with a window left: said, once.
+        set.session.close_asked_ns = Some(clock() - 6_000_000_000);
+        set.session.tick();
+        set.session.tick();
+        let said = set.said();
+        assert_eq!(said.len(), 3);
+        assert_eq!(
+            said[2],
+            serde_json::json!({"v": 1, "event": "still_open", "windows": 2, "after_s": 5})
+        );
+        // The last window going ends the waiting: `empty`, and no `still_open` after it.
+        set.session.close_asked_ns = Some(clock() - 6_000_000_000);
+        set.session.heard(Heard::Windows(0));
+        set.session.tick();
+        let events: Vec<String> = set.said()[3..]
+            .iter()
+            .map(|line| line["event"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(events, ["windows", "empty"]);
         set.session.stop();
     }
 
