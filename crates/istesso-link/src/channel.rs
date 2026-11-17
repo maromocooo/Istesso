@@ -21,7 +21,9 @@
 //! when the answer does not come from a paired device.
 
 use std::cmp::Ordering;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use istesso_pair::Identity;
 use zeroize::Zeroizing;
@@ -145,6 +147,45 @@ fn exchange_magic<S: Read + Write>(stream: &mut S, initiator: bool) -> Result<()
     Ok(())
 }
 
+/// A connection whose waits all end at one point in time. Every read and
+/// write is given what is left of the time, not the whole of it again: a
+/// device that sends one byte just before each wait runs out gets no further
+/// than one that sends nothing.
+struct Hurried<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Hurried<'_> {
+    fn left(&self) -> io::Result<Duration> {
+        self.until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+    }
+}
+
+impl Read for Hurried<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.left()?))?;
+        let mut stream = self.stream;
+        stream.read(buf)
+    }
+}
+
+impl Write for Hurried<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.left()?))?;
+        let mut stream = self.stream;
+        stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stream = self.stream;
+        stream.flush()
+    }
+}
+
 /// An authenticated, encrypted connection to one device.
 ///
 /// Messages arrive whole and in order. After any error the channel must be
@@ -154,6 +195,43 @@ pub struct Channel<S> {
     transport: snow::TransportState,
     peer_key: [u8; 32],
     scratch: Vec<u8>,
+}
+
+impl Channel<TcpStream> {
+    /// Opens a channel as the answering side, as [`Channel::respond`] does,
+    /// with the whole handshake over `within` this time, however slowly the
+    /// other device sends. Until it is over nobody knows who is calling: a
+    /// stranger must not be able to keep a connection, and the place it takes
+    /// up, by sending a byte now and then. Afterwards each wait for the
+    /// other device may take `timeout`.
+    pub fn respond_within(
+        stream: TcpStream,
+        keys: &LocalKeys,
+        within: Duration,
+        timeout: Duration,
+        trusted: impl FnOnce(&[u8; 32]) -> bool,
+    ) -> Result<Self> {
+        let hurried = Hurried {
+            stream: &stream,
+            until: Instant::now() + within,
+        };
+        let Channel {
+            transport,
+            peer_key,
+            scratch,
+            ..
+        } = Channel::respond(hurried, keys, trusted)?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|_| stream.set_write_timeout(Some(timeout)))
+            .map_err(Error::from_io)?;
+        Ok(Channel {
+            stream,
+            transport,
+            peer_key,
+            scratch,
+        })
+    }
 }
 
 impl<S: Read + Write> Channel<S> {

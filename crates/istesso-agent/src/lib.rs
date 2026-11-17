@@ -11,14 +11,16 @@
 
 pub mod cache;
 pub mod discovery;
+pub mod passing;
 pub mod paths;
 pub mod serve;
 pub mod status;
 pub mod survey;
 
+pub use passing::PassLog;
 pub use paths::Paths;
 pub use serve::{Agent, AgentOptions};
-pub use survey::{survey, HostView, SurveyOptions};
+pub use survey::{connect_peer, connect_peer_at, survey, HostView, SurveyOptions};
 
 #[cfg(test)]
 pub(crate) mod testing {
@@ -87,6 +89,10 @@ pub(crate) mod testing {
 
         pub fn paths(&self) -> Paths {
             Paths::at(&self.0)
+        }
+
+        pub fn path(&self) -> &std::path::Path {
+            &self.0
         }
     }
 

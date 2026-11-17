@@ -5,7 +5,7 @@
 //! know is answered with [`ErrorCode::Unsupported`], and readers skip the
 //! parts of an answer they do not understand.
 
-use istesso_proto::{AppEntry, HostManifest, HostStatus};
+use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,17 @@ pub enum Request {
     Apps,
     /// How busy are you?
     Status,
+    /// May I send you what a person does with keyboard and pointer, for the
+    /// application you are showing me? Answered with [`Response::InputOpen`];
+    /// needs the permission to control.
+    InputOpen,
+    /// Keyboard and pointer input, after [`Request::InputOpen`] was granted
+    /// on this connection. Never answered: what a person types must not
+    /// wait for a round trip. An empty list keeps the connection open.
+    Input {
+        #[serde(deserialize_with = "istesso_proto::known_only")]
+        events: Vec<InputEvent>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +46,8 @@ pub enum Response {
     Status {
         status: HostStatus,
     },
+    /// Input is taken from now on.
+    InputOpen,
     Error {
         code: ErrorCode,
         message: String,
@@ -77,6 +90,40 @@ mod tests {
         let request: Request = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
         assert_eq!(request, Request::Ping);
         assert!(serde_json::from_str::<Request>(r#"{"type":"launch_rocket"}"#).is_err());
+    }
+
+    #[test]
+    fn input_is_a_list_that_survives_events_from_a_newer_sender() {
+        let request = Request::Input {
+            events: vec![
+                InputEvent::Key {
+                    code: 30,
+                    pressed: true,
+                },
+                InputEvent::PointerAt { x: 1, y: 2 },
+            ],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"input","events":[{"kind":"key","code":30,"pressed":true},{"kind":"pointer_at","x":1,"y":2}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        // An event this version does not know is dropped; the rest arrives.
+        let newer = r#"{"type":"input","events":[{"kind":"pen","pressure":0.5},{"kind":"button","code":272,"pressed":true}]}"#;
+        assert_eq!(
+            serde_json::from_str::<Request>(newer).unwrap(),
+            Request::Input {
+                events: vec![InputEvent::Button {
+                    code: 272,
+                    pressed: true
+                }]
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::InputOpen).unwrap(),
+            r#"{"type":"input_open"}"#
+        );
     }
 
     #[test]

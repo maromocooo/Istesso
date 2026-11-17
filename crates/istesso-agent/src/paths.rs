@@ -90,6 +90,18 @@ impl Paths {
         self.config.join("identity.key")
     }
 
+    /// Where the program that shows an application of this machine to
+    /// another device takes that device's keyboard and pointer input: a
+    /// datagram socket the program creates, one input event per datagram,
+    /// as JSON. In the user's runtime directory, which nobody else can
+    /// reach; next to the cache where there is none.
+    pub fn input_socket(&self) -> PathBuf {
+        match std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+            Some(dir) => PathBuf::from(dir).join(APP_DIR).join("input.sock"),
+            None => self.cache.join("input.sock"),
+        }
+    }
+
     pub fn peers(&self) -> PathBuf {
         self.config.join("peers.json")
     }

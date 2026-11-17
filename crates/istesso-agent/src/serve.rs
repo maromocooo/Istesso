@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use istesso_link::{ErrorCode, LocalKeys, Request, Response, Session, DEFAULT_PORT};
 use istesso_pair::{Identity, PeerStore, Permission};
-use istesso_proto::{AppEntry, HostManifest};
+use istesso_proto::{AppEntry, HostManifest, InputEvent};
 
 use crate::cache;
 use crate::discovery::Discovery;
@@ -24,6 +24,11 @@ use crate::survey::{refresh_peers, SurveyOptions};
 const MAX_CONNECTIONS: usize = 64;
 /// How long the agent waits for a caller's next message.
 const WAIT: Duration = Duration::from_secs(5);
+/// How often a device that sends input is looked up again in the list of
+/// paired devices. A conversation with input stays open for as long as a
+/// window does; a pairing that is removed, or a right that is taken away,
+/// must stop it soon, not when the window is closed.
+const INPUT_RECHECK: Duration = Duration::from_secs(1);
 /// How long a full inspection of this machine stays valid. The agent repeats
 /// the inspection twice as often and always answers from memory.
 pub const MANIFEST_MAX_AGE: Duration = Duration::from_secs(600);
@@ -47,6 +52,9 @@ pub struct AgentOptions {
     pub refresh_peers: Option<Duration>,
     /// Also report every conversation, not just the refused ones.
     pub verbose: bool,
+    /// For measuring: write down when input was passed on, and never what it
+    /// was ([`crate::passing`]). `None`, the default, writes nothing.
+    pub input_timings: Option<std::path::PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -57,6 +65,7 @@ impl Default for AgentOptions {
             discovery: true,
             refresh_peers: Some(Duration::from_secs(300)),
             verbose: false,
+            input_timings: None,
         }
     }
 }
@@ -75,6 +84,7 @@ struct Shared {
     apps: Mutex<Option<(Instant, Vec<AppEntry>)>>,
     connections: AtomicUsize,
     verbose: bool,
+    passing: Option<crate::PassLog>,
     log: Log,
 }
 
@@ -89,6 +99,13 @@ impl Agent {
                 SocketAddr::new(options.bind, options.port)
             )
         })?;
+        let passing = match &options.input_timings {
+            Some(path) => Some(
+                crate::PassLog::create(path)
+                    .map_err(|e| format!("cannot write to {}: {e}", path.display()))?,
+            ),
+            None => None,
+        };
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -100,6 +117,7 @@ impl Agent {
                 apps: Mutex::new(None),
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
+                passing,
                 log,
             }),
         })
@@ -180,6 +198,53 @@ impl Agent {
     }
 }
 
+/// Where a paired device's keyboard and pointer input goes on this machine:
+/// to the program that shows it an application, through the socket that
+/// program listens on ([`Paths::input_socket`]).
+struct InputSink {
+    #[cfg(unix)]
+    socket: std::os::unix::net::UnixDatagram,
+}
+
+impl InputSink {
+    #[cfg(unix)]
+    fn open(path: &std::path::Path) -> std::io::Result<InputSink> {
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        socket.connect(path)?;
+        socket.set_nonblocking(true)?;
+        Ok(InputSink { socket })
+    }
+
+    #[cfg(not(unix))]
+    fn open(_path: &std::path::Path) -> std::io::Result<InputSink> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// One event, one datagram. A program that has gone away, or does not
+    /// keep up, loses input; the conversation goes on.
+    fn send(&self, event: &InputEvent) {
+        #[cfg(unix)]
+        if let Ok(bytes) = serde_json::to_vec(event) {
+            let _ = self.socket.send(&bytes);
+        }
+        #[cfg(not(unix))]
+        let _ = event;
+    }
+}
+
+/// Whether the device is, at this moment, still paired and still allowed to
+/// control this host: read from the list on disk, not remembered from when
+/// the conversation began.
+fn may_still_control(paths: &Paths, peer: &istesso_pair::Peer) -> bool {
+    PeerStore::open(paths.peers()).is_ok_and(|peers| {
+        peers.peers().iter().any(|known| {
+            known.id == peer.id
+                && known.public_key == peer.public_key
+                && known.permissions.contains(&Permission::Control)
+        })
+    })
+}
+
 impl Shared {
     fn handle(&self, stream: TcpStream) {
         // Read the list of paired devices for every caller: a pairing that
@@ -217,11 +282,50 @@ impl Shared {
             cache::suggest_address(&self.paths, &session.peer().id, &session.peer().name, &hint);
 
         let mut asked: Vec<&'static str> = Vec::new();
+        let mut input: Option<InputSink> = None;
+        let mut checked = Instant::now();
         while let Ok(Some(request)) = session.next_request() {
-            let response = if session.allows(Permission::View) {
-                self.answer(&request, &mut asked)
-            } else {
-                Response::error(ErrorCode::Forbidden, "this device may not look at the host")
+            let response = match request {
+                Request::Input { events } => {
+                    // Passed on and not answered. Input that was not asked for first, or
+                    // that nothing takes any more, is dropped.
+                    let Some(sink) = &input else { continue };
+                    let in_hand = crate::PassLog::mark();
+                    // The device sends something at least every two seconds, so this is
+                    // looked at often enough.
+                    if checked.elapsed() >= INPUT_RECHECK {
+                        checked = Instant::now();
+                        if !may_still_control(&self.paths, session.peer()) {
+                            (self.log)(format!(
+                                "stopped taking input from {}: it is no longer allowed to control this host",
+                                session.peer().name
+                            ));
+                            break;
+                        }
+                    }
+                    events.iter().for_each(|event| sink.send(event));
+                    // The empty message that only says "still here" passes nothing on.
+                    if let (Some(passing), false) = (&self.passing, events.is_empty()) {
+                        passing.passed(in_hand, events.len());
+                    }
+                    continue;
+                }
+                Request::InputOpen if !session.allows(Permission::Control) => {
+                    Response::error(ErrorCode::Forbidden, "this device may not control the host")
+                }
+                Request::InputOpen => match InputSink::open(&self.paths.input_socket()) {
+                    Ok(sink) => {
+                        input = Some(sink);
+                        asked.push("input");
+                        Response::InputOpen
+                    }
+                    Err(_) => Response::error(
+                        ErrorCode::Internal,
+                        "nothing on this host takes input at the moment",
+                    ),
+                },
+                request if session.allows(Permission::View) => self.answer(&request, &mut asked),
+                _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
             if session.respond(&response).is_err() {
                 break;
@@ -255,6 +359,11 @@ impl Shared {
                     status: local_status(),
                 }
             }
+            // Handled where the connection is, before this is reached.
+            Request::InputOpen | Request::Input { .. } => Response::error(
+                ErrorCode::Unsupported,
+                "input is not answered like a question",
+            ),
         }
     }
 
@@ -308,6 +417,7 @@ mod tests {
             discovery: false,
             refresh_peers: None,
             verbose: false,
+            ..AgentOptions::default()
         };
         Agent::bind(paths.clone(), &options, Arc::new(|_| {})).unwrap()
     }
@@ -336,6 +446,70 @@ mod tests {
         agent.shared.refresh_manifest();
         assert_ne!(agent.shared.manifest().name, "planted for this test");
         assert!(paths.local_manifest().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_reaches_whoever_listens_one_event_a_datagram() {
+        use std::os::unix::net::UnixDatagram;
+        let dir = TempDir::new("in");
+        let path = dir.paths().config.join("i.sock");
+        // Nobody listens: there is nothing to open.
+        assert!(InputSink::open(&path).is_err());
+
+        let listener = UnixDatagram::bind(&path).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sink = InputSink::open(&path).unwrap();
+        sink.send(&InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        sink.send(&InputEvent::PointerAt { x: 3, y: 4 });
+        let mut buffer = [0u8; 256];
+        let length = listener.recv(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..length],
+            br#"{"kind":"key","code":30,"pressed":true}"#
+        );
+        let length = listener.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], br#"{"kind":"pointer_at","x":3,"y":4}"#);
+
+        // The listener goes away: input is lost, nothing else happens.
+        drop(listener);
+        sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
+    }
+
+    #[test]
+    fn a_device_stops_being_allowed_to_send_input_when_its_rights_change() {
+        let dir = TempDir::new("rights");
+        let paths = dir.paths();
+        let mut peer = istesso_pair::Peer {
+            id: "aaaa-bbbb-cccc-dddd".into(),
+            name: "a laptop".into(),
+            public_key: "11".repeat(32),
+            paired_at: 0,
+            permissions: Permission::defaults(),
+        };
+        // Not paired at all.
+        assert!(!may_still_control(&paths, &peer));
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(may_still_control(&paths, &peer));
+        // Another device that took over the name does not inherit the right.
+        let mut impostor = peer.clone();
+        impostor.public_key = "22".repeat(32);
+        assert!(!may_still_control(&paths, &impostor));
+        // The pairing is removed while a conversation is open.
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.remove(&peer.id).unwrap();
+        assert!(!may_still_control(&paths, &peer));
+        // Paired again, but only for looking.
+        peer.permissions = vec![Permission::View];
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(!may_still_control(&paths, &peer));
     }
 
     #[test]

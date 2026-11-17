@@ -4,7 +4,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use istesso_pair::{Peer, PeerStore};
-use istesso_proto::{AppEntry, HostManifest, HostStatus};
+use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
 
 use crate::channel::{Channel, LocalKeys};
 use crate::message::{Request, Response};
@@ -115,5 +115,25 @@ impl Client {
             Response::Status { status } => Ok(status),
             _ => Err(Error::Malformed),
         }
+    }
+
+    /// Asks whether the other device takes keyboard and pointer input from
+    /// this one. After `Ok`, [`Client::send_input`] may be used.
+    pub fn open_input(&mut self) -> Result<()> {
+        match self.call(&Request::InputOpen)? {
+            Response::InputOpen => Ok(()),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Sends keyboard and pointer input. No answer comes back and none is
+    /// waited for. An empty list tells the other device that this one is
+    /// still there.
+    pub fn send_input(&mut self, events: &[InputEvent]) -> Result<()> {
+        let request = Request::Input {
+            events: events.to_vec(),
+        };
+        let bytes = serde_json::to_vec(&request).map_err(|_| Error::Malformed)?;
+        self.channel.send(&bytes)
     }
 }
