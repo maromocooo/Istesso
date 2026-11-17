@@ -1,0 +1,713 @@
+Show the windows that come after the first: a question an application asks, a file chooser, a
+second window. Before this, a window that drew its picture once and then waited was never in
+the frame and could not be reached by the pointer, although it had the keyboard.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
+gst-wayland-display-cursor-messages.patch and gst-wayland-display-windows.patch in this
+directory, in that order. The lines of context are from that project and from those patches.
+
+It is kept small and in a shape that can be proposed to that project
+(docs/adr/0009-host-compositor.md). The rule for where a window goes is in
+wayland-display-core/src/comp/windows.rs with its tests. There is no property: all of it is
+always on, because what it mends is a fault, and nothing changes for an application that has
+one window.
+
+The fault: a new toplevel is put into the picture in the handler of the commit that brings
+its first buffer, but a window was asked for its size (`Window::on_commit`) only if it was in
+the picture already when that handler began. So a window was shown with a size of 0 by 0 and
+learned its size at its NEXT commit. A window that keeps drawing commits again at once; one
+that draws once and waits for its user never does.
+
+What it changes:
+
+- The size is taken at the commit that brings the first buffer.
+- A toplevel with a parent (`xdg_toplevel.set_parent`: a dialog) is not told to fill the
+  output. It is told how much room there is (the configure's bounds), keeps the size it
+  wants, and is put over the middle of its parent, moved as far as it takes to lie inside the
+  output. One that is larger than the output begins at the output's corner, and what does not
+  fit is not seen. A toplevel without a parent is treated as before: told to fill the output
+  (unless it has a largest size) and put at the corner, above what is there.
+- A window that comes has the keyboard, as before. When a toplevel goes, it is taken out of
+  the picture at once, the keyboard goes to the window that is on top then, and a frame is
+  made in the "render on commit" mode.
+- Pointer events go to the window under the pointer where it IS. Before, a motion was sent to
+  the window under the place the pointer had left, so that a click after one jump went to the
+  wrong window; with one window that fills the output the two are the same. When a window
+  comes up over another or goes, the pointer is told again where it is without having moved.
+- A click on a window puts the windows that have it as their parent above it again.
+
+Tests (`cargo test -p wayland-display-core`): two of the rule for the place, and six with a
+real Wayland client that opens a second toplevel which commits exactly once: without a parent
+it is in the frame and takes a click; with a parent it keeps its size, lies over the middle,
+and has the pointer that stood there; it has the keyboard and hands it, and the pointer, back
+when it goes; a click on the parent leaves it in front; one larger than the output begins at
+the corner and a frame is still made; two ordinary windows both fill the output with the
+later in front.
+
+Known limits:
+
+- All windows are in one picture. Two ordinary windows of one application lie on top of each
+  other, each as large as the output; the earlier one is reached again when the later goes.
+  There is no way to switch between them from outside yet, and no message says where each
+  window lies (the `wayland.windows` message of the third patch could carry that).
+- A dialog is not kept from losing the keyboard to its parent when the parent is clicked
+  beside it; it stays in front.
+- The parent is looked at when the window gets its first buffer. A parent named later does
+  not move the window.
+- A window is placed once. It is not placed again when it changes its size or when the
+  output does.
+
+diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
+index 06e0360..ce1ce1a 100644
+--- a/wayland-display-core/src/comp/input.rs
++++ b/wayland-display-core/src/comp/input.rs
+@@ -201,7 +201,7 @@ impl State {
+         self.last_pointer_movement = Instant::now();
+         let serial = SERIAL_COUNTER.next_serial();
+         let pointer = self.seat.get_pointer().unwrap();
+-        let under = self
++        let mut under = self
+             .space
+             .element_under(self.pointer_location)
+             .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+@@ -211,6 +211,13 @@ impl State {
+         // Pointer should only move if it's not locked or confined (and going out of bounds)
+         if self.can_pointer_move(&under, possible_pos) {
+             self.set_pointer_location(possible_pos);
++            // The events go to the window under the pointer where it is now, not where it
++            // was: with more than one window in the picture the two differ, and a click
++            // after one jump would go to the window the pointer has left.
++            under = self
++                .space
++                .element_under(self.pointer_location)
++                .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+ 
+             // Not sure why, but order here matters (at least when using Sway nested)!!!
+             // If we send the motion event after the relative_motion it'll behave oddly
+@@ -239,6 +246,30 @@ impl State {
+         pointer.frame(self);
+     }
+ 
++    /// Tells the pointer again where it is, after the windows under it have changed (one has
++    /// come or gone) while it stood still: the window that is under it now has it, so that a
++    /// click without a move goes to the window a person sees there.
++    pub(crate) fn pointer_to_the_window_under_it(&mut self) {
++        let pointer = self.seat.get_pointer().unwrap();
++        if pointer.is_grabbed() {
++            return;
++        }
++        let under = self
++            .space
++            .element_under(self.pointer_location)
++            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
++        pointer.motion(
++            self,
++            under,
++            &MotionEvent {
++                location: self.pointer_location,
++                serial: SERIAL_COUNTER.next_serial(),
++                time: std::time::Duration::from(self.clock.now()).as_millis() as u32,
++            },
++        );
++        pointer.frame(self);
++    }
++
+     pub fn set_pointer_location(&mut self, location: Point<f64, Logical>) {
+         self.pointer_location = location;
+         self.pointer_absolute_location = location;
+@@ -546,6 +577,8 @@ impl State {
+                 .map(|(w, p)| (w.clone(), p))
+             {
+                 self.space.raise_element(&window, true);
++                // Its dialogs stay in front of it.
++                self.raise_children_of(&window);
+                 keyboard.set_focus(self, Some(FocusTarget::from(window)), serial);
+                 return;
+             }
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 53edd93..68e95df 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -457,6 +457,77 @@ impl State {
+         }
+     }
+ 
++    /// Where a window that is about to be shown goes: over the middle of its parent if it
++    /// has one that is shown, and at the corner otherwise ([`windows::place`]).
++    pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
++        use smithay::wayland::seat::WaylandFocus;
++        let parent = window
++            .toplevel()
++            .and_then(|toplevel| toplevel.parent())
++            .and_then(|parent| {
++                self.space
++                    .elements()
++                    .find(|w| w.wl_surface().is_some_and(|s| *s == parent))
++            })
++            .and_then(|parent| {
++                let at = self.space.element_location(parent)?;
++                Some(Rectangle::new(at, parent.geometry().size))
++            });
++        let output = self
++            .output
++            .as_ref()
++            .and_then(|output| output.current_mode())
++            .map(|mode| mode.size.to_logical(1))
++            .unwrap_or_default();
++        windows::place(window.geometry().size, parent, output)
++    }
++
++    /// Gives the keyboard to the window that is on top, when the window that had it is not
++    /// shown any more or nothing has it. A dialog that closes hands the keyboard back to the
++    /// window under it this way.
++    pub(crate) fn keyboard_to_the_top_window(&mut self) {
++        use smithay::utils::IsAlive;
++        let keyboard = self.seat.get_keyboard().unwrap();
++        let lost = match keyboard.current_focus() {
++            Some(FocusTarget::Wayland(window)) => {
++                !window.alive() || !self.space.elements().any(|w| *w == window)
++            }
++            Some(FocusTarget::Popup(_)) => false,
++            None => true,
++        };
++        if lost {
++            let top = self.space.elements().rev().find(|w| w.alive()).cloned();
++            keyboard.set_focus(
++                self,
++                top.map(FocusTarget::from),
++                smithay::utils::SERIAL_COUNTER.next_serial(),
++            );
++        }
++    }
++
++    /// Puts the windows that have `window` as their parent above it again, and theirs above
++    /// them: a dialog stays in front of the window it belongs to when that window is clicked.
++    pub(crate) fn raise_children_of(&mut self, window: &Window) {
++        use smithay::wayland::seat::WaylandFocus;
++        let Some(surface) = window.wl_surface().map(|s| s.into_owned()) else {
++            return;
++        };
++        let children: Vec<Window> = self
++            .space
++            .elements()
++            .filter(|w| {
++                w.toplevel()
++                    .and_then(|toplevel| toplevel.parent())
++                    .is_some_and(|parent| parent == surface)
++            })
++            .cloned()
++            .collect();
++        for child in children {
++            self.space.raise_element(&child, true);
++            self.raise_children_of(&child);
++        }
++    }
++
+     /// Asks every client to close its windows, as the close button of a window manager does
+     /// (`xdg_toplevel.close`). What a client does about it is the client's business: one
+     /// with unsaved work asks its user and stays. Returns how many windows were asked.
+diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
+index f99a2cb..7813b6f 100644
+--- a/wayland-display-core/src/comp/windows.rs
++++ b/wayland-display-core/src/comp/windows.rs
+@@ -11,6 +11,37 @@
+ //!   processes do.
+ //!
+ //! "Windows" are toplevels: popups and the cursor do not count.
++//!
++//! A third thing is here because it is about windows that come later: where they go. The
++//! compositor has one output and shows one picture. The first window fills it. A window that
++//! has a parent (a dialog: `xdg_toplevel.set_parent`) keeps its own size and lies over the
++//! middle of its parent, inside the output ([`place`]); any other window is put at the corner,
++//! as the first is. Whatever comes later lies above what was there, and has the keyboard
++//! until it goes.
++
++use smithay::utils::{Logical, Point, Rectangle, Size};
++
++/// Where a window of this `size` is put on an output of that size. With a parent (where the
++/// parent lies): over the parent's middle, moved as far as it takes to lie inside the output.
++/// A window larger than the output begins at the output's corner, and what does not fit is
++/// not seen. Without a parent: at the corner.
++pub fn place(
++    size: Size<i32, Logical>,
++    parent: Option<Rectangle<i32, Logical>>,
++    output: Size<i32, Logical>,
++) -> Point<i32, Logical> {
++    let Some(parent) = parent else {
++        return (0, 0).into();
++    };
++    let along = |from: i32, parent: i32, window: i32, output: i32| {
++        (from + (parent - window) / 2).min(output - window).max(0)
++    };
++    (
++        along(parent.loc.x, parent.size.w, size.w, output.w),
++        along(parent.loc.y, parent.size.h, size.h, output.h),
++    )
++        .into()
++}
+ 
+ /// Receives the number of windows whenever it changes. Called on the compositor's thread.
+ pub type WindowSink = Box<dyn Fn(usize) + Send>;
+@@ -50,6 +81,35 @@ mod tests {
+     use super::*;
+     use std::sync::{Arc, Mutex};
+ 
++    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
++        Rectangle::new((x, y).into(), (w, h).into())
++    }
++
++    #[test]
++    fn a_window_with_a_parent_lies_over_its_middle_and_inside_the_output() {
++        let output = Size::from((1720, 720));
++        // Over the middle of a parent that fills the output.
++        let at = place((400, 300).into(), Some(rect(0, 0, 1720, 720)), output);
++        assert_eq!((at.x, at.y), (660, 210));
++        // A parent near an edge: the window is moved in, not cut off.
++        let at = place((400, 300).into(), Some(rect(1500, 600, 200, 100)), output);
++        assert_eq!((at.x, at.y), (1320, 420));
++        let at = place((400, 300).into(), Some(rect(-100, -50, 200, 100)), output);
++        assert_eq!((at.x, at.y), (0, 0));
++        // Larger than the output: from the corner, the rest is not seen.
++        let at = place((2000, 900).into(), Some(rect(0, 0, 1720, 720)), output);
++        assert_eq!((at.x, at.y), (0, 0));
++        // Exactly as large as the output.
++        let at = place((1720, 720).into(), Some(rect(0, 0, 1720, 720)), output);
++        assert_eq!((at.x, at.y), (0, 0));
++    }
++
++    #[test]
++    fn a_window_without_a_parent_is_put_at_the_corner() {
++        let at = place((400, 300).into(), None, (1720, 720).into());
++        assert_eq!((at.x, at.y), (0, 0));
++    }
++
+     #[test]
+     fn a_sink_is_told_a_change_once_and_a_new_sink_is_told_what_is() {
+         let told = Arc::new(Mutex::new(Vec::new()));
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index 2a8407c..d552363 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -306,6 +306,77 @@ impl WaylandClient {
+             .set_cursor(state.pointer_entered, None, 0, 0);
+     }
+ 
++    /// Creates a window that is a child of the first, as an application does with a dialog:
++    /// the parent is named before the window is committed for the first time
++    /// (`xdg_toplevel.set_parent`).
++    pub fn create_child_window(&mut self) {
++        let parent = self.state.windows.first().unwrap().xdg_toplevel.clone();
++        self.state.create_window_of(Some(&parent));
++    }
++
++    /// The size and bounds the compositor told the last window, and whether it told it to
++    /// fill the screen.
++    pub fn told_to_last_window(&self) -> ((i32, i32), Option<(i32, i32)>, bool) {
++        let window = self.state.windows.last().unwrap();
++        let (_, configure) = window.configures_received.last().unwrap();
++        (
++            configure.size,
++            configure.bounds,
++            configure.states.contains(&xdg_toplevel::State::Fullscreen),
++        )
++    }
++
++    /// Whether the pointer is over the last window, going by what the compositor said, and
++    /// how many button events the client has had.
++    pub fn pointer_over_last_window(&self) -> (bool, usize) {
++        let surface = &self.state.windows.last().unwrap().surface;
++        let mut over = false;
++        let mut buttons = 0;
++        for event in &self.state.mouse_events {
++            match event {
++                MouseEvents::Pointer(wl_pointer::Event::Enter {
++                    surface: entered, ..
++                }) => over = entered == surface,
++                MouseEvents::Pointer(wl_pointer::Event::Leave { .. }) => over = false,
++                MouseEvents::Pointer(wl_pointer::Event::Button { .. }) => buttons += 1,
++                _ => {}
++            }
++        }
++        (over, buttons)
++    }
++
++    /// Gives the last window a picture of one colour (blue, green, red, alpha) of this size,
++    /// as its first: the window is as large as the picture, as a dialog is that knows its
++    /// own size.
++    pub fn setup_window_of_one_colour(&mut self, (width, height): (i32, i32), bgra: [u8; 4]) {
++        use std::io::Write;
++        let state = &mut self.state;
++        let mut file = tempfile::tempfile().unwrap();
++        file.write_all(&bgra.repeat((width * height) as usize))
++            .unwrap();
++        file.flush().unwrap();
++        let pool = state.shm.as_ref().unwrap().create_pool(
++            file.as_fd(),
++            width * height * 4,
++            &state.qh,
++            (),
++        );
++        let buffer = pool.create_buffer(
++            0,
++            width,
++            height,
++            width * 4,
++            wl_shm::Format::Argb8888,
++            &state.qh,
++            (),
++        );
++        let window = state.windows.last_mut().unwrap();
++        window.set_title("A question");
++        window.attach_new_buffer(&buffer);
++        window.set_size(width as u16, height as u16);
++        window.ack_last_and_commit();
++    }
++
+     /// Whether the compositor has asked the last window to close.
+     pub fn asked_to_close(&self) -> bool {
+         self.state.windows.last().is_some_and(|w| w.close_requested)
+@@ -415,6 +486,10 @@ impl WaylandClient {
+ 
+ impl State {
+     pub fn create_window(&mut self) {
++        self.create_window_of(None);
++    }
++
++    pub fn create_window_of(&mut self, parent: Option<&xdg_toplevel::XdgToplevel>) {
+         let compositor = self.compositor.as_ref().unwrap();
+         let xdg_wm_base = self.wm_base.as_ref().unwrap();
+         let viewporter = self.viewporter.as_ref().unwrap();
+@@ -422,6 +497,9 @@ impl State {
+         let surface = compositor.create_surface(&self.qh, ());
+         let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.qh, ());
+         let xdg_toplevel = xdg_surface.get_toplevel(&self.qh, ());
++        if parent.is_some() {
++            xdg_toplevel.set_parent(parent);
++        }
+         let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+ 
+         let window = Window {
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index 928944b..fc6caee 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -2,6 +2,7 @@ pub(crate) mod client;
+ mod device;
+ mod fixture;
+ mod test_cursor;
++mod test_dialogs;
+ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
+diff --git a/wayland-display-core/src/tests/test_dialogs.rs b/wayland-display-core/src/tests/test_dialogs.rs
+new file mode 100644
+index 0000000..e64aad8
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_dialogs.rs
+@@ -0,0 +1,229 @@
++//! Integration tests for windows that come after the first (see `comp::windows`): a dialog
++//! an application opens has to be in the picture, in front, where a person looks for it, and
++//! has to take the keyboard and the pointer. A real Wayland client opens the windows.
++
++use crate::comp::FocusTarget;
++use crate::tests::fixture::Fixture;
++use smithay::backend::input::ButtonState;
++use smithay::desktop::Window;
++use smithay::utils::Point;
++use test_log::test;
++
++const WHITE: [u8; 4] = [255, 255, 255, 255];
++
++/// A first window that fills the output of 320 by 240, with the pointer in its middle.
++fn fixture() -> Fixture {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    // The cursor is left out of the frames, which are looked at pixel by pixel here.
++    f.server.set_cursor_sink(Some(Box::new(|_| {})));
++    f
++}
++
++/// Opens a second window that draws its picture once and then waits, as a question does.
++fn open(f: &mut Fixture, child: bool, size: (i32, i32)) {
++    if child {
++        f.client.create_child_window();
++    } else {
++        f.client.create_window();
++    }
++    f.round_trip();
++    f.client.setup_window_of_one_colour(size, WHITE);
++    f.round_trip();
++    f.round_trip();
++}
++
++/// How many pixels of the frame are white, in all of it and in the given part.
++fn white(f: &mut Fixture, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> (usize, usize) {
++    let (frame, _) = f.server.create_frame().expect("no frame");
++    let frame = frame.map_readable().expect("frame cannot be read");
++    let is_white =
++        |x: usize, y: usize| frame.as_slice()[(y * 320 + x) * 4..][..3] == [255, 255, 255];
++    let all = (0..240)
++        .flat_map(|y| (0..320).map(move |x| (x, y)))
++        .filter(|(x, y)| is_white(*x, *y))
++        .count();
++    let part = (y0..y1)
++        .flat_map(|y| (x0..x1).map(move |x| (x, y)))
++        .filter(|(x, y)| is_white(*x, *y))
++        .count();
++    (all, part)
++}
++
++fn windows(f: &Fixture) -> Vec<Window> {
++    f.server.space.elements().cloned().collect()
++}
++
++fn has_the_keyboard(f: &Fixture, window: &Window) -> bool {
++    matches!(
++        f.server.seat.get_keyboard().unwrap().current_focus(),
++        Some(FocusTarget::Wayland(focused)) if &focused == window
++    )
++}
++
++#[test]
++fn a_window_that_draws_once_is_in_the_frame_and_takes_a_click() {
++    let mut f = fixture();
++    let (before, _) = white(&mut f, (0, 0, 0, 0));
++    // A second window without a parent, as some applications open their dialogs. It is told
++    // to fill the output like any window; this one keeps its own size all the same.
++    open(&mut f, false, (120, 80));
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((320, 240), Some((0, 0)), true)
++    );
++
++    // It has committed its picture exactly once, and it is in the frame: at the corner,
++    // above the first window.
++    let (_, at_the_corner) = white(&mut f, (0, 0, 120, 80));
++    assert_eq!(at_the_corner, 120 * 80);
++    let stack = windows(&f);
++    assert_eq!(stack.len(), 2);
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (0, 0).into()
++    );
++    assert_eq!(stack[1].geometry().size, (120, 80).into());
++    assert!(has_the_keyboard(&f, &stack[1]));
++
++    // And the pointer reaches it.
++    f.server
++        .pointer_motion_absolute(0, Point::from((60.0, 40.0)));
++    f.round_trip();
++    f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    f.server.pointer_button(0, 0x110, ButtonState::Released);
++    f.round_trip();
++    assert_eq!(f.client.pointer_over_last_window(), (true, 2));
++    assert!(before < 120 * 80, "the first window is not white itself");
++}
++
++#[test]
++fn a_child_keeps_its_size_and_lies_over_the_middle_of_its_parent() {
++    let mut f = fixture();
++    open(&mut f, true, (120, 80));
++    // Not told to fill the output, nor any size: only how much room there is. (An ordinary
++    // window is told no bounds, which travels as 0 by 0.)
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((0, 0), Some((320, 240)), false)
++    );
++
++    let stack = windows(&f);
++    assert_eq!(stack.len(), 2);
++    // Above its parent, over the parent's middle.
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (100, 80).into()
++    );
++    let (_, in_the_middle) = white(&mut f, (100, 80, 220, 160));
++    assert_eq!(in_the_middle, 120 * 80);
++    let (_, at_the_corner) = white(&mut f, (0, 0, 100, 80));
++    assert!(at_the_corner < 100 * 80 / 2);
++
++    // The pointer stood in the middle of the output, and the child came up under it: the
++    // pointer is the child's without having moved, and so is a click.
++    assert_eq!(f.client.pointer_over_last_window(), (true, 0));
++    f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    f.server.pointer_button(0, 0x110, ButtonState::Released);
++    f.round_trip();
++    assert_eq!(f.client.pointer_over_last_window(), (true, 2));
++    // One jump out of the child, and it is over the parent; one jump back, over the child.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    assert!(!f.client.pointer_over_last_window().0);
++    f.server
++        .pointer_motion_absolute(0, Point::from((101.0, 81.0)));
++    f.round_trip();
++    assert!(f.client.pointer_over_last_window().0);
++}
++
++#[test]
++fn a_window_that_comes_has_the_keyboard_and_gives_it_back_when_it_goes() {
++    let mut f = fixture();
++    let parent = windows(&f)[0].clone();
++    assert!(has_the_keyboard(&f, &parent));
++
++    open(&mut f, true, (120, 80));
++    let child = windows(&f)[1].clone();
++    assert!(has_the_keyboard(&f, &child));
++    assert!(!has_the_keyboard(&f, &parent));
++
++    // The question is answered: its window goes, and the keyboard is the parent's again.
++    f.client.close_window();
++    f.round_trip();
++    assert_eq!(windows(&f).len(), 1);
++    assert!(has_the_keyboard(&f, &parent));
++    // So is the pointer, which has not moved, and the question is out of the picture.
++    assert!(f.client.pointer_over_last_window().0);
++    let (_, in_the_middle) = white(&mut f, (100, 80, 220, 160));
++    assert!(in_the_middle < 120 * 80 / 2);
++
++    // The last window goes as well: nothing has the keyboard, and nothing breaks.
++    f.client.close_window();
++    f.round_trip();
++    assert!(
++        f.server
++            .seat
++            .get_keyboard()
++            .unwrap()
++            .current_focus()
++            .is_none()
++    );
++}
++
++#[test]
++fn a_click_on_the_parent_leaves_its_child_in_front() {
++    let mut f = fixture();
++    open(&mut f, true, (120, 80));
++    let (parent, child) = (windows(&f)[0].clone(), windows(&f)[1].clone());
++
++    // A click on the parent, beside the child.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    f.server.pointer_button(0, 0x110, ButtonState::Released);
++    f.round_trip();
++    assert_eq!(windows(&f), [parent, child]);
++    let (_, in_the_middle) = white(&mut f, (100, 80, 220, 160));
++    assert_eq!(in_the_middle, 120 * 80);
++}
++
++#[test]
++fn a_child_larger_than_the_output_begins_at_the_corner() {
++    let mut f = fixture();
++    open(&mut f, true, (400, 300));
++    let stack = windows(&f);
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (0, 0).into()
++    );
++    // What fits is shown, the rest is not, and a frame is still made.
++    let (all, _) = white(&mut f, (0, 0, 0, 0));
++    assert_eq!(all, 320 * 240);
++    assert!(has_the_keyboard(&f, &stack[1]));
++}
++
++#[test]
++fn two_ordinary_windows_are_both_told_to_fill_the_output_and_the_later_is_in_front() {
++    let mut f = fixture();
++    let first = windows(&f)[0].clone();
++    // A second ordinary window, which does as it is told.
++    open(&mut f, false, (320, 240));
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((320, 240), Some((0, 0)), true)
++    );
++    let stack = windows(&f);
++    assert_eq!(stack[0], first);
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (0, 0).into()
++    );
++    let (all, _) = white(&mut f, (0, 0, 0, 0));
++    assert_eq!(all, 320 * 240);
++}
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index bedad8f..595d547 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -78,8 +78,20 @@ impl CompositorHandler for State {
+                 return;
+             }
+ 
++            // A window with a parent is a dialog: it keeps the size it wants and is only told
++            // how much room there is.
++            let is_child = toplevel.parent().is_some();
+             if !initial_configure_sent {
+-                if max_size.w == 0 && max_size.h == 0 {
++                if is_child {
++                    let room = self
++                        .output
++                        .as_ref()
++                        .and_then(|output| output.current_mode())
++                        .map(|mode| mode.size.to_logical(1));
++                    toplevel.with_pending_state(|state| {
++                        state.bounds = room;
++                    });
++                } else if max_size.w == 0 && max_size.h == 0 {
+                     toplevel.with_pending_state(|state| {
+                         state.size = Some(
+                             self.output
+@@ -107,13 +119,24 @@ impl CompositorHandler for State {
+                 toplevel.send_configure();
+                 self.pending_windows.push(window);
+             } else {
+-                let loc = (0, 0);
++                // The window has its first picture. Its size is taken from this very commit:
++                // a window that draws once and then waits (a question, say) never commits
++                // again, and one whose size is not known is neither drawn nor found by the
++                // pointer.
++                window.on_commit();
++                let loc = self.place_window(&window);
+                 self.space.map_element(window.clone(), loc, true);
+                 self.seat.get_keyboard().unwrap().set_focus(
+                     self,
+                     Some(FocusTarget::from(window)),
+                     SERIAL_COUNTER.next_serial(),
+                 );
++                // If it has come up over another window and under the pointer, the pointer is
++                // its own. (A first window is left as it was: it has the pointer from the
++                // first move on.)
++                if self.space.elements().count() > 1 {
++                    self.pointer_to_the_window_under_it();
++                }
+             }
+ 
+             return;
+diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
+index 1c22b23..4931ed6 100644
+--- a/wayland-display-core/src/wayland/handlers/xdg.rs
++++ b/wayland-display-core/src/wayland/handlers/xdg.rs
+@@ -30,6 +30,19 @@ impl XdgShellHandler for State {
+ 
+     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+         self.tell_windows(Some(&surface));
++        // It is a window no longer: out of the picture at once, and the keyboard and the
++        // pointer go to what is there now.
++        let gone = self
++            .space
++            .elements()
++            .find(|w| w.toplevel().is_some_and(|toplevel| *toplevel == surface))
++            .cloned();
++        if let Some(gone) = gone {
++            self.space.unmap_elem(&gone);
++        }
++        self.keyboard_to_the_top_window();
++        self.pointer_to_the_window_under_it();
++        crate::comp::picture_changed(self);
+     }
+ 
+     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

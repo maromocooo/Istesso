@@ -1,0 +1,1267 @@
+Render a frame as soon as the picture has changed, instead of on the next beat of the frame
+rate, and never more frames in one second than the frame rate. Off unless asked for.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86. The lines of context are from that project.
+
+It is kept small and in a shape that can be proposed to that project
+(docs/adr/0009-host-compositor.md): the element `waylanddisplaysrc` gets a property,
+`render-on-commit`, that is off by default, and with it off nothing changes. The rules are in
+one new file with its tests, wayland-display-core/src/comp/pacing.rs, which also says why.
+
+What the mode does:
+
+- A frame the element has asked for is rendered as soon as a client has committed or the
+  pointer has moved. If nothing changes, it goes out after two frame intervals as it is, so
+  that the stream does not stop.
+- In no one second do more frames start rendering than the frame rate says. A frame this rule
+  would hold back for more than a millisecond gives way to the next picture.
+- Clients are told to draw their next frame (wl_surface.frame) when they have committed, but
+  not more often than once a frame interval. A client that draws whenever it is told to, as
+  most applications do, then commits once per interval, and its picture goes out when it
+  arrives instead of waiting for the next beat.
+- When the stream ends, the compositor says in its log how many frames started rendering and
+  how many of them at most in any one second.
+
+Tests (`cargo test -p wayland-display-core`): twelve of the rules, played against model clients
+(one that draws when told, ones that keep a rhythm of their own), and four with a real Wayland
+client.
+
+Earlier versions, in the history of this file. The first rendered on a commit and kept the old
+timer as well: 108 to 118 frames a second where 85 were asked for. The second kept to the frame
+rate but told clients to draw with every frame. A client that draws when told then drew as fast
+as it could: the frames of a second were gone in its first part and the picture stood still for
+the rest (docs/measurements/2026-11-16-step3-pacing.md). Our test application keeps a rhythm of
+its own and did not show it.
+
+Known limits:
+
+- The one-second rule costs a client that keeps exactly the frame rate up to its own
+  unsteadiness: a picture that comes early for its place in the second waits until the second
+  is over.
+- Nothing is exposed through the C bindings yet.
+
+Apply and build, next to the unpatched checkout:
+
+    git worktree add ../repo-commit3 1301f86
+    cd ../repo-commit3 && git apply <this file>
+    cargo build --release -p gst-plugin-wayland-display -p wayland-display-core --features cuda
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 2d67299..5318698 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -53,6 +53,7 @@ pub struct Settings {
+     render_node: Option<String>,
+     input_devices: Vec<String>,
+     disable_intel_workaround: bool,
++    render_on_commit: bool,
+     #[cfg(feature = "cuda")]
+     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
+     #[cfg(feature = "cuda")]
+@@ -274,6 +275,13 @@ impl ObjectImpl for WaylandDisplaySrc {
+                     )
+                     .default_value(false)
+                     .build(),
++                glib::ParamSpecBoolean::builder("render-on-commit")
++                    .nick("Render on commit")
++                    .blurb(
++                        "Render a frame as soon as a client has committed or the pointer has moved, instead of on the beat of the frame rate; never more frames in one second than the frame rate",
++                    )
++                    .default_value(false)
++                    .build(),
+             ]
+         });
+ 
+@@ -337,6 +345,12 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 settings.disable_intel_workaround =
+                     value.get::<bool>().expect("Type checked upstream");
+             }
++            "render-on-commit" => {
++                let enabled = value.get::<bool>().expect("Type checked upstream");
++                self.settings.lock().unwrap().render_on_commit = enabled;
++                // Taken in by the compositor when it runs; it may be changed while it does.
++                let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
++            }
+             _ => unreachable!(),
+         }
+     }
+@@ -371,6 +385,10 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 let settings = self.settings.lock().unwrap();
+                 settings.disable_intel_workaround.to_value()
+             }
++            "render-on-commit" => {
++                let settings = self.settings.lock().unwrap();
++                settings.render_on_commit.to_value()
++            }
+             _ => unreachable!(),
+         }
+     }
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index ac6976d..9af5853 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -71,6 +71,7 @@ use tracing::debug;
+ 
+ mod focus;
+ mod input;
++pub(crate) mod pacing;
+ mod rendering;
+ 
+ pub use self::focus::*;
+@@ -109,6 +110,12 @@ pub struct State {
+     pub renderer: GlesRenderer,
+     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
+     last_render: Option<Instant>,
++    /// When frames go out in the "render on commit" mode.
++    pub(crate) pacing: pacing::FramePacing,
++    /// The frame the element has asked for, in that mode, until it starts rendering.
++    pub(crate) waiting_frame: Option<Box<dyn FnOnce(&mut State, Instant)>>,
++    /// Counts the times the waiting frame was scheduled, so that an earlier timer does nothing.
++    frame_request: u64,
+ 
+     // management
+     pub output: Option<Output>,
+@@ -230,6 +237,9 @@ impl State {
+             dmabuf_global,
+             video_info: None,
+             last_render: None,
++            pacing: pacing::FramePacing::default(),
++            waiting_frame: None,
++            frame_request: 0,
+ 
+             space,
+             popups: PopupManager::default(),
+@@ -320,6 +330,10 @@ pub(crate) fn apply_video_info(
+     state.pointer_location = position;
+     state.pointer_absolute_location = position;
+     state.video_info = Some(video_info.clone().into());
++    state.pacing.set_frame_rate(
++        framerate.numer().max(0) as u64,
++        framerate.denom().max(0) as u64,
++    );
+     match render_target {
+         RenderTarget::Hardware(_) => match video_info {
+             GstVideoInfo::RAW(base_info) => {
+@@ -392,6 +406,92 @@ pub(crate) fn apply_video_info(
+     }
+ }
+ 
++/// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
++/// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
++/// frame no longer counts.
++pub(crate) fn schedule_waiting_frame(state: &mut State, wait: Duration) {
++    let wait = wait.max(state.pacing.room(Instant::now()));
++    state.frame_request = state.frame_request.wrapping_add(1);
++    let request = state.frame_request;
++    let render = move |state: &mut State, now: Instant| {
++        if state.frame_request == request {
++            if let Some(render) = state.waiting_frame.take() {
++                render(state, now);
++            }
++        }
++    };
++    if wait.is_zero() {
++        // Once what is being handled right now (a commit, say) has been taken in.
++        state
++            .handle
++            .insert_idle(move |state| render(state, Instant::now()));
++    } else if let Err(err) =
++        state
++            .handle
++            .insert_source(Timer::from_duration(wait), move |now, _, state| {
++                render(state, now);
++                TimeoutAction::Drop
++            })
++    {
++        tracing::error!(?err, "Event loop error.");
++        state.should_quit = true;
++    }
++}
++
++/// Something that is part of the picture has changed: a client has committed, or the pointer
++/// has moved. In the "render on commit" mode a frame that is waiting goes out now, or as soon
++/// as the frame rate allows.
++pub(crate) fn picture_changed(state: &mut State) {
++    if state.pacing.changed() && state.waiting_frame.is_some() {
++        schedule_waiting_frame(state, Duration::ZERO);
++    }
++}
++
++/// A client has committed. In the "render on commit" mode its picture goes out, and the
++/// clients are told to draw their next frame on a beat of their own (see [`pacing`]): now, or
++/// when a frame interval has passed since they were last told.
++pub(crate) fn client_committed(state: &mut State) {
++    picture_changed(state);
++    if !state.pacing.enabled() {
++        return;
++    }
++    match state.pacing.tell(Instant::now()) {
++        pacing::Tell::Now => send_frame_callbacks(state),
++        pacing::Tell::Later(wait) => {
++            if let Err(err) =
++                state
++                    .handle
++                    .insert_source(Timer::from_duration(wait), |_, _, state| {
++                        state.pacing.told(Instant::now());
++                        send_frame_callbacks(state);
++                        TimeoutAction::Drop
++                    })
++            {
++                tracing::error!(?err, "Event loop error.");
++                state.should_quit = true;
++            }
++        }
++        pacing::Tell::Waiting => {}
++    }
++}
++
++/// Tells the clients that it is time to draw their next frame.
++pub(crate) fn send_frame_callbacks(state: &State) {
++    let Some(output) = state.output.as_ref() else {
++        return;
++    };
++    for window in state.space.elements() {
++        window.send_frame(output, state.clock.now(), Some(Duration::ZERO), |_, _| {
++            Some(output.clone())
++        });
++    }
++    if let CursorImageStatus::Surface(wl_surface) = &state.cursor_state {
++        send_frames_surface_tree(wl_surface, output, state.clock.now(), None, |_, _| {
++            Some(output.clone())
++        })
++    }
++}
++
+ pub(crate) fn init(
+     command_src: Channel<Command>,
+     render: impl Into<RenderTarget>,
+@@ -458,6 +558,12 @@ pub(crate) fn init(
+                             Some(ref tracer) => Some(tracer.trace("render")),
+                             None => None,
+                         };
++                        // On commit the clients are told to draw on a beat of their own, and
++                        // with a frame only when it goes out although nothing has changed.
++                        let started = Instant::now();
++                        let tell_clients = !state.pacing.enabled()
++                            || (!state.pacing.frame_started(started)
++                                && state.pacing.tell_with_idle_frame(started));
+                         if let Err(_) = match state.create_frame() {
+                             Ok((buf, render_result)) => {
+                                 render_result
+@@ -481,12 +587,14 @@ pub(crate) fn init(
+                                                 |next_output, _, _, _| next_output,
+                                             );
+                                         });
+-                                        window.send_frame(
+-                                            output,
+-                                            state.clock.now(),
+-                                            Some(Duration::ZERO),
+-                                            |_, _| Some(output.clone()),
+-                                        );
++                                        if tell_clients {
++                                            window.send_frame(
++                                                output,
++                                                state.clock.now(),
++                                                Some(Duration::ZERO),
++                                                |_, _| Some(output.clone()),
++                                            );
++                                        }
+                                         window.take_presentation_feedback(
+                                             &mut output_presentation_feedback,
+                                             surface_primary_scanout_output,
+@@ -513,8 +621,8 @@ pub(crate) fn init(
+                                             wp_presentation_feedback::Kind::Vsync,
+                                         );
+                                     }
+-                                    if let CursorImageStatus::Surface(wl_surface) =
+-                                        &state.cursor_state
++                                    if let (true, CursorImageStatus::Surface(wl_surface)) =
++                                        (tell_clients, &state.cursor_state)
+                                     {
+                                         send_frames_surface_tree(
+                                             wl_surface,
+@@ -541,21 +649,38 @@ pub(crate) fn init(
+                         }
+                     };
+ 
+-                    match wait {
+-                        Some(duration) => {
+-                            if let Err(err) = state.handle.insert_source(
+-                                Timer::from_duration(duration),
+-                                move |now, _, data| {
+-                                    render(data, now);
+-                                    TimeoutAction::Drop
+-                                },
+-                            ) {
+-                                tracing::error!(?err, "Event loop error.");
+-                                state.should_quit = true;
+-                            };
+-                        }
+-                        None => render(state, Instant::now()),
+-                    };
++                    if state.pacing.enabled() {
++                        let wait = state.pacing.frame_asked(Instant::now(), state.last_render);
++                        state.waiting_frame = Some(Box::new(render));
++                        schedule_waiting_frame(state, wait);
++                    } else {
++                        match wait {
++                            Some(duration) => {
++                                if let Err(err) = state.handle.insert_source(
++                                    Timer::from_duration(duration),
++                                    move |now, _, data| {
++                                        render(data, now);
++                                        TimeoutAction::Drop
++                                    },
++                                ) {
++                                    tracing::error!(?err, "Event loop error.");
++                                    state.should_quit = true;
++                                };
++                            }
++                            None => render(state, Instant::now()),
++                        };
++                    }
++                }
++                Event::Msg(Command::RenderOnCommit(enabled)) => {
++                    tracing::info!(enabled, "Render on commit.");
++                    state.pacing.report();
++                    state.pacing.set_enabled(enabled);
++                    // Whoever waits under the old rule is not kept waiting under the new one:
++                    // the clients are told now, and a frame that is waiting goes out.
++                    send_frame_callbacks(state);
++                    if state.waiting_frame.is_some() {
++                        schedule_waiting_frame(state, Duration::ZERO);
++                    }
+                 }
+                 #[cfg(feature = "cuda")]
+                 Event::Msg(Command::UpdateCUDABufferPool(pool)) => {
+@@ -565,6 +690,7 @@ pub(crate) fn init(
+                     }
+                 }
+                 Event::Msg(Command::Quit) | Event::Closed => {
++                    state.pacing.report();
+                     state.should_quit = true;
+                 }
+                 Event::Msg(Command::KeyboardInput(scancode, key_state)) => {
+@@ -580,10 +706,12 @@ pub(crate) fn init(
+                         position,
+                         position,
+                     );
++                    picture_changed(state);
+                 }
+                 Event::Msg(Command::PointerMotionAbsolute(position)) => {
+                     let time: Duration = state.clock.now().into();
+                     state.pointer_motion_absolute(time.as_millis() as u32, position);
++                    picture_changed(state);
+                 }
+                 Event::Msg(Command::PointerButton(btn_code, btn_state)) => {
+                     let time: Duration = state.clock.now().into();
+diff --git a/wayland-display-core/src/comp/pacing.rs b/wayland-display-core/src/comp/pacing.rs
+new file mode 100644
+index 0000000..472c15e
+--- /dev/null
++++ b/wayland-display-core/src/comp/pacing.rs
+@@ -0,0 +1,655 @@
++//! When frames start rendering, and when clients are told to draw, in the "render on commit"
++//! mode.
++//!
++//! Without the mode a frame goes out on the beat of the frame rate, whatever the clients do:
++//! what a client draws waits for the next beat, half a frame interval on average, and a whole
++//! one for a client that draws when it is told to, because it is told right after a beat.
++//!
++//! With the mode a frame goes out as soon as the picture has changed (a client has committed,
++//! the pointer has moved). The frame rate is kept in two ways:
++//!
++//! - In no one second do more frames start than the frame rate says, whatever came before.
++//! - Clients are told to draw their next frame (`wl_surface.frame`) on a beat of their own:
++//!   when they have committed, but not more often than once a frame interval. A client that
++//!   draws whenever it is told to therefore commits once per interval, and each of its
++//!   pictures goes out when it arrives. If such a client were told at every frame instead,
++//!   it would draw as fast as it can, and all the frames of a second would be gone in the
++//!   first part of it.
++
++use std::collections::VecDeque;
++use std::time::{Duration, Instant};
++
++/// How many frame intervals a frame is held back while nothing changes. After that it goes
++/// out as it is, so that the stream does not stop.
++const IDLE_FRAME_INTERVALS: u32 = 2;
++
++/// A frame that the one-second rule would hold back for longer than this gives way to the
++/// next picture instead (see [`FramePacing::room`]).
++const GIVE_WAY_AFTER: Duration = Duration::from_millis(1);
++
++const SECOND: Duration = Duration::from_secs(1);
++
++/// What to do about telling the clients to draw their next frame.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Tell {
++    /// Tell them now.
++    Now,
++    /// Tell them after this long, and say so with [`FramePacing::told`].
++    Later(Duration),
++    /// They will be told: a timer for it is running.
++    Waiting,
++}
++
++#[derive(Debug)]
++pub(crate) struct FramePacing {
++    enabled: bool,
++    /// Whether the picture has changed since the last frame started rendering.
++    changed: bool,
++    /// How many frames may start rendering in any one second: the frame rate, rounded up.
++    per_second: usize,
++    /// The time from one frame to the next at the frame rate.
++    frame_interval: Duration,
++    /// When the frames of the last second started rendering.
++    recent: VecDeque<Instant>,
++    /// When the clients may be told to draw again, and whether a timer is running for it.
++    tell_from: Option<Instant>,
++    tell_timer: bool,
++    /// How many frames have started rendering, and the most in any one second, for the log.
++    started: u64,
++    most_in_a_second: usize,
++    reported: Option<Instant>,
++}
++
++impl Default for FramePacing {
++    fn default() -> Self {
++        FramePacing {
++            enabled: false,
++            changed: false,
++            per_second: 60,
++            frame_interval: SECOND / 60,
++            recent: VecDeque::new(),
++            tell_from: None,
++            tell_timer: false,
++            started: 0,
++            most_in_a_second: 0,
++            reported: None,
++        }
++    }
++}
++
++impl FramePacing {
++    pub(crate) fn enabled(&self) -> bool {
++        self.enabled
++    }
++
++    pub(crate) fn set_enabled(&mut self, enabled: bool) {
++        if self.enabled != enabled {
++            *self = FramePacing {
++                enabled,
++                per_second: self.per_second,
++                frame_interval: self.frame_interval,
++                // A timer that is running still reports back.
++                tell_timer: self.tell_timer,
++                ..Default::default()
++            };
++        }
++    }
++
++    /// The frame rate of the stream: the time from one frame to the next, and how many frames
++    /// a second may hold. Both rounded up, so that a second never holds one frame too many.
++    pub(crate) fn set_frame_rate(&mut self, numer: u64, denom: u64) {
++        if numer == 0 || denom == 0 {
++            return;
++        }
++        self.frame_interval = Duration::from_nanos((1_000_000_000 * denom).div_ceil(numer));
++        self.per_second = numer.div_ceil(denom) as usize;
++    }
++
++    /// The picture has changed: a client has committed, or the pointer has moved. True when a
++    /// frame that is waiting should be looked at again.
++    pub(crate) fn changed(&mut self) -> bool {
++        self.changed = true;
++        self.enabled
++    }
++
++    /// The element asks for a frame at `now`. Says how long the frame waits before it starts
++    /// rendering: not at all when the picture has changed since the last frame, otherwise
++    /// until the stream would stall; in both cases not less than [`Self::room`].
++    pub(crate) fn frame_asked(&mut self, now: Instant, last_render: Option<Instant>) -> Duration {
++        let idle = match last_render {
++            Some(last) if !self.changed => (self.frame_interval * IDLE_FRAME_INTERVALS)
++                .saturating_sub(now.saturating_duration_since(last)),
++            _ => Duration::ZERO,
++        };
++        idle.max(self.room(now))
++    }
++
++    /// How long until another frame may start.
++    ///
++    /// Not before the frame that started as many frames ago as a second may hold is a second
++    /// old. Where that is more than a moment away, the frame waits one frame interval longer
++    /// still: a client that goes on drawing has committed again by then, this is asked again,
++    /// and the newer picture goes out in place of the one held back. Without that the frame
++    /// held back and the next one would follow each other closely, and a second later the
++    /// same would happen again, and so on every second.
++    pub(crate) fn room(&self, now: Instant) -> Duration {
++        if !self.enabled {
++            return Duration::ZERO;
++        }
++        let Some(earlier) = self.recent.len().checked_sub(self.per_second) else {
++            return Duration::ZERO;
++        };
++        let wait = (self.recent[earlier] + SECOND).saturating_duration_since(now);
++        if wait > GIVE_WAY_AFTER {
++            wait + self.frame_interval
++        } else {
++            wait
++        }
++    }
++
++    /// A frame starts rendering at `now`. Says whether the picture has changed since the last
++    /// one: if not, this frame only keeps the stream going.
++    pub(crate) fn frame_started(&mut self, now: Instant) -> bool {
++        if !self.enabled {
++            return true;
++        }
++        let changed = std::mem::take(&mut self.changed);
++        while self
++            .recent
++            .front()
++            .is_some_and(|&start| now.saturating_duration_since(start) >= SECOND)
++        {
++            self.recent.pop_front();
++        }
++        self.recent.push_back(now);
++        self.started += 1;
++        self.most_in_a_second = self.most_in_a_second.max(self.recent.len());
++
++        let reported = *self.reported.get_or_insert(now);
++        if now.saturating_duration_since(reported) >= SECOND {
++            self.reported = Some(now);
++            tracing::debug!(
++                last_second = self.recent.len(),
++                most_in_a_second = self.most_in_a_second,
++                "Frames started rendering."
++            );
++        }
++        changed
++    }
++
++    /// A client has committed at `now` and may be waiting to be told to draw its next frame.
++    pub(crate) fn tell(&mut self, now: Instant) -> Tell {
++        if self.tell_timer {
++            return Tell::Waiting;
++        }
++        match self.tell_from {
++            Some(from) if now < from => {
++                self.tell_timer = true;
++                Tell::Later(from - now)
++            }
++            _ => {
++                self.tell_from = Some(now + self.frame_interval);
++                Tell::Now
++            }
++        }
++    }
++
++    /// The timer of [`Tell::Later`] has run at `now`, and the clients are being told.
++    pub(crate) fn told(&mut self, now: Instant) {
++        self.tell_timer = false;
++        self.tell_from = Some(now + self.frame_interval);
++    }
++
++    /// A frame goes out at `now` although nothing has changed. Says whether to tell the
++    /// clients with it: a client that was not told when it committed (there was no output
++    /// yet, say) would otherwise wait for ever, and so would the stream for its next picture.
++    pub(crate) fn tell_with_idle_frame(&mut self, now: Instant) -> bool {
++        if self.tell_timer {
++            return false;
++        }
++        self.tell_from = Some(now + self.frame_interval);
++        true
++    }
++
++    /// Says in the log how many frames started rendering and how many of them at most in any
++    /// one second: the figure to hold against the frame rate. Once, when the stream ends.
++    pub(crate) fn report(&self) {
++        if self.enabled && self.started > 0 {
++            tracing::info!(
++                frames = self.started,
++                most_in_a_second = self.most_in_a_second,
++                "Frames started rendering on commit."
++            );
++        }
++    }
++
++    /// The most frames that started rendering in any one second so far.
++    #[cfg(test)]
++    pub(crate) fn most_in_a_second(&self) -> usize {
++        self.most_in_a_second
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn pacing(per_second: u64) -> FramePacing {
++        let mut pacing = FramePacing::default();
++        pacing.set_enabled(true);
++        pacing.set_frame_rate(per_second, 1);
++        pacing
++    }
++
++    #[test]
++    fn is_off_unless_asked_for() {
++        let mut pacing = FramePacing::default();
++        assert!(!pacing.enabled());
++        // A change does not make a waiting frame go out, and nothing is held back or counted.
++        assert!(!pacing.changed());
++        let now = Instant::now();
++        for _ in 0..200 {
++            pacing.frame_started(now);
++        }
++        assert_eq!(pacing.room(now), Duration::ZERO);
++        assert_eq!(pacing.most_in_a_second(), 0);
++    }
++
++    #[test]
++    fn the_frame_rate_is_rounded_up() {
++        let mut pacing = pacing(85);
++        assert_eq!(pacing.frame_interval, Duration::from_nanos(11_764_706));
++        assert_eq!(pacing.per_second, 85);
++        pacing.set_frame_rate(60_000, 1001);
++        assert_eq!(pacing.frame_interval, Duration::from_nanos(16_683_334));
++        assert_eq!(pacing.per_second, 60);
++        // A frame rate nobody has said yet leaves things as they are.
++        pacing.set_frame_rate(0, 1);
++        assert_eq!(pacing.per_second, 60);
++    }
++
++    #[test]
++    fn a_changed_picture_goes_out_at_once() {
++        let mut pacing = pacing(85);
++        let start = Instant::now();
++        assert_eq!(pacing.frame_asked(start, None), Duration::ZERO);
++        assert!(!pacing.frame_started(start));
++        assert!(pacing.changed());
++        let now = start + Duration::from_millis(1);
++        assert_eq!(pacing.frame_asked(now, Some(start)), Duration::ZERO);
++        assert!(pacing.frame_started(now));
++    }
++
++    #[test]
++    fn without_a_change_a_frame_goes_out_after_two_intervals() {
++        let mut pacing = pacing(85);
++        let frame = pacing.frame_interval;
++        let start = Instant::now();
++        assert_eq!(pacing.frame_asked(start, None), Duration::ZERO);
++        pacing.frame_started(start);
++        let now = start + Duration::from_millis(3);
++        assert_eq!(
++            pacing.frame_asked(now, Some(start)),
++            frame * 2 - Duration::from_millis(3)
++        );
++        // Long after the last frame there is nothing left to wait for.
++        let late = start + Duration::from_millis(500);
++        assert_eq!(pacing.frame_asked(late, Some(start)), Duration::ZERO);
++    }
++
++    #[test]
++    fn a_change_counts_for_one_frame_only() {
++        let mut pacing = pacing(85);
++        let frame = pacing.frame_interval;
++        let start = Instant::now();
++        pacing.changed();
++        assert_eq!(pacing.frame_asked(start, None), Duration::ZERO);
++        pacing.frame_started(start);
++        // Nothing has changed since: the next frame waits as long as it does when idle.
++        assert_eq!(pacing.frame_asked(start + frame, Some(start)), frame);
++    }
++
++    #[test]
++    fn clients_are_told_once_a_frame_interval_at_most() {
++        let mut pacing = pacing(85);
++        let frame = pacing.frame_interval;
++        let start = Instant::now();
++        assert_eq!(pacing.tell(start), Tell::Now);
++        // A commit right behind: told when the interval is over, by a timer.
++        let soon = start + Duration::from_millis(2);
++        assert_eq!(
++            pacing.tell(soon),
++            Tell::Later(frame - Duration::from_millis(2))
++        );
++        assert_eq!(pacing.tell(soon + Duration::from_millis(1)), Tell::Waiting);
++        pacing.told(start + frame);
++        assert_eq!(
++            pacing.tell(start + frame + Duration::from_millis(2)),
++            Tell::Later(frame - Duration::from_millis(2))
++        );
++        pacing.told(start + frame * 2);
++        // After a quiet spell: at once again.
++        assert_eq!(pacing.tell(start + frame * 10), Tell::Now);
++        // Told with a frame that only kept the stream going: that counts as well.
++        assert!(pacing.tell_with_idle_frame(start + frame * 20));
++        assert_eq!(
++            pacing.tell(start + frame * 20 + Duration::from_millis(2)),
++            Tell::Later(frame - Duration::from_millis(2))
++        );
++        assert!(!pacing.tell_with_idle_frame(start + frame * 20 + Duration::from_millis(3)));
++    }
++
++    /// The kinds of client the pacing has to do well by.
++    #[derive(Clone, Copy)]
++    enum Client {
++        /// Draws when it is told to (`wl_surface.frame`), and commits this long afterwards.
++        /// Most applications.
++        DrawsWhenTold(Duration),
++        /// Keeps a rhythm of its own, with this much time from one commit to the next, each
++        /// commit up to `off` late.
++        KeepsItsOwnRhythm { every: Duration, off: Duration },
++    }
++
++    struct Run {
++        /// When each frame started rendering, from the beginning of the run.
++        starts: Vec<Duration>,
++        /// How long after the client's commit each of its pictures started rendering. A
++        /// picture that never went out by itself counts until the frame that showed it.
++        waits: Vec<Duration>,
++        most_in_a_second: usize,
++    }
++
++    /// Plays the compositor's event loop with one client and an element that asks for the
++    /// next frame the moment it has one: commits, timers and frames in the order of their
++    /// times.
++    fn run(per_second: u64, client: Client, seconds: u64) -> Run {
++        let mut pacing = pacing(per_second);
++        let begin = Instant::now();
++        let end = begin + Duration::from_secs(seconds);
++        // Rendering takes a moment, and not always the same.
++        let render = |number: usize| Duration::from_micros(300 + (number as u64 * 37) % 900);
++        let off =
++            |number: u64, most: Duration| most.mul_f64(((number * 7919) % 1000) as f64 / 1000.0);
++
++        let mut commits = 0u64;
++        let mut next_commit = Some(begin);
++        let mut tell_timer: Option<Instant> = None;
++        // The frame the element is waiting for: when it was asked for, and when it is to start.
++        let mut asked = begin;
++        let mut frame_at = begin + pacing.frame_asked(begin, None);
++        let mut unshown: Vec<Instant> = Vec::new();
++        let mut starts = Vec::new();
++        let mut waits = Vec::new();
++
++        loop {
++            // The frame can only start once it has been asked for.
++            let frame = frame_at.max(asked);
++            let commit = next_commit.unwrap_or(end);
++            let timer = tell_timer.unwrap_or(end);
++            let now = frame.min(commit).min(timer);
++            if now >= end {
++                break;
++            }
++            if now == commit {
++                commits += 1;
++                unshown.push(now);
++                next_commit = match client {
++                    Client::DrawsWhenTold(draw) => match pacing.tell(now) {
++                        Tell::Now => Some(now + draw),
++                        Tell::Later(wait) => {
++                            tell_timer = Some(now + wait);
++                            None
++                        }
++                        Tell::Waiting => None,
++                    },
++                    Client::KeepsItsOwnRhythm { every, off: most } => {
++                        Some(begin + every * commits as u32 + off(commits, most))
++                    }
++                };
++                if pacing.changed() && now >= asked {
++                    frame_at = now + pacing.room(now);
++                }
++            } else if now == timer {
++                pacing.told(now);
++                tell_timer = None;
++                if let Client::DrawsWhenTold(draw) = client {
++                    next_commit = Some(now + draw);
++                }
++            } else {
++                pacing.frame_started(now);
++                starts.push(now.duration_since(begin));
++                waits.extend(unshown.drain(..).map(|commit| now.duration_since(commit)));
++                asked = now + render(starts.len());
++                frame_at = asked + pacing.frame_asked(asked, Some(now));
++            }
++        }
++        Run {
++            starts,
++            waits,
++            most_in_a_second: pacing.most_in_a_second(),
++        }
++    }
++
++    fn most_within_a_second(starts: &[Duration]) -> usize {
++        (0..starts.len())
++            .map(|index| {
++                starts[index..]
++                    .iter()
++                    .take_while(|&&later| later - starts[index] < SECOND)
++                    .count()
++            })
++            .max()
++            .unwrap_or(0)
++    }
++
++    fn clients(per_second: u64) -> Vec<Client> {
++        let frame = Duration::from_nanos(1_000_000_000 / per_second);
++        vec![
++            Client::DrawsWhenTold(Duration::ZERO),
++            Client::DrawsWhenTold(Duration::from_millis(2)),
++            Client::DrawsWhenTold(frame + Duration::from_millis(3)),
++            // At the frame rate to the nanosecond, a little faster, a little slower, and
++            // three times as fast.
++            Client::KeepsItsOwnRhythm {
++                every: frame,
++                off: Duration::from_millis(2),
++            },
++            Client::KeepsItsOwnRhythm {
++                every: frame.mul_f64(0.999),
++                off: Duration::from_millis(1),
++            },
++            Client::KeepsItsOwnRhythm {
++                every: frame.mul_f64(1.001),
++                off: Duration::from_millis(1),
++            },
++            Client::KeepsItsOwnRhythm {
++                every: frame / 3,
++                off: Duration::ZERO,
++            },
++        ]
++    }
++
++    #[test]
++    fn no_second_holds_more_frames_than_the_frame_rate() {
++        for per_second in [1, 24, 60, 85, 120] {
++            for client in clients(per_second) {
++                let run = run(per_second, client, 6);
++                let most = most_within_a_second(&run.starts);
++                assert!(
++                    most <= per_second as usize && run.most_in_a_second <= per_second as usize,
++                    "{most} frames started within one second at {per_second} frames a second"
++                );
++            }
++        }
++    }
++
++    /// Most applications. Their frames must not come in a rush followed by a pause: once
++    /// things have settled, every frame follows the one before after one frame interval, and
++    /// goes out when the client has committed it.
++    #[test]
++    fn a_client_that_draws_when_told_gets_evenly_spaced_frames_without_waiting() {
++        for per_second in [24, 60, 85, 120] {
++            let frame = Duration::from_nanos(1_000_000_000u64.div_ceil(per_second));
++            let run = run(
++                per_second,
++                Client::DrawsWhenTold(Duration::from_millis(2)),
++                6,
++            );
++            let settled: Vec<Duration> = run
++                .starts
++                .iter()
++                .copied()
++                .filter(|&start| start >= SECOND * 2)
++                .collect();
++            assert!(
++                settled.len() + 1 >= per_second as usize * 4,
++                "only {} frames in four seconds at {per_second} frames a second",
++                settled.len()
++            );
++            for pair in settled.windows(2) {
++                let apart = pair[1] - pair[0];
++                assert!(
++                    apart >= frame && apart <= frame + Duration::from_micros(1),
++                    "two frames {apart:?} apart at {per_second} frames a second"
++                );
++            }
++            let waited = run
++                .waits
++                .iter()
++                .filter(|&&wait| wait > Duration::from_micros(1))
++                .count();
++            assert!(
++                waited <= 2,
++                "{waited} pictures of {} had to wait",
++                run.waits.len()
++            );
++        }
++    }
++
++    fn sorted(mut waits: Vec<Duration>) -> Vec<Duration> {
++        waits.sort();
++        waits
++    }
++
++    /// A client that keeps the rhythm of the frame rate itself, each commit a little late,
++    /// is not held back by more than its own unsteadiness, for as long as it runs: a picture
++    /// that comes early for its place in the second waits until the second is over.
++    #[test]
++    fn a_client_that_keeps_the_rhythm_itself_is_held_back_by_its_unsteadiness_at_most() {
++        let frame = Duration::from_nanos(1_000_000_000 / 85);
++        let unsteady = Duration::from_micros(500);
++        for every in [frame, frame.mul_f64(1.001)] {
++            let run = run(
++                85,
++                Client::KeepsItsOwnRhythm {
++                    every,
++                    off: unsteady,
++                },
++                60,
++            );
++            assert!(
++                run.starts.len() >= 85 * 59,
++                "only {} frames in a minute",
++                run.starts.len()
++            );
++            let waits = sorted(run.waits);
++            let longest = waits[waits.len() - 1];
++            assert!(
++                longest <= unsteady + Duration::from_micros(10),
++                "a picture waited {longest:?}"
++            );
++        }
++        // One that is a thousandth slower than the frame rate, as a timer makes it, hardly
++        // ever comes early for its place.
++        let every = frame.mul_f64(1.001);
++        let waits = sorted(
++            run(
++                85,
++                Client::KeepsItsOwnRhythm {
++                    every,
++                    off: unsteady,
++                },
++                60,
++            )
++            .waits,
++        );
++        let late = waits[waits.len() * 99 / 100];
++        assert!(
++            late <= Duration::from_micros(1),
++            "one picture in a hundred waited {late:?} or more"
++        );
++    }
++
++    /// A very unsteady client at exactly the frame rate loses frames to the one-second rule:
++    /// a picture that would have to wait for more than a moment gives way to the next one.
++    /// Most of its pictures still go out when they are committed, and what is held back
++    /// does not pile up.
++    #[test]
++    fn a_very_unsteady_client_loses_frames_but_does_not_fall_behind() {
++        let frame = Duration::from_nanos(1_000_000_000 / 85);
++        let client = Client::KeepsItsOwnRhythm {
++            every: frame,
++            off: Duration::from_millis(2),
++        };
++        let run = run(85, client, 60);
++        assert!(
++            run.starts.len() >= 85 * 50,
++            "only {} frames in a minute",
++            run.starts.len()
++        );
++        let waits = sorted(run.waits);
++        let median = waits[waits.len() / 2];
++        assert!(
++            median <= GIVE_WAY_AFTER,
++            "half the pictures waited {median:?} or more"
++        );
++        let longest = waits[waits.len() - 1];
++        assert!(longest <= frame * 4, "a picture waited {longest:?}");
++    }
++
++    /// A client that draws three times as fast as the stream gets the newest of its pictures
++    /// into every frame, and the frames evenly spaced.
++    #[test]
++    fn a_client_that_is_faster_than_the_stream_gets_the_whole_frame_rate() {
++        let frame = Duration::from_nanos(1_000_000_000 / 85);
++        let run = run(
++            85,
++            Client::KeepsItsOwnRhythm {
++                every: frame / 3,
++                off: Duration::ZERO,
++            },
++            6,
++        );
++        let settled = run
++            .starts
++            .iter()
++            .filter(|&&start| start >= SECOND * 2)
++            .count();
++        assert!(
++            settled + 2 >= 85 * 4,
++            "only {settled} frames in four seconds"
++        );
++    }
++
++    #[test]
++    fn a_pause_does_not_let_more_frames_through_afterwards() {
++        let mut pacing = pacing(85);
++        let begin = Instant::now();
++        let mut now = begin;
++        let mut starts = Vec::new();
++        // Frames as fast as they may, a pause of three seconds, then as fast as they may again.
++        for round in 0..2 {
++            for _ in 0..200 {
++                pacing.changed();
++                now += pacing.frame_asked(now, None);
++                pacing.frame_started(now);
++                starts.push(now.duration_since(begin));
++            }
++            if round == 0 {
++                now += Duration::from_secs(3);
++            }
++        }
++        let most = most_within_a_second(&starts);
++        assert!(most <= 85, "{most} frames started within one second");
++    }
++}
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index 484b989..738f0cf 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -46,6 +46,9 @@ pub enum Command {
+     TouchMotion(u32, Point<f64, Logical>),
+     TouchCancel,
+     TouchFrame,
++    /// Render a frame as soon as the picture has changed instead of on the beat of the frame
++    /// rate, and never more frames in one second than the frame rate. Off unless asked for.
++    RenderOnCommit(bool),
+     Quit,
+ }
+ 
+@@ -246,6 +249,14 @@ impl WaylandDisplay {
+         let _ = self.command_tx.send(Command::TouchFrame);
+     }
+ 
++    /// Render a frame as soon as the picture has changed (a client has committed, the pointer
++    /// has moved) instead of on the beat of the frame rate: what a client draws no longer
++    /// waits for the next beat. Frames still keep the distance of the frame rate, and in no
++    /// one second do more of them start than it says. Off unless asked for.
++    pub fn set_render_on_commit(&self, enabled: bool) {
++        let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
++    }
++
+     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
+         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+         if let Err(err) = self
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index 4036452..db59847 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -221,6 +221,21 @@ impl WaylandClient {
+         data
+     }
+ 
++    /// Commits the last window as it is, as a client does that has drawn something.
++    pub fn commit_window(&self) {
++        self.state.windows.last().unwrap().commit();
++    }
++
++    /// Asks to be told when to draw the next frame of the last window (`wl_surface.frame`)
++    /// and commits. `done` is set once the compositor has said so.
++    pub fn commit_window_and_wait_to_be_told(&self) -> Arc<SyncData> {
++        let data = Arc::new(SyncData::default());
++        let window = self.state.windows.last().unwrap();
++        window.surface.frame(&self.qh, data.clone());
++        window.commit();
++        data
++    }
++
+     pub fn create_window(&mut self) {
+         self.state.create_window();
+     }
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index 0966159..9c45339 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -1,5 +1,6 @@
+ pub(crate) mod client;
+ mod device;
+ mod fixture;
++mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
+diff --git a/wayland-display-core/src/tests/test_frame_pacing.rs b/wayland-display-core/src/tests/test_frame_pacing.rs
+new file mode 100644
+index 0000000..bbe3178
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_frame_pacing.rs
+@@ -0,0 +1,164 @@
++//! Integration tests for the "render on commit" mode (see `comp::pacing`).
++//!
++//! The element's side is played by the tests: they put a frame into `waiting_frame`, as the
++//! `Command::Buffer` handler in `comp::init` does, and note when it starts. A real Wayland
++//! client commits, so that a failure here says that commits no longer reach the pacing.
++
++use crate::comp::{State, schedule_waiting_frame, send_frame_callbacks};
++use crate::tests::fixture::Fixture;
++use std::cell::RefCell;
++use std::rc::Rc;
++use std::sync::atomic::Ordering;
++use std::time::{Duration, Instant};
++use test_log::test;
++
++/// Twenty frames a second: slow enough for a busy machine to keep up with.
++const PER_SECOND: usize = 20;
++const FRAME: Duration = Duration::from_millis(50);
++
++type Starts = Rc<RefCell<Vec<Instant>>>;
++
++/// Asks for a frame the way the element does. The frame notes when it starts, and tells the
++/// clients to draw when it goes out although nothing has changed, as a rendered frame does.
++fn ask_for_a_frame(f: &mut Fixture, starts: &Starts) {
++    let last = starts.borrow().last().copied();
++    let wait = f.server.pacing.frame_asked(Instant::now(), last);
++    let starts = starts.clone();
++    f.server.waiting_frame = Some(Box::new(move |state: &mut State, _| {
++        let now = Instant::now();
++        starts.borrow_mut().push(now);
++        if !state.pacing.frame_started(now) && state.pacing.tell_with_idle_frame(now) {
++            send_frame_callbacks(state);
++        }
++    }));
++    schedule_waiting_frame(&mut f.server, wait);
++}
++
++/// Lets both sides work for `time`. With `again`, a new frame is asked for whenever the last
++/// one has started, as an element does that is never short of buffers.
++fn run(f: &mut Fixture, time: Duration, starts: &Starts, again: bool) {
++    let until = Instant::now() + time;
++    while Instant::now() < until {
++        f.update_server();
++        f.update_client();
++        if again && f.server.waiting_frame.is_none() {
++            ask_for_a_frame(f, starts);
++        }
++        std::thread::sleep(Duration::from_millis(1));
++    }
++}
++
++fn fixture(render_on_commit: bool) -> (Fixture, Starts) {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server.pacing.set_frame_rate(PER_SECOND as u64, 1);
++    f.server.pacing.set_enabled(render_on_commit);
++    (f, Starts::default())
++}
++
++#[test]
++fn a_commit_lets_the_waiting_frame_out() {
++    let (mut f, starts) = fixture(true);
++    ask_for_a_frame(&mut f, &starts);
++    run(&mut f, Duration::from_millis(10), &starts, false);
++    assert_eq!(starts.borrow().len(), 1, "the first frame goes out at once");
++
++    // Nothing changes: the next frame waits.
++    ask_for_a_frame(&mut f, &starts);
++    run(&mut f, FRAME, &starts, false);
++    assert_eq!(
++        starts.borrow().len(),
++        1,
++        "a frame went out although nothing had changed"
++    );
++
++    let committed = Instant::now();
++    f.client.commit_window();
++    run(&mut f, FRAME / 2, &starts, false);
++    let starts = starts.borrow();
++    assert_eq!(starts.len(), 2, "the commit did not let the frame out");
++    let waited = starts[1].duration_since(committed);
++    assert!(
++        waited < FRAME / 2,
++        "the frame went out {waited:?} after the commit"
++    );
++}
++
++#[test]
++fn without_a_commit_the_frame_goes_out_after_two_frame_intervals() {
++    let (mut f, starts) = fixture(true);
++    ask_for_a_frame(&mut f, &starts);
++    run(&mut f, Duration::from_millis(10), &starts, false);
++    ask_for_a_frame(&mut f, &starts);
++    run(&mut f, FRAME * 3, &starts, false);
++    let starts = starts.borrow();
++    assert_eq!(starts.len(), 2, "the stream stopped");
++    let apart = starts[1].duration_since(starts[0]);
++    assert!(
++        apart >= FRAME * 2 - Duration::from_millis(1) && apart < FRAME * 3,
++        "the second frame went out {apart:?} after the first"
++    );
++}
++
++#[test]
++fn with_the_mode_off_a_commit_does_not_touch_a_frame() {
++    let (mut f, starts) = fixture(false);
++    // Nothing puts a frame here while the mode is off. If something did, a commit would have
++    // to leave it alone.
++    let noted = starts.clone();
++    f.server.waiting_frame = Some(Box::new(move |_: &mut State, now| {
++        noted.borrow_mut().push(now);
++    }));
++    f.client.commit_window();
++    run(&mut f, FRAME, &starts, false);
++    assert!(starts.borrow().is_empty());
++    assert!(f.server.waiting_frame.is_some());
++}
++
++/// A client that draws whenever it is told to, and at once: most applications. Its frames
++/// must not come in a rush followed by a pause: they keep the distance of the frame rate,
++/// because the client is told once a frame interval.
++#[test]
++fn a_client_that_draws_when_told_gets_evenly_spaced_frames() {
++    let (mut f, starts) = fixture(true);
++    ask_for_a_frame(&mut f, &starts);
++    let mut told = f.client.commit_window_and_wait_to_be_told();
++    let until = Instant::now() + Duration::from_millis(1600);
++    while Instant::now() < until {
++        run(&mut f, Duration::from_millis(1), &starts, true);
++        if told.done.load(Ordering::Relaxed) {
++            told = f.client.commit_window_and_wait_to_be_told();
++        }
++    }
++
++    let starts = starts.borrow();
++    let apart: Vec<Duration> = starts
++        .windows(2)
++        .map(|pair| pair[1].duration_since(pair[0]))
++        .collect();
++    assert!(
++        starts.len() >= PER_SECOND && starts.len() <= PER_SECOND * 16 / 10 + 2,
++        "{} frames in 1.6 seconds at {PER_SECOND} frames a second: {apart:?}",
++        starts.len()
++    );
++    // The first two pictures after a quiet spell go out as they come. After a second one
++    // frame gives way for that (see `comp::pacing`); it is not counted here.
++    let uneven = apart
++        .iter()
++        .skip(2)
++        .filter(|&&apart| {
++            apart < FRAME - Duration::from_millis(5) || apart > FRAME + Duration::from_millis(15)
++        })
++        .count();
++    assert!(uneven <= 2, "{uneven} frames out of step: {apart:?}");
++    for (index, &start) in starts.iter().enumerate() {
++        let within = starts[index..]
++            .iter()
++            .take_while(|later| later.duration_since(start) < Duration::from_secs(1))
++            .count();
++        assert!(
++            within <= PER_SECOND,
++            "{within} frames started within one second"
++        );
++    }
++}
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index 63b5356..681fef1 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -35,6 +35,7 @@ impl CompositorHandler for State {
+ 
+     fn commit(&mut self, surface: &WlSurface) {
+         on_commit_buffer_handler::<Self>(surface);
++        crate::comp::client_committed(self);
+ 
+         if let Some(window) = self
+             .space

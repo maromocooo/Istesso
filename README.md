@@ -71,6 +71,7 @@ istesso apps list --all
 - [docs/components.md](docs/components.md)：部品の採否とライセンス
 - [docs/milestones.md](docs/milestones.md)：進め方
 - [docs/m1-plan.md](docs/m1-plan.md)：次の関門（遅延の検証）の手順
+- [docs/wifi.md](docs/wifi.md)：Wi-Fi で使うときの手引き
 - [docs/adr/](docs/adr/)：決定の記録
 
 ## 開発
@@ -81,9 +82,18 @@ cargo test -p istesso-agent -- --ignored      # LAN 内の発見。マルチキ�
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo deny check                         # cargo-deny が必要
+swift build --package-path macos/screen-probe   # Mac だけ。遅延の計測の道具
 ```
 
 コーディングエージェント向けの規約は [AGENTS.md](AGENTS.md) にあります。
+
+## 機器の対応
+
+Stream Deck などの機器には、機器ごとの部品（アダプター）で対応します。作者が実機で確かめるのは、作者が持っている機器だけです。ほかの機器は、使う人が自分のエージェントに作らせたプルリクエストで足せるようにします。
+
+**いまは、外からの機器のプルリクエストを受け付けていません。** アダプターのための口（インターフェース）を、まだ固めていないためです。固めたら、ここに手順を書きます（[ADR 0012](docs/adr/0012-device-framework.md)）。
+
+アダプターは、本体と一緒にコンパイルされるコードで、本体のほかの部分と同じに信頼されます。アダプターのソースを調べる検査は、確認を助けるためのもので、砂場ではありません。
 
 ## ライセンス
 

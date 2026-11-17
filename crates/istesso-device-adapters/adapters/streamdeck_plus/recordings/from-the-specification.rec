@@ -1,0 +1,65 @@
+# istesso device recording 0
+#
+# Written by hand from Elgato's published HID specification for the
+# Stream Deck + (pages "Main API" and "Stream Deck +"). Not taken from a
+# device: it says what the specification says, and the adapter has to agree.
+adapter streamdeck_plus
+
+# Firmware version: 05, length 0c, a checksum of 4 bytes, 8 characters.
+connect
+get 05 -> 05 0c 12 34 56 78 31 2e 30 30 2e 30 31 32 00*18
+event info firmware 1.00.012
+event shape buttons=8 columns=4 button-picture=120x120/jpeg/turn0 dials=4 strip-picture=800x100/jpeg/turn0 strip-touch=yes
+
+# Buttons: 01 00, payload length 8, one byte per button.
+in 01 00 08 00 00 00 01 00*5
+event button 2 down
+in 01 00 08 00*9
+event button 2 up
+in 01 00 08 00 01 00*6 01
+event button 0 down
+event button 7 down
+# The same states again: nothing changed, nothing is said.
+in 01 00 08 00 01 00*6 01
+
+# Dials: 01 03, payload length 5, kind (00 pressed, 01 turned), one byte per dial.
+in 01 03 05 00 01 00 fe 00 03
+event dial 1 turn -2
+event dial 3 turn 3
+in 01 03 05 00*4 01 00
+event dial 2 down
+in 01 03 05 00*6
+event dial 2 up
+
+# Touch: 01 02, kind (01 tap, 02 long, 03 flick), a reserved byte, x, y.
+in 01 02 0a 00 01 00 2c 01 32 00*5
+event touch tap 300 50
+in 01 02 0a 00 02 00 bc 02 0a 00*5
+event touch long 700 10
+in 01 02 0e 00 03 00 64 00 28 00 58 02 2d 00*5
+event touch flick 100 40 -> 600 45
+
+# Brightness: feature report 03 08, the value, padded to 32 bytes.
+brightness 50
+set 03 08 32 00*29
+
+# A picture that fits in one report: 02 07, button, last piece, size, index.
+picture button 3 ff d8 ff d9
+out 02 07 03 01 04 00 00 00 ff d8 ff d9 00*1012
+
+# A picture of 1020 bytes: 1016 in the first report, 4 in the second.
+picture button 0 aa*1016 bb*4
+out 02 07 00 00 f8 03 00 00 aa*1016
+out 02 07 00 01 04 00 01 00 bb*4 00*1012
+
+# The strip: 02 0b, a reserved byte, then as for a button.
+picture strip ff d8 ff d9
+out 02 0b 00 01 04 00 00 00 ff d8 ff d9 00*1012
+
+# There are 8 buttons, counted from 0.
+picture button 8 ff d8 ff d9
+error the device cannot do this: no such button
+
+# Putting the device back: show the logo (03 02).
+reset
+set 03 02 00*30
