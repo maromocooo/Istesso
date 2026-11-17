@@ -16,6 +16,7 @@
                   "command": ["./mark.sh"] },
     "notes":    { "kind": "run" },
     "missing":  { "kind": "run",    "command": ["./does-not-exist"] },
+    "no-such":  { "kind": "run",    "command": ["istesso-route-test-no-such-program"] },
     "teleport": { "kind": "teleport", "command": ["./mark.sh"] }
   }
 }

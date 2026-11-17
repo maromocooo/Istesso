@@ -14,7 +14,7 @@ use istesso_route::decide::{
     decide, lacks, when_several_match, Decision, Place, Remembered, SeveralMatch, Stale,
 };
 use istesso_route::exec::{carry_out, ExecError, Local};
-use istesso_route::find::{find_tasks, Found};
+use istesso_route::find::{check_program, find_tasks, Found, Program};
 use istesso_route::table::{read_table, Candidate};
 use istesso_route::tasks::{read_tasks, Task, TaskFile, TaskKind, TASKS_FILE};
 use istesso_route::{exit, now_unix, utc_date, utc_time};
@@ -162,6 +162,12 @@ fn run(command: Command) -> Result<i32, Fail> {
         } => {
             let (project, task) = project_task(&task, Some(TaskKind::Deploy))?;
             let decision = decide_task(&project, &task, &hosts)?;
+            if matches!(decision, Decision::Go { .. }) {
+                if let Err(Fail { code, message }) = check_program_of(&task, &project.root) {
+                    println!("not ready: deploy `{}`: {message}", task.name);
+                    return Ok(code);
+                }
+            }
             println!("{}", one_line(&task, &decision));
             Ok(decision.exit_code())
         }
@@ -371,7 +377,11 @@ fn carry_out_task(kind: TaskKind, args: &RunArgs) -> Result<Outcome, Fail> {
         }
         return Ok(not_run(decision.exit_code(), task, decision));
     };
-    match carry_out(&mut Local, place, &task, &project.root) {
+    let mut local = Local::default();
+    if place.local {
+        local.program = check_program_of(&task, &project.root)?;
+    }
+    match carry_out(&mut local, place, &task, &project.root) {
         Ok(code) => Ok(Outcome {
             code,
             ran: true,
@@ -393,6 +403,32 @@ fn carry_out_task(kind: TaskKind, args: &RunArgs) -> Result<Outcome, Fail> {
         Err(e @ ExecError::Start { .. }) => {
             Err(fail(exit::CANNOT_START, format!("`{}`: {e}", task.name)))
         }
+    }
+}
+
+/// Checks the program the task names. A relative program that cannot be
+/// trusted ends like an untrusted task file (73); one that is not there,
+/// where the folders down to it pass, cannot be started (127). Either way
+/// nothing runs. `Ok` holds the path to start (`None`: as named).
+fn check_program_of(task: &Task, root: &std::path::Path) -> Result<Option<PathBuf>, Fail> {
+    let Some(program) = task.command.first() else {
+        return Ok(None);
+    };
+    match check_program(program, root) {
+        Ok(Program::Unchecked) => Ok(None),
+        Ok(Program::Checked(real)) => Ok(Some(real)),
+        Ok(Program::Missing(path)) => Err(fail(
+            exit::CANNOT_START,
+            format!(
+                "the program `{program}` of `{}` cannot be started: {} is not there",
+                task.name,
+                path.display()
+            ),
+        )),
+        Err(e) => Err(fail(
+            exit::UNREADABLE,
+            format!("the program `{program}` of `{}` is not run: {e}", task.name),
+        )),
     }
 }
 
