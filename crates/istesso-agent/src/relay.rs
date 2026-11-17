@@ -376,10 +376,13 @@ mod tests {
     /// The numbers of the product, but for the quick tries of the first
     /// seconds: a second try is half a second away. On the loopback the
     /// first try has long ended by then, so a test that counts connections
-    /// counts the same on a machine that is busy with other things.
+    /// counts the same on a machine that is busy with other things. For
+    /// the same reason there are no early tries: one 10 ms after the first
+    /// would be a second connection whenever the first took that long.
     fn unhurried() -> Pace {
         Pace {
             quick: Duration::from_millis(500),
+            early: &[],
             ..Pace::default()
         }
     }

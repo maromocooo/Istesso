@@ -1228,6 +1228,11 @@ mod tests {
         ));
         assert_eq!(racer.tries().started(), 1);
         until(|| alive.load(Ordering::SeqCst) == 1);
+        // And it has said so: its thread, which held the only other handle on
+        // what a try does, is through. (Without this, a busy machine lets the
+        // racer go between the try's completing and its saying so, and the
+        // try closes what it has a moment after the line below looks.)
+        until(|| Arc::strong_count(&before_long) == 1);
         drop(racer);
         assert_eq!(alive.load(Ordering::SeqCst), 0);
     }
@@ -1535,10 +1540,17 @@ mod tests {
 
     /// Times with room in them: these tests run beside other work, at the
     /// lowest priority, where a wait of twenty milliseconds may take fifty.
+    ///
+    /// No early tries: these tests are about handing over and closing, not
+    /// about when tries start (the pretend clock above is for that). With a
+    /// second try 10 ms after the first, a busy machine lets the second
+    /// complete before the first, and a test that knows the first one
+    /// started by being the first to complete is wrong about it.
     fn quick_pace() -> Pace {
         Pace {
             every: Duration::from_secs(5),
             quick: ms(50),
+            early: &[],
             ..Pace::default()
         }
     }
