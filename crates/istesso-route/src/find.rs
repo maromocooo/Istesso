@@ -32,6 +32,13 @@
 //!
 //! Elsewhere than Unix, owner, mode and ACL are not checked; the boundary and
 //! the link rules still are.
+//!
+//! The line: what is checked is the file this command reads itself (the task
+//! file), the file it starts itself (a program the task names by a relative
+//! path, see [`check_program`]), and the folders leading to them. What a
+//! started program reads or runs after that is not checked. Anything outside
+//! this line is a limit written in the documents. One such limit stays until
+//! ADR 0014: the ACLs of folders above the project's root are not looked at.
 
 use std::fmt;
 use std::io::Read;
@@ -187,6 +194,16 @@ pub(crate) fn find_tasks_with(
         let real = inside(&file, &folder)?;
         let parent = real.parent().unwrap_or(&folder);
         for step in parent.ancestors() {
+            if !step.starts_with(&boundary) {
+                break;
+            }
+            check_folder(step, accounts)?;
+        }
+        // The root itself, and the folders from it up to the boundary,
+        // whether or not the task file's real folder lies below it (it
+        // does not when `.istesso` is a link to elsewhere in the project).
+        // Tasks run here, and their relative programs are read from here.
+        for step in dir.ancestors() {
             if !step.starts_with(&boundary) {
                 break;
             }
@@ -350,6 +367,55 @@ fn read_checked(path: &Path, accounts: &AccountDb) -> Result<String, FindError> 
     file.read_to_string(&mut text)
         .map_err(|e| unreadable(path, e))?;
     Ok(text)
+}
+
+/// Checks the program a task names by a relative path (one with a `/` that
+/// is not absolute, which is read from the project's root), before it is
+/// started: its real place must lie inside `root`, every folder from `root`
+/// down to it must pass the same check as the folders down to the task
+/// file, and the program itself must be a regular file of this user that no
+/// one else may write to, without an ACL.
+///
+/// Absolute paths and bare names (looked up on `PATH`) are not checked: they
+/// lie outside what this command checks (see the crate's description).
+pub fn check_program(program: &str, root: &Path) -> Result<(), FindError> {
+    check_program_with(program, root, &AccountDb::system())
+}
+
+pub(crate) fn check_program_with(
+    program: &str,
+    root: &Path,
+    accounts: &AccountDb,
+) -> Result<(), FindError> {
+    let path = Path::new(program);
+    if !program.contains('/') || path.is_absolute() {
+        return Ok(());
+    }
+    let root = root.canonicalize().map_err(|e| unreadable(root, e))?;
+    let real = inside(&root.join(path), &root)?;
+    let parent = real.parent().unwrap_or(&root);
+    for step in parent.ancestors() {
+        if !step.starts_with(&root) {
+            break;
+        }
+        check_folder(step, accounts)?;
+    }
+    let meta = std::fs::metadata(&real).map_err(|e| unreadable(&real, e))?;
+    if !meta.is_file() {
+        return Err(FindError::NotAFile { path: real });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != effective_uid() {
+            return Err(FindError::NotOwned { path: real });
+        }
+        check_writers(&real, &meta, accounts, false)?;
+        check_no_acl(&real)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (meta, accounts);
+    Ok(())
 }
 
 /// Refuses a path that carries an access control list.
@@ -912,5 +978,192 @@ mod tests {
                 path: base.0.join("outer")
             }
         );
+    }
+
+    /// A project with `scripts/build.sh`, as the ordinary case has it.
+    #[cfg(unix)]
+    fn with_script(base: &Base) -> (PathBuf, PathBuf) {
+        base.project("proj");
+        base.tasks("proj");
+        let folder = base.dir("proj/scripts");
+        let script = folder.join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        set_mode(&script, 0o755);
+        (base.0.join("proj"), script)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ordinary_relative_program_is_accepted() {
+        let base = Base::new("program-ok");
+        let (root, script) = with_script(&base);
+        let shared = AccountDb::default();
+        assert_eq!(
+            check_program_with("scripts/build.sh", &root, &shared),
+            Ok(())
+        );
+        assert_eq!(
+            check_program_with("./scripts/build.sh", &root, &shared),
+            Ok(())
+        );
+        // Group-writable (775 folders and file, as umask 002 makes them)
+        // with the user's private group.
+        use std::os::unix::fs::MetadataExt;
+        for path in [root.clone(), root.join("scripts"), script.clone()] {
+            set_mode(&path, 0o775);
+        }
+        let gid = std::fs::metadata(&script).unwrap().gid();
+        let private = crate::accounts::tests::private_db(effective_uid(), gid);
+        assert_eq!(
+            check_program_with("scripts/build.sh", &root, &private),
+            Ok(())
+        );
+        // The same with a group that may hold someone else.
+        assert!(matches!(
+            check_program_with("scripts/build.sh", &root, &shared),
+            Err(FindError::GroupWritable { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_paths_and_bare_names_are_outside_the_line() {
+        let base = Base::new("program-outside");
+        let (root, _) = with_script(&base);
+        let shared = AccountDb::default();
+        assert_eq!(check_program_with("/bin/sh", &root, &shared), Ok(()));
+        assert_eq!(check_program_with("cargo", &root, &shared), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_program_that_cannot_be_trusted_is_refused() {
+        use std::os::unix::fs::symlink;
+        let base = Base::new("program-refused");
+        let (root, script) = with_script(&base);
+        let shared = AccountDb::default();
+        let check = || check_program_with("scripts/build.sh", &root, &shared);
+
+        // Others can write to it, or its group may hold someone else.
+        set_mode(&script, 0o757);
+        assert_eq!(
+            check(),
+            Err(FindError::Writable {
+                path: script.clone()
+            })
+        );
+        set_mode(&script, 0o775);
+        assert!(matches!(check(), Err(FindError::GroupWritable { .. })));
+        set_mode(&script, 0o755);
+
+        // A folder on the way: others can write to it; the root as well.
+        let folder = root.join("scripts");
+        set_mode(&folder, 0o777);
+        assert_eq!(
+            check(),
+            Err(FindError::Writable {
+                path: folder.clone()
+            })
+        );
+        set_mode(&folder, 0o755);
+        set_mode(&root, 0o757);
+        assert_eq!(check(), Err(FindError::Writable { path: root.clone() }));
+        set_mode(&root, 0o755);
+        assert_eq!(check(), Ok(()));
+
+        // An ACL on the program or on its folder.
+        if give_acl(&script, false) {
+            set_mode(&script, 0o755);
+            assert_eq!(
+                check(),
+                Err(FindError::HasAcl {
+                    path: script.clone()
+                })
+            );
+            std::fs::remove_file(&script).unwrap();
+            std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+            set_mode(&script, 0o755);
+            assert!(give_acl(&folder, true));
+            set_mode(&folder, 0o755);
+            assert_eq!(
+                check(),
+                Err(FindError::HasAcl {
+                    path: folder.clone()
+                })
+            );
+        } else {
+            eprintln!("no tool to set an ACL here; the ACL refusal is not tried");
+        }
+
+        // A link that leads out of the project's root.
+        let base2 = Base::new("program-link");
+        let (root2, script2) = with_script(&base2);
+        let outside = base2.0.join("outside.sh");
+        std::fs::write(&outside, "#!/bin/sh\n").unwrap();
+        set_mode(&outside, 0o755);
+        std::fs::remove_file(&script2).unwrap();
+        symlink(&outside, &script2).unwrap();
+        assert!(matches!(
+            check_program_with("scripts/build.sh", &root2, &shared),
+            Err(FindError::OutsideProject { .. })
+        ));
+        // `..` that leaves the root.
+        assert!(matches!(
+            check_program_with("../outside.sh", &root2, &shared),
+            Err(FindError::OutsideProject { .. })
+        ));
+        // A link that stays inside is fine.
+        std::fs::remove_file(&script2).unwrap();
+        let kept = root2.join("scripts/real.sh");
+        std::fs::write(&kept, "#!/bin/sh\n").unwrap();
+        set_mode(&kept, 0o755);
+        symlink(&kept, &script2).unwrap();
+        assert_eq!(
+            check_program_with("scripts/build.sh", &root2, &shared),
+            Ok(())
+        );
+
+        // Not a regular file, or not there.
+        base2.dir("proj/scripts/dir.sh");
+        assert!(matches!(
+            check_program_with("scripts/dir.sh", &root2, &shared),
+            Err(FindError::NotAFile { .. })
+        ));
+        assert!(matches!(
+            check_program_with("scripts/none.sh", &root2, &shared),
+            Err(FindError::Unreadable { .. })
+        ));
+        // A file of another user (root's), reached by a link inside: the
+        // link leads out of the project, so it is refused before that.
+        if effective_uid() != 0 {
+            std::fs::remove_file(&script2).unwrap();
+            symlink("/bin/sh", &script2).unwrap();
+            assert!(check_program_with("scripts/build.sh", &root2, &shared).is_err());
+        }
+    }
+
+    /// The root (the folder that holds `.istesso`) is checked even when the
+    /// task file's real folder does not lie below it.
+    #[cfg(unix)]
+    #[test]
+    fn the_root_itself_is_always_checked() {
+        use std::os::unix::fs::symlink;
+        let base = Base::new("root-checked");
+        base.project("repo");
+        let real = base.tasks("repo/other");
+        base.dir("repo/sub");
+        symlink(real.parent().unwrap(), base.0.join("repo/sub/.istesso")).unwrap();
+        let found = base.find("repo/sub").unwrap().unwrap();
+        assert_eq!(found.root, base.0.join("repo/sub"));
+        // Others can write to the root: refused, though the file's own
+        // folders (repo/other/.istesso, repo/other, repo) are fine.
+        let root = base.0.join("repo/sub");
+        set_mode(&root, 0o777);
+        assert_eq!(
+            base.find("repo/sub").unwrap_err(),
+            FindError::Writable { path: root.clone() }
+        );
+        set_mode(&root, 0o755);
+        assert!(base.find("repo/sub").unwrap().is_some());
     }
 }

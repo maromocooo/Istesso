@@ -14,7 +14,7 @@ use istesso_route::decide::{
     decide, lacks, when_several_match, Decision, Place, Remembered, SeveralMatch, Stale,
 };
 use istesso_route::exec::{carry_out, ExecError, Local};
-use istesso_route::find::{find_tasks, Found};
+use istesso_route::find::{check_program, find_tasks, Found};
 use istesso_route::table::{read_table, Candidate};
 use istesso_route::tasks::{read_tasks, Task, TaskFile, TaskKind, TASKS_FILE};
 use istesso_route::{exit, now_unix, utc_date, utc_time};
@@ -162,6 +162,12 @@ fn run(command: Command) -> Result<i32, Fail> {
         } => {
             let (project, task) = project_task(&task, Some(TaskKind::Deploy))?;
             let decision = decide_task(&project, &task, &hosts)?;
+            if matches!(decision, Decision::Go { .. }) {
+                if let Err(Fail { code, message }) = check_program_of(&task, &project.root) {
+                    println!("not ready: deploy `{}`: {message}", task.name);
+                    return Ok(code);
+                }
+            }
             println!("{}", one_line(&task, &decision));
             Ok(decision.exit_code())
         }
@@ -371,6 +377,9 @@ fn carry_out_task(kind: TaskKind, args: &RunArgs) -> Result<Outcome, Fail> {
         }
         return Ok(not_run(decision.exit_code(), task, decision));
     };
+    if place.local {
+        check_program_of(&task, &project.root)?;
+    }
     match carry_out(&mut Local, place, &task, &project.root) {
         Ok(code) => Ok(Outcome {
             code,
@@ -394,6 +403,20 @@ fn carry_out_task(kind: TaskKind, args: &RunArgs) -> Result<Outcome, Fail> {
             Err(fail(exit::CANNOT_START, format!("`{}`: {e}", task.name)))
         }
     }
+}
+
+/// Refuses a program the task names by a relative path that cannot be
+/// trusted; it ends like an untrusted task file (73) and nothing runs.
+fn check_program_of(task: &Task, root: &std::path::Path) -> Result<(), Fail> {
+    let Some(program) = task.command.first() else {
+        return Ok(());
+    };
+    check_program(program, root).map_err(|e| {
+        fail(
+            exit::UNREADABLE,
+            format!("the program `{program}` of `{}` is not run: {e}", task.name),
+        )
+    })
 }
 
 fn choose(name: &str, machine: &str, hosts: &HostsArg) -> Result<i32, Fail> {

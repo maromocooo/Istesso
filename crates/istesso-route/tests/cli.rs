@@ -461,7 +461,12 @@ fn run_runs_here_in_the_project_root() {
 
     let run = project.with_hosts("hosts-two.json", &["run", "notes"]);
     assert_eq!(run.code, exit::UNREADABLE);
+    // A relative program that is not there cannot be checked: not run (73).
     let run = project.with_hosts("hosts-two.json", &["run", "missing"]);
+    assert_eq!(run.code, exit::UNREADABLE);
+    assert!(run.stderr.contains("does-not-exist"));
+    // A bare name that is not on PATH cannot be started (127).
+    let run = project.with_hosts("hosts-two.json", &["run", "no-such"]);
     assert_eq!(run.code, exit::CANNOT_START);
     // The kind must match.
     let run = project.with_hosts("hosts-two.json", &["run", "test"]);
@@ -540,7 +545,7 @@ fn run_says_in_a_fixed_line_whether_the_task_ran() {
         ("hosts-three.json", ["deploy", "site"], exit::AMBIGUOUS),
         ("hosts-two.json", ["build", "windows"], exit::NOBODY),
         ("hosts-two.json", ["build", "quantum"], exit::NOT_UNDERSTOOD),
-        ("hosts-two.json", ["run", "missing"], exit::CANNOT_START),
+        ("hosts-two.json", ["run", "no-such"], exit::CANNOT_START),
         ("hosts-two.json", ["run", "nothing"], exit::UNREADABLE),
     ] {
         let run = project.with_hosts(hosts, &args);
@@ -622,4 +627,54 @@ fn a_named_project_shares_its_choices_across_worktrees() {
             .unwrap(),
     );
     assert_eq!(run.code, exit::AMBIGUOUS);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_program_that_cannot_be_trusted_is_not_run() {
+    let project = Project::new("program");
+    let script = project.root().join("mark.sh");
+    // The ordinary case: 755 in a 755 root. It runs.
+    let run = project.with_hosts("hosts-two.json", &["build", "test"]);
+    assert_eq!(run.code, 3, "{}", run.all());
+    std::fs::remove_file(project.root().join("marker")).unwrap();
+
+    // Others can write to it: not run, 73, the fixed line, the path named.
+    set_mode(&script, 0o757);
+    let run = project.with_hosts("hosts-two.json", &["build", "test"]);
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert!(run
+        .stderr
+        .contains("the program `./mark.sh` of `test` is not run"));
+    assert!(run
+        .stderr
+        .contains("mark.sh is not used: others can write to it"));
+    assert_eq!(
+        last_line(&run.stderr),
+        "istesso-route: did not run build `test`; exit code 73"
+    );
+    assert!(!project.root().join("marker").exists());
+
+    // `check deploy` reports the same refusal and runs nothing.
+    let run = project.with_hosts("hosts-two.json", &["check", "deploy", "site"]);
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert_eq!(run.stdout.lines().count(), 1);
+    assert!(run
+        .stdout
+        .starts_with("not ready: deploy `site`: the program `./mark.sh`"));
+    assert!(!project.root().join("marker").exists());
+    set_mode(&script, 0o755);
+    let run = project.with_hosts("hosts-two.json", &["check", "deploy", "site"]);
+    assert_eq!(run.code, exit::OK);
+
+    // A link that leads out of the project.
+    let outside = project.base.join("elsewhere.sh");
+    std::fs::write(&outside, "#!/bin/sh\npwd > marker\nexit 3\n").unwrap();
+    set_mode(&outside, 0o755);
+    std::fs::remove_file(&script).unwrap();
+    std::os::unix::fs::symlink(&outside, &script).unwrap();
+    let run = project.with_hosts("hosts-two.json", &["build", "test"]);
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert!(run.stderr.contains("leads out of"));
+    assert!(!project.root().join("marker").exists());
 }
