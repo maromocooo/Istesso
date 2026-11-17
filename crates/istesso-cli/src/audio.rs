@@ -872,6 +872,26 @@ mod mac {
     struct Voice {
         playout: Playout<Sinc>,
         record_in: istesso_audio::rtrb::Producer<f32>,
+        /// Seconds of sound that have been let out since the player began
+        /// to be heard: the first of them are turned down.
+        risen_s: f64,
+    }
+
+    impl Voice {
+        /// Turns down what is heard first: see [`audible_gain`]. Silence
+        /// does not count, so that the rise begins with the sound.
+        fn rise(&mut self, out: &mut [f32], channels: usize, device_rate: f64) {
+            if self.risen_s >= AUDIBLE_RISE_S || !out.iter().any(|sample| *sample != 0.0) {
+                return;
+            }
+            for frame in out.chunks_exact_mut(channels.max(1)) {
+                let gain = audible_gain(self.risen_s);
+                for sample in frame {
+                    *sample *= gain;
+                }
+                self.risen_s += 1.0 / device_rate;
+            }
+        }
     }
 
     /// Starts `output` with the callback that plays from `voice`.
@@ -893,6 +913,9 @@ mod mac {
                     Some(Some(voice)) => {
                         voice.playout.render(frames, out, now_ns);
                         let _ = voice.record_in.push_partial_slice(out);
+                        if audible {
+                            voice.rise(out, channels, device_rate);
+                        }
                     }
                     _ => out.fill(0.0),
                 }
@@ -1174,7 +1197,11 @@ mod mac {
         let mut rearranged_seen = (0u64, 0u64);
         // The playout is shared with the device's callback, so that it can
         // be handed to another device when the default output changes.
-        let voice = Arc::new(Mutex::new(Some(Voice { playout, record_in })));
+        let voice = Arc::new(Mutex::new(Some(Voice {
+            playout,
+            record_in,
+            risen_s: 0.0,
+        })));
         start_output(
             &mut output,
             channels,
@@ -1370,6 +1397,7 @@ mod mac {
                                     Some(Voice {
                                         playout: Playout::new(cfg, reader, resampler, counts, waits),
                                         record_in: old.record_in,
+                                        risen_s: old.risen_s,
                                     });
                                 start_output(
                                     &mut next,
@@ -1596,6 +1624,25 @@ fn compare(sent: &std::path::Path, received: &std::path::Path) -> Result<(), Str
     } else {
         Err("what was received is not what was sent".to_string())
     }
+}
+
+/// How long the sound takes to come up when the player is made audible,
+/// and from how far down.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const AUDIBLE_RISE_S: f64 = 20.0;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const AUDIBLE_RISE_FROM_DB: f64 = -40.0;
+
+/// The gain of what is heard, `seconds` of sound after the player began to
+/// be heard: it starts 40 dB down and comes up evenly, in decibels, over
+/// 20 seconds, and is 1 from then on. It is never more than 1.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn audible_gain(seconds: f64) -> f32 {
+    if seconds >= AUDIBLE_RISE_S {
+        return 1.0;
+    }
+    let still_down_db = AUDIBLE_RISE_FROM_DB * (1.0 - seconds.max(0.0) / AUDIBLE_RISE_S);
+    (10f64.powf(still_down_db / 20.0) as f32).min(1.0)
 }
 
 /// The record the audio path keeps of itself: one line for every hour and
@@ -1837,6 +1884,29 @@ mod record {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn what_is_heard_first_is_quiet_and_comes_up_without_a_step() {
+        assert!(
+            (audible_gain(0.0) - 0.01).abs() < 1e-6,
+            "40 dB down at the start"
+        );
+        assert!(
+            (audible_gain(10.0) - 0.1).abs() < 1e-6,
+            "20 dB down half way"
+        );
+        assert_eq!(audible_gain(20.0), 1.0);
+        assert_eq!(audible_gain(3_600.0), 1.0);
+        // From one frame to the next the gain rises by less than a
+        // thousandth of itself, never falls, and never passes 1.
+        let mut before = audible_gain(0.0);
+        for frame in 1..=(21 * 48_000) {
+            let gain = audible_gain(f64::from(frame) / 48_000.0);
+            assert!(gain >= before && gain <= 1.0);
+            assert!(gain - before <= before * 1e-3, "a step at frame {frame}");
+            before = gain;
+        }
+    }
 
     #[test]
     fn the_record_stamps_times_in_local_time() {

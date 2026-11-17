@@ -955,6 +955,56 @@ mod tests {
         played: Vec<f32>,
     }
 
+    /// The largest step from one sample to the next, and the largest
+    /// sample, of what a rig has played.
+    fn steepest_and_highest(played: &[f32]) -> (f32, f32) {
+        let steepest = played
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0f32, f32::max);
+        let highest = played
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0f32, f32::max);
+        (steepest, highest)
+    }
+
+    #[test]
+    fn no_seam_is_a_hard_cut_and_nothing_is_louder_than_the_source() {
+        // A constant level is the hardest case: any cut shows as a step of
+        // the whole level (0.5 here) from one sample to the next.
+        let mut rig = sinc_rig();
+        rig.run(1.0);
+        // The source says that its audio does not follow on.
+        rig.packet(true);
+        rig.run(0.5);
+        // Nothing arrives for a while: the queue runs dry, then audio is back.
+        for _ in 0..((0.3 * RATE) as usize / CALLBACK) {
+            rig.callback();
+        }
+        rig.run(0.5);
+        // Far too much arrives at once: the playout has to leave some out.
+        for _ in 0..40 {
+            rig.packet(false);
+        }
+        rig.run(0.5);
+        // The same again while the last seam is hardly over.
+        rig.packet(true);
+        rig.callback();
+        rig.packet(true);
+        rig.run(0.5);
+        let seen = rig.snapshot();
+        assert!(seen.starts >= 2 && seen.underruns >= 1, "{seen:?}");
+        assert!(seen.skips >= 1, "{seen:?}");
+        let (steepest, highest) = steepest_and_highest(&rig.played);
+        eprintln!("steepest step {steepest}, highest sample {highest}");
+        assert!(steepest <= 0.05, "a step of {steepest} between two samples");
+        assert!(
+            highest <= 0.5 * 1.05,
+            "a sample of {highest} from a source of 0.5"
+        );
+    }
+
     #[test]
     fn a_playout_that_is_taken_apart_keeps_what_is_in_the_queue() {
         let (mut writer, reader) = crate::fifo::queue(2, 48_000);
