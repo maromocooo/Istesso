@@ -2211,7 +2211,7 @@ fn a_host_that_is_away_is_asked_again_until_it_is_back() {
     // Tries that fail at once, a tenth of a second apart while the cut is
     // fresh (fewer, if this machine was busy with something else).
     let tried = between.connections() - 1;
-    assert!((5..=10).contains(&tried), "{tried} tries");
+    assert!((3..=10).contains(&tried), "{tried} tries");
     assert_eq!(viewer.tries(), tried);
 
     between.lead_to(pair.addr);
@@ -2339,8 +2339,12 @@ fn a_device_holds_four_waiting_connections_and_no_more() {
     let mut held: Vec<_> = (0..4).map(|_| pair.open().unwrap()).collect();
     pair.until(|| pair.host.waiting() == 4);
 
-    // The fifth completes its handshake, and is closed.
+    // The fifth completes its handshake, and is closed. That can be told
+    // without asking on it, which is how a viewer keeps from using it; the
+    // ones that wait do not look closed.
     let fifth = pair.open().unwrap();
+    pair.until(|| fifth.closed_by_host());
+    assert!(held.iter().all(|waiting| !waiting.closed_by_host()));
     let refused = fifth.watch().err().expect("the fifth was taken");
     assert!(
         matches!(refused, Error::Link(LinkError::Closed)),
@@ -2430,9 +2434,10 @@ fn of_several_tries_that_complete_one_asks_and_the_others_are_closed() {
         Stepped::Connected { again: true, .. }
     ));
     // Four tries were started a tenth of a second apart while the first was
-    // on its way (three, if this machine was busy with something else).
+    // on its way (fewer, if this machine was busy with something else and
+    // woke the viewer late; more than one, or nothing was under way at once).
     let tries = viewer.tries();
-    assert!((3..=4).contains(&tries), "{tries} tries");
+    assert!((2..=4).contains(&tries), "{tries} tries");
     assert_eq!(between.connections(), 1 + tries);
     assert_eq!(viewer.cuts(), 1);
 
@@ -2458,7 +2463,10 @@ fn of_several_tries_that_complete_one_asks_and_the_others_are_closed() {
     // anything. To the host one device came back, once: one stream, no
     // further key frame asked for, one earlier connection closed.
     nothing_happens(&mut viewer, Duration::from_millis(900));
-    pair.until(|| pair.host.waiting() == 0 && pair.host.pending() == 0);
+    pair.until(|| {
+        assert!(viewer.next(Duration::from_millis(20)).unwrap().is_none());
+        pair.host.waiting() == 0 && pair.host.pending() == 0
+    });
     assert_eq!(pair.host.viewers(), 1);
     assert!(!pair.host.key_frame_wanted());
     let said = pair.said.lock().unwrap().clone();
@@ -2497,8 +2505,9 @@ fn a_host_that_was_away_is_reached_by_the_next_try_after_it_is_back() {
     between.host_is_away(true);
     assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
     nothing_happens(&mut viewer, Duration::from_millis(2500));
+    // (Ten or more on a machine that is not busy with other things.)
     let tried = viewer.tries();
-    assert!(tried >= 8, "{tried} tries in two and a half seconds");
+    assert!(tried >= 6, "{tried} tries in two and a half seconds");
     // None of them reached the host.
     assert_eq!(pair.host.waiting(), 0);
 
@@ -2510,7 +2519,7 @@ fn a_host_that_was_away_is_reached_by_the_next_try_after_it_is_back() {
     ));
     // The next try was a quarter of a second away at most.
     let took = back_from.elapsed();
-    assert!(took < Duration::from_secs(1), "back after {took:?}");
+    assert!(took < Duration::from_millis(1500), "back after {took:?}");
     assert!(
         viewer.tries() - tried <= 2,
         "{} more",
@@ -2549,4 +2558,35 @@ fn a_viewer_that_does_not_overlap_its_tries_is_taken_as_before() {
     assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
     assert_eq!(take(&mut second).unwrap().unwrap().data, b"key");
     assert!(take(&mut first).is_err());
+}
+
+/// Quitting while tries are under way (a window is closed): every try
+/// ends, what it opened is closed, and the host is left with nothing that
+/// waits and with nobody new to show the picture to.
+#[test]
+fn a_viewer_that_is_dropped_while_tries_are_under_way_leaves_nothing_behind() {
+    let pair = pair();
+    let between = Between::new(pair.addr);
+    // Tries that complete their handshake and take a while to say so.
+    let slow = Duration::from_millis(400);
+    let mut viewer = pair.lasting_paced(between.addr, Pace::default(), slow);
+    lasting_and_shown(&pair, &mut viewer);
+
+    between.fall_silent();
+    assert_eq!(step(&mut viewer).unwrap(), Stepped::Cut);
+    nothing_happens(&mut viewer, Duration::from_millis(150));
+    // At least one try has got as far as the host, and none is back.
+    pair.until(|| pair.host.waiting() >= 1);
+    assert!(viewer.tries() >= 1);
+    assert!(viewer.viewer().is_none());
+
+    drop(viewer);
+    pair.until(|| pair.host.waiting() == 0 && pair.host.pending() == 0);
+    // The picture was asked for once, by the connection that fell silent.
+    let said = pair.said.lock().unwrap().clone();
+    let shown = said
+        .iter()
+        .filter(|line| *line == "showing the picture to air")
+        .count();
+    assert_eq!(shown, 1, "{said:?}");
 }

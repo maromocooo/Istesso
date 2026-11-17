@@ -180,6 +180,24 @@ impl Opened {
         &self.peer
     }
 
+    /// Whether the host has closed this connection already, as far as that
+    /// can be seen without waiting. A host that has as many connections of
+    /// this device waiting as it holds closes a further one right after the
+    /// handshake; such a connection is not one to ask on.
+    pub fn closed_by_host(&self) -> bool {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+        let stream = self.channel.stream().stream();
+        if stream.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let peeked = stream.peek(&mut [0u8; 1]);
+        let _ = stream.set_nonblocking(false);
+        match peeked {
+            Ok(read) => read == 0,
+            Err(err) => matches!(err.kind(), ConnectionReset | ConnectionAborted | BrokenPipe),
+        }
+    }
+
     /// The second half of [`Viewer::connect`]: asks the host for its
     /// picture on this connection, which is the request that makes the
     /// host use this connection for the device from now on. The answer has

@@ -254,10 +254,20 @@ impl Lasting {
                         self.over = true;
                         Err(err)
                     }
-                    Again::Soon | Again::Slowly => {
+                    Again::Soon => {
                         // The first try at once, unless the connection had only
                         // just been made.
                         self.racer.tries_mut().cut(Instant::now());
+                        self.heard = Some(heard);
+                        Ok(Some(Step::Cut))
+                    }
+                    Again::Slowly => {
+                        // No error of a stream that runs asks for leisure today
+                        // (a host that is full says so in answer to the request,
+                        // and a list of paired devices is read when connecting).
+                        // Should one come to, the pause it asks for is kept, as
+                        // it was before tries overlapped.
+                        self.racer.tries_mut().cut_at_leisure(Instant::now());
                         self.heard = Some(heard);
                         Ok(Some(Step::Cut))
                     }
@@ -317,7 +327,12 @@ impl Lasting {
         let Some(again) = self.again.clone() else {
             return Ok(None);
         };
-        let opened = match self.racer.turn(wait, &again, Error::again) {
+        // A connection that the host has closed since its handshake (it holds
+        // only so many of a device that have not asked for the picture yet) is
+        // not one that was opened: it counts as a try that failed.
+        let still_open = |opened: &Opened| !opened.closed_by_host();
+        let turn = self.racer.turn_if(wait, &again, Error::again, still_open);
+        let opened = match turn {
             Turn::Nothing => return Ok(None),
             Turn::Stopped(err) => {
                 self.over = true;
