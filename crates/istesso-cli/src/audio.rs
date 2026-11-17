@@ -120,6 +120,10 @@ pub enum AudioAction {
         /// device skip and break on their own. No address is given
         #[arg(long, conflicts_with = "address")]
         reference: bool,
+        /// Let the sound be heard: hand it to the output device. Without
+        /// this the device gets silence and the sound is only measured
+        #[arg(long, conflicts_with = "reference")]
+        audible: bool,
         /// Id or name of the paired device expected there (default: any
         /// paired device)
         #[arg(long)]
@@ -266,6 +270,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
         AudioAction::Play {
             address,
             reference,
+            audible,
             peer,
             output,
             latency_ms,
@@ -280,6 +285,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
         } => play(PlayOptions {
             address: address.unwrap_or_default(),
             reference,
+            audible,
             peer,
             output,
             latency_ms,
@@ -610,6 +616,19 @@ fn serve(options: ServeOptions) -> Result<(), String> {
     // does. With a limit and a pipe that goes on, stop at the limit.
     let begin = Instant::now();
     let mut late_cycles_said = 0u64;
+    let mut record = record::Record::open("source", &[]);
+    let mut record_at = Instant::now();
+    let source_totals = |capture: &serde_json::Value| {
+        [
+            (
+                "clicks",
+                capture["late_cycles"].as_u64().unwrap_or(0) as f64,
+            ),
+            ("late_ms", capture["late_total_ms"].as_f64().unwrap_or(0.0)),
+            ("cycles", capture["cycles"].as_u64().unwrap_or(0) as f64),
+            ("pauses", capture["resumed"].as_u64().unwrap_or(0) as f64),
+        ]
+    };
     while !feeder.is_finished() {
         if seconds.is_some_and(|limit| begin.elapsed().as_secs_f64() >= limit + 0.5) {
             break;
@@ -628,10 +647,19 @@ fn serve(options: ServeOptions) -> Result<(), String> {
                 );
             }
         }
+        if record_at.elapsed() >= Duration::from_secs(1) {
+            record_at = Instant::now();
+            if let Some(capture) = capture_report.as_ref().map(|report| report()) {
+                record.tick(&source_totals(&capture));
+            }
+        }
         if options.stop_file.as_ref().is_some_and(|file| file.exists()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(capture) = capture_report.as_ref().map(|report| report()) {
+        record.end(&source_totals(&capture));
     }
     stop.store(true, Ordering::Relaxed);
     if feeder.is_finished() {
@@ -670,6 +698,7 @@ fn serve(options: ServeOptions) -> Result<(), String> {
 struct PlayOptions {
     address: String,
     reference: bool,
+    audible: bool,
     peer: Option<String>,
     output: Option<String>,
     latency_ms: f64,
@@ -708,6 +737,7 @@ fn play(options: PlayOptions) -> Result<(), String> {
         options.stop_file,
         options.keep_awake,
         options.reference,
+        options.audible,
     );
     Err("playing is only built for macOS so far".to_string())
 }
@@ -900,6 +930,8 @@ mod mac {
         let (mut queue_in, queue_out) = queue(channels, (stream_rate * 4.0) as usize);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_pump = stop.clone();
+        let cuts = Arc::new(AtomicU64::new(0));
+        let cuts_seen = cuts.clone();
         let keep_ledger = options.ledger.is_some();
         // One packet's time, for the scheduling of the thread that receives.
         let packet_time =
@@ -952,6 +984,7 @@ mod mac {
                         let at = began.elapsed().as_secs_f64();
                         match event {
                             Rejoining::Cut => {
+                                cuts_seen.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("{at:>7.1} s since the start: the connection was cut; connecting again")
                             }
                             Rejoining::Rejoined => {
@@ -1044,6 +1077,7 @@ mod mac {
         // The device's own word on turns that were not made in time, and
         // the system's on its devices being rearranged.
         let overloads = output.count_overloads().ok();
+        let audible = options.audible;
         let rearranged = istesso_audio::mac::watch_devices().ok();
         let mut rearranged_seen = (0u64, 0u64);
         let seen = callbacks.clone();
@@ -1054,9 +1088,12 @@ mod mac {
                 let began_ns = clock::now_ns();
                 playout.render(frames, out, now_ns);
                 let _ = record_in.push_partial_slice(out);
-                // Nothing is to be heard yet: the device gets silence, and
-                // with it the clock of the device still drives the playout.
-                out.fill(0.0);
+                // Unless the person asked to hear it, the device gets
+                // silence, and with it the clock of the device still drives
+                // the playout.
+                if !audible {
+                    out.fill(0.0);
+                }
                 // Was this program late, or did the device not come? How
                 // long the work here took, and whether the frames of this
                 // callback are due when those of the last one end.
@@ -1082,7 +1119,8 @@ mod mac {
             })
             .map_err(|e| e.to_string())?;
         eprintln!(
-            "Playing silently into an output at {} Hz ({} frames at a time); the stream is {} Hz, {} channels.",
+            "Playing {} an output at {} Hz ({} frames at a time); the stream is {} Hz, {} channels.",
+            if audible { "into" } else { "silently into" },
             device.sample_rate, device.buffer_frames, info.sample_rate, info.channels
         );
 
@@ -1112,6 +1150,49 @@ mod mac {
         let mut on_the_way_ms: Vec<f64> = Vec::new();
         let begin = Instant::now();
         let mut said = Instant::now();
+        // The record this path keeps of itself: a line an hour and a day.
+        let mut record = record::Record::open(
+            if options.reference {
+                "reference"
+            } else {
+                "exit"
+            },
+            &[("audible", audible), ("reference", options.reference)],
+        );
+        let mut gap_began_ms = 0.0f64;
+        let mut underruns_before = 0u64;
+        let mut underrun_ms_before = 0.0f64;
+        let totals = |now: &istesso_audio::playout::Snapshot| {
+            [
+                ("clicks", now.source_slips as f64),
+                ("skips", now.skips as f64),
+                ("breaks", now.underruns as f64),
+                ("break_ms", now.underrun_ms),
+                ("reconnections", cuts.load(Ordering::Relaxed) as f64),
+                (
+                    "devices_rearranged",
+                    rearranged
+                        .as_ref()
+                        .map_or(0, |c| c.devices.load(Ordering::Relaxed))
+                        as f64,
+                ),
+                (
+                    "default_output_changed",
+                    rearranged
+                        .as_ref()
+                        .map_or(0, |c| c.default_output.load(Ordering::Relaxed))
+                        as f64,
+                ),
+                (
+                    "device_overloads",
+                    overloads.as_ref().map_or(0, |c| c.load(Ordering::Relaxed)) as f64,
+                ),
+                (
+                    "missed_device_turns",
+                    callbacks.missed_turns.load(Ordering::Relaxed) as f64,
+                ),
+            ]
+        };
         loop {
             while record_out.slots() >= channels {
                 if record_out.pop_entire_slice(&mut frame).is_err() {
@@ -1175,6 +1256,19 @@ mod mac {
                     now.underruns,
                     now.skips
                 );
+                // The longest single break, and the delay as it is now.
+                if now.underruns != underruns_before {
+                    // A break began since the last look: it is counted
+                    // from what the breaks added up to then.
+                    underruns_before = now.underruns;
+                    gap_began_ms = underrun_ms_before;
+                }
+                underrun_ms_before = now.underrun_ms;
+                record.note_gap(now.underrun_ms - gap_began_ms);
+                if let Some(delay) = latency_ms.last() {
+                    record.note_delay(*delay);
+                }
+                record.tick(&totals(&now));
                 if let Some(changes) = &rearranged {
                     let now = (
                         changes.default_output.load(Ordering::Relaxed),
@@ -1212,6 +1306,7 @@ mod mac {
             std::thread::sleep(Duration::from_millis(20));
         }
         let ran_s = begin.elapsed().as_secs_f64();
+        record.end(&totals(&stats.snapshot()));
 
         // Hang up, and let the device finish.
         stop.store(true, Ordering::Relaxed);
@@ -1382,8 +1477,304 @@ fn compare(sent: &std::path::Path, received: &std::path::Path) -> Result<(), Str
     }
 }
 
+/// The record the audio path keeps of itself: one line for every hour and
+/// one for every day it ran, in a file of this machine. A line holds
+/// counts and times only: no name, no address, nothing about what played.
+mod record {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Where the lines go: `ISTESSO_AUDIO_RECORD_DIR`, or
+    /// `~/.local/state/istesso/audio`. The value `off` keeps no record.
+    fn directory() -> Option<PathBuf> {
+        match std::env::var("ISTESSO_AUDIO_RECORD_DIR") {
+            Ok(dir) if dir == "off" => None,
+            Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+            _ => {
+                let state = std::env::var("XDG_STATE_HOME")
+                    .ok()
+                    .filter(|dir| !dir.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var("HOME")
+                            .ok()
+                            .map(|home| PathBuf::from(home).join(".local/state"))
+                    })?;
+                Some(state.join("istesso/audio"))
+            }
+        }
+    }
+
+    /// This machine's offset from UTC in seconds, from the system's `date`
+    /// (`+0900`). Zero when that cannot be had.
+    fn local_offset_s() -> i64 {
+        std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()
+            .and_then(|out| parse_offset(String::from_utf8_lossy(&out.stdout).trim()))
+            .unwrap_or(0)
+    }
+
+    pub(super) fn parse_offset(text: &str) -> Option<i64> {
+        let (sign, digits) = match text.as_bytes().first()? {
+            b'+' => (1, &text[1..]),
+            b'-' => (-1, &text[1..]),
+            _ => return None,
+        };
+        if digits.len() != 4 {
+            return None;
+        }
+        let hours: i64 = digits[..2].parse().ok()?;
+        let minutes: i64 = digits[2..].parse().ok()?;
+        Some(sign * (hours * 3600 + minutes * 60))
+    }
+
+    /// `2026-11-17T15:00:00+09:00` for a moment and an offset from UTC.
+    pub(super) fn stamp(epoch_s: u64, offset_s: i64) -> String {
+        let local = epoch_s as i64 + offset_s;
+        let (days, second_of_day) = (local.div_euclid(86_400), local.rem_euclid(86_400));
+        // Days since 1970-01-01 to a date of the calendar in use.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let day_of_era = z.rem_euclid(146_097);
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_index = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+        let month = if month_index < 10 {
+            month_index + 3
+        } else {
+            month_index - 9
+        };
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+            second_of_day / 3600,
+            second_of_day % 3600 / 60,
+            second_of_day % 60,
+            if offset_s < 0 { '-' } else { '+' },
+            offset_s.abs() / 3600,
+            offset_s.abs() % 3600 / 60
+        )
+    }
+
+    /// One hour or one day that is being counted.
+    struct Period {
+        kind: &'static str,
+        length_s: i64,
+        /// Which hour or day, counted in local time.
+        key: i64,
+        from_s: u64,
+        base: Vec<f64>,
+        longest_gap_ms: f64,
+        delays_ms: Vec<f64>,
+    }
+
+    pub(super) struct Record {
+        file: Option<PathBuf>,
+        role: &'static str,
+        flags: Vec<(&'static str, bool)>,
+        offset_s: i64,
+        periods: Vec<Period>,
+    }
+
+    fn now_s() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs())
+    }
+
+    impl Record {
+        /// The record of the program in the role `role` ("exit", "source",
+        /// "reference"); `flags` are written into every line as they are.
+        pub(super) fn open(role: &'static str, flags: &[(&'static str, bool)]) -> Self {
+            let file = directory().map(|dir| dir.join(format!("{role}.jsonl")));
+            Record::at(file, role, flags, local_offset_s(), now_s())
+        }
+
+        pub(super) fn at(
+            file: Option<PathBuf>,
+            role: &'static str,
+            flags: &[(&'static str, bool)],
+            offset_s: i64,
+            now_s: u64,
+        ) -> Self {
+            let period = |kind, length_s: i64| Period {
+                kind,
+                length_s,
+                key: (now_s as i64 + offset_s).div_euclid(length_s),
+                from_s: now_s,
+                base: Vec::new(),
+                longest_gap_ms: 0.0,
+                delays_ms: Vec::new(),
+            };
+            Record {
+                file,
+                role,
+                flags: flags.to_vec(),
+                offset_s,
+                periods: vec![period("hour", 3_600), period("day", 86_400)],
+            }
+        }
+
+        /// A break of this length is going on or just ended.
+        pub(super) fn note_gap(&mut self, ms: f64) {
+            for period in &mut self.periods {
+                period.longest_gap_ms = period.longest_gap_ms.max(ms);
+            }
+        }
+
+        /// The delay from the capture to the hand-over, as it is now.
+        pub(super) fn note_delay(&mut self, ms: f64) {
+            for period in &mut self.periods {
+                if period.delays_ms.len() < 100_000 {
+                    period.delays_ms.push(ms);
+                }
+            }
+        }
+
+        /// Call about once a second with the counts since the program
+        /// started. Writes a line when an hour or a day has ended.
+        pub(super) fn tick(&mut self, totals: &[(&'static str, f64)]) {
+            self.tick_at(now_s(), totals, false);
+        }
+
+        /// The program ends: the hour and the day it is in are written as
+        /// far as they got.
+        pub(super) fn end(&mut self, totals: &[(&'static str, f64)]) {
+            self.tick_at(now_s(), totals, true);
+        }
+
+        pub(super) fn tick_at(&mut self, now_s: u64, totals: &[(&'static str, f64)], ending: bool) {
+            let mut lines = Vec::new();
+            for period in &mut self.periods {
+                if period.base.is_empty() {
+                    period.base = vec![0.0; totals.len()];
+                }
+                let key = (now_s as i64 + self.offset_s).div_euclid(period.length_s);
+                if key == period.key && !ending {
+                    continue;
+                }
+                let mut line = serde_json::Map::new();
+                line.insert("kind".into(), period.kind.into());
+                line.insert("role".into(), self.role.into());
+                line.insert("from".into(), stamp(period.from_s, self.offset_s).into());
+                line.insert("to".into(), stamp(now_s, self.offset_s).into());
+                line.insert("seconds".into(), now_s.saturating_sub(period.from_s).into());
+                for ((name, total), base) in totals.iter().zip(&period.base) {
+                    let counted = ((total - base) * 10.0).round() / 10.0;
+                    line.insert((*name).into(), counted.into());
+                }
+                line.insert(
+                    "longest_gap_ms".into(),
+                    ((period.longest_gap_ms * 10.0).round() / 10.0).into(),
+                );
+                period.delays_ms.sort_by(f64::total_cmp);
+                let delay = period.delays_ms.get(period.delays_ms.len() / 2);
+                line.insert(
+                    "delay_ms".into(),
+                    delay.map_or(serde_json::Value::Null, |ms| {
+                        ((ms * 10.0).round() / 10.0).into()
+                    }),
+                );
+                for (name, value) in &self.flags {
+                    line.insert((*name).into(), (*value).into());
+                }
+                lines.push(serde_json::Value::Object(line).to_string());
+                period.key = key;
+                period.from_s = now_s;
+                period.base = totals.iter().map(|(_, total)| *total).collect();
+                period.longest_gap_ms = 0.0;
+                period.delays_ms.clear();
+            }
+            let Some(file) = &self.file else { return };
+            if lines.is_empty() {
+                return;
+            }
+            // A record that cannot be written must not stop the sound.
+            let written = file
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(file)
+                })
+                .and_then(|mut out| lines.iter().try_for_each(|line| writeln!(out, "{line}")));
+            if let Err(err) = written {
+                eprintln!("the audio record could not be written: {err}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_record_stamps_times_in_local_time() {
+        assert_eq!(record::parse_offset("+0900"), Some(32_400));
+        assert_eq!(record::parse_offset("-0330"), Some(-12_600));
+        assert_eq!(record::parse_offset("JST"), None);
+        assert_eq!(record::stamp(0, 0), "1970-01-01T00:00:00+00:00");
+        // 2026-11-17 06:00:00 UTC is 15:00 in a place nine hours ahead.
+        assert_eq!(
+            record::stamp(1_794_895_200, 32_400),
+            "2026-11-17T15:00:00+09:00"
+        );
+        assert_eq!(record::stamp(951_782_400, 0), "2000-02-29T00:00:00+00:00");
+    }
+
+    #[test]
+    fn the_record_writes_a_line_when_an_hour_ends_and_counts_from_there() {
+        let dir = std::env::temp_dir().join(format!("istesso-record-test-{}", std::process::id()));
+        let file = dir.join("exit.jsonl");
+        let _ = std::fs::remove_file(&file);
+        let start = 1_794_895_200 + 1_800; // half past the hour
+        let mut record = record::Record::at(
+            Some(file.clone()),
+            "exit",
+            &[("audible", false)],
+            32_400,
+            start,
+        );
+        record.tick_at(start + 1, &[("clicks", 0.0), ("skips", 0.0)], false);
+        record.note_gap(40.0);
+        record.note_delay(61.0);
+        record.note_delay(63.0);
+        record.note_delay(62.0);
+        record.tick_at(start + 1_799, &[("clicks", 2.0), ("skips", 1.0)], false);
+        assert!(!file.exists(), "nothing is written before the hour ends");
+        record.tick_at(start + 1_800, &[("clicks", 2.0), ("skips", 1.0)], false);
+        record.tick_at(start + 2_000, &[("clicks", 5.0), ("skips", 1.0)], true);
+        let text = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[0]["kind"], "hour");
+        assert_eq!(lines[0]["from"], "2026-11-17T15:30:00+09:00");
+        assert_eq!(lines[0]["to"], "2026-11-17T16:00:00+09:00");
+        assert_eq!(lines[0]["seconds"], 1_800);
+        assert_eq!(lines[0]["clicks"], 2.0);
+        assert_eq!(lines[0]["longest_gap_ms"], 40.0);
+        assert_eq!(lines[0]["delay_ms"], 62.0);
+        assert_eq!(lines[0]["audible"], false);
+        // The end writes the hour and the day as far as they got.
+        assert_eq!(lines[1]["kind"], "hour");
+        assert_eq!(lines[1]["clicks"], 3.0);
+        assert_eq!(lines[1]["longest_gap_ms"], 0.0);
+        assert_eq!(lines[2]["kind"], "day");
+        assert_eq!(lines[2]["clicks"], 5.0);
+        assert_eq!(lines[2]["seconds"], 2_000);
+    }
     use super::*;
 
     #[test]
