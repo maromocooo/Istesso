@@ -163,21 +163,20 @@ fn main() {
         at += Duration::from_micros(gap_us);
     }
     let end = events.last().map_or(Duration::ZERO, |e| e.0);
-    if awake_fps > 0 {
-        let mut k = 1u64;
-        loop {
-            let due = Duration::from_nanos(k * 1_000_000_000 / awake_fps);
-            if due >= end {
-                break;
-            }
-            let held = inputs
-                .iter()
-                .any(|&input| input <= due && due < input + Duration::from_millis(hold_ms));
-            if !held {
-                events.push((due, Kind::Unchanged));
-            }
-            k += 1;
+    // No beat at all when --awake-fps is 0.
+    let mut k = 1u64;
+    while let Some(nanos) = (k * 1_000_000_000).checked_div(awake_fps) {
+        let due = Duration::from_nanos(nanos);
+        if due >= end {
+            break;
         }
+        let held = inputs
+            .iter()
+            .any(|&input| input <= due && due < input + Duration::from_millis(hold_ms));
+        if !held {
+            events.push((due, Kind::Unchanged));
+        }
+        k += 1;
     }
     events.sort_by_key(|e| e.0);
 
