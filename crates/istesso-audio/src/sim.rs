@@ -49,6 +49,10 @@ pub struct Scenario {
     /// Spans (start, length) in which nothing is delivered; what was due
     /// then arrives together when the span ends.
     pub stalls: Vec<(f64, f64)>,
+    /// Moments (time, by how much) at which the source's own timeline
+    /// moves later: a cycle of its sound system that begins late. Every
+    /// frame from then on is captured that much later.
+    pub source_slips: Vec<(f64, f64)>,
     /// How long before its frames are due the sound card asks for them, and
     /// by up to how much that varies either way.
     pub callback_lead_s: f64,
@@ -85,6 +89,7 @@ impl Scenario {
             spike_one_in: 0,
             spike_s: 0.0,
             stalls: Vec::new(),
+            source_slips: Vec::new(),
             callback_lead_s: 0.011,
             callback_jitter_s: 0.0,
             timestamp_noise_s: 0.0,
@@ -188,10 +193,22 @@ fn simulate<R: Resample>(
     let mut out = vec![0.0f32; scenario.callback_frames * channels];
     let mut played = Vec::new();
 
+    // When the frame at `frame_s` on the source's count of frames was
+    // really captured: later by every slip of its timeline before then.
+    let slipped = |frame_s: f64| -> f64 {
+        let late: f64 = scenario
+            .source_slips
+            .iter()
+            .filter(|(at, _)| *at <= frame_s)
+            .map(|(_, by)| by)
+            .sum();
+        frame_s + late
+    };
     // The arrival of packet `n`, given the arrival of the one before it.
     let arrival = |n: u64, previous: f64, random: &mut Random| -> f64 {
         // A packet exists once its last frame has been captured.
-        let captured = (n + 1) as f64 * packet as f64 / source_rate;
+        let captured =
+            slipped(n as f64 * packet as f64 / source_rate) + packet as f64 / source_rate;
         let mut at = captured + scenario.delay_s + scenario.jitter_s * random.unit();
         if scenario.spike_one_in > 0 && random.unit() * f64::from(scenario.spike_one_in) < 1.0 {
             at += scenario.spike_s * random.unit();
@@ -242,7 +259,7 @@ fn simulate<R: Resample>(
             // The first frame of the packet was captured when the source's
             // count of frames reached it.
             let position = next_packet * packet as u64;
-            let capture_ns = (position as f64 / source_rate * 1e9) as u64;
+            let capture_ns = (slipped(position as f64 / source_rate) * 1e9) as u64;
             writer.push_audio(packet, &samples, false, position, capture_ns, arrival_ns);
             next_packet += 1;
             next_arrival = arrival(next_packet, next_arrival, &mut random);
@@ -308,6 +325,9 @@ mod tests {
     /// network and the sound card do within what is tested here. 50 ppm is
     /// 0.005%, less than a tenth of a cent; a cent is a hundredth of a
     /// semitone, and differences of a few cents are the smallest that
+    /// The bound on the pitch right after the source's timeline moved:
+    /// what is paid back per second, and room for the loop beside it.
+    const SLIP_PITCH_ERROR_PPM: f64 = 130.0;
     /// trained ears tell apart.
     const PITCH_ERROR_PPM: f64 = 50.0;
     /// With a network that delivers evenly and exact time stamps it stays
@@ -505,6 +525,40 @@ mod tests {
         assert_uneventful(&outcome);
         assert_pitch_bound(&outcome);
         assert_wait(&outcome, 60.0, 1.0);
+    }
+
+    #[test]
+    fn a_source_cycle_that_begins_late_is_paid_back_slowly() {
+        // Twenty minutes; ten in, the source's sound system skips a cycle
+        // (5.3 ms), and later two at once (10.7 ms): its audio arrives that
+        // much later from then on.
+        let mut scenario = Scenario::quiet(1200.0);
+        scenario.target_s = 0.060;
+        scenario.source_slips = vec![(600.0, 256.0 / 48_000.0), (800.0, 512.0 / 48_000.0)];
+        let outcome = run(&scenario);
+        report("20 min, source cycles 5.3 and 10.7 ms late", &outcome);
+        assert_eq!(outcome.stats.source_slips, 2);
+        assert!(
+            (outcome.stats.source_slip_ms - 16.0).abs() < 0.1,
+            "{outcome:?}"
+        );
+        // Nothing breaks, and nothing is skipped.
+        assert_eq!(outcome.underruns_after_settling, 0);
+        assert_eq!(outcome.skips_after_settling, 0);
+        // The wait is short by what is owed for a while, never by more.
+        assert!(
+            outcome.wait_min_ms.unwrap() > 60.0 - 10.7 - 0.6,
+            "{outcome:?}"
+        );
+        // The pitch stays near what it was: the 100 ppm of paying back and
+        // a little on top, where a loop that took the slip for drift would
+        // go to 500 ppm and more.
+        assert!(
+            outcome.pitch_error_ppm <= SLIP_PITCH_ERROR_PPM,
+            "{outcome:?}"
+        );
+        // And the wait is back at the target at the end.
+        assert!((outcome.stats.wait_ms - 60.0).abs() < 0.3, "{outcome:?}");
     }
 
     #[test]

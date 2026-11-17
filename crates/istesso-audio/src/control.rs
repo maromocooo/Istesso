@@ -44,6 +44,14 @@ pub struct ControlConfig {
     pub max_correction: f64,
     /// Largest change of the correction in one second.
     pub max_slew_per_s: f64,
+    /// When the source's own timeline moves later (a cycle of its sound
+    /// system that began late), the wait is short by that much from then
+    /// on. It is taken back at this rate, as a fraction of the rate, and
+    /// not by the loop above, which would answer a step of 5 ms with 0.05%.
+    pub payback: f64,
+    /// The most that may be owed in this way, in seconds. A timeline that
+    /// moved by more is a large error like any other.
+    pub max_owed_s: f64,
 }
 
 impl ControlConfig {
@@ -57,6 +65,8 @@ impl ControlConfig {
             smoothing_s: 0.5,
             max_correction: 1000e-6,
             max_slew_per_s: 100e-6,
+            payback: 100e-6,
+            max_owed_s: 0.020,
         }
     }
 }
@@ -106,6 +116,13 @@ impl Window {
         self.len += 1;
     }
 
+    /// Adds `by_s` to every wait that is remembered.
+    fn shift(&mut self, by_s: f64) {
+        for offset in 0..self.len {
+            self.entries[(self.front + offset) % WINDOW_ENTRIES].1 += by_s;
+        }
+    }
+
     fn longest(&mut self, now_s: f64, window_s: f64) -> Option<f64> {
         while self.len > 0 && self.at(0).0 < now_s - window_s {
             self.front = (self.front + 1) % WINDOW_ENTRIES;
@@ -126,6 +143,9 @@ pub struct Controller {
     /// The part of the correction that remembers.
     integral: f64,
     correction: f64,
+    /// By how much the wait may be short of the target just now, because
+    /// the source's timeline moved later. Paid back steadily.
+    owed_s: f64,
 }
 
 impl Controller {
@@ -138,6 +158,7 @@ impl Controller {
             error: None,
             integral: 0.0,
             correction: 0.0,
+            owed_s: 0.0,
         }
     }
 
@@ -150,6 +171,24 @@ impl Controller {
         self.window.push(now_s, wait_s);
     }
 
+    /// Says that the source's timeline moved by `by_s` seconds (later when
+    /// positive): from now on its audio arrives that much later than its
+    /// frame count alone would have it. That is not the clocks drifting
+    /// apart, and it is not answered as if it were: the wait is allowed to
+    /// be short by that much, and the allowance shrinks at
+    /// [`ControlConfig::payback`].
+    pub fn source_slipped(&mut self, by_s: f64) {
+        let owed = (self.owed_s + by_s).clamp(0.0, self.cfg.max_owed_s);
+        // The waits remembered were measured on the timeline as it was.
+        self.window.shift(self.owed_s - owed);
+        self.owed_s = owed;
+    }
+
+    /// By how much the wait may be short of the target just now.
+    pub fn owed(&self) -> f64 {
+        self.owed_s
+    }
+
     /// Advances by `dt_s` seconds and returns the correction to apply: the
     /// playback rate is the nominal one times `1 + correction`. A positive
     /// correction takes audio out of the queue more slowly.
@@ -158,7 +197,14 @@ impl Controller {
             // Nothing arrived lately. That says nothing about the clocks.
             return self.correction;
         };
-        let raw = wait - self.cfg.target_s;
+        let raw = wait - (self.cfg.target_s - self.owed_s);
+        // What is owed is paid back by playing a little slower for a while.
+        let paying = if self.owed_s > 0.0 {
+            self.owed_s = (self.owed_s - self.cfg.payback * dt_s).max(0.0);
+            self.cfg.payback
+        } else {
+            0.0
+        };
         let error = match self.error {
             None => raw,
             Some(previous) => {
@@ -173,7 +219,7 @@ impl Controller {
         // correction.
         let proportional = -self.proportional_gain * error;
         let integral = (self.integral - self.integral_gain * error * dt_s).clamp(-limit, limit);
-        let wanted = (integral + proportional).clamp(-limit, limit);
+        let wanted = (integral + proportional + paying).clamp(-limit, limit);
         // While the output is held at a limit, remembering more of the same
         // would only have to be forgotten again later.
         let pushing_further = (wanted >= limit && integral > self.integral)
@@ -192,6 +238,7 @@ impl Controller {
     pub fn restart(&mut self) {
         self.window.clear();
         self.error = None;
+        self.owed_s = 0.0;
     }
 
     /// The correction returned by the last step.

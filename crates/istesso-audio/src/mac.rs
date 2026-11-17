@@ -171,6 +171,53 @@ impl Output {
         &self.device
     }
 
+    /// Counts the device's own notices that the processing for one of its
+    /// turns was not done in time ("overload"). Core Audio sends them for
+    /// every program that plays into the device, so they tell of this
+    /// program's turns and of others'.
+    ///
+    /// The count lives as long as the process does: the listener is not
+    /// taken away again.
+    pub fn count_overloads(&self) -> Result<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        unsafe extern "C-unwind" fn noticed(
+            _device: u32,
+            _addresses: u32,
+            _address: NonNull<AudioObjectPropertyAddress>,
+            count: *mut std::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: `count` is the pointer handed over below, to a
+            // counter that is never freed.
+            unsafe { &*count.cast::<AtomicU64>() }.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+
+        let count = Arc::new(AtomicU64::new(0));
+        let address = AudioObjectPropertyAddress {
+            mSelector: objc2_core_audio::kAudioDeviceProcessorOverload,
+            mScope: objc2_core_audio::kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        // SAFETY: the address is valid for the call; the counter is kept
+        // alive for good by the reference given away here.
+        let status = unsafe {
+            objc2_core_audio::AudioObjectAddPropertyListener(
+                self.device.id,
+                NonNull::from(&address),
+                Some(noticed),
+                Arc::into_raw(count.clone()).cast_mut().cast(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Device(format!(
+                "the output does not report overloads (status {status})"
+            )));
+        }
+        Ok(count)
+    }
+
     /// Starts playing. Each time the device wants frames, `render` is
     /// called on Core Audio's thread with the number of frames, the buffer
     /// to fill (`channels` channels, interleaved) and the time at which the

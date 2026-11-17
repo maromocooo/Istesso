@@ -751,7 +751,7 @@ mod mac {
 
     /// How the device asked for audio.
     #[derive(Default)]
-    struct Callbacks {
+    pub(super) struct Callbacks {
         count: AtomicU64,
         frames_min: AtomicU64,
         frames_max: AtomicU64,
@@ -759,6 +759,53 @@ mod mac {
         lead_min_us: AtomicI64,
         lead_max_us: AtomicI64,
         lead_sum_us: AtomicI64,
+        /// Callbacks that began after their frames were due.
+        late: AtomicU64,
+        /// How long this program took in a callback at most, microseconds,
+        /// and how often more than half the time of the frames asked for.
+        took_max_us: AtomicU64,
+        took_long: AtomicU64,
+        /// Turns the device did not come for: the frames of a callback were
+        /// due later than those of the one before left room for. How many
+        /// turns in all, on how many occasions, and the longest such step.
+        missed_turns: AtomicU64,
+        missed_occasions: AtomicU64,
+        step_max_us: AtomicU64,
+    }
+
+    /// Notes what one callback says about the device's turns. `due_ns` is
+    /// when its frames are handed over, `before` the same for the callback
+    /// before it with the time its frames lasted.
+    fn note_turn(seen: &Callbacks, due_ns: u64, before: Option<(u64, u64)>) {
+        let Some((due_before, lasted_ns)) = before else {
+            return;
+        };
+        let step = due_ns.saturating_sub(due_before);
+        seen.step_max_us.fetch_max(step / 1000, Ordering::Relaxed);
+        // Half a turn of slack for the jitter of the time stamps.
+        if lasted_ns > 0 && step > lasted_ns + lasted_ns / 2 {
+            let missed = (step + lasted_ns / 2) / lasted_ns - 1;
+            seen.missed_turns.fetch_add(missed, Ordering::Relaxed);
+            seen.missed_occasions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn callbacks_for_test() -> Callbacks {
+        Callbacks::default()
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_turn_for_test(seen: &Callbacks, due_ns: u64, before: Option<(u64, u64)>) {
+        note_turn(seen, due_ns, before)
+    }
+
+    #[cfg(test)]
+    pub(super) fn missed_for_test(seen: &Callbacks) -> (u64, u64) {
+        (
+            seen.missed_turns.load(Ordering::Relaxed),
+            seen.missed_occasions.load(Ordering::Relaxed),
+        )
     }
 
     pub fn play(options: PlayOptions) -> Result<(), String> {
@@ -934,15 +981,35 @@ mod mac {
             });
         }
 
+        // The device's own word on turns that were not made in time.
+        let overloads = output.count_overloads().ok();
         let seen = callbacks.clone();
+        let device_rate = device.sample_rate;
+        let mut turn_before: Option<(u64, u64)> = None;
         output
             .start(channels, move |frames, out, now_ns| {
+                let began_ns = clock::now_ns();
                 playout.render(frames, out, now_ns);
                 let _ = record_in.push_partial_slice(out);
                 // Nothing is to be heard yet: the device gets silence, and
                 // with it the clock of the device still drives the playout.
                 out.fill(0.0);
-                let lead_us = (now_ns as i64 - clock::now_ns() as i64) / 1000;
+                // Was this program late, or did the device not come? How
+                // long the work here took, and whether the frames of this
+                // callback are due when those of the last one end.
+                let lasts_ns = (frames as f64 / device_rate * 1e9) as u64;
+                let took_ns = clock::now_ns().saturating_sub(began_ns);
+                seen.took_max_us
+                    .fetch_max(took_ns / 1000, Ordering::Relaxed);
+                if took_ns > lasts_ns / 2 {
+                    seen.took_long.fetch_add(1, Ordering::Relaxed);
+                }
+                note_turn(&seen, now_ns, turn_before);
+                turn_before = Some((now_ns, lasts_ns));
+                let lead_us = (now_ns as i64 - began_ns as i64) / 1000;
+                if lead_us <= 0 {
+                    seen.late.fetch_add(1, Ordering::Relaxed);
+                }
                 seen.count.fetch_add(1, Ordering::Relaxed);
                 seen.frames_min.fetch_min(frames as u64, Ordering::Relaxed);
                 seen.frames_max.fetch_max(frames as u64, Ordering::Relaxed);
@@ -1141,6 +1208,21 @@ mod mac {
                 "lead_mean_ms": callbacks.lead_sum_us.load(Ordering::Relaxed) as f64 * 1e-3
                     / count as f64,
                 "lead_max_ms": callbacks.lead_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
+                // Callbacks that began after their frames were due.
+                "began_late": callbacks.late.load(Ordering::Relaxed),
+                // This program's own work in a callback: the longest, and
+                // how often it took more than half the time of the frames.
+                "took_max_ms": callbacks.took_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
+                "took_more_than_half_a_turn": callbacks.took_long.load(Ordering::Relaxed),
+                // Turns the device did not come for, by the times its
+                // frames were due: how many, on how many occasions, and the
+                // longest step from one callback's frames to the next's.
+                "missed_turns": callbacks.missed_turns.load(Ordering::Relaxed),
+                "missed_occasions": callbacks.missed_occasions.load(Ordering::Relaxed),
+                "step_max_ms": callbacks.step_max_us.load(Ordering::Relaxed) as f64 * 1e-3,
+                // What the device itself said: turns not made in time, by
+                // any program playing into it. `null` if it does not say.
+                "device_overloads": overloads.as_ref().map(|count| count.load(Ordering::Relaxed)),
             },
             // How much later than asked a thread of this process that only
             // sleeps was woken: the longest, and how often by 10 ms or more.
@@ -1216,6 +1298,24 @@ mod tests {
         assert!(parse_stall("600:0").is_err());
         assert!(parse_stall("-1:1").is_err());
         assert!(parse_stall("a:b").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_turn_the_device_did_not_come_for_is_told_from_jitter() {
+        let seen = mac::callbacks_for_test();
+        let turn = 10_666_667u64;
+        // On time, a little late, a little early: no turn missed.
+        mac::note_turn_for_test(&seen, 100_000_000, None);
+        mac::note_turn_for_test(&seen, 100_000_000 + turn, Some((100_000_000, turn)));
+        mac::note_turn_for_test(&seen, 3_000_000 + 2 * turn, Some((turn, turn)));
+        assert_eq!(mac::missed_for_test(&seen), (0, 0));
+        // The frames are due two turns later than the last ones end: the
+        // device did not come twice, on one occasion.
+        mac::note_turn_for_test(&seen, 4 * turn, Some((turn, turn)));
+        assert_eq!(mac::missed_for_test(&seen), (2, 1));
+        mac::note_turn_for_test(&seen, 6 * turn, Some((4 * turn, turn)));
+        assert_eq!(mac::missed_for_test(&seen), (3, 2));
     }
 
     #[test]

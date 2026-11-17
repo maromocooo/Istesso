@@ -29,8 +29,14 @@ use rtrb::Producer;
 use serde::Serialize;
 
 use crate::control::{ControlConfig, Controller};
-use crate::fifo::Reader;
+use crate::fifo::{MarkKind, Reader};
 use crate::resample::Resample;
+
+/// Audio captured this much later or earlier than its frame count accounts
+/// for, against the audio before it, shows that the source's timeline moved. Less is the jitter
+/// of time stamps; a second or more is a clock that cannot be believed.
+const SLIP_NS: i64 = 1_000_000;
+const SLIP_TOO_LARGE_NS: i64 = 1_000_000_000;
 
 /// Frames handled in one go. A sound card that asks for more gets them in
 /// several steps.
@@ -123,6 +129,8 @@ pub struct PlayoutStats {
     skips: AtomicU64,
     skipped_frames: AtomicU64,
     source_gaps: AtomicU64,
+    source_slips: AtomicU64,
+    source_slip_us: AtomicU64,
     trimmed_frames: AtomicU64,
     frames_in: AtomicU64,
     frames_out: AtomicU64,
@@ -144,6 +152,8 @@ impl Default for PlayoutStats {
             skips: AtomicU64::new(0),
             skipped_frames: AtomicU64::new(0),
             source_gaps: AtomicU64::new(0),
+            source_slips: AtomicU64::new(0),
+            source_slip_us: AtomicU64::new(0),
             trimmed_frames: AtomicU64::new(0),
             frames_in: AtomicU64::new(0),
             frames_out: AtomicU64::new(0),
@@ -171,6 +181,11 @@ pub struct Snapshot {
     pub skipped_frames: u64,
     /// Breaks in the stream that the source announced.
     pub source_gaps: u64,
+    /// Times the source's own timeline moved by a millisecond or more
+    /// between two packets that follow on (a cycle of its sound system
+    /// that began late), and by how much in all.
+    pub source_slips: u64,
+    pub source_slip_ms: f64,
     /// Frames let go when playing began, to begin at the target.
     pub trimmed_frames: u64,
     pub frames_in: u64,
@@ -201,6 +216,8 @@ impl PlayoutStats {
             skips: get(&self.skips),
             skipped_frames: get(&self.skipped_frames),
             source_gaps: get(&self.source_gaps),
+            source_slips: get(&self.source_slips),
+            source_slip_ms: get(&self.source_slip_us) as f64 * 1e-3,
             trimmed_frames: get(&self.trimmed_frames),
             frames_in: get(&self.frames_in),
             frames_out: get(&self.frames_out),
@@ -267,6 +284,9 @@ pub struct Playout<R: Resample> {
     correction: f64,
     /// The newest packet seen.
     newest: Option<Seen>,
+    /// Where the newest packet stood on the source's timeline: its capture
+    /// time less the time its position stands for.
+    timeline_ns: Option<i64>,
     /// The shortest time a packet took from being captured to arriving, on
     /// whatever scale the difference of the two clocks gives it: of the
     /// current span of time, and of the one before. A packet that took
@@ -332,6 +352,7 @@ impl<R: Resample> Playout<R> {
             correction: 0.0,
             newest: None,
             fastest_ns: [None, None],
+            timeline_ns: None,
             fastest_since_ns: 0,
             last_frames: 0,
             steady: 0,
@@ -413,7 +434,15 @@ impl<R: Resample> Playout<R> {
         let mut newest = self.newest;
         let mut fastest = self.fastest_ns[0];
         let waits = &mut self.waits;
+        // The newest packet's place on the source's timeline: when its first
+        // frame was captured, less the time its position stands for.
+        let mut timeline: Option<(u64, i64)> = None;
         self.reader.scan_new(|mark| {
+            if mark.kind == MarkKind::Audio && timeline.is_none_or(|(index, _)| mark.index >= index)
+            {
+                let counted_ns = (mark.position as f64 / stream_rate * 1e9) as i64;
+                timeline = Some((mark.index, mark.capture_ns as i64 - counted_ns));
+            }
             let seen = Seen {
                 index: mark.index,
                 arrival_ns: mark.arrival_ns,
@@ -444,6 +473,18 @@ impl<R: Resample> Playout<R> {
         });
         self.newest = newest;
         self.fastest_ns[0] = fastest;
+        // Audio that was captured later than its frame count accounts for,
+        // compared with the audio before it: the source's timeline moved.
+        if let Some((_, now)) = timeline {
+            if let Some(before) = self.timeline_ns.replace(now) {
+                let slip = now - before;
+                if (SLIP_NS..SLIP_TOO_LARGE_NS).contains(&slip.abs()) {
+                    self.controller.source_slipped(slip as f64 * 1e-9);
+                    add(&self.stats.source_slips, 1);
+                    add(&self.stats.source_slip_us, slip.unsigned_abs() / 1000);
+                }
+            }
+        }
 
         // Frames of silence in front of the audio, when playing begins in
         // the middle of what is asked for.
