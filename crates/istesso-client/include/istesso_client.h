@@ -40,7 +40,8 @@ typedef struct IstessoInputState {
     uint32_t open;     /* 1 while there is a conversation */
     uint32_t answered; /* 1 when the host answers "still here", so that silence is noticed */
     uint32_t over;     /* 1 once the host does not take input from here any more */
-    uint32_t reserved;
+    uint32_t interactive; /* the thread's scheduling as work a person is waiting for:
+                           * 0 not asked for, 1 in effect, 2 asked for and not in effect */
 } IstessoInputState;
 
 /* What happened to the conversation: the `event` of IstessoInputTold. */
@@ -89,9 +90,12 @@ void istesso_input_send(const IstessoInput *input, const IstessoInputEvent *even
 int32_t istesso_input_state(const IstessoInput *input, IstessoInputState *state);
 
 /*
- * Ends the conversation and the thread, and returns when both are over (a tenth of a second
- * at most, or when an attempt to connect has ended). The host lets go of every key and button
- * that was down. `told` is not called after this returns.
+ * Ends the thread and frees the input. The conversation is closed, and the host lets go of
+ * every key and button that was down. Returns at once, except that it waits for a call of
+ * `told` that is being made; `told` is not called after this returns. When the thread is in
+ * the middle of an attempt to reach a host that does not answer, that attempt is not waited
+ * for: there is no conversation then, and the thread ends by itself when the attempt does
+ * (seconds at most).
  */
 void istesso_input_close(IstessoInput *input);
 

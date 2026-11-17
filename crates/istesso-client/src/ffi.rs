@@ -36,7 +36,9 @@ pub struct IstessoInputState {
     pub answered: u32,
     /// 1 once the host does not take input from here any more.
     pub over: u32,
-    pub reserved: u32,
+    /// The thread's scheduling as work a person is waiting for: 0 not asked
+    /// for, 1 in effect, 2 asked for and not in effect.
+    pub interactive: u32,
 }
 
 /// Called on the input's thread for what happens to the conversation:
@@ -227,6 +229,7 @@ pub unsafe extern "C" fn istesso_input_state(
         open,
         answered,
         over,
+        interactive,
     } = input.input.state();
     // SAFETY: not null, and room for the result by the caller's promise.
     unsafe {
@@ -235,7 +238,11 @@ pub unsafe extern "C" fn istesso_input_state(
             open: u32::from(open),
             answered: u32::from(answered),
             over: u32::from(over.is_some()),
-            reserved: 0,
+            interactive: match interactive {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
         }
     };
     0
@@ -311,7 +318,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::os::unix::net::UnixDatagram;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -652,6 +659,221 @@ mod tests {
             );
             istesso_input_close(input);
         }
+    }
+
+    /// A door in front of the agent. Through the first conversation the host's
+    /// words pass only until the caller has spoken a second time: the handshake gets
+    /// through, the answer to the first request does not. Later conversations pass
+    /// whole. Says whether an answer was held back.
+    fn door_that_holds_the_first_answer(
+        to: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, Arc<AtomicBool>) {
+        use std::io::{Read, Write};
+        let door = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = door.local_addr().unwrap();
+        let held = Arc::new(AtomicBool::new(false));
+        let holding = held.clone();
+        std::thread::spawn(move || {
+            for (nth, near) in door.incoming().map_while(Result::ok).enumerate() {
+                let Ok(far) = std::net::TcpStream::connect(to) else {
+                    continue;
+                };
+                // What the host has said so far, and whether the caller spoke after it.
+                let host_spoke = Arc::new(AtomicBool::new(false));
+                let caller_answered = Arc::new(AtomicBool::new(false));
+                {
+                    let (mut from, mut to) = (near.try_clone().unwrap(), far.try_clone().unwrap());
+                    let (host_spoke, caller_answered) =
+                        (host_spoke.clone(), caller_answered.clone());
+                    std::thread::spawn(move || {
+                        let mut buffer = [0u8; 4096];
+                        while let Ok(length @ 1..) = from.read(&mut buffer) {
+                            if host_spoke.load(Ordering::SeqCst) {
+                                caller_answered.store(true, Ordering::SeqCst);
+                            }
+                            if to.write_all(&buffer[..length]).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+                let (mut from, mut to) = (far, near);
+                let holding = holding.clone();
+                std::thread::spawn(move || {
+                    let mut buffer = [0u8; 4096];
+                    while let Ok(length @ 1..) = from.read(&mut buffer) {
+                        if nth == 0 && caller_answered.load(Ordering::SeqCst) {
+                            // The answer: kept, and the caller is left waiting.
+                            holding.store(true, Ordering::SeqCst);
+                            continue;
+                        }
+                        host_spoke.store(true, Ordering::SeqCst);
+                        if to.write_all(&buffer[..length]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        (at, held)
+    }
+
+    #[test]
+    fn a_first_question_that_is_not_answered_in_time_is_asked_again() {
+        let pair = Pair::new();
+        let (door, held) = door_that_holds_the_first_answer(pair.addr);
+        let heard: Heard = Mutex::new(Vec::new());
+        let (dir, address) = (c_path(&pair.root.join("d")), c(&door.to_string()));
+        // SAFETY: as in the tests above.
+        unsafe {
+            let began = std::time::Instant::now();
+            let input = istesso_input_open(
+                dir.as_ptr(),
+                c("a host").as_ptr(),
+                address.as_ptr(),
+                std::ptr::null(),
+                0,
+                Some(hear),
+                &heard as *const Heard as *mut c_void,
+            );
+            assert!(!input.is_null());
+            // The answer does not come. That is not a refusal: said once that there is
+            // no conversation yet, and asked again on a new conversation, which is
+            // answered.
+            until("the conversation", || {
+                heard.lock().unwrap().iter().any(|told| told.0 == 1)
+            });
+            assert!(held.load(Ordering::SeqCst), "the first answer got through");
+            assert!(
+                began.elapsed() >= istesso_agent::relay::FIRST_ANSWER_WITHIN,
+                "it did not wait for the first answer"
+            );
+            {
+                let heard = heard.lock().unwrap();
+                let events: Vec<i32> = heard.iter().map(|told| told.0).collect();
+                assert_eq!(events, [5, 1], "{heard:?}");
+            }
+            let mut state = IstessoInputState::default();
+            assert_eq!(istesso_input_state(input, &mut state), 0);
+            assert_eq!((state.open, state.over, state.cuts), (1, 0, 0));
+            let key = IstessoInputEvent {
+                kind: 1,
+                a: 30,
+                b: 1,
+            };
+            istesso_input_send(input, &key, 1);
+            assert_eq!(
+                pair.handed_over(Duration::from_secs(3)).unwrap(),
+                r#"{"kind":"key","code":30,"pressed":true}"#
+            );
+            istesso_input_close(input);
+        }
+    }
+
+    #[test]
+    fn a_modifier_held_before_the_first_conversation_is_down_when_it_opens() {
+        let pair = Pair::new();
+        let socket = pair.root.join("i.sock");
+        std::fs::remove_file(&socket).unwrap();
+        let heard: Heard = Mutex::new(Vec::new());
+        let (dir, address) = (c_path(&pair.root.join("d")), c(&pair.addr.to_string()));
+        let key = |code: i32, pressed: i32| IstessoInputEvent {
+            kind: 1,
+            a: code,
+            b: pressed,
+        };
+        // SAFETY: as in the tests above.
+        unsafe {
+            let input = istesso_input_open(
+                dir.as_ptr(),
+                c("a host").as_ptr(),
+                address.as_ptr(),
+                std::ptr::null(),
+                0,
+                Some(hear),
+                &heard as *const Heard as *mut c_void,
+            );
+            assert!(!input.is_null());
+            until("the word that it is not there yet", || {
+                !heard.lock().unwrap().is_empty()
+            });
+            // No conversation yet. Shift goes down and stays down; Control goes down and
+            // comes up again; a letter is typed; the pointer moves.
+            let before = [
+                key(42, 1),
+                key(29, 1),
+                key(30, 1),
+                key(30, 0),
+                key(29, 0),
+                IstessoInputEvent {
+                    kind: 2,
+                    a: 7,
+                    b: 9,
+                },
+            ];
+            istesso_input_send(input, before.as_ptr(), before.len());
+            std::thread::sleep(Duration::from_millis(100));
+
+            let taken = UnixDatagram::bind(&socket).unwrap();
+            taken
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let next = || {
+                let mut buffer = [0u8; 512];
+                let length = taken.recv(&mut buffer).unwrap();
+                String::from_utf8(buffer[..length].to_vec()).unwrap()
+            };
+            // The conversation opens: Shift is down on the host and the pointer is where
+            // it is. The letter is not typed later, and Control is not down.
+            assert_eq!(next(), r#"{"kind":"key","code":42,"pressed":true}"#);
+            assert_eq!(next(), r#"{"kind":"pointer_at","x":7,"y":9}"#);
+            istesso_input_send(input, &key(42, 0), 1);
+            assert_eq!(next(), r#"{"kind":"key","code":42,"pressed":false}"#);
+            istesso_input_close(input);
+        }
+    }
+
+    #[test]
+    fn closing_does_not_wait_for_a_host_that_does_not_answer() {
+        // A host that takes the connection and says nothing: the handshake waits for
+        // it for seconds.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = silent.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let kept: Vec<_> = silent.incoming().map_while(Result::ok).collect();
+            drop(kept);
+        });
+        let pair = Pair::new();
+        let heard: Heard = Mutex::new(Vec::new());
+        let (dir, address) = (c_path(&pair.root.join("d")), c(&at.to_string()));
+        // SAFETY: as in the tests above.
+        unsafe {
+            let input = istesso_input_open(
+                dir.as_ptr(),
+                c("a host").as_ptr(),
+                address.as_ptr(),
+                std::ptr::null(),
+                0,
+                Some(hear),
+                &heard as *const Heard as *mut c_void,
+            );
+            assert!(!input.is_null());
+            // In the middle of the first attempt.
+            std::thread::sleep(Duration::from_millis(300));
+            let closing = std::time::Instant::now();
+            istesso_input_close(input);
+            let took = closing.elapsed();
+            assert!(took < Duration::from_millis(600), "closing took {took:?}");
+        }
+        // The attempt ends by itself, and nothing is told to a caller that has closed.
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(
+            heard.lock().unwrap().is_empty(),
+            "{:?}",
+            heard.lock().unwrap()
+        );
     }
 
     #[test]

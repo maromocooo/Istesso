@@ -8,6 +8,7 @@
 //! silence, opens the conversation again after a cut, and does not send
 //! later what was typed while there was none.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -16,14 +17,16 @@ use std::time::{Duration, Instant};
 
 use istesso_agent::passing::Mark;
 use istesso_agent::relay::{
-    after_failure, Again, Connect, Happened, InputLine, LISTEN_EVERY, RETRY, RETRY_SLOWLY, SOON_FOR,
+    after_failure, Again, Connect, Happened, InputLine, LISTEN_EVERY, MODIFIERS, RETRY,
+    RETRY_SLOWLY, SOON_FOR,
 };
 use istesso_agent::PassLog;
 use istesso_proto::InputEvent;
 
-/// How long the thread waits for events while there is no conversation:
-/// an attempt to open one may be due at once.
-const WHILE_CLOSED: Duration = Duration::from_millis(5);
+/// How long closing waits for the thread. It looks up at once when it is
+/// told to stop, unless it is in the middle of an attempt to reach the host
+/// (seconds, when the host is not there): closing does not wait for that.
+const CLOSING_WAITS: Duration = Duration::from_millis(200);
 /// What connecting and the handshake may take the first time.
 const FIRST_WITHIN: Duration = Duration::from_secs(3);
 
@@ -59,6 +62,9 @@ pub struct State {
     pub answered: bool,
     /// Why no input is taken any more, once that is so.
     pub over: Option<String>,
+    /// Whether the thread is scheduled as work a person is waiting for:
+    /// `None` when that was not asked for, otherwise whether it took effect.
+    pub interactive: Option<bool>,
 }
 
 struct Batch {
@@ -67,9 +73,19 @@ struct Batch {
     mark: Mark,
 }
 
+/// What reaches the thread.
+enum Handed {
+    Events(Batch),
+    /// Look up now: it is time to stop.
+    Stop,
+}
+
 struct Shared {
     state: Mutex<State>,
     stop: AtomicBool,
+    /// Whether the caller's function may still be called. Held while it is
+    /// called, so that closing returns only between two calls.
+    may_tell: Mutex<bool>,
 }
 
 /// Makes the function that opens a conversation with the host. Called for
@@ -82,9 +98,11 @@ pub type Tell = Box<dyn Fn(&Told, u64) + Send>;
 
 /// The input's connection and the thread that owns it.
 pub struct Input {
-    events: mpsc::Sender<Batch>,
+    events: mpsc::Sender<Handed>,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// Closed by the thread when it has ended.
+    ended: mpsc::Receiver<()>,
 }
 
 impl Input {
@@ -100,9 +118,11 @@ impl Input {
         tell: Tell,
     ) -> Input {
         let (events, taken) = mpsc::channel();
+        let (ending, ended) = mpsc::channel::<()>();
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             stop: AtomicBool::new(false),
+            may_tell: Mutex::new(true),
         });
         let thread = {
             let shared = shared.clone();
@@ -110,9 +130,22 @@ impl Input {
                 .name("istesso input".into())
                 .spawn(move || {
                     if interactive {
-                        ask_to_be_interactive();
+                        let took = ask_to_be_interactive();
+                        shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .interactive = Some(took);
                     }
-                    run(taken, make_connect, &shared, passing.as_ref(), &*tell);
+                    let tell = |what: &Told, cuts: u64| {
+                        let may = shared.may_tell.lock().unwrap_or_else(|e| e.into_inner());
+                        if *may {
+                            tell(what, cuts);
+                        }
+                    };
+                    run(taken, make_connect, &shared, passing.as_ref(), &tell);
+                    // The conversation is closed by now: whoever waits may go on.
+                    drop(ending);
                 })
                 .ok()
         };
@@ -120,6 +153,7 @@ impl Input {
             events,
             shared,
             thread,
+            ended,
         }
     }
 
@@ -129,10 +163,10 @@ impl Input {
         if events.is_empty() {
             return;
         }
-        let _ = self.events.send(Batch {
+        let _ = self.events.send(Handed::Events(Batch {
             events,
             mark: PassLog::mark(),
-        });
+        }));
     }
 
     /// For the measurement's way in: hands over events as [`Input::send`]
@@ -142,10 +176,10 @@ impl Input {
         let events = self.events.clone();
         Box::new(move |batch, mark| {
             if !batch.is_empty() {
-                let _ = events.send(Batch {
+                let _ = events.send(Handed::Events(Batch {
                     events: batch,
                     mark,
-                });
+                }));
             }
         })
     }
@@ -162,11 +196,25 @@ impl Input {
 impl Drop for Input {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        let _ = self.events.send(Handed::Stop);
+        // From here on the caller's function is not called any more (a call that is
+        // being made is waited for; it is short).
+        *self
+            .shared
+            .may_tell
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
         if let Some(thread) = self.thread.take() {
-            // It looks up at least every tenth of a second, or as soon as an attempt to
-            // connect is over. The conversation is closed with the thread, and the host
-            // lets go of what it had down.
-            let _ = thread.join();
+            // It looks up at once and closes the conversation, and the host lets go of
+            // what it had down. Only when it is in the middle of an attempt to reach a
+            // host that does not answer, that is not waited for: there is no
+            // conversation then, and the thread ends by itself when the attempt does.
+            match self.ended.recv_timeout(CLOSING_WAITS) {
+                Err(RecvTimeoutError::Timeout) => drop(thread),
+                _ => {
+                    let _ = thread.join();
+                }
+            }
         }
     }
 }
@@ -180,8 +228,26 @@ pub(crate) fn take(events: &mut Vec<InputEvent>, event: InputEvent) {
     }
 }
 
+/// Keeps what is held and where the pointer is, as far as the events say,
+/// while there is no line to keep it yet.
+fn keep(events: &[InputEvent], held: &mut BTreeSet<u32>, pointer: &mut Option<(i32, i32)>) {
+    for event in events {
+        match *event {
+            InputEvent::Key { code, pressed } if MODIFIERS.contains(&code) => {
+                if pressed {
+                    held.insert(code);
+                } else {
+                    held.remove(&code);
+                }
+            }
+            InputEvent::PointerAt { x, y } => *pointer = Some((x, y)),
+            _ => {}
+        }
+    }
+}
+
 fn run(
-    taken: mpsc::Receiver<Batch>,
+    taken: mpsc::Receiver<Handed>,
     make_connect: MakeConnect,
     shared: &Shared,
     passing: Option<&PassLog>,
@@ -196,29 +262,52 @@ fn run(
     let mut over = false;
     // Since when the first conversation has been asked for in vain.
     let mut in_vain_since: Option<Instant> = None;
+    // Before the first conversation: the modifiers that are held and where the
+    // pointer is. What is handed over then is gone, but when the conversation opens
+    // the host is brought in line with these, as it is after a cut.
+    let (mut held, mut pointer) = (BTreeSet::new(), None);
+    // What goes out first on a conversation that has just been opened.
+    let mut in_line: Vec<InputEvent> = Vec::new();
     while !shared.stop.load(Ordering::SeqCst) {
-        let open = line.as_ref().is_some_and(InputLine::is_open);
-        // While a conversation is being opened, the attempt may be due at once. Once
-        // it is over there is nothing to look after: what is handed over is taken and
-        // dropped.
-        let wait = if open || over {
-            LISTEN_EVERY
+        // Waits for what is handed over, and no longer than until the conversation
+        // wants looking after: every tenth of a second while it is open, and when the
+        // next attempt to open one is due while it is not. Once it is over there is
+        // nothing to look after: what is handed over is taken and dropped.
+        let now = Instant::now();
+        let wait = if over {
+            Duration::from_secs(1)
+        } else if !in_line.is_empty() {
+            Duration::ZERO
         } else {
-            WHILE_CLOSED
+            match &line {
+                Some(line) => line.due().map_or(LISTEN_EVERY, |due| {
+                    due.saturating_duration_since(now).min(LISTEN_EVERY)
+                }),
+                None => due.saturating_duration_since(now).min(LISTEN_EVERY),
+            }
         };
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut in_line);
         let mut mark = None;
+        let mut hand_in = |handed: Handed, events: &mut Vec<InputEvent>| match handed {
+            Handed::Events(batch) => {
+                mark.get_or_insert(batch.mark);
+                batch.events.into_iter().for_each(|e| take(events, e));
+            }
+            Handed::Stop => {}
+        };
         match taken.recv_timeout(wait) {
-            Ok(batch) => {
-                mark = Some(batch.mark);
-                batch.events.into_iter().for_each(|e| take(&mut events, e));
+            Ok(handed) => {
+                hand_in(handed, &mut events);
                 // Whatever else has been handed over meanwhile leaves in the same message.
                 while let Ok(more) = taken.try_recv() {
-                    more.events.into_iter().for_each(|e| take(&mut events, e));
+                    hand_in(more, &mut events);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if shared.stop.load(Ordering::SeqCst) {
+            break;
         }
         if over {
             continue;
@@ -227,6 +316,7 @@ fn run(
         let Some(open_line) = &mut line else {
             // No conversation yet: what was handed over is gone, and the first one is
             // tried when it is due.
+            keep(&events, &mut held, &mut pointer);
             if now < due {
                 continue;
             }
@@ -237,6 +327,19 @@ fn run(
                 Ok(opened) => {
                     let answered = opened.is_answered();
                     line = Some(opened);
+                    // The host has nothing down for this device. What is held here is
+                    // in line again, as after a cut: the modifiers go down and the
+                    // pointer is where it is; nothing else is pressed.
+                    in_line = held
+                        .iter()
+                        .map(|&code| InputEvent::Key {
+                            code,
+                            pressed: true,
+                        })
+                        .collect();
+                    if let Some((x, y)) = pointer {
+                        in_line.push(InputEvent::PointerAt { x, y });
+                    }
                     set(&|state| {
                         state.open = true;
                         state.answered = answered;
@@ -330,10 +433,21 @@ fn run(
 /// Asks the system to schedule this thread as work a person is waiting
 /// for (macOS: the user-interactive class). Not a privileged operation;
 /// elsewhere it does nothing.
-fn ask_to_be_interactive() {
+/// Asks for the calling thread to be scheduled as work a person is waiting
+/// for, and says whether that is so afterwards.
+pub(crate) fn ask_to_be_interactive() -> bool {
     #[cfg(target_os = "macos")]
-    // SAFETY: changes the scheduling class of the calling thread only.
+    // SAFETY: changes, and then reads, the scheduling class of the calling thread only.
     unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        let wanted = libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE;
+        if libc::pthread_set_qos_class_self_np(wanted, 0) != 0 {
+            return false;
+        }
+        let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+        let mut relative = 0;
+        libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative) == 0
+            && class as u32 == wanted as u32
     }
+    #[cfg(not(target_os = "macos"))]
+    false
 }
