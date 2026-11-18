@@ -426,6 +426,17 @@ enum Asker<'a> {
     Host,
 }
 
+impl Asker<'_> {
+    /// Who it is, for the record of a forced end: a device by its name and
+    /// id in the list of paired devices, never by an address.
+    fn who(&self) -> String {
+        match self {
+            Asker::Device(caller) => format!("{} ({})", caller.peer.name, caller.peer.id),
+            Asker::Host => "the person at the host".to_string(),
+        }
+    }
+}
+
 /// Why a device that lost its rights is not shown a session.
 const NOT_ALLOWED: &str = "its device may no longer use applications of this host";
 /// Why an application is not started for such a device.
@@ -436,8 +447,9 @@ const CANNOT_READ: &str = "the host cannot read its list of paired devices right
 
 #[derive(Default)]
 struct Orders {
-    /// End the application.
-    force: bool,
+    /// End the application by force, at the word of this one (who it is,
+    /// for the record).
+    force: Option<String>,
     /// Ask the application to close.
     close: bool,
     /// The client that is shown the session leaves: the attachment it
@@ -1028,7 +1040,7 @@ impl Sessions {
             // A person's force is kept whatever the session is doing: while
             // it is stopping (the application is being asked) and while it is
             // left over, it is what ends the application.
-            entry.orders.force = true;
+            entry.orders.force = Some(asker.who());
             let left = deadline.saturating_duration_since(Instant::now());
             if state == SessionState::Stopping || left.is_zero() {
                 inner.changed.notify_all();
@@ -1304,7 +1316,8 @@ struct Job {
 /// What the supervisor found to do in one round.
 #[derive(Default)]
 struct Round {
-    force: bool,
+    /// Who asked to end the application by force.
+    force: Option<String>,
     close: bool,
     attach: Option<Attach>,
     /// The client that is shown the session is to be left, and why.
@@ -1634,9 +1647,9 @@ impl Inner {
                     break 'session ending(EndReason::StreamFailed, why);
                 }
                 let round = self.round(&job, &mut checked, None);
-                if round.force {
+                if let Some(who) = round.force {
                     forced = true;
-                    break 'session ending(EndReason::Stopped, "");
+                    break 'session self.forced_by(id, &job, &who);
                 }
                 if round.revoked {
                     // No application runs yet, so no work is lost.
@@ -1816,9 +1829,9 @@ impl Inner {
 
                 let being_attached = attaching.as_ref().map(|(_, _, device)| device);
                 let round = self.round(&job, &mut checked, being_attached);
-                if round.force {
+                if let Some(who) = round.force {
                     forced = true;
-                    break 'session ending(EndReason::Stopped, "");
+                    break 'session self.forced_by(id, &job, &who);
                 }
                 if round.close {
                     // Only the compositor can ask a window to close.
@@ -1912,9 +1925,13 @@ impl Inner {
                     Waited::Ended(how) => {
                         add_to(&mut end, &format!("it ended when asked to ({how})"))
                     }
-                    Waited::Forced => {
+                    Waited::Forced(who) => {
+                        (self.log)(format!(
+                            "session {id}: {} is ended by force at the word of {who}",
+                            job.app_name
+                        ));
                         app.end_by_force(rules.app_stop_grace);
-                        add_to(&mut end, "a person ended it by force");
+                        add_to(&mut end, &format!("ended by force at the word of {who}"));
                         end.reason = EndReason::Stopped;
                     }
                     Waited::Stays => stays = Some(app.group()),
@@ -1953,8 +1970,8 @@ impl Inner {
             if let Some(how) = app.poll() {
                 return Waited::Ended(how);
             }
-            if self.take_force(id) {
-                return Waited::Forced;
+            if let Some(who) = self.take_force(id) {
+                return Waited::Forced(who);
             }
             if Instant::now() >= deadline {
                 return Waited::Stays;
@@ -1963,14 +1980,27 @@ impl Inner {
         }
     }
 
-    /// Whether a person asked to end the session's application by force
-    /// since this was last asked.
-    fn take_force(&self, id: &SessionId) -> bool {
+    /// Who asked to end the session's application by force since this was
+    /// last asked, if anybody did.
+    fn take_force(&self, id: &SessionId) -> Option<String> {
         let mut table = self.lock();
         table
             .sessions
             .get_mut(&id.0)
-            .is_some_and(|entry| std::mem::take(&mut entry.orders.force))
+            .and_then(|entry| entry.orders.force.take())
+    }
+
+    /// The end of a session that somebody ended by force: who it was goes
+    /// into the log and into the end that everybody is shown.
+    fn forced_by(&self, id: &SessionId, job: &Job, who: &str) -> SessionEnd {
+        (self.log)(format!(
+            "session {id}: {} is ended by force at the word of {who}",
+            job.app_name
+        ));
+        ending(
+            EndReason::Stopped,
+            format!("ended by force at the word of {who}"),
+        )
     }
 
     /// The session is over, and the application's processes stay after they
@@ -2017,12 +2047,15 @@ impl Inner {
                     None => Orders::default(),
                 }
             };
-            if orders.force {
+            if let Some(who) = orders.force {
                 // A person's word: the one way to end it by force. Stopping
                 // until it is over, so that whoever asked waits for the end.
+                (self.log)(format!(
+                    "session {id}: what was left over is ended by force at the word of {who}"
+                ));
                 self.update(id, |entry| entry.info.state = SessionState::Stopping);
                 app.end_by_force(self.rules.app_stop_grace);
-                add_to(end, "a person ended them by force");
+                add_to(end, &format!("ended by force at the word of {who}"));
                 end.reason = EndReason::Stopped;
                 return;
             }
@@ -2037,8 +2070,8 @@ impl Inner {
 /// What became of an application that was asked to end.
 enum Waited {
     Ended(String),
-    /// A person asked to end it by force meanwhile.
-    Forced,
+    /// A person asked to end it by force meanwhile: who.
+    Forced(String),
     /// Still there.
     Stays,
 }

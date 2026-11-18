@@ -19,6 +19,8 @@ struct Host {
     runner: Arc<FakeRunner>,
     launcher: Arc<FakeLauncher>,
     laptop: Peer,
+    /// What the table wrote to its log.
+    log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn pair(paths: &Paths, name: &str, permissions: Vec<Permission>) -> Peer {
@@ -42,9 +44,11 @@ fn host_named(tag: &str, rules: Rules) -> Host {
     let journal = Journal::default();
     let runner = Arc::new(FakeRunner::new(&journal));
     let launcher = Arc::new(FakeLauncher::new(&journal));
+    let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let written = log.clone();
     let sessions = Sessions::with(
         paths.clone(),
-        Arc::new(|_| {}),
+        Arc::new(move |line| written.lock().unwrap().push(line)),
         Some(runner.clone()),
         launcher.clone(),
         rules,
@@ -58,6 +62,7 @@ fn host_named(tag: &str, rules: Rules) -> Host {
         runner,
         launcher,
         laptop,
+        log,
     }
 }
 
@@ -2234,7 +2239,8 @@ fn an_application_that_stays_when_asked_is_left_over_for_a_person_to_see() {
     let end = over.end.unwrap();
     assert_eq!(end.reason, EndReason::Stopped);
     assert!(
-        end.message.ends_with("a person ended them by force"),
+        end.message
+            .ends_with("ended by force at the word of the person at the host"),
         "{}",
         end.message
     );
@@ -2392,11 +2398,8 @@ fn force_while_an_application_is_being_asked_to_end_is_kept() {
     );
     let end = over.end.unwrap();
     assert_eq!(end.reason, EndReason::Stopped);
-    assert!(
-        end.message.ends_with("a person ended it by force"),
-        "{}",
-        end.message
-    );
+    let who = format!("ended by force at the word of laptop ({})", host.laptop.id);
+    assert!(end.message.ends_with(&who), "{}", end.message);
     assert_eq!(over.left_over, None);
     assert_eq!(host.journal.count("app ended by force"), 1);
 }
@@ -2531,4 +2534,58 @@ fn an_attach_in_flight_is_detached_when_the_session_ends() {
         host.since_running(),
         ["runner attach", "runner detach", "runner stop"]
     );
+}
+
+#[test]
+fn who_ended_an_application_by_force_is_recorded() {
+    // Over the wire: the device, by its name and id in the list of paired
+    // devices, in the log and in the end every device and the host are shown.
+    let host = host();
+    let id = host.running().id;
+    session(host.stop(&id, true));
+    let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
+    let who = format!("laptop ({})", host.laptop.id);
+    assert_eq!(end.reason, EndReason::Stopped);
+    assert_eq!(end.message, format!("ended by force at the word of {who}"));
+    assert_eq!(
+        host.sessions
+            .host_look(&id)
+            .unwrap()
+            .info
+            .end
+            .unwrap()
+            .message,
+        end.message
+    );
+    let logged = host.log.lock().unwrap().clone();
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.contains(&id.0)
+                && l.ends_with(&format!("ended by force at the word of {who}"))),
+        "{logged:?}"
+    );
+    // Nothing of where it asked from is recorded.
+    assert!(!logged.iter().any(|l| l.contains(LAPTOP)), "{logged:?}");
+
+    // At the host (`--local --force`), on what was left over.
+    let host = self::host();
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    host.follow_until(&id, SessionState::LeftOver);
+    host.sessions.host_stop(&id, true).unwrap();
+    let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
+    assert!(
+        end.message
+            .ends_with("ended by force at the word of the person at the host"),
+        "{}",
+        end.message
+    );
+    assert!(host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.ends_with("ended by force at the word of the person at the host")));
 }
