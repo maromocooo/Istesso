@@ -1456,6 +1456,7 @@ static NSCursor *empty_cursor(void) {
 
 - (void)mouseEntered:(NSEvent *)event {
     [self pointerIsAt:event inside:YES];
+    [self modifiersUp:NSEvent.modifierFlags];
 }
 
 - (void)mouseExited:(NSEvent *)event {
@@ -1476,6 +1477,8 @@ static NSCursor *empty_cursor(void) {
 
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
+    // What this view watched was the window it was in: it watches the one it is in now, once.
+    [NSNotificationCenter.defaultCenter removeObserver:self];
     if (self.window == nil) {
         return;
     }
@@ -1522,28 +1525,47 @@ static NSCursor *empty_cursor(void) {
     [self send:changes count:keys_let_go(&_keys, changes)];
 }
 
+// This window is the one typed into: the key window of the active application. Only then do the
+// modifiers' own releases come here.
+- (BOOL)typedInto {
+    return self.window.isKeyWindow && NSApp.isActive;
+}
+
 // The window is the one typed into again: the modifiers held on this keyboard now go down on the
 // other side (nothing else: a letter pressed again would be typed). Not while the picture is
 // being reconnected; fallInLine does it when the picture is back.
 - (void)keyboardIsBack {
-    if (!self.window.isKeyWindow || !NSApp.isActive || picture_stale) {
+    if (picture_stale) {
         return;
     }
     [self fallInLine];
 }
 
 // Before a button or a scroll is sent the modifiers over there are brought in line with the
-// event's flags (keys.h): a modifier whose release went elsewhere comes up, one that is held and
-// whose press went elsewhere goes down. Nothing goes down while the picture is being reconnected.
-- (void)modifiersInLine:(NSEvent *)event {
-    KeyChange changes[KEYS_MOST];
+// event's flags (keys_around_pointer() in keys.h): a modifier whose release went elsewhere comes
+// up; one that is held and whose press went elsewhere goes down, and stays down only while this
+// window is the one typed into. What is to go after the button or scroll is left in `changes`
+// from the returned place to `*end`. Usually there is nothing to send, and nothing is sent.
+- (size_t)modifiersBefore:(NSEvent *)event changes:(KeyChange *)changes end:(size_t *)end {
     _keys.command_is_control = command_is_control;
-    size_t count = keys_fall_in_line(&_keys, event.modifierFlags, changes);
-    if (picture_stale) {
-        bool dropped = false;
-        count = keys_hold_back(&_keys, changes, count, &dropped);
+    size_t before = 0;
+    *end = keys_around_pointer(&_keys, event.modifierFlags, [self typedInto], picture_stale, changes, &before);
+    if (before > 0) {
+        [self send:changes count:before];
     }
-    [self send:changes count:count];
+    return before;
+}
+
+// A modifier that is down over there and not held any more comes up (something took the keyboard
+// without the window losing it: Spotlight, a palette, a menu). Nothing goes down, and when all is
+// in line nothing is sent.
+- (void)modifiersUp:(NSEventModifierFlags)flags {
+    KeyChange changes[8];
+    _keys.command_is_control = command_is_control;
+    size_t count = keys_releases(&_keys, flags, changes);
+    if (count > 0) {
+        [self send:changes count:count];
+    }
 }
 
 // The line that says "what you type does not arrive" has come up: whatever is held on the other
@@ -1561,7 +1583,11 @@ static NSCursor *empty_cursor(void) {
 // The picture is back: the modifiers held on this keyboard are held on the other side again.
 // Buttons stay up there; one that is still held here counts as not held until it is let go
 // (pressing it over there now would begin a click or a drag where the pointer happens to be).
+// Only while this window is the one typed into: otherwise nothing is held for it.
 - (void)fallInLine {
+    if (![self typedInto]) {
+        return;
+    }
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
     [self send:changes count:keys_fall_in_line(&_keys, NSEvent.modifierFlags, changes)];
@@ -1576,7 +1602,7 @@ static NSCursor *empty_cursor(void) {
         bool dropped = false;
         count = keys_hold_back(&_keys, changes, count, &dropped);
         held_back_count += dropped ? 1 : 0;
-    } else if (count > 0) {
+    } else if (keys_presses_key(&_keys, event.keyCode, changes, count)) {
         note_press();
     }
     [self send:changes count:count];
@@ -1639,15 +1665,22 @@ static NSCursor *empty_cursor(void) {
     if (!pressed && !(_buttons & bit)) {
         return;  // It never went down over there, or was let go there already.
     }
-    [self modifiersInLine:event];
+    KeyChange around[KEYS_MOST];
+    size_t end = 0, after = [self modifiersBefore:event changes:around end:&end];
     _buttons = pressed ? (_buttons | bit) : (_buttons & ~bit);
     if (pressed) {
         note_press();
     }
     send_input("{\"kind\":\"button\",\"code\":%u,\"pressed\":%s}", code, pressed ? "true" : "false");
+    if (end > after) {
+        [self send:around + after count:end - after];
+    }
 }
 
-- (void)mouseMoved:(NSEvent *)event { [self pointer:event]; }
+- (void)mouseMoved:(NSEvent *)event {
+    [self pointer:event];
+    [self modifiersUp:event.modifierFlags];
+}
 - (void)mouseDragged:(NSEvent *)event { [self pointer:event]; }
 - (void)rightMouseDragged:(NSEvent *)event { [self pointer:event]; }
 - (void)otherMouseDragged:(NSEvent *)event { [self pointer:event]; }
@@ -1676,8 +1709,12 @@ static NSCursor *empty_cursor(void) {
     if (dx != 0 || dy != 0) {
         _scroll[0] -= dx;
         _scroll[1] -= dy;
-        [self modifiersInLine:event];
+        KeyChange around[KEYS_MOST];
+        size_t end = 0, after = [self modifiersBefore:event changes:around end:&end];
         send_input("{\"kind\":\"scroll\",\"dx\":%d,\"dy\":%d}", dx, dy);
+        if (end > after) {
+            [self send:around + after count:end - after];
+        }
     }
 }
 
