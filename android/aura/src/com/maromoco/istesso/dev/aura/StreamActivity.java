@@ -61,6 +61,37 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private float scrollY;
 
     private long statsSince;
+    private long statsLines;
+
+    /**
+     * The battery, every 10 s in the stats line: level (%), charging or not, the current (µA as
+     * the system says it; the sign differs between devices) and the temperature (°C). No
+     * identifiers. Read from the system's last battery broadcast, without any permission.
+     */
+    private String batteryLine() {
+        try {
+            android.content.Intent b = registerReceiver(null,
+                    new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            android.os.BatteryManager bm = (android.os.BatteryManager) getSystemService(Context.BATTERY_SERVICE);
+            if (b == null || bm == null) {
+                return " battery=unknown";
+            }
+            int level = b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
+            int scale = b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
+            int status = b.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1);
+            int plugged = b.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0);
+            int tenths = b.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
+            boolean charging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING
+                    || status == android.os.BatteryManager.BATTERY_STATUS_FULL;
+            long current = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CURRENT_NOW);
+            return " battery_pct=" + (scale > 0 && level >= 0 ? level * 100 / scale : -1)
+                    + " battery_charging=" + charging + " battery_plugged=" + plugged
+                    + " battery_current_ua=" + current
+                    + " battery_temp_c=" + (tenths == Integer.MIN_VALUE ? "?" : String.valueOf(tenths / 10.0));
+        } catch (RuntimeException e) {
+            return " battery=unknown";
+        }
+    }
 
     private final Runnable inputWatch = new Runnable() {
         @Override
@@ -114,6 +145,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                     .append(" input_cuts=").append(s[0]).append(" input_over=").append(s[3]);
         }
         b.append(wifiLine());
+        if (++statsLines % 10 == 1) {
+            b.append(batteryLine());
+        }
         Log.i("IstessoAura", b.toString());
     }
 
@@ -188,9 +222,6 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     protected void onResume() {
         super.onResume();
         resumed = true;
-        if (wifiLock != null) {
-            wifiLock.acquire();
-        }
         // Both connections name the paired host; without one, nothing is connected.
         String peer = settings.hostId();
         if (peer.trim().isEmpty()) {
@@ -221,9 +252,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         }
         buttons = 0;
         touchDown = false;
-        if (wifiLock != null && wifiLock.isHeld()) {
-            wifiLock.release();
-        }
+        releaseWifi("panel in the background");
         super.onPause();
     }
 
@@ -272,6 +301,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         pictureWidth = width;
         pictureHeight = height;
         runOnUiThread(() -> {
+            takeWifi();
             frame.setAspect(width, height);
             pictureLine = getString(R.string.connected, width, height, fps, chroma);
             show();
@@ -310,7 +340,32 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         } else {
             text = getString(R.string.over, why == null ? "" : why);
         }
-        runOnUiThread(() -> { pictureLine = text; show(); });
+        runOnUiThread(() -> { pictureLine = text; show(); releaseWifi("picture over"); });
+    }
+
+    /**
+     * Wi-Fi in its low-latency mode (WIFI_MODE_FULL_LOW_LATENCY) while this panel shows a picture.
+     * Each panel holds its own lock; the system keeps the mode while any lock is held, so it ends
+     * when no panel shows a picture. The system applies the mode only while the app is in front and
+     * the screen is on; whether it did, and whether the device supports it, cannot be read through
+     * the public SDK, so the log says what can be read: that the lock is held.
+     */
+    private void takeWifi() {
+        if (wifiLock == null || wifiLock.isHeld()) {
+            return;
+        }
+        wifiLock.acquire();
+        // Whether the device supports the mode (WifiManager.isLowLatencyModeSupported) is not in the
+        // public SDK this builds against, and whether the system applied it cannot be read either.
+        Log.i("IstessoAura", "wifi lock taken panel=" + app.name + " mode=low-latency held=" + wifiLock.isHeld()
+                + " applied=not-readable");
+    }
+
+    private void releaseWifi(String why) {
+        if (wifiLock != null && wifiLock.isHeld()) {
+            wifiLock.release();
+            Log.i("IstessoAura", "wifi lock released panel=" + app.name + " (" + why + ")");
+        }
     }
 
     private void showInput() {
