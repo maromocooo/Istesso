@@ -118,7 +118,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial10/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial19/target/release'}
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 state="$HOME/Library/Caches/istesso-daily"
