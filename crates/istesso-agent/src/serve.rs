@@ -4,14 +4,24 @@
 //! the caller is paired, the only work done for it is that handshake, with
 //! short timeouts and small buffers; the number of simultaneous connections
 //! is capped.
+//!
+//! After the handshake, too, nothing is done for a connection until its
+//! first request has come. A device that opens a conversation again makes
+//! several tries at once and asks on one of them (ADR 0007, "つなぎ直しの
+//! 試みを、重ねる"): the conversation it had before is ended, and its keys
+//! are let go of, when `input_open` arrives, and not for a connection that
+//! has merely shown who it is. Such a connection only takes one of a few
+//! places, for a few seconds.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use istesso_link::{ErrorCode, HangUp, LocalKeys, Request, Response, Session, DEFAULT_PORT};
+use istesso_link::{
+    waiting, ErrorCode, HangUp, LocalKeys, Request, Response, Session, Waiting, DEFAULT_PORT,
+};
 use istesso_pair::{Identity, PeerStore, Permission};
 use istesso_proto::{AppEntry, HostManifest, InputEvent};
 
@@ -23,7 +33,20 @@ use crate::survey::{refresh_peers, SurveyOptions};
 
 /// Connections served at the same time; further ones are dropped.
 const MAX_CONNECTIONS: usize = 64;
-/// How long the agent waits for a caller's next message.
+/// Of those, connections that have completed the handshake and not sent
+/// their first request yet: these many of all devices together, and
+/// [`MAX_WAITING_OF_A_DEVICE`] of one device. Further ones are closed.
+const MAX_WAITING: usize = 16;
+/// A device whose input is being opened again may have as many connections
+/// waiting as it starts tries quickly ([`waiting::PER_DEVICE`]). Every
+/// conversation of the device comes to this agent, not only its input, so
+/// two places are kept beyond those: while its input comes back, the device
+/// can still ask what the host has (`istesso hosts`) or open a
+/// conversation for the first time.
+const MAX_WAITING_OF_A_DEVICE: usize = waiting::PER_DEVICE + 2;
+/// How long the agent waits for a caller's next message. The first one has
+/// [`waiting::REQUEST_WITHIN`] from the end of the handshake, all of it
+/// together.
 const WAIT: Duration = Duration::from_secs(5);
 /// How often a device that sends input is looked up again in the list of
 /// paired devices. A conversation with input stays open for as long as a
@@ -93,6 +116,11 @@ struct Shared {
     manifest: Mutex<Option<HostManifest>>,
     apps: Mutex<Option<(Instant, Vec<AppEntry>)>>,
     connections: AtomicUsize,
+    /// The connections that have shown who they are and have not asked for
+    /// anything yet.
+    waiting: Waiting,
+    /// How long such a connection may wait, in milliseconds.
+    request_within_ms: AtomicU64,
     verbose: bool,
     /// Where input is handed over on this machine.
     input_socket: std::path::PathBuf,
@@ -140,6 +168,8 @@ impl Agent {
                 manifest: Mutex::new(None),
                 apps: Mutex::new(None),
                 connections: AtomicUsize::new(0),
+                waiting: Waiting::new(MAX_WAITING_OF_A_DEVICE, MAX_WAITING),
+                request_within_ms: AtomicU64::new(waiting::REQUEST_WITHIN.as_millis() as u64),
                 verbose: options.verbose,
                 input_socket: options.input_socket.clone().unwrap_or(paths_input_socket),
                 inputs: Mutex::new(HashMap::new()),
@@ -156,6 +186,23 @@ impl Agent {
     /// Fingerprint of this device's identity key.
     pub fn fingerprint(&self) -> &str {
         &self.shared.fingerprint
+    }
+
+    /// The count of connections that wait for their first request, to look
+    /// at while the agent runs.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> Waiting {
+        self.shared.waiting.clone()
+    }
+
+    /// Gives a connection this long for its first request instead of
+    /// [`waiting::REQUEST_WITHIN`], so that a test need not wait that out.
+    #[cfg(test)]
+    pub(crate) fn set_request_within(&self, within: Duration) {
+        let within = within.as_millis() as u64;
+        self.shared
+            .request_within_ms
+            .store(within, Ordering::SeqCst);
     }
 
     /// Serves paired devices until the process ends.
@@ -389,6 +436,21 @@ impl Shared {
             }
         };
 
+        // A paired device, and so far nothing but that: it has not asked for
+        // anything. Nothing is done for it until it does, and it may be one of
+        // several tries of which the device uses another. It waits in one of a
+        // few places, and not for long; a device that has as many waiting as it
+        // may is not given another, and this connection is closed.
+        let Some(waiting) = self.waiting.take(&session.peer().id) else {
+            return;
+        };
+        let mut waiting = Some(waiting);
+        // The first request has this long from here, all of it together: a
+        // device that sends a byte now and then, or requests this version does
+        // not know, does not keep its place by that.
+        let request_within = Duration::from_millis(self.request_within_ms.load(Ordering::SeqCst));
+        let mut first_by = Some(Instant::now() + request_within);
+
         // The caller's address is a hint for reaching it later. Its port is
         // not known from an incoming connection, so the default is assumed.
         let hint = SocketAddr::new(session.remote_addr().ip(), DEFAULT_PORT).to_string();
@@ -400,7 +462,17 @@ impl Shared {
         // The device asked to be answered when it says "still here".
         let mut answers_alive = false;
         let mut checked = Instant::now();
-        while let Ok(Some(request)) = session.next_request() {
+        loop {
+            let request = match first_by.take() {
+                Some(by) => session.first_request_by(by, WAIT),
+                None => session.next_request(),
+            };
+            // The first request has come, or will not: the connection waits no
+            // longer. From here on it has the time every conversation has.
+            drop(waiting.take());
+            let Ok(Some(request)) = request else {
+                break;
+            };
             let response = match request {
                 Request::Input { events } => {
                     // Passed on and not answered. Input that was not asked for first, or
@@ -803,6 +875,279 @@ mod tests {
             assert_eq!(pair.handed_over(SOON), Some(key(30, false)));
             client.send_input(&[]).unwrap();
             assert!(hears_alive(&mut client, SOON));
+        }
+
+        /// Whether the conversation has been ended by the host.
+        fn is_over(client: &mut istesso_link::Client) -> bool {
+            matches!(client.heard_alive(), Err(istesso_link::Error::Closed))
+        }
+
+        /// Test 11 of ADR 0007, the host's side: a device that opens its
+        /// conversation again makes several tries. Two of them complete the
+        /// handshake. The host adopts the one on which `input_open` comes,
+        /// then and not before, and the other costs nothing.
+        #[test]
+        fn of_two_connections_only_the_one_that_asks_takes_the_input_over() {
+            let pair = InputPair::new("ig");
+            let mut before = pair.connect();
+            before.open_input_alive().unwrap();
+            before.send_input(&[key(42, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(42, true)));
+
+            // Two tries of the same device have completed their handshakes.
+            let mut one = pair.connect();
+            let two = pair.connect();
+            pair.until(|| pair.waiting.waiting_of(&one_id(&pair)) == 2);
+            // Nothing has changed for it: the conversation before carries input, is
+            // answered, and what it has down stays down.
+            before.send_input(&[key(30, true), key(30, false)]).unwrap();
+            assert_eq!(
+                pair.all_handed_over(A_MOMENT),
+                [key(30, true), key(30, false)]
+            );
+            before.send_input(&[]).unwrap();
+            assert!(hears_alive(&mut before, SOON));
+
+            // "Use this one": the request, on one of the two.
+            assert_eq!(
+                one.open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+            // Now the conversation before is over, and its key comes up: once.
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(42, false)]);
+            pair.until(|| is_over(&mut before));
+            assert_eq!(pair.waiting.waiting(), 1);
+
+            // The device drops the other. The host lets go of nothing for it, passes
+            // nothing on, and says nothing about it.
+            drop(two);
+            pair.until(|| pair.waiting.waiting() == 0);
+            assert!(pair.all_handed_over(A_MOMENT).is_empty());
+            assert!(pair.said.lock().unwrap().is_empty());
+            // The one in use goes on.
+            one.send_input(&[key(31, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(31, true)));
+            one.send_input(&[]).unwrap();
+            assert!(hears_alive(&mut one, SOON));
+        }
+
+        /// The id the host knows the device of an [`InputPair`] by.
+        fn one_id(pair: &InputPair) -> String {
+            let peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+            peers.find("a laptop").unwrap().unwrap().id.clone()
+        }
+
+        /// Test 13: a connection on which the request never comes is closed
+        /// when its time is up, and gives its place back. The conversation
+        /// that is flowing is not touched by it.
+        #[test]
+        fn a_connection_that_never_asks_is_closed_when_its_time_is_up() {
+            let pair = InputPair::giving_a_request("ih", Duration::from_millis(300));
+            let mut flowing = pair.connect();
+            flowing.open_input_alive().unwrap();
+            flowing.send_input(&[key(42, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(42, true)));
+
+            let mut silent = pair.connect();
+            let began = Instant::now();
+            pair.until(|| pair.waiting.waiting() == 1);
+            pair.until(|| is_over(&mut silent));
+            let after = began.elapsed();
+            assert!(
+                after >= Duration::from_millis(250) && after < Duration::from_millis(1500),
+                "closed after {after:?}"
+            );
+            pair.until(|| pair.waiting.waiting() == 0);
+            // Nothing came up, and the conversation that flows still does.
+            assert!(pair.all_handed_over(A_MOMENT).is_empty());
+            flowing.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            flowing.send_input(&[]).unwrap();
+            assert!(hears_alive(&mut flowing, SOON));
+
+            // A connection that has asked for something is a conversation, and has
+            // the time a conversation has: well over the time for the first request.
+            let mut asked = pair.connect();
+            asked.ping().unwrap();
+            assert_eq!(pair.waiting.waiting(), 0);
+            std::thread::sleep(Duration::from_millis(900));
+            asked.ping().unwrap();
+        }
+
+        /// A device whose input is being opened again has four tries waiting
+        /// at the host, over a long way. It can still ask the host what it
+        /// has, and open a conversation for the first time: two places are
+        /// kept beyond the four.
+        #[test]
+        fn a_device_that_is_coming_back_can_still_ask_other_things() {
+            // (With time enough for the test to look at them before they are closed.)
+            let pair = InputPair::giving_a_request("ii", Duration::from_secs(30));
+            let mut tries: Vec<_> = (0..4).map(|_| pair.connect()).collect();
+            let laptop = one_id(&pair);
+            pair.until(|| pair.waiting.waiting_of(&laptop) == 4);
+
+            // What `istesso hosts` asks, on a connection of its own, and a
+            // second one beside it.
+            let mut hosts = pair.connect();
+            let mut another = pair.connect();
+            assert_eq!(hosts.manifest().unwrap().name, "a host");
+            hosts.status().unwrap();
+            another.ping().unwrap();
+            // The four tries have lost nothing by it.
+            assert_eq!(pair.waiting.waiting_of(&laptop), 4);
+            for waiting in &mut tries {
+                assert!(!is_over(waiting));
+            }
+            // And one of them is the one the input comes back on.
+            assert_eq!(
+                tries[0].open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+        }
+
+        /// A device has six places for connections that have not asked yet.
+        /// The seventh is closed at once, the six are left alone, and
+        /// another device is not kept out by them.
+        #[test]
+        fn a_device_holds_six_waiting_connections_and_no_more() {
+            let pair = InputPair::giving_a_request("ik", Duration::from_secs(30));
+            let mut held: Vec<_> = (0..6).map(|_| pair.connect()).collect();
+            let laptop = one_id(&pair);
+            pair.until(|| pair.waiting.waiting_of(&laptop) == 6);
+
+            // The seventh completes its handshake, and is closed.
+            let mut seventh = pair.connect();
+            pair.until(|| is_over(&mut seventh));
+            assert_eq!(pair.waiting.waiting_of(&laptop), 6);
+            // The ones that waited before it are still there.
+            for waiting in &mut held {
+                assert!(!is_over(waiting));
+            }
+
+            // Another paired device gets its place and its answer.
+            let pad = pair.another_device("ik", "a pad");
+            let mut other = pair.connect_as(&pad).unwrap();
+            other.ping().unwrap();
+
+            // One of the six asks: it is served, and its place is free again.
+            held[0].ping().unwrap();
+            pair.until(|| pair.waiting.waiting_of(&laptop) == 5);
+            let mut eighth = pair.connect();
+            eighth.ping().unwrap();
+        }
+
+        /// A paired device that sends something now and then, and never a
+        /// request, does not keep its place by that: the time for the first
+        /// request is one time for all of it, from the end of the handshake.
+        #[test]
+        fn a_connection_that_trickles_is_closed_when_its_time_is_up() {
+            use std::io::Write;
+
+            use istesso_link::{Channel, LocalKeys};
+            // (A second, so that a machine that is busy, and wakes a sleeper late,
+            // still gets several messages in before the time is up.)
+            let pair = InputPair::giving_a_request("il", Duration::from_secs(1));
+            let paths = pair.device.paths();
+            let identity = istesso_pair::Identity::load_or_create(&paths.identity()).unwrap();
+            let channel = || {
+                let stream = std::net::TcpStream::connect(pair.addr).unwrap();
+                stream.set_read_timeout(Some(SOON)).unwrap();
+                let keys = LocalKeys::new(&identity).unwrap();
+                Channel::initiate(stream, &keys, |_| Ok(())).unwrap()
+            };
+            let closed = |channel: &mut Channel<std::net::TcpStream>| {
+                channel.stream().set_nonblocking(true).unwrap();
+                let over = matches!(channel.stream().peek(&mut [0u8; 1]), Ok(0));
+                channel.stream().set_nonblocking(false).unwrap();
+                over
+            };
+
+            // One sends requests this version does not know, well inside every
+            // single wait. Each is answered, and none of them is the first request.
+            let mut junk = channel();
+            let began = Instant::now();
+            pair.until(|| pair.waiting.waiting() == 1);
+            let mut sent = 0;
+            while pair.waiting.waiting() == 1 {
+                assert!(began.elapsed() < SOON, "it keeps its place");
+                if junk.send(br#"{"type":"teleport"}"#).is_ok() {
+                    sent += 1;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            let after = began.elapsed();
+            assert!(sent >= 3, "{sent} requests in {after:?}");
+            assert!(
+                after >= Duration::from_millis(900) && after < Duration::from_millis(2500),
+                "closed after {after:?}"
+            );
+
+            // One sends the beginning of a message, and then a byte at a time.
+            let mut bytes = channel();
+            let began = Instant::now();
+            pair.until(|| pair.waiting.waiting() == 1);
+            let mut wire = bytes.stream();
+            wire.write_all(&[0x02, 0x00]).unwrap();
+            while pair.waiting.waiting() == 1 {
+                assert!(began.elapsed() < SOON, "it keeps its place");
+                let _ = wire.write_all(&[0]);
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            let after = began.elapsed();
+            assert!(
+                after >= Duration::from_millis(900) && after < Duration::from_millis(2500),
+                "closed after {after:?}"
+            );
+            pair.until(|| closed(&mut bytes));
+            assert_eq!(pair.waiting.waiting(), 0);
+        }
+
+        /// Test 14: callers that are not paired never get a place among the
+        /// connections that wait for a request, however many they are, and
+        /// the conversation that flows goes on.
+        #[test]
+        fn callers_that_are_not_paired_take_no_place_and_stop_nothing() {
+            let pair = InputPair::new("ij");
+            let mut flowing = pair.connect();
+            flowing.open_input_alive().unwrap();
+            flowing.send_input(&[key(42, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(42, true)));
+
+            // Some open a connection and say nothing ...
+            let mute: Vec<_> = (0..6)
+                .map(|_| std::net::TcpStream::connect(pair.addr).unwrap())
+                .collect();
+            // ... and some run the handshake with a key the host has never seen.
+            let stranger = crate::testing::TempDir::new("ij");
+            {
+                use istesso_pair::{Hello, Identity, Peer, PeerStore};
+                let host = Identity::load_or_create(&pair.host.paths().identity()).unwrap();
+                Identity::load_or_create(&stranger.paths().identity()).unwrap();
+                PeerStore::open(stranger.paths().peers())
+                    .unwrap()
+                    .add(Peer::from_hello(&Hello {
+                        device_name: "a host".into(),
+                        public_key: host.public_key(),
+                    }))
+                    .unwrap();
+            }
+            for _ in 0..6 {
+                assert!(matches!(
+                    pair.connect_as(&stranger),
+                    Err(istesso_link::Error::NotTrusted)
+                ));
+                assert_eq!(pair.waiting.waiting(), 0);
+            }
+
+            // The conversation that flows has lost nothing: its key is down, it
+            // carries input and is answered.
+            assert!(pair.all_handed_over(A_MOMENT).is_empty());
+            flowing.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            flowing.send_input(&[]).unwrap();
+            assert!(hears_alive(&mut flowing, SOON));
+            assert_eq!(pair.waiting.waiting(), 0);
+            drop(mute);
         }
 
         #[test]

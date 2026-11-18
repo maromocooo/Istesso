@@ -590,25 +590,19 @@ fn relay_input(
         None => None,
     };
     use istesso_agent::relay::{Happened, InputLine, LISTEN_EVERY};
-    // Opens a conversation with the device: now, and again whenever it is cut. The
-    // list of paired devices is read each time, so a pairing that was removed
-    // meanwhile is not used.
-    let mut connect: istesso_agent::relay::Connect = {
-        let (to, address) = (to.to_string(), address.map(str::to_string));
-        Box::new(move |within| {
-            istesso_agent::connect_peer_or_say_why(
-                &Paths::from_env(),
-                &to,
-                address.as_deref(),
-                within,
-            )
-        })
+    // Opens a conversation with the device, now. The list of paired devices is
+    // read each time, so a pairing that was removed meanwhile is not used.
+    // At every address the device is remembered at, at once; the one that answers
+    // first is where the conversation is.
+    let first = || {
+        let within = Duration::from_secs(3);
+        istesso_agent::connect_peer_and_say_where(&Paths::from_env(), to, address, within)
     };
     let began = std::time::Instant::now();
     let mut said = false;
-    let client = loop {
-        match connect(Duration::from_secs(3)) {
-            Ok(client) => break client,
+    let (client, worked) = loop {
+        match first() {
+            Ok(opened) => break opened,
             Err(why) if began.elapsed() < keep_trying => {
                 if !said {
                     eprintln!("cannot reach the device yet ({why}); trying again");
@@ -618,6 +612,15 @@ fn relay_input(
             }
             Err(why) => return Err(why.to_string()),
         }
+    };
+    // One try at opening it again when it was cut. Several run at once, each with
+    // its own keys and its own reading of the list, and each is over when its time
+    // is. A try is one connection, to the address the conversation last worked at;
+    // the device's other addresses come in only when that one has failed for a
+    // while (ADR 0007).
+    let connect: istesso_agent::relay::Connect = {
+        let reaching = istesso_agent::Reaching::new(Paths::from_env(), to, address, Some(worked));
+        std::sync::Arc::new(move |within| reaching.open(within))
     };
     let mut line = InputLine::open(client, connect)
         .map_err(|(_, why)| format!("the device does not take input from here: {why}"))?;

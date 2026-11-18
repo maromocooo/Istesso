@@ -9,6 +9,10 @@
 //!   exchanged with a device that is not on that list.
 //! * [`message`] defines what one device can ask of another.
 //! * [`client`] and [`server`] are the two ends of a conversation.
+//! * [`again`] opens a conversation again after it was cut, with tries that
+//!   overlap, and [`waiting`] is the answering side's limit on connections
+//!   that have not sent their first request yet. Neither touches the
+//!   handshake or the encryption.
 //!
 //! Addresses are never trusted. Whoever answers at an address has to pass the
 //! handshake, so a wrong or forged address (from discovery or from memory) can
@@ -16,16 +20,20 @@
 //!
 //! See `docs/adr/0007-control-channel.md` for the reasoning.
 
+pub mod again;
 pub mod channel;
 pub mod client;
 mod frame;
 pub mod message;
 pub mod server;
+pub mod waiting;
 
+pub use again::{Again, Pace, Racer, Tries, Turn};
 pub use channel::{Channel, LocalKeys};
 pub use client::{Client, InputAnswer};
 pub use message::{ErrorCode, Request, Response};
 pub use server::{HangUp, Session};
+pub use waiting::{Waiting, WaitingPlace};
 
 /// Port the agent listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 47801;

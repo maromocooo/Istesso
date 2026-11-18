@@ -161,9 +161,15 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         }
         builder.create(parent)?;
     }
-    // The agent and the command line tool may write at the same time; each
-    // process uses its own temporary file.
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // The agent and the command line tool may write at the same time, and so
+    // may several threads of the agent (a device that opens a conversation
+    // again makes several connections at once, and each one's thread notes
+    // where the device called from). Every write uses a temporary file of its
+    // own: one that two writers shared could be moved into place half
+    // written, or empty.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let number = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{number}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -306,5 +312,51 @@ mod tests {
         assert_ne!(fresh.hardware.cpu_model, "planted");
         let again = local_manifest(&paths, Duration::from_secs(600));
         assert_ne!(again.hardware.cpu_model, "planted");
+    }
+
+    /// Several threads of one process write a device's snapshot at the same
+    /// time, as the agent's do when a device makes several connections at
+    /// once. Whoever reads meanwhile reads a whole snapshot, never an empty
+    /// or a half-written one.
+    #[test]
+    fn a_reader_never_sees_half_of_what_several_threads_write() {
+        let dir = TempDir::new("cache-threads");
+        let paths = dir.paths();
+        let snapshot = |address: &str| HostSnapshot {
+            id: ID.to_string(),
+            name: "studio".to_string(),
+            addresses: list(&[address]),
+            ..HostSnapshot::default()
+        };
+        store(&paths, &snapshot("first.invalid:47801")).unwrap();
+
+        let writers: Vec<_> = (0..4)
+            .map(|writer| {
+                let paths = paths.clone();
+                std::thread::spawn(move || {
+                    for round in 0..200 {
+                        let address = format!("writer-{writer}-{round}.invalid:47801");
+                        store(&paths, &snapshot(&address)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let mut read = 0;
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let loaded = load(&paths, ID).expect("an empty or damaged snapshot");
+            assert_eq!(loaded.addresses.len(), 1);
+            read += 1;
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(read > 0);
+        // No temporary file is left behind.
+        let left: Vec<_> = std::fs::read_dir(paths.host_snapshot(ID).unwrap().parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("tmp-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }

@@ -82,7 +82,8 @@
 // are asked for over the same connection, and only when a frame could not be decoded, because
 // frames do not get lost on that way.
 // When the connection is cut (it fails, or the host says nothing for a second), the program
-// connects again by itself: at once, then four times a second. It does not when the host said
+// connects again by itself: at once, then with a new try every half second, without waiting
+// for the tries before (the library does this; ADR 0007). It does not when the host said
 // why the stream ends or refused this device (the session is over, the picture is for another
 // device or put aside, the pairing or the right to look is gone): then the window says so and
 // stays as it is. While the connection is being made again the window keeps the last picture.

@@ -330,8 +330,9 @@ fn stay(mut args: Args) -> Result<(), Failure> {
     let addr = addr.to_socket_addrs()?.next().ok_or("that is no address")?;
 
     let mut viewer = Lasting::new(
-        Box::new(move |began_with, within| {
-            // Read anew for every connection: the pairing may have changed.
+        std::sync::Arc::new(move |began_with, within| {
+            // Read anew for every connection: the pairing may have changed. And made
+            // anew: several tries at connecting again run at once, each with its own keys.
             // Never made here: a device without an identity has nothing to connect with.
             if !paths.identity().exists() {
                 return Err(istesso_media::Error::NoIdentity);
@@ -349,7 +350,7 @@ fn stay(mut args: Args) -> Result<(), Failure> {
                 ),
                 (None, None) => None,
             };
-            Viewer::connect(addr, &keys, &peers, expected.as_deref(), within)
+            Viewer::open(addr, &keys, &peers, expected.as_deref(), within)
         }),
         None,
     );

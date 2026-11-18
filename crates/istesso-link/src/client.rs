@@ -1,7 +1,7 @@
 //! The calling end of a conversation.
 
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use istesso_pair::{Peer, PeerStore};
 use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
@@ -19,6 +19,21 @@ pub enum InputAnswer {
     Open { alive: bool },
     /// It is not, and this is why: callers decide by the code.
     Refused { code: ErrorCode, message: String },
+}
+
+/// The paired device that has this key, if it is the one that was asked
+/// for.
+fn paired(peers: &PeerStore, expected: Option<&str>, key: &[u8; 32]) -> Result<Peer> {
+    let peer = peers.find_by_key(key).ok_or(Error::UnknownPeer)?;
+    if let Some(expected) = expected {
+        if peer.id != expected {
+            return Err(Error::WrongPeer {
+                expected: expected.to_string(),
+                found: format!("{} ({})", peer.name, peer.id),
+            });
+        }
+    }
+    Ok(peer.clone())
 }
 
 /// An open conversation with one paired device.
@@ -50,19 +65,38 @@ impl Client {
 
         let mut found: Option<Peer> = None;
         let channel = Channel::initiate(stream, keys, |key| {
-            let peer = peers.find_by_key(key).ok_or(Error::UnknownPeer)?;
-            if let Some(expected) = expected {
-                if peer.id != expected {
-                    return Err(Error::WrongPeer {
-                        expected: expected.to_string(),
-                        found: format!("{} ({})", peer.name, peer.id),
-                    });
-                }
-            }
-            found = Some(peer.clone());
+            found = Some(paired(peers, expected, key)?);
             Ok(())
         })?;
         // `initiate` only succeeds after `accept` has run and agreed.
+        let peer = found.ok_or(Error::UnknownPeer)?;
+        Ok(Client { channel, peer })
+    }
+
+    /// As [`Client::connect`], with connecting and the handshake over by
+    /// `by`, all of it together: for a try at connecting again that runs
+    /// beside others and has to end at a time that is known beforehand
+    /// (ADR 0007). Each later wait for the other device may take `timeout`.
+    pub fn connect_by(
+        addr: SocketAddr,
+        keys: &LocalKeys,
+        peers: &PeerStore,
+        expected: Option<&str>,
+        by: Instant,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let left = by
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(Error::Timeout)?;
+        let stream = TcpStream::connect_timeout(&addr, left).map_err(Error::from_io)?;
+        stream.set_nodelay(true).map_err(Error::from_io)?;
+
+        let mut found: Option<Peer> = None;
+        let channel = Channel::initiate_by(stream, keys, by, timeout, |key| {
+            found = Some(paired(peers, expected, key)?);
+            Ok(())
+        })?;
         let peer = found.ok_or(Error::UnknownPeer)?;
         Ok(Client { channel, peer })
     }
@@ -163,6 +197,31 @@ impl Client {
             Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
             _ => Err(Error::Malformed),
         }
+    }
+
+    /// As [`Client::open_input_alive`], with the whole answer there by
+    /// `by`, however slowly it comes. Afterwards each wait for the other
+    /// device may take `then`.
+    pub fn open_input_alive_by(&mut self, by: Instant, then: Duration) -> Result<InputAnswer> {
+        let bytes = serde_json::to_vec(&Request::InputOpen { alive: true })
+            .map_err(|_| Error::Malformed)?;
+        // Asking and the answer end at the same point in time.
+        self.channel.send_by(&bytes, by)?;
+        let answer = self.channel.recv_by(by);
+        self.set_timeout(then)?;
+        match serde_json::from_slice(&answer?).map_err(|_| Error::Malformed)? {
+            Response::InputOpen { alive } => Ok(InputAnswer::Open { alive }),
+            Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Whether the other device has closed this conversation already, as
+    /// far as that can be seen without waiting. A host that has as many
+    /// connections of this device waiting as it holds closes a further one
+    /// right after the handshake; such a connection is not one to ask on.
+    pub fn closed_by_peer(&self) -> bool {
+        matches!(self.something_has_arrived(), Err(Error::Closed))
     }
 
     /// Whether the other device has said "still here" since this was last

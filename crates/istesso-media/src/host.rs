@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use istesso_link::{Channel, Error as LinkError, LocalKeys};
+use istesso_link::{waiting, Channel, Error as LinkError, LocalKeys, Waiting};
 use istesso_pair::{Identity, Peer, PeerStore, Permission};
 
 use crate::clock;
@@ -145,6 +145,12 @@ struct Shared {
     /// want, and devices that are being shown the picture.
     pending: Arc<AtomicUsize>,
     serving: Arc<AtomicUsize>,
+    /// Of the callers above, the ones that have shown that they are a
+    /// paired device and have not said what they want yet: counted for each
+    /// device. A device that connects again makes several tries at once and
+    /// asks on one of them (ADR 0007); the others wait here until the device
+    /// closes them, and one device has only so many of these places.
+    waiting: Waiting,
     seq: AtomicU64,
     /// Somebody needs a key frame, and the encoder has not been told yet.
     key_wanted: AtomicBool,
@@ -340,6 +346,7 @@ impl Host {
             admit: Mutex::new(admit),
             pending: Arc::new(AtomicUsize::new(0)),
             serving: Arc::new(AtomicUsize::new(0)),
+            waiting: Waiting::new(waiting::PER_DEVICE, MAX_PENDING),
             seq: AtomicU64::new(0),
             key_wanted: AtomicBool::new(false),
             cursor: Mutex::new(None),
@@ -544,6 +551,13 @@ impl Host {
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         self.shared.pending.load(Ordering::SeqCst)
+    }
+
+    /// Connections of paired devices that have completed the handshake and
+    /// not said what they want yet.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.shared.waiting.waiting()
     }
 }
 
@@ -928,7 +942,18 @@ impl Shared {
         })?;
         let peer = found.ok_or(LinkError::UnknownPeer)?;
 
-        let first = channel.recv()?;
+        // A paired device, and so far nothing but that. Nothing is done for it
+        // until it says what it wants: its earlier connection stays, and no key
+        // frame is asked for. It may be one of several tries of which the device
+        // uses another, and then this connection is closed without a word. It
+        // waits in one of a few places; a device that has as many waiting as it
+        // may is not given another, and this connection is closed.
+        let Some(waiting) = self.waiting.take(&peer.id) else {
+            return Ok(());
+        };
+        let first = channel.recv();
+        drop(waiting);
+        let first = first?;
         if !matches!(serde_json::from_slice::<Ask>(&first), Ok(Ask::Watch { .. })) {
             return refuse(
                 &mut channel,
