@@ -55,6 +55,11 @@
 #                         input.sock in that directory. Keyboard and mouse are NOT passed on from the
 #                         window in such a run: the host's agent hands input to the ordinary run only.
 #                         `stop` with the same name stops that run and nothing else.
+#   ISTESSO_TRY_NO_STOP   1: a start stops nothing first. Without it a start begins with `stop`, which
+#                         ends the viewer, the input relay and the host's pipeline BY NAME, whoever
+#                         started them. With it the start looks whether an earlier run is still there
+#                         (the programs written down at its start, the host's two tmux sessions), and
+#                         if one is, says so and does nothing at all
 #   ISTESSO_BUILT         with TRY=channel: another checkout of this repository whose built programs are
 #                         started on this Mac (its target/release/istesso and its
 #                         macos/gst-viewer/build/gst-viewer), for a checkout that has nothing built:
@@ -230,7 +235,24 @@ mac_address=$(ipconfig getifaddr "${interface:-en0}" 2>/dev/null)
 [ -n "$mac_address" ] || { echo "error: cannot tell which of this Mac's addresses the host can reach"; exit 1; }
 to="$mac_address:5004"
 
-stop_all
+if [ -n "${ISTESSO_TRY_NO_STOP:-}" ]; then
+    # Nothing is stopped, by name or otherwise: an earlier run that is still there ends this start.
+    if [ -s "$started" ]; then
+        while read -r pid program; do
+            case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
+            *"$program") echo "error: $program ($pid) of an earlier run is still running; nothing was stopped or started"; exit 1 ;;
+            esac
+        done < "$started"
+    fi
+    left=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" "tmux has-session -t '=$pipeline_session' 2>/dev/null && echo $pipeline_session; tmux has-session -t '=$app_session' 2>/dev/null && echo $app_session; echo checked" 2>/dev/null)
+    case "$left" in
+    checked) ;;
+    *checked) echo "error: on the host the tmux session(s) $(echo "$left" | grep -v checked | tr '\n' ' ')of an earlier run are still there; nothing was stopped or started"; exit 1 ;;
+    *) echo "error: cannot ask the host whether an earlier run is still there; nothing was stopped or started"; exit 1 ;;
+    esac
+else
+    stop_all
+fi
 on_host <<'HOST' || exit 1
 run=$(eval echo "$RUN"); mkdir -p "$run"
 plugin=$(eval echo "$PLUGIN"); src=$(eval echo "$SRC")
