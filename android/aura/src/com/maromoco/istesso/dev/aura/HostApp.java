@@ -9,11 +9,10 @@ import android.net.Uri;
  * (`scripts/daily.sh open NAME --for aura`); Chrome since its crash report and usage statistics
  * are off in the trial (2026-11-19).
  *
- * <p>Ports: the host has ONE slot for AURA for now (picture 47914, input 47924; a second
- * application is refused there while one runs), so every panel connects to the ports on the first
- * screen, whose defaults are those. A panel cannot tell which application the host shows in that
- * slot: open the panel of the application that was opened for AURA. Several panels at once need
- * several AURA slots on the host (docs/m8-aura-prototype.md, 7.2).
+ * <p>Ports: each application has a fixed AURA slot on the host (the trial edition, trial-daily
+ * 78a6c10): editor 1, firefox 2, blender 3, chrome 4; the picture on 4793N and the input on
+ * 4794N. So each panel knows where its own application is without asking, and several panels can
+ * be open at once (the host runs at most three AURA applications at a time and refuses a fourth).
  */
 final class HostApp {
     final String name;
@@ -28,8 +27,8 @@ final class HostApp {
 
     static final HostApp[] ALL = {
         new HostApp("editor", R.string.app_editor, 1),
-        new HostApp("blender", R.string.app_blender, 2),
-        new HostApp("firefox", R.string.app_firefox, 3),
+        new HostApp("firefox", R.string.app_firefox, 2),
+        new HostApp("blender", R.string.app_blender, 3),
         new HostApp("chrome", R.string.app_chrome, 4),
     };
 
@@ -58,12 +57,13 @@ final class HostApp {
         return named(uri.getPathSegments().get(0));
     }
 
-    /** The host's one AURA slot for every application, for now. */
-    int picturePort(Settings settings) {
-        return settings.picturePort();
+    /** This application's picture on the host: 4793N for slot N. */
+    int picturePort() {
+        return 47930 + slot;
     }
 
-    int inputPort(Settings settings) {
-        return settings.inputPort();
+    /** This application's input (the agent of its slot): 4794N for slot N. */
+    int inputPort() {
+        return 47940 + slot;
     }
 }

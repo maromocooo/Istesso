@@ -150,7 +150,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             input = 0;
             inputLine = getString(R.string.need_pair);
         } else {
-            input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(), app.inputPort(settings)));
+            input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(), app.inputPort()));
             if (input == 0) {
                 String why = Native.lastError(Native.ERROR_PAIRING);
                 inputLine = getString(R.string.input_over) + " "
@@ -182,7 +182,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (!resumed || !surfaceReady || picture != null) {
             return;
         }
-        picture = new Picture(settings.configDir, Settings.join(settings.host(), app.picturePort(settings)),
+        picture = new Picture(settings.configDir, Settings.join(settings.host(), app.picturePort()),
                 settings.hostId(), view.getHolder().getSurface(), this);
         picture.start();
     }

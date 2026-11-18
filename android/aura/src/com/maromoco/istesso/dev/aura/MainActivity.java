@@ -20,8 +20,6 @@ import android.widget.TextView;
 public final class MainActivity extends Activity {
     private Settings settings;
     private EditText host;
-    private EditText picturePort;
-    private EditText inputPort;
     private EditText code;
     private TextView status;
     private Button pair;
@@ -51,13 +49,6 @@ public final class MainActivity extends Activity {
         host.setText(settings.host());
         column.addView(host);
 
-        picturePort = field(R.string.picture_port_hint, InputType.TYPE_CLASS_NUMBER);
-        picturePort.setText(String.valueOf(settings.picturePort()));
-        column.addView(picturePort);
-
-        inputPort = field(R.string.input_port_hint, InputType.TYPE_CLASS_NUMBER);
-        inputPort.setText(String.valueOf(settings.inputPort()));
-        column.addView(inputPort);
 
         // The code has letters and digits (ABCD-EFGH), so it is a text field; shown while typed (the owner types it
         // with the headset's own on-screen keyboard and must see it), in capitals, without suggestions.
@@ -109,17 +100,8 @@ public final class MainActivity extends Activity {
             status.setText(R.string.need_host);
             return false;
         }
-        settings.setHost(h, port(picturePort, Settings.PICTURE_PORT), port(inputPort, Settings.INPUT_PORT));
+        settings.setHost(h);
         return true;
-    }
-
-    private static int port(EditText e, int otherwise) {
-        try {
-            int p = Integer.parseInt(e.getText().toString().trim());
-            return p > 0 && p < 65536 ? p : otherwise;
-        } catch (NumberFormatException ex) {
-            return otherwise;
-        }
     }
 
     private void showPaired() {

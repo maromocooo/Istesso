@@ -8,14 +8,13 @@ import java.io.File;
 
 /**
  * What the application remembers, all in its own storage, which no other application can read:
- * the host's address and ports, and which paired device it is. The device's key and the list of
+ * the host's address, and which paired device it is (each application's ports are fixed:
+ * {@link HostApp}). The device's key and the list of
  * paired devices are in {@link #configDir}, kept by the Rust library as `istesso` keeps them.
  * The pairing code is never kept.
  */
 final class Settings {
     static final String DEVICE_NAME = "aura-proto";
-    static final int PICTURE_PORT = 47914;
-    static final int INPUT_PORT = 47924;
 
     private final SharedPreferences prefs;
     final String configDir;
@@ -37,14 +36,11 @@ final class Settings {
     }
 
     String host() { return prefs.getString("host", ""); }
-    int picturePort() { return prefs.getInt("picture_port", PICTURE_PORT); }
-    int inputPort() { return prefs.getInt("input_port", INPUT_PORT); }
     String hostId() { return prefs.getString("host_id", ""); }
     String hostName() { return prefs.getString("host_name", ""); }
 
-    void setHost(String host, int picturePort, int inputPort) {
-        prefs.edit().putString("host", host.trim()).putInt("picture_port", picturePort)
-                .putInt("input_port", inputPort).apply();
+    void setHost(String host) {
+        prefs.edit().putString("host", host.trim()).remove("picture_port").remove("input_port").apply();
     }
 
     void setPaired(String id, String name) {
