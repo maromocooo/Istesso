@@ -46,7 +46,7 @@ final class Native {
 
     /**
      * Waits up to waitMs. NEXT_FRAME: the frame is at the start of `into` and meta holds
-     * {length, seq, pts_ns, key_frame, discontinuity, whole_ns}. One thread calls this.
+     * {length, seq, pts_ns, key_frame, discontinuity, whole_ns, encoded_ns}. One thread calls this.
      */
     static native int watchNext(long watch, int waitMs, ByteBuffer into, long[] meta);
 
@@ -71,4 +71,7 @@ final class Native {
     static native void inputClose(long input);
 
     static native String lastError(int which);
+
+    /** TRIAL ONLY: how often quick acknowledgements were set on the picture's socket; -1 without. */
+    static native long quickackRearms();
 }

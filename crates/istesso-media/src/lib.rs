@@ -295,6 +295,20 @@ pub(crate) mod testing {
     }
 }
 
+// TRIAL ONLY (the AURA prototype): quick acknowledgements on the viewer's socket (quickack.rs).
+// After all the library's code and before its tests, so that nothing of the library moves. In
+// every other build the macro below is all there is, and it expands to nothing.
+#[cfg(all(target_os = "android", feature = "quickack"))]
+pub mod quickack;
+#[cfg(not(all(target_os = "android", feature = "quickack")))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! quickack_rearm {
+    ($stream:expr) => {
+        ()
+    };
+}
+
 #[cfg(test)]
 mod failure_tests {
     use super::{Error, Failure};

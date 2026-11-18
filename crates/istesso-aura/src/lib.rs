@@ -15,7 +15,6 @@
 //! keeps them in (in the application's own folder). The texts handed back for the screen never
 //! contain them.
 
-use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
@@ -258,9 +257,17 @@ pub fn pair_join(
 // JNI: class com.maromoco.istesso.dev.aura.Native
 // ---------------------------------------------------------------------------------------------
 
-thread_local! {
-    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+// The initializer is const already; clippy for Android says otherwise (its expansion of
+// thread_local! differs there).
+#[allow(clippy::missing_const_for_thread_local)]
+mod last_error {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(super) static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+    }
 }
+use last_error::LAST_ERROR;
 
 fn remember(text: impl Into<String>) {
     LAST_ERROR.with(|last| *last.borrow_mut() = text.into());
@@ -464,7 +471,8 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_watchOpe
 /// `int watchNext(long watch, int waitMs, java.nio.ByteBuffer into, long[] meta)`: as
 /// istesso_media_watch_next. With 1 the frame has been copied to the start of `into` (a direct
 /// buffer, a decoder's input buffer) and `meta` holds {length, seq, pts_ns, key_frame,
-/// discontinuity, whole_ns}. -2: the frame did not fit and was dropped (ask for a key frame).
+/// discontinuity, whole_ns, encoded_ns} (whole_ns on this device's monotonic clock, encoded_ns on
+/// the host's clock: only their changes can be compared). -2: the frame did not fit and was dropped (ask for a key frame).
 /// One thread calls this.
 ///
 /// # Safety
@@ -511,9 +519,15 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_watchNex
             frame.key_frame as i64,
             frame.discontinuity as i64,
             frame.whole_ns as i64,
+            frame.encoded_ns as i64,
         ];
         if !meta.is_null() {
-            set(env, meta, 0, values.len() as jsize, values.as_ptr());
+            let room = (**env)
+                .GetArrayLength
+                .map_or(0, |len| len(env, meta))
+                .max(0) as usize;
+            let n = values.len().min(room);
+            set(env, meta, 0, n as jsize, values.as_ptr());
         }
     }
     1
@@ -740,6 +754,26 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputClo
     if input != 0 {
         // SAFETY: the caller's promise.
         unsafe { istesso_input_close(input as *mut c_void) }
+    }
+}
+
+/// `long quickackRearms()`: how often quick acknowledgements were set on the viewer's socket
+/// (TRIAL ONLY, istesso-media's quickack.rs); -1 in a build without them.
+///
+/// # Safety
+/// Called by the Java virtual machine.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_quickackRearms(
+    _env: *mut JNIEnv,
+    _class: jclass,
+) -> jlong {
+    #[cfg(all(target_os = "android", feature = "quickack"))]
+    {
+        istesso_media::quickack::rearms() as jlong
+    }
+    #[cfg(not(all(target_os = "android", feature = "quickack")))]
+    {
+        -1
     }
 }
 

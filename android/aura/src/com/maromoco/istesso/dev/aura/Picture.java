@@ -66,6 +66,59 @@ final class Picture {
     private final AtomicLong gapMaxNs = new AtomicLong();
     private final AtomicLong cuts = new AtomicLong();
     private volatile long lastArrivalNs;
+
+    // ---- the one-way delay's increase (TRIAL; docs/m8-aura-prototype.md, 7.5) ----
+    // d = arrival here (this device's monotonic clock) - the host's encoder end (the host's
+    // clock). The clocks are not aligned, so d itself means nothing; its increase over a
+    // baseline does. The baseline is the least d of the first 2 s after each connection, then the
+    // least d of each 60 s window, taken over at the window's end (the clocks drift apart slowly).
+    private static final long WARM_NS = 2_000_000_000L;
+    private static final long REBASE_NS = 60_000_000_000L;
+    private long baseline = Long.MAX_VALUE;
+    private boolean baselineReady;
+    private long baselineFrom;
+    private long windowMin = Long.MAX_VALUE;
+    private long windowFrom;
+    private final AtomicLong onewaySumNs = new AtomicLong();
+    private final AtomicLong onewayCount = new AtomicLong();
+    private final AtomicLong onewayMaxNs = new AtomicLong();
+
+    /** On the receiving thread, for every frame. */
+    private void oneWay(long arrivedNs, long encodedNs) {
+        if (encodedNs == 0) {
+            return;
+        }
+        long d = arrivedNs - encodedNs;
+        if (!baselineReady) {
+            if (baselineFrom == 0) {
+                baselineFrom = arrivedNs;
+            }
+            baseline = Math.min(baseline, d);
+            if (arrivedNs - baselineFrom >= WARM_NS) {
+                baselineReady = true;
+                windowFrom = arrivedNs;
+                windowMin = Long.MAX_VALUE;
+            }
+            return;
+        }
+        windowMin = Math.min(windowMin, d);
+        if (arrivedNs - windowFrom >= REBASE_NS) {
+            baseline = windowMin;
+            windowMin = Long.MAX_VALUE;
+            windowFrom = arrivedNs;
+        }
+        long up = Math.max(0, d - baseline);
+        onewaySumNs.addAndGet(up);
+        onewayCount.incrementAndGet();
+        max(onewayMaxNs, up);
+    }
+
+    /** A new connection: a new baseline (the host's pipeline clock may have started anew). */
+    private void newBaseline() {
+        baseline = Long.MAX_VALUE;
+        baselineReady = false;
+        baselineFrom = 0;
+    }
     /** When each queued frame had arrived, by its presentation time, for the time to its render. */
     private final long[] ringPtsUs = new long[128];
     private final long[] ringArrivalNs = new long[128];
@@ -112,14 +165,20 @@ final class Picture {
         long sum = lagSumNs.getAndSet(0);
         long lmax = lagMaxNs.getAndSet(0);
         long gap = gapMaxNs.getAndSet(0);
+        long ow = onewayCount.getAndSet(0);
+        long owSum = onewaySumNs.getAndSet(0);
+        long owMax = onewayMaxNs.getAndSet(0);
         long last = lastArrivalNs;
         if (last != 0) {
             gap = Math.max(gap, now - last);
         }
         double seconds = windowNs / 1e9;
         return String.format(java.util.Locale.ROOT,
-                "frames=%d mbit=%.1f frame_bytes_max=%d queued=%d rendered=%d in_decoder=%d input_wait_ms=%.1f render_ms_max=%.1f render_ms_mean=%.1f dropped=%d gap_ms_max=%.0f cuts=%d",
-                frames, bytes * 8 / 1e6 / seconds, frameMaxBytes.getAndSet(0), q, r, queuedTotal.get() - renderedTotal.get(),
+                "frames=%d mbit=%.1f frame_bytes_max=%d oneway_up_ms_max=%s oneway_up_ms_mean=%s quickack_rearms=%d queued=%d rendered=%d in_decoder=%d input_wait_ms=%.1f render_ms_max=%.1f render_ms_mean=%.1f dropped=%d gap_ms_max=%.0f cuts=%d",
+                frames, bytes * 8 / 1e6 / seconds, frameMaxBytes.getAndSet(0),
+                ow == 0 ? "-" : String.format(java.util.Locale.ROOT, "%.1f", owMax / 1e6),
+                ow == 0 ? "-" : String.format(java.util.Locale.ROOT, "%.1f", owSum / 1e6 / ow),
+                Native.quickackRearms(), q, r, queuedTotal.get() - renderedTotal.get(),
                 inputWaitNs.getAndSet(0) / 1e6, lmax / 1e6, n == 0 ? 0 : sum / 1e6 / n,
                 dropped.getAndSet(0), gap / 1e6, cuts.get());
     }
@@ -173,7 +232,7 @@ final class Picture {
             return;
         }
         told.connecting();
-        long[] meta = new long[6];
+        long[] meta = new long[7];
         int held = -1;
         boolean waitForKey = true;
         try {
@@ -219,6 +278,7 @@ final class Picture {
                             max(gapMaxNs, arrived - lastArrivalNs);
                         }
                         lastArrivalNs = arrived;
+                        oneWay(arrived, meta[6]);
                         if (codec == null || held < 0) {
                             dropped.incrementAndGet();
                             break;
@@ -239,6 +299,7 @@ final class Picture {
                         break;
                     }
                     case Native.NEXT_CONNECTED: {
+                        newBaseline();
                         int[] info = Native.watchInfo(watch);
                         if (info == null) {
                             break;

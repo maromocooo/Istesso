@@ -12,6 +12,11 @@ publish.workspace = true
 # The library for Rust callers is only there for the tests.
 crate-type = ["cdylib", "lib"]
 
+[features]
+# TRIAL ONLY: quick acknowledgements on the viewer's socket (istesso-media's src/quickack.rs).
+# Turned on by android/aura/build.sh only.
+quickack = ["istesso-media/quickack"]
+
 [dependencies]
 istesso-pair.workspace = true
 istesso-link.workspace = true

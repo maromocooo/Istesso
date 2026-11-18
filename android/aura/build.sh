@@ -103,7 +103,7 @@ do_build() {
         export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$llvm/aarch64-linux-android34-clang" \
             CC_aarch64_linux_android="$llvm/aarch64-linux-android34-clang" \
             AR_aarch64_linux_android="$llvm/llvm-ar" &&
-        guarded cargo build --release --target aarch64-linux-android -p istesso-aura)
+        guarded cargo build --release --target aarch64-linux-android -p istesso-aura --features quickack)
     cp "$repo/target/aarch64-linux-android/release/libistesso_aura.so" "$out/stage/lib/arm64-v8a/"
 
     echo "== resources and manifest"

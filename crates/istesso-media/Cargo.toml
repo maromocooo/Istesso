@@ -13,6 +13,11 @@ publish.workspace = true
 # shared library, the viewer on the Mac links the static one.
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[features]
+# TRIAL ONLY, for the AURA prototype: quick acknowledgements on the viewer's socket on Android
+# (src/quickack.rs). Only android/aura/build.sh turns it on; no other build changes with it.
+quickack = []
+
 [dependencies]
 istesso-pair.workspace = true
 istesso-link.workspace = true

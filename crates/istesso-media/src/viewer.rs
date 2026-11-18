@@ -303,8 +303,7 @@ impl Viewer {
                 let ask = serde_json::to_vec(&Ask::KeyFrame).map_err(|_| Error::Malformed)?;
                 self.channel.send(&ask)?;
             }
-            // The host counts as silent only when nothing of it is there to be read:
-            // what arrived while nobody was asking is not silence.
+            // Silent only when nothing of the host waits to be read: what came unasked is not.
             let left = until.saturating_duration_since(Instant::now());
             let silent_in = SILENT_AFTER.saturating_sub(self.last_heard.elapsed());
             let ready = wait_for(
@@ -326,6 +325,7 @@ impl Viewer {
             }
             let first_ns = clock::now_ns();
             self.packet = self.channel.recv()?;
+            crate::quickack_rearm!(self.channel.stream().stream()); // AURA trial only (quickack.rs)
             let whole_ns = clock::now_ns();
             self.last_heard = Instant::now();
             match wire::decode(&self.packet) {
