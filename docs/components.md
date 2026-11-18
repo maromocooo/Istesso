@@ -24,6 +24,7 @@
 | libc | OS の呼び出し。映像の経路（`istesso-media`、[ADR 0015](adr/0015-media-transport.md)）が、接続と合図を同時に待つこと（`poll`）、計測の道具と同じ時計を読むこと、受信スレッドの優先度を上げることに使う。ペアリングの記録（`istesso-pair`、[ADR 0006](adr/0006-pairing.md)）は、いくつものプロセスが同時に書き換えても互いの変更を失わないように、ファイルの錠（`flock`）に使う。これまでも、ほかのクレートの依存として入っていた | MIT OR Apache-2.0 | <https://github.com/rust-lang/libc> |
 | winit、softbuffer | テストアプリ（`istesso-flash`）の窓と描画。`istesso` 本体には入らない | Apache-2.0、MIT OR Apache-2.0 | <https://github.com/rust-windowing/winit>、<https://github.com/rust-windowing/softbuffer> |
 | glutin、glutin-winit、glow | テストアプリが GPU で描くときの OpenGL（`--draw gpu`）。`istesso` 本体には入らない | Apache-2.0、MIT、MIT OR Apache-2.0 OR Zlib | <https://github.com/rust-windowing/glutin>、<https://github.com/grovesNL/glow> |
+| jni-sys | AURA の試作のクライアント（`istesso-aura`。M8、[m8-aura-prototype.md](m8-aura-prototype.md)）が、Android の Java から Rust を呼ぶための、JNI の関数表だけ。包むクレート（`jni`）は使わない | MIT OR Apache-2.0 | <https://github.com/jni-rs/jni-sys> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。使うのは、コンポジターの本体（gst-wayland-display の `wayland-display-core`）です。元のコミットに小さな修正を重ね、修正は元のプロジェクトに提案できる形に保ちます（[ADR 0009](adr/0009-host-compositor.md)）。入力はコンポジターに直接渡すので、仮想入力（inputtino）は、ゲームパッドが要るようになるまで使いません。
