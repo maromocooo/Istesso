@@ -10,6 +10,7 @@ import android.util.Log;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Receives the host's picture and decodes it in hardware onto a surface.
@@ -48,6 +49,79 @@ final class Picture {
     private MediaCodec codec;
     private Thread drainer;
     private volatile boolean draining;
+
+    // ---- counters for the once-a-second log line (sizes and times only, nothing of the content) ----
+    private final AtomicLong framesIn = new AtomicLong();
+    private final AtomicLong bytesIn = new AtomicLong();
+    private final AtomicLong queuedWindow = new AtomicLong();
+    private final AtomicLong renderedWindow = new AtomicLong();
+    private final AtomicLong queuedTotal = new AtomicLong();
+    private final AtomicLong renderedTotal = new AtomicLong();
+    private final AtomicLong dropped = new AtomicLong();
+    private final AtomicLong inputWaitNs = new AtomicLong();
+    private final AtomicLong lagSumNs = new AtomicLong();
+    private final AtomicLong lagCount = new AtomicLong();
+    private final AtomicLong lagMaxNs = new AtomicLong();
+    private final AtomicLong gapMaxNs = new AtomicLong();
+    private final AtomicLong cuts = new AtomicLong();
+    private volatile long lastArrivalNs;
+    /** When each queued frame had arrived, by its presentation time, for the time to its render. */
+    private final long[] ringPtsUs = new long[128];
+    private final long[] ringArrivalNs = new long[128];
+    private int ringNext;
+
+    private void remember(long ptsUs, long arrivalNs) {
+        synchronized (ringPtsUs) {
+            ringPtsUs[ringNext] = ptsUs;
+            ringArrivalNs[ringNext] = arrivalNs;
+            ringNext = (ringNext + 1) % ringPtsUs.length;
+        }
+    }
+
+    private long arrivalOf(long ptsUs) {
+        synchronized (ringPtsUs) {
+            for (int i = 0; i < ringPtsUs.length; i++) {
+                if (ringPtsUs[i] == ptsUs && ringArrivalNs[i] != 0) {
+                    long at = ringArrivalNs[i];
+                    ringArrivalNs[i] = 0;
+                    return at;
+                }
+            }
+        }
+        return 0;
+    }
+
+    private static void max(AtomicLong m, long v) {
+        m.accumulateAndGet(v, Math::max);
+    }
+
+    /**
+     * The counters of the last window as one line, and a new window. Frames and bytes received,
+     * frames queued to the decoder and rendered, frames in the decoder, time spent waiting for a
+     * decoder input buffer, time from a frame's arrival (whole, on the monotonic clock) to its
+     * release for rendering, frames dropped here, the longest time without a frame, cuts so far.
+     */
+    String statsLine(long windowNs) {
+        long now = System.nanoTime();
+        long frames = framesIn.getAndSet(0);
+        long bytes = bytesIn.getAndSet(0);
+        long q = queuedWindow.getAndSet(0);
+        long r = renderedWindow.getAndSet(0);
+        long n = lagCount.getAndSet(0);
+        long sum = lagSumNs.getAndSet(0);
+        long lmax = lagMaxNs.getAndSet(0);
+        long gap = gapMaxNs.getAndSet(0);
+        long last = lastArrivalNs;
+        if (last != 0) {
+            gap = Math.max(gap, now - last);
+        }
+        double seconds = windowNs / 1e9;
+        return String.format(java.util.Locale.ROOT,
+                "frames=%d mbit=%.1f queued=%d rendered=%d in_decoder=%d input_wait_ms=%.1f render_ms_max=%.1f render_ms_mean=%.1f dropped=%d gap_ms_max=%.0f cuts=%d",
+                frames, bytes * 8 / 1e6 / seconds, q, r, queuedTotal.get() - renderedTotal.get(),
+                inputWaitNs.getAndSet(0) / 1e6, lmax / 1e6, n == 0 ? 0 : sum / 1e6 / n,
+                dropped.getAndSet(0), gap / 1e6, cuts.get());
+    }
     private int width;
     private int height;
 
@@ -104,8 +178,10 @@ final class Picture {
         try {
             while (!stop) {
                 if (codec != null && held < 0) {
+                    long askedAt = System.nanoTime();
                     try {
                         held = codec.dequeueInputBuffer(10_000);
+                        inputWaitNs.addAndGet(System.nanoTime() - askedAt);
                     } catch (IllegalStateException e) {
                         Log.w(TAG, "the decoder failed; it is made again");
                         closeCodec();
@@ -131,20 +207,35 @@ final class Picture {
                 }
                 int got = Native.watchNext(watch, 100, into, meta);
                 switch (got) {
-                    case Native.NEXT_FRAME:
+                    case Native.NEXT_FRAME: {
+                        // When the whole frame had been read: istesso_media_now_ns(), which on Android is the
+                        // monotonic clock, the one System.nanoTime() reads.
+                        long arrived = meta[5];
+                        framesIn.incrementAndGet();
+                        bytesIn.addAndGet(meta[0]);
+                        if (lastArrivalNs != 0) {
+                            max(gapMaxNs, arrived - lastArrivalNs);
+                        }
+                        lastArrivalNs = arrived;
                         if (codec == null || held < 0) {
+                            dropped.incrementAndGet();
                             break;
                         }
                         boolean key = meta[3] != 0;
                         if (waitForKey && !key) {
+                            dropped.incrementAndGet();
                             break; // keep the buffer for the next frame
                         }
                         waitForKey = false;
                         int length = (int) meta[0];
                         long ptsUs = meta[2] / 1000;
+                        remember(ptsUs, arrived);
                         codec.queueInputBuffer(held, 0, length, ptsUs, key ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
+                        queuedWindow.incrementAndGet();
+                        queuedTotal.incrementAndGet();
                         held = -1;
                         break;
+                    }
                     case Native.NEXT_CONNECTED: {
                         int[] info = Native.watchInfo(watch);
                         if (info == null) {
@@ -166,11 +257,14 @@ final class Picture {
                         break;
                     }
                     case Native.NEXT_CUT:
+                        cuts.incrementAndGet();
+                        Log.i("IstessoAura", "picture: cut, connecting again");
                         long[] state = Native.watchState(watch);
                         told.cut(state == null ? 0 : state[0]);
                         waitForKey = true;
                         break;
                     case Native.NEXT_TOO_BIG:
+                        dropped.incrementAndGet();
                         Log.w(TAG, "a frame did not fit the decoder's buffer; a key frame is asked for");
                         waitForKey = true;
                         Native.watchAskKeyFrame(watch);
@@ -299,6 +393,15 @@ final class Picture {
             if (index >= 0) {
                 try {
                     c.releaseOutputBuffer(index, true);
+                    long at = arrivalOf(info.presentationTimeUs);
+                    if (at != 0) {
+                        long lag = System.nanoTime() - at;
+                        lagSumNs.addAndGet(lag);
+                        lagCount.incrementAndGet();
+                        max(lagMaxNs, lag);
+                    }
+                    renderedWindow.incrementAndGet();
+                    renderedTotal.incrementAndGet();
                 } catch (IllegalStateException e) {
                     return;
                 }
@@ -326,5 +429,7 @@ final class Picture {
         }
         codec.release();
         codec = null;
+        // What was in the old decoder is gone with it.
+        queuedTotal.set(renderedTotal.get());
     }
 }

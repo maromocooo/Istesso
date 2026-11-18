@@ -60,15 +60,40 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private float scrollX;
     private float scrollY;
 
+    private long statsSince;
+
     private final Runnable inputWatch = new Runnable() {
         @Override
         public void run() {
             showInput();
+            logStats();
             if (resumed) {
                 status.postDelayed(this, 1000);
             }
         }
     };
+
+    /**
+     * Once a second, one line for this panel (tag IstessoAura): the picture's counters and the
+     * input's state. Sizes, counts and times only; never a key, a code or anything of the content.
+     * The input library does not say how much is waiting to be sent, so that is not in the line.
+     */
+    private void logStats() {
+        long now = System.nanoTime();
+        long window = statsSince == 0 ? 1_000_000_000L : now - statsSince;
+        statsSince = now;
+        Picture p = picture;
+        StringBuilder b = new StringBuilder("stats panel=").append(app.name).append(' ');
+        b.append(p == null ? "picture=none" : p.statsLine(window));
+        long[] s = input == 0 ? null : Native.inputState(input);
+        if (s == null) {
+            b.append(" input=none");
+        } else {
+            b.append(" input_open=").append(s[1]).append(" input_answered=").append(s[2])
+                    .append(" input_cuts=").append(s[0]).append(" input_over=").append(s[3]);
+        }
+        Log.i("IstessoAura", b.toString());
+    }
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -157,6 +182,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                         + (why.isEmpty() ? Native.lastError(Native.ERROR_INPUT) : why);
             }
         }
+        statsSince = 0;
+        status.removeCallbacks(inputWatch); // one loop, also when the panel comes back within a second
         status.post(inputWatch);
         view.requestFocus();
         startPicture();
