@@ -188,9 +188,9 @@ scripts/daily.sh stop            # 全部を閉じて、2 台の上の試用版�
 持ち主の決め（2026-11-19）：アプリを起動する部分は、試用版と AURA の試作で 1 つにする。AURA の試作の `scripts/aura-trial.sh` は、前の版の `daily.sh` を写していたので、バスにポータルがあり、`LC_ALL=C` のままだった（ファイルを選ぶ窓が出ず、エディターが英語だった）。
 
 - `scripts/daily.sh open NAME --for aura [--size 幅x高さ] [--document PATH]`：ホストの側だけを起動します（Mac の窓と中継はない。AURA が窓で、AURA がホストへ自分でつなぐ）。アプリのセッションの作り方は、試用版とまったく同じです（自分のバス、ポータルなし、机の言葉と見た目、Blender の設定の写し、呼んでいる窓の数、番号で止める、計測の合図）。
-- 違うところ：AURA の枠（1 つだけ。絵は 47914、入力は 47924）。絵は 4:2:0、72 フレーム毎秒、大きさは AURA が言うもの（言わなければ 1920x1080）、ポインターは絵に描き込む（`--cursor` なし）。ホストの身元は、AURA とペアリングした試用の身元（`~/.cache/istesso-aura-trial/config`。**読むだけ**。`DAILY_AURA_CONFIG` で替えられる）。ホストの中の名前は `aura-<アプリ>`。開けるのは `editor`、`firefox`、`blender`、`chrome`。
-- 計測の合図：`busy` で止め、`free` で、ホストの見張りが絵をもう 1 度出します（Mac の側で開き直すものがないため）。
-- `scripts/daily.sh close NAME --for aura`、`list`（窓の欄が `window on AURA`）、`stop`（AURA の分も閉じる）。
+- 違うところ：**AURA の枠は、アプリごとに番号が決まっています**（持ち主の決め「ホストのアプリ 1 つに、パネル 1 枚」）。`editor` は 1、`firefox` は 2、`blender` は 3、`chrome` は 4。枠 N の絵は **4793N**、入力は **4794N**（Mac の窓の 4791N、4792N とは重ならない）。枠ごとに、エンコーダー、隠れたコンポジター、入力のエージェントが 1 つずつ。**同時に開けるのは 3 つまで**で、4 つ目は `3 applications are open for AURA already (at most 3 at once: …): close one first` と断ります（Mac の窓の 3 つと合わせて、エンコーダーは多くて 6。カード全体の 12 の中）。絵は 4:2:0、72 フレーム毎秒、大きさは AURA が言うもの（言わなければ 1920x1080）、ポインターは絵に描き込む（`--cursor` なし）。ホストの身元は、AURA とペアリングした試用の身元（`~/.cache/istesso-aura-trial/config`。**読むだけ**で、どの枠も同じものを使う。`DAILY_AURA_CONFIG` で替えられる）。ホストの中の名前は `aura-<アプリ>`。開けるのは `editor`、`firefox`、`blender`、`chrome`。
+- 計測の合図：どの枠も同じに、`busy` で止め（絵を止めてエンコーダーを手放し、全部のプロセスを止めたままにする）、`free` で動かし直し、ホストの見張りが絵をもう 1 度出します（Mac の側で開き直すものがないため）。
+- `scripts/daily.sh close NAME --for aura`、`list`（`aura-firefox  AURA slot 2  …  window on AURA (picture 47932, input 47942)` の形で、どの枠でどのアプリが動いているか）、`stop`（AURA の分も閉じる）。
 - ペアリング：`scripts/daily.sh aura-pair-line` が、持ち主がホストで打つ 1 行を出します（ここでは動かさない）。
 - `--document PATH`（試用版でも AURA でも）：ホストの、試用版のソースの写しの中のファイル（たとえば `crates/istesso-agent/src/serve.rs`）を、文書のフォルダー（`~/.cache/istesso-daily-wip/documents/`）に 1 回だけ写し（もうあれば、そのまま使う。書き足したものが残る）、それを開きます。Text Editor はそのファイル、Firefox と Chrome はそのファイルを開き、Blender は `.blend` だけ。
 - `aura-trial.sh` は、`setup` と `status` のほかは、`daily.sh` を呼ぶだけにできます（どう替えるかは AURA の流れが決める）。ソースの写しとプラグインは、試用版のもの（`~/.cache/istesso-daily-wip`）を使います。
@@ -312,6 +312,16 @@ Mac にも、ホストの机にも、何も出していません。Mac のビュ
 | 4 のつづき：AURA の身元のフォルダー | 開く前と閉じた後で、名前、大きさ、時刻が同じ | 読むだけだった |
 
 AURA の機械はつながっていません（ホストの側の確かめだけ）。
+
+### AURA の枠を、アプリごとに（2026-11-19 0:36〜0:37 の確かめ）
+
+| 確かめ | 見たこと | 結果 |
+|---|---|---|
+| 3 つ同時 | `editor`、`firefox`、`blender` を `--for aura` で：枠 1、2、3。ホストで 47931〜47933 と 47941〜47943 が待ち受け。パイプラインは枠ごとに別（`--to-channel 4793N`）、カードの上でそれぞれのフレームバッファ（441〜455 MB）。エージェントは `--port 4794N`。身元はどれも `~/.cache/istesso-aura-trial/config`。机のバスに、どれも 0 | 通った |
+| 4 つ目は断る | `chrome --for aura`：`3 applications are open for AURA already (at most 3 at once: editor firefox blender): close one first` | 通った |
+| 計測の合図（代わり） | `busy` から 2.3 秒で 3 つとも `held … picture stopped and its encoder given back`（firefox 14、editor 5、blender 5 のプロセス、止まっていないものは 0）。`free` で 3 つとも `let … go on` と `resumed` | 通った |
+| 1 つ閉じると開ける | `close firefox --for aura` のあと、`chrome --for aura` が枠 4（47934、47944）で開いた。`list` に、枠 1、3、4 と、そのアプリ | 通った |
+| 身元のフォルダー | 時刻は、ペアリングしたときのまま（`identity.key` 22:01、`peers.json` 22:03） | 読むだけだった |
 
 ## 机に出ていたクラッシュの窓（2026-11-19、外から読んで調べた）
 

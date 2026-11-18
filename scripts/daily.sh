@@ -17,10 +17,11 @@
 #                                     start the application on the host and show it; one that already
 #                                     runs is shown again. --document: a file of the trial's copy of
 #                                     the source (e.g. crates/istesso-agent/src/serve.rs), copied once
-#                                     into its documents folder and opened. --for aura: in AURA's slot
-#                                     (picture 47914, input 47924, 4:2:0, 72 fps, WxH as AURA asks,
-#                                     1920x1080 if not said), with the trial identity AURA is paired
-#                                     with; nothing is shown here
+#                                     into its documents folder and opened. --for aura: in the AURA
+#                                     slot of that application (editor 1, firefox 2, blender 3,
+#                                     chrome 4: picture 4793N, input 4794N; 4:2:0, 72 fps, WxH as AURA
+#                                     asks, 1920x1080 if not said), with the trial identity AURA is
+#                                     paired with; at most 3 at once; nothing is shown here
 #   scripts/daily.sh list             what is open, and in which state
 #   scripts/daily.sh close NAME [--for aura]
 #                                     ask the application to close its windows; one that is still
@@ -130,9 +131,14 @@ staged="$bundle_place/$bundle_name.staged"
 
 apps="firefox blender editor chrome"
 known_name() { case "${1:-}" in firefox | blender | editor | chrome) return 0 ;; *) return 1 ;; esac; }
-# What can be opened for AURA (--for aura), in AURA's slot of its own; on the host its run is
-# "aura-NAME". The trial identity of the host that AURA is paired with is only read.
+# What can be opened for AURA (--for aura), each in an AURA slot of its own with a fixed number
+# (editor 1, firefox 2, blender 3, chrome 4: picture on 4793N, input on 4794N, apart from this Mac's
+# 4791N and 4792N); at most aura_max at once, each with its own encoder, hidden compositor and
+# agent. On the host the run is "aura-NAME". The trial identity of the host that AURA is paired
+# with is only read, and shared by the slots.
 aura_apps="editor firefox blender chrome"
+aura_max=3
+aura_slot() { case "$1" in editor) echo 1 ;; firefox) echo 2 ;; blender) echo 3 ;; chrome) echo 4 ;; esac; }
 aura_known() { case "${1:-}" in editor | firefox | blender | chrome) return 0 ;; *) return 1 ;; esac; }
 aura_config=${DAILY_AURA_CONFIG:-'~/.cache/istesso-aura-trial/config'}
 aura_size=1920x1080
@@ -431,7 +437,7 @@ let_go() { # NAME: the opposite of holding it
     echo "$(date '+%H:%M:%S') let $1 go on"
     [ "${1#aura-}" = blender ] && blender_settings_check "after a measurement's pause" "$1"
     # For AURA nobody opens a window again here: its picture goes on with the application.
-    [ "$(cat "$run/slot" 2>/dev/null)" = aura ] && tell "$1" resume
+    case "$(cat "$run/slot" 2>/dev/null)" in aura*) tell "$1" resume ;; esac
     return 0
 }
 end_members() { # RUN PART: asked to end by number; what is still there two seconds later is ended
@@ -504,7 +510,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -721,9 +727,10 @@ signal_busy && { echo "host: a latency measurement is running: nothing is starte
 [ -x "$src/target/release/istesso" ] && [ -e "$src/target/release/libistesso_media.so" ] || { echo "host: the trial's copy is not built in $src (scripts/daily.sh setup)"; exit 1; }
 config=""
 [ -n "$HOST_CONFIG" ] && config=$(eval echo "$HOST_CONFIG")
-# For AURA (--for aura): the slot of its own (picture 47914, input 47924), 4:2:0 at 72 frames a
-# second, the size AURA asks for, the pointer drawn into the picture, and the trial identity that
-# AURA is paired with (only read). Its run is "aura-NAME"; everything else is the same.
+# For AURA (--for aura): the application's own AURA slot (picture 4793N, input 4794N), 4:2:0 at 72
+# frames a second, the size AURA asks for, the pointer drawn into the picture, and the trial
+# identity that AURA is paired with (only read, shared). Its run is "aura-NAME"; everything else is
+# the same.
 APP=${NAME#aura-}
 pipe_options="--cursor --fps 85"
 if [ "$FOR" = aura ]; then
@@ -754,11 +761,16 @@ if still_runs "$run/pipeline.pid"; then
     fi
 else
     if [ "$FOR" = aura ]; then
-        # AURA's slot: one application at a time.
+        # The application's own AURA slot, and no more than AURA_MAX of them at once.
+        case "$APP" in editor) n=1 ;; firefox) n=2 ;; blender) n=3 ;; chrome) n=4 ;; *) echo "fail $APP has no AURA slot"; exit 2 ;; esac
+        open_now=""
         for other in $(running_names); do
-            [ "$(cat "$D/run/$other/slot" 2>/dev/null)" = aura ] && { echo "fail $other is open for AURA already: close it first"; exit 5; }
+            case "$(cat "$D/run/$other/slot" 2>/dev/null)" in aura*) open_now="$open_now ${other#aura-}" ;; esac
         done
-        slot=aura; port=47914; agent_port=47924
+        if [ "$(echo $open_now | wc -w)" -ge "$AURA_MAX" ]; then
+            echo "fail $AURA_MAX applications are open for AURA already (at most $AURA_MAX at once:$open_now): close one first"; exit 5
+        fi
+        slot=aura$n; port=$((47930 + n)); agent_port=$((47940 + n))
     else
         # A slot of the three: the first that no running application has.
         slot=""
@@ -1044,14 +1056,14 @@ HOST
 # guard holds it still for a measurement and lets its picture go on afterwards).
 open_for_aura() {
     find_the_way || exit 1
-    local kind=$name answer host_side
-    name=aura-$kind
+    local kind=$name answer host_side n
+    name=aura-$kind; n=$(aura_slot "$kind")
     answer=$(host_open)
     printf '%s\n' "$answer" | grep -v '^\(slot\|way\|peer\|fail\) ' | grep .
     printf '%s\n' "$answer" | grep -q '^fail ' && { printf '%s\n' "$answer" | sed -n 's/^fail /error: /p' | head -1; return 1; }
     host_side=$(printf '%s\n' "$answer" | sed -n 's/^way //p' | tail -1)
     [ -n "$host_side" ] || { echo "error: the host did not start $kind for AURA"; return 1; }
-    echo "$kind: open for AURA: picture on the host's port 47914 (4:2:0, 72 frames a second, $size), input on 47924; the host's address on this network: $host_side"
+    echo "$kind: open for AURA in AURA slot $n: picture on the host's port $((47930 + n)) (4:2:0, 72 frames a second, $size), input on $((47940 + n)); the host's address on this network: $host_side"
 }
 
 # Writes down the settings an application was opened with, so that the guard opens it again the same way.
@@ -1290,7 +1302,8 @@ HOST
     printf '%s\n' "$answer" | while read -r each slot what windows picture calling; do
         if [ "${each#aura-}" != "$each" ]; then
             [ "$what" = ended ] && continue
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window on AURA"
+            local n=${slot#aura}
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "AURA slot $n" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window on AURA (picture $((47930 + n)), input $((47940 + n)))"
             continue
         fi
         known_name "$each" || continue
