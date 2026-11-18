@@ -88,8 +88,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         FrameLayout root = new FrameLayout(this);
         root.addView(frame, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
+        // Bottom right, where an app has the fewest buttons; it goes away 5 s after it last changed and comes back
+        // when something changes (the owner, 2026-11-18: at the top left it covered the editor's buttons).
+        status.setClickable(false);
+        status.setFocusable(false);
         root.addView(status, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START));
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.END));
         setContentView(root);
         line(getString(R.string.mark));
 
@@ -240,8 +244,21 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         show();
     }
 
+    private final Runnable hideStatus = new Runnable() {
+        @Override
+        public void run() {
+            status.setVisibility(View.INVISIBLE);
+        }
+    };
+
     private void line(String text) {
+        if (text.contentEquals(status.getText())) {
+            return;
+        }
         status.setText(text);
+        status.setVisibility(View.VISIBLE);
+        status.removeCallbacks(hideStatus);
+        status.postDelayed(hideStatus, 5000);
     }
 
     private void show() {
