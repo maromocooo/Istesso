@@ -2144,13 +2144,9 @@ type Ending = fn(&Host, &SessionId);
 fn no_way_of_ending_but_a_persons_force_ends_an_application_by_force() {
     // Every way a session ends, each with an application that is still
     // there when it does.
-    let ways: [(&str, Ending); 6] = [
+    let ways: [(&str, Ending); 5] = [
         ("its last window closed", |host, _| {
             host.runner.say(StreamEvent::Said(RunnerEvent::Empty))
-        }),
-        ("no window came", |host, _| {
-            host.runner
-                .say(StreamEvent::Said(RunnerEvent::NoWindowYet { after_s: 60 }))
         }),
         ("the stream died", |host, _| {
             host.runner.say(StreamEvent::Exited("signal 9".into()))
@@ -2287,17 +2283,54 @@ fn an_application_is_opening_until_its_first_window() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(host.look(&id).state, SessionState::Running);
-    // A session that showed no window for long is ended as after `empty`.
+}
+
+#[test]
+fn an_application_that_is_opening_is_never_ended_by_a_timeout() {
+    // The owner, 2026-11-19: heavy applications take long to show a window.
+    let host = host();
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Opening));
+    // No window for long: it is still opening, and nothing is sent to it.
     host.runner
         .say(StreamEvent::Said(RunnerEvent::NoWindowYet { after_s: 60 }));
+    // Said after it, to know that it was read.
+    host.runner.say(StreamEvent::Said(RunnerEvent::Detached {
+        message: "a marker".into(),
+    }));
+    host.follow_until(&id, SessionState::Detached);
+    let info = host.look(&id);
+    assert!(info.opening);
+    assert_eq!(info.end, None);
+    assert_eq!(host.journal.count("app asked to end"), 0);
+    // Its process ends without a window: that ends the session.
+    host.launcher.end_app("exit status 1");
     let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
     assert_eq!(end.reason, EndReason::AppExited);
+    assert_eq!(host.journal.count("app asked to end"), 0);
+}
+
+#[test]
+fn a_left_over_session_goes_by_itself_when_its_processes_end() {
+    let host = host();
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    host.follow_until(&id, SessionState::LeftOver);
+    assert_eq!(host.list(&host.laptop).len(), 1);
+    // Nobody does anything: the processes end by themselves.
+    host.launcher.end_app("exit status 0");
+    let over = host.follow_until(&id, SessionState::Ended);
+    assert_eq!(over.left_over, None);
+    let message = over.end.unwrap().message;
     assert!(
-        end.message
-            .starts_with("the application showed no window within 60 seconds"),
-        "{}",
-        end.message
+        message.ends_with("they ended later (exit status 0)"),
+        "{message}"
     );
+    assert!(host.list(&host.laptop).is_empty());
+    assert!(host.sessions.host_list().is_empty());
+    assert_eq!(host.journal.count("app ended by force"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 1);
 }
 
 /// Rules under which ending by force takes longer than a request to stop

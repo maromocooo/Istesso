@@ -1714,13 +1714,15 @@ impl Inner {
                         continue;
                     }
                     Some(StreamEvent::Said(RunnerEvent::NoWindowYet { after_s })) => {
-                        // The runner concludes nothing. The application's
-                        // processes live (it would have ended above
-                        // otherwise): it is ended as after `empty`, asked
-                        // and never forced.
-                        let why =
-                            format!("the application showed no window within {after_s} seconds");
-                        break 'session ending(EndReason::AppExited, why);
+                        // Never ended for that (the owner, 2026-11-19): a
+                        // heavy application takes long to show a window. It
+                        // stays opening until a window comes, its process
+                        // ends (above), or a person closes it.
+                        (self.log)(format!(
+                            "session {id}: {} has shown no window for {after_s} seconds; it is still opening",
+                            job.app_name
+                        ));
+                        continue;
                     }
                     Some(StreamEvent::Said(RunnerEvent::Error { message })) => {
                         break 'session ending(EndReason::StreamFailed, message)
