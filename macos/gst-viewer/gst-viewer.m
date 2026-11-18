@@ -23,6 +23,19 @@
 // The Command keys are passed on as Control, where applications on Linux expect what Command
 // does on a Mac; with ISTESSO_COMMAND_KEY=super they are passed on as the Super keys.
 //
+// For the everyday trial only (branch trial-daily, docs/trial-daily.md; never in a build that is
+// measured):
+//   ISTESSO_DOCK_TILE=none     the program gets no tile in the Dock and no menu bar of its own
+//                              (an accessory application): the trial's launcher has the one tile
+//   ISTESSO_NO_WINDOW          for checks that must put nothing on the screen: the window is made
+//                              but never shown, the program never becomes the active one and has
+//                              no Dock tile; the picture is received, decoded and handed to the
+//                              window's layer as always, so that the frame log says what came
+//   ISTESSO_END_WITH_WINDOW    the program ends when its window is closed (otherwise it stays,
+//                              with nothing on the screen)
+//   ISTESSO_PID_FILE=PATH      write this program's process number to PATH once it runs: for a
+//                              program started through `open`, which does not say it
+//
 // Decoding with VideoToolbox. GStreamer's own VideoToolbox element holds frames back, so the
 // pipeline may instead end in an application sink called "vt" that hands over H.265 access
 // units:
@@ -1642,6 +1655,16 @@ static NSCursor *empty_cursor(void) {
 
 @end
 
+// The everyday trial's ISTESSO_END_WITH_WINDOW: the program ends with its window.
+@interface EndWithWindow : NSObject <NSApplicationDelegate>
+@end
+
+@implementation EndWithWindow
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+    return YES;
+}
+@end
+
 // A window without a title bar does not take the keyboard unless it says that it can.
 @interface WholeDisplayWindow : NSWindow
 @end
@@ -1711,8 +1734,32 @@ int main(int argc, char *argv[]) {
             return 2;
         }
 
+        // The everyday trial's switches (see the top of this file).
+        BOOL no_window = getenv("ISTESSO_NO_WINDOW") != NULL;
+        const char *dock_tile = getenv("ISTESSO_DOCK_TILE");
+        const char *pid_file = getenv("ISTESSO_PID_FILE");
+        if (pid_file != NULL) {
+            FILE *file = fopen(pid_file, "w");
+            if (file == NULL) {
+                fprintf(stderr, "error: cannot write ISTESSO_PID_FILE\n");
+                return 1;
+            }
+            fprintf(file, "%d\n", (int)getpid());
+            fclose(file);
+        }
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        if (no_window) {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+        } else if (dock_tile != NULL && strcmp(dock_tile, "none") == 0) {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        } else {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        }
+        static EndWithWindow *ender = nil;
+        if (getenv("ISTESSO_END_WITH_WINDOW") != NULL) {
+            ender = [EndWithWindow new];
+            NSApp.delegate = ender;
+        }
         NSRect display = NSZeroRect;
         if (whole_display) {
             // The display the point lies on. Screens count from the bottom left of the main one.
@@ -1755,7 +1802,24 @@ int main(int argc, char *argv[]) {
         if (input_socket >= 0) {
             [window makeFirstResponder:view];
         }
-        [window orderFrontRegardless];
+        if (!no_window) {
+            [window orderFrontRegardless];
+        }
+        if (pid_file != NULL) {
+            // The everyday trial: the signal USR2 brings the window to the front, for a program
+            // started through `open` whose window is asked for again. Without a window it does
+            // nothing.
+            static dispatch_source_t front;
+            signal(SIGUSR2, SIG_IGN);
+            front = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR2, 0, dispatch_get_main_queue());
+            dispatch_source_set_event_handler(front, ^{
+                if (!no_window) {
+                    [NSApp activate];
+                    [window makeKeyAndOrderFront:nil];
+                }
+            });
+            dispatch_resume(front);
+        }
         // Moved after it exists: at creation macOS pulls a window that is placed on another
         // display than the one in use back onto that one. Coordinates count from the top left
         // of the main display, which is the first screen.
