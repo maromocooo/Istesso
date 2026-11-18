@@ -213,8 +213,13 @@ pub enum Event {
     },
     /// A fact about the device worth showing, such as its firmware version.
     /// Never a serial number.
+    ///
+    /// `value` may be text the device supplied. The framework does not pass
+    /// it on as it is: where it collects notices it turns everything that is
+    /// not printable ASCII into escapes and cuts overlong text, and it holds
+    /// `name` to a plain lower-case word. An adapter need not do this itself.
     Info {
-        name: &'static str,
+        name: String,
         value: String,
     },
 }

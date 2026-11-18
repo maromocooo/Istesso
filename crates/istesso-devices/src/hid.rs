@@ -9,6 +9,7 @@ use std::ffi::CString;
 use hidapi::{HidApi, HidDevice};
 use istesso_device_api::{AdapterEntry, UsbId};
 
+use crate::text::printable;
 use crate::transport::Transport;
 
 /// A device that is plugged in and has an adapter.
@@ -31,8 +32,9 @@ pub struct Hid {
 
 impl Hid {
     pub fn new() -> Result<Self, String> {
-        let api = HidApi::new()
-            .map_err(|error| format!("the HID interface could not be opened: {error}"))?;
+        let api = HidApi::new().map_err(|error| {
+            printable(&format!("the HID interface could not be opened: {error}"))
+        })?;
         // Do not take the device away from other software. Whether Istesso
         // may talk to it at all is decided before opening (see `software`).
         #[cfg(target_os = "macos")]
@@ -71,10 +73,9 @@ impl Hid {
 
     /// Open a device that [`Hid::find`] returned.
     pub fn open(&self, found: &Found) -> Result<HidTransport, String> {
-        let device = self
-            .api
-            .open_path(&found.path)
-            .map_err(|error| format!("{} could not be opened: {error}", found.product))?;
+        let device = self.api.open_path(&found.path).map_err(|error| {
+            printable(&format!("{} could not be opened: {error}", found.product))
+        })?;
         Ok(HidTransport { device })
     }
 }

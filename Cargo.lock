@@ -1162,6 +1162,7 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "hkdf",
+ "libc",
  "rand_core",
  "serde",
  "serde_json",

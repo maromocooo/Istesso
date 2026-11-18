@@ -628,7 +628,7 @@ fn relay_input(
         }
     };
     let mut line = InputLine::open(client, connect)
-        .map_err(|e| format!("the device does not take input from here: {e}"))?;
+        .map_err(|(_, why)| format!("the device does not take input from here: {why}"))?;
     // A socket left by an earlier run is in the way of a new one.
     match std::fs::remove_file(socket) {
         Ok(()) => {}
@@ -1102,6 +1102,9 @@ fn run_pair(action: PairAction) -> Result<(), String> {
             name,
         } => {
             let identity = load_identity()?;
+            // Opened before the wait so that a damaged list is reported before
+            // anyone types the code. `add` reads the file again under its lock,
+            // so changes made with `istesso peers` while this waits are kept.
             let mut peers = open_peers()?;
             let name = name.unwrap_or_else(istesso_doctor::hostname);
             let listener = TcpListener::bind(("0.0.0.0", port))
@@ -1144,6 +1147,7 @@ fn run_pair(action: PairAction) -> Result<(), String> {
             name,
         } => {
             let identity = load_identity()?;
+            // As above: `add` reads the file again before it writes.
             let mut peers = open_peers()?;
             let name = name.unwrap_or_else(istesso_doctor::hostname);
             let code = PairCode::parse(&code).map_err(|e| e.to_string())?;
@@ -1911,38 +1915,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_are_named_as_they_are_stored() {
-        use istesso_pair::Permission;
-        assert_eq!(permission_names(&[]), "nothing");
-        assert_eq!(
-            permission_names(&[Permission::View, Permission::Audio]),
-            "view, audio"
-        );
-        // Every name the command line takes leads to the permission that is
-        // stored under that name.
-        for arg in PermissionArg::value_variants() {
-            let name = arg.to_possible_value().unwrap().get_name().to_string();
-            assert_eq!(Permission::from(*arg).name(), name);
-        }
-        // Both spellings of the one name that has two words are understood.
-        for spelling in ["install_apps", "install-apps"] {
-            let cli = Cli::try_parse_from(["istesso", "peers", "allow", "studio", spelling]);
-            assert!(matches!(
-                cli.map(|cli| cli.command),
-                Ok(Command::Peers {
-                    action: PeersAction::Allow {
-                        permission: PermissionArg::InstallApps,
-                        ..
-                    }
-                })
-            ));
-        }
-        assert!(
-            Cli::try_parse_from(["istesso", "peers", "allow", "studio", "everything"]).is_err()
-        );
-    }
-
-    #[test]
     fn frame_sizes_are_width_by_height() {
         assert_eq!(parse_frame_size("3440x1440"), Ok((3440, 1440)));
         assert_eq!(parse_frame_size("8X8"), Ok((8, 8)));
@@ -2003,6 +1975,38 @@ mod tests {
         // Added latency of one window alone says nothing about the pass line.
         assert!(parse(&["--local-app", "local.jsonl"]).is_err());
         assert!(parse(&["--relayed-app", "host.jsonl"]).is_err());
+    }
+
+    #[test]
+    fn permissions_are_named_as_they_are_stored() {
+        use istesso_pair::Permission;
+        assert_eq!(permission_names(&[]), "nothing");
+        assert_eq!(
+            permission_names(&[Permission::View, Permission::Audio]),
+            "view, audio"
+        );
+        // Every name the command line takes leads to the permission that is
+        // stored under that name.
+        for arg in PermissionArg::value_variants() {
+            let name = arg.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(Permission::from(*arg).name(), name);
+        }
+        // Both spellings of the one name that has two words are understood.
+        for spelling in ["install_apps", "install-apps"] {
+            let cli = Cli::try_parse_from(["istesso", "peers", "allow", "studio", spelling]);
+            assert!(matches!(
+                cli.map(|cli| cli.command),
+                Ok(Command::Peers {
+                    action: PeersAction::Allow {
+                        permission: PermissionArg::InstallApps,
+                        ..
+                    }
+                })
+            ));
+        }
+        assert!(
+            Cli::try_parse_from(["istesso", "peers", "allow", "studio", "everything"]).is_err()
+        );
     }
 
     #[test]
