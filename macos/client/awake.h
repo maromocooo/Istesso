@@ -23,6 +23,13 @@
 #define AWAKE_SPIN 1  // one thread never lets go of its core
 #define AWAKE_TICK 2  // one thread wakes every AWAKE_TICK_NS and does nothing
 
+// What the latest input was, for the line that says what began a stretch ("by"). The pointer's
+// movement over the window counts as input as keys and buttons do: a hand on the mouse is
+// usually a hand about to type, so the core is awake when the first key comes.
+#define AWAKE_BY_WINDOW 0   // a key, a button or scrolling in the window
+#define AWAKE_BY_POINTER 1  // only the pointer's movement over the window
+#define AWAKE_BY_WAY_IN 2   // the measurement's way in for keys (a measuring build)
+
 // How long after the latest input the core is kept awake. Between the keys of a word lie tenths
 // of a second, between words and sentences up to about two seconds; a silence longer than that
 // is the person reading or thinking, and the first key after it finds the core as it would be
@@ -67,6 +74,7 @@ static FILE *awake_log = NULL;
 // When input was last handed to the input's thread (0: never), and whether the window is the
 // one in front.
 static _Atomic uint64_t awake_last_input_ns = 0;
+static _Atomic int awake_last_by = AWAKE_BY_WINDOW;
 static _Atomic bool awake_in_front = false;
 // The thread rests while the rule does not hold. Whoever changes what the rule reads wakes it,
 // if it is resting.
@@ -100,10 +108,28 @@ static inline void awake_stir(void) {
     }
 }
 
-// Input was handed on. From any thread; only with the switch.
-static inline void awake_input(void) {
+// Input was handed on, of the kind `by`. From any thread; only with the switch.
+static inline void awake_input_by(int by) {
+    atomic_store(&awake_last_by, by);
     atomic_store(&awake_last_input_ns, awake_clock());
     awake_stir();
+}
+
+static inline void awake_input(void) {
+    awake_input_by(AWAKE_BY_WINDOW);
+}
+
+// What began a stretch that begins now, when the one before ended at `ended_ns` (or the thread
+// began then): the whole session; an input that came after that end (of its kind); or else the
+// window coming to the front while an input was still recent.
+static inline const char *awake_began_by(bool whole_session, uint64_t last_input_ns, int last_by, uint64_t ended_ns) {
+    if (whole_session) {
+        return "session";
+    }
+    if (last_input_ns != 0 && last_input_ns >= ended_ns) {
+        return last_by == AWAKE_BY_POINTER ? "pointer" : (last_by == AWAKE_BY_WAY_IN ? "way_in" : "window");
+    }
+    return "front";
 }
 
 // The window became the one in front, or stopped being it. Returns whether that is a change.
@@ -128,6 +154,9 @@ static void *awake_thread(void *unused) {
     }
     mach_timebase_info_data_t base;
     mach_timebase_info(&base);
+    // An input from before the thread began, with the window coming to the front only later,
+    // did not begin the first stretch: the front did.
+    uint64_t last_ended = awake_clock();
     for (;;) {
         // "Resting" is said before the rule is looked at, and both under the lock: a change
         // that comes after the look finds the thread resting and wakes it.
@@ -143,7 +172,9 @@ static void *awake_thread(void *unused) {
         }
         uint64_t began = awake_clock(), turns = 0;
         if (awake_log != NULL) {
-            fprintf(awake_log, "{\"kind\":\"awake\",\"t_ns\":%llu,\"on\":1}\n", (unsigned long long)began);
+            // What began it: "pointer" when the pointer's movement over the window did.
+            fprintf(awake_log, "{\"kind\":\"awake\",\"t_ns\":%llu,\"on\":1,\"by\":\"%s\"}\n", (unsigned long long)began,
+                    awake_began_by(awake_whole_session, atomic_load(&awake_last_input_ns), atomic_load(&awake_last_by), last_ended));
         }
         if (awake_form == AWAKE_SPIN) {
             do {
@@ -164,6 +195,7 @@ static void *awake_thread(void *unused) {
             } while (!atomic_load(&awake_over) && awake_now());
         }
         uint64_t ended = awake_clock();
+        last_ended = ended;
         awake_on_ns += ended - began;
         awake_stretches++;
         awake_turns += turns;

@@ -28,7 +28,9 @@
 //                               latency-critical  the system is told that this program's work is
 //                                                 latency critical for as long as it runs
 //                               awake-spin        one thread keeps a fast core busy while the window
-//                                                 is in front and input is going on (awake.h)
+//                                                 is in front and input is going on (awake.h): keys,
+//                                                 buttons, scrolling, and the pointer moving over the
+//                                                 window, which comes before the first key
 //                               awake-tick        the same, with a thread that wakes a thousand
 //                                                 times a second instead of one that never rests
 //                               awake-session     with one of the two: from start to end, whatever
@@ -73,7 +75,9 @@
 // The other lines are those of the prototype, and: {"kind":"wake",...} with the switches that are
 // on, {"kind":"input","t_ns":T,"event":"open"|"cut"|"back"|"over","reconnections":N}, and with
 // --wake awake-spin or awake-tick {"kind":"awake","t_ns":T,"on":1|0} for when a core was kept
-// awake. With those, with usage and with front: {"kind":"awake","t_ns":T,"in_front":1|0,
+// awake; the "on":1 line says what began it: "by":"pointer" (the pointer moved over the window),
+// "window" (a key, a button, scrolling), "way_in" (a measuring build's way in), "front" (the
+// window came to the front while an input was recent) or "session". With those, with usage and with front: {"kind":"awake","t_ns":T,"in_front":1|0,
 // "active":1|0,"key":1|0,"visible":1|0,"role":N} whenever one of them changes (in front: the
 // application is the active one and the window takes the keys; visible: the window is not
 // wholly covered; role: usage.h). With front: {"kind":"front","t_ns":T,"event":"lost"|"asked"|
@@ -1379,7 +1383,13 @@ static void send_input(const IstessoInputEvent *events, size_t count) {
     if (input != NULL && count > 0) {
         istesso_input_send(input, events, count);
         if (awake_form != AWAKE_OFF) {
-            awake_input();
+            // The pointer moving over the window wakes the core as a key does: the hand is
+            // usually on its way to typing. The log tells the two apart.
+            bool only_pointer = true;
+            for (size_t i = 0; i < count; i++) {
+                only_pointer = only_pointer && events[i].kind == ISTESSO_INPUT_POINTER_AT;
+            }
+            awake_input_by(only_pointer ? AWAKE_BY_POINTER : AWAKE_BY_WINDOW);
         }
     }
 }
@@ -2072,7 +2082,7 @@ static void front_watch_the_window(void) {
 #ifdef ISTESSO_MEASURING
 // Called on the thread of the measurement's way in, after it handed keys to the input's thread.
 static void awake_came_through_the_way_in(void *context) {
-    awake_input();
+    awake_input_by(AWAKE_BY_WAY_IN);
 }
 #endif
 

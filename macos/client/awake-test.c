@@ -29,6 +29,14 @@ static void the_rule(void) {
     // The pauses inside typing are bridged, and so is the pause between a measurement's keys
     // (0.43 s).
     assert(AWAKE_AFTER_INPUT_NS > 2 * second && AWAKE_AFTER_INPUT_NS <= 5 * second);
+
+    // What began a stretch: an input after the stretch before ended, by its kind; else the front.
+    assert(strcmp(awake_began_by(true, 0, AWAKE_BY_WINDOW, 0), "session") == 0);
+    assert(strcmp(awake_began_by(false, t, AWAKE_BY_POINTER, t - second), "pointer") == 0);
+    assert(strcmp(awake_began_by(false, t, AWAKE_BY_WINDOW, t - second), "window") == 0);
+    assert(strcmp(awake_began_by(false, t, AWAKE_BY_WAY_IN, t), "way_in") == 0);
+    assert(strcmp(awake_began_by(false, t - second, AWAKE_BY_POINTER, t), "front") == 0);
+    assert(strcmp(awake_began_by(false, 0, AWAKE_BY_WINDOW, 0), "front") == 0);
 }
 
 static void wait_ms(unsigned ms) {
@@ -102,6 +110,47 @@ static void the_thread(void) {
     assert(awake_cpu_ns < awake_on_ns / 2);
 }
 
+// The "on":1 line says what began each stretch: here the pointer, after a pause in which the
+// core was let go; then a key; then the window coming back to the front; then the way in.
+static void the_cause(void) {
+    awake_log = tmpfile();
+    assert(awake_log != NULL);
+    begin(AWAKE_SPIN, false);
+    awake_set_in_front(true);
+    wait_ms(10);
+    awake_input_by(AWAKE_BY_POINTER);
+    wait_ms(20);
+    // The latest input made old: the stretch ends as after a pause of three seconds.
+    atomic_store(&awake_last_input_ns, awake_clock() - AWAKE_AFTER_INPUT_NS - 1);
+    wait_ms(20);
+    assert(atomic_load(&awake_resting));
+    awake_input_by(AWAKE_BY_WINDOW);
+    wait_ms(20);
+    awake_set_in_front(false);
+    wait_ms(20);
+    awake_set_in_front(true);
+    wait_ms(20);
+    atomic_store(&awake_last_input_ns, awake_clock() - AWAKE_AFTER_INPUT_NS - 1);
+    wait_ms(20);
+    awake_input_by(AWAKE_BY_WAY_IN);
+    wait_ms(20);
+    awake_finish();
+    assert(awake_stretches == 4);
+    const char *want[] = {"\"by\":\"pointer\"", "\"by\":\"window\"", "\"by\":\"front\"", "\"by\":\"way_in\""};
+    char line[512];
+    int n = 0;
+    rewind(awake_log);
+    while (fgets(line, sizeof line, awake_log) != NULL) {
+        if (strstr(line, "\"kind\":\"awake\"") != NULL && strstr(line, "\"on\":1") != NULL) {
+            assert(n < 4 && strstr(line, want[n]) != NULL);
+            n++;
+        }
+    }
+    assert(n == 4);
+    fclose(awake_log);
+    awake_log = NULL;
+}
+
 int main(void) {
     the_rule();
     for (int i = 0; i < 1024; i++) {
@@ -122,6 +171,7 @@ int main(void) {
         off += strstr(line, "\"kind\":\"awake\"") != NULL && strstr(line, "\"on\":0") != NULL;
     }
     assert(starts == 6 && ends == 6 && on == 6 && off == 6);
-    printf("awake: the rule holds as written, and the thread follows it\n");
+    the_cause();
+    printf("awake: the rule holds as written, the thread follows it, and says what began each stretch\n");
     return 0;
 }
