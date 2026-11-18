@@ -1007,24 +1007,29 @@ impl Sessions {
             let Some(entry) = table.get(session, asker) else {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
-            let over = matches!(
-                entry.info.state,
-                SessionState::Stopping | SessionState::Ended
-            );
+            let state = entry.info.state;
             if !force {
                 // Asking is all that is done. What the application makes of
-                // it shows in the session's state, later or never.
-                if !over {
+                // it shows in the session's state, later or never. A left
+                // over application is asked again.
+                if !matches!(state, SessionState::Stopping | SessionState::Ended) {
                     entry.orders.close = true;
                     inner.changed.notify_all();
                 }
                 return report_to(&entry.info, false);
             }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if over || left.is_zero() {
+            if state == SessionState::Ended {
                 return report_to(&entry.info, false);
             }
+            // A person's force is kept whatever the session is doing: while
+            // it is stopping (the application is being asked) and while it is
+            // left over, it is what ends the application.
             entry.orders.force = true;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if state == SessionState::Stopping || left.is_zero() {
+                inner.changed.notify_all();
+                return report_to(&entry.info, false);
+            }
             inner.changed.notify_all();
             table = inner
                 .changed
@@ -1249,6 +1254,15 @@ impl Table {
                 None => format!("{} ({})", e.app_name, e.info.id),
             })
             .collect();
+        let mut left: Vec<&&Entry> = live
+            .iter()
+            .filter(|e| e.info.state == SessionState::LeftOver && e.is_for(caller))
+            .collect();
+        left.sort_by_key(|e| e.number);
+        let left: Vec<String> = left
+            .iter()
+            .map(|e| format!("{} ({})", e.app_name, e.info.id))
+            .collect();
         let mut why = format!(
             "this host already keeps {} sessions open, as many as it is set to \
              (`istesso agent --max-sessions`)",
@@ -1256,6 +1270,13 @@ impl Table {
         );
         if !idle.is_empty() {
             why.push_str(&format!("; nobody is shown: {}", idle.join(", ")));
+        }
+        if !left.is_empty() {
+            why.push_str(&format!(
+                "; without a window, their processes left over (`istesso sessions stop <session> \
+                 --force` ends them): {}",
+                left.join(", ")
+            ));
         }
         Some(why)
     }
@@ -1570,8 +1591,10 @@ impl Inner {
                 Err(why) => break 'session ending(EndReason::StreamFailed, why),
             };
             let asked = Instant::now();
-            // The client may leave before there is anything to show.
+            // The client may leave before there is anything to show, and
+            // the application may be asked to close before it runs.
             let mut left_early: Option<String> = None;
+            let mut close_early = false;
             let (env, display, answer) = loop {
                 match running.poll() {
                     Some(StreamEvent::Said(RunnerEvent::Ready {
@@ -1608,6 +1631,7 @@ impl Inner {
                     break 'session ending(EndReason::Stopped, NOT_STARTED);
                 }
                 left_early = left_early.or(round.leave);
+                close_early |= round.close;
                 self.pause();
             };
             if !fits(&answer) {
@@ -1651,6 +1675,10 @@ impl Inner {
             if let Some(why) = left_early {
                 let _ = running.tell(&RunnerCommand::Detach);
                 self.detached(id, &why);
+            }
+            if close_early {
+                (self.log)(format!("session {id}: asking {} to close", job.app_name));
+                let _ = running.tell(&RunnerCommand::Close);
             }
 
             // The attach order that the runner has been told and has not
@@ -1828,7 +1856,9 @@ impl Inner {
             }
         };
 
+        let mut was_shown = false;
         self.update(id, |entry| {
+            was_shown = entry.info.state == SessionState::Running;
             entry.info.state = SessionState::Stopping;
             entry.info.answer = None;
             entry.info.shown_on = None;
@@ -1840,14 +1870,30 @@ impl Inner {
         // it is asked to end, and what does not listen is left as it is,
         // for a person to see and decide on (ADR 0010, 3).
         let mut stays = None;
-        if let Some(app) = app.as_mut() {
+        if let Some(app) = app
+            .as_mut()
+            .and_then(|app| app.poll().is_none().then_some(app))
+        {
+            // The session is over for its client: nobody is sent its picture
+            // while the application is given time to end (ADR 0010, 12: an
+            // unpaired device is cut within 0.1 s).
+            if let Some(stream) = stream.as_mut().filter(|_| was_shown) {
+                let _ = stream.tell(&RunnerCommand::Detach);
+            }
             if forced {
                 app.end_by_force(rules.app_stop_grace);
-            } else if app.poll().is_none() {
+            } else {
                 app.ask_to_end();
-                match self.ends_within(app.as_mut(), rules.app_end_wait) {
-                    Some(how) => add_to(&mut end, &format!("it ended when asked to ({how})")),
-                    None => stays = Some(app.group()),
+                match self.ends_within(id, app.as_mut(), rules.app_end_wait) {
+                    Waited::Ended(how) => {
+                        add_to(&mut end, &format!("it ended when asked to ({how})"))
+                    }
+                    Waited::Forced => {
+                        app.end_by_force(rules.app_stop_grace);
+                        add_to(&mut end, "a person ended it by force");
+                        end.reason = EndReason::Stopped;
+                    }
+                    Waited::Stays => stays = Some(app.group()),
                 }
             }
         }
@@ -1875,19 +1921,32 @@ impl Inner {
 }
 
 impl Inner {
-    /// Waits for an application that was asked to end. `Some` with how it
-    /// ended, `None` when it is still there after `time`.
-    fn ends_within(&self, app: &mut dyn RunningApp, time: Duration) -> Option<String> {
+    /// Waits for an application that was asked to end, for up to `time`,
+    /// or until a person asks to end it by force.
+    fn ends_within(&self, id: &SessionId, app: &mut dyn RunningApp, time: Duration) -> Waited {
         let deadline = Instant::now() + time;
         loop {
             if let Some(how) = app.poll() {
-                return Some(how);
+                return Waited::Ended(how);
+            }
+            if self.take_force(id) {
+                return Waited::Forced;
             }
             if Instant::now() >= deadline {
-                return None;
+                return Waited::Stays;
             }
             std::thread::sleep(self.rules.tick.min(Duration::from_millis(50)));
         }
+    }
+
+    /// Whether a person asked to end the session's application by force
+    /// since this was last asked.
+    fn take_force(&self, id: &SessionId) -> bool {
+        let mut table = self.lock();
+        table
+            .sessions
+            .get_mut(&id.0)
+            .is_some_and(|entry| std::mem::take(&mut entry.orders.force))
     }
 
     /// The session is over, and the application's processes stay after they
@@ -1935,7 +1994,9 @@ impl Inner {
                 }
             };
             if orders.force {
-                // A person's word: the one way to end it by force.
+                // A person's word: the one way to end it by force. Stopping
+                // until it is over, so that whoever asked waits for the end.
+                self.update(id, |entry| entry.info.state = SessionState::Stopping);
                 app.end_by_force(self.rules.app_stop_grace);
                 add_to(end, "a person ended them by force");
                 end.reason = EndReason::Stopped;
@@ -1947,6 +2008,15 @@ impl Inner {
             self.pause();
         }
     }
+}
+
+/// What became of an application that was asked to end.
+enum Waited {
+    Ended(String),
+    /// A person asked to end it by force meanwhile.
+    Forced,
+    /// Still there.
+    Stays,
 }
 
 /// Adds a sentence to the message of a session's end.

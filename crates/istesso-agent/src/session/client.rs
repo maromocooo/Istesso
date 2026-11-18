@@ -254,8 +254,8 @@ pub fn stop_session(
         .map_err(failed)?;
     let until = Instant::now() + watch;
     // Left over is as far as asking goes: what stays is the person's to
-    // end by force (ADR 0010, 3).
-    while !matches!(info.state, SessionState::Ended | SessionState::LeftOver) {
+    // end by force (ADR 0010, 3). After force, only the end is.
+    while !(info.state == SessionState::Ended || (!force && info.state == SessionState::LeftOver)) {
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;

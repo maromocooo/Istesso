@@ -192,11 +192,9 @@ pub fn stop_here(
         force,
     })?;
     let until = Instant::now() + watch;
-    while !matches!(
-        last.info.state,
-        SessionState::Ended | SessionState::LeftOver
-    ) && Instant::now() < until
-    {
+    // After force, only the end ends the watch (ADR 0010, 3).
+    let done = |state| state == SessionState::Ended || (!force && state == SessionState::LeftOver);
+    while !done(last.info.state) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(100));
         last = ask(&HostRequest::Session {
             session: session.clone(),

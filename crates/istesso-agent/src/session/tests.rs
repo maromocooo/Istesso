@@ -589,11 +589,14 @@ fn ending_by_force_stops_the_application_before_the_stream() {
     assert_eq!(ended.answer, None);
     // The application is not asked to close first: the two ways are kept
     // apart.
-    assert_eq!(host.since_running(), ["app ended by force", "runner stop"]);
+    assert_eq!(
+        host.since_running(),
+        ["runner detach", "app ended by force", "runner stop"]
+    );
     // Asking again does no harm and says the same.
     let again = session(host.stop(&id, true));
     assert_eq!(again.state, SessionState::Ended);
-    assert_eq!(host.journal.all().len(), 4);
+    assert_eq!(host.journal.all().len(), 5);
 }
 
 #[test]
@@ -715,7 +718,10 @@ fn a_stream_that_dies_ends_the_application() {
         end.message,
         "the host's side of the stream ended (signal 9); it ended when asked to (signal 15)"
     );
-    assert_eq!(host.since_running(), ["app asked to end", "runner stop"]);
+    assert_eq!(
+        host.since_running(),
+        ["runner detach", "app asked to end", "runner stop"]
+    );
 }
 
 #[test]
@@ -1230,8 +1236,10 @@ fn an_attachment_belongs_to_the_device_it_was_given_to() {
     host.settles(&id, |s| s.info.state == SessionState::Detached);
 }
 
+/// The table's answer only: which device is shown a session, and where its
+/// input socket is. Nothing passes input by it yet (ADR 0010, 9, "入力").
 #[test]
-fn input_for_a_session_is_taken_from_the_device_that_is_shown_it() {
+fn the_table_says_which_device_is_shown_a_session_and_its_input_socket() {
     let host = host();
     let id = host.running().id;
     let tablet = pair(&host.paths, "tablet", Permission::defaults());
@@ -2289,5 +2297,110 @@ fn an_application_is_opening_until_its_first_window() {
             .starts_with("the application showed no window within 60 seconds"),
         "{}",
         end.message
+    );
+}
+
+/// Rules under which ending by force takes longer than a request to stop
+/// waits for it, as with a real application (three seconds).
+fn slow_force() -> Rules {
+    Rules {
+        app_stop_grace: Duration::from_millis(600),
+        ..quick_rules()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_left_over_application_ended_by_force_from_the_host_is_said_to_have_ended() {
+    use super::local::{listen, serve, stop_here};
+
+    let host = host_named("f", slow_force());
+    let listener = listen(&host.paths).unwrap();
+    let sessions = host.sessions.clone();
+    std::thread::spawn(move || {
+        serve(
+            listener,
+            Arc::new(move |request| sessions.answer_host(request)),
+        );
+    });
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    host.follow_until(&id, SessionState::LeftOver);
+    // Asked without force, it is left over as it was: said at once.
+    let asked = stop_here(&host.paths, &id, false, Duration::from_secs(2)).unwrap();
+    assert_eq!(asked.info.state, SessionState::LeftOver);
+    // With force, whoever asked is told the end, not the state before it.
+    let over = stop_here(&host.paths, &id, true, Duration::from_secs(5)).unwrap();
+    assert_eq!(over.info.state, SessionState::Ended);
+    assert_eq!(over.info.end.unwrap().reason, EndReason::Stopped);
+    assert_eq!(host.journal.count("app ended by force"), 1);
+}
+
+#[test]
+fn force_while_an_application_is_being_asked_to_end_is_kept() {
+    let host = host_with(Rules {
+        app_end_wait: Duration::from_secs(5),
+        ..quick_rules()
+    });
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    host.follow_until(&id, SessionState::Stopping);
+    host.journal.wait_for("app asked to end", 1);
+    // The person does not wait for the five seconds.
+    let asked = Instant::now();
+    session(host.stop(&id, true));
+    let over = host.follow_until(&id, SessionState::Ended);
+    assert!(
+        asked.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        asked.elapsed()
+    );
+    let end = over.end.unwrap();
+    assert_eq!(end.reason, EndReason::Stopped);
+    assert!(
+        end.message.ends_with("a person ended it by force"),
+        "{}",
+        end.message
+    );
+    assert_eq!(over.left_over, None);
+    assert_eq!(host.journal.count("app ended by force"), 1);
+}
+
+#[test]
+fn a_close_asked_for_while_starting_is_done_once_the_application_runs() {
+    let host = host();
+    host.runner.instead_of_ready(Vec::new());
+    let id = host.start().id;
+    host.journal.wait_for("runner start", 1);
+    let asked = session(host.stop(&id, false));
+    assert_eq!(asked.state, SessionState::Starting);
+    host.runner.say(StreamEvent::Said(RunnerEvent::Ready {
+        env: BTreeMap::from([("WAYLAND_DISPLAY".to_string(), "wayland-fake".to_string())]),
+        display: host.runner.display(),
+        answer: serde_json::json!({"fake": "answer"}),
+    }));
+    host.journal.wait_for("runner close", 1);
+    let all = host.journal.all();
+    let launched = all
+        .iter()
+        .position(|l| l.starts_with("app launch"))
+        .unwrap();
+    let closed = all.iter().position(|l| l == "runner close").unwrap();
+    assert!(launched < closed, "{all:?}");
+}
+
+#[test]
+fn nobody_is_sent_the_picture_while_an_application_is_given_time_to_end() {
+    let host = host();
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    host.follow_until(&id, SessionState::LeftOver);
+    // Detached before it was asked, and before the wait.
+    assert_eq!(
+        host.since_running(),
+        ["runner detach", "app asked to end", "runner stop"]
     );
 }

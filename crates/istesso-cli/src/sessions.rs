@@ -338,7 +338,7 @@ pub fn stop_local(session: &str, force: bool) -> Result<(), String> {
 /// are asked to close, which they may answer with a question. The lines
 /// to print.
 pub fn unpaired(paths: &Paths, device: &str, name: &str, close: bool) -> Vec<String> {
-    let left = match after_unpairing(paths, device) {
+    let mut left = match after_unpairing(paths, device) {
         // No agent here, so nothing that device started runs here.
         Ok(None) => return Vec::new(),
         Ok(Some(left)) => left,
@@ -363,17 +363,25 @@ pub fn unpaired(paths: &Paths, device: &str, name: &str, close: bool) -> Vec<Str
         }
         let until = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let running: Vec<String> = sessions_here(paths)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|session| session.info.id.0)
-                .collect();
+            let now = sessions_here(paths).unwrap_or_default();
+            // What each one is now: a left-over one has no window, and
+            // its processes stay until a person ends them (ADR 0010, 3).
+            for session in left.iter_mut() {
+                if let Some(found) = now.iter().find(|s| s.info.id == session.info.id) {
+                    session.info = found.info.clone();
+                }
+            }
             let still: Vec<String> = left
                 .iter()
+                .filter(|session| session.info.state != SessionState::LeftOver)
                 .map(|session| session.info.id.0.clone())
-                .filter(|id| running.contains(id))
+                .filter(|id| now.iter().any(|s| &s.info.id.0 == id))
                 .collect();
-            if still.is_empty() || std::time::Instant::now() >= until {
+            let settled = left.iter().all(|s| {
+                !now.iter().any(|n| n.info.id == s.info.id)
+                    || s.info.state == SessionState::LeftOver
+            });
+            if settled || std::time::Instant::now() >= until {
                 break Some(still);
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -416,16 +424,28 @@ fn unpaired_words(name: &str, left: &[HostSession], still: Option<&[String]>) ->
                 if left.len() == 1 { "was" } else { "were" }
             ));
             for session in left {
-                let became = if still.contains(&session.info.id.0) {
-                    "still running: it may be asking whether to save"
-                } else {
-                    "ended"
+                let became = match (session.info.state, session.info.left_over) {
+                    (SessionState::LeftOver, Some(group)) => format!(
+                        "has no window; its processes stay after they were asked to end \
+                         (process group {group})"
+                    ),
+                    _ if still.contains(&session.info.id.0) => {
+                        "still running: it may be asking whether to save".to_string()
+                    }
+                    _ => "ended".to_string(),
                 };
                 lines.push(format!(
                     "  {} {} {became}",
                     session.info.id,
                     crate::pad(&session.app_name, app)
                 ));
+            }
+            if left.iter().any(|s| s.info.state == SessionState::LeftOver) {
+                lines.push(
+                    "Nothing is ended by force: `istesso sessions stop <session> --local \
+                     --force` ends what was left over."
+                        .to_string(),
+                );
             }
             if !still.is_empty() {
                 lines.push(

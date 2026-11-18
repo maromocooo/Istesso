@@ -1036,6 +1036,29 @@ mod tests {
         }
 
         #[test]
+        fn asking_for_input_again_reads_the_right_to_control_then() {
+            // One conversation, open all along: the right is read when input
+            // is asked for, not remembered from the handshake.
+            let pair = InputPair::new("ig");
+            let mut client = pair.connect();
+            assert_eq!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+            let mut peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+            let mut laptop = peers.find("a laptop").unwrap().unwrap().clone();
+            laptop.permissions = vec![istesso_pair::Permission::View];
+            peers.add(laptop).unwrap();
+            assert!(matches!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Refused {
+                    code: istesso_link::ErrorCode::Forbidden,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
         fn a_device_that_loses_the_right_to_control_has_its_keys_let_go() {
             let pair = InputPair::new("if");
             let mut client = pair.connect();
@@ -1211,6 +1234,66 @@ mod tests {
         tablet_talks.ping().unwrap();
         assert_eq!(open(), 1);
         assert!(connect(&laptop_identity).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_pairing_cuts_the_device_off_before_the_command_returns() {
+        use istesso_link::Client;
+        use istesso_pair::{Hello, Peer};
+
+        // A short name: the agent's own socket lives under it.
+        let dir = TempDir::new("pc");
+        let paths = dir.paths();
+        let agent = agent(&paths);
+        let addr = agent.local_addr().unwrap();
+        let shared = agent.shared.clone();
+        std::thread::spawn(move || agent.run());
+        let host_key = Identity::load_or_create(&paths.identity())
+            .unwrap()
+            .public_key();
+        let identity = Identity::generate();
+        let laptop = Peer::from_hello(&Hello {
+            device_name: "laptop".to_string(),
+            public_key: identity.public_key(),
+        });
+        PeerStore::open(paths.peers())
+            .unwrap()
+            .add(laptop.clone())
+            .unwrap();
+        let own = TempDir::new("pc-device");
+        let mut known = PeerStore::open(own.paths().peers()).unwrap();
+        known
+            .add(Peer::from_hello(&Hello {
+                device_name: "host".to_string(),
+                public_key: host_key,
+            }))
+            .unwrap();
+        let keys = LocalKeys::new(&identity).unwrap();
+        let mut talks = Client::connect(addr, &keys, &known, None, Duration::from_secs(5)).unwrap();
+        talks.ping().unwrap();
+        // The agent's socket for the person at this machine is open.
+        let since = Instant::now();
+        while crate::session::local::sessions_here(&paths).is_err() {
+            assert!(since.elapsed() < Duration::from_secs(5), "no socket");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // What `istesso peers remove` does: the list first, then the agent
+        // is told, and the device is cut off before that answer comes.
+        PeerStore::open(paths.peers())
+            .unwrap()
+            .remove(&laptop.id)
+            .unwrap();
+        let told = Instant::now();
+        let left = crate::session::local::after_unpairing(&paths, &laptop.id).unwrap();
+        assert_eq!(left.map(|l| l.len()), Some(0));
+        assert!(
+            told.elapsed() < PAIRINGS_READ_EVERY / 2,
+            "{:?}",
+            told.elapsed()
+        );
+        assert_eq!(shared.open.lock().unwrap().len(), 0);
+        assert!(talks.ping().is_err());
     }
 
     #[test]

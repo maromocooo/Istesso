@@ -20,6 +20,9 @@
 #                                                   (all eight when none is named)
 #
 # Every part takes well under a minute. The script ends with the number of checks that failed.
+# It follows the measuring signal (AGENTS.md, "計測の合図"): it does not start a part while the
+# signal reads busy, and while it runs it reads the signal every 5 seconds; on busy it stops within
+# 10 seconds (what it started, by number) and stops the trial agent.
 # Taking a pairing away is not tried here, because that would change the list of paired
 # devices of a real machine; the automated tests do it with lists of their own.
 set -u
@@ -144,9 +147,31 @@ else
 fi
 echo "  path  $family, leaving this machine through ${way:-an interface that could not be told}${kind:+ ($kind)}"
 sees_them() { "$BIN" apps list --all 2> /dev/null | grep -q "Istesso M3 Unsaved"; }
+
+# The measuring signal: free (or no file) lets the trial go on.
+signal_free() { "$HERE/scripts/measuring.sh" status > /dev/null 2>&1; }
+signal_free || { echo "the measuring signal reads busy: the trial does not start"; exit 2; }
+# A watcher for the time the trial runs: on busy, the trial and what it started (its children, by
+# their numbers) are told to stop; the trial agent is stopped on the way out.
+trial=$$
+(
+    while kill -0 "$trial" 2> /dev/null; do
+        if ! signal_free; then
+            echo "the measuring signal reads busy: the trial stops"
+            kill -TERM "$trial" 2> /dev/null
+            for child in $(pgrep -P "$trial"); do kill -TERM "$child" 2> /dev/null; done
+            exit 0
+        fi
+        sleep 5
+    done
+) &
+watcher=$!
+trap 'kill "$watcher" 2> /dev/null; stop_agent; echo "  the trial agent is stopped"; exit 3' TERM INT
+
 check "the client sees the test applications" sees_them
 
 for part in "$@"; do
+    signal_free || { echo "the measuring signal reads busy: no part is started from here on"; break; }
     case $part in
     leave)
         echo "== leaving a window and coming back to it; closing it =="
@@ -310,6 +335,8 @@ for part in "$@"; do
 done
 
 echo "== cleaning up =="
+trap - TERM INT
+kill "$watcher" 2> /dev/null
 stop_agent
 echo "  the trial agent is stopped"
 echo "$failed checks failed"

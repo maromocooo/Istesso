@@ -365,7 +365,11 @@ impl RunningApp for FakeApp {
         }
     }
 
-    fn end_by_force(&mut self, _grace: Duration) {
+    fn end_by_force(&mut self, grace: Duration) {
+        // As long as a real one may take: asked first, made to end after.
+        if self.over.is_none() && *self.deaf.lock().unwrap() {
+            std::thread::sleep(grace);
+        }
         self.journal.note("app ended by force");
         if self.over.is_none() {
             self.over = Some("signal 9".to_string());

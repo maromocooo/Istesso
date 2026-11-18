@@ -439,7 +439,12 @@ fn a_session_can_be_asked_to_close_or_ended_from_elsewhere() {
     );
     assert_eq!(
         pair.on_host()[2..],
-        ["runner close", "app ended by force", "runner stop"]
+        [
+            "runner close",
+            "runner detach",
+            "app ended by force",
+            "runner stop"
+        ]
     );
     assert!(sessions_on(&link, &quick_client()).unwrap().is_empty());
 
@@ -1037,4 +1042,40 @@ fn with_programs_on_both_sides_a_session_is_left_come_back_to_and_closed() {
         logged("ended: AppExited")
     });
     assert!(sessions_on(&link, &quick_client()).unwrap().is_empty());
+}
+
+#[test]
+fn a_left_over_application_ended_by_force_from_elsewhere_is_said_to_have_ended() {
+    // Ending by force takes longer than a request to stop waits for it.
+    let pair = pair_on(
+        Ipv4Addr::LOCALHOST.into(),
+        Permission::defaults(),
+        Rules {
+            app_stop_grace: Duration::from_millis(600),
+            ..quick_rules()
+        },
+    )
+    .unwrap();
+    pair.launcher.deaf_to_asking(true);
+    let window = pair.open(Arc::default());
+    let id = pair.session().id;
+    pair.runner.say(super::super::StreamEvent::Said(
+        istesso_proto::RunnerEvent::Empty,
+    ));
+    let (outcome, _) = window.join().unwrap();
+    assert!(matches!(&outcome, Ok(Outcome::Ended(_))), "{outcome:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pair.sessions.look(&id).map(|info| info.state) != Some(SessionState::LeftOver) {
+        assert!(Instant::now() < deadline, "not left over");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let link = pair.link();
+    // Asked without force: left over, said at once.
+    let asked = stop_session(&link, &id, false, Duration::from_secs(2), &quick_client()).unwrap();
+    assert_eq!(asked.state, SessionState::LeftOver);
+    // With force: the end.
+    let over = stop_session(&link, &id, true, Duration::from_secs(5), &quick_client()).unwrap();
+    assert_eq!(over.state, SessionState::Ended);
+    assert_eq!(over.end.unwrap().reason, EndReason::Stopped);
+    assert_eq!(pair.journal.count("app ended by force"), 1);
 }
