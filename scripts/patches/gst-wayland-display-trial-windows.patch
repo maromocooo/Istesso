@@ -144,10 +144,15 @@ none; a client that disconnects leaves no session behind, also when asked about 
 menu that reaches past its window stays with the menu; a marked window that goes takes its mark with it, and windows have
 ids of their own that do not change.
 
-Also in this part, for trying only: the time a frame is held back while nothing changes
-(the render-on-commit patch's two frame intervals) can be set with the environment variable
-ISTESSO_IDLE_FRAME_INTERVALS (1 to 1000, read once; otherwise two). The viewer counts a
-second of silence as a lost connection: keep it well under a second.
+Also in this part: while nothing changes, the frames that keep the stream going (the
+render-on-commit patch sends one every two frame intervals) keep that beat for half a
+second after the last change, so that the encoder polishes the last picture and it looks
+crisp at once when things stop moving; after that they come every 12 frame intervals
+(6 a second at 72 fps, 7 at 85), and before any change too. The trial settings
+ISTESSO_IDLE_FRAME_INTERVALS (1 to 1000) and ISTESSO_IDLE_RAMP_MS (0 to 10000), read once,
+change the 12 and the half second. The viewer counts a second of silence as a lost
+connection: keep the wide interval well under a second. Two tests of the render-on-commit
+patch start with a change so that they fall within the half second.
 
 2. Maximized, not fullscreen
 
@@ -1159,18 +1164,20 @@ index 68e95df..8007d2c 100644
          })
          .expect("Failed to init wayland socket source");
 diff --git a/wayland-display-core/src/comp/pacing.rs b/wayland-display-core/src/comp/pacing.rs
-index 472c15e..c25081e 100644
+index 472c15e..8fbee00 100644
 --- a/wayland-display-core/src/comp/pacing.rs
 +++ b/wayland-display-core/src/comp/pacing.rs
-@@ -23,6 +23,28 @@ use std::time::{Duration, Instant};
+@@ -23,6 +23,49 @@ use std::time::{Duration, Instant};
  /// out as it is, so that the stream does not stop.
  const IDLE_FRAME_INTERVALS: u32 = 2;
  
-+/// How many frame intervals a frame is held back while nothing changes: two, unless
-+/// `ISTESSO_IDLE_FRAME_INTERVALS` (read once) says another number from 1 to 1000. For trying,
-+/// in the trial build only, how a slower idle stream fares (the viewer counts a second of
-+/// silence as a lost connection: keep the product of this and the frame interval well under
-+/// a second).
++/// How many frame intervals a frame is held back while nothing has changed for a while (the
++/// trial build): [`WIDE_IDLE_FRAME_INTERVALS`], unless `ISTESSO_IDLE_FRAME_INTERVALS` (read
++/// once) says another number from 1 to 1000. Right after a change it is two, for
++/// [`idle_ramp`]: the encoder then polishes the last picture at the full beat, and it looks
++/// crisp at once when things stop moving; only then does the idle stream slow down. The
++/// viewer counts a second of silence as a lost connection: keep the wide interval well
++/// under a second.
 +fn idle_frame_intervals() -> u32 {
 +    static INTERVALS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 +    *INTERVALS.get_or_init(|| {
@@ -1182,41 +1189,150 @@ index 472c15e..c25081e 100644
 +    })
 +}
 +
++/// The wide idle interval of the trial build, in frame intervals: about 6 frames a second at
++/// 72 fps (167 ms apart), 7 at 85.
++const WIDE_IDLE_FRAME_INTERVALS: u32 = 12;
++
++/// How long after the last change the idle frames keep the two-interval beat: 500 ms, unless
++/// `ISTESSO_IDLE_RAMP_MS` (read once) says another number of milliseconds up to 10000.
++fn idle_ramp() -> Duration {
++    static RAMP: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
++    *RAMP.get_or_init(|| idle_ramp_from(std::env::var("ISTESSO_IDLE_RAMP_MS").ok().as_deref()))
++}
++
++fn idle_ramp_from(text: Option<&str>) -> Duration {
++    Duration::from_millis(
++        text.and_then(|t| t.trim().parse::<u64>().ok())
++            .filter(|ms| *ms <= 10_000)
++            .unwrap_or(500),
++    )
++}
++
 +fn idle_frame_intervals_from(text: Option<&str>) -> u32 {
 +    text.and_then(|t| t.trim().parse::<u32>().ok())
 +        .filter(|n| (1..=1000).contains(n))
-+        .unwrap_or(IDLE_FRAME_INTERVALS)
++        .unwrap_or(WIDE_IDLE_FRAME_INTERVALS)
 +}
 +
  /// A frame that the one-second rule would hold back for longer than this gives way to the
  /// next picture instead (see [`FramePacing::room`]).
  const GIVE_WAY_AFTER: Duration = Duration::from_millis(1);
-@@ -117,7 +139,7 @@ impl FramePacing {
+@@ -54,6 +97,8 @@ pub(crate) struct FramePacing {
+     /// When the clients may be told to draw again, and whether a timer is running for it.
+     tell_from: Option<Instant>,
+     tell_timer: bool,
++    /// When the last frame with a change started rendering (the idle ramp counts from it).
++    last_change: Option<Instant>,
+     /// How many frames have started rendering, and the most in any one second, for the log.
+     started: u64,
+     most_in_a_second: usize,
+@@ -70,6 +115,7 @@ impl Default for FramePacing {
+             recent: VecDeque::new(),
+             tell_from: None,
+             tell_timer: false,
++            last_change: None,
+             started: 0,
+             most_in_a_second: 0,
+             reported: None,
+@@ -112,12 +158,25 @@ impl FramePacing {
+         self.enabled
+     }
+ 
++    /// How many frame intervals an idle frame is held back at `now`: two within the ramp after
++    /// the last change, the wide interval after it (and before any change).
++    fn idle_intervals(&self, now: Instant) -> u32 {
++        self.idle_intervals_with(now, idle_ramp(), idle_frame_intervals())
++    }
++
++    fn idle_intervals_with(&self, now: Instant, ramp: Duration, wide: u32) -> u32 {
++        match self.last_change {
++            Some(at) if now.saturating_duration_since(at) < ramp => IDLE_FRAME_INTERVALS,
++            _ => wide,
++        }
++    }
++
+     /// The element asks for a frame at `now`. Says how long the frame waits before it starts
+     /// rendering: not at all when the picture has changed since the last frame, otherwise
      /// until the stream would stall; in both cases not less than [`Self::room`].
      pub(crate) fn frame_asked(&mut self, now: Instant, last_render: Option<Instant>) -> Duration {
          let idle = match last_render {
 -            Some(last) if !self.changed => (self.frame_interval * IDLE_FRAME_INTERVALS)
-+            Some(last) if !self.changed => (self.frame_interval * idle_frame_intervals())
++            Some(last) if !self.changed => (self.frame_interval * self.idle_intervals(now))
                  .saturating_sub(now.saturating_duration_since(last)),
              _ => Duration::ZERO,
          };
-@@ -280,6 +302,16 @@ mod tests {
+@@ -154,6 +213,9 @@ impl FramePacing {
+             return true;
+         }
+         let changed = std::mem::take(&mut self.changed);
++        if changed {
++            self.last_change = Some(now);
++        }
+         while self
+             .recent
+             .front()
+@@ -280,11 +342,61 @@ mod tests {
          assert!(pacing.frame_started(now));
      }
  
 +    #[test]
-+    fn the_idle_interval_is_two_unless_a_number_from_1_to_1000_is_given() {
-+        assert_eq!(idle_frame_intervals_from(None), 2);
-+        assert_eq!(idle_frame_intervals_from(Some("8")), 8);
-+        assert_eq!(idle_frame_intervals_from(Some(" 36 ")), 36);
-+        assert_eq!(idle_frame_intervals_from(Some("0")), 2);
-+        assert_eq!(idle_frame_intervals_from(Some("5000")), 2);
-+        assert_eq!(idle_frame_intervals_from(Some("x")), 2);
++    fn the_wide_idle_interval_and_the_ramp_have_defaults_and_bounds() {
++        assert_eq!(idle_frame_intervals_from(None), WIDE_IDLE_FRAME_INTERVALS);
++        assert_eq!(idle_frame_intervals_from(Some(" 8 ")), 8);
++        assert_eq!(
++            idle_frame_intervals_from(Some("0")),
++            WIDE_IDLE_FRAME_INTERVALS
++        );
++        assert_eq!(
++            idle_frame_intervals_from(Some("5000")),
++            WIDE_IDLE_FRAME_INTERVALS
++        );
++        assert_eq!(idle_ramp_from(None), Duration::from_millis(500));
++        assert_eq!(idle_ramp_from(Some("0")), Duration::ZERO);
++        assert_eq!(idle_ramp_from(Some("20000")), Duration::from_millis(500));
++    }
++
++    #[test]
++    fn idle_frames_keep_the_beat_for_the_ramp_after_a_change_and_widen_after() {
++        let mut pacing = pacing(72);
++        let start = Instant::now();
++        let ramp = Duration::from_millis(500);
++        // Before any change: the wide interval.
++        assert_eq!(pacing.idle_intervals_with(start, ramp, 12), 12);
++        // A frame with a change: two intervals for the next 500 ms, then wide.
++        pacing.changed();
++        pacing.frame_started(start);
++        assert_eq!(
++            pacing.idle_intervals_with(start + Duration::from_millis(100), ramp, 12),
++            2
++        );
++        assert_eq!(
++            pacing.idle_intervals_with(start + Duration::from_millis(499), ramp, 12),
++            2
++        );
++        assert_eq!(
++            pacing.idle_intervals_with(start + Duration::from_millis(500), ramp, 12),
++            12
++        );
++        // An idle frame does not start the ramp again.
++        pacing.frame_started(start + Duration::from_millis(600));
++        assert_eq!(
++            pacing.idle_intervals_with(start + Duration::from_millis(700), ramp, 12),
++            12
++        );
 +    }
 +
      #[test]
      fn without_a_change_a_frame_goes_out_after_two_intervals() {
          let mut pacing = pacing(85);
+         let frame = pacing.frame_interval;
+         let start = Instant::now();
++        // (Trial build: two intervals hold for half a second after a change; the frame below
++        // is such a change.)
++        pacing.changed();
+         assert_eq!(pacing.frame_asked(start, None), Duration::ZERO);
+         pacing.frame_started(start);
+         let now = start + Duration::from_millis(3);
 diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
 index 7813b6f..a907e4a 100644
 --- a/wayland-display-core/src/comp/windows.rs
@@ -2344,6 +2460,20 @@ index e64aad8..55a0b19 100644
      );
      let stack = windows(&f);
      assert_eq!(stack[0], first);
+diff --git a/wayland-display-core/src/tests/test_frame_pacing.rs b/wayland-display-core/src/tests/test_frame_pacing.rs
+index bbe3178..9a65bab 100644
+--- a/wayland-display-core/src/tests/test_frame_pacing.rs
++++ b/wayland-display-core/src/tests/test_frame_pacing.rs
+@@ -87,6 +87,9 @@ fn a_commit_lets_the_waiting_frame_out() {
+ #[test]
+ fn without_a_commit_the_frame_goes_out_after_two_frame_intervals() {
+     let (mut f, starts) = fixture(true);
++    // (Trial build: two intervals hold for half a second after a change; the first frame is
++    // such a change.)
++    f.server.pacing.changed();
+     ask_for_a_frame(&mut f, &starts);
+     run(&mut f, Duration::from_millis(10), &starts, false);
+     ask_for_a_frame(&mut f, &starts);
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
 index 0000000..fed6032
