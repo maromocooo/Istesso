@@ -64,7 +64,12 @@ What it changes:
   remembered, so a menu item that opens a window, and the next menu along a menu bar, are
   not taken for another application. The grab of a popup that has gone is ended, and the
   keyboard given back to its holder's window, when a window of its application comes, a new
-  popup grabs, a button is pressed, or a window goes. Nobody holds the keyboard after the
+  popup grabs, a button is pressed, or a window goes; not while another popup of the
+  holder's window is still open (a submenu that closed under its open menu: the grab goes
+  on with that menu, so that a click outside still dismisses it). Known: in this
+  compositor a submenu's own grab leaves the keyboard on the window (the seat's pointer grab
+  is replaced after the keyboard grab, which ends the new keyboard grab; upstream order, not
+  changed here). Nobody holds the keyboard after the
   last window has gone (the seat does not report that change), so the next application's
   first window takes it.
 - A window of the application in use that comes while one of its menus still has the grab
@@ -105,7 +110,8 @@ application closing one of its windows after a menu has gone takes no keyboard; 
 application's window goes below the main window too when a dialog has the keyboard; after
 the last window has gone, a new application's window takes the keyboard; a refused popup
 after a menu has gone leaves the keyboard in the window in use; a click after a menu has
-gone reaches the window; a marked window that goes takes its mark with it, and windows have
+gone reaches the window; after a submenu has closed, a click outside still dismisses its
+menu; a marked window that goes takes its mark with it, and windows have
 ids of their own that do not change.
 
 2. Maximized, not fullscreen
@@ -480,7 +486,7 @@ index ce1ce1a..aa599e3 100644
  }
  
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 68e95df..1e6645c 100644
+index 68e95df..4c76ee6 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
 @@ -58,6 +58,7 @@ use smithay::{
@@ -584,7 +590,7 @@ index 68e95df..1e6645c 100644
  /// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
  /// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
  /// frame no longer counts.
-@@ -457,8 +505,244 @@ impl State {
+@@ -457,8 +505,252 @@ impl State {
          }
      }
  
@@ -716,6 +722,14 @@ index 68e95df..1e6645c 100644
 +        if !gone {
 +            return;
 +        }
++        // A submenu that closed while its menu is still open: the grab goes on with that menu
++        // (a click outside still dismisses it), and is left to the seat.
++        let a_menu_is_open = self.keyboard_holder.as_ref().is_some_and(|(root, _)| {
++            PopupManager::popups_for_surface(root).any(|(popup, _)| popup.alive())
++        });
++        if a_menu_is_open {
++            return;
++        }
 +        if keyboard.is_grabbed() {
 +            keyboard.unset_grab(self);
 +        }
@@ -830,7 +844,7 @@ index 68e95df..1e6645c 100644
      pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
          use smithay::wayland::seat::WaylandFocus;
          let parent = window
-@@ -479,30 +763,56 @@ impl State {
+@@ -479,30 +771,56 @@ impl State {
              .and_then(|output| output.current_mode())
              .map(|mode| mode.size.to_logical(1))
              .unwrap_or_default();
@@ -902,7 +916,7 @@ index 68e95df..1e6645c 100644
      }
  
      /// Puts the windows that have `window` as their parent above it again, and theirs above
-@@ -523,7 +833,7 @@ impl State {
+@@ -523,7 +841,7 @@ impl State {
              .cloned()
              .collect();
          for child in children {
@@ -911,7 +925,7 @@ index 68e95df..1e6645c 100644
              self.raise_children_of(&child);
          }
      }
-@@ -552,8 +862,46 @@ impl State {
+@@ -552,8 +870,46 @@ impl State {
                  .iter()
                  .filter(|window| window.alive() && Some(*window) != gone)
                  .count();
@@ -1249,7 +1263,7 @@ index 7813b6f..cf75392 100644
      }
  }
 diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
-index d552363..824cf41 100644
+index d552363..a91a10c 100644
 --- a/wayland-display-core/src/tests/client.rs
 +++ b/wayland-display-core/src/tests/client.rs
 @@ -27,7 +27,8 @@ use wayland_protocols::{
@@ -1430,7 +1444,7 @@ index d552363..824cf41 100644
      /// Whether the compositor has asked the last window to close.
      pub fn asked_to_close(&self) -> bool {
          self.state.windows.last().is_some_and(|w| w.close_requested)
-@@ -392,6 +472,233 @@ impl WaylandClient {
+@@ -392,6 +472,265 @@ impl WaylandClient {
          }
      }
  
@@ -1579,6 +1593,38 @@ index d552363..824cf41 100644
 +        number
 +    }
 +
++    /// Opens a popup on another popup (a submenu) that grabs with this serial. Returns the
++    /// popup's number.
++    pub fn open_popup_on_popup(&mut self, parent: usize, grab: u32) -> usize {
++        let state = &mut self.state;
++        let wm_base = state.wm_base.as_ref().unwrap();
++        let positioner = wm_base.create_positioner(&state.qh, ());
++        positioner.set_size(20, 20);
++        positioner.set_anchor_rect(0, 0, 10, 10);
++        let surface = state
++            .compositor
++            .as_ref()
++            .unwrap()
++            .create_surface(&state.qh, ());
++        let xdg_surface = wm_base.get_xdg_surface(&surface, &state.qh, ());
++        let number = state.popups.len();
++        let popup = xdg_surface.get_popup(
++            Some(&state.popups[parent].xdg_surface),
++            &positioner,
++            &state.qh,
++            number,
++        );
++        popup.grab(state.seat.as_ref().unwrap(), grab);
++        surface.commit();
++        state.popups.push(Popup {
++            surface,
++            xdg_surface,
++            xdg_popup: popup,
++            dismissed: false,
++        });
++        number
++    }
++
 +    /// Closes a popup, as a menu does when one of its items is chosen.
 +    pub fn close_popup(&mut self, popup: usize) {
 +        let popup = &self.state.popups[popup];
@@ -1664,7 +1710,7 @@ index d552363..824cf41 100644
      pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
          self.state.mouse_events.as_mut()
      }
-@@ -489,7 +796,29 @@ impl State {
+@@ -489,7 +828,29 @@ impl State {
          self.create_window_of(None);
      }
  
@@ -1694,7 +1740,7 @@ index d552363..824cf41 100644
          let compositor = self.compositor.as_ref().unwrap();
          let xdg_wm_base = self.wm_base.as_ref().unwrap();
          let viewporter = self.viewporter.as_ref().unwrap();
-@@ -500,6 +829,13 @@ impl State {
+@@ -500,6 +861,13 @@ impl State {
          if parent.is_some() {
              xdg_toplevel.set_parent(parent);
          }
@@ -1708,7 +1754,7 @@ index d552363..824cf41 100644
          let viewport = viewporter.get_viewport(&surface, &self.qh, ());
  
          let window = Window {
-@@ -616,6 +952,10 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
+@@ -616,6 +984,10 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
      ) {
          match event {
              xdg_surface::Event::Configure { serial } => {
@@ -1719,7 +1765,7 @@ index d552363..824cf41 100644
                  let window = state
                      .windows
                      .iter_mut()
-@@ -696,7 +1036,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
+@@ -696,7 +1068,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
  
  impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
      fn event(
@@ -1728,7 +1774,7 @@ index d552363..824cf41 100644
          _: &wl_keyboard::WlKeyboard,
          event: wl_keyboard::Event,
          _: &(),
-@@ -704,6 +1044,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+@@ -704,6 +1076,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
          _: &QueueHandle<Self>,
      ) {
          tracing::debug!("{:?}", event);
@@ -1876,10 +1922,10 @@ index e64aad8..55a0b19 100644
      assert_eq!(stack[0], first);
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
-index 0000000..47e3f1d
+index 0000000..0ecf8de
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_windows.rs
-@@ -0,0 +1,823 @@
+@@ -0,0 +1,845 @@
 +//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
 +//! window, the one a person sees under the pointer; a window is told to be maximized, not
 +//! fullscreen, unless it asks; a second window keeps its own size and is not lost under the
@@ -2702,6 +2748,28 @@ index 0000000..47e3f1d
 +    assert!(!crate::comp::windows::wants_attention(&theirs));
 +    assert_eq!(told.lock().unwrap().last(), Some(&(1, 0)));
 +    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++}
++
++#[test]
++fn after_a_submenu_has_closed_a_click_outside_still_dismisses_its_menu() {
++    // (With the order of the seat's grabs in this compositor, a submenu's grab leaves the
++    // keyboard on the window, so the submenu is never the keyboard's focus here and this
++    // test passes with or without the check for an open menu; it guards the outcome.)
++    let mut f = fixture();
++    let menu = open_a_menu(&mut f);
++    let serial = f.client.last_button_serial().unwrap();
++    let submenu = f.client.open_popup_on_popup(menu, serial);
++    f.round_trip();
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(submenu));
++    // The submenu closes (the person goes back to the menu); the menu stays open.
++    f.client.close_popup(submenu);
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(menu));
++    // A click outside the menu, in the window: the menu is dismissed.
++    click(&mut f);
++    f.round_trip();
++    assert!(f.client.popup_dismissed(menu));
 +}
 diff --git a/wayland-display-core/src/tests/test_windows.rs b/wayland-display-core/src/tests/test_windows.rs
 index 8d177dc..8c33648 100644
