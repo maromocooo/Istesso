@@ -1094,6 +1094,9 @@ fn run_pair(action: PairAction) -> Result<(), String> {
             name,
         } => {
             let identity = load_identity()?;
+            // Opened before the wait so that a damaged list is reported before
+            // anyone types the code. `add` reads the file again under its lock,
+            // so changes made with `istesso peers` while this waits are kept.
             let mut peers = open_peers()?;
             let name = name.unwrap_or_else(istesso_doctor::hostname);
             let listener = TcpListener::bind(("0.0.0.0", port))
@@ -1136,6 +1139,7 @@ fn run_pair(action: PairAction) -> Result<(), String> {
             name,
         } => {
             let identity = load_identity()?;
+            // As above: `add` reads the file again before it writes.
             let mut peers = open_peers()?;
             let name = name.unwrap_or_else(istesso_doctor::hostname);
             let code = PairCode::parse(&code).map_err(|e| e.to_string())?;
