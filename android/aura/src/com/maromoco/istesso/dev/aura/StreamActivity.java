@@ -76,7 +76,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         settings = new Settings(this);
         app = HostApp.of(getIntent().getData());
         if (app == null) {
-            app = HostApp.named("manual");
+            app = HostApp.ALL[0];
         }
         setTitle(getString(R.string.panel_name, getString(app.titleRes)));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

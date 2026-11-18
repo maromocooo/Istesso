@@ -5,13 +5,15 @@ import android.net.Uri;
 
 /**
  * The host applications the prototype offers, each in a panel of its own (the owner's decision,
- * 2026-11-18: one panel per host application). Only these three: Chrome stays out until its
- * crash-report and telemetry checks are done.
+ * 2026-11-18: one panel per host application). The four the trial edition opens for AURA
+ * (`scripts/daily.sh open NAME --for aura`); Chrome since its crash report and usage statistics
+ * are off in the trial (2026-11-19).
  *
- * <p>Ports: PROVISIONAL. Slot N has the picture on 4791N and the input's agent on 4792N, as the
- * trial edition numbers its slots. The host side is being brought into the trial edition
- * (`scripts/daily.sh`, a mode for AURA); when its interface is there, this follows it. "manual"
- * takes the two ports typed on the first screen (the AURA trial launcher's 47914 and 47924).
+ * <p>Ports: the host has ONE slot for AURA for now (picture 47914, input 47924; a second
+ * application is refused there while one runs), so every panel connects to the ports on the first
+ * screen, whose defaults are those. A panel cannot tell which application the host shows in that
+ * slot: open the panel of the application that was opened for AURA. Several panels at once need
+ * several AURA slots on the host (docs/m8-aura-prototype.md, 7.2).
  */
 final class HostApp {
     final String name;
@@ -28,7 +30,7 @@ final class HostApp {
         new HostApp("editor", R.string.app_editor, 1),
         new HostApp("blender", R.string.app_blender, 2),
         new HostApp("firefox", R.string.app_firefox, 3),
-        new HostApp("manual", R.string.app_manual, 0),
+        new HostApp("chrome", R.string.app_chrome, 4),
     };
 
     static HostApp named(String name) {
@@ -56,11 +58,12 @@ final class HostApp {
         return named(uri.getPathSegments().get(0));
     }
 
+    /** The host's one AURA slot for every application, for now. */
     int picturePort(Settings settings) {
-        return slot == 0 ? settings.picturePort() : 47910 + slot;
+        return settings.picturePort();
     }
 
     int inputPort(Settings settings) {
-        return slot == 0 ? settings.inputPort() : 47920 + slot;
+        return settings.inputPort();
     }
 }

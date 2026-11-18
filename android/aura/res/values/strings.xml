@@ -28,10 +28,10 @@
     <string name="input_over">入力：受け付けられません</string>
     <string name="middle_off">中ボタン：切</string>
     <string name="middle_on">中ボタン：入（左が中になる）</string>
-    <string name="apps_title">ホストのアプリ（1 つにつき 1 枚のパネル。開いているものは前に出る）</string>
+    <string name="apps_title">ホストのアプリ（1 つにつき 1 枚のパネル。開いているものは前に出る。いまホストの AURA 用の枠は 1 つなので、ホストで AURA 向けに開いたアプリのパネルを選ぶ）</string>
     <string name="app_editor">エディター</string>
     <string name="app_blender">Blender</string>
     <string name="app_firefox">Firefox</string>
-    <string name="app_manual">試し（上のポートを手で）</string>
+    <string name="app_chrome">Chrome</string>
     <string name="panel_name">%1$s（Istesso 試作）</string>
 </resources>
