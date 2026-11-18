@@ -481,6 +481,19 @@ fn refuse(code: ErrorCode, message: impl Into<String>) -> Response {
     Response::error(code, message)
 }
 
+/// The answer to `session_attach` once the host's side of the stream took
+/// the client, or did not. What the media path agreed on is for the caller
+/// only while it is the device that is shown the session: another device
+/// may have taken it in the meantime. (The same device that attached twice
+/// at once is told the answer of the attachment that won on both requests;
+/// it is that device's own, so nothing goes to another device.)
+fn attach_reply(entry: &Entry, caller: Caller<'_>, went: Result<(), String>) -> Response {
+    match went {
+        Ok(()) => report_to(&entry.info, entry.shows(caller, entry.info.attachment)),
+        Err(why) => refuse(ErrorCode::Unavailable, why),
+    }
+}
+
 fn report(info: &SessionInfo) -> Response {
     Response::Session {
         session: Box::new(info.clone()),
@@ -921,12 +934,8 @@ impl Sessions {
                 return refuse(ErrorCode::NotFound, "no such session");
             };
             if let Some(at) = entry.attached.iter().position(|(n, _)| *n == number) {
-                return match entry.attached.swap_remove(at).1 {
-                    // What the media path agreed on, for the caller only
-                    // while it is the one that is shown the session.
-                    Ok(()) => report_to(&entry.info, entry.shows(caller, entry.info.attachment)),
-                    Err(why) => refuse(ErrorCode::Unavailable, why),
-                };
+                let went = entry.attached.swap_remove(at).1;
+                return attach_reply(entry, caller, went);
             }
             if entry.ended_at.is_some() || entry.info.state == SessionState::Stopping {
                 return refuse(
@@ -1605,10 +1614,17 @@ impl Inner {
             // display the application appears on.
             if let Some(dir) = job.input_socket.parent() {
                 if let Err(why) = input_dir(dir) {
-                    let why = format!(
-                        "the folder of the session's input socket is not this user's alone ({why})"
+                    // Where it is, and why, for the host's own log only: the
+                    // path can name the host's user, and the end is shown to
+                    // paired devices.
+                    (self.log)(format!(
+                        "session {id}: the folder of its input socket ({}) is not private: {why}",
+                        dir.display()
+                    ));
+                    break 'session ending(
+                        EndReason::StreamFailed,
+                        "the folder of the session's input socket on the host is not private",
                     );
-                    break 'session ending(EndReason::StreamFailed, why);
                 }
             }
             let running = match job.runner.start(&job.start) {

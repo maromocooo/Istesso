@@ -2504,11 +2504,20 @@ fn a_session_whose_input_folder_is_not_private_does_not_start() {
     let id = host.start().id;
     let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
     assert_eq!(end.reason, EndReason::StreamFailed);
-    assert!(
-        end.message.contains("not this user's alone"),
-        "{}",
-        end.message
+    // Devices are told that it is not private, not where it is.
+    assert_eq!(
+        end.message,
+        "the folder of the session's input socket on the host is not private"
     );
+    let folder = dir.display().to_string();
+    assert!(!end.message.contains(&folder));
+    // The host's own log says where.
+    assert!(host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("not private") && l.contains(&folder)));
     assert_eq!(host.journal.count("runner start"), 0);
 }
 
@@ -2588,4 +2597,66 @@ fn who_ended_an_application_by_force_is_recorded() {
         .unwrap()
         .iter()
         .any(|l| l.ends_with("ended by force at the word of the person at the host")));
+}
+
+#[test]
+fn the_answer_to_attaching_is_only_for_the_device_that_is_shown_the_session() {
+    let host = host();
+    let id = host.running().id;
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    let rights = Permission::defaults();
+    let laptop = Caller {
+        peer: &host.laptop,
+        rights: &rights,
+    };
+    let answer = |response: Response| match response {
+        Response::Session { session } => session.answer,
+        other => panic!("not a session: {other:?}"),
+    };
+    let mut table = host.sessions.inner.lock();
+    let entry = table.sessions.get_mut(&id.0).unwrap();
+    assert!(entry.info.answer.is_some());
+    // The laptop is shown the session: its attach is answered with the
+    // media path's answer.
+    assert!(answer(attach_reply(entry, laptop, Ok(()))).is_some());
+    // The tablet took the session before the laptop's answer was read: the
+    // laptop is told that it went, and nothing of the tablet's.
+    entry.viewer = Device::of(&tablet);
+    entry.info.attachment += 1;
+    assert_eq!(answer(attach_reply(entry, laptop, Ok(()))), None);
+    // A refusal stays a refusal.
+    let (code, _) = refusal(attach_reply(entry, laptop, Err("no".into())));
+    assert_eq!(code, ErrorCode::Unavailable);
+}
+
+#[test]
+fn an_attach_in_flight_is_detached_while_the_application_is_asked_to_end() {
+    let host = host();
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.on_attach(OnAttach::Ignore);
+    let held = asking(
+        &host,
+        Request::SessionAttach {
+            session: id.clone(),
+            display: mode(),
+            offer: serde_json::json!({"port": 50010}),
+        },
+    );
+    host.journal.wait_for("runner attach", 1);
+    // The last window closes while the runner has not answered; the
+    // application is still there and is asked to end.
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    host.follow_until(&id, SessionState::LeftOver);
+    let _ = held.join();
+    // Detached once, before it was asked, and nobody was attached.
+    assert_eq!(
+        host.since_running(),
+        [
+            "runner attach",
+            "runner detach",
+            "app asked to end",
+            "runner stop"
+        ]
+    );
 }

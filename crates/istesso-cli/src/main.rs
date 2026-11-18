@@ -1459,7 +1459,10 @@ fn set_permission(
     // looks at the sessions and the conversations now (ADR 0010, 12).
     #[cfg(unix)]
     match istesso_agent::session::local::pairings_changed(&Paths::from_env()) {
-        Ok(true) => println!("The agent on this machine was told: it applies now."),
+        Ok(true) => println!(
+            "The agent on this machine was told: its sessions and their pictures follow the \
+             change now, and an open input conversation within about a second."
+        ),
         Ok(false) => println!("No agent runs on this machine: it applies when one starts."),
         Err(why) => println!(
             "The agent on this machine could not be told ({why}). It applies within a second: \
