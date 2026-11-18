@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Installed by the pkg as /Library/LaunchAgents/com.maromoco.istesso.agent.plist (root:wheel, 0644).
+         It runs per user, inside the graphical login session: screen recording and the
+         Local Network permission belong to that session. -->
+    <key>Label</key>
+    <string>com.maromoco.istesso.agent</string>
+
+    <!-- The bundle's own executable, so that the permissions attach to the bundle.
+         build-pkg.sh rewrites the path when the bundle is not called Istesso.app. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Istesso.app/Contents/MacOS/istesso</string>
+        <string>agent</string>
+    </array>
+
+    <!-- Lets System Settings show the agent under the app, not as an unnamed item. -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.maromoco.istesso</string>
+    </array>
+
+    <!-- Start when the user logs in; start again if it exits with an error.
+         An exit with status 0 (istesso agent stopped on purpose) stays stopped. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Only in a graphical session (not over ssh without one). -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <!-- Answers the user's devices in real time: do not let the system treat it as background work. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- No log files: the agent writes what it has to say to standard error, which goes
+         to the unified log. It must never print pairing codes, keys or tokens. -->
+</dict>
+</plist>
