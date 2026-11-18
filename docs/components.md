@@ -25,6 +25,10 @@
 | winit、softbuffer | テストアプリ（`istesso-flash`）の窓と描画。`istesso` 本体には入らない | Apache-2.0、MIT OR Apache-2.0 | <https://github.com/rust-windowing/winit>、<https://github.com/rust-windowing/softbuffer> |
 | glutin、glutin-winit、glow | テストアプリが GPU で描くときの OpenGL（`--draw gpu`）。`istesso` 本体には入らない | Apache-2.0、MIT、MIT OR Apache-2.0 OR Zlib | <https://github.com/rust-windowing/glutin>、<https://github.com/grovesNL/glow> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
+| rubato、audioadapter-buffers | 音の時計のずれ補正（動かしながら比を変えられるリサンプラー）。sinc 補間だけを使う | MIT OR Apache-2.0 | <https://github.com/HEnquist/rubato> |
+| rtrb | 音のスレッドとの受け渡し（待たないリングバッファー） | MIT OR Apache-2.0 | <https://github.com/mgeier/rtrb> |
+| coreaudio-rs、objc2-core-audio | Mac の音の出力（Core Audio）。macOS でだけコンパイルされる | MIT OR Apache-2.0、Zlib OR Apache-2.0 OR MIT | <https://github.com/RustAudio/coreaudio-rs>、<https://github.com/madsmtm/objc2> |
+| pipewire（pipewire-rs）、libc | Linux の音の取り込み（PipeWire のクライアントとして、仮想の出力先を作る）。Linux で、機能 `pipewire` を有効にしたときだけコンパイルされる。ビルドに `libpipewire-0.3-dev` と `libclang-dev` が要る | MIT、MIT OR Apache-2.0 | <https://gitlab.freedesktop.org/pipewire/pipewire-rs> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。使うのは、コンポジターの本体（gst-wayland-display の `wayland-display-core`）です。元のコミットに小さな修正を重ね、修正は元のプロジェクトに提案できる形に保ちます（[ADR 0009](adr/0009-host-compositor.md)）。入力はコンポジターに直接渡すので、仮想入力（inputtino）は、ゲームパッドが要るようになるまで使いません。
 
@@ -34,15 +38,16 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 |---|---|---|---|
 | GStreamer | Linux ホストの映像パイプライン | LGPL | 動的リンクで使う |
 | FFmpeg | 予備のコーデック経路 | LGPL（既定の構成） | `--enable-gpl` と `--enable-nonfree` を付けない。x264 / x265 を使わない。動的リンク |
-| Roc Toolkit | 音の配信（時計のずれ補正、欠落の補完） | MPL-2.0 | ライブラリとして使う。Roc 自体を変更した場合はその変更を公開する。`deny.toml` に個別登録 |
 | NVENC | NVIDIA のエンコーダー | ヘッダーは MIT、本体はドライバー | SDK 本体をリポジトリに入れない |
+
+Roc Toolkit（MPL-2.0）は、音の配信に使う予定でしたが、使わないことにしました（[ADR 0011](adr/0011-audio-transport.md)）。認証と暗号化を持たないこと、Mac に入れる手段がソースからのビルドしかないこと、Ubuntu の版では失われたパケットの復元が使えないことが理由です。音の配信は、自前のクレート（`istesso-audio`）で行います。
 
 ## OS の機能（呼び出すだけ）
 
 | 機能 | 用途 |
 |---|---|
 | ScreenCaptureKit、VideoToolbox、Core Audio のタップ（macOS 14.2 以降） | Mac ホストの取り込み、圧縮、アプリ音声の取得 |
-| PipeWire | Linux の音声。Roc 用の送受信モジュールあり |
+| PipeWire | Linux の音声。クライアントとして仮想の出力先を作り、そこに流れた音を取り込む（[ADR 0011](adr/0011-audio-transport.md)） |
 | Linux カーネルの USB/IP | Linux が受け側の USB 付け替え |
 | Jetpack Compose for XR | AURA クライアント（ベータ） |
 
@@ -79,3 +84,5 @@ cargo deny check
 ```
 
 2026-11-16 時点の依存 268 クレートは、すべて MIT、Apache-2.0、BSD-3-Clause、ISC、Unicode-3.0 のいずれかで利用できます（cargo-deny 0.20.2 でライセンス・禁止項目・取得元・既知の脆弱性を検査済み）。このうち 169 は、テストアプリが使う winit、softbuffer、glutin、glow が連れてくるものです。Android や Web 向けなど、対象の OS ではコンパイルされないものも数に入っています。
+
+音（`istesso-audio`）のために足した依存を含めると、`m2-audio` のブランチでは、`main` と合わせる前、すべての機能を有効にした状態で 168 クレートでした（2026-11-16、同じ版の cargo-deny で、`--all-features` を付けて同じ 4 項目を検査済み）。足した分は、どれも `deny.toml` の許可リストの中にあり、例外は足していません。Roc Toolkit は、使いません（[ADR 0011](adr/0011-audio-transport.md)）。

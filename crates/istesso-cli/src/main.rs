@@ -17,6 +17,8 @@ use istesso_proto::{
     NetKind, Role, UnifiedApp,
 };
 
+mod audio;
+
 #[derive(Parser)]
 #[command(
     name = "istesso",
@@ -83,6 +85,11 @@ enum Command {
     },
     /// Show this device's name and key fingerprint
     Id,
+    /// Send the sound of one machine to another (first tests)
+    Audio {
+        #[command(subcommand)]
+        action: audio::AudioAction,
+    },
     /// Work with latency measurements (see docs/measurements/README.md)
     Measure {
         #[command(subcommand)]
@@ -484,6 +491,7 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("Cache        {}", paths.cache.display());
             Ok(())
         }
+        Command::Audio { action } => audio::run(action),
         Command::Measure { action } => run_measure(action),
         Command::Input { action } => match action {
             InputAction::Relay {
