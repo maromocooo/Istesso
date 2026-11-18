@@ -1546,7 +1546,7 @@ static NSCursor *empty_cursor(void) {
 - (void)keyUp:(NSEvent *)event {
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
-    [self send:changes count:keys_key_up(&_keys, event.keyCode, changes)];
+    [self send:changes count:keys_key_up(&_keys, event.keyCode, event.modifierFlags, changes)];
 }
 
 // Keys with Command come here first; they all go to the other side.
