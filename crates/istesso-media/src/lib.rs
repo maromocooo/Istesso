@@ -53,6 +53,83 @@ pub use wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, DEFAULT_P
 /// host. Never a key, and never an address.
 pub type Log = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
+/// Why an attempt to reach a host failed, in one word that names no address
+/// and no device. For a log, and for telling "the host is there but nothing
+/// listens" from "there is no way to it from this machine".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Failure {
+    /// The machine answered, and nothing listens where it was asked.
+    Refused = 1,
+    /// There is no way to the machine from here: no route, the network is
+    /// down, or this machine does not let the program out onto the network.
+    Unreachable = 2,
+    /// Connecting, or the first exchange, got no answer in time.
+    TimedOut = 3,
+    /// The host was reached and greeted, and then said nothing more (in
+    /// time): the request was not answered, or the connection went silent
+    /// or was closed.
+    NoAnswer = 4,
+    /// The host answered that it cannot do it right now.
+    NotReady = 5,
+    /// Anything else.
+    Other = 6,
+}
+
+impl Failure {
+    pub fn word(self) -> &'static str {
+        match self {
+            Failure::Refused => "refused",
+            Failure::Unreachable => "unreachable",
+            Failure::TimedOut => "timed_out",
+            Failure::NoAnswer => "no_answer",
+            Failure::NotReady => "not_ready",
+            Failure::Other => "other",
+        }
+    }
+
+    /// What a socket error says about the way to the other machine.
+    pub fn of_io(err: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        #[cfg(unix)]
+        if let Some(code) = err.raw_os_error() {
+            let no_way = [
+                libc::EHOSTUNREACH,
+                libc::ENETUNREACH,
+                libc::ENETDOWN,
+                libc::EHOSTDOWN,
+                libc::EADDRNOTAVAIL,
+                libc::EACCES,
+                libc::EPERM,
+            ];
+            if no_way.contains(&code) {
+                return Failure::Unreachable;
+            }
+        }
+        match err.kind() {
+            ErrorKind::ConnectionRefused => Failure::Refused,
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => Failure::TimedOut,
+            ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe => Failure::NoAnswer,
+            _ => Failure::Other,
+        }
+    }
+
+    /// What a failure of the control channel's kind of connection says.
+    pub fn of_link(err: &istesso_link::Error) -> Self {
+        use istesso_link::Error as Link;
+        match err {
+            Link::Refused => Failure::Refused,
+            Link::Timeout => Failure::TimedOut,
+            Link::Closed => Failure::NoAnswer,
+            Link::Io(err) => Failure::of_io(err),
+            _ => Failure::Other,
+        }
+    }
+}
+
 /// Everything that can go wrong between a host and a viewer.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -111,6 +188,17 @@ impl Error {
     /// or refused this device, the answer would be the same the next time,
     /// and a device that takes a picture back from the one it was moved to
     /// would never stop doing so.
+    /// The failure in one word that names no address.
+    pub fn failure(&self) -> Failure {
+        match self {
+            Error::Link(err) => Failure::of_link(err),
+            Error::Io(err) => Failure::of_io(err),
+            Error::Silent => Failure::NoAnswer,
+            Error::Busy => Failure::NotReady,
+            _ => Failure::Other,
+        }
+    }
+
     pub fn again(&self) -> Again {
         use istesso_link::Error as Link;
         match self {
@@ -204,5 +292,104 @@ pub(crate) mod testing {
             device_name: name.to_string(),
             public_key: identity.public_key(),
         })
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::{Error, Failure};
+    use istesso_link::Error as Link;
+    use std::io;
+
+    #[test]
+    fn a_failure_is_one_of_six_words_and_names_nothing() {
+        let words: Vec<&str> = [
+            Failure::Refused,
+            Failure::Unreachable,
+            Failure::TimedOut,
+            Failure::NoAnswer,
+            Failure::NotReady,
+            Failure::Other,
+        ]
+        .into_iter()
+        .map(Failure::word)
+        .collect();
+        assert_eq!(
+            words,
+            [
+                "refused",
+                "unreachable",
+                "timed_out",
+                "no_answer",
+                "not_ready",
+                "other"
+            ]
+        );
+        // The numbers are the ones of the header.
+        assert_eq!((Failure::Refused as u32, Failure::Other as u32), (1, 6));
+    }
+
+    #[test]
+    fn nothing_listening_is_told_from_no_way_to_the_machine() {
+        // The machine answered: nothing listens there.
+        assert_eq!(
+            Failure::of_io(&io::Error::from(io::ErrorKind::ConnectionRefused)),
+            Failure::Refused
+        );
+        assert_eq!(Failure::of_link(&Link::Refused), Failure::Refused);
+        // No way to the machine from here, in every form the system says it. The last
+        // two are what a program hears that this machine does not let out.
+        #[cfg(unix)]
+        for code in [
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::ENETDOWN,
+            libc::EHOSTDOWN,
+            libc::EADDRNOTAVAIL,
+            libc::EACCES,
+            libc::EPERM,
+        ] {
+            let err = io::Error::from_raw_os_error(code);
+            assert_eq!(Failure::of_io(&err), Failure::Unreachable, "{code}");
+            assert_eq!(
+                Failure::of_link(&Link::Io(io::Error::from_raw_os_error(code))),
+                Failure::Unreachable,
+                "{code}"
+            );
+            assert_eq!(
+                Error::Io(io::Error::from_raw_os_error(code)).failure(),
+                Failure::Unreachable,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn silence_before_and_after_the_greeting_are_told_apart() {
+        // No answer to connecting or to the first exchange.
+        assert_eq!(
+            Failure::of_io(&io::Error::from(io::ErrorKind::TimedOut)),
+            Failure::TimedOut
+        );
+        assert_eq!(Failure::of_link(&Link::Timeout), Failure::TimedOut);
+        assert_eq!(Error::Link(Link::Timeout).failure(), Failure::TimedOut);
+        // Reached and greeted, and then nothing more, or the end.
+        assert_eq!(Failure::of_link(&Link::Closed), Failure::NoAnswer);
+        assert_eq!(Error::Silent.failure(), Failure::NoAnswer);
+        assert_eq!(
+            Failure::of_io(&io::Error::from(io::ErrorKind::ConnectionReset)),
+            Failure::NoAnswer
+        );
+    }
+
+    #[test]
+    fn a_host_that_cannot_right_now_and_everything_else() {
+        assert_eq!(Error::Busy.failure(), Failure::NotReady);
+        assert_eq!(Error::Malformed.failure(), Failure::Other);
+        assert_eq!(Failure::of_link(&Link::Malformed), Failure::Other);
+        assert_eq!(
+            Failure::of_io(&io::Error::from(io::ErrorKind::InvalidData)),
+            Failure::Other
+        );
     }
 }

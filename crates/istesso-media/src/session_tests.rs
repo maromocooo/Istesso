@@ -1840,6 +1840,79 @@ fn pass_on(mut from: TcpStream, mut to: TcpStream, number: u64, state: &BetweenS
     }
 }
 
+/// What the person asked after seeing the system drop a program's first tries in
+/// the first milliseconds after it was rebuilt (and the same will happen after
+/// every update): the first attempts fail at once, as a local refusal does, and
+/// then the way is open. The viewer must not sit out a long wait: it is connected
+/// at the first attempt that is made once the way is open.
+#[test]
+fn when_the_first_attempts_fail_at_once_the_viewer_is_connected_as_soon_as_the_way_opens() {
+    let pair = pair();
+    let keys = LocalKeys::new(&pair.air).unwrap();
+    let list = pair.air_peers.path();
+    let addr = pair.addr;
+    const FAIL: u32 = 3;
+    let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+    let noted = attempts.clone();
+    let mut lasting = Lasting::new(
+        Box::new(move |expected, within| {
+            let mut attempts = noted.lock().unwrap();
+            attempts.push(Instant::now());
+            if attempts.len() as u32 <= FAIL {
+                // At once, without having reached anybody.
+                return Err(Error::Link(istesso_link::Error::Io(
+                    std::io::Error::from_raw_os_error(libc::EHOSTUNREACH),
+                )));
+            }
+            drop(attempts);
+            let peers = istesso_pair::PeerStore::open(&list)?;
+            Viewer::connect(addr, &keys, &peers, expected, within)
+        }),
+        None,
+    );
+    let began = Instant::now();
+    let connected = loop {
+        assert!(began.elapsed() < SOON, "never connected");
+        match lasting.next(Duration::from_millis(20)).unwrap() {
+            Some(Step::Connected { again, .. }) => {
+                assert!(!again);
+                break began.elapsed();
+            }
+            Some(Step::Cut) => panic!("a first connection that failed is not a cut"),
+            _ => {
+                // While it is away the viewer says in what way.
+                if !attempts.lock().unwrap().is_empty() {
+                    assert_eq!(lasting.last_failure(), Some(crate::Failure::Unreachable));
+                }
+            }
+        }
+    };
+    assert_eq!(lasting.last_failure(), None);
+    assert_eq!(lasting.cuts(), 0);
+    let attempts = attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len() as u32, FAIL + 1);
+    // The first attempt is made at once, and so is the second: a viewer answers a
+    // failure at once, once. After that, each attempt that fails is followed by the
+    // next after the viewer's ordinary pause (a quarter of a second), no longer.
+    let first = attempts[0] - began;
+    assert!(first < Duration::from_millis(100), "{first:?}");
+    let second = attempts[1] - attempts[0];
+    assert!(second < Duration::from_millis(50), "{second:?}");
+    for pair in attempts[1..].windows(2) {
+        let apart = pair[1] - pair[0];
+        assert!(
+            apart >= crate::rejoin::RETRY - Duration::from_millis(5)
+                && apart < crate::rejoin::RETRY + Duration::from_millis(150),
+            "{apart:?}"
+        );
+    }
+    // Connected at the fourth attempt, the one that finds the way open: two pauses
+    // after the start, and what a connection takes (the handshake, unoptimised
+    // here; a third of a second is ample for it).
+    let bound = crate::rejoin::RETRY * (FAIL - 1) + Duration::from_millis(350);
+    assert!(connected < bound, "{connected:?}");
+}
+
 impl Pair {
     /// A viewer of the device "air" that connects through `addr` and
     /// connects again when it is cut.

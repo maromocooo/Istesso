@@ -1,0 +1,16 @@
+# Who this application is, in one place: the build script makes the bundle's Info.plist and its
+# signature from these three lines. The system hangs permissions (the local network) on the
+# identifier, so it changes at most once, and only here.
+#
+# Decided by the owner (2026-11-17). The name may still change after a trademark search; then
+# it changes here.
+BUNDLE_ID=com.maromoco.istesso
+APP_NAME=Istesso
+EXECUTABLE=Istesso
+
+# The measuring build: the same program with a local way in for the measurement's keys
+# (ADR 0018). A development helper, named so and with an identifier of its own, so that it is
+# never taken for the application that is handed out.
+MEASURING_BUNDLE_ID=com.maromoco.istesso-dev.measure
+MEASURING_APP_NAME="Istesso Dev Measure"
+MEASURING_EXECUTABLE="Istesso Dev Measure"

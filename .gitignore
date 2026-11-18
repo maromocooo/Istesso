@@ -14,3 +14,5 @@ __pycache__/
 
 # Notes handed to the agent from other tools; not part of the project
 /Claude outputs/
+# Output of macos/client/build.sh
+/macos/client/build/
