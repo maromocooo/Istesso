@@ -8,6 +8,9 @@
 use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
 use serde::{Deserialize, Serialize};
 
+// Streaming sessions (`docs/adr/0010-session-start.md`).
+use istesso_proto::{DisplayMode, SessionId, SessionInfo, StreamKind};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -40,6 +43,79 @@ pub enum Request {
         #[serde(deserialize_with = "istesso_proto::known_only")]
         events: Vec<InputEvent>,
     },
+    /// Start one of your applications and stream it to me. Answered at
+    /// once with [`Response::Session`], before the application runs; needs
+    /// the permissions to view and to control. Only an application from the
+    /// host's own list can be asked for, by its id: no command line.
+    SessionStart {
+        /// The application's id on the host, as `apps` lists it.
+        app: String,
+        #[serde(default = "app_window")]
+        kind: StreamKind,
+        /// What the caller's window shows.
+        display: DisplayMode,
+        /// From the caller's media path, for the host's. Carried as it is.
+        #[serde(default)]
+        offer: serde_json::Value,
+    },
+    /// How is my session? Answered at once when it changed after revision
+    /// `after`; otherwise the host may hold the answer back for up to
+    /// `timeout_ms`. A request that names the attachment that is shown the
+    /// session also tells the host that this client is still there. Any
+    /// paired device that may view and control the host may ask.
+    SessionWait {
+        session: SessionId,
+        /// The revision the caller has seen; 0 for none.
+        #[serde(default)]
+        after: u64,
+        /// 0 asks for an answer at once.
+        #[serde(default)]
+        timeout_ms: u32,
+        /// The attachment the caller is; 0 when it only asks.
+        #[serde(default)]
+        attachment: u64,
+    },
+    /// Ask the application to close, the way closing its window does: it
+    /// may have a question first, and stay. With `force`, end it.
+    SessionStop {
+        session: SessionId,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Which of the host's sessions are not over, whichever device started
+    /// them? Answered with
+    /// [`Response::Sessions`].
+    SessionList,
+    /// Show me this session (again). Whoever is shown it now is not any
+    /// more. Answered once the host's side of the stream is set up, with
+    /// the new attachment and answer; a refusal leaves the session running
+    /// and shown to nobody. Needs the permissions to view and to control.
+    SessionAttach {
+        session: SessionId,
+        /// What the caller's window shows.
+        display: DisplayMode,
+        /// From the caller's media path, for the host's. Carried as it is.
+        #[serde(default)]
+        offer: serde_json::Value,
+    },
+    /// Stop showing me this session. The application runs on. Does nothing
+    /// when `attachment` is no longer the one that is shown it.
+    SessionDetach { session: SessionId, attachment: u64 },
+    /// My window for this session can be seen, or cannot. A session whose
+    /// window cannot be seen needs no picture; the other device may stop
+    /// making it and give the encoder to another window. The attachment
+    /// stays. Said again with `visible` when the person turns to the
+    /// window. Does nothing when `attachment` is no longer the one that
+    /// is shown the session.
+    SessionShow {
+        session: SessionId,
+        attachment: u64,
+        visible: bool,
+    },
+}
+
+fn app_window() -> StreamKind {
+    StreamKind::AppWindow
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +145,14 @@ pub enum Response {
         code: ErrorCode,
         message: String,
     },
+    /// The state of one session: the answer to every request about one.
+    Session {
+        session: Box<SessionInfo>,
+    },
+    /// The caller's sessions that are not over, oldest first.
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +164,12 @@ pub enum ErrorCode {
     Forbidden,
     /// The host failed to produce an answer.
     Internal,
+    /// No such application, or no such session of the caller's.
+    NotFound,
+    /// The host cannot do it now: it has no media path, the application
+    /// cannot be shown this way, or too many sessions run already.
+    Unavailable,
+    // serde wants the catch-all to stay the last one.
     #[serde(other)]
     Other,
 }
@@ -244,6 +334,211 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_requests_are_tagged_objects_with_defaults() {
+        let id = SessionId("5b0c9e3a7f21d684".to_string());
+        let start = Request::SessionStart {
+            app: "org.mozilla.firefox.desktop".into(),
+            kind: StreamKind::AppWindow,
+            display: DisplayMode {
+                width: 1720,
+                height: 720,
+                fps: 85,
+            },
+            offer: serde_json::json!({"rtp_port": 50004}),
+        };
+        let json = serde_json::to_string(&start).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session_start","app":"org.mozilla.firefox.desktop","kind":"app_window","display":{"width":1720,"height":720,"fps":85},"offer":{"rtp_port":50004}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), start);
+        // The kind and the offer may be left out.
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"session_start","app":"a.desktop","display":{"width":800,"height":600,"fps":60}}"#
+            )
+            .unwrap(),
+            Request::SessionStart {
+                app: "a.desktop".into(),
+                kind: StreamKind::AppWindow,
+                display: DisplayMode {
+                    width: 800,
+                    height: 600,
+                    fps: 60
+                },
+                offer: serde_json::Value::Null,
+            }
+        );
+        // A kind this version does not know makes the request one it does
+        // not know: the host answers `unsupported`.
+        assert!(serde_json::from_str::<Request>(
+            r#"{"type":"session_start","app":"a","kind":"hologram","display":{"width":1,"height":1,"fps":1}}"#
+        )
+        .is_err());
+
+        let wait = Request::SessionWait {
+            session: id.clone(),
+            after: 1,
+            timeout_ms: 2000,
+            attachment: 1,
+        };
+        assert_eq!(
+            serde_json::to_string(&wait).unwrap(),
+            r#"{"type":"session_wait","session":"5b0c9e3a7f21d684","after":1,"timeout_ms":2000,"attachment":1}"#
+        );
+        // Only asking: no patience, and no attachment to speak for.
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"session_wait","session":"5b0c9e3a7f21d684"}"#
+            )
+            .unwrap(),
+            Request::SessionWait {
+                session: id.clone(),
+                after: 0,
+                timeout_ms: 0,
+                attachment: 0,
+            }
+        );
+        // Asking to close is what is meant unless force is spelled out.
+        assert_eq!(
+            serde_json::to_string(&Request::SessionStop {
+                session: id.clone(),
+                force: false,
+            })
+            .unwrap(),
+            r#"{"type":"session_stop","session":"5b0c9e3a7f21d684","force":false}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"session_stop","session":"5b0c9e3a7f21d684"}"#
+            )
+            .unwrap(),
+            Request::SessionStop {
+                session: id.clone(),
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn coming_back_to_a_session_has_its_own_requests() {
+        let id = SessionId("5b0c9e3a7f21d684".to_string());
+        assert_eq!(
+            serde_json::to_string(&Request::SessionList).unwrap(),
+            r#"{"type":"session_list"}"#
+        );
+        let attach = Request::SessionAttach {
+            session: id.clone(),
+            display: DisplayMode {
+                width: 1280,
+                height: 720,
+                fps: 60,
+            },
+            offer: serde_json::json!({"rtp_port": 50010}),
+        };
+        let json = serde_json::to_string(&attach).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session_attach","session":"5b0c9e3a7f21d684","display":{"width":1280,"height":720,"fps":60},"offer":{"rtp_port":50010}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), attach);
+        assert_eq!(
+            serde_json::to_string(&Request::SessionDetach {
+                session: id.clone(),
+                attachment: 1,
+            })
+            .unwrap(),
+            r#"{"type":"session_detach","session":"5b0c9e3a7f21d684","attachment":1}"#
+        );
+        let hidden = Request::SessionShow {
+            session: id.clone(),
+            attachment: 2,
+            visible: false,
+        };
+        let json = serde_json::to_string(&hidden).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session_show","session":"5b0c9e3a7f21d684","attachment":2,"visible":false}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), hidden);
+
+        let listed = Response::Sessions {
+            sessions: vec![SessionInfo {
+                id,
+                app: "org.mozilla.firefox.desktop".into(),
+                kind: StreamKind::AppWindow,
+                state: istesso_proto::SessionState::Detached,
+                revision: 3,
+                attachment: 1,
+                display: Some(DisplayMode {
+                    width: 1720,
+                    height: 720,
+                    fps: 85,
+                }),
+                answer: None,
+                end: None,
+                left_by: None,
+                shown_on: None,
+                paused: None,
+                opening: false,
+                left_over: None,
+            }],
+        };
+        let json = serde_json::to_string(&listed).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"sessions","sessions":[{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"detached","revision":3,"attachment":1,"display":{"width":1720,"height":720,"fps":85},"answer":null,"end":null}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), listed);
+    }
+
+    #[test]
+    fn a_session_is_answered_as_one_object() {
+        let response = Response::Session {
+            session: Box::new(SessionInfo {
+                id: SessionId("5b0c9e3a7f21d684".to_string()),
+                app: "org.mozilla.firefox.desktop".into(),
+                kind: StreamKind::AppWindow,
+                state: istesso_proto::SessionState::Running,
+                revision: 2,
+                attachment: 1,
+                display: Some(DisplayMode {
+                    width: 1720,
+                    height: 720,
+                    fps: 85,
+                }),
+                answer: Some(serde_json::json!({"key_request_port": 50005})),
+                end: None,
+                left_by: None,
+                shown_on: None,
+                paused: None,
+                opening: false,
+                left_over: None,
+            }),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"session","session":{"id":"5b0c9e3a7f21d684","app":"org.mozilla.firefox.desktop","kind":"app_window","state":"running","revision":2,"attachment":1,"display":{"width":1720,"height":720,"fps":85},"answer":{"key_request_port":50005},"end":null}}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+    }
+
+    #[test]
+    fn the_new_error_codes_have_names() {
+        assert_eq!(
+            serde_json::to_string(&Response::error(ErrorCode::Unavailable, "no media path"))
+                .unwrap(),
+            r#"{"type":"error","code":"unavailable","message":"no media path"}"#
+        );
+        let json = r#"{"type":"error","code":"not_found","message":""}"#;
+        assert_eq!(
+            serde_json::from_str::<Response>(json).unwrap(),
+            Response::error(ErrorCode::NotFound, "")
+        );
     }
 
     #[test]

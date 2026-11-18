@@ -360,7 +360,7 @@ fn port_of(address: &str) -> u16 {
 
 /// Tries all candidate addresses at once and returns the first conversation
 /// that opens, together with the address that worked.
-fn connect_any(
+pub(crate) fn connect_any(
     candidates: Vec<String>,
     keys: Arc<LocalKeys>,
     peers: Arc<PeerStore>,
@@ -542,7 +542,8 @@ mod tests {
                         Request::Status => Response::Status {
                             status: HostStatus::default(),
                         },
-                        Request::InputOpen { .. } | Request::Input { .. } => continue,
+                        // Nothing else is asked of this stand-in.
+                        _ => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;
@@ -830,7 +831,10 @@ mod tests {
         let ubuntu = Device::new("ubuntu");
         let addr = ubuntu.start_agent();
         assert!(local_agent_running(addr.port()));
-        assert!(!local_agent_running(dead_address().port()));
+        // Nothing listens where a listener was closed a moment ago, unless
+        // another test was handed that very port in between. Then the next
+        // port will do.
+        assert!((0..10).any(|_| !local_agent_running(dead_address().port())));
     }
 
     #[test]

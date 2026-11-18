@@ -16,3 +16,7 @@ istesso-catalog.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mdns-sd.workspace = true
+rand_core.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

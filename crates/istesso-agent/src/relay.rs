@@ -90,7 +90,11 @@ pub fn after_refusal(code: ErrorCode) -> Again {
     match code {
         // The program that shows the application is not there: it may be on its way.
         ErrorCode::Internal => Again::Slowly,
-        ErrorCode::Forbidden | ErrorCode::Unsupported | ErrorCode::Other => Again::Never,
+        // The host cannot do it now (the session codes of ADR 0010): it may later.
+        ErrorCode::Unavailable => Again::Slowly,
+        ErrorCode::Forbidden | ErrorCode::Unsupported | ErrorCode::NotFound | ErrorCode::Other => {
+            Again::Never
+        }
     }
 }
 

@@ -23,3 +23,6 @@ unicode-width.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true

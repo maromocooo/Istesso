@@ -17,6 +17,9 @@ use istesso_proto::{
     NetKind, Role, UnifiedApp,
 };
 
+mod open;
+mod sessions;
+
 #[derive(Parser)]
 #[command(
     name = "istesso",
@@ -66,6 +69,22 @@ enum Command {
         /// Report every conversation with a paired device
         #[arg(short, long)]
         verbose: bool,
+        /// Program that makes the picture of an application for another
+        /// device (default: $ISTESSO_SESSION_RUNNER). Without one, this
+        /// machine does not show its applications to other devices
+        #[arg(long, value_name = "PROGRAM")]
+        session_runner: Option<PathBuf>,
+        /// How many applications this machine keeps open for other devices
+        /// at the same time, shown or not (default: $ISTESSO_MAX_SESSIONS,
+        /// else 64). A safety value; one more is refused with the reason
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..=1024))]
+        max_sessions: Option<u32>,
+        /// How many pictures this machine compresses at the same time
+        /// (default: $ISTESSO_ENCODER_SLOTS, else 8). A window beyond that
+        /// is opened all the same, with its picture stopped until another
+        /// window gives its slot up
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..=1024))]
+        encoder_slots: Option<u32>,
         /// For measuring: write to this file when input from a paired
         /// device was passed on. Times only, never what the input was; the
         /// file can be read by its owner only
@@ -83,6 +102,56 @@ enum Command {
     },
     /// Show this device's name and key fingerprint
     Id,
+    /// Open an application, wherever it is installed
+    ///
+    /// An application of this machine is started here. One that only
+    /// another device has runs there and is shown in a window here. It
+    /// keeps running there when the window is gone: the command comes back
+    /// to an application that is running before it starts one.
+    ///
+    /// Closing the window asks the application to close, and the window
+    /// stays until it has: it may ask whether to save. Ctrl-C leaves the
+    /// application running. `istesso sessions` lists what runs.
+    #[command(name = open::COMMAND)]
+    Open {
+        /// Name of the application, as `istesso apps list --all` shows it
+        app: String,
+        /// Device to run it on (name or id), instead of the one chosen
+        /// automatically
+        #[arg(long, value_name = "DEVICE")]
+        host: Option<String>,
+        /// Start the application even if it is running already
+        #[arg(long, conflicts_with = "session")]
+        new: bool,
+        /// Come back to this session, when the application runs more than
+        /// once (the id from `istesso sessions`, or the beginning of it)
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Program that shows the picture (default: $ISTESSO_VIEWER)
+        #[arg(long, value_name = "PROGRAM")]
+        viewer: Option<PathBuf>,
+        /// Size of the picture, in pixels
+        #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = open::parse_size)]
+        size: Option<(u32, u32)>,
+        /// Frames a second
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        fps: Option<u32>,
+        /// Where the window goes, in points from the top left of the main
+        /// display
+        #[arg(long, value_name = "X,Y", value_parser = open::parse_position, allow_hyphen_values = true)]
+        position: Option<(i32, i32)>,
+    },
+    /// List the applications of other devices that run for this one, or
+    /// stop one
+    Sessions {
+        /// The applications of this machine that run for other devices
+        /// instead, whichever device started them: for the person at the
+        /// host. Asks the agent that runs on this machine.
+        #[arg(long, global = true)]
+        local: bool,
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
     /// Work with latency measurements (see docs/measurements/README.md)
     Measure {
         #[command(subcommand)]
@@ -92,6 +161,27 @@ enum Command {
     Input {
         #[command(subcommand)]
         action: InputAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List them, shown in a window or not (the default)
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask an application to close, the way closing its window does
+    ///
+    /// The application may have a question first (unsaved work), and stay.
+    /// `istesso open` shows it then.
+    Stop {
+        /// The session's id from `istesso sessions`, or the beginning of it
+        session: String,
+        /// End the application instead of asking it: it is told to end,
+        /// and ended three seconds later if it has not
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -360,7 +450,18 @@ enum PeersAction {
         json: bool,
     },
     /// Stop trusting a device (by id or name)
-    Remove { selector: String },
+    ///
+    /// The device is cut off at once. The applications it had opened on
+    /// this machine are listed and keep running, so that no work is lost:
+    /// devices that may control this machine can show and end them.
+    Remove {
+        selector: String,
+        /// Ask the applications that device had opened on this machine to
+        /// close, instead of keeping them. One that has unsaved work may
+        /// stay and ask.
+        #[arg(long)]
+        close_apps: bool,
+    },
     /// Tell this machine where a paired device can be reached
     ///
     /// Addresses are normally learnt while pairing and from the devices
@@ -465,15 +566,23 @@ fn run(cli: Cli) -> Result<(), String> {
             bind,
             no_discovery,
             verbose,
+            session_runner,
+            max_sessions,
+            encoder_slots,
             input_timings,
-        } => run_agent(AgentOptions {
-            bind,
-            port,
-            discovery: !no_discovery,
-            verbose,
-            input_timings,
-            ..AgentOptions::default()
-        }),
+        } => run_agent(
+            AgentOptions {
+                bind,
+                port,
+                discovery: !no_discovery,
+                verbose,
+                input_timings,
+                ..AgentOptions::default()
+            },
+            session_runner,
+            max_sessions,
+            encoder_slots,
+        ),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
         Command::Id => {
             let paths = Paths::from_env();
@@ -484,6 +593,37 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("Cache        {}", paths.cache.display());
             Ok(())
         }
+        Command::Open {
+            app,
+            host,
+            new,
+            session,
+            viewer,
+            size,
+            fps,
+            position,
+        } => open::run(open::Options {
+            app,
+            host,
+            new,
+            session,
+            viewer,
+            size,
+            fps,
+            position,
+        }),
+        Command::Sessions { local, action } => match (action, local) {
+            (None, false) => sessions::list(false),
+            (None, true) => sessions::list_local(false),
+            (Some(SessionsAction::List { json }), false) => sessions::list(json),
+            (Some(SessionsAction::List { json }), true) => sessions::list_local(json),
+            (Some(SessionsAction::Stop { session, force }), false) => {
+                sessions::stop(&session, force)
+            }
+            (Some(SessionsAction::Stop { session, force }), true) => {
+                sessions::stop_local(&session, force)
+            }
+        },
         Command::Measure { action } => run_measure(action),
         Command::Input { action } => match action {
             InputAction::Relay {
@@ -1246,12 +1386,21 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
             }
             Ok(())
         }
-        PeersAction::Remove { selector } => {
+        PeersAction::Remove {
+            selector,
+            close_apps,
+        } => {
             let mut peers = open_peers()?;
             match peers.remove(&selector).map_err(|e| e.to_string())? {
                 Some(peer) => {
-                    cache::forget(&Paths::from_env(), &peer.id);
+                    let paths = Paths::from_env();
+                    cache::forget(&paths, &peer.id);
                     println!("Removed {} ({})", peer.name, peer.id);
+                    // The agent on this machine ends what the device has
+                    // open now, not when it next looks (ADR 0010).
+                    for line in sessions::unpaired(&paths, &peer.id, &peer.name, close_apps) {
+                        println!("{line}");
+                    }
                     Ok(())
                 }
                 None => Err(format!("no paired device matches '{selector}'")),
@@ -1306,6 +1455,21 @@ fn set_permission(
         peer.id,
         permission_names(&peer.permissions)
     );
+    // The agent here reads rights for every request anyway; told, it also
+    // looks at the sessions and the conversations now (ADR 0010, 12).
+    #[cfg(unix)]
+    match istesso_agent::session::local::pairings_changed(&Paths::from_env()) {
+        Ok(true) => println!(
+            "The agent on this machine was told: its sessions and their pictures follow the \
+             change now, and an open input conversation within about a second."
+        ),
+        Ok(false) => println!("No agent runs on this machine: it applies when one starts."),
+        Err(why) => println!(
+            "The agent on this machine could not be told ({why}). It applies within a second: \
+             the agent reads the list of paired devices every second."
+        ),
+    }
+    #[cfg(not(unix))]
     println!("This applies from the device's next connection at the latest.");
     Ok(())
 }
@@ -1314,7 +1478,49 @@ fn set_permission(
 // agent / hosts
 // ---------------------------------------------------------------------------
 
-fn run_agent(options: AgentOptions) -> Result<(), String> {
+/// A number the agent goes by: what was asked for, else what the
+/// environment variable `name` says, else the default.
+fn setting(
+    asked: Option<u32>,
+    from_env: Option<&str>,
+    name: &str,
+    default: usize,
+) -> Result<usize, String> {
+    match (
+        asked,
+        from_env.map(str::trim).filter(|text| !text.is_empty()),
+    ) {
+        (Some(count), _) => Ok(count as usize),
+        (None, None) => Ok(default),
+        (None, Some(text)) => match text.parse::<usize>() {
+            Ok(count) if (1..=1024).contains(&count) => Ok(count),
+            _ => Err(format!(
+                "{name} is '{text}'; it has to be a number from 1 to 1024"
+            )),
+        },
+    }
+}
+
+fn run_agent(
+    options: AgentOptions,
+    session_runner: Option<PathBuf>,
+    max_sessions: Option<u32>,
+    encoder_slots: Option<u32>,
+) -> Result<(), String> {
+    use istesso_agent::session::policy;
+    let from_env = |name: &str| std::env::var(name).ok();
+    let max_sessions = setting(
+        max_sessions,
+        from_env("ISTESSO_MAX_SESSIONS").as_deref(),
+        "ISTESSO_MAX_SESSIONS",
+        policy::OPEN_SESSIONS,
+    )?;
+    let encoder_slots = setting(
+        encoder_slots,
+        from_env("ISTESSO_ENCODER_SLOTS").as_deref(),
+        "ISTESSO_ENCODER_SLOTS",
+        policy::ENCODER_SLOTS,
+    )?;
     let paths = Paths::from_env();
     // Everything that takes time happens before the port is opened: from
     // that moment on callers expect a prompt reaction.
@@ -1323,9 +1529,37 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     let paired = open_peers()?.peers().len();
 
     let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
+    // The program that makes the picture when a paired device asks for an
+    // application of this machine (ADR 0010).
+    let session_runner = session_runner.or_else(|| {
+        std::env::var_os("ISTESSO_SESSION_RUNNER")
+            .filter(|program| !program.is_empty())
+            .map(PathBuf::from)
+    });
+    let agent = match &session_runner {
+        Some(program) => agent.with_session_runner(
+            program,
+            istesso_agent::session::Rules {
+                max_sessions,
+                encoder_slots,
+                ..Default::default()
+            },
+        ),
+        None => agent,
+    };
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
     println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
+    match &session_runner {
+        Some(program) => println!(
+            "Paired devices that may control this machine can start its applications; {} shows them. \
+             `istesso sessions --local` lists what they started.",
+            program.display()
+        ),
+        None => println!(
+            "No session runner is set (--session-runner): applications of this machine are not shown to other devices."
+        ),
+    }
     let reachable: Vec<String> = addresses
         .iter()
         .map(|address| with_port(address, addr.port()))
@@ -1900,6 +2134,26 @@ fn render_probe(summary: &ProbeSummary, seed: u64) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn the_number_of_open_sessions_is_a_setting() {
+        let session_limit = |asked, from_env| setting(asked, from_env, "ISTESSO_MAX_SESSIONS", 64);
+        // Nothing said: the safety value.
+        assert_eq!(session_limit(None, None), Ok(64));
+        assert_eq!(session_limit(None, Some("  ")), Ok(64));
+        // The environment, and the command line before it.
+        assert_eq!(session_limit(None, Some("12")), Ok(12));
+        assert_eq!(session_limit(Some(200), Some("12")), Ok(200));
+        // A setting that is not a number is said, not ignored.
+        for wrong in ["many", "0", "-3", "5000"] {
+            let why = session_limit(None, Some(wrong)).unwrap_err();
+            assert!(why.contains("ISTESSO_MAX_SESSIONS"), "{why}");
+        }
+        let parsed = Cli::try_parse_from(["istesso", "agent", "--encoder-slots", "12"]);
+        assert!(parsed.is_ok());
+        let parsed = Cli::try_parse_from(["istesso", "agent", "--max-sessions", "0"]);
+        assert!(parsed.is_err());
+    }
 
     #[test]
     fn cli_definition_is_consistent() {

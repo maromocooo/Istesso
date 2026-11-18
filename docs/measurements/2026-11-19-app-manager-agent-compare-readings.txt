@@ -1,0 +1,120 @@
+== amc-rehearsal-a  (arm a, run tag amc-rehearsal-a-013716)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  20 / 0/0 / 11 / 1.80/0.07
+   agent: arm, commit, sha256                           a 7f003a5 bba1ddf416226dce
+   relayed-local median/95/99 ms (official)             10.69/14.58/8.92
+   input path and network mean/median/95/99/max ms      1.37/1.33/1.63/2.02/2.02
+   compositor mean/median/95/99/max ms                  0.97/0.96/1.19/1.23/1.23
+   upload, convert, encode mean/median/95/99/max ms     3.94/3.92/4.05/4.08/4.08
+   parse mean/median/95/99/max ms                       0.12/0.10/0.19/0.31/0.31
+   host non-waits: sum of medians (judged) / table means 6.31 / 6.20
+   status                                               2026-11-19 01:38:06 amc-rehearsal-a: status 0; Inputs: 20 sent, 20 shown by the local window, 20 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm a; run tag: amc-rehearsal-a-013716
+   status                                               2026-11-19 01:38:07 amc-rehearsal-a: agent arm a (7f003a5, bba1ddf416226dce) before and after the run
+   status                                               2026-11-19 01:38:07 amc-rehearsal-a: the client's wake line is the form's
+== amc-rehearsal-b  (arm b, run tag amc-rehearsal-b-013807)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  20 / 0/0 / 14 / 2.30/0.33
+   agent: arm, commit, sha256                           b bf97f0f 09e90c8c4e203217
+   relayed-local median/95/99 ms (official)             9.96/10.50/18.56
+   input path and network mean/median/95/99/max ms      1.31/1.28/1.60/1.63/1.63
+   compositor mean/median/95/99/max ms                  0.84/0.84/0.98/1.04/1.04
+   upload, convert, encode mean/median/95/99/max ms     4.00/3.98/4.11/4.12/4.12
+   parse mean/median/95/99/max ms                       0.13/0.13/0.20/0.25/0.25
+   host non-waits: sum of medians (judged) / table means 6.23 / 6.06
+   status                                               2026-11-19 01:39:00 amc-rehearsal-b: status 0; Inputs: 20 sent, 20 shown by the local window, 20 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm b; run tag: amc-rehearsal-b-013807
+   status                                               2026-11-19 01:39:00 amc-rehearsal-b: agent arm b (bf97f0f, 09e90c8c4e203217) before and after the run
+   status                                               2026-11-19 01:39:00 amc-rehearsal-b: the client's wake line is the form's
+== amc-a1  (arm a, run tag amc-a1-013901)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  400 / 0/0 / 36 / 2.70/0.14
+   agent: arm, commit, sha256                           a 7f003a5 bba1ddf416226dce
+   relayed-local median/95/99 ms (official)             9.73/10.07/10.39
+   input path and network mean/median/95/99/max ms      1.33/1.30/1.65/1.95/2.80
+   compositor mean/median/95/99/max ms                  0.95/0.91/1.19/1.27/4.22
+   upload, convert, encode mean/median/95/99/max ms     3.97/3.96/4.10/4.23/4.45
+   parse mean/median/95/99/max ms                       0.13/0.11/0.23/0.33/0.40
+   host non-waits: sum of medians (judged) / table means 6.28 / 6.17
+   status                                               2026-11-19 01:42:16 amc-a1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm a; run tag: amc-a1-013901
+   status                                               2026-11-19 01:42:17 amc-a1: agent arm a (7f003a5, bba1ddf416226dce) before and after the run
+   status                                               2026-11-19 01:42:17 amc-a1: the client's wake line is the form's
+== amc-b1  (arm b, run tag amc-b1-014217)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  400 / 0/0 / 42 / 3.51/0.15
+   agent: arm, commit, sha256                           b bf97f0f 09e90c8c4e203217
+   relayed-local median/95/99 ms (official)             9.37/10.28/10.93
+   input path and network mean/median/95/99/max ms      1.36/1.32/1.76/2.03/2.31
+   compositor mean/median/95/99/max ms                  1.01/0.91/1.21/1.52/18.00
+   upload, convert, encode mean/median/95/99/max ms     3.97/3.96/4.10/4.16/4.31
+   parse mean/median/95/99/max ms                       0.14/0.12/0.23/0.39/0.58
+   host non-waits: sum of medians (judged) / table means 6.31 / 6.26
+   status                                               2026-11-19 01:46:00 amc-b1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm b; run tag: amc-b1-014217
+   status                                               2026-11-19 01:46:00 amc-b1: agent arm b (bf97f0f, 09e90c8c4e203217) before and after the run
+   status                                               2026-11-19 01:46:00 amc-b1: the client's wake line is the form's
+== amc-a2  (arm a, run tag amc-a2-014600)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  400 / 0/0 / 41 / 2.66/0.17
+   agent: arm, commit, sha256                           a 7f003a5 bba1ddf416226dce
+   relayed-local median/95/99 ms (official)             10.15/10.30/10.21
+   input path and network mean/median/95/99/max ms      1.39/1.37/1.75/1.94/2.16
+   compositor mean/median/95/99/max ms                  0.94/0.90/1.18/1.34/4.18
+   upload, convert, encode mean/median/95/99/max ms     3.97/3.95/4.09/4.18/4.32
+   parse mean/median/95/99/max ms                       0.14/0.13/0.22/0.41/0.49
+   host non-waits: sum of medians (judged) / table means 6.35 / 6.21
+   status                                               2026-11-19 01:49:30 amc-a2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm a; run tag: amc-a2-014600
+   status                                               2026-11-19 01:49:30 amc-a2: agent arm a (7f003a5, bba1ddf416226dce) before and after the run
+   status                                               2026-11-19 01:49:30 amc-a2: the client's wake line is the form's
+== amc-b2  (arm b, run tag amc-b2-014931)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  400 / 0/0 / 38 / 3.41/0.32
+   agent: arm, commit, sha256                           b bf97f0f 09e90c8c4e203217
+   relayed-local median/95/99 ms (official)             10.52/10.33/11.34
+   input path and network mean/median/95/99/max ms      1.35/1.31/1.64/2.05/3.77
+   compositor mean/median/95/99/max ms                  0.93/0.90/1.18/1.25/1.36
+   upload, convert, encode mean/median/95/99/max ms     3.97/3.95/4.10/4.18/4.27
+   parse mean/median/95/99/max ms                       0.13/0.11/0.22/0.36/0.44
+   host non-waits: sum of medians (judged) / table means 6.27 / 6.16
+   status                                               2026-11-19 01:52:58 amc-b2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm b; run tag: amc-b2-014931
+   status                                               2026-11-19 01:52:58 amc-b2: agent arm b (bf97f0f, 09e90c8c4e203217) before and after the run
+   status                                               2026-11-19 01:52:58 amc-b2: the client's wake line is the form's
+== amc-a3  (arm a, run tag amc-a3-015259)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  400 / 0/0 / 42 / 2.77/0.18
+   agent: arm, commit, sha256                           a 7f003a5 bba1ddf416226dce
+   relayed-local median/95/99 ms (official)             9.00/10.35/10.84
+   input path and network mean/median/95/99/max ms      1.41/1.38/1.76/2.18/3.20
+   compositor mean/median/95/99/max ms                  0.94/0.90/1.19/1.23/4.45
+   upload, convert, encode mean/median/95/99/max ms     3.97/3.95/4.11/4.41/4.57
+   parse mean/median/95/99/max ms                       0.14/0.12/0.25/0.40/0.49
+   host non-waits: sum of medians (judged) / table means 6.35 / 6.24
+   status                                               2026-11-19 01:56:44 amc-a3: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm a; run tag: amc-a3-015259
+   status                                               2026-11-19 01:56:44 amc-a3: agent arm a (7f003a5, bba1ddf416226dce) before and after the run
+   status                                               2026-11-19 01:56:44 amc-a3: the client's wake line is the form's
+== amc-b3  (arm b, run tag amc-b3-015644)
+   valid                                                yes
+   inputs / reconnections / AWDL lines / load Mac/host  400 / 0/0 / 41 / 2.61/0.10
+   agent: arm, commit, sha256                           b bf97f0f 09e90c8c4e203217
+   relayed-local median/95/99 ms (official)             9.38/10.37/10.56
+   input path and network mean/median/95/99/max ms      1.37/1.34/1.70/1.95/2.52
+   compositor mean/median/95/99/max ms                  0.92/0.90/1.18/1.22/1.25
+   upload, convert, encode mean/median/95/99/max ms     3.96/3.95/4.08/4.14/4.29
+   parse mean/median/95/99/max ms                       0.13/0.10/0.22/0.39/0.50
+   host non-waits: sum of medians (judged) / table means 6.29 / 6.17
+   status                                               2026-11-19 02:00:28 amc-b3: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; arm b; run tag: amc-b3-015644
+   status                                               2026-11-19 02:00:28 amc-b3: agent arm b (bf97f0f, 09e90c8c4e203217) before and after the run
+   status                                               2026-11-19 02:00:28 amc-b3: the client's wake line is the form's
+
+== per arm (valid runs only; mean of the rounds, and the spread max - min between rounds)
+                                                            A (main's agent)          B (app manager's)      B - A
+   relayed-local median ms                            9.63 (n3, spread 1.15)     9.76 (n3, spread 1.15)      +0.13
+   relayed-local 95% ms                              10.24 (n3, spread 0.28)    10.33 (n3, spread 0.09)      +0.09
+   relayed-local 99% ms (not judged)                 10.48 (n3, spread 0.63)    10.94 (n3, spread 0.78)      +0.46
+   input path and network, median ms                  1.35 (n3, spread 0.08)     1.32 (n3, spread 0.03)      -0.03
+   input path and network, 95% ms                     1.72 (n3, spread 0.11)     1.70 (n3, spread 0.12)      -0.02
+   input path and network, 99% ms (not judged)        2.02 (n3, spread 0.24)     2.01 (n3, spread 0.10)      -0.01
+   input path and network, max ms (not judged)        2.72 (n3, spread 1.04)     2.87 (n3, spread 1.46)      +0.15
+   host non-waits, sum of medians ms                  6.33 (n3, spread 0.07)     6.29 (n3, spread 0.04)      -0.04
+   host non-waits, table means ms (not judged)        6.21 (n3, spread 0.07)     6.20 (n3, spread 0.10)      -0.01
+   relayed-local, B - A round by round (reference): round 1: median -0.36, 95% +0.21; round 2: median +0.37, 95% +0.03; round 3: median +0.38, 95% +0.02
+
+== the verdict, by the lines written down before measuring (app-manager-compare-reading.md)
+   UNDECIDED: A's own relayed-local median moved 1.15 ms between rounds (more than 1.00): the night was too unsteady to compare
