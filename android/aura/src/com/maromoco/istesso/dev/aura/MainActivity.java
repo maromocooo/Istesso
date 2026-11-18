@@ -77,6 +77,16 @@ public final class MainActivity extends Activity {
         connect.setOnClickListener(v -> connectNow());
         column.addView(connect);
 
+        // Placeholder panels, for the Home Space question only (no picture, nothing on the host).
+        Button panelA = new Button(this);
+        panelA.setText(R.string.panel_open_a);
+        panelA.setOnClickListener(v -> PanelActivity.open(this, 2, 0));
+        column.addView(panelA);
+        Button panelB = new Button(this);
+        panelB.setText(R.string.panel_open_b);
+        panelB.setOnClickListener(v -> PanelActivity.open(this, 2, 1));
+        column.addView(panelB);
+
         status = new TextView(this);
         status.setPadding(0, pad / 2, 0, 0);
         column.addView(status);

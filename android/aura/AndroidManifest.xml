@@ -43,5 +43,13 @@
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+        <!-- A placeholder panel with no picture: can Home Space show two or more of ours side by side? -->
+        <activity
+            android:name=".PanelActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:taskAffinity="com.maromoco.istesso.dev.aura.panel"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode"
+            android:theme="@android:style/Theme.DeviceDefault" />
     </application>
 </manifest>
