@@ -13,8 +13,10 @@
   - **［報道］**：報道、ほかの人の報告、掲示板。
   - **［不明］**：公開の資料からは分からない。**実機で確かめる。**
   - **［読んだ］**：このリポジトリのコードと文書を読んで分かった。
+  - **［実機］**：実機で、adb の読むだけのコマンドの出力を見た（1.1。2026-11-18）。
+  - **［推した］**：［実機］の値から、考えて出したこと。そのものは、実機で見ていない。
 - 出典は、最後の 6 章にまとめた。開けなかったページも、そこに書いた。
-- この文書は、実機を手にする前に書いた。実機を手にしたら、1 章の一覧を上から確かめて、答えをこの文書に書き足す。
+- この文書は、実機を手にする前に書いた。実機を手にしたら、1 章の一覧を上から確かめて、答えをこの文書に書き足す。実機で、読むだけで分かったことは、1.1 に書いた。
 
 ## 1. 実機を手にしたら確かめること（持ち主の一覧）
 
@@ -102,6 +104,144 @@ adb を使う項目は、Mac から行う。Mac には adb が要る。**入れ�
 - **マニフェスト**：`android.window.PROPERTY_XR_ACTIVITY_START_MODE`（Home Space か Full Space で始めるか）、`<uses-feature android:name="android.software.xr.api.spatial">`（XR 専用の配布なら必須）。SDK は minSdk 24、compileSdk 34 以上［資料：S27、S28］。
 - **アプリの入れ方**：Google の Engine Hub の端末の管理で、USB-C から APK を入れられる（開発者向けの設定と USB デバッグを入れたあと）［資料：S29］。XREAL の製品ページは、USB-C に「Full ADB support」と書く［資料：S1］。
 - **ふつうの 2D のアプリ**：変えずに、Home Space のパネルとして動く［資料：S20、S27］。
+
+### 1.1 実機で読んだこと（2026-11-18、USB、読むだけ）
+
+- いつ、どうやって：2026-11-18 の 19 時台（日本時間）。AURA の箱を、Mac に USB の線でつないだ。持ち主が USB デバッグを許したあとで、Mac から `adb shell` の、読むだけのコマンドを使った（`getprop`、`pm list features`、`pm list libraries`、`dumpsys`、`wm size`、`wm density`、`getevent -lp`、`settings get`、`cat` で設定ファイル）。眼鏡は、箱につないだままだった。
+- しなかったこと：何も入れていない。設定を変えていない。アプリを起動も、止めもしていない。画面の取り込み（`screencap`、`screenrecord`）はしていない。アカウント、写真、メッセージ、ほかのアプリのデータは読んでいない。入れたアプリの一覧は取っていない。システムのパッケージだけを、`pm list packages -s` で、名前に XR を含むものに絞って見た。
+- 個体を指す値（製造番号、ネットワークのアドレス、持ち主が付けた名前）は、出力を見る前に消した。この文書にも書いていない。
+- 各項目は、**読めた**（値）、**読めない**（理由）、**要るもの**（アプリ、設定、持ち主の手）に分けた。印は、0 章の［実機］と［推した］。
+
+#### 機械と版（a-1。2 章の「OS」）
+
+- **読めた**［実機：`getprop`］
+  - **Android 14、API 34。** 最初の API レベルも 34（`ro.product.first_api_level`、`ro.board.first_api_level`）。
+  - ビルド：system は `UXP4.261012.001.O5`。vendor、odm、boot は `UXP5.261012.001.O6`。種類は `user`、`release-keys`。ビルドの日は 2026-10-19。
+  - セキュリティパッチ：2026-08-05（system と vendor の両方）。
+  - 作り手は XREAL。型は「Android XR Puck」。brand は `androidxr`、device は `axrpuck`。
+  - チップ：`ro.soc.manufacturer` は QTI、`ro.soc.model` は `SXR2330P`、`ro.board.platform` は `niobe`。製品ページの名前（Snapdragon Reality Elite）との対応は、確かめていない。
+- **XR の版**
+  - 「Android XR の版の番号」そのものは、`getprop` になかった［実機：名前に xr を含むプロパティの名前を、全部見た］。
+  - 機能の宣言：`android.software.xr.api.spatial` は版 4。`android.software.xr.api.openxr` は版 65538。宣言のファイルの名前は `openxr-1_2`（OpenXR 1.2）［実機：`pm list features`、`/system/etc/permissions/`］。
+  - `android.hardware.xr.input.hand_tracking` がある。目の追跡の機能（`android.hardware.xr.input.eye_tracking`）は、一覧にない［実機］。
+  - システムのライブラリ：`com.android.extensions.xr`（Jetpack XR がつながる口）と `libopenxr.google.so`［実機：`pm list libraries`］。
+  - XR のシステムのパッケージ：`com.android.openxr.broker`、`com.android.xranchormanager`、`com.qualcomm.qti.xrcb`、`com.qualcomm.qti.xrvd.service` は、どれも versionName 14（OS と同じ）。`com.google.android.xr.controller2` は 1.0.844307187。`com.qualcomm.qti.xrwifi` は 0.1.3［実機：`dumpsys package <名前>` の、版の行だけ］。
+  - apex：`com.google.xr.perception` は versionCode 16646113（system のビルド番号と同じ）。`com.android.media` と `com.android.media.swcodec` は 340090000［実機：`pm list packages --apex-only`］。
+- **読めない**：利用者向けの「Android XR」の版の名前。**要るもの**：持ち主が、設定の「端末情報」を見る。
+- **a-1 の答え**：API 34 なので、**36 以下**の側である。HEVC Main 4:4:4 を問う公開の定数（API 37）は使えない［推した：1 章の a-1］。ただし、a-2 で復号器の一覧を読めたので、問う意味は小さくなった（下）。
+
+#### 映像の復号（a-2、a-4、a-5）
+
+- 読んだ所［実機］：`dumpsys media.player` の「Decoder infos by media types」。`/vendor/etc/media_codecs_niobe_vendor.xml`、`/vendor/etc/media_codecs.xml`、`/vendor/etc/media_codecs_performance_niobe*.xml`、`/apex/com.android.media.swcodec/etc/media_codecs.xml`。設定ファイルの選び分けは `_niobe`（`ro.media.xml_variant.codecs`）。`/system/etc/`、`/odm/etc/`、`/product/etc/` には、`media_codecs` の XML はなかった。`media.codec` という名前のサービスもなかった（`service list`）。
+- **読めた：機械（ハードウェア）の復号器**［実機。プロファイルと色の形式は `dumpsys media.player`、上限は同じ一覧と XML］
+
+| 復号器 | プロファイル（最大のレベル） | 色の形式 | 最大の大きさ | 16×16 のブロック／秒 | ビットレート | 毎秒の枚数 | 同時に | `low-latency` |
+|---|---|---|---|---|---|---|---|---|
+| `c2.qti.hevc.decoder` | Main、Main Still、Main10、Main10 HDR10、Main10 HDR10+（High tier 6.2） | 4:2:0 だけ（YUV420 の各形と、10 ビットの P010） | 8192×8192 | 7,776,000 | 160 Mbps | 1〜480 | 16 | なし |
+| `c2.qti.hevc.decoder.low_latency` | 同じ | 同じ | 8192×8192 | 4,147,200 | 70 Mbps | 1〜480 | 16 | **あり** |
+| `c2.qti.avc.decoder` | Baseline、Constrained Baseline、Main、High、Constrained High（6.2） | 同じ | 8192×8192 | 7,776,000 | 220 Mbps | 1〜480 | 16 | なし |
+| `c2.qti.avc.decoder.low_latency` | 同じ | 同じ | 8192×8192 | 4,147,200 | 70 Mbps | 1〜480 | 16 | あり |
+| `c2.qti.av1.decoder` | Main（8 ビット）、Main10、HDR10、HDR10+（6.1） | 同じ | 8192×8192 | 7,776,000 | 160 Mbps | 1〜480 | 16 | なし |
+| `c2.qti.av1.decoder.low_latency` | 同じ | 同じ | 8192×8192 | 4,147,200 | 70 Mbps | 1〜480 | 16 | あり |
+| `c2.qti.vp9.decoder` | Profile 0、Profile 2、HDR（レベル 6） | 同じ | 7680×7680 | 7,776,000 | 100 Mbps | 1〜120 | 6 | なし |
+| `c2.qti.vp9.decoder.low_latency` | 同じ | 同じ | 7680×7680 | 3,916,800 | 30 Mbps | 1〜120 | 6 | あり |
+
+- ほかの復号器［実機］
+  - 守られた再生（DRM）用の `.secure` が、それぞれにある。毎秒 60 枚、40 Mbps、同時に 3 つまで。Istesso では使わない。
+  - `c2.qti.mvhevc.decoder`（`video/x-mvhevc`。立体の動画）。最大 4096×2160。`special-codec` が必須。
+  - ソフトウェアの復号器（`c2.android.*`）：HEVC は Main と Main Still、4096×4096 まで。AVC は High の 5.2、4080×4080 まで。AV1 と VP9 は 2048×2048 まで。
+  - 一覧の中の、測った毎秒の枚数（ベンダーの値）：低遅延の HEVC で、3840×2160 は 134〜208 枚、1920×1080 は 463〜725 枚。
+- **4:4:4**［実機］
+  - HEVC：Main 4:4:4（RExt）は、どの復号器にもない。プロファイルの値 16 も、ベンダー独自の値も並ばない。色の形式は 4:2:0（と P010）だけ。
+  - AVC：High 4:4:4 Predictive（プロファイルの値 64）はない。High 10 と High 4:2:2 もない。
+  - AV1 は Main だけ（4:4:4 の High はない）。VP9 は Profile 0 と 2 だけ（4:4:4 を含む 1 と 3 はない）。
+  - ソフトウェアの復号器にも、4:4:4 はない。
+- **a-2 の答え**［推した］：**この機械は、HEVC の 4:4:4 も、AVC の 4:4:4 も、機械で復号しない見込みが高い。** 一覧に出ない形を、実際には解けることも、まれにある。だから a-3（実際に流してみる）は残る。ただ、色の形式に 4:4:4 がないので、解けたとしても、4:4:4 のまま面に出す道は見えない。
+- **a-4 の答え**［実機］：HEVC、AVC、AV1、VP9 のそれぞれに、`.low_latency` という別の名前の復号器があり、`low-latency` の機能を持つ。報道 S8 の例と同じ形である。ふつうの名前の復号器には、`low-latency` の印がない。
+  - ［推した］アプリは、`FEATURE_LowLatency` を求めて選ぶか、`c2.qti.hevc.decoder.low_latency` を名前で選ぶ。`KEY_LOW_LATENCY` を受けて、本当に 1 フレームずつ出すかは、試験のアプリで測る［不明］。
+  - トンネルの再生（`tunneled-playback`）は、どの復号器にもない［実機］。Istesso は、復号した絵を自分の面に出すので、要らない［推した］。
+  - スライスごとの出力（2 章の「low-latency slice-based decoding」）は、一覧からは分からない［不明］。
+- **a-5 の答え**［実機］：同時に開ける数は、HEVC、AVC、AV1 で 16、VP9 で 6。低遅延の HEVC の上限は、4,147,200 ブロック／秒、70 Mbps。上限に当てると［推した：計算］：
+  - いまの流れ（3440×1440、毎秒 85 枚）：1,644,750 ブロック／秒。上限の 40%。
+  - 窓を並べた絵（2 倍の 3440×2880、毎秒 85 枚）：3,289,500。上限の 79%。4.1 の「1.5〜2 倍」は入る。
+  - 眼鏡の画面の全部（3840×1200、毎秒 72 枚）：1,296,000。上限の 31%。
+  - いまの 30 Mbps は、上限 70 Mbps の半分より下。
+- **4.2 と 4.2.1 の前提と比べる**［推した］
+  - 4.2 の「色の間引き：復号器が受けるなら 4:4:4」：**受けない見込み。** 4.2.1 の道の 2（4:2:0 で送る。案 (ii)）に進むことになる見込み。決めるのは、a-3 で試したあと。
+  - 案 (ii) の流れ（`scripts/m1_encoder.py` の `--chroma 420`。HEVC Main、8 ビット）は、低遅延の HEVC の復号器の一覧に、そのまま入る。新しい部品は要らない。
+  - 4.2 の「ビットの深さ 8」：10 ビット（Main10、P010）も受ける。要る理由は、まだない。
+  - 案 (i)（2 枚に詰める）は、採らないと決めてある。量だけなら、低遅延の復号器の上限に入る（上の 79%）。決めは変えない。
+  - AV1 にも、低遅延の復号器がある。AV1 も 4:2:0 だけなので、色の問題は同じ。どのコーデックにするかは、M8 の ADR で決める。
+
+#### 画面（b-1〜b-5）
+
+- **読めた**［実機：`dumpsys display`、`dumpsys SurfaceFlinger` の表示の部分、`wm size`、`wm density`］
+  - 画面は 2 つある。
+  - **眼鏡**：外の画面（`HDMI画面`、type EXTERNAL）として出る。EDID の名前は「XREAL 1 Ultra」。**3840×1200、72.00001 Hz の、1 つのモードだけ。** HDR は HDR10 と HLG（種類 2 と 3）。明るさは、最大 500、平均 250（画面が伝える値）。色のモードは NATIVE だけ。density 213（304.8 dpi）。これが既定の画面（論理の画面 0）である。
+  - **箱の「内蔵スクリーン」**：1920×1200、60.24 Hz。中身なし（`mHasContent=false`）。HDR なし。
+  - `wm size`：物理 3840×1200、上書き 1920×1200。`wm density`：213。
+  - SurfaceFlinger：VSYNC の周期は 13,888,888 ns（72 Hz）。起動してからの 44 分ほどの、ほぼ全部が 72 Hz だった（60.24 Hz は 16 ms だけ）。`mRefreshRateChangeable: false`。広い色域と、色の管理は「あり」。
+- ［推した］：3840×1200 は、片目の 1920×1200 を左右に並べたもの（製品ページの片目 1920×1200 と合う）。アプリから見える既定の画面は、上書きの 1920×1200 と見る。箱の「内蔵スクリーン」は、本当の画面ではなく、置き場の画面と見る（`vendor.display.null_display_resolution` が 1920x1200）。
+- **b-1 の答え**：いま、画面のモードは **72 Hz だけ**［実機］。製品ページの「最大 120 Hz」は、この状態では見えない。設定の画面で 90 や 120 を選べるかは、読むだけでは分からない。**要るもの**：持ち主が、設定の画面で、リフレッシュレートの選択肢を見る（変えなくてよい）。
+- **b-4 への影響**［推した］：ホストの毎秒 85 枚は、72 Hz の画面に合わない。AURA に送るときは、毎秒 72 枚（画面に合わせる）から始める。ただし、パネルの絵は、XR の合成器が頭の動きに合わせて描き直す。アプリの枚数と画面の枚数の関係は、作る段で測る［不明］。
+- **読めない**：b-2（パネルが片目の何画素ぶんか）、b-3（にじみ）、b-5（4:2:0 の色が足りるか）。どれも、画面を見るか、取り込むことが要る。**要るもの**：持ち主の目。画面の取り込みは、この回では使わない決まりだったので、試していない。使ってよいかは、持ち主が決める。
+
+#### アプリを入れる道（c-1〜c-6）
+
+- **読めた**［実機：`settings get`、`getprop`］
+  - 開発者向けの設定：入っている（`development_settings_enabled=1`）。**c-1 は済み。**
+  - USB デバッグ：入っている（`adb_enabled=1`）。Mac から、USB の adb が通った。**c-2 は済み。**
+  - 眼鏡をつないだまま、USB の adb が通った（眼鏡は、外の画面として出ていた）。
+  - 無線のデバッグ：切れている（`adb_wifi_enabled=0`）。c-3 は、まだ。
+  - 知らない源のアプリ：`install_non_market_apps=1`。Play プロテクトの同意：`package_verifier_user_consent=1`。adb で入れたアプリを確かめるかの設定（`verifier_verify_adb_installs`）は、値がない（既定のまま）。
+  - ビルドは `user`。`ro.debuggable=0`、`ro.adb.secure=1`。
+- ［推した］
+  - 眼鏡は眼鏡用の口、Mac の線は、もう 1 つの口（充電と映像の入力）に挿さっている。どちらの口かは、見ていない。
+  - 自分で作った APK を `adb install` で入れる道は、開いている見込み。設定は既定のままなので、入れるときに、Play プロテクトの確かめが走り、端末に知らせや問いが出ることがある。
+  - `adb root` は、`user` のビルドなので使えない（試していない）。
+- **読めない**：c-4（本当に入るか）、c-5、c-6。**要るもの**：c-4 は、自分で作った小さな APK を入れること。端末を変える操作なので、持ち主の許しが要る。
+
+#### 入力（d-1〜d-6）
+
+- **読めた**［実機：`getevent -lp`（装置の名前と、出せる値の種類だけ）と、`dumpsys input` の、装置の読み手の部分だけ］
+  - 箱のタッチパッド：`IQS9150`。指 7 本まで。座標は 1440×2880。Android は TOUCHPAD として扱い、源は MOUSE と TOUCHPAD（ポインターを動かす形）。
+  - 眼鏡のボタン：`XREAL XREAL AURA`（USB の HID）。音量、明るさなどのキーと、横の回転（`REL_HWHEEL`）、`ABS_VOLUME`。KEYBOARD、DPAD、JOYSTICK として登録されている。
+  - 箱のキー：電源（`pmic_pwrkey`）、音量（`pmic_resin`、`gpio-keys`）、指紋のセンサーの方向キー（`gf-keys`）。
+  - 仮想の装置：`frames-virtual-keyboard`（XR のシステムのキーボード。KEYBOARD と STYLUS）、`uinput_nav`（方向キー）、Android の `Virtual`。
+  - **Bluetooth のキーボードとマウスは、いまつながっていない**（一覧にない）。
+  - 手の追跡は、機能としてある（`android.hardware.xr.input.hand_tracking`）。手は、入力の装置の一覧には出ない。
+  - 目の追跡の機能は、一覧にない。`persist.cpm.openpx_gg_eye_tracking` は false。
+- ［推した］：AURA には、アプリに見える目の追跡はない。2 章の「目は［不明］」は、「ない見込み」になる。視線でホバーする道（d-5）は、もともとアプリに渡らないので、設計は変わらない。箱のタッチパッドは、マウスに近い入力として使える見込み（d-5 の「マウスが要る」の代わりになるかは、作る段で見る）。
+- **読めない**：d-1（つながるか）、d-2・d-3（押したキーの番号）、d-4〜d-6。**要るもの**：d-1 は、持ち主が手持ちのキーボードとマウスをつなぐ。d-2・d-3 は、つないだあと、持ち主がキーを押しているあいだに `getevent -l` を流す。押したキーがそのまま記録に残るので、押すキーを先に決め、持ち主がいるときだけ行う。d-4〜d-6 は、試験のアプリ（M8 の作る段）。
+
+#### ネットワーク（e-1〜e-7）
+
+- **読めた**［実機：`dumpsys wifi` から、規格、帯、リンクの速さの語だけを抜き出した。ネットワークの名前とアドレスは見ていない。`pm list features`。`/vendor/etc/wifi/` の設定ファイル］
+  - 箱そのものが、Wi-Fi でつながっていた。**e-2 の答え：電話を介さない。**
+  - いまのリンク：Wi-Fi の規格の値は 6（`WIFI_STANDARD_11AX`。Wi-Fi 6）。5 GHz 帯。送り 458 Mbps、受け 516 Mbps、リンクの最大 573 Mbps。
+  - 機能：`android.hardware.wifi`、`wifi.aware`、`wifi.direct`、`wifi.passpoint` がある。`wifi.rtt` はない。
+  - 無線の設定のフォルダーの名前は `kiwi_v2`。設定ファイルでは `gDot11Mode=0`（自動）、`oem_6g_support_disable=0`（6 GHz を止めていない）。
+- ［推した］
+  - 最大 573 Mbps は、Wi-Fi 6 の、2 本の流れ、40 MHz 幅の値に当たる。家の基地局の設定しだいである。
+  - `kiwi` は、Qualcomm の FastConnect 7800 の系列の呼び名と見られる。チップは Wi-Fi 7 を扱える見込み。製品ページの「Wi-Fi 6/6E」との食い違い（2 章）は、まだ解けていない。
+- **読めない**：Android が、Wi-Fi 7（11be）と 6 GHz 帯を「使える」と言うか。`cmd wifi get-allowed-channel` は、シェルからは権限で断られた（SecurityException）。**要るもの**：試験のアプリで、`WifiManager.isWifiStandardSupported(WIFI_STANDARD_11BE)`、`is6GHzBandSupported()`、`isLowLatencyModeSupported()`（e-7）を見る。または、持ち主が、6 GHz の基地局につないでみる。
+- e-3〜e-7 は、読むだけではできない。ホストまでの ping は、ホストのアドレスを使い、計測の合図が `free` のときに行う。VPN、眠ったとき、低遅延のロックは、アプリか持ち主の操作が要る。
+
+#### 窓（f-1〜f-7）
+
+- **読めた**［実機：`pm list features`］：`android.software.freeform_window_management` と `android.software.picture_in_picture` がある。
+- ［推した］：Home Space の窓は、大きさを自由に変えられる窓（freeform）の仕組みの上にある見込み。f-6、f-7 の前提に合う。
+- **読めない**：f-1〜f-7 の全部。**要るもの**：f-6 は、持ち主がブラウザーで「新しいウィンドウ」を開く。ほかは、資料と試験のアプリ。
+
+#### この回から、持ち主への問い
+
+1. 設定の画面で、リフレッシュレートを選べるか。72 Hz のほかに、90 や 120 があるか（変えずに、選択肢だけ）。b-1。
+2. Mac の線を、箱のどちらの口に挿しているか。c-2。
+3. 設定の「端末情報」に、Android XR の版の名前が出るか。a-1。
+4. a-3 のために、4:4:4 と 4:2:0 の短い動画を、ホストで作り（計測の合図が `free` のとき）、端末に置いて、端末の動画の再生で開いてよいか。ファイルを置くのは、端末の保存の場所を変える操作である。
+5. b-5 の比べのために、画面の取り込み（`screencap`）を、いつか使ってよいか。使うなら、Istesso の試験の絵だけが出ているときに限る。
+6. Bluetooth のキーボードとマウスを、いつつなぐか（d-1〜d-3）。
+7. 試験の APK を `adb install` で入れる段で、Play プロテクトの問いが端末に出たら、どうするか。c-4。
 
 ## 2. この機械は何か（2026-11-18 に、公開の資料で分かること）
 
