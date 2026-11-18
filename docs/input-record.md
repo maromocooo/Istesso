@@ -174,3 +174,31 @@ ssh istesso-ubuntu 'rm ~/.cache/istesso-try/input-record.jsonl ~/.cache/istesso-
 - **確かめていない**：ホストでの実行すべて。パイプラインへの組み込み（`--input-record`）、`scripts/try.sh` のスイッチ、`WAYLAND_DEBUG` の出力の実際の形（ライブラリーの版で、少し違う。2 つの形に合わせてある）、コンポジターのパッチのビルド
 - **測っていない**：遅延。スイッチを入れると、入力 1 つごとに、1 行を書く仕事が増える。スイッチを入れた回は、遅延の計測に使わない。スイッチを入れないときに増えるのは、入力 1 つごとの、1 回の比較だけ
 - この夜は、ホストで音の試験が走っていて、何も起動できなかった。Mac でも、窓を出すものは動かしていない
+
+## 2026-11-18：Blender での自己試験（ホストだけ）
+
+自己試験（パイプラインの入力の口に、テスト用のキーだけを書き込む）を、アプリを Blender 5.3（`--debug-events --debug-handlers`）にして回した。ホストの `~/.cache/istesso-inputlog-wip/selftest-blender/`。アプリの記録には、このために、`wl_keyboard`・`wl_pointer` の `enter`・`leave` の相手の面（`wl_surface` の番号）、`xdg_toplevel` の `set_parent`・`set_title`・`close`、キーボードの設定（keymap の大きさ、repeat_info）を足した（フィルターの写しで。リポジトリーのフィルターは変えていない）。
+
+見たこと：
+
+- **窓が 1 つのとき**：Shift+A、Ctrl+A、Alt+A、Shift・Ctrl＋スクロール、Alt＋左ボタンのどれも、Blender の `wmEvent` に修飾キーが付いていた（`modifier={SHIFT}`、`utf8:'A'` など）。300 ms の間でも、人の速さ（40／80 ms）でも同じ。テキストエディターの記録と、行ごとに同じ形だった。座席（`wl_seat`）もキーボードも 1 つ
+- **昨夜の試用の設定には `userpref.blend` がない**。「Emulate 3 Button Mouse」は効いていなかった。Option＋左ドラッグで何も起きないのは、これで説明がつく。Blender 自身の `--python-expr` で設定を入れると、Alt＋左は `MIDDLEMOUSE` になった
+- **Preferences を別の窓で開いたとき**（Blender 自身に開かせた。Edit メニューと同じ操作）：
+  - 窓が出た瞬間に、キーボードは Preferences の面へ移った（main を `leave`、Preferences に `enter`）。**ポインターは main の面に `enter` した**。2 つの窓は、どちらも出力の大きさで、Preferences が上に重なっている
+  - Preferences の toplevel に `set_parent` はなかった
+  - ポインターを動かさずにクリックすると、ボタンは **main** に届き（Blender は 3D View のキーマップで扱った）、キーボードは Preferences のままだった（`leave`・`enter` なし）
+  - その状態の Shift+A は、**Preferences の窓**に届いた（`{SHIFT}` つき。Preferences のキーマップで扱った）。Shift＋スクロールと Alt＋左は、main に届いて、`{SHIFT}`・`{ALT}` が付いていた
+  - ポインターを動かすと、ポインターは Preferences に移り（main を `leave`、Preferences に `enter`）、そのあとはすべて Preferences に、修飾キーつきで届いた
+  - main の窓を Preferences より上に上げることは、この試験ではできなかった（上に重なった窓しか、クリックで選べない）
+
+結論：
+
+- 修飾キーは、Mac からアプリまで、どこでも落ちていない。Blender も、窓が 2 つでも、修飾キーの状態を正しく持っている
+- 落ちているのは **キーの行き先**。コンポジターは、新しい窓が出てもポインターの行き先を見直さない（動かすまで、下の窓のまま）。（ここから、パッチのソースを読んだこと）クリックのときは、キーボードを「ポインターの位置のいちばん上の窓」に渡し、ボタンは「ポインターがいま入っている窓」に渡す。この 2 つが食い違うと、キーボードとポインターが別の窓に分かれる。キーは見えていない方の窓に行き、スクロールとクリックは見えている方に行く
+- 直すのは、コンポジターのパッチ（ゲートのビルドの外）：窓が出た・上がった・閉じたあとに、ポインターの行き先を、いまの位置で見直す（動きを 1 回送り直す）。クリックでは、ボタンが届く窓にキーボードを渡す
+- 昨夜の「main が Preferences の上に上がった」ところは、まだ作れていない。手の試用で、そのときの `enter`・`leave` の面を記録で見るのが次の手順
+
+ほかに分かったこと：
+
+- スクロールは、パイプラインの `dy` が、そのまま 1/120 ノッチの数としてアプリに渡る（−15 は 1/8 ノッチ）。小さなスクロールでは、Blender の wheel のイベントにならない
+- Chrome（Wayland で、自分のプロファイル）も、修飾キーを正しく受け取った。**`TMPDIR` を `~/.cache` の下のフォルダーにすると、Chrome は起動の直後に落ちる**（SIGTRAP）。試用の起動では、Chrome に `TMPDIR` を設定しない
