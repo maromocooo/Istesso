@@ -249,5 +249,52 @@ class WhatTheApplicationWasTold(unittest.TestCase):
         self.assertEqual(subprocess.run([sys.executable, program], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode, 2)
 
 
+class TheTwoRecordsNextToEachOther(unittest.TestCase):
+    def test_each_thing_done_with_a_pause_is_a_group(self):
+        second = 10**9
+        pipeline = [
+            '{"kind":"header","record":"pipeline"}',
+            '{"t_ns":1,"kind":"key","name":"key","state":"down","held":[],"moves":0}',
+            '{"kind":"summary"}',
+            '{"kind":"header","record":"pipeline"}',
+            '{"t_ns":%d,"kind":"modifier","name":"shift_l","state":"down","held":["shift_l"],"moves":0}' % (10 * second),
+            '{"t_ns":%d,"kind":"key","name":"key","state":"down","held":["shift_l"],"moves":0}' % (10 * second + 5),
+            '{"t_ns":%d,"kind":"key","name":"key","state":"up","held":["shift_l"],"moves":0}' % (10 * second + 6),
+            '{"t_ns":%d,"kind":"modifier","name":"shift_l","state":"up","held":[],"moves":0}' % (10 * second + 7),
+            '{"t_ns":%d,"kind":"scroll","name":"vertical","dx":0,"dy":3,"held":["shift_l"],"moves":0}' % (14 * second),
+            '{"t_ns":%d,"kind":"scroll","name":"vertical","dx":0,"dy":4,"held":["shift_l"],"moves":0}' % (14 * second + 1),
+            "not a line",
+            '{"t_ns":%d,"kind":"summary","keys":1}' % (15 * second),
+        ]
+        application = [
+            '{"kind":"header","record":"application"}',
+            '{"t_ms":500.0,"kind":"focus","name":"pointer","state":"enter"}',
+            '{"t_ms":5000.0,"kind":"modifier","name":"shift_l","state":"down"}',
+            '{"t_ms":5000.1,"kind":"modifiers","name":"state","depressed":1,"latched":0,"locked":16,"held":["shift"]}',
+            '{"t_ms":5000.2,"kind":"key","name":"key","state":"down"}',
+            '{"t_ms":5000.3,"kind":"key","name":"key","state":"up"}',
+            '{"t_ms":5000.4,"kind":"modifier","name":"shift_l","state":"up"}',
+            '{"t_ms":5000.5,"kind":"modifiers","name":"state","depressed":0,"latched":0,"locked":16,"held":[]}',
+            '{"t_ms":9000.0,"kind":"scroll","name":"vertical","message":"axis","value":0.1}',
+        ]
+        self.assertEqual(
+            input_record.summary(pipeline, application),
+            [
+                "group 1",
+                "  pipeline got:     shift_l down, key down [held: shift_l], key up [held: shift_l], shift_l up",
+                "  application told: shift_l down, told depressed=1 (shift) locked=16, key down, key up, shift_l up, told depressed=0 (none) locked=16",
+                "group 2",
+                "  pipeline got:     scroll vertical [held: shift_l] x2",
+                "  application told: scroll vertical",
+                "focus changes apart from any group, in the application's record: pointer enter",
+            ],
+        )
+
+    def test_records_that_do_not_agree_are_said_to(self):
+        told = input_record.summary(['{"t_ns":1,"kind":"modifier","name":"alt_l","state":"down","held":["alt_l"],"moves":0}'], [])
+        self.assertEqual(told[:3], ["group 1", "  pipeline got:     alt_l down", "  application told: (nothing)"])
+        self.assertIn("1 groups in the pipeline's record and 0 in the application's", told[3])
+
+
 if __name__ == "__main__":
     unittest.main()

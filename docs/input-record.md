@@ -145,6 +145,22 @@ ssh istesso-ubuntu 'rm ~/.cache/istesso-try/input-record.jsonl ~/.cache/istesso-
 
 元の試用に戻すときは、`~/link-proj-media` で、いつもどおり `scripts/try.sh` を起動します。ホストの `~/.cache/istesso-inputlog-wip` は、要らなくなったら、フォルダーごと消せます。
 
+## 2026-11-18 の朝に足したこと
+
+- **何も止めない起動**：`ISTESSO_TRY_NO_STOP=1`。これがないと、`scripts/try.sh` の起動は、まず `stop` をします。`stop` は、ビューアー、入力の中継、ホストのパイプラインを、**名前で**止めます（誰が起動したものでも）。これを付けると、何も止めません。前の回が残っていれば（起動のときに書き留めたプログラム、ホストの 2 つの `tmux` のセッション）、そう言って、何もせずに終わります
+- **2 つの記録を並べる要約**：`python3 scripts/input_record.py --summary パイプラインの記録 アプリの記録`。1.5 秒より長い間で区切って、区切りごとに、パイプラインに届いたものと、アプリが告げられたもの（`depressed` の値つき）を、1 行ずつ出します。最初の区切りは、窓をクリックしたときのものです
+- **テキストエディターで試す形**：ホストの `~/.cache/istesso-inputlog-wip/trial/editor.sh`（リポジトリーには入っていない）が、このフォルダーの空のファイルを、このフォルダーの中の設定と状態で開きます。持ち主のエディターの状態（`~/.local/share/org.gnome.TextEditor/`）は、読みも書きもしません。起動の前に、その名前・大きさ・時刻だけを `owner-state-before.txt` に書きます
+
+  ```sh
+  cd ~/link-proj-inputlog
+  ISTESSO_TRY_NO_STOP=1 ISTESSO_BUILT=~/link-proj-media \
+  ISTESSO_HOST_SRC='~/.cache/istesso-inputlog-wip/src' \
+  ISTESSO_INPUT_RECORD=2 TRY=channel \
+  scripts/try.sh '$HOME/.cache/istesso-inputlog-wip/trial/editor.sh'
+  ```
+
+- ホストのエージェント（`tmux` の `istesso-agent`）は、あれば、そのまま使います。起動し直しません。記録が試すのは、**そのとき動いているエージェント**です
+
 ## もう 1 つの見方（スイッチなしで）
 
 パイプラインは、キーを押すたびに `key_in` の行（時刻だけ。キーの番号はない）を、フレームのログに書きます。ただし、`scripts/try.sh` は、ログを捨てる設定（`--log -`）でパイプラインを起動するので、試用では出ません。
@@ -153,7 +169,7 @@ ssh istesso-ubuntu 'rm ~/.cache/istesso-try/input-record.jsonl ~/.cache/istesso-
 
 ## 確かめたこと、確かめていないこと
 
-- 確かめた：`python3 scripts/test_input_record.py`（20 個。分類、行の形、「どのキーかを書かない」決まり、フィルター）。Mac の、OS に付いている python3（3.9）で通る。新しいパッケージは要らない
+- 確かめた：`python3 scripts/test_input_record.py`（22 個。分類、行の形、「どのキーかを書かない」決まり、フィルター、2 つの記録を並べる要約）。Mac の、OS に付いている python3（3.9）と、ホストの python3（3.12）で通る。新しいパッケージは要らない
 - 確かめた：コンポジターのパッチが、4 つの修正を当てた木に当たること。パッチの中の `input_record.rs` は、標準ライブラリーだけを使うので、単独でコンパイルして、3 個のテストを通した
 - **確かめていない**：ホストでの実行すべて。パイプラインへの組み込み（`--input-record`）、`scripts/try.sh` のスイッチ、`WAYLAND_DEBUG` の出力の実際の形（ライブラリーの版で、少し違う。2 つの形に合わせてある）、コンポジターのパッチのビルド
 - **測っていない**：遅延。スイッチを入れると、入力 1 つごとに、1 行を書く仕事が増える。スイッチを入れた回は、遅延の計測に使わない。スイッチを入れないときに増えるのは、入力 1 つごとの、1 回の比較だけ

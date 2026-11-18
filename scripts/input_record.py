@@ -244,7 +244,90 @@ def wayland_lines(lines, out, clock=time.time_ns):
             out.write(line)
 
 
+# ---- The two records of one trial, next to each other ----
+
+
+def _last_run(lines):
+    """The lines of a record after its last header, as dicts; what is not a line is left out."""
+    run = []
+    for text in lines:
+        try:
+            fields = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(fields, dict):
+            continue
+        if fields.get("kind") == "header":
+            run = []
+        elif fields.get("kind") != "summary":
+            run.append(fields)
+    return run
+
+
+def _said(fields):
+    """One line of either record in a few words."""
+    kind, name = fields.get("kind"), fields.get("name")
+    if kind == "modifiers":
+        words = "told depressed=%s (%s)" % (fields.get("depressed"), ",".join(fields.get("held", [])) or "none")
+        return words + (" locked=%s" % fields["locked"] if fields.get("locked") else "")
+    if kind == "focus":
+        return "%s %s" % (name, fields.get("state"))
+    words = "scroll %s" % name if kind == "scroll" else "%s %s" % (name, fields.get("state"))
+    if "odd" in fields:
+        words += " (odd: %s)" % fields["odd"]
+    if "held" in fields and kind != "modifier":
+        words += " [held: %s]" % (",".join(fields["held"]) or "none")
+    return words
+
+
+def _groups(run, seconds, gap):
+    """The lines that lie less than `gap` seconds apart, together; each group in a few words,
+    with a count where the same words come in a row. A group of nothing but focus is "apart"."""
+    groups, last = [], None
+    for fields in run:
+        at = seconds(fields)
+        if last is None or at - last > gap:
+            groups.append([])
+        groups[-1].append(fields)
+        last = at
+    told = []
+    for group in groups:
+        words = []
+        for fields in group:
+            said = _said(fields)
+            if words and words[-1][0] == said:
+                words[-1][1] += 1
+            else:
+                words.append([said, 1])
+        text = ", ".join(said if count == 1 else "%s x%d" % (said, count) for said, count in words)
+        told.append((all(fields.get("kind") == "focus" for fields in group), text))
+    return told
+
+
+def summary(pipeline_lines, application_lines, gap=1.5):
+    """What the pipeline got and what the application was told, for each thing a person did
+    with a pause before the next: the last run of each record, group by group."""
+    pipeline = [text for _, text in _groups(_last_run(pipeline_lines), lambda f: f.get("t_ns", 0) / 1e9, gap)]
+    application = _groups(_last_run(application_lines), lambda f: f.get("t_ms", 0) / 1e3, gap)
+    apart = [text for alone, text in application if alone]
+    application = [text for alone, text in application if not alone]
+    out = []
+    for number in range(max(len(pipeline), len(application))):
+        out.append("group %d" % (number + 1))
+        out.append("  pipeline got:     %s" % (pipeline[number] if number < len(pipeline) else "(nothing)"))
+        out.append("  application told: %s" % (application[number] if number < len(application) else "(nothing)"))
+    if len(pipeline) != len(application):
+        out.append("note: %d groups in the pipeline's record and %d in the application's: they may not lie next to each other as numbered" % (len(pipeline), len(application)))
+    if apart:
+        out.append("focus changes apart from any group, in the application's record: %s" % "; ".join(apart))
+    return out
+
+
 def main(arguments):
+    if len(arguments) == 3 and arguments[0] == "--summary":
+        with open(arguments[1]) as pipeline, open(arguments[2]) as application:
+            print("\n".join(summary(pipeline, application)))
+        return 0
     if len(arguments) == 2 and arguments[0] == "--wayland-debug":
         out = open_record(arguments[1])
         try:
@@ -254,7 +337,11 @@ def main(arguments):
             pass
         out.close()
         return 0
-    print("usage: APPLICATION 2>&1 | input_record.py --wayland-debug FILE   (APPLICATION started with WAYLAND_DEBUG=1)", file=sys.stderr)
+    print(
+        "usage: APPLICATION 2>&1 | input_record.py --wayland-debug FILE   (APPLICATION started with WAYLAND_DEBUG=1)\n"
+        "       input_record.py --summary PIPELINE_RECORD APPLICATION_RECORD",
+        file=sys.stderr,
+    )
     return 2
 
 
