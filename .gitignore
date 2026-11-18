@@ -14,3 +14,6 @@ __pycache__/
 
 # Notes handed to the agent from other tools; not part of the project
 /Claude outputs/
+
+# What the owner noticed while using the everyday trial (scripts/daily.sh note); never committed
+/trial-notes.md
