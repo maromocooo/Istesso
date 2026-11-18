@@ -106,6 +106,7 @@ Mac                                              ホスト（Ubuntu）
 - Firefox も、4 回目から、ほかと同じく自分のバスです。snap だったとき、snap の起動（`snap run`）は、セッションバスで systemd に頼んで自分用の scope を作らないと起動しなかったので、机のバスへ systemd への頼み 1 つだけを通すふるい（`xdg-dbus-proxy`）を渡していました。Mozilla のビルドには要らないので、ふるいは消しました。
 - **ポータルも、バスに置かない**ことにしました（4 回目から）。ポータルのファイルを選ぶ窓は、隠れたコンポジターの中に出ました。ただし、別のプログラム（`xdg-desktop-portal-gtk`）の窓なので、試用版のコンポジターはキーボードを渡さず、「見てほしい」の印を付けました（Firefox と Chrome で見た。Esc が届かない）。ポータルがなければ、アプリは自分のファイルを選ぶ窓を開きます。Firefox と Text Editor では、それがキーボードを受け取りました（Esc で閉じた）。Chrome の自分の窓は、Chrome が別の Wayland の接続で開くので、やはり印付きで出ます（下の「危うさ」）。ポータルだけが尋ねる問い（画面の共有など）は、出ずに断られます。
 - ブラウザーは、机のパスワードの保管庫を使えません（試用のプロファイルなので、かまわない。持ち主の決め）。
+- **クラッシュの報告と、使い方の統計は、送りません**（5 回目から）。Firefox：置き場所のポリシー（`DisableTelemetry`、`DisableFirefoxStudies`、`DisableDefaultBrowserAgent`、`DontCheckDefaultBrowser`、`DisableAppUpdate`。起動のたびに書き直す）、`MOZ_CRASHREPORTER_DISABLE=1`（クラッシュの報告の仕組みが動かない）、プロファイルの `user.js`（未送信の報告を自動で送らない、健康の報告と統計を送らない）。Chrome：プロファイルの `Local State` の同意（`user_experience_metrics.reporting_enabled` を `false`。起動の前に書く）、起動の引数（`--disable-breakpad`、`--disable-crash-reporter`、`--metrics-recording-only`）。Linux の Chrome は、それでもクラッシュを受け取る係（crashpad）を起動しますが、その設定の「送る」は切れています（`uploads_enabled False`）。何かが落ちても、記録は試用版のフォルダーに残るだけで、送られません。システム全体のポリシーは使っていません（`sudo` なし）。
 
 ### Firefox（Mozilla のビルド）
 
@@ -181,6 +182,18 @@ scripts/daily.sh stop            # 全部を閉じて、2 台の上の試用版�
 2. 窓の包み（`Istesso Dev Daily Viewer`）の「ローカルネットワーク」：今日、持ち主が許可しました。包みを作り直さないかぎり、もう出ません（`setup` か `bundle` をやり直して `bundle --finish` したときは、また出る）。
 3. 画面収録、アクセシビリティ、入力監視：出ません。窓は、自分の窓の中のキーとマウスだけを受け取ります。
 4. ターミナルを閉じても、窓、中継、見張りは動き続けるはずです（ターミナルの切断の合図を受けない形で起動する。コードから。確かめていない）。止めるのは `close` か `stop` です。
+
+## AURA に出すとき（`--for aura`）
+
+持ち主の決め（2026-11-19）：アプリを起動する部分は、試用版と AURA の試作で 1 つにする。AURA の試作の `scripts/aura-trial.sh` は、前の版の `daily.sh` を写していたので、バスにポータルがあり、`LC_ALL=C` のままだった（ファイルを選ぶ窓が出ず、エディターが英語だった）。
+
+- `scripts/daily.sh open NAME --for aura [--size 幅x高さ] [--document PATH]`：ホストの側だけを起動します（Mac の窓と中継はない。AURA が窓で、AURA がホストへ自分でつなぐ）。アプリのセッションの作り方は、試用版とまったく同じです（自分のバス、ポータルなし、机の言葉と見た目、Blender の設定の写し、呼んでいる窓の数、番号で止める、計測の合図）。
+- 違うところ：AURA の枠（1 つだけ。絵は 47914、入力は 47924）。絵は 4:2:0、72 フレーム毎秒、大きさは AURA が言うもの（言わなければ 1920x1080）、ポインターは絵に描き込む（`--cursor` なし）。ホストの身元は、AURA とペアリングした試用の身元（`~/.cache/istesso-aura-trial/config`。**読むだけ**。`DAILY_AURA_CONFIG` で替えられる）。ホストの中の名前は `aura-<アプリ>`。開けるのは `editor`、`firefox`、`blender`、`chrome`。
+- 計測の合図：`busy` で止め、`free` で、ホストの見張りが絵をもう 1 度出します（Mac の側で開き直すものがないため）。
+- `scripts/daily.sh close NAME --for aura`、`list`（窓の欄が `window on AURA`）、`stop`（AURA の分も閉じる）。
+- ペアリング：`scripts/daily.sh aura-pair-line` が、持ち主がホストで打つ 1 行を出します（ここでは動かさない）。
+- `--document PATH`（試用版でも AURA でも）：ホストの、試用版のソースの写しの中のファイル（たとえば `crates/istesso-agent/src/serve.rs`）を、文書のフォルダー（`~/.cache/istesso-daily-wip/documents/`）に 1 回だけ写し（もうあれば、そのまま使う。書き足したものが残る）、それを開きます。Text Editor はそのファイル、Firefox と Chrome はそのファイルを開き、Blender は `.blend` だけ。
+- `aura-trial.sh` は、`setup` と `status` のほかは、`daily.sh` を呼ぶだけにできます（どう替えるかは AURA の流れが決める）。ソースの写しとプラグインは、試用版のもの（`~/.cache/istesso-daily-wip`）を使います。
 
 ## ランチャー（A の最初の一歩）※まだ作っていない
 
@@ -287,6 +300,28 @@ Mac にも、ホストの机にも、何も出していません。Mac のビュ
 | 4. ファイルを選ぶ窓 | 試しのキー Ctrl＋O：Firefox は窓が 1 → 2、印なし。Esc で 2 → 1（窓がキーボードを持っていた）。ポータルがあったときは、`window attention app_id="xdg-desktop-portal-gtk" wants_attention=true` で、Esc が届かなかった。Text Editor も 1 → 2 → 1。Chrome は 1 → 2 で `app_id="GTK Application"` に印、Esc は届かなかった | Firefox と Text Editor は通った。Chrome は印付き（危うさ） |
 | 5. 持ち主のフォルダー | `~/.mozilla` と `~/.cache/mozilla` は、前も後もない。試用版の起動の中身（`run/*/app.sh`）に `snap` は 0 | 通った |
 
+## 確かめたこと（5 回目。2026-11-19 0:29〜0:31、実機 2 台、窓を出さずに）
+
+| 確かめ | 見たこと | 結果 |
+|---|---|---|
+| 1. ファイルを選ぶ窓（ポータルなし） | 試しのキー Ctrl＋O と Esc：Firefox も Text Editor も、窓が 1 → 2 → 1。印なし | 通った |
+| 2. Firefox の報告と統計 | 主のプロセスの環境に `MOZ_CRASHREPORTER_DISABLE=1`。クラッシュの係のプロセスはない。`policies.json` に、上の 5 つ | 通った |
+| 3. Chrome の報告と統計 | 起動の引数に `--disable-breakpad --disable-crash-reporter --metrics-recording-only`。`Local State` の `reporting_enabled` は `False`。crashpad は動いているが、その設定（`settings.dat`）の `uploads_enabled` は `False` | 送らない形になった（係は動く） |
+| 4. AURA に出す | `open editor --for aura --document crates/istesso-agent/src/serve.rs`：パイプラインの引数は `--to-channel 47914 --chroma 420 --fps 72 --size 1920x1080 --config-dir ~/.cache/istesso-aura-trial/config`（`--cursor` なし）、エージェントは `--port 47924` で同じ身元。ホストで 47914 と 47924 が待ち受け。エディターは `serve.rs`（試用版のソースの写しと同じ中身）を開いた。机のバスに 0。`list`：`aura-editor  slot aura … window on AURA`。2 つ目の `open firefox --for aura` は `aura-editor is open for AURA already` で断った | 通った |
+| 4 のつづき：計測の合図（代わり） | `busy` から 1.4 秒で `held aura-editor: picture stopped and its encoder given back; 5 processes, 0 of them not held still`。`free` で `let aura-editor go on`、パイプラインが `resumed` | 通った |
+| 4 のつづき：AURA の身元のフォルダー | 開く前と閉じた後で、名前、大きさ、時刻が同じ | 読むだけだった |
+
+AURA の機械はつながっていません（ホストの側の確かめだけ）。
+
+## 机に出ていたクラッシュの窓（2026-11-19、外から読んで調べた）
+
+持ち主が見た、ホストの机のクラッシュの報告の窓は、**Ubuntu のクラッシュの報告（`apport-gtk`）**でした。外から見たこと：
+
+- 机にいま出ている窓のうち、名前が合うものは 1 つだけ：`apport-gtk`（親は `update-notifier`）、**2026-11-18 12:24:32 に起動**し、いまも開いている。
+- ホストの記録（`/var/log/apport.log.1`）：12:24:32 に Chrome（`/opt/google/chrome/chrome`）が信号 5（SIGTRAP。Chrome が自分で止まるときのもの）で落ち、報告 `/var/crash/_opt_google_chrome_chrome.1000.crash` が書かれた。その Chrome のプロファイルは、**入力の記録の流れの自己試験のもの**（`~/.cache/istesso-inputlog-wip/selftest-chrome/profile`）。同じものが 9:58、9:59、10:00 にも落ちている。セッションの記録（`journalctl --user`）にも、12:24:33 に `update-notifier-crash … chrome`。
+- **試用版の Chrome ではありません**。試用版の Chrome のフォルダーは 13:38 に作られた。20:43 に書かれた「Crash Reports」は、クラッシュの報告ではなく、Chrome が起動のたびに書く設定（`settings.dat`、40 バイト）で、報告そのもの（pending、completed）は 1 つもない。20:4x の確かめのあいだ、試用版のアプリが机のバスに頼んだ記録（`requested by`）はなく、試用版のアプリは `DISPLAY` を持たない。
+- 試用版のアプリが落ちても、Ubuntu の `apport` が机に窓を出しうる（Chrome は Ubuntu の外のパッケージでも報告される）。止めるには、システムの設定（`apport` を切る）が要る（持ち主の判断）。机の `apport-gtk` の窓は、こちらでは触っていません（持ち主が閉じる）。
+
 ## 危うさ
 
 - **エンコーダーの数**：このホストのカードとドライバーでは、同時に開けるのは、PC 全体で 12。試用版は、アプリ 1 つにつき 1 つ使います（多くて 3）。ふだんの試用のパイプライン、ほかの流れの試験、机の人の録画も、同じ 12 の中です。断られたときは、パイプラインが `refused` と言い、その窓だけ「戻せなかった」になります。
@@ -348,3 +383,4 @@ Mac にも、ホストの机にも、何も出していません。Mac のビュ
 6. 1 回目の手の確認で出た 4 つ（言葉と見た目、Blender の設定の写し、Blender のイベントの記録、赤いボタンでエンコーダーを手放す）と、持ち主が自分で開け閉めする形（鍵）。**済み**（上の「確かめたこと（2 回目）」）
 7. 机のセッションバスから切り離す。呼んでいる窓を、題名と Dock で知らせる。コンポジターを `gwd-trial10` に。**済み**（上の「確かめたこと（3 回目）」）。窓の一覧は、あとで（上の「窓が呼んでいるとき」）
 8. Firefox を、snap から Mozilla のビルド（試用版のフォルダー）へ。バスからポータルを外す。**済み**（上の「確かめたこと（4 回目）」）
+9. AURA にも、同じ起動の部分で出す（`--for aura`）。文書を開いて始める（`--document`）。ブラウザーの報告と統計を切る。**済み**（上の「確かめたこと（5 回目）」）

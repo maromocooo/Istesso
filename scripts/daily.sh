@@ -13,14 +13,23 @@
 #                                     already is moved aside (no window of it may be open)
 #   scripts/daily.sh                  what is open, and how to open, close, list and stop (= `start`)
 #   scripts/daily.sh apps             the applications that can be opened
-#   scripts/daily.sh open NAME        start the application on the host and show it; one that already
-#                                     runs is shown again
+#   scripts/daily.sh open NAME [--document PATH] [--for aura [--size WxH]]
+#                                     start the application on the host and show it; one that already
+#                                     runs is shown again. --document: a file of the trial's copy of
+#                                     the source (e.g. crates/istesso-agent/src/serve.rs), copied once
+#                                     into its documents folder and opened. --for aura: in AURA's slot
+#                                     (picture 47914, input 47924, 4:2:0, 72 fps, WxH as AURA asks,
+#                                     1920x1080 if not said), with the trial identity AURA is paired
+#                                     with; nothing is shown here
 #   scripts/daily.sh list             what is open, and in which state
-#   scripts/daily.sh close NAME       ask the application to close its windows; one that is still
+#   scripts/daily.sh close NAME [--for aura]
+#                                     ask the application to close its windows; one that is still
 #                                     there 10 s later is ended by its process numbers
 #   scripts/daily.sh stop             close every application that way, and stop everything of the
 #                                     trial on both machines
 #   scripts/daily.sh note TEXT        write down something that was noticed (trial-notes.md, not in git)
+#   scripts/daily.sh aura-pair-line   the one command the owner types on the host, in a terminal of
+#                                     their own, to pair AURA with the trial identity (not run here)
 #   scripts/daily.sh firefox-get [VERSION]
 #                                     fetch Mozilla's Firefox (the newest release), check its
 #                                     signature and sum, and unpack it into the trial's folder
@@ -88,6 +97,8 @@
 #   DAILY_MAC_CONFIG, DAILY_HOST_CONFIG
 #                       identity and paired devices of a pair made for the check (the istesso-media
 #                       example `picture pair`): this Mac's own and the host's own are not used
+#   DAILY_AURA_CONFIG   the trial identity of the host that AURA is paired with (only read;
+#                       default ~/.cache/istesso-aura-trial/config on the host)
 #   DAILY_BLENDER_CONFIG
 #                       Blender's settings folder (its XDG_CONFIG_HOME) on the host for the check,
 #                       instead of the trial's own; it gets its one copy of the owner's settings the
@@ -119,6 +130,12 @@ staged="$bundle_place/$bundle_name.staged"
 
 apps="firefox blender editor chrome"
 known_name() { case "${1:-}" in firefox | blender | editor | chrome) return 0 ;; *) return 1 ;; esac; }
+# What can be opened for AURA (--for aura), in AURA's slot of its own; on the host its run is
+# "aura-NAME". The trial identity of the host that AURA is paired with is only read.
+aura_apps="editor firefox blender chrome"
+aura_known() { case "${1:-}" in editor | firefox | blender | chrome) return 0 ;; *) return 1 ;; esac; }
+aura_config=${DAILY_AURA_CONFIG:-'~/.cache/istesso-aura-trial/config'}
+aura_size=1920x1080
 app_title() {
     case "$1" in firefox) echo "Firefox" ;; blender) echo "Blender" ;; editor) echo "Text Editor" ;; chrome) echo "Chrome" ;; esac
 }
@@ -262,9 +279,26 @@ print(interface.get_string("gtk-theme") + (":dark" if interface.get_string("colo
 PY
 }
 normal_settings_state() { stat -c '%y %s %i' "$1" 2>/dev/null || echo absent; }
-blender_settings_check() { # WHEN: is the owner's normal userpref.blend as it was when the trial's
-    # Blender started? Said, and written into the trial's log of these checks (blender-settings.log).
-    local run=$D/run/blender file before now line
+firefox_policies() { # FIREFOX_DIR: the policies of the trial's Firefox, in its own folder: no updates
+    # (it is updated with `firefox-get`), no usage statistics, no studies, no default-browser check
+    mkdir -p "$1/distribution"
+    cat > "$1/distribution/policies.json.new" <<'JSON'
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisableDefaultBrowserAgent": true,
+    "DontCheckDefaultBrowser": true
+  }
+}
+JSON
+    mv -f "$1/distribution/policies.json.new" "$1/distribution/policies.json"
+}
+blender_settings_check() { # WHEN [RUN]: is the owner's normal userpref.blend as it was when the
+    # trial's Blender (run RUN: blender, or aura-blender) started? Said, and written into the
+    # trial's log of these checks (blender-settings.log).
+    local run=$D/run/${2:-blender} file before now line
     [ -s "$run/normal-settings" ] || return 0
     { read -r file; read -r before; } < "$run/normal-settings"
     now=$(normal_settings_state "$file")
@@ -395,7 +429,9 @@ let_go() { # NAME: the opposite of holding it
     done
     : > "$run/held"
     echo "$(date '+%H:%M:%S') let $1 go on"
-    [ "$1" = blender ] && blender_settings_check "after a measurement's pause"
+    [ "${1#aura-}" = blender ] && blender_settings_check "after a measurement's pause" "$1"
+    # For AURA nobody opens a window again here: its picture goes on with the application.
+    [ "$(cat "$run/slot" 2>/dev/null)" = aura ] && tell "$1" resume
     return 0
 }
 end_members() { # RUN PART: asked to end by number; what is still there two seconds later is ended
@@ -443,17 +479,20 @@ close_apps() { # NAME...: each is asked to close; what is still there 10 s later
         fi
         end_run "$name"
         echo "$name: closed: $how (the pipeline said that its last window had gone: $empty)"
-        [ "$name" = blender ] && blender_settings_check "after it was closed"
+        [ "${name#aura-}" = blender ] && blender_settings_check "after it was closed" "$name"
     done
     return 0
 }
-blender_ended_by_itself() { # for the guard: Blender ended while nobody had asked it to (its own Quit)
-    local run=$D/run/blender
-    still_runs "$run/pipeline.pid" || return 0
-    [ -s "$run/close-asked" ] || [ -s "$run/held" ] || [ -s "$run/ended-checked" ] && return 0
-    [ -s "$run/app.sid" ] && [ -z "$(members "$run" app)" ] || return 0
-    date +%s > "$run/ended-checked"
-    blender_settings_check "it ended by itself"
+blender_ended_by_itself() { # for the guard: a Blender of the trial ended while nobody had asked it to (its own Quit)
+    local each run
+    for each in blender aura-blender; do
+        run=$D/run/$each
+        still_runs "$run/pipeline.pid" || continue
+        [ -s "$run/close-asked" ] || [ -s "$run/held" ] || [ -s "$run/ended-checked" ] && continue
+        [ -s "$run/app.sid" ] && [ -z "$(members "$run" app)" ] || continue
+        date +%s > "$run/ended-checked"
+        blender_settings_check "it ended by itself" "$each"
+    done
 }
 LIB
 
@@ -465,7 +504,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps' HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -660,8 +699,7 @@ sum=$(awk -v n="$name" '$2 == n {print $1}' "$dl/SHA512SUMS")
 # Unpacked beside, and put in place whole.
 next=$D/apps/.firefox-$want-$(date +%s)
 mkdir -p "$next" && tar -xf "$archive" -C "$next" && [ -x "$next/firefox/firefox" ] || fail "the archive did not unpack"
-mkdir -p "$next/firefox/distribution"
-printf '{\n  "policies": {\n    "DisableAppUpdate": true\n  }\n}\n' > "$next/firefox/distribution/policies.json"
+firefox_policies "$next/firefox"
 echo "$want $name $(date '+%Y-%m-%d %H:%M') sha512 $sum signed-by $key" > "$next/verified"
 mv "$next" "$place" || fail "it could not be put in place"
 echo "host: Firefox $want (the Japanese build) is in the trial's folder: its signature by Mozilla's release key and its sum were checked; updates are off by policy"
@@ -683,6 +721,16 @@ signal_busy && { echo "host: a latency measurement is running: nothing is starte
 [ -x "$src/target/release/istesso" ] && [ -e "$src/target/release/libistesso_media.so" ] || { echo "host: the trial's copy is not built in $src (scripts/daily.sh setup)"; exit 1; }
 config=""
 [ -n "$HOST_CONFIG" ] && config=$(eval echo "$HOST_CONFIG")
+# For AURA (--for aura): the slot of its own (picture 47914, input 47924), 4:2:0 at 72 frames a
+# second, the size AURA asks for, the pointer drawn into the picture, and the trial identity that
+# AURA is paired with (only read). Its run is "aura-NAME"; everything else is the same.
+APP=${NAME#aura-}
+pipe_options="--cursor --fps 85"
+if [ "$FOR" = aura ]; then
+    config=$(eval echo "$AURA_CONFIG")
+    [ -s "$config/identity.key" ] || { echo "fail no trial identity for AURA in $AURA_CONFIG (pair AURA first)"; exit 1; }
+    pipe_options="--chroma 420 --fps 72"
+fi
 run=$D/run/$NAME
 if still_runs "$run/pipeline.pid"; then
     let_go "$NAME"
@@ -705,15 +753,23 @@ if still_runs "$run/pipeline.pid"; then
         echo "host: $NAME was running already"
     fi
 else
-    # A slot of the three: the first that no running application has.
-    slot=""
-    for s in 1 2 3; do
-        taken=""
-        for other in $(running_names); do [ "$(cat "$D/run/$other/slot" 2>/dev/null)" = "$s" ] && taken=1; done
-        [ -n "$taken" ] || { slot=$s; break; }
-    done
-    [ -n "$slot" ] || { echo "fail three applications are open already: close one first"; exit 5; }
-    port=$((47910 + slot)); agent_port=$((47920 + slot))
+    if [ "$FOR" = aura ]; then
+        # AURA's slot: one application at a time.
+        for other in $(running_names); do
+            [ "$(cat "$D/run/$other/slot" 2>/dev/null)" = aura ] && { echo "fail $other is open for AURA already: close it first"; exit 5; }
+        done
+        slot=aura; port=47914; agent_port=47924
+    else
+        # A slot of the three: the first that no running application has.
+        slot=""
+        for s in 1 2 3; do
+            taken=""
+            for other in $(running_names); do [ "$(cat "$D/run/$other/slot" 2>/dev/null)" = "$s" ] && taken=1; done
+            [ -n "$taken" ] || { slot=$s; break; }
+        done
+        [ -n "$slot" ] || { echo "fail three applications are open already: close one first"; exit 5; }
+        port=$((47910 + slot)); agent_port=$((47920 + slot))
+    fi
     if ss -Hltn "( sport = :$port or sport = :$agent_port )" 2>/dev/null | grep -q .; then
         echo "fail port $port or $agent_port is taken on the host by something else"; exit 5
     fi
@@ -727,7 +783,18 @@ else
     # (GSETTINGS_BACKEND=keyfile), seeded from the desk at every start. Blender has a look of its own.
     look=""
     # What the application is started as, apart from what its owner uses every day.
-    case "$NAME" in
+    # A document to open at the start (--document PATH): a file of the trial's copy of the source,
+    # copied once into the documents folder (a copy that is there already is kept, with what was
+    # done to it) and handed to the application.
+    doc=""
+    if [ -n "$DOCUMENT" ]; then
+        case "$DOCUMENT" in /* | *..*) echo "fail --document names a file inside the trial's copy of the source, like crates/istesso-agent/src/serve.rs"; exit 2 ;; esac
+        [ -f "$src/$DOCUMENT" ] || { echo "fail there is no $DOCUMENT in the trial's copy of the source"; exit 2; }
+        mkdir -p "$D/documents"; doc=$D/documents/$(basename "$DOCUMENT")
+        [ -e "$doc" ] || cp "$src/$DOCUMENT" "$doc"
+        echo "host: $APP opens $(basename "$DOCUMENT") (a copy in the trial's documents folder)"
+    fi
+    case "$APP" in
     firefox)
         # Mozilla's own build (the Japanese one), unpacked into the trial's folder by
         # `scripts/daily.sh firefox-get` after its signature and sum were checked; the newest there
@@ -751,6 +818,10 @@ user_pref("browser.startup.homepage_override.mstone", "ignore");
 // Its own file dialog, not the portal's: the portal's dialog is another program's window, which
 // the trial compositor does not give the keyboard to (it marks it as calling instead).
 user_pref("widget.use-xdg-desktop-portal.file-picker", 0);
+// No crash reports sent, no usage statistics (the policies of its folder say so too).
+user_pref("browser.crashReports.unsubmittedCheck.autoSubmit2", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
 PREFS
         grep -q '"media.volume_scale", *"0.0"' "$profile/user.js" 2>/dev/null ||
             { echo "fail the trial profile of Firefox does not say that it is silent: not started"; exit 1; }
@@ -758,8 +829,11 @@ PREFS
             holder=$(readlink "$profile/lock" | sed -n 's/.*:+\([0-9]*\)$/\1/p')
             [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && { echo "fail the trial profile of Firefox is in use by another Firefox: not started"; exit 1; }
         fi
+        # Its policies, written again at every start (an older install gets the newer ones).
+        firefox_policies "$(dirname "$firefox")"
         look=$home/config
-        app="env XDG_CONFIG_HOME=$home/config XDG_CACHE_HOME=$home/cache XDG_DATA_HOME=$home/data XDG_STATE_HOME=$home/state GSETTINGS_BACKEND=keyfile $firefox --no-remote --profile $profile" ;;
+        # MOZ_CRASHREPORTER_DISABLE: no crash reporter at all.
+        app="env XDG_CONFIG_HOME=$home/config XDG_CACHE_HOME=$home/cache XDG_DATA_HOME=$home/data XDG_STATE_HOME=$home/state GSETTINGS_BACKEND=keyfile MOZ_CRASHREPORTER_DISABLE=1 $firefox --no-remote --profile $profile${doc:+ $doc}" ;;
     blender)
         blender=$BLENDER
         [ -n "$blender" ] || blender=$(command -v blender)
@@ -787,18 +861,34 @@ PREFS
         # The owner's own settings file as it is now: whenever this Blender ends, it is looked at again.
         printf '%s\n%s\n' "$normal/userpref.blend" "$(normal_settings_state "$normal/userpref.blend")" > "$run/normal-settings"
         : > "$run/ended-checked"
-        app="env XDG_CONFIG_HOME=$settings $(printf '%q' "$blender") -noaudio" ;;
+        app="env XDG_CONFIG_HOME=$settings $(printf '%q' "$blender") -noaudio"
+        case "$doc" in *.blend) app="$app $doc" ;; esac ;;
     editor)
         home=$D/apps/editor; mkdir -p "$home/data" "$home/config" "$home/state" "$home/cache" "$D/documents"
         [ -e "$D/documents/trial.txt" ] || : > "$D/documents/trial.txt"
         look=$home/config
-        app="env XDG_DATA_HOME=$home/data XDG_CONFIG_HOME=$home/config XDG_STATE_HOME=$home/state XDG_CACHE_HOME=$home/cache GSETTINGS_BACKEND=keyfile GIO_USE_VFS=local gnome-text-editor --standalone --ignore-session $D/documents/trial.txt" ;;
+        app="env XDG_DATA_HOME=$home/data XDG_CONFIG_HOME=$home/config XDG_STATE_HOME=$home/state XDG_CACHE_HOME=$home/cache GSETTINGS_BACKEND=keyfile GIO_USE_VFS=local gnome-text-editor --standalone --ignore-session ${doc:-$D/documents/trial.txt}" ;;
     chrome)
         # Its own profile. Never TMPDIR below ~/.cache: Chrome then ends at once.
-        mkdir -p "$D/apps/chrome"
+        mkdir -p "$D/apps/chrome/profile"
+        # No usage statistics and no crash reports: the profile's own consent says no (Local State),
+        # and the start says it again (--disable-breakpad, --disable-crash-reporter, and
+        # --metrics-recording-only, which keeps whatever is recorded from being sent).
+        python3 -I - "$D/apps/chrome/profile/Local State" <<'PY2' || { echo "fail Chrome's Local State could not be read or written: not started"; exit 1; }
+import json, os, sys
+path = sys.argv[1]
+state = {}
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as f:
+        state = json.load(f)
+state.setdefault("user_experience_metrics", {})["reporting_enabled"] = False
+with open(path + ".new", "w", encoding="utf-8") as f:
+    json.dump(state, f)
+os.replace(path + ".new", path)
+PY2
         look=$D/apps/chrome/config
-        app="env XDG_CONFIG_HOME=$look GSETTINGS_BACKEND=keyfile google-chrome --ozone-platform=wayland --user-data-dir=$D/apps/chrome/profile --no-first-run --no-default-browser-check --mute-audio --password-store=basic --disable-gpu" ;;
-    *) echo "fail no application is called $NAME"; exit 2 ;;
+        app="env XDG_CONFIG_HOME=$look GSETTINGS_BACKEND=keyfile google-chrome --ozone-platform=wayland --user-data-dir=$D/apps/chrome/profile --no-first-run --no-default-browser-check --mute-audio --password-store=basic --disable-gpu --disable-breakpad --disable-crash-reporter --metrics-recording-only${doc:+ $doc}" ;;
+    *) echo "fail no application is called $APP"; exit 2 ;;
     esac
     shown=""
     if [ -n "$look" ]; then
@@ -807,7 +897,7 @@ PREFS
     fi
     echo "host: $NAME gets the desk's language ($(printf '%s\n' $desk | sed -n 's/^LANG=//p' | grep . || echo none))$([ -n "$shown" ] && echo " and look ($shown)")"
     events=""
-    if [ "$NAME" = blender ] && [ -n "$BLENDER_EVENTS" ]; then
+    if [ "$APP" = blender ] && [ -n "$BLENDER_EVENTS" ]; then
         # Blender's own event log, asked for at this start only. Line by line, so that nothing is
         # lost when Blender is ended (a file is otherwise written in blocks, and what is still in
         # the block when the process is ended is gone).
@@ -833,7 +923,7 @@ echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/pipeline.sid
 # The words for the pipeline are written into this pipe; it is held open so that it never ends.
 exec 3<>$run/control
-exec python3 -u $src/scripts/m1-step3-host.py --to-channel $port --cursor --input-socket $run/rt/istesso/input.sock --size $SIZE --fps 85 --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
+exec python3 -u $src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
     # Through bash, whatever the login shell (tmux starts the command with it), and how it ended is kept.
@@ -950,6 +1040,20 @@ echo "peer $(${config:+env ISTESSO_CONFIG_DIR=$config} $src/target/release/istes
 HOST
 }
 
+# For AURA, only the host's side: AURA is the window, and it connects to the host itself (the host's
+# guard holds it still for a measurement and lets its picture go on afterwards).
+open_for_aura() {
+    find_the_way || exit 1
+    local kind=$name answer host_side
+    name=aura-$kind
+    answer=$(host_open)
+    printf '%s\n' "$answer" | grep -v '^\(slot\|way\|peer\|fail\) ' | grep .
+    printf '%s\n' "$answer" | grep -q '^fail ' && { printf '%s\n' "$answer" | sed -n 's/^fail /error: /p' | head -1; return 1; }
+    host_side=$(printf '%s\n' "$answer" | sed -n 's/^way //p' | tail -1)
+    [ -n "$host_side" ] || { echo "error: the host did not start $kind for AURA"; return 1; }
+    echo "$kind: open for AURA: picture on the host's port 47914 (4:2:0, 72 frames a second, $size), input on 47924; the host's address on this network: $host_side"
+}
+
 # Writes down the settings an application was opened with, so that the guard opens it again the same way.
 remember_settings() { # FOLDER
     # In single quotes, so that nothing in them is expanded when they are read back (a path of the
@@ -965,10 +1069,28 @@ remember_settings() { # FOLDER
     echo "export SIZE=$(quoted "$size") LAYOUT=$(quoted "$layout")" >> "$1/settings"
 }
 
-do_open() {
-    name=$1
+do_open() { # NAME [--for aura] [--size WxH] [--document PATH]
+    name=${1:-}; shift
+    for_whom="" document=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --for) for_whom=${2:-}; shift 2 ;;
+        --size) size=${2:-}; shift 2 ;;
+        --document) document=${2:-}; shift 2 ;;
+        *) echo "error: open NAME [--for aura] [--size WxH] [--document PATH]"; exit 2 ;;
+        esac
+    done
     known_name "$name" || { echo "error: the applications are: $apps"; exit 2; }
+    case "$for_whom" in
+    "") ;;
+    aura) aura_known "$name" || { echo "error: for AURA: $aura_apps"; exit 2; }
+        [ "$size" = "${SIZE:-1720x720}" ] && size=$aura_size ;;
+    *) echo "error: --for knows only aura"; exit 2 ;;
+    esac
+    [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { echo "error: --size is WIDTHxHEIGHT"; exit 2; }
+    width=${size%x*}; height=${size#*x}
     refuse_when_busy
+    if [ "$for_whom" = aura ]; then open_for_aura; return; fi
     [ -x "$viewer" ] && [ -x "$istesso" ] || { echo "error: not built here yet: scripts/daily.sh setup"; exit 1; }
     find_the_way || exit 1
     local answer host_side peer slot mine
@@ -1166,6 +1288,11 @@ HOST
     )
     [ -s "$state/held" ] && echo "held still for a latency measurement; the windows open again when it is over"
     printf '%s\n' "$answer" | while read -r each slot what windows picture calling; do
+        if [ "${each#aura-}" != "$each" ]; then
+            [ "$what" = ended ] && continue
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window on AURA"
+            continue
+        fi
         known_name "$each" || continue
         local window=closed
         still_runs "$state/$each/viewer.pid" && window=open
@@ -1176,10 +1303,14 @@ HOST
 }
 
 # Asks the applications to close and says what became of them; the windows here follow.
-do_close() {
-    [ $# -ge 1 ] || { echo "usage: scripts/daily.sh close NAME"; exit 2; }
+do_close() { # NAME [--for aura]
+    [ $# -ge 1 ] || { echo "usage: scripts/daily.sh close NAME [--for aura]"; exit 2; }
     known_name "$1" || { echo "error: the applications are: $apps"; exit 2; }
-    close_some "$1"
+    case "${2:-} ${3:-}" in
+    "--for aura") close_some "aura-$1" ;;
+    " ") close_some "$1" ;;
+    *) echo "usage: scripts/daily.sh close NAME [--for aura]"; exit 2 ;;
+    esac
 }
 close_some() { # NAME...
     local answer each
@@ -1189,15 +1320,17 @@ close_some() { # NAME...
         case "$answer" in
         *"$each: closed"* | *"$each: is not running"*)
             stop_window "$each"
-            : > "$state/$each/not-back" 2>/dev/null ;;
+            [ -d "$state/$each" ] && : > "$state/$each/not-back" ;;
         esac
     done
 }
 do_stop() {
     local each open_ones=""
     for each in $apps; do [ -d "$state/$each" ] && open_ones="$open_ones $each"; done
+    # And what runs for AURA.
+    open_ones="$open_ones $(printf 'running_names\n' | on_host | grep '^aura-' | tr '\n' ' ')"
     # shellcheck disable=SC2086
-    [ -n "$open_ones" ] && close_some $open_ones
+    [ -n "${open_ones// /}" ] && close_some $open_ones
     stop_windows
     stop_written_down "$state/guard.pid"
     : > "$state/held"
@@ -1238,10 +1371,11 @@ setup) my_turn setup; do_setup ;;
 bundle) my_turn bundle; do_bundle "${2:-}" ;;
 start) do_start ;;
 apps) do_apps ;;
-open) my_turn "open ${2:-}"; do_open "${2:-}" ;;
+open) shift; my_turn "open $*"; do_open "$@" ;;
 firefox-get) my_turn firefox-get; do_firefox_get "${2:-}" ;;
+aura-pair-line) echo "ISTESSO_CONFIG_DIR=$aura_config $host_dir/src/target/release/istesso pair host --name host-trial" ;;
 list) do_list ;;
-close) my_turn "close ${2:-}"; do_close "${2:-}" ;;
+close) shift; my_turn "close $*"; do_close "$@" ;;
 stop) my_turn stop; do_stop ;;
 note) shift; do_note "$@" ;;
 guard) do_guard ;;
