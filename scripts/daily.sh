@@ -13,7 +13,7 @@
 #                                     already is moved aside (no window of it may be open)
 #   scripts/daily.sh                  what is open, and how to open, close, list and stop (= `start`)
 #   scripts/daily.sh apps             the applications that can be opened
-#   scripts/daily.sh open NAME [--document PATH] [--for aura [--size WxH]]
+#   scripts/daily.sh open NAME [--document PATH] [--min-qp N] [--for aura [--size WxH]]
 #                                     start the application on the host and show it; one that already
 #                                     runs is shown again. --document: a file of the trial's copy of
 #                                     the source (e.g. crates/istesso-agent/src/serve.rs), copied once
@@ -21,7 +21,8 @@
 #                                     slot of that application (editor 1, firefox 2, blender 3,
 #                                     chrome 4: picture 4793N, input 4794N; 4:2:0, 72 fps, WxH as AURA
 #                                     asks, 1920x1080 if not said), with the trial identity AURA is
-#                                     paired with; at most 3 at once; nothing is shown here
+#                                     paired with; at most 3 at once; nothing is shown here.
+#                                     --min-qp N: the encoder's quality floor (below)
 #   scripts/daily.sh list             what is open, and in which state
 #   scripts/daily.sh close NAME [--for aura]
 #                                     ask the application to close its windows; one that is still
@@ -98,6 +99,11 @@
 #   DAILY_MAC_CONFIG, DAILY_HOST_CONFIG
 #                       identity and paired devices of a pair made for the check (the istesso-media
 #                       example `picture pair`): this Mac's own and the host's own are not used
+#   DAILY_MIN_QP=N      a quality floor for the encoder of an application started now (min-qp-i,
+#                       -p and -b all N, 0-51; also `open ... --min-qp N`): a picture that stands
+#                       still is encoded in very few bytes. Trial only: the pipeline is then started
+#                       through scripts/daily-pipeline.py, which gives the encoder the floor without
+#                       changing scripts/m1-step3-host.py; without it, the start is the old one
 #   DAILY_AURA_CONFIG   the trial identity of the host that AURA is paired with (only read;
 #                       default ~/.cache/istesso-aura-trial/config on the host)
 #   DAILY_BLENDER_CONFIG
@@ -510,7 +516,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -740,6 +746,7 @@ if [ "$FOR" = aura ]; then
 fi
 run=$D/run/$NAME
 if still_runs "$run/pipeline.pid"; then
+    [ -n "$MIN_QP" ] && echo "host: note: $NAME runs already; its encoder keeps what it was started with (close it and open it again for --min-qp $MIN_QP)"
     let_go "$NAME"
     : > "$run/close-asked"
     slot=$(cat "$run/slot")
@@ -935,9 +942,10 @@ echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/pipeline.sid
 # The words for the pipeline are written into this pipe; it is held open so that it never ends.
 exec 3<>$run/control
-exec python3 -u $src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
+exec python3 -u ${MIN_QP:+$src/scripts/daily-pipeline.py --min-qp $MIN_QP }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
+    [ -n "$MIN_QP" ] && echo "host: $NAME's encoder gets the quality floor min-qp $MIN_QP (trial only)"
     # Through bash, whatever the login shell (tmux starts the command with it), and how it ended is kept.
     tmux new-session -d -s "daily-$NAME-pipe" "bash -c '$run/pipeline.sh > $run/pipeline.log 2>&1; echo \$? > $run/pipeline.exit'" 9>&-
     sock=""
@@ -1081,15 +1089,16 @@ remember_settings() { # FOLDER
     echo "export SIZE=$(quoted "$size") LAYOUT=$(quoted "$layout")" >> "$1/settings"
 }
 
-do_open() { # NAME [--for aura] [--size WxH] [--document PATH]
+do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
     name=${1:-}; shift
-    for_whom="" document=""
+    for_whom="" document="" min_qp=${DAILY_MIN_QP:-}
     while [ $# -gt 0 ]; do
         case "$1" in
         --for) for_whom=${2:-}; shift 2 ;;
         --size) size=${2:-}; shift 2 ;;
         --document) document=${2:-}; shift 2 ;;
-        *) echo "error: open NAME [--for aura] [--size WxH] [--document PATH]"; exit 2 ;;
+        --min-qp) min_qp=${2:-}; shift 2 ;;
+        *) echo "error: open NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]"; exit 2 ;;
         esac
     done
     known_name "$name" || { echo "error: the applications are: $apps"; exit 2; }
@@ -1100,6 +1109,7 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH]
     *) echo "error: --for knows only aura"; exit 2 ;;
     esac
     [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { echo "error: --size is WIDTHxHEIGHT"; exit 2; }
+    [ -z "$min_qp" ] || { [[ "$min_qp" =~ ^[0-9]+$ ]] && [ "$min_qp" -le 51 ]; } || { echo "error: --min-qp (DAILY_MIN_QP) is a number from 0 to 51"; exit 2; }
     width=${size%x*}; height=${size#*x}
     refuse_when_busy
     if [ "$for_whom" = aura ]; then open_for_aura; return; fi

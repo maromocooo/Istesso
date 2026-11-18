@@ -195,6 +195,17 @@ scripts/daily.sh stop            # 全部を閉じて、2 台の上の試用版�
 - `--document PATH`（試用版でも AURA でも）：ホストの、試用版のソースの写しの中のファイル（たとえば `crates/istesso-agent/src/serve.rs`）を、文書のフォルダー（`~/.cache/istesso-daily-wip/documents/`）に 1 回だけ写し（もうあれば、そのまま使う。書き足したものが残る）、それを開きます。Text Editor はそのファイル、Firefox と Chrome はそのファイルを開き、Blender は `.blend` だけ。
 - `aura-trial.sh` は、`setup` と `status` のほかは、`daily.sh` を呼ぶだけにできます（どう替えるかは AURA の流れが決める）。ソースの写しとプラグインは、試用版のもの（`~/.cache/istesso-daily-wip`）を使います。
 
+## 静止画の質の下限（試してみる切り替え）
+
+持ち主の求め（2026-11-19）：止まっている絵を、ずっと小さく送る。コンポジターの流れが、このホストで測った：NVENC の `min-qp-i`、`min-qp-p`、`min-qp-b` を全部 18 にすると、止まった Blender の画面の 1 枚が、約 33 KB から約 880 バイトに。24 なら約 200 バイト。`min-qp-p` だけでは変わらない。
+
+- 入れ方：`DAILY_MIN_QP=18 scripts/daily.sh open blender`、または `scripts/daily.sh open blender --min-qp 18`。AURA にも：`scripts/daily.sh open blender --for aura --min-qp 18`。0〜51。**付けなければ、何も変わりません**（既定は切）。
+- 効くのは、その時に起動するアプリだけです。もう動いているアプリは、起動したときの設定のままです（`open` が `runs already` と言う。閉じて開き直す）。
+- 作り方：**計測の道具（`scripts/m1-step3-host.py` と `scripts/m1_encoder.py`）は、どの写しも変えていません。** 付けたときだけ、パイプラインを `scripts/daily-pipeline.py`（試用版だけのもの）から起動します。これは、`m1_encoder.encoder` をその 1 回だけ取り替えてから、ホストのスクリプトを、そのまま動かします。エンコーダーは、始めにも、絵を止めて戻すたびにも、同じ説明から作られるので、どちらにも下限が付きます。パイプラインができたとき、エンコーダーが実際に持っている値を、パイプラインの記録に 1 行（`daily: encoder quality floor (trial only): asked 18, the encoder has min-qp-i/p/b [...]`）。
+- 包むほうを選んだわけ：計測の道具のファイルを、試用版の写しでさえ 1 バイトも変えないため。付けないときの起動の 1 行は、前とまったく同じです（下）。
+- 確かめたこと（Mac の上で。ホストへの ssh が閉じていたので、ホストではまだ動かしていない）：前の版と新しい版の起動の中身（`pipeline.sh`）を、同じ値で作って比べた。切のときは、バイト単位で同じ（710 バイト）。18 のときは、1 行だけ違い、`daily-pipeline.py --min-qp 18` が前に付く。下限を付けたエンコーダーの説明：`nvcudah265enc name=enc min-qp-i=18 min-qp-p=18 min-qp-b=18 preset=p1 …`。ホストのスクリプトの代わりの小さなスクリプトで、取り替えたエンコーダーが届き、引数と終わり方（終了コード）がそのまま渡ることを見た。範囲の外（99）は断る。
+- 持ち主が見るところ：18 から。止めた直後の絵がくっきりしているか（コンポジターの流れが、止まって 0.5 秒で仕上げの 1 枚を足す修正を入れている）。
+
 ## ランチャー（A の最初の一歩）※まだ作っていない
 
 - 窓 1 枚。上に、開けるアプリ（Firefox、Blender、Text Editor、Chrome）。下に、開いているものと、その状態（映している／窓を閉じた（アプリは動いている）／閉じるよう頼んだ／計測のために止めている／戻せなかった）。行ごとに「前に出す」と「閉じる」。下の端に、気づきを書く欄。
