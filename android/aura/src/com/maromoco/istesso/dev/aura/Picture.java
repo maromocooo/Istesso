@@ -53,6 +53,7 @@ final class Picture {
     // ---- counters for the once-a-second log line (sizes and times only, nothing of the content) ----
     private final AtomicLong framesIn = new AtomicLong();
     private final AtomicLong bytesIn = new AtomicLong();
+    private final AtomicLong frameMaxBytes = new AtomicLong();
     private final AtomicLong queuedWindow = new AtomicLong();
     private final AtomicLong renderedWindow = new AtomicLong();
     private final AtomicLong queuedTotal = new AtomicLong();
@@ -117,8 +118,8 @@ final class Picture {
         }
         double seconds = windowNs / 1e9;
         return String.format(java.util.Locale.ROOT,
-                "frames=%d mbit=%.1f queued=%d rendered=%d in_decoder=%d input_wait_ms=%.1f render_ms_max=%.1f render_ms_mean=%.1f dropped=%d gap_ms_max=%.0f cuts=%d",
-                frames, bytes * 8 / 1e6 / seconds, q, r, queuedTotal.get() - renderedTotal.get(),
+                "frames=%d mbit=%.1f frame_bytes_max=%d queued=%d rendered=%d in_decoder=%d input_wait_ms=%.1f render_ms_max=%.1f render_ms_mean=%.1f dropped=%d gap_ms_max=%.0f cuts=%d",
+                frames, bytes * 8 / 1e6 / seconds, frameMaxBytes.getAndSet(0), q, r, queuedTotal.get() - renderedTotal.get(),
                 inputWaitNs.getAndSet(0) / 1e6, lmax / 1e6, n == 0 ? 0 : sum / 1e6 / n,
                 dropped.getAndSet(0), gap / 1e6, cuts.get());
     }
@@ -213,6 +214,7 @@ final class Picture {
                         long arrived = meta[5];
                         framesIn.incrementAndGet();
                         bytesIn.addAndGet(meta[0]);
+                        max(frameMaxBytes, meta[0]);
                         if (lastArrivalNs != 0) {
                             max(gapMaxNs, arrived - lastArrivalNs);
                         }

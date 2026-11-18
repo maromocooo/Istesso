@@ -74,6 +74,27 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     };
 
     /**
+     * The Wi-Fi link: its speed (Mbit/s; transmit and receive where the system says them) and the
+     * signal strength (dBm). Nothing else of the connection: never the network's name, the base
+     * station's identity or an address. Needs no permission that asks the person (the network's
+     * name would, and is not read).
+     */
+    @SuppressWarnings("deprecation")
+    private String wifiLine() {
+        try {
+            WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            android.net.wifi.WifiInfo w = wifi == null ? null : wifi.getConnectionInfo();
+            if (w == null) {
+                return " wifi=none";
+            }
+            return " wifi_mbit=" + w.getLinkSpeed() + " wifi_tx_mbit=" + w.getTxLinkSpeedMbps()
+                    + " wifi_rx_mbit=" + w.getRxLinkSpeedMbps() + " wifi_rssi_dbm=" + w.getRssi();
+        } catch (RuntimeException e) {
+            return " wifi=unknown";
+        }
+    }
+
+    /**
      * Once a second, one line for this panel (tag IstessoAura): the picture's counters and the
      * input's state. Sizes, counts and times only; never a key, a code or anything of the content.
      * The input library does not say how much is waiting to be sent, so that is not in the line.
@@ -92,6 +113,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             b.append(" input_open=").append(s[1]).append(" input_answered=").append(s[2])
                     .append(" input_cuts=").append(s[0]).append(" input_over=").append(s[3]);
         }
+        b.append(wifiLine());
         Log.i("IstessoAura", b.toString());
     }
 
