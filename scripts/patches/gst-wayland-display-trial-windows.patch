@@ -1,5 +1,6 @@
 Windows for everyday use: the pointer, the button and the keyboard go to the same window, the
-one a person sees under the pointer.
+one a person sees under the pointer (1); a window is told it is maximized, not fullscreen,
+unless it asks (2).
 
 A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
 MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
@@ -44,6 +45,29 @@ Wayland client): a second window that commits before its first picture has the p
 that picture on, and a click without a move gives it the button and the keyboard, and makes
 it the active window; a click without any move reaches a lone window with the keyboard; a
 click beside a dialog gives the button, the keyboard and the active state to its parent.
+
+2. Maximized, not fullscreen
+
+The fault: the compositor told every window without a parent that it was fullscreen, as the
+project does upstream. Firefox hides its toolbar then (it slides in only when the pointer
+touches the top edge), and other applications drop their own bars.
+
+What it changes:
+
+- A window that is made as large as the output is told it is maximized, at the size of the
+  output (kept to its largest size, if it has one). It is told fullscreen only when it asks
+  (`xdg_toplevel.set_fullscreen`: a video player, a game, a presentation); it is put at the
+  corner in front then. When it asks no longer, a window without a parent is maximized again;
+  a dialog keeps a size of its own.
+- A window that asks to be maximized is.
+- When the output changes its size, a window that fills it (maximized, or fullscreen because
+  it asked) is told the new size; any other window keeps its size and is told how much room
+  there is. Before, every window was told fullscreen with no size (an empty intersection with
+  "no largest size").
+
+Tests: the first window is told maximized at the size of the output and not fullscreen; one
+that asks for fullscreen has it and is maximized again when it leaves it; a maximized window
+is told the new size of the output.
 
 diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
 index ce1ce1a..05371be 100644
@@ -176,8 +200,131 @@ index ce1ce1a..05371be 100644
      }
  }
  
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 68e95df..c777354 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -402,12 +402,18 @@ pub(crate) fn apply_video_info(
+             .unwrap_or(new_size),
+         );
+ 
+-        let new_size = max_size
+-            .intersection(Rectangle::from_size(new_size))
+-            .map(|rect| rect.size);
++        // A window that fills the output (maximized, or fullscreen because it asked) is told
++        // the new size, kept to its largest size; any other keeps its size and is told how
++        // much room there is.
++        let full = windows::full_size(new_size, max_size.size);
+         toplevel.with_pending_state(|state| {
+-            state.size = new_size;
+-            state.states.set(XdgState::Fullscreen);
++            if state.states.contains(XdgState::Maximized)
++                || state.states.contains(XdgState::Fullscreen)
++            {
++                state.size = Some(full);
++            } else {
++                state.bounds = Some(new_size);
++            }
+             state.states.set(XdgState::Activated);
+         });
+         toplevel.send_configure();
+@@ -457,6 +463,61 @@ impl State {
+         }
+     }
+ 
++    /// The size of the output, in the units the windows are told their size in.
++    pub(crate) fn output_size(&self) -> Option<Size<i32, Logical>> {
++        let output = self.output.as_ref()?;
++        let mode = output.current_mode()?;
++        Some(
++            mode.size
++                .to_f64()
++                .to_logical(output.current_scale().fractional_scale())
++                .to_i32_round(),
++        )
++    }
++
++    /// Tells a window to fill the output, as a window that asks for fullscreen (`fullscreen`)
++    /// or to be maximized, and puts it at the corner, in front. One that is not shown yet is
++    /// told with its first configure.
++    pub(crate) fn fill_the_output(
++        &mut self,
++        toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
++        fullscreen: bool,
++    ) {
++        use smithay::wayland::seat::WaylandFocus;
++        let max_size = with_states(toplevel.wl_surface(), |states| {
++            states
++                .cached_state
++                .get::<SurfaceCachedState>()
++                .current()
++                .max_size
++        });
++        let size = self
++            .output_size()
++            .map(|size| windows::full_size(size, max_size));
++        toplevel.with_pending_state(|state| {
++            state.size = size;
++            if fullscreen {
++                state.states.set(XdgState::Fullscreen);
++            } else {
++                state.states.set(XdgState::Maximized);
++            }
++        });
++        if !toplevel.is_initial_configure_sent() {
++            return;
++        }
++        toplevel.send_configure();
++        let shown = self
++            .space
++            .elements()
++            .find(|w| w.wl_surface().is_some_and(|s| *s == *toplevel.wl_surface()))
++            .cloned();
++        if let Some(window) = shown {
++            self.space.map_element(window, (0, 0), false);
++            self.pointer_to_the_window_under_it();
++            picture_changed(self);
++        }
++    }
++
+     /// Where a window that is about to be shown goes: over the middle of its parent if it
+     /// has one that is shown, and at the corner otherwise ([`windows::place`]).
+     pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
+diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
+index 7813b6f..087b51c 100644
+--- a/wayland-display-core/src/comp/windows.rs
++++ b/wayland-display-core/src/comp/windows.rs
+@@ -43,6 +43,13 @@ pub fn place(
+         .into()
+ }
+ 
++/// The size a window is told when it is to fill an output of this size: the output's, kept
++/// to the window's largest size where it has one (a largest size of 0 is no limit).
++pub fn full_size(output: Size<i32, Logical>, max: Size<i32, Logical>) -> Size<i32, Logical> {
++    let keep = |output: i32, max: i32| if max > 0 { output.min(max) } else { output };
++    (keep(output.w, max.w), keep(output.h, max.h)).into()
++}
++
+ /// Receives the number of windows whenever it changes. Called on the compositor's thread.
+ pub type WindowSink = Box<dyn Fn(usize) + Send>;
+ 
+@@ -104,6 +111,14 @@ mod tests {
+         assert_eq!((at.x, at.y), (0, 0));
+     }
+ 
++    #[test]
++    fn a_window_that_fills_the_output_is_kept_to_its_largest_size() {
++        let output = Size::from((1720, 720));
++        assert_eq!(full_size(output, (0, 0).into()), output);
++        assert_eq!(full_size(output, (800, 0).into()), (800, 720).into());
++        assert_eq!(full_size(output, (4000, 600).into()), (1720, 600).into());
++    }
++
+     #[test]
+     fn a_window_without_a_parent_is_put_at_the_corner() {
+         let at = place((400, 300).into(), None, (1720, 720).into());
 diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
-index d552363..63bab12 100644
+index d552363..b0f55d3 100644
 --- a/wayland-display-core/src/tests/client.rs
 +++ b/wayland-display-core/src/tests/client.rs
 @@ -62,6 +62,8 @@ struct State {
@@ -205,7 +352,25 @@ index d552363..63bab12 100644
              windows: Vec::new(),
              mouse_events: Vec::new(),
              output: None,
-@@ -349,8 +351,23 @@ impl WaylandClient {
+@@ -315,14 +317,15 @@ impl WaylandClient {
+     }
+ 
+     /// The size and bounds the compositor told the last window, and whether it told it to
+-    /// fill the screen.
++    /// fill the screen (maximized or fullscreen).
+     pub fn told_to_last_window(&self) -> ((i32, i32), Option<(i32, i32)>, bool) {
+         let window = self.state.windows.last().unwrap();
+         let (_, configure) = window.configures_received.last().unwrap();
+         (
+             configure.size,
+             configure.bounds,
+-            configure.states.contains(&xdg_toplevel::State::Fullscreen),
++            configure.states.contains(&xdg_toplevel::State::Fullscreen)
++                || configure.states.contains(&xdg_toplevel::State::Maximized),
+         )
+     }
+ 
+@@ -349,8 +352,23 @@ impl WaylandClient {
      /// as its first: the window is as large as the picture, as a dialog is that knows its
      /// own size.
      pub fn setup_window_of_one_colour(&mut self, (width, height): (i32, i32), bgra: [u8; 4]) {
@@ -230,7 +395,7 @@ index d552363..63bab12 100644
          let mut file = tempfile::tempfile().unwrap();
          file.write_all(&bgra.repeat((width * height) as usize))
              .unwrap();
-@@ -370,13 +387,11 @@ impl WaylandClient {
+@@ -370,13 +388,11 @@ impl WaylandClient {
              &state.qh,
              (),
          );
@@ -247,10 +412,33 @@ index d552363..63bab12 100644
      /// Whether the compositor has asked the last window to close.
      pub fn asked_to_close(&self) -> bool {
          self.state.windows.last().is_some_and(|w| w.close_requested)
-@@ -392,6 +407,69 @@ impl WaylandClient {
+@@ -392,6 +408,92 @@ impl WaylandClient {
          }
      }
  
++    /// The states the compositor told the last window in its last configure.
++    pub fn states_told_to_last_window(&self) -> Vec<xdg_toplevel::State> {
++        let window = self.state.windows.last().unwrap();
++        let (_, configure) = window.configures_received.last().unwrap();
++        configure.states.clone()
++    }
++
++    /// Asks for the last window to fill the screen (`xdg_toplevel.set_fullscreen`), or no
++    /// longer to, as a video player does.
++    pub fn ask_for_fullscreen(&mut self, fullscreen: bool) {
++        let toplevel = &self.state.windows.last().unwrap().xdg_toplevel;
++        if fullscreen {
++            toplevel.set_fullscreen(None);
++        } else {
++            toplevel.unset_fullscreen();
++        }
++    }
++
++    /// Answers the last configure of the last window and commits its picture again.
++    pub fn ack_and_commit(&mut self) {
++        self.state.windows.last().unwrap().ack_last_and_commit();
++    }
++
 +    /// Answers the last window's configure and commits without a picture, as some
 +    /// applications do with a second window before they have drawn into it.
 +    pub fn ack_and_commit_without_a_picture(&mut self) {
@@ -317,7 +505,7 @@ index d552363..63bab12 100644
      pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
          self.state.mouse_events.as_mut()
      }
-@@ -696,7 +774,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
+@@ -696,7 +798,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
  
  impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
      fn event(
@@ -326,7 +514,7 @@ index d552363..63bab12 100644
          _: &wl_keyboard::WlKeyboard,
          event: wl_keyboard::Event,
          _: &(),
-@@ -704,6 +782,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+@@ -704,6 +806,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
          _: &QueueHandle<Self>,
      ) {
          tracing::debug!("{:?}", event);
@@ -350,18 +538,22 @@ index fc6caee..ad5c069 100644
  mod test_windows;
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
-index 0000000..7327b8e
+index 0000000..2f154ce
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_windows.rs
-@@ -0,0 +1,94 @@
-+//! Integration tests for everyday use with more than one window: the pointer, the button and
-+//! the keyboard go to the same window, the one a person sees under the pointer. A real
-+//! Wayland client opens the windows.
+@@ -0,0 +1,144 @@
++//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
++//! window, the one a person sees under the pointer; a window is told to be maximized, not
++//! fullscreen, unless it asks. A real Wayland client opens the windows.
 +
++use crate::comp::apply_video_info;
 +use crate::tests::fixture::Fixture;
++use crate::utils::RenderTarget;
++use crate::utils::video_info::GstVideoInfo;
 +use smithay::backend::input::ButtonState;
 +use smithay::utils::Point;
 +use test_log::test;
++use wayland_protocols::xdg::shell::client::xdg_toplevel::State as Told;
 +
 +const WHITE: [u8; 4] = [255, 255, 255, 255];
 +
@@ -448,8 +640,54 @@ index 0000000..7327b8e
 +    assert!(f.client.told_active(0));
 +    assert!(!f.client.told_active(1));
 +}
++
++#[test]
++fn the_first_window_is_told_maximized_at_the_size_of_the_output_not_fullscreen() {
++    let f = fixture();
++    let states = f.client.states_told_to_last_window();
++    assert!(states.contains(&Told::Maximized), "{states:?}");
++    assert!(!states.contains(&Told::Fullscreen), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (320, 240));
++}
++
++#[test]
++fn a_window_that_asks_for_fullscreen_has_it_and_is_maximized_again_when_it_leaves_it() {
++    let mut f = fixture();
++    f.client.ask_for_fullscreen(true);
++    f.round_trip();
++    let states = f.client.states_told_to_last_window();
++    assert!(states.contains(&Told::Fullscreen), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (320, 240));
++    f.client.ack_and_commit();
++    f.round_trip();
++
++    f.client.ask_for_fullscreen(false);
++    f.round_trip();
++    let states = f.client.states_told_to_last_window();
++    assert!(!states.contains(&Told::Fullscreen), "{states:?}");
++    assert!(states.contains(&Told::Maximized), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (320, 240));
++}
++
++#[test]
++fn a_maximized_window_is_told_the_new_size_of_the_output() {
++    let mut f = fixture();
++    let video_info = GstVideoInfo::RAW(
++        gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, 640, 360)
++            .fps(gst::Fraction::new(30, 1))
++            .build()
++            .unwrap(),
++    );
++    apply_video_info(&mut f.server, video_info, &RenderTarget::Software, None);
++    f.round_trip();
++    f.round_trip();
++    let states = f.client.states_told_to_last_window();
++    assert!(states.contains(&Told::Maximized), "{states:?}");
++    assert!(!states.contains(&Told::Fullscreen), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (640, 360));
++}
 diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
-index 595d547..84cc810 100644
+index 595d547..c051ecd 100644
 --- a/wayland-display-core/src/wayland/handlers/compositor.rs
 +++ b/wayland-display-core/src/wayland/handlers/compositor.rs
 @@ -42,12 +42,17 @@ impl CompositorHandler for State {
@@ -472,7 +710,41 @@ index 595d547..84cc810 100644
          }
          self.popups.commit(surface);
  
-@@ -131,12 +136,11 @@ impl CompositorHandler for State {
+@@ -92,25 +97,15 @@ impl CompositorHandler for State {
+                         state.bounds = room;
+                     });
+                 } else if max_size.w == 0 && max_size.h == 0 {
++                    let size = self.output_size();
+                     toplevel.with_pending_state(|state| {
+-                        state.size = Some(
+-                            self.output
+-                                .as_ref()
+-                                .unwrap()
+-                                .current_mode()
+-                                .unwrap()
+-                                .size
+-                                .to_f64()
+-                                .to_logical(
+-                                    self.output
+-                                        .as_ref()
+-                                        .unwrap()
+-                                        .current_scale()
+-                                        .fractional_scale(),
+-                                )
+-                                .to_i32_round(),
+-                        );
+-                        state.states.set(XdgState::Fullscreen);
++                        state.size = size;
++                        // As large as the output, but maximized: the application keeps its
++                        // own bars (Firefox's toolbar slides away in fullscreen). Fullscreen
++                        // only when the application has asked for it.
++                        if !state.states.contains(XdgState::Fullscreen) {
++                            state.states.set(XdgState::Maximized);
++                        }
+                     });
+                 }
+                 toplevel.with_pending_state(|state| {
+@@ -131,12 +126,11 @@ impl CompositorHandler for State {
                      Some(FocusTarget::from(window)),
                      SERIAL_COUNTER.next_serial(),
                  );
@@ -488,10 +760,20 @@ index 595d547..84cc810 100644
  
              return;
 diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
-index 4931ed6..0008689 100644
+index 4931ed6..e3994d9 100644
 --- a/wayland-display-core/src/wayland/handlers/xdg.rs
 +++ b/wayland-display-core/src/wayland/handlers/xdg.rs
-@@ -41,6 +41,7 @@ impl XdgShellHandler for State {
+@@ -5,7 +5,8 @@ use smithay::{
+         find_popup_root_surface, get_popup_toplevel_coords,
+     },
+     input::{Seat, pointer::Focus},
+-    reexports::wayland_server::protocol::wl_seat::WlSeat,
++    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
++    reexports::wayland_server::protocol::{wl_output::WlOutput, wl_seat::WlSeat},
+     utils::Serial,
+     wayland::{
+         seat::WaylandFocus,
+@@ -41,10 +42,36 @@ impl XdgShellHandler for State {
              self.space.unmap_elem(&gone);
          }
          self.keyboard_to_the_top_window();
@@ -499,3 +781,32 @@ index 4931ed6..0008689 100644
          self.pointer_to_the_window_under_it();
          crate::comp::picture_changed(self);
      }
+ 
++    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
++        self.fill_the_output(&surface, true);
++    }
++
++    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
++        // Back to what it was told before it asked: a window without a parent fills the
++        // output, maximized; a dialog keeps a size of its own.
++        if surface.parent().is_none() {
++            surface.with_pending_state(|state| state.states.unset(XdgState::Fullscreen));
++            self.fill_the_output(&surface, false);
++        } else {
++            surface.with_pending_state(|state| {
++                state.states.unset(XdgState::Fullscreen);
++                state.size = None;
++            });
++            if surface.is_initial_configure_sent() {
++                surface.send_configure();
++            }
++        }
++    }
++
++    fn maximize_request(&mut self, surface: ToplevelSurface) {
++        self.fill_the_output(&surface, false);
++    }
++
+     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+         self.unconstrain_popup(&surface);
+         if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
