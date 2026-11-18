@@ -1,0 +1,10 @@
+[package]
+name = "istesso-device-api"
+description = "The one interface between Istesso and a device adapter. An adapter depends on nothing else."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

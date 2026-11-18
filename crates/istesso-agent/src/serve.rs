@@ -5,14 +5,15 @@
 //! short timeouts and small buffers; the number of simultaneous connections
 //! is capped.
 
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use istesso_link::{ErrorCode, LocalKeys, Request, Response, Session, DEFAULT_PORT};
+use istesso_link::{ErrorCode, HangUp, LocalKeys, Request, Response, Session, DEFAULT_PORT};
 use istesso_pair::{Identity, PeerStore, Permission};
-use istesso_proto::{AppEntry, HostManifest};
+use istesso_proto::{AppEntry, HostManifest, InputEvent};
 
 use crate::cache;
 use crate::discovery::Discovery;
@@ -27,6 +28,15 @@ use crate::session::{Pairing, Sessions};
 const MAX_CONNECTIONS: usize = 64;
 /// How long the agent waits for a caller's next message.
 const WAIT: Duration = Duration::from_secs(5);
+/// How often a device that sends input is looked up again in the list of
+/// paired devices. A conversation with input stays open for as long as a
+/// window does; a pairing that is removed, or a right that is taken away,
+/// must stop it soon, not when the window is closed.
+const INPUT_RECHECK: Duration = Duration::from_secs(1);
+/// How long a device that sends input may say nothing, once it has agreed to
+/// say "still here" twice a second (`alive` at `input_open`). A device that
+/// did not agree to that has [`WAIT`], and says so every two seconds.
+const INPUT_SILENCE: Duration = Duration::from_secs(2);
 /// How long a full inspection of this machine stays valid. The agent repeats
 /// the inspection twice as often and always answers from memory.
 pub const MANIFEST_MAX_AGE: Duration = Duration::from_secs(600);
@@ -54,6 +64,13 @@ pub struct AgentOptions {
     pub refresh_peers: Option<Duration>,
     /// Also report every conversation, not just the refused ones.
     pub verbose: bool,
+    /// Where input is handed to the program that shows an application,
+    /// instead of [`Paths::input_socket`]. For tests, which must never
+    /// write to the socket of a pipeline that is really running.
+    pub input_socket: Option<std::path::PathBuf>,
+    /// For measuring: write down when input was passed on, and never what it
+    /// was ([`crate::passing`]). `None`, the default, writes nothing.
+    pub input_timings: Option<std::path::PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -64,6 +81,8 @@ impl Default for AgentOptions {
             discovery: true,
             refresh_peers: Some(Duration::from_secs(300)),
             verbose: false,
+            input_socket: None,
+            input_timings: None,
         }
     }
 }
@@ -82,6 +101,12 @@ struct Shared {
     apps: Mutex<Option<(Instant, Vec<AppEntry>)>>,
     connections: AtomicUsize,
     verbose: bool,
+    /// Where input is handed over on this machine.
+    input_socket: std::path::PathBuf,
+    /// The conversation each device sends its input on, by the device's id:
+    /// one for each device. A device that opens another ends the one before.
+    inputs: Mutex<HashMap<String, InputHold>>,
+    passing: Option<crate::PassLog>,
     log: Log,
     /// The applications of this machine that are shown to other devices.
     sessions: Sessions,
@@ -114,6 +139,14 @@ impl Drop for Listed<'_> {
     }
 }
 
+/// What is kept of a conversation that carries input, for ending it from
+/// another one.
+struct InputHold {
+    held: Arc<Mutex<Held>>,
+    sink: InputSink,
+    hang_up: HangUp,
+}
+
 impl Agent {
     /// Loads (or creates) the device identity and starts listening.
     pub fn bind(paths: Paths, options: &AgentOptions, log: Log) -> Result<Self, String> {
@@ -125,6 +158,14 @@ impl Agent {
                 SocketAddr::new(options.bind, options.port)
             )
         })?;
+        let passing = match &options.input_timings {
+            Some(path) => Some(
+                crate::PassLog::create(path)
+                    .map_err(|e| format!("cannot write to {}: {e}", path.display()))?,
+            ),
+            None => None,
+        };
+        let paths_input_socket = paths.input_socket();
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -138,6 +179,9 @@ impl Agent {
                 apps: Mutex::new(None),
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
+                input_socket: options.input_socket.clone().unwrap_or(paths_input_socket),
+                inputs: Mutex::new(HashMap::new()),
+                passing,
                 log,
                 open: Mutex::new(Vec::new()),
                 conversations: AtomicU64::new(0),
@@ -282,6 +326,141 @@ impl Agent {
     }
 }
 
+/// Where a paired device's keyboard and pointer input goes on this machine:
+/// to the program that shows it an application, through the socket that
+/// program listens on ([`Paths::input_socket`]).
+struct InputSink {
+    #[cfg(unix)]
+    socket: std::os::unix::net::UnixDatagram,
+    /// What this conversation has down on the application's side.
+    held: Arc<Mutex<Held>>,
+}
+
+/// The keys and buttons one conversation has pressed and not let go.
+#[derive(Default)]
+struct Held {
+    keys: BTreeSet<u32>,
+    buttons: BTreeSet<u32>,
+    /// The conversation is over: nothing more is passed on for it.
+    over: bool,
+}
+
+impl InputSink {
+    #[cfg(unix)]
+    fn open(path: &std::path::Path) -> std::io::Result<InputSink> {
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        socket.connect(path)?;
+        socket.set_nonblocking(true)?;
+        Ok(InputSink {
+            socket,
+            held: Arc::default(),
+        })
+    }
+
+    /// A second handle on the same socket and the same record of what is
+    /// held, for whoever ends this conversation from outside.
+    #[cfg(unix)]
+    fn another(&self) -> std::io::Result<InputSink> {
+        Ok(InputSink {
+            socket: self.socket.try_clone()?,
+            held: self.held.clone(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn another(&self) -> std::io::Result<InputSink> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// Passes events on, and notes which keys and buttons are down because
+    /// of them. Nothing is passed on once the conversation is over.
+    fn pass(&self, events: &[InputEvent]) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held.over {
+            return;
+        }
+        for event in events {
+            match *event {
+                InputEvent::Key {
+                    code,
+                    pressed: true,
+                } => {
+                    held.keys.insert(code);
+                }
+                InputEvent::Key {
+                    code,
+                    pressed: false,
+                } => {
+                    held.keys.remove(&code);
+                }
+                InputEvent::Button {
+                    code,
+                    pressed: true,
+                } => {
+                    held.buttons.insert(code);
+                }
+                InputEvent::Button {
+                    code,
+                    pressed: false,
+                } => {
+                    held.buttons.remove(&code);
+                }
+                InputEvent::PointerAt { .. } | InputEvent::Scroll { .. } => {}
+            }
+            self.send(event);
+        }
+    }
+
+    /// The conversation is over, however it ended: every key and button it
+    /// had down comes up, so that none stays down and goes on typing, and
+    /// nothing more is passed on for it. Doing it twice does nothing more.
+    fn let_go(&self) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.over = true;
+        for code in std::mem::take(&mut held.keys) {
+            self.send(&InputEvent::Key {
+                code,
+                pressed: false,
+            });
+        }
+        for code in std::mem::take(&mut held.buttons) {
+            self.send(&InputEvent::Button {
+                code,
+                pressed: false,
+            });
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn open(_path: &std::path::Path) -> std::io::Result<InputSink> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// One event, one datagram. A program that has gone away, or does not
+    /// keep up, loses input; the conversation goes on.
+    fn send(&self, event: &InputEvent) {
+        #[cfg(unix)]
+        if let Ok(bytes) = serde_json::to_vec(event) {
+            let _ = self.socket.send(&bytes);
+        }
+        #[cfg(not(unix))]
+        let _ = event;
+    }
+}
+
+/// Whether the device is, at this moment, still paired and still allowed to
+/// control this host: read from the list on disk, not remembered from when
+/// the conversation began.
+fn may_still_control(paths: &Paths, peer: &istesso_pair::Peer) -> bool {
+    PeerStore::open(paths.peers()).is_ok_and(|peers| {
+        peers.peers().iter().any(|known| {
+            known.id == peer.id
+                && known.public_key == peer.public_key
+                && known.permissions.contains(&Permission::Control)
+        })
+    })
+}
+
 impl Shared {
     fn handle(&self, stream: TcpStream) {
         // Read the list of paired devices for every caller: a pairing that
@@ -323,6 +502,10 @@ impl Shared {
         let _listed = handle.ok().map(|stream| self.list(session.peer(), stream));
 
         let mut asked: Vec<&'static str> = Vec::new();
+        let mut input: Option<InputSink> = None;
+        // The device asked to be answered when it says "still here".
+        let mut answers_alive = false;
+        let mut checked = Instant::now();
         while let Ok(Some(request)) = session.next_request() {
             // What the device may do is read now, not remembered from the
             // handshake: a conversation can stay open for as long as a
@@ -333,21 +516,94 @@ impl Shared {
                 let peer = session.peer();
                 crate::session::pairing_now(&self.paths, &peer.id, &peer.public_key)
             };
-            let response = if crate::session::is_session_request(&request) {
+            let response = match request {
+                // Input is the one request that does not read the list when
+                // it comes: a file read for every key would sit on the input
+                // path. The list is read again every INPUT_RECHECK instead,
+                // below, and when input is asked for.
+                Request::Input { events } => {
+                    // Passed on and not answered. Input that was not asked for first, or
+                    // that nothing takes any more, is dropped.
+                    let Some(sink) = &input else { continue };
+                    let in_hand = crate::PassLog::mark();
+                    // The device sends something at least every two seconds, so this is
+                    // looked at often enough.
+                    if checked.elapsed() >= INPUT_RECHECK {
+                        checked = Instant::now();
+                        if !may_still_control(&self.paths, session.peer()) {
+                            (self.log)(format!(
+                                "stopped taking input from {}: it is no longer allowed to control this host",
+                                session.peer().name
+                            ));
+                            break;
+                        }
+                    }
+                    sink.pass(&events);
+                    // The empty message that only says "still here" passes nothing on.
+                    if let (Some(passing), false) = (&self.passing, events.is_empty()) {
+                        passing.passed(in_hand, events.len());
+                    }
+                    // Only "still here" is answered, and only when that was asked for:
+                    // what a person types never waits for an answer.
+                    if !(events.is_empty() && answers_alive) {
+                        continue;
+                    }
+                    Response::InputAlive
+                }
+                // The right to control is the one the list of paired devices
+                // gives now, like every other right in this loop.
+                Request::InputOpen { alive } => match now() {
+                    Pairing::Paired(rights) if rights.contains(&Permission::Control) => {
+                        match InputSink::open(&self.input_socket) {
+                            Ok(sink) => {
+                                // One conversation carries a device's input. An earlier one (cut
+                                // off somewhere on the way, perhaps, without either end having
+                                // been told) is over now, and what it had down comes up before
+                                // this one presses anything.
+                                if let Some(earlier) = input.take() {
+                                    earlier.let_go();
+                                    // Asked twice in one conversation: it is not its own
+                                    // predecessor, and is not ended for it.
+                                    self.forget_input(session.peer(), &earlier);
+                                }
+                                self.take_over_input(&session, &sink);
+                                input = Some(sink);
+                                answers_alive = alive;
+                                if alive {
+                                    // It says "still here" twice a second from now on.
+                                    let _ = session.set_wait(INPUT_SILENCE);
+                                }
+                                asked.push("input");
+                                Response::InputOpen { alive }
+                            }
+                            Err(_) => Response::error(
+                                ErrorCode::Internal,
+                                "nothing on this host takes input at the moment",
+                            ),
+                        }
+                    }
+                    Pairing::Paired(_) => Response::error(
+                        ErrorCode::Forbidden,
+                        "this device may not control the host",
+                    ),
+                    Pairing::Unpaired | Pairing::Unknown => break,
+                },
                 // Streaming sessions have their own table, and their own
                 // rules about who may ask. An answer can be held back for
                 // seconds, so the list is read once more when it is ready.
-                let response =
-                    self.sessions
-                        .answer(&request, session.peer(), session.remote_addr(), || {
-                            self.apps()
-                        });
-                if !matches!(now(), Pairing::Paired(_)) {
-                    break;
+                request if crate::session::is_session_request(&request) => {
+                    let response = self.sessions.answer(
+                        &request,
+                        session.peer(),
+                        session.remote_addr(),
+                        || self.apps(),
+                    );
+                    if !matches!(now(), Pairing::Paired(_)) {
+                        break;
+                    }
+                    response
                 }
-                response
-            } else {
-                match now() {
+                request => match now() {
                     Pairing::Paired(rights) if rights.contains(&Permission::View) => {
                         self.answer(&request, &mut asked)
                     }
@@ -356,11 +612,17 @@ impl Shared {
                         "this device may not look at the host",
                     ),
                     Pairing::Unpaired | Pairing::Unknown => break,
-                }
+                },
             };
             if session.respond(&response).is_err() {
                 break;
             }
+        }
+        // However the conversation ended (the device hung up, went silent, lost its
+        // right, or opened another): no key or button stays down because of it.
+        if let Some(sink) = input {
+            sink.let_go();
+            self.forget_input(session.peer(), &sink);
         }
         if self.verbose && !asked.is_empty() {
             (self.log)(format!(
@@ -422,6 +684,42 @@ impl Shared {
         cut.len()
     }
 
+    /// Notes that `session` carries its device's input from now on, and ends
+    /// the conversation that did before: its keys and buttons come up here
+    /// and now, and the thread that serves it is told that its caller is done.
+    fn take_over_input(&self, session: &Session, sink: &InputSink) {
+        let (Ok(hang_up), Ok(another)) = (session.hang_up_handle(), sink.another()) else {
+            return;
+        };
+        let hold = InputHold {
+            held: sink.held.clone(),
+            sink: another,
+            hang_up,
+        };
+        let earlier = self
+            .inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.peer().id.clone(), hold);
+        if let Some(earlier) = earlier {
+            earlier.sink.let_go();
+            earlier.hang_up.hang_up();
+        }
+    }
+
+    /// The conversation with this sink is over: it is not the one its
+    /// device sends input on any more, unless another one has taken over
+    /// already.
+    fn forget_input(&self, peer: &istesso_pair::Peer, sink: &InputSink) {
+        let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        if inputs
+            .get(&peer.id)
+            .is_some_and(|hold| Arc::ptr_eq(&hold.held, &sink.held))
+        {
+            inputs.remove(&peer.id);
+        }
+    }
+
     fn answer(&self, request: &Request, asked: &mut Vec<&'static str>) -> Response {
         match request {
             Request::Ping => Response::Pong,
@@ -441,6 +739,11 @@ impl Shared {
                     status: local_status(),
                 }
             }
+            // Handled where the connection is, before this is reached.
+            Request::InputOpen { .. } | Request::Input { .. } => Response::error(
+                ErrorCode::Unsupported,
+                "input is not answered like a question",
+            ),
             // Sessions are answered where the connection is, before this is
             // reached.
             _ => Response::error(ErrorCode::Unsupported, "not a question about the host"),
@@ -497,6 +800,7 @@ mod tests {
             discovery: false,
             refresh_peers: None,
             verbose: false,
+            ..AgentOptions::default()
         };
         Agent::bind(paths.clone(), &options, Arc::new(|_| {})).unwrap()
     }
@@ -525,6 +829,277 @@ mod tests {
         agent.shared.refresh_manifest();
         assert_ne!(agent.shared.manifest().name, "planted for this test");
         assert!(paths.local_manifest().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_reaches_whoever_listens_one_event_a_datagram() {
+        use std::os::unix::net::UnixDatagram;
+        let dir = TempDir::new("in");
+        let path = dir.paths().config.join("i.sock");
+        // Nobody listens: there is nothing to open.
+        assert!(InputSink::open(&path).is_err());
+
+        let listener = UnixDatagram::bind(&path).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sink = InputSink::open(&path).unwrap();
+        sink.send(&InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        sink.send(&InputEvent::PointerAt { x: 3, y: 4 });
+        let mut buffer = [0u8; 256];
+        let length = listener.recv(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..length],
+            br#"{"kind":"key","code":30,"pressed":true}"#
+        );
+        let length = listener.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], br#"{"kind":"pointer_at","x":3,"y":4}"#);
+
+        // The listener goes away: input is lost, nothing else happens.
+        drop(listener);
+        sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
+    }
+
+    #[cfg(unix)]
+    mod input_over_a_conversation {
+        use std::time::{Duration, Instant};
+
+        use istesso_link::InputAnswer;
+        use istesso_proto::InputEvent;
+
+        use crate::testing::InputPair;
+
+        const SOON: Duration = Duration::from_secs(3);
+        const A_MOMENT: Duration = Duration::from_millis(300);
+
+        fn key(code: u32, pressed: bool) -> InputEvent {
+            InputEvent::Key { code, pressed }
+        }
+
+        fn button(code: u32, pressed: bool) -> InputEvent {
+            InputEvent::Button { code, pressed }
+        }
+
+        /// Waits until the device has heard "still here", for a moment at most.
+        fn hears_alive(client: &mut istesso_link::Client, within: Duration) -> bool {
+            let began = Instant::now();
+            while began.elapsed() < within {
+                if client.heard_alive().unwrap() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        }
+
+        #[test]
+        fn still_here_is_answered_when_that_was_asked_for_and_keys_never_are() {
+            let pair = InputPair::new("ia");
+            let mut asking = pair.connect();
+            assert_eq!(
+                asking.open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+            asking.send_input(&[]).unwrap();
+            assert!(hears_alive(&mut asking, SOON));
+            // What a person types is passed on, and not answered.
+            asking.send_input(&[key(30, true), key(30, false)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            assert_eq!(pair.handed_over(SOON), Some(key(30, false)));
+            assert!(!hears_alive(&mut asking, A_MOMENT));
+            drop(asking);
+
+            // A device of the version before does not ask, and is not answered: nothing
+            // piles up where nobody reads.
+            let mut earlier = pair.connect();
+            earlier.open_input().unwrap();
+            earlier.send_input(&[]).unwrap();
+            assert!(!hears_alive(&mut earlier, A_MOMENT));
+            earlier.send_input(&[key(31, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(31, true)));
+        }
+
+        #[test]
+        fn keys_and_buttons_come_up_when_the_conversation_ends() {
+            let pair = InputPair::new("ib");
+            let mut client = pair.connect();
+            client.open_input().unwrap();
+            client
+                .send_input(&[
+                    key(42, true),
+                    key(30, true),
+                    key(30, false),
+                    button(0x110, true),
+                    InputEvent::PointerAt { x: 5, y: 6 },
+                ])
+                .unwrap();
+            assert_eq!(pair.all_handed_over(A_MOMENT).len(), 5);
+            // The device goes away with Shift and the left button down.
+            drop(client);
+            assert_eq!(
+                pair.all_handed_over(A_MOMENT),
+                [key(42, false), button(0x110, false)]
+            );
+        }
+
+        #[test]
+        fn a_device_that_opens_another_conversation_ends_the_one_before() {
+            let pair = InputPair::new("ic");
+            let mut first = pair.connect();
+            assert_eq!(
+                first.open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+            first.send_input(&[key(29, true), key(30, true)]).unwrap();
+            assert_eq!(pair.all_handed_over(A_MOMENT).len(), 2);
+
+            // The same device again, as after a cut that the first conversation's two
+            // ends have not noticed: what the first one had down comes up before the
+            // second presses anything.
+            let mut second = pair.connect();
+            assert_eq!(
+                second.open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+            second.send_input(&[key(29, true)]).unwrap();
+            assert_eq!(
+                pair.all_handed_over(A_MOMENT),
+                [key(29, false), key(30, false), key(29, true)]
+            );
+
+            // The first conversation is over: the device is told so at once, and what
+            // it still sends goes nowhere.
+            let began = Instant::now();
+            let over = loop {
+                match first.heard_alive() {
+                    Err(err) => break err,
+                    Ok(_) => assert!(began.elapsed() < SOON, "the first one was left open"),
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(matches!(over, istesso_link::Error::Closed), "{over}");
+            let _ = first.send_input(&[key(31, true)]);
+            assert!(pair.all_handed_over(A_MOMENT).is_empty());
+
+            // The second one goes on, and ending it lets its key go: once.
+            second.send_input(&[]).unwrap();
+            assert!(hears_alive(&mut second, SOON));
+            drop(second);
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(29, false)]);
+        }
+
+        #[test]
+        fn asking_twice_in_one_conversation_does_not_end_it() {
+            let pair = InputPair::new("id");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            assert_eq!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+            // What was down comes up, and the conversation carries on.
+            assert_eq!(pair.handed_over(SOON), Some(key(30, false)));
+            client.send_input(&[]).unwrap();
+            assert!(hears_alive(&mut client, SOON));
+        }
+
+        #[test]
+        fn a_device_that_says_nothing_for_two_seconds_is_let_go_of() {
+            let pair = InputPair::new("ie");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            // Not a word from here on. (A device that did not ask to be answered has
+            // five seconds, as before.)
+            let began = Instant::now();
+            assert_eq!(
+                pair.handed_over(Duration::from_secs(4)),
+                Some(key(30, false))
+            );
+            let after = began.elapsed();
+            assert!(
+                after >= super::super::INPUT_SILENCE - Duration::from_millis(200),
+                "{after:?}"
+            );
+            assert!(
+                after < super::super::INPUT_SILENCE + Duration::from_secs(1),
+                "{after:?}"
+            );
+            drop(client);
+        }
+
+        #[test]
+        fn a_device_that_loses_the_right_to_control_has_its_keys_let_go() {
+            let pair = InputPair::new("if");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+
+            let mut peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+            let mut laptop = peers.find("a laptop").unwrap().unwrap().clone();
+            laptop.permissions = vec![istesso_pair::Permission::View];
+            peers.add(laptop).unwrap();
+            // Looked up again at most a second apart, when the device says something.
+            let began = Instant::now();
+            let mut handed = Vec::new();
+            while handed.is_empty() {
+                assert!(
+                    began.elapsed() < Duration::from_secs(4),
+                    "it still takes input"
+                );
+                let _ = client.send_input(&[]);
+                handed = pair.all_handed_over(Duration::from_millis(100));
+            }
+            assert_eq!(handed, [key(30, false)]);
+            // And it does not get in again.
+            let mut again = pair.connect();
+            assert!(matches!(
+                again.open_input_alive().unwrap(),
+                InputAnswer::Refused {
+                    code: istesso_link::ErrorCode::Forbidden,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_device_stops_being_allowed_to_send_input_when_its_rights_change() {
+        let dir = TempDir::new("rights");
+        let paths = dir.paths();
+        let mut peer = istesso_pair::Peer {
+            id: "aaaa-bbbb-cccc-dddd".into(),
+            name: "a laptop".into(),
+            public_key: "11".repeat(32),
+            paired_at: 0,
+            permissions: Permission::defaults(),
+        };
+        // Not paired at all.
+        assert!(!may_still_control(&paths, &peer));
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(may_still_control(&paths, &peer));
+        // Another device that took over the name does not inherit the right.
+        let mut impostor = peer.clone();
+        impostor.public_key = "22".repeat(32);
+        assert!(!may_still_control(&paths, &impostor));
+        // The pairing is removed while a conversation is open.
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.remove(&peer.id).unwrap();
+        assert!(!may_still_control(&paths, &peer));
+        // Paired again, but only for looking.
+        peer.permissions = vec![Permission::View];
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(!may_still_control(&paths, &peer));
     }
 
     #[test]

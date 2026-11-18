@@ -17,6 +17,9 @@ istesso-catalog = { path = "crates/istesso-catalog" }
 istesso-pair = { path = "crates/istesso-pair" }
 istesso-link = { path = "crates/istesso-link" }
 istesso-agent = { path = "crates/istesso-agent" }
+istesso-measure = { path = "crates/istesso-measure" }
+istesso-device-api = { path = "crates/istesso-device-api" }
+istesso-device-adapters = { path = "crates/istesso-device-adapters" }
 
 # Third-party crates. Every dependency must pass the licence allowlist in deny.toml.
 serde = { version = "1", features = ["derive"] }
@@ -40,7 +43,43 @@ if-addrs = "0.15"
 mdns-sd = { version = "0.21", default-features = false }
 unicode-width = "0.2"
 zeroize = "1"
+# Window and pixels for the test application (istesso-flash) only. X11 and Wayland are loaded at
+# run time, so building needs no system headers. No client-side decorations: inside the
+# streaming compositor the window is borderless, and elsewhere the window manager draws them.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+glutin = { version = "0.32", default-features = false, features = ["egl", "wayland", "x11"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland", "x11"] }
+glow = "0.18"
+# Device framework (ADR 0012). Reasons and licences are in docs/components.md.
+# Pinned: later 0.25 releases need a newer Rust than this workspace asks for.
+image = { version = "=0.25.6", default-features = false, features = ["jpeg"] }
+# No default features: the default Linux backend needs the system's libudev,
+# and the libusb backends would bring in LGPL code.
+hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev"] }
+# Only in tests of the device framework. Already in the tree through serde and clap.
+proc-macro2 = "1"
 
 [profile.release]
 lto = "thin"
 strip = true
+
+# Tests seal megabytes of frames. Unoptimised, the cipher alone keeps a processor busy for tens of
+# milliseconds a frame, and tests that run side by side then take the processors from each
+# other: bounds by the clock fail although nothing waits (docs/measurements/2026-11-17-tests-
+# that-fail-now-and-then.md). The cipher and what it is built on are compiled optimised in the
+# development and test profiles; everything of this project's own stays as the profile says.
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.universal-hash]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.aead]
+opt-level = 3
+[profile.dev.package.snow]
+opt-level = 3

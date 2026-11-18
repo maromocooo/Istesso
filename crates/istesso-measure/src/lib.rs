@@ -1,0 +1,49 @@
+//! Records and summarises latency measurements.
+//!
+//! The figure that decides M1 is the *added latency*: the time the relay puts
+//! between an input and the frame that reacts to it. `docs/measurements/README.md`
+//! defines it as
+//!
+//! ```text
+//! added latency = round trip - the application's own response time
+//! ```
+//!
+//! The round trip is measured on the client's clock (input sent, reacting
+//! frame shown) and the response time on the host's clock (input delivered,
+//! next frame committed). Each interval stays within one clock, so the clocks
+//! of the two machines never have to agree.
+//!
+//! This crate holds what every tool involved has to share: the clock
+//! ([`clock`]), the log format ([`record`]), the statistics ([`stats`]), the
+//! calculation ([`report`]), the spacing of inputs ([`jitter`]), the
+//! conventions of the test application ([`flash`]) and its pictures
+//! ([`picture`]), a first measurement that needs no video ([`probe`]), the
+//! comparison of a relayed window with a local one ([`compare`]) and of a
+//! relayed picture with the one that was sent ([`quality`]). It depends on
+//! neither a window system nor a media library.
+
+pub mod clock;
+pub mod compare;
+pub mod flash;
+pub mod jitter;
+pub mod picture;
+pub mod probe;
+pub mod quality;
+pub mod record;
+pub mod report;
+pub mod stats;
+
+pub use clock::Clock;
+pub use compare::{
+    Beats, Comparison, Gap, Standing, Steps, BEATS_JUDGED_FROM, BEAT_PARTS, LATE_SHARE_LIMIT,
+    LOCAL_DRIFT_LIMIT_MS, MEDIAN_BORDER_MS, PASS_LINE, VERDICT_SAMPLES,
+};
+pub use flash::{classify, FlashAck, FlashInput, Rgb, Shade, DEFAULT_FLASH_PORT};
+pub use jitter::Jitter;
+pub use probe::{probe, Answer, ProbeSample, ProbeSummary};
+pub use record::{
+    beat_shift_seed, client_samples, host_samples, read_log, sent_as_keys, ClientSample, Header,
+    HostSample, InputSource, LogError, LogWriter, Record, Side,
+};
+pub use report::{Report, MIN_SAMPLES};
+pub use stats::{percentile, table, Summary};

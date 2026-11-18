@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "ask": "where",
+      "kind": "build",
+      "task": "core",
+      "hosts": "hosts-two.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "build",
+      "task": "core",
+      "hosts": "hosts-three.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "build",
+      "task": "flash-build",
+      "hosts": "hosts-two.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "build",
+      "task": "flash-build",
+      "hosts": "hosts-three.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "run",
+      "task": "screen-probe",
+      "hosts": "hosts-two.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "run",
+      "task": "screen-probe",
+      "hosts": "hosts-three.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "run",
+      "task": "mac-host",
+      "hosts": "hosts-two.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "run",
+      "task": "mac-host",
+      "hosts": "hosts-three.json",
+      "code": 0,
+      "place": "mini"
+    },
+    {
+      "ask": "where",
+      "kind": "run",
+      "task": "linux-host",
+      "hosts": "hosts-two.json",
+      "code": 0,
+      "place": "tower"
+    },
+    {
+      "ask": "where",
+      "kind": "run",
+      "task": "linux-host",
+      "hosts": "hosts-three.json",
+      "code": 0,
+      "place": "tower"
+    },
+    {
+      "ask": "where",
+      "kind": "build",
+      "task": "apple-build",
+      "hosts": "hosts-two.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "where",
+      "kind": "build",
+      "task": "apple-build",
+      "hosts": "hosts-three.json",
+      "code": 0,
+      "place": "air"
+    },
+    {
+      "ask": "run",
+      "kind": "build",
+      "task": "windows-app",
+      "hosts": "hosts-two.json",
+      "code": 70,
+      "behaviour": "Does not run the task anywhere. Tells the person that no machine meets the needs and what each machine lacks."
+    },
+    {
+      "ask": "run",
+      "kind": "run",
+      "task": "linux-host",
+      "hosts": "hosts-tower-asleep.json",
+      "code": 71,
+      "behaviour": "Does not run the task anywhere else. Tells the person that tower is needed, does not answer, and can be woken over the network."
+    },
+    {
+      "ask": "run",
+      "kind": "deploy",
+      "task": "site",
+      "hosts": "hosts-three.json",
+      "code": 72,
+      "behaviour": "Does not run `istesso-route choose` by itself. Shows the person tower and mini and asks which one; runs `choose` only with the person's answer."
+    },
+    {
+      "ask": "run",
+      "kind": "build",
+      "task": "docs",
+      "hosts": "hosts-two.json",
+      "code": 73,
+      "behaviour": "Reads the message (there is no task `docs`) and tells the person; does not invent a task."
+    },
+    {
+      "ask": "run",
+      "kind": "build",
+      "task": "quantum",
+      "hosts": "hosts-two.json",
+      "code": 74,
+      "behaviour": "Does not run the task anyway. Tells the person the task states a need this version cannot decide on (roles: quantum)."
+    },
+    {
+      "ask": "run",
+      "kind": "run",
+      "task": "linux-host",
+      "hosts": "hosts-two.json",
+      "code": 75,
+      "behaviour": "Does not run it by other means (no ssh). Tells the person the task goes to tower and running on another machine is not built yet."
+    }
+  ]
+}

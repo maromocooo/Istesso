@@ -87,6 +87,8 @@ fn pair_on(bind: std::net::IpAddr, rights: Vec<Permission>, rules: Rules) -> Opt
         discovery: false,
         refresh_peers: None,
         verbose: false,
+        input_socket: None,
+        input_timings: None,
     };
     let sessions = Sessions::with(
         host.paths(),
@@ -930,6 +932,8 @@ fn with_programs_on_both_sides_a_session_is_left_come_back_to_and_closed() {
         discovery: false,
         refresh_peers: None,
         verbose: false,
+        input_socket: None,
+        input_timings: None,
     };
     let agent = Agent::bind(host.paths(), &options, log.clone())
         .unwrap()

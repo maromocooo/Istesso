@@ -15,6 +15,7 @@
 | `istesso hosts` | この PC とペアリング済みの全端末について、状態・役割・負荷・空きメモリを一覧する |
 | `istesso apps list` | この PC のアプリを一覧する。`--all` を付けると全端末を合わせ、アプリごとに1行へまとめる。応答しない端末にしかないアプリには `!` が付く |
 | `istesso peers list` / `remove` / `address` | 信頼している端末の一覧、失効、到達先アドレスの手動指定。`remove` は、その端末をすぐに切り、その端末がこの PC で開いたアプリを表示する（アプリは残る。`--close-apps` で、閉じるよう頼む） |
+| `istesso peers allow` / `deny` | 端末ごとの権限（閲覧、操作、インストール、USB、音）を与える、取り消す。新しくペアリングした端末は、閲覧と操作だけを持つ |
 | `istesso apps export` / `istesso apps merge` | 一覧をファイルで持ち寄って統合する（ネットワークを使わない方法） |
 | `istesso id` | この端末の名前と鍵の指紋、設定とキャッシュの場所 |
 | `istesso open <アプリ>` | アプリを開く。手元にあれば手元で起動する。ほかの端末にしかなければ、そこで起動して、手元に窓を出す。窓がなくなっても、アプリはその端末で動き続け、同じコマンドで戻れる（M3 の最初の一切れ。映像の経路がまだ入っていないので、ほかの端末のアプリは、試験用のランナーとビューアーでだけ動く。[ADR 0010](docs/adr/0010-session-start.md)） |
@@ -73,6 +74,7 @@ istesso apps list --all
 - [docs/components.md](docs/components.md)：部品の採否とライセンス
 - [docs/milestones.md](docs/milestones.md)：進め方
 - [docs/m1-plan.md](docs/m1-plan.md)：次の関門（遅延の検証）の手順
+- [docs/wifi.md](docs/wifi.md)：Wi-Fi で使うときの手引き
 - [docs/adr/](docs/adr/)：決定の記録
 
 ## 開発
@@ -83,9 +85,18 @@ cargo test -p istesso-agent -- --ignored      # LAN 内の発見。マルチキ�
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo deny check                         # cargo-deny が必要
+swift build --package-path macos/screen-probe   # Mac だけ。遅延の計測の道具
 ```
 
 コーディングエージェント向けの規約は [AGENTS.md](AGENTS.md) にあります。
+
+## 機器の対応
+
+Stream Deck などの機器には、機器ごとの部品（アダプター）で対応します。作者が実機で確かめるのは、作者が持っている機器だけです。ほかの機器は、使う人が自分のエージェントに作らせたプルリクエストで足せるようにします。
+
+**いまは、外からの機器のプルリクエストを受け付けていません。** アダプターのための口（インターフェース）を、まだ固めていないためです。固めたら、ここに手順を書きます（[ADR 0012](docs/adr/0012-device-framework.md)）。
+
+アダプターは、本体と一緒にコンパイルされるコードで、本体のほかの部分と同じに信頼されます。アダプターのソースを調べる検査は、確認を助けるためのもので、砂場ではありません。
 
 ## ライセンス
 
