@@ -33,16 +33,28 @@ static void expect(const char *what, const KeyChange *got, size_t count, const i
         expect(what, out, count, want, sizeof want / sizeof want[0]);    \
     } while (0)
 #define EXPECT_NOTHING(what, count) expect(what, out, count, NULL, 0)
+// A condition that must hold.
+#define CHECK(what, condition)                    \
+    do {                                          \
+        checks++;                                 \
+        if (!(condition)) {                       \
+            failures++;                           \
+            printf("FAILED: %s\n", what);         \
+        }                                         \
+    } while (0)
 
 enum {
     A = 0x00,
     COMMAND_KEY = 0x37,
     SHIFT_KEY = 0x38,
     CAPS = 0x39,
+    B = 0x0B,
+    RIGHT_COMMAND_KEY = 0x36,
     OPTION_KEY = 0x3A,
     CONTROL_KEY = 0x3B,
     RIGHT_SHIFT_KEY = 0x3C,
     RIGHT_OPTION_KEY = 0x3D,
+    RIGHT_CONTROL_KEY = 0x3E,
 };
 
 int main(void) {
@@ -262,6 +274,111 @@ int main(void) {
     EXPECT("back with Command and Shift held",
            keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_SHIFT | KEYS_DEVICE_RIGHT_SHIFT, out), 42, 29);
     EXPECT("the window lets them go", keys_let_go(&keys, out), -29, -42);
+
+    // Control with no key bit goes as left Control.
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    EXPECT("Control with no key bit goes as left Control", keys_flags_changed(&keys, CONTROL_KEY, KEYS_FLAG_CONTROL, out), 29);
+    EXPECT("and comes up", keys_flags_changed(&keys, CONTROL_KEY, 0, out), -29);
+    keys.command_is_control = false;
+    EXPECT("the same when Command goes as Super", keys_flags_changed(&keys, CONTROL_KEY, KEYS_FLAG_CONTROL, out), 29);
+    EXPECT("and comes up", keys_flags_changed(&keys, CONTROL_KEY, 0, out), -29);
+
+    // A stale modifier comes up before the ones lent to a key go down.
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    EXPECT("Option by hand", keys_flags_changed(&keys, OPTION_KEY, KEYS_FLAG_OPTION | KEYS_DEVICE_LEFT_OPTION, out), 56);
+    EXPECT("A with Shift's flag after Option's release was lost: Option up, Shift lent",
+           keys_key_down(&keys, A, KEYS_FLAG_SHIFT, false, out), -56, 42, 30, -42);
+    EXPECT("the letter comes up", keys_key_up(&keys, A, KEYS_FLAG_SHIFT, out), -30);
+
+    // Only the key itself makes a press to count.
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    size_t n;
+    keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out);
+    n = keys_key_down(&keys, A, KEYS_FLAG_SHIFT, false, out);
+    CHECK("a letter's press counts", keys_presses_key(&keys, A, out, n));
+    n = keys_key_down(&keys, A, 0, true, out);
+    EXPECT("a repeat after Shift's release was lost", n, -42);
+    CHECK("only lets Shift go and does not count", !keys_presses_key(&keys, A, out, n));
+    keys_key_up(&keys, A, 0, out);
+    n = keys_key_down(&keys, A, KEYS_FLAG_COMMAND, false, out);
+    CHECK("a hotkey counts once, the lent modifier not by itself", n == 4 && keys_presses_key(&keys, A, out, n));
+
+    // Around a button or a scroll.
+    size_t before = 0;
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    n = keys_around_pointer(&keys, KEYS_FLAG_COMMAND, false, false, out, &before);
+    EXPECT("a scroll over the window while another application is in front, Command held there: lent", n, 29, -29);
+    CHECK("  pressed before the scroll, let go after it", before == 1);
+    EXPECT_NOTHING("nothing stays down over there", keys_let_go(&keys, out));
+    n = keys_around_pointer(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_SHIFT, false, false, out, &before);
+    EXPECT("a Command-Shift click on it: both lent", n, 42, 29, -29, -42);
+    CHECK("  both before, both after", before == 2);
+    n = keys_around_pointer(&keys, KEYS_FLAG_COMMAND, true, false, out, &before);
+    EXPECT("the same in the window typed into: Command goes down and stays", n, 29);
+    CHECK("  before the click", before == 1);
+    n = keys_around_pointer(&keys, KEYS_FLAG_COMMAND, false, false, out, &before);
+    EXPECT_NOTHING("lent nothing when it is down already", n);
+    n = keys_around_pointer(&keys, 0, false, false, out, &before);
+    EXPECT("a stale one comes up before, typed into or not", n, -29);
+    CHECK("  before", before == 1);
+    n = keys_around_pointer(&keys, KEYS_FLAG_SHIFT, true, true, out, &before);
+    EXPECT_NOTHING("while the picture is being reconnected nothing goes down", n);
+    keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out);
+    n = keys_around_pointer(&keys, 0, false, true, out, &before);
+    EXPECT("but a stale one comes up", n, -42);
+    CHECK("  before", before == 1);
+
+    // A pointer's move only lets go, and sends nothing when all is in line.
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    EXPECT_NOTHING("a move with Shift held and not down over there presses nothing", keys_releases(&keys, KEYS_FLAG_SHIFT, out));
+    keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out);
+    EXPECT_NOTHING("a move with Shift held and down over there: nothing", keys_releases(&keys, KEYS_FLAG_SHIFT, out));
+    EXPECT("a move after Shift's release went to Spotlight lets it go", keys_releases(&keys, 0, out), -42);
+    EXPECT_NOTHING("and the next move sends nothing", keys_releases(&keys, 0, out));
+
+    // Left as they are (written down in ADR 0007):
+    // A program's hotkey that carries only Command lets go of a Shift held by hand; the next keys
+    // under that Shift borrow it, until a click or a scroll presses it for good.
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    EXPECT("Shift by hand", keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out), 42);
+    EXPECT("a program's Command-A with only Command's flag lets Shift go",
+           keys_key_down(&keys, A, KEYS_FLAG_COMMAND, false, out), -42, 29, 30, -30, -29);
+    EXPECT("B under the Shift still held borrows it", keys_key_down(&keys, B, KEYS_FLAG_SHIFT, false, out), 42, 48, -42);
+    n = keys_around_pointer(&keys, KEYS_FLAG_SHIFT, true, false, out, &before);
+    EXPECT("a click presses it for good", n, 42);
+    keys_let_go(&keys, out);
+    // A borrowed Shift is up again while the letter is held: the other side repeats it without.
+    EXPECT("A with Shift's flag and its press lost", keys_key_down(&keys, A, KEYS_FLAG_SHIFT, false, out), 42, 30, -42);
+    keys_let_go(&keys, out);
+    // Command as Control and Control by hand are one key over there: the side can come out
+    // wrong, nothing stays down.
+    EXPECT("right Control", keys_flags_changed(&keys, RIGHT_CONTROL_KEY, KEYS_FLAG_CONTROL | KEYS_DEVICE_RIGHT_CONTROL, out), 97);
+    EXPECT("left Command",
+           keys_flags_changed(&keys, COMMAND_KEY,
+                              KEYS_FLAG_CONTROL | KEYS_FLAG_COMMAND | KEYS_DEVICE_RIGHT_CONTROL | KEYS_DEVICE_LEFT_COMMAND, out),
+           29);
+    EXPECT_NOTHING("left Command up, right Control held: left Control stays",
+                   keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_CONTROL | KEYS_DEVICE_RIGHT_CONTROL, out));
+    EXPECT("right Control up: both", keys_flags_changed(&keys, RIGHT_CONTROL_KEY, 0, out), -29, -97);
+    keys_flags_changed(&keys, CONTROL_KEY, KEYS_FLAG_CONTROL | KEYS_DEVICE_LEFT_CONTROL, out);
+    keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_CONTROL | KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_CONTROL | KEYS_DEVICE_LEFT_COMMAND, out);
+    EXPECT("left Control, left and right Command",
+           keys_flags_changed(&keys, RIGHT_COMMAND_KEY,
+                              KEYS_FLAG_CONTROL | KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_CONTROL | KEYS_DEVICE_LEFT_COMMAND
+                                  | KEYS_DEVICE_RIGHT_COMMAND,
+                              out),
+           97);
+    EXPECT("left Command up: left Control comes up while it is held, right stays",
+           keys_flags_changed(&keys, COMMAND_KEY,
+                              KEYS_FLAG_CONTROL | KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_CONTROL | KEYS_DEVICE_RIGHT_COMMAND, out),
+           -29);
+    EXPECT("all let go", keys_flags_changed(&keys, CONTROL_KEY, 0, out), -97);
 
     if (failures == 0) {
         printf("keys: all %d checks passed\n", checks);

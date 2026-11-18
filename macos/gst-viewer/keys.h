@@ -14,10 +14,12 @@
 // - Which of the two keys of a modifier is down comes in bits of their own. An event that has the
 //   modifier's flag and neither of those bits still means the modifier is down: it goes over as
 //   its left key.
-// - Every key, button and scroll that is sent first brings the modifiers over there in line with
-//   the event's flags: one that is down over there and not held any more comes up; for a button or
-//   a scroll, one that is held and not down over there goes down (its left key). An event of a
-//   modifier that was lost (it went to another application, say) is made good by the next one.
+// - Every key, modifier, button and scroll that is sent first brings the modifiers over there in
+//   line with the event's flags: one that is down over there and not held any more comes up; for a
+//   modifier's own event, a button or a scroll, one that is held and not down over there goes down
+//   (its left key; lent around the button or scroll when the window is not the one typed into).
+//   A pointer's move only lets go (keys_releases()). An event of a modifier that was lost (it went
+//   to another application, say) is made good by the next one of these.
 // - When the window stops being the one typed into, every key down over there comes up
 //   (keys_let_go()); when it is that window again, the modifiers held at that moment go down
 //   (keys_fall_in_line()).
@@ -147,11 +149,42 @@ static inline size_t keys_line_up(Keys *keys, unsigned long flags, bool press, u
     return count;
 }
 
+// Only the modifiers that are down over there and not held any more come up (whichever of their
+// keys is down). Nothing goes down. Adds to `out` from `count` (at most 8 changes).
+static inline size_t keys_releases(Keys *keys, unsigned long flags, KeyChange *out) {
+    return keys_line_up(keys, flags, false, 0, out, 0);
+}
+
+// Lends the modifiers that `flags` hold and that have neither key down over there: their left keys
+// go down, and are noted in `lent` (4 places) to be given back by keys_give_back().
+static inline size_t keys_lend(Keys *keys, unsigned long flags, unsigned lent[4], KeyChange *out, size_t count) {
+    KeysModifier modifiers[4];
+    keys_modifiers(keys, flags, modifiers);
+    for (int i = 0; i < 4; i++) {
+        lent[i] = 0;
+        if (modifiers[i].held && !keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
+            lent[i] = modifiers[i].left;
+            count = keys_set(keys, lent[i], true, out, count);
+        }
+    }
+    return count;
+}
+
+// The lent modifiers come up again, in the reverse order.
+static inline size_t keys_give_back(Keys *keys, const unsigned lent[4], KeyChange *out, size_t count) {
+    for (int i = 3; i >= 0; i--) {
+        if (lent[i] != 0) {
+            count = keys_set(keys, lent[i], false, out, count);
+        }
+    }
+    return count;
+}
+
 // A key went down while the event's flags say which modifiers are held. `out` has room for
 // KEYS_MOST changes; returns how many there are. A modifier that is down over there and not held
 // any more comes up first; one that is held and not down over there is lent to the key.
 static inline size_t keys_key_down(Keys *keys, unsigned short key, unsigned long flags, bool repeat, KeyChange *out) {
-    size_t count = keys_line_up(keys, flags, false, 0, out, 0);
+    size_t count = keys_releases(keys, flags, out);
     unsigned code = keys_code(keys, key);
     if (code == 0) {
         return count;
@@ -161,30 +194,59 @@ static inline size_t keys_key_down(Keys *keys, unsigned short key, unsigned long
         // The application on the other side repeats a held key itself.
         return count;
     }
-    KeysModifier modifiers[4];
-    keys_modifiers(keys, flags, modifiers);
-    unsigned lent[4] = {0, 0, 0, 0};
-    for (int i = 0; i < 4; i++) {
-        if (modifiers[i].held && !keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
-            lent[i] = modifiers[i].left;
-            count = keys_set(keys, lent[i], true, out, count);
-        }
-    }
+    unsigned lent[4];
+    count = keys_lend(keys, flags, lent, out, count);
     count = keys_set(keys, code, true, out, count);
     if (command) {
         count = keys_set(keys, code, false, out, count);
     }
-    for (int i = 3; i >= 0; i--) {
-        if (lent[i] != 0) {
-            count = keys_set(keys, lent[i], false, out, count);
+    return keys_give_back(keys, lent, out, count);
+}
+
+// Whether the key itself went down among what a key press caused: a press to count as one.
+// Modifiers that came up or were lent around it do not count by themselves.
+static inline bool keys_presses_key(const Keys *keys, unsigned short key, const KeyChange *out, size_t count) {
+    unsigned code = keys_code(keys, key);
+    for (size_t i = 0; i < count; i++) {
+        if (code != 0 && out[i].code == code && out[i].pressed) {
+            return true;
         }
     }
-    return count;
+    return false;
+}
+
+// Around a button or a scroll. The modifiers over there are brought in line with the event's
+// flags. One that is down over there and not held comes up before. One that is held and not down
+// over there:
+// - when this window is the one typed into (`typed_into`: the key window of the active
+//   application), goes down before and stays down: its release comes to this window;
+// - when it is not (macOS sends scrolls, and clicks that also activate, to the window under the
+//   pointer), is lent: down before, up after, because its release would go to another
+//   application and nothing would bring it up over there.
+// With `held_back` (the picture is being reconnected) nothing goes down: only releases.
+// The changes to send before the button or scroll are the first `*before` of `out`; the rest are
+// sent after it. Returns how many there are in all (at most 16).
+static inline size_t keys_around_pointer(Keys *keys, unsigned long flags, bool typed_into, bool held_back, KeyChange *out,
+                                         size_t *before) {
+    size_t count = keys_releases(keys, flags, out);
+    if (held_back) {
+        *before = count;
+        return count;
+    }
+    if (typed_into) {
+        count = keys_line_up(keys, flags, true, 0, out, count);
+        *before = count;
+        return count;
+    }
+    unsigned lent[4];
+    count = keys_lend(keys, flags, lent, out, count);
+    *before = count;
+    return keys_give_back(keys, lent, out, count);
 }
 
 // A key came up. A modifier that is down over there and not held any more comes up first.
 static inline size_t keys_key_up(Keys *keys, unsigned short key, unsigned long flags, KeyChange *out) {
-    size_t count = keys_line_up(keys, flags, false, 0, out, 0);
+    size_t count = keys_releases(keys, flags, out);
     return keys_set(keys, keys_code(keys, key), false, out, count);
 }
 
@@ -278,8 +340,8 @@ static inline size_t keys_hold_back(Keys *keys, KeyChange *out, size_t count, bo
 // The modifiers on the other side are brought in line with the ones held on this keyboard now
 // (`flags` as an event has them): one that is held and is not down over there goes down (its left
 // key), one that is down over there and is not held comes up. Other keys are left as they are:
-// pressing a letter again would type it. Called when the picture is back, when the window is the
-// one typed into again, and before a button or a scroll is sent. `out` has room for 8 changes.
+// pressing a letter again would type it. Called when the picture is back and when the window is
+// the one typed into again, both only while it is the one typed into. `out` has room for 8 changes.
 static inline size_t keys_fall_in_line(Keys *keys, unsigned long flags, KeyChange *out) {
     return keys_line_up(keys, flags, true, 0, out, 0);
 }
