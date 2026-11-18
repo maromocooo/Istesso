@@ -49,8 +49,9 @@ What it changes:
 - No application takes the keyboard without the person doing something in it. A new window
   takes the keyboard when it is shown only when nothing has the keyboard or its own
   application has it (a second window, a dialog; a parent is always of the same
-  application). A window of another application is shown just below the window that has the
-  keyboard, so that it covers nothing in use, and is marked as wanting attention (see 3).
+  application). A window of another application is shown on top all the same, so that it
+  is not lost behind, but without the keyboard, and is marked as wanting attention (see 3);
+  a click in it gives it the keyboard.
 - A popup that asks for a grab (a menu) takes the keyboard only when the window it belongs
   to has the keyboard and the grab names a recent key or button event that went to its
   application (the click that opened the menu), or when it opens from a popup of that window
@@ -73,10 +74,12 @@ new size of the output leaves only the window with the keyboard active, and a wi
 gets the keyboard back after it was told it was inactive before; a window that moves under the
 pointer is told where the pointer lies in it; Ctrl+Shift+Tab with a US keymap leaves the
 keyboard where it is; a window is told it is active only with the keyboard (not in its
-first configure); a window of another application does not take the keyboard nor cover the
-window in use, and is marked; a popup is dismissed when its window has no keyboard or the
-grab names no input of its application, and takes the keyboard when it answers a click, its
-window staying the active one.
+first configure); a window of another application is shown on top without the keyboard
+and is marked, the mark is told with the windows and goes with a click in it; a second
+window and a dialog of the application in use take the keyboard as before, unmarked; a
+popup is dismissed when its window has no keyboard or the grab names no input of its
+application, and takes the keyboard when it answers a click, its window staying the active
+one.
 
 2. Maximized, not fullscreen
 
@@ -135,9 +138,11 @@ What it changes:
   application a person is using asks, as the answer to something the person did in it. A
   token handed to another process (a link opened in a browser started from it) does not
   move the keyboard. Any other request moves nothing, neither the keyboard nor the stack:
-  the window is only marked as wanting attention, unless it has the keyboard already (a
-  mark nothing shows yet, to be carried to the viewer; it goes when the window gets the
-  keyboard). A token counts for 10 seconds and once; a client holds at most 32 unused
+  the window is only marked as wanting attention, unless it has the keyboard already. The
+  mark goes when the window gets the keyboard. Each change of a mark is written to the log
+  (one line with the application's id), and the number of windows that want attention goes
+  out with the number of windows: the `wayland.windows` message of the windows patch has a
+  field `attention` next to `count` (the viewer does not show it yet). A token counts for 10 seconds and once; a client holds at most 32 unused
   tokens; tokens are let go after their lifetime whenever one is made or used. A request
   with a token that was not kept, or has been let go, never reaches the compositor's
   handler (Smithay drops it): it marks nothing. A request for a window that is not shown
@@ -170,8 +175,31 @@ Known limits:
 - `xdg_toplevel.unset_maximized` of the first window is answered with the same size: it stays
   maximized.
 
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index a5cb4ec..5dafbc7 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -68,14 +68,16 @@ pub struct State {
+ 
+ /// Posts the number of windows (toplevels) the clients have as an application message on the
+ /// element's bus: the structure `wayland.windows` with a `count`. 0 says that the last window
+-/// has gone.
++/// has gone. `attention` is how many of them want attention: their application asked for
++/// them to come forward, or they came, while another application had the keyboard.
+ fn window_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddisplaycore::WindowSink {
+-    Box::new(move |windows| {
++    Box::new(move |windows, attention| {
+         let Some(element) = element.upgrade() else {
+             return;
+         };
+         let structure = Structure::builder("wayland.windows")
+             .field("count", windows as u32)
++            .field("attention", attention as u32)
+             .build();
+         let message = Application::builder(structure).src(&element).build();
+         if let Err(err) = element.post_message(message) {
 diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
-index ce1ce1a..381df68 100644
+index ce1ce1a..4e25c21 100644
 --- a/wayland-display-core/src/comp/input.rs
 +++ b/wayland-display-core/src/comp/input.rs
 @@ -19,7 +19,7 @@ use smithay::{
@@ -295,7 +323,7 @@ index ce1ce1a..381df68 100644
          pointer.motion(
              self,
              under,
-@@ -270,6 +304,38 @@ impl State {
+@@ -270,6 +304,43 @@ impl State {
          pointer.frame(self);
      }
  
@@ -316,12 +344,13 @@ index ce1ce1a..381df68 100644
 +            Some(FocusTarget::Popup(p)) => smithay::desktop::find_popup_root_surface(p).ok(),
 +            None => None,
 +        };
++        let mut active_window = None;
 +        for window in self.space.elements() {
 +            let active = active_surface.is_some()
 +                && window.wl_surface().map(|s| s.into_owned()) == active_surface;
 +            window.set_activated(active);
 +            if active {
-+                crate::comp::windows::set_wants_attention(window, false);
++                active_window = Some(window.clone());
 +            }
 +            if let Some(toplevel) = window.toplevel() {
 +                if toplevel.is_initial_configure_sent() {
@@ -329,12 +358,16 @@ index ce1ce1a..381df68 100644
 +                }
 +            }
 +        }
++        // A window that wanted attention has it now.
++        if let Some(window) = active_window {
++            self.mark_wants_attention(&window, false);
++        }
 +    }
 +
      pub fn set_pointer_location(&mut self, location: Point<f64, Logical>) {
          self.pointer_location = location;
          self.pointer_absolute_location = location;
-@@ -297,9 +363,31 @@ impl State {
+@@ -297,9 +368,31 @@ impl State {
          let serial = SERIAL_COUNTER.next_serial();
  
          if ButtonState::Pressed == state {
@@ -367,7 +400,7 @@ index ce1ce1a..381df68 100644
          pointer.button(
              self,
              &ButtonEvent {
-@@ -558,7 +646,9 @@ impl State {
+@@ -558,7 +651,9 @@ impl State {
          pos
      }
  
@@ -378,7 +411,7 @@ index ce1ce1a..381df68 100644
          let pointer = self.seat.get_pointer().unwrap();
          let keyboard = self.seat.get_keyboard().unwrap();
          // change the keyboard focus unless the pointer or keyboard is grabbed
-@@ -576,13 +666,20 @@ impl State {
+@@ -576,13 +671,20 @@ impl State {
                  .element_under(self.pointer_location)
                  .map(|(w, p)| (w.clone(), p))
              {
@@ -403,7 +436,7 @@ index ce1ce1a..381df68 100644
  }
  
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 68e95df..cf16780 100644
+index 68e95df..f010b6a 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
 @@ -58,6 +58,7 @@ use smithay::{
@@ -499,7 +532,7 @@ index 68e95df..cf16780 100644
  /// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
  /// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
  /// frame no longer counts.
-@@ -457,8 +497,123 @@ impl State {
+@@ -457,8 +497,102 @@ impl State {
          }
      }
  
@@ -580,27 +613,6 @@ index 68e95df..cf16780 100644
 +        of_window.is_some() && client_of_focus(focus.as_ref()) == of_window
 +    }
 +
-+    /// Maps a new window just below the window that has the keyboard (and below whatever lay
-+    /// above that), so that it covers nothing the person is using.
-+    pub(crate) fn map_below_the_window_in_use(&mut self, window: &Window, at: Point<i32, Logical>) {
-+        use smithay::wayland::seat::WaylandFocus;
-+        let in_use = match self.seat.get_keyboard().unwrap().current_focus() {
-+            Some(FocusTarget::Wayland(w)) => w.wl_surface().map(|s| s.into_owned()),
-+            Some(FocusTarget::Popup(p)) => smithay::desktop::find_popup_root_surface(&p).ok(),
-+            None => None,
-+        };
-+        let from_in_use: Vec<Window> = self
-+            .space
-+            .elements()
-+            .skip_while(|w| w.wl_surface().map(|s| s.into_owned()) != in_use)
-+            .cloned()
-+            .collect();
-+        self.space.map_element(window.clone(), at, false);
-+        for w in from_in_use {
-+            self.space.raise_element(&w, false);
-+        }
-+    }
-+
 +    /// Puts a shown window at `at` and leaves the order of the windows as it was (a space
 +    /// puts a window it maps on top: the windows that were above it are put back above it).
 +    pub(crate) fn move_window(&mut self, window: &Window, at: Point<i32, Logical>) {
@@ -624,7 +636,7 @@ index 68e95df..cf16780 100644
      pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
          use smithay::wayland::seat::WaylandFocus;
          let parent = window
-@@ -479,9 +634,58 @@ impl State {
+@@ -479,9 +613,58 @@ impl State {
              .and_then(|output| output.current_mode())
              .map(|mode| mode.size.to_logical(1))
              .unwrap_or_default();
@@ -683,7 +695,7 @@ index 68e95df..cf16780 100644
      /// Gives the keyboard to the window that is on top, when the window that had it is not
      /// shown any more or nothing has it. A dialog that closes hands the keyboard back to the
      /// window under it this way.
-@@ -523,7 +727,7 @@ impl State {
+@@ -523,7 +706,7 @@ impl State {
              .cloned()
              .collect();
          for child in children {
@@ -692,8 +704,46 @@ index 68e95df..cf16780 100644
              self.raise_children_of(&child);
          }
      }
+@@ -552,8 +735,36 @@ impl State {
+                 .iter()
+                 .filter(|window| window.alive() && Some(*window) != gone)
+                 .count();
+-            self.window_report.tell(windows);
++            let wanting_attention = self
++                .space
++                .elements()
++                .filter(|w| w.toplevel() != gone && windows::wants_attention(w))
++                .count();
++            self.window_report.tell(windows, wanting_attention);
++        }
++    }
++
++    /// Marks a window as wanting attention, or takes the mark off. A change is written to the
++    /// log (one line, with the application's id) and told with the number of windows.
++    pub(crate) fn mark_wants_attention(&mut self, window: &Window, wants: bool) {
++        if windows::wants_attention(window) == wants {
++            return;
+         }
++        windows::set_wants_attention(window, wants);
++        let app_id = window.toplevel().and_then(|toplevel| {
++            with_states(toplevel.wl_surface(), |states| {
++                states
++                    .data_map
++                    .get::<XdgToplevelSurfaceData>()
++                    .and_then(|data| data.lock().unwrap().app_id.clone())
++            })
++        });
++        tracing::info!(
++            app_id = app_id.as_deref().unwrap_or("-"),
++            wants_attention = wants,
++            "window attention"
++        );
++        self.tell_windows(None);
+     }
+ 
+     /// Tells `sink` how many windows there are, now and whenever that changes; with `None`,
 diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
-index 7813b6f..2b452fb 100644
+index 7813b6f..9a106ae 100644
 --- a/wayland-display-core/src/comp/windows.rs
 +++ b/wayland-display-core/src/comp/windows.rs
 @@ -13,10 +13,11 @@
@@ -712,15 +762,18 @@ index 7813b6f..2b452fb 100644
  //! until it goes.
  
  use smithay::utils::{Logical, Point, Rectangle, Size};
-@@ -43,6 +44,126 @@ pub fn place(
+@@ -43,14 +44,136 @@ pub fn place(
          .into()
  }
  
+-/// Receives the number of windows whenever it changes. Called on the compositor's thread.
+-pub type WindowSink = Box<dyn Fn(usize) + Send>;
 +/// Marks a window without a parent that was not made as large as the output when it came
 +/// (it came while another filled the output, or it has a largest size): it is not made so
 +/// when it leaves fullscreen or maximized.
 +pub struct KeepsItsOwnSize;
-+
+ 
+-/// Tells a sink how many windows there are, and only when that is not what it was told last.
 +/// How many of the last key and button events are kept: enough that fast typing does not
 +/// push a click out within [`RECENT`].
 +const EVENTS_KEPT: usize = 64;
@@ -780,8 +833,10 @@ index 7813b6f..2b452fb 100644
 +    }
 +}
 +
-+/// Marks a window whose application asked for it to come forward and was not let: it wants
-+/// attention. Nothing shows the mark yet; it is there to be carried to the viewer.
++/// Marks a window that wants attention: its application asked for it to come forward and
++/// was not let, or it came while another application had the keyboard. The number of such
++/// windows goes out with the number of windows (`WindowReport`); the viewer does not show it
++/// yet. Set it through `State::mark_wants_attention`, which also tells it.
 +struct WantsAttention(std::cell::Cell<bool>);
 +
 +/// Sets or clears the mark of a window that wants attention.
@@ -794,9 +849,7 @@ index 7813b6f..2b452fb 100644
 +    }
 +}
 +
-+/// Whether a window wants attention (see [`set_wants_attention`]). Read by the tests until
-+/// something carries the mark to the viewer.
-+#[cfg_attr(not(test), allow(dead_code))]
++/// Whether a window wants attention (see [`set_wants_attention`]).
 +pub fn wants_attention(window: &smithay::desktop::Window) -> bool {
 +    window
 +        .user_data()
@@ -836,10 +889,42 @@ index 7813b6f..2b452fb 100644
 +    (keep(output.w, max.w), keep(output.h, max.h)).into()
 +}
 +
- /// Receives the number of windows whenever it changes. Called on the compositor's thread.
- pub type WindowSink = Box<dyn Fn(usize) + Send>;
++/// Receives the number of windows, and how many of them want attention (see
++/// [`set_wants_attention`]), whenever that changes. Called on the compositor's thread.
++pub type WindowSink = Box<dyn Fn(usize, usize) + Send>;
++
++/// Tells a sink how many windows there are and how many want attention, and only when that
++/// is not what it was told last.
+ #[derive(Default)]
+ pub struct WindowReport {
+     sink: Option<WindowSink>,
+-    last: Option<usize>,
++    last: Option<(usize, usize)>,
+ }
  
-@@ -104,6 +225,41 @@ mod tests {
+ impl WindowReport {
+@@ -64,14 +187,15 @@ impl WindowReport {
+         self.sink.is_some()
+     }
+ 
+-    /// Tells the sink the number of windows, unless that is what it was told last.
+-    pub fn tell(&mut self, windows: usize) {
++    /// Tells the sink the number of windows and of those that want attention, unless that is
++    /// what it was told last.
++    pub fn tell(&mut self, windows: usize, wanting_attention: usize) {
+         let Some(sink) = &self.sink else {
+             return;
+         };
+-        if self.last != Some(windows) {
+-            sink(windows);
+-            self.last = Some(windows);
++        if self.last != Some((windows, wanting_attention)) {
++            sink(windows, wanting_attention);
++            self.last = Some((windows, wanting_attention));
+         }
+     }
+ }
+@@ -104,6 +228,41 @@ mod tests {
          assert_eq!((at.x, at.y), (0, 0));
      }
  
@@ -881,6 +966,59 @@ index 7813b6f..2b452fb 100644
      #[test]
      fn a_window_without_a_parent_is_put_at_the_corner() {
          let at = place((400, 300).into(), None, (1720, 720).into());
+@@ -112,27 +271,41 @@ mod tests {
+ 
+     #[test]
+     fn a_sink_is_told_a_change_once_and_a_new_sink_is_told_what_is() {
+-        let told = Arc::new(Mutex::new(Vec::new()));
+-        let sink = |told: &Arc<Mutex<Vec<usize>>>| -> WindowSink {
++        type Told = Arc<Mutex<Vec<(usize, usize)>>>;
++        let told = Told::default();
++        let sink = |told: &Told| -> WindowSink {
+             let told = told.clone();
+-            Box::new(move |windows| told.lock().unwrap().push(windows))
++            Box::new(move |windows, attention| told.lock().unwrap().push((windows, attention)))
+         };
+         let mut report = WindowReport::default();
+-        report.tell(1);
++        report.tell(1, 0);
+         assert!(!report.listening());
+ 
+         report.set_sink(Some(sink(&told)));
+-        for windows in [0, 0, 1, 1, 2, 1, 0, 0] {
+-            report.tell(windows);
++        for (windows, attention) in [
++            (0, 0),
++            (0, 0),
++            (1, 0),
++            (1, 0),
++            (2, 0),
++            (2, 1),
++            (2, 1),
++            (1, 0),
++            (0, 0),
++        ] {
++            report.tell(windows, attention);
+         }
+-        assert_eq!(*told.lock().unwrap(), [0, 1, 2, 1, 0]);
++        assert_eq!(
++            *told.lock().unwrap(),
++            [(0, 0), (1, 0), (2, 0), (2, 1), (1, 0), (0, 0)]
++        );
+ 
+-        let other = Arc::new(Mutex::new(Vec::new()));
++        let other = Told::default();
+         report.set_sink(Some(sink(&other)));
+-        report.tell(0);
+-        assert_eq!(*other.lock().unwrap(), [0]);
++        report.tell(0, 0);
++        assert_eq!(*other.lock().unwrap(), [(0, 0)]);
+         report.set_sink(None);
+-        report.tell(3);
++        report.tell(3, 0);
+         assert_eq!(other.lock().unwrap().len(), 1);
+     }
+ }
 diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
 index d552363..053cd06 100644
 --- a/wayland-display-core/src/tests/client.rs
@@ -1497,10 +1635,10 @@ index e64aad8..55a0b19 100644
      assert_eq!(stack[0], first);
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
-index 0000000..a8fe4b5
+index 0000000..5ab19a2
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_windows.rs
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,598 @@
 +//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
 +//! window, the one a person sees under the pointer; a window is told to be maximized, not
 +//! fullscreen, unless it asks; a second window keeps its own size and is not lost under the
@@ -1929,8 +2067,16 @@ index 0000000..a8fe4b5
 +}
 +
 +#[test]
-+fn a_window_of_another_application_does_not_take_the_keyboard_nor_cover_the_one_in_use() {
++fn a_window_of_another_application_is_shown_on_top_without_the_keyboard_and_wants_attention() {
 +    let mut f = fixture();
++    let told: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> = Default::default();
++    {
++        let told = told.clone();
++        f.server
++            .set_window_sink(Some(Box::new(move |windows, attention| {
++                told.lock().unwrap().push((windows, attention))
++            })));
++    }
 +    let in_use = f.server.space.elements().next().cloned().unwrap();
 +    // A second application maps a window while the first has the keyboard.
 +    let mut other = f.another_client();
@@ -1941,13 +2087,45 @@ index 0000000..a8fe4b5
 +    f.round_trip_with(&mut other);
 +    let stack: Vec<_> = f.server.space.elements().cloned().collect();
 +    assert_eq!(stack.len(), 2);
-+    // It lies below the window in use, without the keyboard, never told it is active, and
-+    // marked as wanting attention.
-+    assert_eq!(stack.last(), Some(&in_use));
++    let theirs = stack[1].clone();
++    // It is on top, so that it is not lost, but without the keyboard, never told it is
++    // active, and marked as wanting attention; the mark is told with the windows.
++    assert_ne!(theirs, in_use);
 +    assert_eq!(keyboard_in(&f, &in_use), (true, false));
 +    assert!(!other.told_active(0));
 +    assert!(f.client.told_active(0));
-+    assert!(crate::comp::windows::wants_attention(&stack[0]));
++    assert!(crate::comp::windows::wants_attention(&theirs));
++    assert_eq!(told.lock().unwrap().last(), Some(&(2, 1)));
++    // A click in it gives it the keyboard, and takes the mark off.
++    click(&mut f);
++    f.round_trip_with(&mut other);
++    assert_eq!(keyboard_in(&f, &theirs), (true, false));
++    assert!(other.told_active(0));
++    assert!(!f.client.told_active(0));
++    assert!(!crate::comp::windows::wants_attention(&theirs));
++    assert_eq!(told.lock().unwrap().last(), Some(&(2, 0)));
++}
++
++#[test]
++fn a_new_window_of_the_application_in_use_takes_the_keyboard_as_before() {
++    // A second window, and a dialog, of the application that has the keyboard: each takes
++    // the keyboard when it is shown, and nothing is marked.
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    f.client.create_child_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour((60, 40), WHITE);
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(f.client.keyboard_window(), Some(2));
++    assert!(f.client.told_active(2));
++    assert!(
++        !f.server
++            .space
++            .elements()
++            .any(crate::comp::windows::wants_attention)
++    );
 +}
 +
 +#[test]
@@ -1973,8 +2151,12 @@ index 0000000..a8fe4b5
 +    assert!(f.client.popup_dismissed(popup));
 +    assert_eq!(keyboard_in(&f, &in_use), (true, false));
 +
-+    // The same, as the answer to a click in its window: the menu has the keyboard, and its
-+    // window stays the active one.
++    // The same, as the answer to a click in its window (beside the other application's
++    // window, which lies on top in the middle): the menu has the keyboard, and its window
++    // stays the active one.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
 +    click(&mut f);
 +    let serial = f.client.last_button_serial();
 +    let popup = f.client.open_popup(0, serial);
@@ -2002,8 +2184,11 @@ index 0000000..a8fe4b5
 +        .find(|w| **w != in_use)
 +        .cloned()
 +        .unwrap();
-+    // The application in use makes a token as the answer to a click, and hands it on; the
-+    // other uses it for its own window.
++    // The application in use makes a token as the answer to a click (beside the other
++    // application's window), and hands it on; the other uses it for its own window.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
 +    click(&mut f);
 +    let serial = f.client.last_button_serial();
 +    f.client.ask_for_an_activation_token(serial);
@@ -2052,8 +2237,21 @@ index 0000000..a8fe4b5
 +    // Shown, it has the keyboard, and is told so.
 +    assert!(f.client.told_active(0));
 +}
+diff --git a/wayland-display-core/src/tests/test_windows.rs b/wayland-display-core/src/tests/test_windows.rs
+index 8d177dc..8c33648 100644
+--- a/wayland-display-core/src/tests/test_windows.rs
++++ b/wayland-display-core/src/tests/test_windows.rs
+@@ -13,7 +13,7 @@ fn listen(f: &mut Fixture) -> Told {
+     let told = Told::default();
+     let sink: WindowSink = {
+         let told = told.clone();
+-        Box::new(move |windows| told.lock().unwrap().push(windows))
++        Box::new(move |windows, _| told.lock().unwrap().push(windows))
+     };
+     f.server.set_window_sink(Some(sink));
+     told
 diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
-index 595d547..142c6ee 100644
+index 595d547..dc1da5a 100644
 --- a/wayland-display-core/src/wayland/handlers/compositor.rs
 +++ b/wayland-display-core/src/wayland/handlers/compositor.rs
 @@ -42,12 +42,26 @@ impl CompositorHandler for State {
@@ -2174,11 +2372,11 @@ index 595d547..142c6ee 100644
 +                        SERIAL_COUNTER.next_serial(),
 +                    );
 +                } else {
-+                    // Another application has the keyboard: the new window does not take it,
-+                    // and does not cover the window in use (it goes just below it), and is
-+                    // marked as wanting attention.
-+                    self.map_below_the_window_in_use(&window, loc);
-+                    crate::comp::windows::set_wants_attention(&window, true);
++                    // Another application has the keyboard: the new window does not take it.
++                    // It is shown on top all the same, so that it is not lost behind, and is
++                    // marked as wanting attention; a click in it gives it the keyboard.
++                    self.space.map_element(window.clone(), loc, false);
++                    self.mark_wants_attention(&window, true);
 +                }
                  // If it has come up over another window and under the pointer, the pointer is
                  // its own. (A first window is left as it was: it has the pointer from the
@@ -2341,10 +2539,10 @@ index 4931ed6..19cfe71 100644
              return;
 diff --git a/wayland-display-core/src/wayland/handlers/xdg_activation.rs b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
 new file mode 100644
-index 0000000..0dc70da
+index 0000000..4072a6a
 --- /dev/null
 +++ b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,118 @@
 +use smithay::{
 +    delegate_xdg_activation,
 +    input::Seat,
@@ -2357,7 +2555,7 @@ index 0000000..0dc70da
 +    },
 +};
 +
-+use crate::comp::{FocusTarget, State, client_of_focus, windows};
++use crate::comp::{FocusTarget, State, client_of_focus};
 +
 +/// How long a token is good for: an application asks for a window to come forward right
 +/// after a person did something in it (a click on a link, a menu item).
@@ -2430,10 +2628,7 @@ index 0000000..0dc70da
 +                Some(FocusTarget::Wayland(w)) if w == window
 +            );
 +            if !has_the_keyboard {
-+                windows::set_wants_attention(&window, true);
-+                tracing::info!(
-+                    "a window asked to come forward and was not let: it wants attention"
-+                );
++                self.mark_wants_attention(&window, true);
 +            }
 +        }
 +    }
