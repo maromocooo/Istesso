@@ -731,6 +731,7 @@ take_turn
 signal_busy && { echo "host: a latency measurement is running: nothing is started"; exit 3; }
 [ -e "$plugin/libgstwaylanddisplaysrc.so" ] || { echo "host: the compositor plugin is not in $plugin (scripts/daily.sh setup)"; exit 1; }
 [ -x "$src/target/release/istesso" ] && [ -e "$src/target/release/libistesso_media.so" ] || { echo "host: the trial's copy is not built in $src (scripts/daily.sh setup)"; exit 1; }
+[ -z "$MIN_QP" ] || [ -f "$src/scripts/daily-pipeline.py" ] || { echo "fail the trial's copy on the host has no scripts/daily-pipeline.py yet (scripts/daily.sh setup)"; exit 1; }
 config=""
 [ -n "$HOST_CONFIG" ] && config=$(eval echo "$HOST_CONFIG")
 # For AURA (--for aura): the application's own AURA slot (picture 4793N, input 4794N), 4:2:0 at 72
