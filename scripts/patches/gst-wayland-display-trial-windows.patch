@@ -64,12 +64,28 @@ What it changes:
   remembered, so a menu item that opens a window, and the next menu along a menu bar, are
   not taken for another application. The grab of a popup that has gone is ended, and the
   keyboard given back to its holder's window, when a window of its application comes, a new
-  popup grabs, a button is pressed, or a window goes; not while another popup of the
-  holder's window is still open (a submenu that closed under its open menu: the grab goes
-  on with that menu, so that a click outside still dismisses it). Known: in this
-  compositor a submenu's own grab leaves the keyboard on the window (the seat's pointer grab
-  is replaced after the keyboard grab, which ends the new keyboard grab; upstream order, not
-  changed here). Nobody holds the keyboard after the
+  popup grabs, a button is pressed, or a window goes; not while a popup that grabbed (a
+  menu, not a tooltip or another popup that did not grab) is still open (a submenu that
+  closed under its open menu: the grab goes on with that menu, so that a click outside
+  still dismisses it). Known: in this compositor a submenu that grabs with its menu's
+  serial leaves the keyboard on the window (the seat's pointer grab is replaced after the
+  keyboard grab, which ends the new keyboard grab; upstream order, not changed here); one
+  that grabs with a newer serial (a key pressed in the menu) has the keyboard.
+- A press outside an open menu dismisses the menu, and the seat passes the button on to the
+  window under the pointer (of another application too). That window then comes up and has
+  the keyboard, as with any click: the button and the keys do not go to two windows. The
+  click is kept, not swallowed: the person meant it for that window.
+- Only the application in use (the keyboard's holder) may lock or confine the pointer: the
+  pointer now also moves into a window without a motion, and a window of another
+  application under it must not take it.
+- "The same application" is the same connection, or a connection from a process in the
+  same session (`setsid`; read from /proc/PID/stat with the process id the connection
+  carries, once, while it is connected, so a process id that is used again later cannot
+  mislead it). One compositor shows one application session: a program that opens a dialog
+  on a connection of its own (Chrome's file dialog) is the same application; a client from
+  outside the session is another. This counts wherever "the same application" is asked:
+  new windows, the place of another's window, the keyboard after a window goes, raising
+  smaller windows, activation, the recent input of an activation, pointer constraints. Nobody holds the keyboard after the
   last window has gone (the seat does not report that change), so the next application's
   first window takes it.
 - A window of the application in use that comes while one of its menus still has the grab
@@ -111,7 +127,11 @@ application's window goes below the main window too when a dialog has the keyboa
 the last window has gone, a new application's window takes the keyboard; a refused popup
 after a menu has gone leaves the keyboard in the window in use; a click after a menu has
 gone reaches the window; after a submenu has closed, a click outside still dismisses its
-menu; a marked window that goes takes its mark with it, and windows have
+menu; a tooltip (a popup that does not grab) is no open menu; a submenu opened with a key's
+serial has the keyboard, and after it closes a click outside dismisses its menu; a click
+that dismisses a menu gives the button and the keyboard to the other application's window it
+reaches, and raises it; only the application in use may confine the pointer; a second
+connection from the same process session is the same application; a marked window that goes takes its mark with it, and windows have
 ids of their own that do not change.
 
 2. Maximized, not fullscreen
@@ -235,7 +255,7 @@ index a5cb4ec..5dafbc7 100644
          let message = Application::builder(structure).src(&element).build();
          if let Err(err) = element.post_message(message) {
 diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
-index ce1ce1a..aa599e3 100644
+index ce1ce1a..49bb080 100644
 --- a/wayland-display-core/src/comp/input.rs
 +++ b/wayland-display-core/src/comp/input.rs
 @@ -19,7 +19,7 @@ use smithay::{
@@ -307,7 +327,25 @@ index ce1ce1a..aa599e3 100644
      }
  
      pub(crate) fn maybe_activate_pointer_constraint(
-@@ -219,6 +229,8 @@ impl State {
+@@ -108,6 +118,17 @@ impl State {
+     ) {
+         let pointer = self.seat.get_pointer().unwrap();
+ 
++        // Only the application in use may lock or confine the pointer: the pointer now also
++        // moves into a window without a motion (a window that comes, a click), and a window
++        // of another application under it must not take it.
++        let holder = self.keyboard_holder.as_ref().and_then(|(_, c)| c.as_ref());
++        let of_target = new_under
++            .as_ref()
++            .and_then(|(target, _)| crate::comp::client_of_focus(Some(target)));
++        if !self.same_app(holder, of_target.as_ref()) {
++            return;
++        }
++
+         if let Some((under, surface_location)) = new_under
+             .as_ref()
+             .and_then(|(target, loc)| Some((target.wl_surface()?, loc)))
+@@ -219,6 +240,8 @@ impl State {
                  .element_under(self.pointer_location)
                  .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
  
@@ -316,7 +354,7 @@ index ce1ce1a..aa599e3 100644
              // Not sure why, but order here matters (at least when using Sway nested)!!!
              // If we send the motion event after the relative_motion it'll behave oddly
              pointer.motion(
-@@ -247,17 +259,39 @@ impl State {
+@@ -247,17 +270,39 @@ impl State {
      }
  
      /// Tells the pointer again where it is, after the windows under it have changed (one has
@@ -359,7 +397,7 @@ index ce1ce1a..aa599e3 100644
          pointer.motion(
              self,
              under,
-@@ -270,6 +304,52 @@ impl State {
+@@ -270,6 +315,52 @@ impl State {
          pointer.frame(self);
      }
  
@@ -412,7 +450,7 @@ index ce1ce1a..aa599e3 100644
      pub fn set_pointer_location(&mut self, location: Point<f64, Logical>) {
          self.pointer_location = location;
          self.pointer_absolute_location = location;
-@@ -294,12 +374,36 @@ impl State {
+@@ -294,12 +385,18 @@ impl State {
  
      pub fn pointer_button(&mut self, event_time_msec: u32, button_code: u32, state: ButtonState) {
          self.last_pointer_movement = Instant::now();
@@ -422,35 +460,54 @@ index ce1ce1a..aa599e3 100644
  
          if ButtonState::Pressed == state {
 -            self.update_keyboard_focus(serial);
-+            // The window under the pointer comes up, the pointer is in what is on top there
-+            // now, and the keyboard goes where the button goes: never one window for the
-+            // button and another for the keys.
-+            let before: Vec<_> = self.space.elements().cloned().collect();
-+            if let Some(clicked) = self.raise_the_window_clicked() {
-+                self.pointer_to_what_is_under_it(true);
-+                let target = self
-+                    .seat
-+                    .get_pointer()
-+                    .unwrap()
-+                    .current_focus()
-+                    .unwrap_or(FocusTarget::from(clicked));
-+                let keyboard = self.seat.get_keyboard().unwrap();
-+                if !keyboard.is_grabbed() {
-+                    keyboard.set_focus(self, Some(target), serial);
-+                }
-+                if !self.space.elements().eq(before.iter()) {
-+                    crate::comp::picture_changed(self);
-+                }
-+            }
++            self.the_click_takes_the_window(serial);
          };
          let pointer = self.seat.get_pointer().unwrap();
++        let a_menu_had_the_pointer = pointer.is_grabbed();
 +        // The button goes to the client the pointer is in, now that it has been put there.
 +        let to = crate::comp::client_of_focus(pointer.current_focus().as_ref());
 +        self.input_serials.input(serial, to);
          pointer.button(
              self,
              &ButtonEvent {
-@@ -558,7 +662,9 @@ impl State {
+@@ -310,6 +407,36 @@ impl State {
+             },
+         );
+         pointer.frame(self);
++        // A press outside an open menu dismisses the menu, and the seat passes the button on
++        // to the window under the pointer. That window then comes up and has the keyboard, as
++        // with any click: the button and the keys never go to two windows. (The click is
++        // kept, not swallowed: the person meant it for that window.)
++        if ButtonState::Pressed == state && a_menu_had_the_pointer && !pointer.is_grabbed() {
++            self.the_click_takes_the_window(serial);
++        }
++    }
++
++    /// What a click does before its button goes out: the window under the pointer comes up,
++    /// the pointer is in what is on top there now, and the keyboard goes where the button
++    /// goes: never one window for the button and another for the keys.
++    fn the_click_takes_the_window(&mut self, serial: smithay::utils::Serial) {
++        let before: Vec<_> = self.space.elements().cloned().collect();
++        if let Some(clicked) = self.raise_the_window_clicked() {
++            self.pointer_to_what_is_under_it(true);
++            let target = self
++                .seat
++                .get_pointer()
++                .unwrap()
++                .current_focus()
++                .unwrap_or(FocusTarget::from(clicked));
++            let keyboard = self.seat.get_keyboard().unwrap();
++            if !keyboard.is_grabbed() {
++                keyboard.set_focus(self, Some(target), serial);
++            }
++            if !self.space.elements().eq(before.iter()) {
++                crate::comp::picture_changed(self);
++            }
++        }
+     }
+ 
+     pub fn pointer_axis(
+@@ -558,7 +685,9 @@ impl State {
          pos
      }
  
@@ -461,7 +518,7 @@ index ce1ce1a..aa599e3 100644
          let pointer = self.seat.get_pointer().unwrap();
          let keyboard = self.seat.get_keyboard().unwrap();
          // change the keyboard focus unless the pointer or keyboard is grabbed
-@@ -576,13 +682,20 @@ impl State {
+@@ -576,13 +705,20 @@ impl State {
                  .element_under(self.pointer_location)
                  .map(|(w, p)| (w.clone(), p))
              {
@@ -486,7 +543,7 @@ index ce1ce1a..aa599e3 100644
  }
  
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 68e95df..4c76ee6 100644
+index 68e95df..662caad 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
 @@ -58,6 +58,7 @@ use smithay::{
@@ -497,7 +554,7 @@ index 68e95df..4c76ee6 100644
      },
  };
  use std::sync::Mutex;
-@@ -151,6 +152,19 @@ pub struct State {
+@@ -151,6 +152,25 @@ pub struct State {
      pub shell_state: XdgShellState,
      pub shm_state: ShmState,
      viewporter_state: ViewporterState,
@@ -510,6 +567,12 @@ index 68e95df..4c76ee6 100644
 +    /// The window that has the keyboard (or whose popup has it) and its client, as of the
 +    /// last move of the keyboard. A popup that has the keyboard and is gone keeps the
 +    /// keyboard's focus until the next input; this still says whose it was.
++    /// The popups that grabbed (menus), for telling an open menu from a tooltip or another
++    /// popup that does not grab. Gone ones are dropped when they are looked at.
++    pub(crate) grabbing_popups: Vec<smithay::desktop::PopupKind>,
++    /// The session of each client's process, read once while it is connected (see
++    /// [`State::same_app`]). Tests may put their own in.
++    pub(crate) app_sessions: std::cell::RefCell<std::collections::HashMap<ClientId, Option<i64>>>,
 +    pub(crate) keyboard_holder: Option<(
 +        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 +        Option<ClientId>,
@@ -517,7 +580,7 @@ index 68e95df..4c76ee6 100644
      cursor_event_count: i32,
      pub single_pixel_buffer_state: SinglePixelBufferState,
  }
-@@ -175,6 +189,7 @@ impl State {
+@@ -175,6 +195,7 @@ impl State {
          let mut seat_state = SeatState::new();
          let shell_state = XdgShellState::new::<State>(&dh);
          let viewporter_state = ViewporterState::new::<State>(&dh);
@@ -525,7 +588,7 @@ index 68e95df..4c76ee6 100644
          let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
  
          let render_node: Option<DrmNode> = render_target.clone().into();
-@@ -275,6 +290,10 @@ impl State {
+@@ -275,6 +296,12 @@ impl State {
              shell_state,
              shm_state,
              viewporter_state,
@@ -533,10 +596,12 @@ index 68e95df..4c76ee6 100644
 +            input_serials: windows::InputSerials::default(),
 +            pointer_window_at: None,
 +            keyboard_holder: None,
++            grabbing_popups: Vec::new(),
++            app_sessions: Default::default(),
              single_pixel_buffer_state,
          }
      }
-@@ -402,18 +421,47 @@ pub(crate) fn apply_video_info(
+@@ -402,18 +429,47 @@ pub(crate) fn apply_video_info(
              .unwrap_or(new_size),
          );
  
@@ -590,7 +655,7 @@ index 68e95df..4c76ee6 100644
  /// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
  /// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
  /// frame no longer counts.
-@@ -457,8 +505,252 @@ impl State {
+@@ -457,8 +513,289 @@ impl State {
          }
      }
  
@@ -670,7 +735,43 @@ index 68e95df..4c76ee6 100644
 +            return true;
 +        };
 +        let of_window = client_of_focus(Some(&FocusTarget::from(window.clone())));
-+        of_window.is_some() && *holder == of_window
++        self.same_app(holder.as_ref(), of_window.as_ref())
++    }
++
++    /// The session of a client's process (see [`windows::session_of_process`]), read the
++    /// first time it is asked for. The process id comes with the connection (its
++    /// credentials), so it is the process that is connected now; it cannot be another's while
++    /// the connection stands.
++    fn session_of_client(&self, client: &ClientId) -> Option<i64> {
++        if let Some(session) = self.app_sessions.borrow().get(client) {
++            return *session;
++        }
++        let session = self
++            .dh
++            .backend_handle()
++            .get_client_credentials(client.clone())
++            .ok()
++            .and_then(|credentials| windows::session_of_process(credentials.pid));
++        self.app_sessions
++            .borrow_mut()
++            .insert(client.clone(), session);
++        session
++    }
++
++    /// Whether two clients belong to the same application: they are the same connection, or
++    /// their processes are in the same session. One compositor shows one application
++    /// session; a second connection from it (a dialog a program opens on a connection of its
++    /// own, a helper process) is the same application, a client from outside that session
++    /// is another.
++    pub(crate) fn same_app(&self, a: Option<&ClientId>, b: Option<&ClientId>) -> bool {
++        let (Some(a), Some(b)) = (a, b) else {
++            return false;
++        };
++        if a == b {
++            return true;
++        }
++        let session = self.session_of_client(a);
++        session.is_some() && session == self.session_of_client(b)
 +    }
 +
 +    /// The client a window belongs to.
@@ -697,7 +798,7 @@ index 68e95df..4c76ee6 100644
 +        let from_the_lowest: Vec<Window> = self
 +            .space
 +            .elements()
-+            .skip_while(|w| holder.is_none() || Self::client_of_window(w) != holder)
++            .skip_while(|w| !self.same_app(holder.as_ref(), Self::client_of_window(w).as_ref()))
 +            .cloned()
 +            .collect();
 +        let from_the_lowest = if from_the_lowest.is_empty() {
@@ -723,10 +824,11 @@ index 68e95df..4c76ee6 100644
 +            return;
 +        }
 +        // A submenu that closed while its menu is still open: the grab goes on with that menu
-+        // (a click outside still dismisses it), and is left to the seat.
-+        let a_menu_is_open = self.keyboard_holder.as_ref().is_some_and(|(root, _)| {
-+            PopupManager::popups_for_surface(root).any(|(popup, _)| popup.alive())
-+        });
++        // (a click outside still dismisses it), and is left to the seat. Only popups that
++        // grabbed count: a tooltip or a popup that did not grab is no open menu.
++        self.grabbing_popups.retain(|popup| popup.alive());
++        let a_menu_is_open = !self.grabbing_popups.is_empty()
++            && (keyboard.is_grabbed() || self.seat.get_pointer().unwrap().is_grabbed());
 +        if a_menu_is_open {
 +            return;
 +        }
@@ -803,7 +905,7 @@ index 68e95df..4c76ee6 100644
 +                alive
 +                    .iter()
 +                    .rev()
-+                    .find(|w| Self::client_of_window(w).as_ref() == Some(client))
++                    .find(|w| self.same_app(Some(client), Self::client_of_window(w).as_ref()))
 +                    .cloned()
 +            })
 +        };
@@ -844,7 +946,7 @@ index 68e95df..4c76ee6 100644
      pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
          use smithay::wayland::seat::WaylandFocus;
          let parent = window
-@@ -479,30 +771,56 @@ impl State {
+@@ -479,30 +816,56 @@ impl State {
              .and_then(|output| output.current_mode())
              .map(|mode| mode.size.to_logical(1))
              .unwrap_or_default();
@@ -887,7 +989,7 @@ index 68e95df..4c76ee6 100644
 +                    && w.toplevel()
 +                        .is_some_and(|toplevel| toplevel.parent().is_none())
 +                    && !fills_the_output(w)
-+                    && client_of(w).as_ref() == Some(&client)
++                    && self.same_app(client_of(w).as_ref(), Some(&client))
 +            })
 +            .cloned()
 +            .collect();
@@ -916,7 +1018,7 @@ index 68e95df..4c76ee6 100644
      }
  
      /// Puts the windows that have `window` as their parent above it again, and theirs above
-@@ -523,7 +841,7 @@ impl State {
+@@ -523,7 +886,7 @@ impl State {
              .cloned()
              .collect();
          for child in children {
@@ -925,7 +1027,7 @@ index 68e95df..4c76ee6 100644
              self.raise_children_of(&child);
          }
      }
-@@ -552,8 +870,46 @@ impl State {
+@@ -552,8 +915,46 @@ impl State {
                  .iter()
                  .filter(|window| window.alive() && Some(*window) != gone)
                  .count();
@@ -974,7 +1076,7 @@ index 68e95df..4c76ee6 100644
  
      /// Tells `sink` how many windows there are, now and whenever that changes; with `None`,
 diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
-index 7813b6f..cf75392 100644
+index 7813b6f..f7ebfb7 100644
 --- a/wayland-display-core/src/comp/windows.rs
 +++ b/wayland-display-core/src/comp/windows.rs
 @@ -13,10 +13,11 @@
@@ -993,7 +1095,7 @@ index 7813b6f..cf75392 100644
  //! until it goes.
  
  use smithay::utils::{Logical, Point, Rectangle, Size};
-@@ -43,14 +44,148 @@ pub fn place(
+@@ -43,14 +44,163 @@ pub fn place(
          .into()
  }
  
@@ -1044,24 +1146,39 @@ index 7813b6f..cf75392 100644
 +        self.0.push_back((serial, client, at));
 +    }
 +
-+    /// Whether `serial` is one of the last key or button events, went to `client`, and is
-+    /// recent.
-+    pub fn is_recent_for(&self, serial: smithay::utils::Serial, client: &C) -> bool {
-+        self.is_recent_for_at(serial, client, std::time::Instant::now())
++    /// Whether `serial` is one of the last key or button events, went to a client for which
++    /// `of_the_app` holds, and is recent.
++    pub fn is_recent_for(
++        &self,
++        serial: smithay::utils::Serial,
++        of_the_app: impl Fn(&C) -> bool,
++    ) -> bool {
++        self.is_recent_for_at(serial, of_the_app, std::time::Instant::now())
 +    }
 +
 +    fn is_recent_for_at(
 +        &self,
 +        serial: smithay::utils::Serial,
-+        client: &C,
++        of_the_app: impl Fn(&C) -> bool,
 +        now: std::time::Instant,
 +    ) -> bool {
 +        self.0.iter().any(|(s, to, at)| {
 +            *s == serial
-+                && to.as_ref() == Some(client)
++                && to.as_ref().is_some_and(&of_the_app)
 +                && now.saturating_duration_since(*at) <= RECENT
 +        })
 +    }
++}
++
++/// The session (`setsid`) a process belongs to, read from `/proc/PID/stat`: the processes of
++/// one application session (a program, its helpers, the dialogs it opens on a connection of
++/// their own) share it unless one of them starts a session of its own. `None` when it cannot
++/// be read.
++pub fn session_of_process(pid: i32) -> Option<i64> {
++    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
++    // pid (comm) state ppid pgrp session ...; comm may hold spaces and parentheses.
++    let after = &stat[stat.rfind(')')? + 1..];
++    after.split_whitespace().nth(3)?.parse().ok()
 +}
 +
 +/// Marks a window that wants attention: its application asked for it to come forward and
@@ -1146,7 +1263,7 @@ index 7813b6f..cf75392 100644
  }
  
  impl WindowReport {
-@@ -64,14 +199,15 @@ impl WindowReport {
+@@ -64,14 +214,15 @@ impl WindowReport {
          self.sink.is_some()
      }
  
@@ -1167,7 +1284,7 @@ index 7813b6f..cf75392 100644
          }
      }
  }
-@@ -104,6 +240,41 @@ mod tests {
+@@ -104,6 +255,48 @@ mod tests {
          assert_eq!((at.x, at.y), (0, 0));
      }
  
@@ -1184,32 +1301,39 @@ index 7813b6f..cf75392 100644
 +        let mut serials = InputSerials::<u32>::default();
 +        let now = std::time::Instant::now();
 +        let first = smithay::utils::Serial::from(1);
-+        assert!(!serials.is_recent_for_at(first, &7, now));
++        assert!(!serials.is_recent_for_at(first, |c| *c == 7, now));
 +        serials.input_at(first, Some(7), now);
-+        assert!(serials.is_recent_for_at(first, &7, now));
++        assert!(serials.is_recent_for_at(first, |c| *c == 7, now));
 +        // Not for another client, nor for an event that went to none.
-+        assert!(!serials.is_recent_for_at(first, &8, now));
++        assert!(!serials.is_recent_for_at(first, |c| *c == 8, now));
 +        serials.input_at(2.into(), None, now);
-+        assert!(!serials.is_recent_for_at(2.into(), &7, now));
++        assert!(!serials.is_recent_for_at(2.into(), |c| *c == 7, now));
 +        // Not when it is older than RECENT.
-+        assert!(serials.is_recent_for_at(first, &7, now + RECENT));
++        assert!(serials.is_recent_for_at(first, |c| *c == 7, now + RECENT));
 +        assert!(!serials.is_recent_for_at(
 +            first,
-+            &7,
++            |c| *c == 7,
 +            now + RECENT + std::time::Duration::from_millis(1)
 +        ));
 +        // Not when it has been pushed out.
 +        for n in 3..=(EVENTS_KEPT as u32 + 1) {
 +            serials.input_at(n.into(), Some(7), now);
 +        }
-+        assert!(!serials.is_recent_for_at(first, &7, now));
-+        assert!(serials.is_recent_for_at((EVENTS_KEPT as u32 + 1).into(), &7, now));
++        assert!(!serials.is_recent_for_at(first, |c| *c == 7, now));
++        assert!(serials.is_recent_for_at((EVENTS_KEPT as u32 + 1).into(), |c| *c == 7, now));
++    }
++
++    #[test]
++    fn a_process_has_a_session() {
++        let me = std::process::id() as i32;
++        assert!(session_of_process(me).is_some());
++        assert_eq!(session_of_process(-1), None);
 +    }
 +
      #[test]
      fn a_window_without_a_parent_is_put_at_the_corner() {
          let at = place((400, 300).into(), None, (1720, 720).into());
-@@ -112,27 +283,41 @@ mod tests {
+@@ -112,27 +305,41 @@ mod tests {
  
      #[test]
      fn a_sink_is_told_a_change_once_and_a_new_sink_is_told_what_is() {
@@ -1263,7 +1387,7 @@ index 7813b6f..cf75392 100644
      }
  }
 diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
-index d552363..a91a10c 100644
+index d552363..cdc719c 100644
 --- a/wayland-display-core/src/tests/client.rs
 +++ b/wayland-display-core/src/tests/client.rs
 @@ -27,7 +27,8 @@ use wayland_protocols::{
@@ -1276,12 +1400,14 @@ index d552363..a91a10c 100644
  };
  
  pub struct WaylandClient {
-@@ -62,10 +63,24 @@ struct State {
+@@ -62,10 +63,26 @@ struct State {
      shm: Option<wl_shm::WlShm>,
      cursor_surface: Option<wl_surface::WlSurface>,
      keyboard: Option<wl_keyboard::WlKeyboard>,
 +    /// The surface the keyboard is in, going by what the compositor said.
 +    keyboard_in: Option<wl_surface::WlSurface>,
++    /// The serial of the last key event the client had.
++    last_key_serial: Option<u32>,
      windows: Vec<Window>,
      pub mouse_events: Vec<MouseEvents>,
      pub output: Option<wl_output::WlOutput>,
@@ -1301,7 +1427,7 @@ index d552363..a91a10c 100644
  }
  
  #[derive(Debug, Clone, Default)]
-@@ -144,6 +159,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
+@@ -144,6 +161,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                          registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
                      );
                  }
@@ -1317,7 +1443,7 @@ index d552363..a91a10c 100644
                  "wl_output" => {
                      // The compositor only advertises wl_output after the first
                      // VideoInfo has created it, so this branch may fire well after
-@@ -168,6 +192,38 @@ delegate_noop!(State: ignore WpViewport);
+@@ -168,6 +194,38 @@ delegate_noop!(State: ignore WpViewport);
  delegate_noop!(State: ignore ZwpPointerConstraintsV1);
  delegate_noop!(State: ignore ZwpLockedPointerV1);
  delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
@@ -1356,11 +1482,12 @@ index d552363..a91a10c 100644
  
  impl WaylandClient {
      pub fn new(w_socket: UnixStream) -> Self {
-@@ -196,10 +252,14 @@ impl WaylandClient {
+@@ -196,10 +254,15 @@ impl WaylandClient {
              shm: None,
              cursor_surface: None,
              keyboard: None,
 +            keyboard_in: None,
++            last_key_serial: None,
              windows: Vec::new(),
              mouse_events: Vec::new(),
              output: None,
@@ -1371,7 +1498,7 @@ index d552363..a91a10c 100644
          };
  
          WaylandClient {
-@@ -306,6 +366,12 @@ impl WaylandClient {
+@@ -306,6 +369,12 @@ impl WaylandClient {
              .set_cursor(state.pointer_entered, None, 0, 0);
      }
  
@@ -1384,7 +1511,7 @@ index d552363..a91a10c 100644
      /// Creates a window that is a child of the first, as an application does with a dialog:
      /// the parent is named before the window is committed for the first time
      /// (`xdg_toplevel.set_parent`).
-@@ -315,14 +381,15 @@ impl WaylandClient {
+@@ -315,14 +384,15 @@ impl WaylandClient {
      }
  
      /// The size and bounds the compositor told the last window, and whether it told it to
@@ -1402,7 +1529,7 @@ index d552363..a91a10c 100644
          )
      }
  
-@@ -349,8 +416,23 @@ impl WaylandClient {
+@@ -349,8 +419,23 @@ impl WaylandClient {
      /// as its first: the window is as large as the picture, as a dialog is that knows its
      /// own size.
      pub fn setup_window_of_one_colour(&mut self, (width, height): (i32, i32), bgra: [u8; 4]) {
@@ -1427,7 +1554,7 @@ index d552363..a91a10c 100644
          let mut file = tempfile::tempfile().unwrap();
          file.write_all(&bgra.repeat((width * height) as usize))
              .unwrap();
-@@ -370,13 +452,11 @@ impl WaylandClient {
+@@ -370,13 +455,11 @@ impl WaylandClient {
              &state.qh,
              (),
          );
@@ -1444,7 +1571,7 @@ index d552363..a91a10c 100644
      /// Whether the compositor has asked the last window to close.
      pub fn asked_to_close(&self) -> bool {
          self.state.windows.last().is_some_and(|w| w.close_requested)
-@@ -392,6 +472,265 @@ impl WaylandClient {
+@@ -392,6 +475,270 @@ impl WaylandClient {
          }
      }
  
@@ -1662,6 +1789,11 @@ index d552363..a91a10c 100644
 +        self.state.create_window_of_with_requests(None, None, true);
 +    }
 +
++    /// The serial of the last key event the client had.
++    pub fn last_key_serial(&self) -> Option<u32> {
++        self.state.last_key_serial
++    }
++
 +    /// The serial of the last button event the client had.
 +    pub fn last_button_serial(&self) -> Option<u32> {
 +        self.state
@@ -1710,7 +1842,7 @@ index d552363..a91a10c 100644
      pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
          self.state.mouse_events.as_mut()
      }
-@@ -489,7 +828,29 @@ impl State {
+@@ -489,7 +836,29 @@ impl State {
          self.create_window_of(None);
      }
  
@@ -1740,7 +1872,7 @@ index d552363..a91a10c 100644
          let compositor = self.compositor.as_ref().unwrap();
          let xdg_wm_base = self.wm_base.as_ref().unwrap();
          let viewporter = self.viewporter.as_ref().unwrap();
-@@ -500,6 +861,13 @@ impl State {
+@@ -500,6 +869,13 @@ impl State {
          if parent.is_some() {
              xdg_toplevel.set_parent(parent);
          }
@@ -1754,7 +1886,7 @@ index d552363..a91a10c 100644
          let viewport = viewporter.get_viewport(&surface, &self.qh, ());
  
          let window = Window {
-@@ -616,6 +984,10 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
+@@ -616,6 +992,10 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
      ) {
          match event {
              xdg_surface::Event::Configure { serial } => {
@@ -1765,7 +1897,7 @@ index d552363..a91a10c 100644
                  let window = state
                      .windows
                      .iter_mut()
-@@ -696,7 +1068,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
+@@ -696,7 +1076,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
  
  impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
      fn event(
@@ -1774,32 +1906,75 @@ index d552363..a91a10c 100644
          _: &wl_keyboard::WlKeyboard,
          event: wl_keyboard::Event,
          _: &(),
-@@ -704,6 +1076,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+@@ -704,6 +1084,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
          _: &QueueHandle<Self>,
      ) {
          tracing::debug!("{:?}", event);
 +        match event {
 +            wl_keyboard::Event::Enter { surface, .. } => state.keyboard_in = Some(surface),
 +            wl_keyboard::Event::Leave { .. } => state.keyboard_in = None,
++            wl_keyboard::Event::Key { serial, .. } => state.last_key_serial = Some(serial),
 +            _ => {}
 +        }
      }
  }
  
 diff --git a/wayland-display-core/src/tests/fixture.rs b/wayland-display-core/src/tests/fixture.rs
-index 0cb8d65..bee225d 100644
+index 0cb8d65..195106c 100644
 --- a/wayland-display-core/src/tests/fixture.rs
 +++ b/wayland-display-core/src/tests/fixture.rs
-@@ -19,6 +19,8 @@ use std::time::Duration;
+@@ -12,13 +12,20 @@ use smithay::output::{Output, PhysicalProperties, Subpixel};
+ use smithay::reexports::input::Libinput;
+ use smithay::reexports::wayland_server::Display;
+ use smithay::wayland::socket::ListeningSocketSource;
++use smithay::reexports::wayland_server::backend::ClientId;
++use std::cell::RefCell;
+ use std::os::unix::net::UnixStream;
++use std::rc::Rc;
+ use std::sync::Arc;
+ use std::sync::atomic::Ordering;
+ use std::time::Duration;
  
  pub struct Fixture {
      pub client: WaylandClient,
 +    /// Where the compositor listens, for a second client.
 +    socket_path: String,
++    /// The clients that have connected, in order.
++    connected: Rc<RefCell<Vec<ClientId>>>,
      pub server: State,
      server_event_loop: EventLoop<'static, State>,
  }
-@@ -72,12 +74,12 @@ impl Fixture {
+@@ -42,17 +49,22 @@ impl Fixture {
+         );
+ 
+         let source = ListeningSocketSource::new_auto().unwrap();
++        let connected: Rc<RefCell<Vec<ClientId>>> = Default::default();
+         let socket_name = source.socket_name().to_string_lossy().into_owned();
+         tracing::info!(?socket_name, "Listening on wayland socket.");
+         server_state
+             .handle
+-            .insert_source(source, |client_stream, _, state| {
+-                if let Err(err) = state
+-                    .dh
+-                    .insert_client(client_stream, Arc::new(ClientState::default()))
+-                {
+-                    tracing::error!(?err, "Error adding wayland client.");
+-                };
++            .insert_source(source, {
++                let connected = connected.clone();
++                move |client_stream, _, state| {
++                    match state
++                        .dh
++                        .insert_client(client_stream, Arc::new(ClientState::default()))
++                    {
++                        Ok(client) => connected.borrow_mut().push(client.id()),
++                        Err(err) => tracing::error!(?err, "Error adding wayland client."),
++                    };
++                }
+             })
+             .expect("Failed to init wayland socket source");
+ 
+@@ -72,12 +84,13 @@ impl Fixture {
  
          // Setup Wayland client
          let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
@@ -1812,10 +1987,11 @@ index 0cb8d65..bee225d 100644
          let mut f = Fixture {
              client: wclient,
 +            socket_path,
++            connected,
              server: server_state,
              server_event_loop: event_loop,
          };
-@@ -143,6 +145,30 @@ impl Fixture {
+@@ -143,6 +156,44 @@ impl Fixture {
          }
      }
  
@@ -1824,6 +2000,20 @@ index 0cb8d65..bee225d 100644
 +        let mut other = WaylandClient::new(UnixStream::connect(&self.socket_path).unwrap());
 +        self.round_trip_with(&mut other);
 +        self.round_trip_with(&mut other);
++        other
++    }
++
++    /// Connects a client of another application: the compositor is told that its process is
++    /// in a session of its own (all the test's clients are in this process, whose session is
++    /// the first client's).
++    pub fn another_application(&mut self) -> WaylandClient {
++        let other = self.another_client();
++        let id = self.connected.borrow().last().cloned().unwrap();
++        let fake_session = -(self.connected.borrow().len() as i64);
++        self.server
++            .app_sessions
++            .borrow_mut()
++            .insert(id, Some(fake_session));
 +        other
 +    }
 +
@@ -1922,10 +2112,10 @@ index e64aad8..55a0b19 100644
      assert_eq!(stack[0], first);
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
-index 0000000..0ecf8de
+index 0000000..644560c
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_windows.rs
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,984 @@
 +//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
 +//! window, the one a person sees under the pointer; a window is told to be maximized, not
 +//! fullscreen, unless it asks; a second window keeps its own size and is not lost under the
@@ -2366,7 +2556,7 @@ index 0000000..0ecf8de
 +    }
 +    let in_use = f.server.space.elements().next().cloned().unwrap();
 +    // A second application maps a window while the first has the keyboard.
-+    let mut other = f.another_client();
++    let mut other = f.another_application();
 +    other.create_window();
 +    f.round_trip_with(&mut other);
 +    other.setup_window_of_one_colour((120, 80), WHITE);
@@ -2426,7 +2616,7 @@ index 0000000..0ecf8de
 +    let mut f = fixture();
 +    let in_use = f.server.space.elements().next().cloned().unwrap();
 +    // Another application's popup, on a window without the keyboard: dismissed.
-+    let mut other = f.another_client();
++    let mut other = f.another_application();
 +    other.create_window();
 +    f.round_trip_with(&mut other);
 +    other.setup_window_of_one_colour((120, 80), WHITE);
@@ -2518,7 +2708,7 @@ index 0000000..0ecf8de
 +    f.round_trip();
 +    f.round_trip();
 +    assert_eq!(f.client.keyboard_window(), Some(1));
-+    let mut other = f.another_client();
++    let mut other = f.another_application();
 +    other.create_window();
 +    f.round_trip_with(&mut other);
 +    other.setup_window_of_one_colour((120, 80), WHITE);
@@ -2545,7 +2735,7 @@ index 0000000..0ecf8de
 +fn a_token_handed_to_another_application_does_not_move_the_keyboard() {
 +    let mut f = fixture();
 +    let in_use = f.server.space.elements().next().cloned().unwrap();
-+    let mut other = f.another_client();
++    let mut other = f.another_application();
 +    other.create_window();
 +    f.round_trip_with(&mut other);
 +    other.setup_window_of_one_colour((120, 80), WHITE);
@@ -2613,7 +2803,7 @@ index 0000000..0ecf8de
 +
 +/// Another application, with one window of 120 by 80 shown (below the window in use).
 +fn another_application_with_a_window(f: &mut Fixture) -> crate::tests::client::WaylandClient {
-+    let mut other = f.another_client();
++    let mut other = f.another_application();
 +    other.create_window();
 +    f.round_trip_with(&mut other);
 +    other.setup_window_of_one_colour((120, 80), WHITE);
@@ -2770,6 +2960,145 @@ index 0000000..0ecf8de
 +    click(&mut f);
 +    f.round_trip();
 +    assert!(f.client.popup_dismissed(menu));
++}
++
++#[test]
++fn a_popup_that_does_not_grab_is_no_open_menu() {
++    let mut f = fixture();
++    // A tooltip (a popup without a grab) is open; a menu opens and goes, and the
++    // application opens a window: it takes the keyboard.
++    let _tooltip = f.client.open_popup(0, None);
++    f.round_trip();
++    let menu = open_a_menu(&mut f);
++    f.client.close_popup(menu);
++    f.round_trip();
++    open_a_second_window(&mut f, (120, 80));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    assert!(
++        !f.server
++            .space
++            .elements()
++            .any(crate::comp::windows::wants_attention)
++    );
++}
++
++#[test]
++fn a_submenu_opened_with_a_key_has_the_keyboard_and_after_it_closes_a_click_dismisses_the_menu() {
++    use smithay::backend::input::KeyState;
++    let mut f = fixture();
++    let menu = open_a_menu(&mut f);
++    // A key in the menu (Down), and the submenu opens as its answer, with the key's serial.
++    let down = f.server.scancode_to_keycode(108);
++    f.server.keyboard_input(0, down, KeyState::Pressed);
++    f.server.keyboard_input(0, down, KeyState::Released);
++    f.round_trip();
++    let serial = f.client.last_key_serial().unwrap();
++    let submenu = f.client.open_popup_on_popup(menu, serial);
++    f.round_trip();
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(submenu));
++    // The submenu has the keyboard (unlike one that grabs with its menu's serial).
++    assert!(matches!(
++        f.server.seat.get_keyboard().unwrap().current_focus(),
++        Some(crate::comp::FocusTarget::Popup(_))
++    ));
++    // It closes; the menu stays open, and a click outside dismisses it.
++    f.client.close_popup(submenu);
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(menu));
++    click(&mut f);
++    f.round_trip();
++    assert!(f.client.popup_dismissed(menu));
++}
++
++#[test]
++fn a_click_that_dismisses_a_menu_gives_the_keyboard_to_the_window_it_reaches() {
++    // The application in use has a small window in the middle and opens a menu in it by a
++    // click; another application's window fills the output below.
++    let mut f = Fixture::new();
++    f.client.create_window_with_largest_size((100, 100));
++    f.round_trip();
++    f.client.setup_window_of_one_colour((100, 100), WHITE);
++    f.round_trip();
++    f.round_trip();
++    let mut other = f.another_application();
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window(320, 240);
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    let theirs = f.server.space.elements().next().cloned().unwrap();
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    click(&mut f);
++    let serial = f.client.last_button_serial();
++    let menu = f.client.open_popup(0, serial);
++    f.round_trip();
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(menu));
++    // A click on the other application's window, outside the menu: the menu goes, and that
++    // window comes up with the button and the keyboard.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip_with(&mut other);
++    let buttons_before = other.pointer_and_buttons().1[0];
++    click(&mut f);
++    f.round_trip_with(&mut other);
++    f.round_trip();
++    assert!(f.client.popup_dismissed(menu));
++    let (_, buttons) = other.pointer_and_buttons();
++    assert!(
++        buttons[0] > buttons_before,
++        "the button reached the other window"
++    );
++    assert_eq!(keyboard_in(&f, &theirs), (true, false));
++    assert_eq!(f.server.space.elements().last(), Some(&theirs));
++}
++
++#[test]
++fn only_the_application_in_use_may_confine_the_pointer() {
++    let mut f = Fixture::new();
++    // The application in use has a small window in the middle; another application's window
++    // fills the output below it, and the pointer is over that one.
++    f.client.create_window_with_largest_size((100, 100));
++    f.round_trip();
++    f.client.setup_window_of_one_colour((100, 100), WHITE);
++    f.round_trip();
++    f.round_trip();
++    let mut other = f.another_application();
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window(320, 240);
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip_with(&mut other);
++    // It asks to confine the pointer: it is not let.
++    let _confined = other.confine_pointer(0, 0, 320, 240);
++    f.round_trip_with(&mut other);
++    f.server
++        .pointer_motion_absolute(0, Point::from((12.0, 12.0)));
++    f.round_trip_with(&mut other);
++    assert!(!other.is_confined());
++}
++
++#[test]
++fn a_second_connection_from_the_same_process_session_is_the_same_application() {
++    // A program that opens a dialog on a connection of its own (Chrome's file dialog does):
++    // the dialog takes the keyboard, unmarked.
++    let mut f = fixture();
++    let mut dialog = f.another_client();
++    dialog.create_window();
++    f.round_trip_with(&mut dialog);
++    dialog.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip_with(&mut dialog);
++    f.round_trip_with(&mut dialog);
++    let theirs = f.server.space.elements().last().cloned().unwrap();
++    assert_eq!(keyboard_in(&f, &theirs), (true, false));
++    assert!(dialog.told_active(0));
++    assert!(!crate::comp::windows::wants_attention(&theirs));
 +}
 diff --git a/wayland-display-core/src/tests/test_windows.rs b/wayland-display-core/src/tests/test_windows.rs
 index 8d177dc..8c33648 100644
@@ -2956,7 +3285,7 @@ index 9bd9383..b0ef369 100644
              let client = match surface {
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
-index 4931ed6..f4b3114 100644
+index 4931ed6..803b722 100644
 --- a/wayland-display-core/src/wayland/handlers/xdg.rs
 +++ b/wayland-display-core/src/wayland/handlers/xdg.rs
 @@ -5,7 +5,8 @@ use smithay::{
@@ -3077,7 +3406,19 @@ index 4931ed6..f4b3114 100644
          if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
              self.space
                  .elements()
-@@ -106,7 +185,27 @@ impl XdgShellHandler for State {
+@@ -86,6 +165,11 @@ impl XdgShellHandler for State {
+                     }
+                     pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Clear);
+                 }
++                {
++                    use smithay::utils::IsAlive;
++                    self.grabbing_popups.retain(|popup| popup.alive());
++                }
++                self.grabbing_popups.push(kind);
+             }
+         }
+     }
+@@ -106,7 +190,27 @@ impl XdgShellHandler for State {
      }
  }
  
@@ -3107,10 +3448,10 @@ index 4931ed6..f4b3114 100644
              return;
 diff --git a/wayland-display-core/src/wayland/handlers/xdg_activation.rs b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
 new file mode 100644
-index 0000000..905fd53
+index 0000000..83ef5cb
 --- /dev/null
 +++ b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,120 @@
 +use smithay::{
 +    delegate_xdg_activation,
 +    input::Seat,
@@ -3213,18 +3554,20 @@ index 0000000..905fd53
 +        let Some(maker) = data.client_id.as_ref() else {
 +            return false;
 +        };
-+        if surface.client().map(|c| c.id()).as_ref() != Some(maker) {
++        if !self.same_app(surface.client().map(|c| c.id()).as_ref(), Some(maker)) {
 +            return false;
 +        }
 +        let keyboard = self.keyboard_holder.as_ref().and_then(|(_, c)| c.as_ref());
-+        if keyboard != Some(maker) {
++        if !self.same_app(keyboard, Some(maker)) {
 +            return false;
 +        }
 +        let Some((serial, seat)) = &data.serial else {
 +            return false;
 +        };
 +        Seat::<State>::from_resource(seat).is_some_and(|s| s == self.seat)
-+            && self.input_serials.is_recent_for(*serial, maker)
++            && self
++                .input_serials
++                .is_recent_for(*serial, |to| self.same_app(Some(to), Some(maker)))
 +    }
 +}
 +
