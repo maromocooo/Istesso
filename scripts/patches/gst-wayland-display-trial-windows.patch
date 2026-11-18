@@ -1,6 +1,7 @@
 Windows for everyday use: the pointer, the button and the keyboard go to the same window, the
 one a person sees under the pointer (1); a window is told it is maximized, not fullscreen,
-unless it asks (2).
+unless it asks (2); a second window keeps its own size and is not lost under the first, and
+an application can ask for a window to come forward (3).
 
 A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
 MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
@@ -69,8 +70,57 @@ Tests: the first window is told maximized at the size of the output and not full
 that asks for fullscreen has it and is maximized again when it leaves it; a maximized window
 is told the new size of the output.
 
+3. A second window that is not lost (a stopgap until windows can be switched from outside)
+
+The fault: a second window without a parent (Blender's Preferences, a second Firefox window)
+was told to fill the output like the first and lay exactly over it. A click on the first
+window, if it ever came up, hid the second for good: only the top window can be clicked.
+
+What it changes:
+
+- A window without a parent that comes while another window fills the output is not made as
+  large as the output. It is told how much room there is (the configure's bounds), keeps the
+  size it wants, and lies over the middle of the output. So does any window without a parent
+  that does not fill the output (one with a largest size, say). It keeps its size when it
+  leaves fullscreen or asks to be maximized no longer. (A window that comes while only such
+  smaller windows are shown, after a splash screen say, still fills the output.)
+- A window that was shown before it had a picture (it committed without one first, as
+  Blender does with its Preferences) is placed again by the size of its first picture.
+  Before, it was placed as a window of no size: over the middle meant its corner lay in the
+  middle, and the rest of it beyond the output. (This holds for dialogs too.)
+- When a window that fills the output is raised by a click, the smaller windows without a
+  parent of the same client are put above it again, in the order they had, with their dialogs;
+  its own dialogs come above all of them. Windows of other clients stay where they are. The
+  click itself goes as in part 1: the button and the keyboard go to what is on top under the
+  pointer after this, so a click where a smaller window comes back goes to that window.
+- `xdg_activation_v1` is offered: an application can ask for one of its windows to come
+  forward (raised with its dialogs, with the keyboard). A token counts for 10 seconds and once.
+  It is how a second start of an application shows the window of the first, and how the
+  first window can be brought back over a smaller one. A window that is not shown yet is not
+  remembered: it comes in front with the keyboard when it is shown anyway.
+
+Tests: a second window without a parent keeps its size, lies over the middle, has the pointer
+that stood there and the keyboard, and keeps its size when it leaves fullscreen; one shown
+before its picture lies over the middle by the size of its picture; the main window brought
+forward by activation lies over the smaller one and is the active window, and a click on it
+brings the smaller window back on top while the main window has the button and the keyboard,
+and the smaller window takes a click where it lies. Two tests of gst-wayland-display-dialogs.patch
+are changed to this rule (a second window without a parent: told the room, not the size of
+the output; over the middle, not at the corner).
+
+Known limits:
+
+- Nothing outside the compositor can pick a window yet; a window under another that fills the
+  output is reached only when the one on top goes, or by its application.
+- "The same client" is one Wayland connection. An application that opens its windows on two
+  connections is two clients here.
+- A window that leaves fullscreen or maximized stays where it was put then (the corner), and a
+  window is not placed again when it changes its size after its first picture.
+- `xdg_toplevel.unset_maximized` of the first window is answered with the same size: it stays
+  maximized.
+
 diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
-index ce1ce1a..05371be 100644
+index ce1ce1a..41ba823 100644
 --- a/wayland-display-core/src/comp/input.rs
 +++ b/wayland-display-core/src/comp/input.rs
 @@ -19,7 +19,7 @@ use smithay::{
@@ -187,8 +237,17 @@ index ce1ce1a..05371be 100644
          let pointer = self.seat.get_pointer().unwrap();
          let keyboard = self.seat.get_keyboard().unwrap();
          // change the keyboard focus unless the pointer or keyboard is grabbed
-@@ -579,10 +638,10 @@ impl State {
+@@ -577,12 +636,19 @@ impl State {
+                 .map(|(w, p)| (w.clone(), p))
+             {
                  self.space.raise_element(&window, true);
++                // A window that fills the output does not hide its application's smaller
++                // windows.
++                if window.toplevel().is_some_and(|t| t.parent().is_none())
++                    && crate::comp::fills_the_output(&window)
++                {
++                    self.raise_its_smaller_windows(&window);
++                }
                  // Its dialogs stay in front of it.
                  self.raise_children_of(&window);
 -                keyboard.set_focus(self, Some(FocusTarget::from(window)), serial);
@@ -201,10 +260,42 @@ index ce1ce1a..05371be 100644
  }
  
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 68e95df..c777354 100644
+index 68e95df..6ae9ea4 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
-@@ -402,12 +402,18 @@ pub(crate) fn apply_video_info(
+@@ -58,6 +58,7 @@ use smithay::{
+         shm::ShmState,
+         socket::ListeningSocketSource,
+         viewporter::ViewporterState,
++        xdg_activation::XdgActivationState,
+     },
+ };
+ use std::sync::Mutex;
+@@ -151,6 +152,7 @@ pub struct State {
+     pub shell_state: XdgShellState,
+     pub shm_state: ShmState,
+     viewporter_state: ViewporterState,
++    pub(crate) activation_state: XdgActivationState,
+     cursor_event_count: i32,
+     pub single_pixel_buffer_state: SinglePixelBufferState,
+ }
+@@ -175,6 +177,7 @@ impl State {
+         let mut seat_state = SeatState::new();
+         let shell_state = XdgShellState::new::<State>(&dh);
+         let viewporter_state = ViewporterState::new::<State>(&dh);
++        let activation_state = XdgActivationState::new::<State>(&dh);
+         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+ 
+         let render_node: Option<DrmNode> = render_target.clone().into();
+@@ -275,6 +278,7 @@ impl State {
+             shell_state,
+             shm_state,
+             viewporter_state,
++            activation_state,
+             single_pixel_buffer_state,
+         }
+     }
+@@ -402,18 +406,35 @@ pub(crate) fn apply_video_info(
              .unwrap_or(new_size),
          );
  
@@ -228,7 +319,24 @@ index 68e95df..c777354 100644
              state.states.set(XdgState::Activated);
          });
          toplevel.send_configure();
-@@ -457,6 +463,61 @@ impl State {
+     }
+ }
+ 
++/// Whether a window has been told to fill the output: maximized, or fullscreen because it
++/// asked.
++pub(crate) fn fills_the_output(window: &Window) -> bool {
++    window.toplevel().is_some_and(|toplevel| {
++        toplevel.with_pending_state(|state| {
++            state.states.contains(XdgState::Maximized)
++                || state.states.contains(XdgState::Fullscreen)
++        })
++    })
++}
++
+ /// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
+ /// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
+ /// frame no longer counts.
+@@ -457,8 +478,64 @@ impl State {
          }
      }
  
@@ -288,16 +396,125 @@ index 68e95df..c777354 100644
 +    }
 +
      /// Where a window that is about to be shown goes: over the middle of its parent if it
-     /// has one that is shown, and at the corner otherwise ([`windows::place`]).
+-    /// has one that is shown, and at the corner otherwise ([`windows::place`]).
++    /// has one that is shown, at the corner if it fills the output, and over the middle of
++    /// the output otherwise ([`windows::place`]).
      pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
+         use smithay::wayland::seat::WaylandFocus;
+         let parent = window
+@@ -479,9 +556,59 @@ impl State {
+             .and_then(|output| output.current_mode())
+             .map(|mode| mode.size.to_logical(1))
+             .unwrap_or_default();
++        let parent =
++            parent.or_else(|| (!fills_the_output(window)).then(|| Rectangle::from_size(output)));
+         windows::place(window.geometry().size, parent, output)
+     }
+ 
++    /// Puts the smaller windows without a parent that `window`'s client has above it again
++    /// (in the order they had), and their dialogs above them. Called when a window that fills
++    /// the output has been raised by a click: a second window of the same application, such
++    /// as Blender's Preferences, cannot be lost under it. Windows of other clients stay where
++    /// they are.
++    pub(crate) fn raise_its_smaller_windows(&mut self, window: &Window) {
++        use smithay::reexports::wayland_server::Resource;
++        use smithay::wayland::seat::WaylandFocus;
++        let client_of = |w: &Window| w.wl_surface().and_then(|s| s.client()).map(|c| c.id());
++        let Some(client) = client_of(window) else {
++            return;
++        };
++        let smaller: Vec<Window> = self
++            .space
++            .elements()
++            .filter(|w| {
++                *w != window
++                    && w.toplevel()
++                        .is_some_and(|toplevel| toplevel.parent().is_none())
++                    && !fills_the_output(w)
++                    && client_of(w).as_ref() == Some(&client)
++            })
++            .cloned()
++            .collect();
++        for w in smaller {
++            self.space.raise_element(&w, false);
++            self.raise_children_of(&w);
++        }
++    }
++
++    /// Brings a window forward because its application asked (`xdg_activation_v1`): it is
++    /// raised with its dialogs and has the keyboard.
++    pub(crate) fn activate_window(&mut self, window: &Window) {
++        self.space.raise_element(window, true);
++        self.raise_children_of(window);
++        let keyboard = self.seat.get_keyboard().unwrap();
++        if !keyboard.is_grabbed() {
++            keyboard.set_focus(
++                self,
++                Some(FocusTarget::from(window.clone())),
++                smithay::utils::SERIAL_COUNTER.next_serial(),
++            );
++            self.tell_windows_which_is_active();
++        }
++        self.pointer_to_the_window_under_it();
++        picture_changed(self);
++    }
++
+     /// Gives the keyboard to the window that is on top, when the window that had it is not
+     /// shown any more or nothing has it. A dialog that closes hands the keyboard back to the
+     /// window under it this way.
 diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
-index 7813b6f..087b51c 100644
+index 7813b6f..d7029ee 100644
 --- a/wayland-display-core/src/comp/windows.rs
 +++ b/wayland-display-core/src/comp/windows.rs
-@@ -43,6 +43,13 @@ pub fn place(
+@@ -13,10 +13,11 @@
+ //! "Windows" are toplevels: popups and the cursor do not count.
+ //!
+ //! A third thing is here because it is about windows that come later: where they go. The
+-//! compositor has one output and shows one picture. The first window fills it. A window that
+-//! has a parent (a dialog: `xdg_toplevel.set_parent`) keeps its own size and lies over the
+-//! middle of its parent, inside the output ([`place`]); any other window is put at the corner,
+-//! as the first is. Whatever comes later lies above what was there, and has the keyboard
++//! compositor has one output and shows one picture. The first window fills it, maximized. A
++//! window that has a parent (a dialog: `xdg_toplevel.set_parent`) keeps its own size and lies
++//! over the middle of its parent, inside the output ([`place`]). A window without a parent
++//! that comes while another fills the output keeps its own size too, and lies over the
++//! middle of the output. Whatever comes later lies above what was there, and has the keyboard
+ //! until it goes.
+ 
+ use smithay::utils::{Logical, Point, Rectangle, Size};
+@@ -43,6 +44,42 @@ pub fn place(
          .into()
  }
  
++/// Marks a window without a parent that came while another filled the output: it was not
++/// made as large as the output, and is not made so when it leaves fullscreen.
++pub struct KeepsItsOwnSize;
++
++/// Marks a window that was shown before it had a size (it committed without a picture
++/// first): it is placed again when it has one.
++struct PlacedWithoutASize(std::cell::Cell<bool>);
++
++/// Remembers that `window` is being placed without a size, if it has none.
++pub fn placing(window: &smithay::desktop::Window) {
++    if window.geometry().size.is_empty() {
++        window
++            .user_data()
++            .insert_if_missing(|| PlacedWithoutASize(std::cell::Cell::new(true)));
++    }
++}
++
++/// Whether `window` was placed without a size and has one now: true once.
++pub fn to_be_placed_again(window: &smithay::desktop::Window) -> bool {
++    let Some(mark) = window.user_data().get::<PlacedWithoutASize>() else {
++        return false;
++    };
++    let again = mark.0.get() && !window.geometry().size.is_empty();
++    if again {
++        mark.0.set(false);
++    }
++    again
++}
++
 +/// The size a window is told when it is to fill an output of this size: the output's, kept
 +/// to the window's largest size where it has one (a largest size of 0 is no limit).
 +pub fn full_size(output: Size<i32, Logical>, max: Size<i32, Logical>) -> Size<i32, Logical> {
@@ -308,7 +525,7 @@ index 7813b6f..087b51c 100644
  /// Receives the number of windows whenever it changes. Called on the compositor's thread.
  pub type WindowSink = Box<dyn Fn(usize) + Send>;
  
-@@ -104,6 +111,14 @@ mod tests {
+@@ -104,6 +141,14 @@ mod tests {
          assert_eq!((at.x, at.y), (0, 0));
      }
  
@@ -324,10 +541,18 @@ index 7813b6f..087b51c 100644
      fn a_window_without_a_parent_is_put_at_the_corner() {
          let at = place((400, 300).into(), None, (1720, 720).into());
 diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
-index d552363..b0f55d3 100644
+index d552363..ea8d5c9 100644
 --- a/wayland-display-core/src/tests/client.rs
 +++ b/wayland-display-core/src/tests/client.rs
-@@ -62,6 +62,8 @@ struct State {
+@@ -27,6 +27,7 @@ use wayland_protocols::{
+         viewporter::client::wp_viewport::WpViewport,
+         viewporter::client::wp_viewporter::WpViewporter,
+     },
++    xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1},
+     xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
+ };
+ 
+@@ -62,10 +63,15 @@ struct State {
      shm: Option<wl_shm::WlShm>,
      cursor_surface: Option<wl_surface::WlSurface>,
      keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -336,15 +561,53 @@ index d552363..b0f55d3 100644
      windows: Vec<Window>,
      pub mouse_events: Vec<MouseEvents>,
      pub output: Option<wl_output::WlOutput>,
-@@ -168,7 +170,6 @@ delegate_noop!(State: ignore WpViewport);
+     pub output_events: Vec<wl_output::Event>,
++    activation: Option<xdg_activation_v1::XdgActivationV1>,
++    /// The last activation token the compositor handed out.
++    activation_token: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Default)]
+@@ -144,6 +150,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
+                         registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
+                     );
+                 }
++                "xdg_activation_v1" => {
++                    state.activation =
++                        Some(registry.bind::<xdg_activation_v1::XdgActivationV1, _, _>(
++                            name,
++                            version,
++                            qh,
++                            (),
++                        ));
++                }
+                 "wl_output" => {
+                     // The compositor only advertises wl_output after the first
+                     // VideoInfo has created it, so this branch may fire well after
+@@ -168,6 +183,22 @@ delegate_noop!(State: ignore WpViewport);
  delegate_noop!(State: ignore ZwpPointerConstraintsV1);
  delegate_noop!(State: ignore ZwpLockedPointerV1);
  delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
--
++delegate_noop!(State: ignore xdg_activation_v1::XdgActivationV1);
++
++impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for State {
++    fn event(
++        state: &mut Self,
++        _: &xdg_activation_token_v1::XdgActivationTokenV1,
++        event: xdg_activation_token_v1::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let xdg_activation_token_v1::Event::Done { token } = event {
++            state.activation_token = Some(token);
++        }
++    }
++}
+ 
  impl WaylandClient {
      pub fn new(w_socket: UnixStream) -> Self {
-         let backend = Backend::connect(w_socket).unwrap();
-@@ -196,6 +197,7 @@ impl WaylandClient {
+@@ -196,10 +227,13 @@ impl WaylandClient {
              shm: None,
              cursor_surface: None,
              keyboard: None,
@@ -352,7 +615,13 @@ index d552363..b0f55d3 100644
              windows: Vec::new(),
              mouse_events: Vec::new(),
              output: None,
-@@ -315,14 +317,15 @@ impl WaylandClient {
+             output_events: Vec::new(),
++            activation: None,
++            activation_token: None,
+         };
+ 
+         WaylandClient {
+@@ -315,14 +349,15 @@ impl WaylandClient {
      }
  
      /// The size and bounds the compositor told the last window, and whether it told it to
@@ -370,7 +639,7 @@ index d552363..b0f55d3 100644
          )
      }
  
-@@ -349,8 +352,23 @@ impl WaylandClient {
+@@ -349,8 +384,23 @@ impl WaylandClient {
      /// as its first: the window is as large as the picture, as a dialog is that knows its
      /// own size.
      pub fn setup_window_of_one_colour(&mut self, (width, height): (i32, i32), bgra: [u8; 4]) {
@@ -395,7 +664,7 @@ index d552363..b0f55d3 100644
          let mut file = tempfile::tempfile().unwrap();
          file.write_all(&bgra.repeat((width * height) as usize))
              .unwrap();
-@@ -370,13 +388,11 @@ impl WaylandClient {
+@@ -370,13 +420,11 @@ impl WaylandClient {
              &state.qh,
              (),
          );
@@ -412,7 +681,7 @@ index d552363..b0f55d3 100644
      /// Whether the compositor has asked the last window to close.
      pub fn asked_to_close(&self) -> bool {
          self.state.windows.last().is_some_and(|w| w.close_requested)
-@@ -392,6 +408,92 @@ impl WaylandClient {
+@@ -392,6 +440,117 @@ impl WaylandClient {
          }
      }
  
@@ -502,10 +771,35 @@ index d552363..b0f55d3 100644
 +            .position(|w| &w.surface == surface)
 +    }
 +
++    /// Asks the compositor for an activation token (`xdg_activation_v1`), as an application
++    /// does before it asks for a window to come forward. The token comes with a round trip.
++    pub fn ask_for_an_activation_token(&mut self) {
++        let activation = self
++            .state
++            .activation
++            .as_ref()
++            .expect("the compositor offers no xdg_activation_v1");
++        let token = activation.get_activation_token(&self.qh, ());
++        token.commit();
++        self.state.activation_token = None;
++    }
++
++    /// Asks for the first window to come forward, with the token the compositor handed out.
++    pub fn activate_first_window(&mut self) {
++        let token = self
++            .state
++            .activation_token
++            .take()
++            .expect("no activation token came");
++        let surface = &self.state.windows.first().unwrap().surface;
++        let activation = self.state.activation.as_ref().unwrap();
++        activation.activate(token, surface);
++    }
++
      pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
          self.state.mouse_events.as_mut()
      }
-@@ -696,7 +798,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
+@@ -696,7 +855,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
  
  impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
      fn event(
@@ -514,7 +808,7 @@ index d552363..b0f55d3 100644
          _: &wl_keyboard::WlKeyboard,
          event: wl_keyboard::Event,
          _: &(),
-@@ -704,6 +806,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+@@ -704,6 +863,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
          _: &QueueHandle<Self>,
      ) {
          tracing::debug!("{:?}", event);
@@ -536,15 +830,80 @@ index fc6caee..ad5c069 100644
  mod test_resolution;
 +mod test_trial_windows;
  mod test_windows;
+diff --git a/wayland-display-core/src/tests/test_dialogs.rs b/wayland-display-core/src/tests/test_dialogs.rs
+index e64aad8..55a0b19 100644
+--- a/wayland-display-core/src/tests/test_dialogs.rs
++++ b/wayland-display-core/src/tests/test_dialogs.rs
+@@ -68,30 +68,31 @@ fn has_the_keyboard(f: &Fixture, window: &Window) -> bool {
+ fn a_window_that_draws_once_is_in_the_frame_and_takes_a_click() {
+     let mut f = fixture();
+     let (before, _) = white(&mut f, (0, 0, 0, 0));
+-    // A second window without a parent, as some applications open their dialogs. It is told
+-    // to fill the output like any window; this one keeps its own size all the same.
++    // A second window without a parent, as some applications open their dialogs. While the
++    // first fills the output it is not told to (gst-wayland-display-trial-windows.patch): it
++    // is told how much room there is, and keeps its own size.
+     open(&mut f, false, (120, 80));
+     assert_eq!(
+         f.client.told_to_last_window(),
+-        ((320, 240), Some((0, 0)), true)
++        ((0, 0), Some((320, 240)), false)
+     );
+ 
+-    // It has committed its picture exactly once, and it is in the frame: at the corner,
+-    // above the first window.
+-    let (_, at_the_corner) = white(&mut f, (0, 0, 120, 80));
+-    assert_eq!(at_the_corner, 120 * 80);
++    // It has committed its picture exactly once, and it is in the frame: over the middle of
++    // the output, above the first window.
++    let (_, in_the_middle) = white(&mut f, (100, 80, 220, 160));
++    assert_eq!(in_the_middle, 120 * 80);
+     let stack = windows(&f);
+     assert_eq!(stack.len(), 2);
+     assert_eq!(
+         f.server.space.element_location(&stack[1]).unwrap(),
+-        (0, 0).into()
++        (100, 80).into()
+     );
+     assert_eq!(stack[1].geometry().size, (120, 80).into());
+     assert!(has_the_keyboard(&f, &stack[1]));
+ 
+     // And the pointer reaches it.
+     f.server
+-        .pointer_motion_absolute(0, Point::from((60.0, 40.0)));
++        .pointer_motion_absolute(0, Point::from((110.0, 90.0)));
+     f.round_trip();
+     f.server.pointer_button(0, 0x110, ButtonState::Pressed);
+     f.server.pointer_button(0, 0x110, ButtonState::Released);
+@@ -209,14 +210,15 @@ fn a_child_larger_than_the_output_begins_at_the_corner() {
+ }
+ 
+ #[test]
+-fn two_ordinary_windows_are_both_told_to_fill_the_output_and_the_later_is_in_front() {
++fn two_ordinary_windows_the_later_keeps_its_size_and_is_in_front() {
+     let mut f = fixture();
+     let first = windows(&f)[0].clone();
+-    // A second ordinary window, which does as it is told.
++    // A second ordinary window: told how much room there is, not to fill the output
++    // (gst-wayland-display-trial-windows.patch). This one takes all of it.
+     open(&mut f, false, (320, 240));
+     assert_eq!(
+         f.client.told_to_last_window(),
+-        ((320, 240), Some((0, 0)), true)
++        ((0, 0), Some((320, 240)), false)
+     );
+     let stack = windows(&f);
+     assert_eq!(stack[0], first);
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
-index 0000000..2f154ce
+index 0000000..fd26c36
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_windows.rs
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,254 @@
 +//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
 +//! window, the one a person sees under the pointer; a window is told to be maximized, not
-+//! fullscreen, unless it asks. A real Wayland client opens the windows.
++//! fullscreen, unless it asks; a second window keeps its own size and is not lost under the
++//! first. A real Wayland client opens the windows.
 +
 +use crate::comp::apply_video_info;
 +use crate::tests::fixture::Fixture;
@@ -686,11 +1045,120 @@ index 0000000..2f154ce
 +    assert!(!states.contains(&Told::Fullscreen), "{states:?}");
 +    assert_eq!(f.client.told_to_last_window().0, (640, 360));
 +}
++
++/// Opens a second window without a parent that draws itself once at this size.
++fn open_a_second_window(f: &mut Fixture, size: (i32, i32)) {
++    f.client.create_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour(size, WHITE);
++    f.round_trip();
++    f.round_trip();
++}
++
++#[test]
++fn a_second_window_without_a_parent_keeps_its_size_and_lies_over_the_middle() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((0, 0), Some((320, 240)), false)
++    );
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (100, 80).into()
++    );
++    // It came up under the pointer, which stood in the middle: it has the pointer and the
++    // keyboard.
++    assert_eq!(f.client.pointer_and_buttons().0, Some(1));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++
++    // Fullscreen, and back: it has its own size again, not the output's.
++    f.client.ask_for_fullscreen(true);
++    f.round_trip();
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((320, 240), Some((320, 240)), true)
++    );
++    f.client.ack_and_commit();
++    f.round_trip();
++    f.client.ask_for_fullscreen(false);
++    f.round_trip();
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((0, 0), Some((320, 240)), false)
++    );
++}
++
++#[test]
++fn the_main_window_raised_by_a_click_brings_the_smaller_window_back_on_top() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    let (main, smaller) = {
++        let stack: Vec<_> = f.server.space.elements().cloned().collect();
++        (stack[0].clone(), stack[1].clone())
++    };
++
++    // The application asks for its main window to come forward (xdg_activation_v1): it is
++    // raised over the smaller one and has the keyboard.
++    f.client.ask_for_an_activation_token();
++    f.round_trip();
++    f.client.activate_first_window();
++    f.round_trip();
++    f.round_trip();
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack, [smaller.clone(), main.clone()]);
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    assert!(f.client.told_active(0));
++    assert!(!f.client.told_active(1));
++    // The pointer, which stood over the smaller window, is in the main window now.
++    assert_eq!(f.client.pointer_and_buttons().0, Some(0));
++
++    // A click on the main window, beside where the smaller one lies: the main window has the
++    // button and the keyboard, and the smaller window is on top again.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    click(&mut f);
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack, [main, smaller]);
++    assert_eq!(f.client.pointer_and_buttons(), (Some(0), vec![2, 0]));
++    assert_eq!(f.client.keyboard_window(), Some(0));
++
++    // And it takes the pointer and a click again where it lies.
++    f.server
++        .pointer_motion_absolute(0, Point::from((150.0, 100.0)));
++    f.round_trip();
++    click(&mut f);
++    assert_eq!(f.client.pointer_and_buttons(), (Some(1), vec![2, 2]));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++}
++
++#[test]
++fn a_second_window_shown_before_its_picture_lies_over_the_middle_by_the_size_of_its_picture() {
++    let mut f = fixture();
++    f.client.create_window();
++    f.round_trip();
++    f.client.ack_and_commit_without_a_picture();
++    f.round_trip();
++    f.round_trip();
++    f.client.draw_last_window_of_one_colour((120, 80), WHITE);
++    f.round_trip();
++    f.round_trip();
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack.len(), 2);
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (100, 80).into()
++    );
++    // The pointer, in the middle, is in it.
++    assert_eq!(f.client.pointer_and_buttons().0, Some(1));
++}
 diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
-index 595d547..c051ecd 100644
+index 595d547..cdb0025 100644
 --- a/wayland-display-core/src/wayland/handlers/compositor.rs
 +++ b/wayland-display-core/src/wayland/handlers/compositor.rs
-@@ -42,12 +42,17 @@ impl CompositorHandler for State {
+@@ -42,12 +42,24 @@ impl CompositorHandler for State {
          }
          crate::comp::client_committed(self);
  
@@ -703,6 +1171,13 @@ index 595d547..c051ecd 100644
 +            .cloned();
 +        if let Some(window) = shown {
              window.on_commit();
++            // A window that was shown before its first picture was put where a window of no
++            // size goes. It is put where it belongs once it has a size.
++            if crate::comp::windows::to_be_placed_again(&window) {
++                let loc = self.place_window(&window);
++                self.space.map_element(window.clone(), loc, false);
++                crate::comp::picture_changed(self);
++            }
 +            // What is under the pointer may have changed with this picture: a window that
 +            // was shown before its first picture (as some applications do with a second
 +            // window) is found by the pointer from its first picture on.
@@ -710,9 +1185,29 @@ index 595d547..c051ecd 100644
          }
          self.popups.commit(surface);
  
-@@ -92,25 +97,15 @@ impl CompositorHandler for State {
+@@ -91,26 +103,35 @@ impl CompositorHandler for State {
+                     toplevel.with_pending_state(|state| {
                          state.bounds = room;
                      });
++                } else if max_size.w == 0
++                    && max_size.h == 0
++                    && self.space.elements().any(crate::comp::fills_the_output)
++                    && !toplevel
++                        .with_pending_state(|state| state.states.contains(XdgState::Fullscreen))
++                {
++                    // A second window without a parent, while a window that fills the output
++                    // is shown (Blender's Preferences, a second Firefox window): it is not made
++                    // as large as the output. It keeps the size it wants, is told how much room
++                    // there is, and lies over the middle of the output.
++                    let room = self.output_size();
++                    with_states(surface, |states| {
++                        states
++                            .data_map
++                            .insert_if_missing(|| crate::comp::windows::KeepsItsOwnSize)
++                    });
++                    toplevel.with_pending_state(|state| {
++                        state.bounds = room;
++                    });
                  } else if max_size.w == 0 && max_size.h == 0 {
 +                    let size = self.output_size();
                      toplevel.with_pending_state(|state| {
@@ -744,7 +1239,14 @@ index 595d547..c051ecd 100644
                      });
                  }
                  toplevel.with_pending_state(|state| {
-@@ -131,12 +126,11 @@ impl CompositorHandler for State {
+@@ -125,18 +146,18 @@ impl CompositorHandler for State {
+                 // pointer.
+                 window.on_commit();
+                 let loc = self.place_window(&window);
++                crate::comp::windows::placing(&window);
+                 self.space.map_element(window.clone(), loc, true);
+                 self.seat.get_keyboard().unwrap().set_focus(
+                     self,
                      Some(FocusTarget::from(window)),
                      SERIAL_COUNTER.next_serial(),
                  );
@@ -759,8 +1261,17 @@ index 595d547..c051ecd 100644
              }
  
              return;
+diff --git a/wayland-display-core/src/wayland/handlers/mod.rs b/wayland-display-core/src/wayland/handlers/mod.rs
+index e41c12b..b764f27 100644
+--- a/wayland-display-core/src/wayland/handlers/mod.rs
++++ b/wayland-display-core/src/wayland/handlers/mod.rs
+@@ -10,3 +10,4 @@ pub mod shm;
+ pub mod viewporter;
+ pub mod wl_drm;
+ pub mod xdg;
++pub mod xdg_activation;
 diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
-index 4931ed6..e3994d9 100644
+index 4931ed6..1427063 100644
 --- a/wayland-display-core/src/wayland/handlers/xdg.rs
 +++ b/wayland-display-core/src/wayland/handlers/xdg.rs
 @@ -5,7 +5,8 @@ use smithay::{
@@ -773,7 +1284,7 @@ index 4931ed6..e3994d9 100644
      utils::Serial,
      wayland::{
          seat::WaylandFocus,
-@@ -41,10 +42,36 @@ impl XdgShellHandler for State {
+@@ -41,10 +42,51 @@ impl XdgShellHandler for State {
              self.space.unmap_elem(&gone);
          }
          self.keyboard_to_the_top_window();
@@ -788,8 +1299,9 @@ index 4931ed6..e3994d9 100644
 +
 +    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
 +        // Back to what it was told before it asked: a window without a parent fills the
-+        // output, maximized; a dialog keeps a size of its own.
-+        if surface.parent().is_none() {
++        // output, maximized; a dialog, and a second window that keeps its own size, have a
++        // size of their own.
++        if surface.parent().is_none() && !keeps_its_own_size(&surface) {
 +            surface.with_pending_state(|state| state.states.unset(XdgState::Fullscreen));
 +            self.fill_the_output(&surface, false);
 +        } else {
@@ -807,6 +1319,88 @@ index 4931ed6..e3994d9 100644
 +        self.fill_the_output(&surface, false);
 +    }
 +
++    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
++        // The first window stays maximized: there is no desk behind it to show. A dialog or
++        // a second window has a size of its own again.
++        if surface.parent().is_some() || keeps_its_own_size(&surface) {
++            surface.with_pending_state(|state| {
++                state.states.unset(XdgState::Maximized);
++                state.size = None;
++            });
++        }
++        if surface.is_initial_configure_sent() {
++            surface.send_configure();
++        }
++    }
++
      fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
          self.unconstrain_popup(&surface);
          if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
+@@ -106,6 +148,16 @@ impl XdgShellHandler for State {
+     }
+ }
+ 
++/// Whether a window was shown as a second window, with a size of its own.
++fn keeps_its_own_size(surface: &ToplevelSurface) -> bool {
++    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
++        states
++            .data_map
++            .get::<crate::comp::windows::KeepsItsOwnSize>()
++            .is_some()
++    })
++}
++
+ impl State {
+     fn unconstrain_popup(&self, popup: &PopupSurface) {
+         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
+diff --git a/wayland-display-core/src/wayland/handlers/xdg_activation.rs b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
+new file mode 100644
+index 0000000..9faf9f0
+--- /dev/null
++++ b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
+@@ -0,0 +1,45 @@
++use smithay::{
++    delegate_xdg_activation,
++    reexports::wayland_server::protocol::wl_surface::WlSurface,
++    wayland::{
++        seat::WaylandFocus,
++        xdg_activation::{
++            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
++        },
++    },
++};
++
++use crate::comp::State;
++
++/// How long a token is good for: an application asks for a window to come forward right
++/// after it was told to (a second instance started, a link opened).
++const TOKEN_LIFETIME_S: u64 = 10;
++
++impl XdgActivationHandler for State {
++    fn activation_state(&mut self) -> &mut XdgActivationState {
++        &mut self.activation_state
++    }
++
++    fn request_activation(
++        &mut self,
++        token: XdgActivationToken,
++        token_data: XdgActivationTokenData,
++        surface: WlSurface,
++    ) {
++        self.activation_state.remove_token(&token);
++        if token_data.timestamp.elapsed().as_secs() >= TOKEN_LIFETIME_S {
++            return;
++        }
++        // A window that is not shown yet comes in front, with the keyboard, when it is.
++        let shown = self
++            .space
++            .elements()
++            .find(|w| w.wl_surface().is_some_and(|s| *s == surface))
++            .cloned();
++        if let Some(window) = shown {
++            self.activate_window(&window);
++        }
++    }
++}
++
++delegate_xdg_activation!(State);
