@@ -9,7 +9,6 @@
     <string name="input_port_hint">入力のポート</string>
     <string name="code_hint">ペアリングコード（ホストに出た 8 文字）</string>
     <string name="pair">ペアにする</string>
-    <string name="connect">つなぐ</string>
     <string name="pairing">ペアにしています…</string>
     <string name="paired_with">ペアの相手：%1$s</string>
     <string name="not_paired">まだペアにしていません</string>
@@ -27,11 +26,12 @@
     <string name="input_open">入力：つながっています</string>
     <string name="input_waiting">入力：つないでいます</string>
     <string name="input_over">入力：受け付けられません</string>
-    <string name="panel_open_a">パネルを足す（試し A：新しいタスク）</string>
-    <string name="panel_open_b">パネルを足す（試し B：新しい文書）</string>
-    <string name="panel_title">仮のパネル %1$d（%2$s）</string>
-    <string name="panel_note">映像なしの仮の画面。ホストには何もつながない。</string>
-    <string name="panel_more">もう 1 枚</string>
     <string name="middle_off">中ボタン：切</string>
     <string name="middle_on">中ボタン：入（左が中になる）</string>
+    <string name="apps_title">ホストのアプリ（1 つにつき 1 枚のパネル。開いているものは前に出る）</string>
+    <string name="app_editor">エディター</string>
+    <string name="app_blender">Blender</string>
+    <string name="app_firefox">Firefox</string>
+    <string name="app_manual">試し（上のポートを手で）</string>
+    <string name="panel_name">%1$s（Istesso 試作）</string>
 </resources>

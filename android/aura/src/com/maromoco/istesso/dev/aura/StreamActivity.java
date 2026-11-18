@@ -21,7 +21,8 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 
 /**
- * One panel with the host's picture. Keys and the pointer made over it go to the host. While the
+ * One panel with the picture of one host application (the intent's data names it; one panel per
+ * application, the owner's decision of 2026-11-18). Keys and the pointer made over it go to the host. While the
  * panel is in the background the picture is let go (the host gives its encoder back) and the
  * input is closed (the host lets go of whatever was held down).
  */
@@ -31,6 +32,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private static final float WHEEL_PIXELS = 15f;
 
     private Settings settings;
+    /** The host application this panel shows. */
+    private HostApp app;
     private Fitted frame;
     private SurfaceView view;
     private TextView status;
@@ -71,6 +74,11 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         settings = new Settings(this);
+        app = HostApp.of(getIntent().getData());
+        if (app == null) {
+            app = HostApp.named("manual");
+        }
+        setTitle(getString(R.string.panel_name, getString(app.titleRes)));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         frame = new Fitted(this);
@@ -121,6 +129,14 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         }
     }
 
+    /** The same application chosen again: this panel is brought to the front, nothing else. */
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        HostApp asked = HostApp.of(intent.getData());
+        Log.i(TAG, "panel brought to the front for " + (asked == null ? "?" : asked.name) + " (this panel: " + app.name + ")");
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
@@ -134,7 +150,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             input = 0;
             inputLine = getString(R.string.need_pair);
         } else {
-            input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(), settings.inputPort()));
+            input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(), app.inputPort(settings)));
             if (input == 0) {
                 String why = Native.lastError(Native.ERROR_PAIRING);
                 inputLine = getString(R.string.input_over) + " "
@@ -166,7 +182,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (!resumed || !surfaceReady || picture != null) {
             return;
         }
-        picture = new Picture(settings.configDir, Settings.join(settings.host(), settings.picturePort()),
+        picture = new Picture(settings.configDir, Settings.join(settings.host(), app.picturePort(settings)),
                 settings.hostId(), view.getHolder().getSurface(), this);
         picture.start();
     }
@@ -352,6 +368,20 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         }
     }
 
+    /**
+     * The scroll axes, written to the log once for each kind of device and direction (tag
+     * IstessoAura), so that which way a two-finger swipe goes can be read next to what the host
+     * did: what Android said (h, v) and what was sent (pixels right, pixels down).
+     */
+    private void noteScroll(MotionEvent e, float h, float v, int dx, int dy) {
+        String k = "scroll source=0x" + Integer.toHexString(e.getSource()) + " tool=" + e.getToolType(0)
+                + " class=" + e.getClassification() + " h" + (int) Math.signum(h) + " v" + (int) Math.signum(v);
+        if (seenKinds.add(k)) {
+            android.util.Log.i("IstessoAura", k + " AXIS_HSCROLL=" + h + " AXIS_VSCROLL=" + v
+                    + " sent right=" + dx + " down=" + dy + " (down > 0: the host scrolls down, as for a wheel turned towards the person)");
+        }
+    }
+
     private void buttonsOf(MotionEvent e) {
         int now = e.getButtonState();
         int[][] map = {
@@ -391,8 +421,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             case MotionEvent.ACTION_SCROLL: {
                 place(e);
                 // The system says how far the content moves; the host wants how far to scroll.
-                scrollX += e.getAxisValue(MotionEvent.AXIS_HSCROLL) * WHEEL_PIXELS;
-                scrollY -= e.getAxisValue(MotionEvent.AXIS_VSCROLL) * WHEEL_PIXELS;
+                float h = e.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                float v = e.getAxisValue(MotionEvent.AXIS_VSCROLL);
+                scrollX += h * WHEEL_PIXELS;
+                scrollY -= v * WHEEL_PIXELS;
                 int dx = (int) scrollX;
                 int dy = (int) scrollY;
                 if (dx != 0 || dy != 0) {
@@ -400,6 +432,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                     scrollY -= dy;
                     send(Native.INPUT_SCROLL, dx, dy);
                 }
+                noteScroll(e, h, v, dx, dy);
                 return true;
             }
             default:

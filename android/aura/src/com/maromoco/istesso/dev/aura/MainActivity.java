@@ -72,20 +72,18 @@ public final class MainActivity extends Activity {
         pair.setOnClickListener(v -> pairNow());
         column.addView(pair);
 
-        Button connect = new Button(this);
-        connect.setText(R.string.connect);
-        connect.setOnClickListener(v -> connectNow());
-        column.addView(connect);
-
-        // Placeholder panels, for the Home Space question only (no picture, nothing on the host).
-        Button panelA = new Button(this);
-        panelA.setText(R.string.panel_open_a);
-        panelA.setOnClickListener(v -> PanelActivity.open(this, 2, 0));
-        column.addView(panelA);
-        Button panelB = new Button(this);
-        panelB.setText(R.string.panel_open_b);
-        panelB.setOnClickListener(v -> PanelActivity.open(this, 2, 1));
-        column.addView(panelB);
+        // The host's applications, one panel each (the owner's decision, 2026-11-18). Choosing one
+        // that has a panel already brings that panel to the front.
+        TextView apps = new TextView(this);
+        apps.setText(R.string.apps_title);
+        apps.setPadding(0, pad / 2, 0, 0);
+        column.addView(apps);
+        for (HostApp app : HostApp.ALL) {
+            Button open = new Button(this);
+            open.setText(app.titleRes);
+            open.setOnClickListener(v -> openApp(app));
+            column.addView(open);
+        }
 
         status = new TextView(this);
         status.setPadding(0, pad / 2, 0, 0);
@@ -155,7 +153,12 @@ public final class MainActivity extends Activity {
         }, "istesso-pair").start();
     }
 
-    private void connectNow() {
+    /**
+     * Opens the application's panel, or brings its panel to the front: a document of its own,
+     * identified by the application (StreamActivity is documentLaunchMode="intoExisting"). Never
+     * FLAG_ACTIVITY_MULTIPLE_TASK, which would add a panel every time.
+     */
+    private void openApp(HostApp app) {
         if (!saveHost()) {
             return;
         }
@@ -163,6 +166,9 @@ public final class MainActivity extends Activity {
             status.setText(R.string.need_pair);
             return;
         }
-        startActivity(new Intent(this, StreamActivity.class));
+        Intent i = new Intent(this, StreamActivity.class);
+        i.setData(app.uri());
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT | Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT);
+        startActivity(i);
     }
 }

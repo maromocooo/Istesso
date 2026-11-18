@@ -36,20 +36,18 @@
             </intent-filter>
         </activity>
 
-        <!-- Not made again when the panel is resized: the connections live with it. -->
+        <!-- One panel per host application: a document of its own, identified by the application
+             (the intent's data, istesso-aura://app/NAME). Opening the same application again brings
+             its panel to the front instead of adding one (intoExisting). A panel the person closes
+             leaves the recent list. Not made again when the panel is resized: the connections live
+             with it. -->
         <activity
             android:name=".StreamActivity"
             android:exported="false"
+            android:documentLaunchMode="intoExisting"
+            android:autoRemoveFromRecents="true"
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
-        <!-- A placeholder panel with no picture: can Home Space show two or more of ours side by side? -->
-        <activity
-            android:name=".PanelActivity"
-            android:exported="false"
-            android:resizeableActivity="true"
-            android:taskAffinity="com.maromoco.istesso.dev.aura.panel"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode"
-            android:theme="@android:style/Theme.DeviceDefault" />
     </application>
 </manifest>
