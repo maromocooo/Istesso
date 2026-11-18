@@ -73,6 +73,14 @@ pub enum AudioAction {
         /// `key=value`; may be given several times
         #[arg(long)]
         node_property: Vec<String>,
+        /// With `--source pipewire`, for tests: take the sound in through a
+        /// capture stream (`Stream/Input/Audio`, not linked automatically)
+        /// instead of an output. It is not in any list of outputs, so it can
+        /// never become the default output, nor be remembered as one; the
+        /// sound reaches it only through links made by name with `pw-link`
+        /// (its ports are found with `pw-link -i`)
+        #[arg(long)]
+        test_input: bool,
         /// Stop, as at the end of `--seconds`, once this file exists
         #[arg(long)]
         stop_file: Option<PathBuf>,
@@ -252,6 +260,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             node_description,
             quantum,
             node_property,
+            test_input,
             stop_file,
         } => serve(ServeOptions {
             addr: SocketAddr::new(bind, port),
@@ -264,7 +273,7 @@ pub fn run(action: AudioAction) -> Result<(), String> {
             node_name,
             node_description,
             quantum,
-            node_properties: node_property,
+            node_properties: node_properties(test_input, node_property),
             stop_file,
         }),
         AudioAction::Play {
@@ -387,6 +396,20 @@ struct ServeOptions {
 type Feeder = std::thread::JoinHandle<std::io::Result<()>>;
 /// What a source that captures has to say about itself at the end.
 type CaptureReport = Box<dyn Fn() -> serde_json::Value>;
+
+/// The properties of the capture node. With `test_input`, the node is a
+/// capture stream that nothing links to by itself, rather than an output:
+/// the session manager only ever chooses (and remembers) outputs and
+/// inputs as defaults. Properties given by hand come after, so they win.
+fn node_properties(test_input: bool, given: Vec<String>) -> Vec<String> {
+    let mut properties = Vec::new();
+    if test_input {
+        properties.push("media.class=Stream/Input/Audio".to_string());
+        properties.push("node.autoconnect=false".to_string());
+    }
+    properties.extend(given);
+    properties
+}
 
 fn parse_property(text: &str) -> Result<(String, String), String> {
     match text.split_once('=') {
@@ -2061,6 +2084,26 @@ mod tests {
         assert_eq!(mac::missed_for_test(&seen), (2, 1));
         mac::note_turn_for_test(&seen, 6 * turn, Some((4 * turn, turn)));
         assert_eq!(mac::missed_for_test(&seen), (3, 2));
+    }
+
+    #[test]
+    fn a_test_input_is_a_stream_that_is_never_linked_by_itself() {
+        assert_eq!(
+            node_properties(false, vec!["device.routes=1".to_string()]),
+            vec!["device.routes=1".to_string()]
+        );
+        let properties: Vec<_> = node_properties(true, vec!["node.group=a".to_string()])
+            .iter()
+            .map(|text| parse_property(text).unwrap())
+            .collect();
+        assert_eq!(
+            properties,
+            vec![
+                ("media.class".to_string(), "Stream/Input/Audio".to_string()),
+                ("node.autoconnect".to_string(), "false".to_string()),
+                ("node.group".to_string(), "a".to_string()),
+            ]
+        );
     }
 
     #[test]
