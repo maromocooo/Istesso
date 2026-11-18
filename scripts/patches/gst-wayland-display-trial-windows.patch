@@ -1,0 +1,3231 @@
+Windows for everyday use: the pointer, the button and the keyboard go to the same window, the
+one a person sees under the pointer (1); a window is told it is maximized, not fullscreen,
+unless it asks (2); a second window keeps its own size and is not lost under the first, and
+an application can ask for a window to come forward (3).
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
+gst-wayland-display-cursor-messages.patch, gst-wayland-display-windows.patch and
+gst-wayland-display-dialogs.patch in this directory, in that order. The lines of context are
+from that project and from those patches.
+
+FOR TRIALS AND EVERYDAY USE ONLY. It is not in the build the M1 gate and verdict measure, and
+must not be: scripts/build-compositor.sh applies it only when given --trial
+(docs/m3-compositor-windows.md). Like the others it is kept small and in a shape that can be
+proposed to that project (docs/adr/0009-host-compositor.md). There is no property.
+
+1. Where the pointer, the button and the keyboard go
+
+The fault (seen with Blender's Preferences, which is a second window without a parent): a
+window is put into the picture at the commit after its first configure, whether that commit
+brings a picture or not. Blender's second window answers its configure and commits before it
+has drawn; the pointer, told again where it is at that moment, finds nothing of the new window
+under it and goes into the window below. It stayed there until it moved. A click without a
+move then went to the window below, while the keyboard went to the window on top (the keyboard
+was given to the top window under the pointer, the button to the window the pointer was in).
+
+What it changes:
+
+- The pointer is told again where it is whenever a window that is shown commits (a new
+  picture, a new size, a first picture), when a window comes or goes, and on a click after the
+  window clicked has been raised. Nothing is sent when the pointer is in the right window
+  already and that window has not moved under it, so a commit costs one look at what is
+  under the pointer. A window that has moved (to the corner, when it goes fullscreen) is
+  told where the pointer lies in it now. A pointer that has never
+  been in a window stays out of a lone window until it moves or clicks, as before.
+- On a click the window under the pointer comes up (with its dialogs, as before), the pointer
+  is put into what is on top at its place now, and the keyboard goes to that same window: the
+  button and the keys never go to two windows. A click with no move before it reaches a lone
+  window too (before, it went nowhere). A frame is made when the click changed the order.
+- Which window is active (the `xdg_toplevel` state "activated") follows the keyboard and
+  nothing else: every window is told whether it is the active one whenever the keyboard
+  moves (only a change is sent), from `SeatHandler::focus_changed` with the new focus; while
+  a popup has the keyboard, the window it belongs to is the active one. Windows are raised
+  and mapped without touching the state, the first configure does not say active, and a new
+  size of the output no longer tells every window it is active. Before, every window was told
+  it was active when it came and never told otherwise. Blender goes by this state: in the
+  window it still took for inactive, a Shift held down did not reach the next key (Shift+A
+  came as A, Shift+scroll and Alt+drag lost their modifier), seen in the host's self-test.
+- No application takes the keyboard without the person doing something in it. A new window
+  takes the keyboard when it is shown only when nothing has the keyboard or its own
+  application has it (a second window, a dialog; a parent is always of the same
+  application). A window of another application is put below every window of the
+  application that has the keyboard (at the bottom when that application has none shown),
+  without the keyboard, and is marked as wanting attention (see 3). On top it would catch a click the person meant for the application in
+  use; the mark is to be shown by the viewer, so that the window is not lost.
+- A popup that asks for a grab (a menu) takes the keyboard only when the window it belongs
+  to has the keyboard (or had it through a popup of it); otherwise it is dismissed at once
+  (`xdg_popup.popup_done`). No serial is asked for beyond the seat's own check: the grab only
+  moves the keyboard within the application in use, and a menu opened with the keyboard
+  (F10, the menu key) or long after the last click names an older button serial.
+- Who has the keyboard is remembered at every move of it (the window, or the window of the
+  popup that has it, and its application). A popup that had the keyboard and has gone keeps
+  the seat's focus until the next input; the checks above and below go by what was
+  remembered, so a menu item that opens a window, and the next menu along a menu bar, are
+  not taken for another application. The grab of a popup that has gone is ended, and the
+  keyboard given back to its holder's window, when a window of its application comes, a new
+  popup grabs, a button is pressed, or a window goes; not while another popup of the
+  holder's window is still open (a submenu that closed under its open menu: the grab goes
+  on with that menu, so that a click outside still dismisses it). Known: in this
+  compositor a submenu's own grab leaves the keyboard on the window (the seat's pointer grab
+  is replaced after the keyboard grab, which ends the new keyboard grab; upstream order, not
+  changed here). Nobody holds the keyboard after the
+  last window has gone (the seat does not report that change), so the next application's
+  first window takes it.
+- A window of the application in use that comes while one of its menus still has the grab
+  does not get the keyboard (the seat keeps it in the menu): it is marked, and a click gives
+  it the keyboard.
+- When a window goes, the keyboard moves only if it was the holder's window (the window with
+  the keyboard, or the window whose popup had it): to its parent if that is shown, else to
+  the top window of the same application, and only when that application has no window
+  left, to the top window. Any other window going (another application's, even while a gone
+  popup is still the seat's focus) leaves the keyboard with its holder.
+- "Recent" (for `xdg_activation_v1`, see 3) is the last 64 key and button events on the
+  seat, each kept with the client it went to, and not older than 10 seconds.
+- The compositor's own keys (upstream: Ctrl+Shift+Tab gives the keyboard to the window on
+  top, Ctrl+Shift+Q closes the window with the keyboard) are kept, and they are still taken
+  from the applications. When Ctrl+Shift+Tab moves the keyboard, the pointer is told again
+  where it is and a frame is made. (With a US keymap
+  Shift turns Tab into ISO_Left_Tab, and the filter never takes it: seen in a test.)
+
+Tests (`cargo test -p wayland-display-core`, file tests/test_trial_windows.rs, with a real
+Wayland client): a second window that commits before its first picture has the pointer from
+that picture on, and a click without a move gives it the button and the keyboard, and makes
+it the active window; a click without any move reaches a lone window with the keyboard; a
+click beside a dialog gives the button, the keyboard and the active state to its parent; a
+new size of the output leaves only the window with the keyboard active, and a window that
+gets the keyboard back after it was told it was inactive before; a window that moves under the
+pointer is told where the pointer lies in it; Ctrl+Shift+Tab with a US keymap leaves the
+keyboard where it is; a window is told it is active only with the keyboard (not in its
+first configure); a window of another application goes below the one in use without the
+keyboard, marked, a click still goes to the one in use, the mark is told with the windows,
+and it goes when the window gets the keyboard; a second
+window and a dialog of the application in use take the keyboard as before, unmarked; a
+popup is dismissed when its window has no keyboard, and takes the keyboard (whatever serial
+it names) when its window has it, its window staying the active one; a window a menu item
+opens after the menu has gone takes the keyboard; after a menu has gone the next menu may
+grab; a window that comes while a menu has the grab is marked; when a dialog closes, the
+keyboard goes back to its parent and not to another application's window above it; another
+application closing one of its windows after a menu has gone takes no keyboard; another
+application's window goes below the main window too when a dialog has the keyboard; after
+the last window has gone, a new application's window takes the keyboard; a refused popup
+after a menu has gone leaves the keyboard in the window in use; a click after a menu has
+gone reaches the window; after a submenu has closed, a click outside still dismisses its
+menu; a marked window that goes takes its mark with it, and windows have
+ids of their own that do not change.
+
+2. Maximized, not fullscreen
+
+The fault: the compositor told every window without a parent that it was fullscreen, as the
+project does upstream. Firefox hides its toolbar then (it slides in only when the pointer
+touches the top edge), and other applications drop their own bars.
+
+What it changes:
+
+- A window that is made as large as the output is told it is maximized, at the size of the
+  output (kept to its largest size, if it has one). It is told fullscreen only when it asks
+  (`xdg_toplevel.set_fullscreen`: a video player, a game, a presentation); it is put at the
+  corner then, in front only if it has the keyboard (a window without it keeps its place in
+  the stack: asking does not bring a window over the one a person uses). When it asks no
+  longer, a window without a parent is maximized again; a dialog keeps a size of its own.
+  Asking and taking it back before the first configure only takes the asking back.
+- A window that asks to be maximized is, on the same terms.
+- When the output changes its size, a window that fills it (maximized, or fullscreen because
+  it asked) is told the new size; any other window keeps its size and is told how much room
+  there is, and whether it is the active window stays as it was. Before, every window was
+  told fullscreen with no size (an empty intersection with "no largest size") and active.
+
+Tests: the first window is told maximized at the size of the output and not fullscreen; one
+that asks for fullscreen has it and is maximized again when it leaves it; a maximized window
+is told the new size of the output; a window without the keyboard that asks for fullscreen
+stays where it is in the stack.
+
+3. A second window that is not lost (a stopgap until windows can be switched from outside)
+
+The fault: a second window without a parent (Blender's Preferences, a second Firefox window)
+was told to fill the output like the first and lay exactly over it. A click on the first
+window, if it ever came up, hid the second for good: only the top window can be clicked.
+
+What it changes:
+
+- A window without a parent that comes while another window fills the output is not made as
+  large as the output. It is told how much room there is (the configure's bounds), keeps the
+  size it wants, and lies over the middle of the output. So does any window without a parent
+  that does not fill the output (one with a largest size, say). Both keep their own size
+  when they leave fullscreen or ask to be maximized no longer. (A window that comes while only such
+  smaller windows are shown, after a splash screen say, still fills the output.)
+- A window that was shown before it had a picture (it committed without one first, as
+  Blender does with its Preferences) is placed again by the size of its first picture, where
+  it is in the stack, with its dialogs above it. Before, it was placed as a window of no
+  size: over the middle meant its corner lay in the middle, and the rest of it beyond the
+  output. (This holds for dialogs too.)
+- When a window that fills the output is raised by a click, the smaller windows without a
+  parent of the same client are put above it again, in the order they had, with their dialogs;
+  its own dialogs come above all of them. Windows of other clients stay where they are. The
+  click itself goes as in part 1: the button and the keyboard go to what is on top under the
+  pointer after this, so a click where a smaller window comes back goes to that window.
+- `xdg_activation_v1` is offered. A request for a window to come forward is followed
+  (the window is raised with its dialogs and has the keyboard) only when the client that
+  made the token has the keyboard at that moment, the window is that client's own, and the
+  token names a recent key or button event (see 1) that went to that same client: the
+  application a person is using asks, as the answer to something the person did in it. A
+  token handed to another process (a link opened in a browser started from it) does not
+  move the keyboard. Any other request moves nothing, neither the keyboard nor the stack:
+  the window is only marked as wanting attention, unless it has the keyboard already. The
+  mark goes when the window gets the keyboard, and when the window goes. Each change of a
+  mark is written to the log (one line, `window attention id=… app_id=…
+  wants_attention=true|false`, with the window's id and its application's id; a window's id
+  is a number given when it is shown, never given to another window while the compositor
+  runs, for a later request to raise or close a given window), and the number of windows that want attention goes
+  out with the number of windows: the `wayland.windows` message of the windows patch has a
+  field `attention` next to `count` (the viewer does not show it yet). A token counts for 10 seconds and once; a client holds at most 32 unused
+  tokens; tokens are let go after their lifetime whenever one is made or used. A request
+  with a token that was not kept, or has been let go, never reaches the compositor's
+  handler (Smithay drops it): it marks nothing. A request for a window that is not shown
+  yet is dropped (and uses its token up). A second start of an application from outside,
+  which has no such serial, cannot bring a window forward.
+
+Tests: a second window without a parent keeps its size, lies over the middle, has the pointer
+that stood there and the keyboard, and keeps its size when it leaves fullscreen; one shown
+before its picture lies over the middle by the size of its picture; the main window brought
+forward by activation lies over the smaller one and is the active window, and a click on it
+brings the smaller window back on top while the main window has the button and the keyboard,
+and the smaller window takes a click where it lies; an activation token without a serial,
+or with one that is no key or button event, moves nothing and marks the window as wanting
+attention, and one that answers a click in the window with the keyboard brings the window
+forward, clears the mark, and is used up; a token handed to another application moves
+nothing and marks its window; a client holds at most 32 unused tokens; a window that asks
+for fullscreen and takes it back before its first configure is still told the room only; a
+window with a largest size keeps its own size after fullscreen. Two tests of gst-wayland-display-dialogs.patch
+are changed to this rule (a second window without a parent: told the room, not the size of
+the output; over the middle, not at the corner).
+
+Known limits:
+
+- Nothing outside the compositor can pick a window yet; a window under another that fills the
+  output is reached only when the one on top goes, or by its application.
+- "The same client" is one Wayland connection. An application that opens its windows on two
+  connections is two clients here.
+- A window that leaves fullscreen or maximized stays where it was put then (the corner), and a
+  window is not placed again when it changes its size after its first picture.
+- `xdg_toplevel.unset_maximized` of the first window is answered with the same size: it stays
+  maximized.
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index a5cb4ec..5dafbc7 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -68,14 +68,16 @@ pub struct State {
+ 
+ /// Posts the number of windows (toplevels) the clients have as an application message on the
+ /// element's bus: the structure `wayland.windows` with a `count`. 0 says that the last window
+-/// has gone.
++/// has gone. `attention` is how many of them want attention: their application asked for
++/// them to come forward, or they came, while another application had the keyboard.
+ fn window_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddisplaycore::WindowSink {
+-    Box::new(move |windows| {
++    Box::new(move |windows, attention| {
+         let Some(element) = element.upgrade() else {
+             return;
+         };
+         let structure = Structure::builder("wayland.windows")
+             .field("count", windows as u32)
++            .field("attention", attention as u32)
+             .build();
+         let message = Application::builder(structure).src(&element).build();
+         if let Err(err) = element.post_message(message) {
+diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
+index ce1ce1a..aa599e3 100644
+--- a/wayland-display-core/src/comp/input.rs
++++ b/wayland-display-core/src/comp/input.rs
+@@ -19,7 +19,7 @@ use smithay::{
+         input::LibinputInterface,
+         rustix::fs::{Mode, OFlags, open},
+     },
+-    utils::{Logical, Point, SERIAL_COUNTER, Serial},
++    utils::{Logical, Point, SERIAL_COUNTER},
+     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
+ };
+ use std::{os::unix::io::OwnedFd, path::Path, time::Instant};
+@@ -49,8 +49,12 @@ impl State {
+     pub fn keyboard_input(&mut self, event_time_msec: u32, keycode: Keycode, state: KeyState) {
+         let serial = SERIAL_COUNTER.next_serial();
+         let keyboard = self.seat.get_keyboard().unwrap();
++        // The key goes to the client with the keyboard.
++        let to = crate::comp::client_of_focus(keyboard.current_focus().as_ref());
++        self.input_serials.input(serial, to);
+ 
+-        keyboard.input::<(), _>(
++        // `Some(true)`: the keys below have given the keyboard to another window.
++        let moved = keyboard.input::<bool, _>(
+             self,
+             keycode,
+             state,
+@@ -64,13 +68,13 @@ impl State {
+                                 if let Some(element) = data.space.elements().last().cloned() {
+                                     data.surpressed_keys.insert(keysyms::KEY_Tab);
+                                     let location = data.space.element_location(&element).unwrap();
+-                                    data.space.map_element(element.clone(), location, true);
++                                    data.space.map_element(element.clone(), location, false);
+                                     data.seat.get_keyboard().unwrap().set_focus(
+                                         data,
+                                         Some(FocusTarget::from(element)),
+                                         serial,
+                                     );
+-                                    return FilterResult::Intercept(());
++                                    return FilterResult::Intercept(true);
+                                 }
+                             }
+                             Keysym::Q => {
+@@ -84,7 +88,7 @@ impl State {
+                                         _ => return FilterResult::Forward,
+                                     };
+                                     data.surpressed_keys.insert(keysyms::KEY_Q);
+-                                    return FilterResult::Intercept(());
++                                    return FilterResult::Intercept(false);
+                                 }
+                             }
+                             _ => {}
+@@ -92,13 +96,19 @@ impl State {
+                     }
+                 } else {
+                     if data.surpressed_keys.remove(&handle.modified_sym().raw()) {
+-                        return FilterResult::Intercept(());
++                        return FilterResult::Intercept(false);
+                     }
+                 }
+ 
+                 FilterResult::Forward
+             },
+         );
++        // As after a click: the pointer is put into what is on top under it, and the new
++        // order is shown. (Which window is active follows the keyboard by itself.)
++        if moved == Some(true) {
++            self.pointer_to_the_window_under_it();
++            crate::comp::picture_changed(self);
++        }
+     }
+ 
+     pub(crate) fn maybe_activate_pointer_constraint(
+@@ -219,6 +229,8 @@ impl State {
+                 .element_under(self.pointer_location)
+                 .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+ 
++            self.pointer_window_at = under.as_ref().map(|(_, at)| *at);
++
+             // Not sure why, but order here matters (at least when using Sway nested)!!!
+             // If we send the motion event after the relative_motion it'll behave oddly
+             pointer.motion(
+@@ -247,17 +259,39 @@ impl State {
+     }
+ 
+     /// Tells the pointer again where it is, after the windows under it have changed (one has
+-    /// come or gone) while it stood still: the window that is under it now has it, so that a
+-    /// click without a move goes to the window a person sees there.
++    /// come or gone, has been raised, or has a new picture) while it stood still: the window
++    /// that is under it now has it, so that a click without a move goes to the window a person
++    /// sees there. Nothing is sent when that is the window the pointer is in already, so this
++    /// can be called on every commit. A pointer that has never been in a window stays out
++    /// while there is only one: it goes in with the first move or click, as before.
+     pub(crate) fn pointer_to_the_window_under_it(&mut self) {
++        self.pointer_to_what_is_under_it(false);
++    }
++
++    /// As [`Self::pointer_to_the_window_under_it`]; with `even_a_first`, a pointer that has
++    /// never been in a window goes into the only one as well (a click does that).
++    fn pointer_to_what_is_under_it(&mut self, even_a_first: bool) {
+         let pointer = self.seat.get_pointer().unwrap();
+         if pointer.is_grabbed() {
+             return;
+         }
+-        let under = self
++        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
+             .space
+             .element_under(self.pointer_location)
+             .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
++        let now = pointer.current_focus();
++        // Nothing to tell when the pointer is in that window already and the window has not
++        // moved under it. A window that has moved (maximized, fullscreen) is told where the
++        // pointer lies in it now.
++        if now.as_ref() == under.as_ref().map(|(target, _)| target)
++            && self.pointer_window_at == under.as_ref().map(|(_, at)| *at)
++        {
++            return;
++        }
++        if now.is_none() && !even_a_first && self.space.elements().count() < 2 {
++            return;
++        }
++        self.pointer_window_at = under.as_ref().map(|(_, at)| *at);
+         pointer.motion(
+             self,
+             under,
+@@ -270,6 +304,52 @@ impl State {
+         pointer.frame(self);
+     }
+ 
++    /// Tells every window whether it is the active one, the one with the keyboard
++    /// (`xdg_toplevel` state "activated"), if that has changed. Some applications go by this
++    /// and not by where the keyboard is: Blender handles keys in its active window with the
++    /// modifiers it has seen there, and a window it was never told is inactive keeps that
++    /// part. While a popup has the keyboard, the window it belongs to is the active one.
++    ///
++    /// This is the only place that sets the state. It is called from
++    /// `SeatHandler::focus_changed` with the new focus (the keyboard's own lock is held
++    /// then: the keyboard is not asked here), so it follows every move of the keyboard and
++    /// nothing else. Windows are raised and mapped without touching it.
++    pub(crate) fn tell_windows_which_is_active(&mut self, focus: Option<&FocusTarget>) {
++        use smithay::wayland::seat::WaylandFocus;
++        let active_surface = match focus {
++            Some(FocusTarget::Wayland(w)) => w.wl_surface().map(|s| s.into_owned()),
++            Some(FocusTarget::Popup(p)) => smithay::desktop::find_popup_root_surface(p).ok(),
++            None => None,
++        };
++        // Who has the keyboard: kept for when the focus is a popup that has gone.
++        match (&active_surface, focus) {
++            (Some(surface), _) => {
++                use smithay::reexports::wayland_server::Resource;
++                self.keyboard_holder = Some((surface.clone(), surface.client().map(|c| c.id())));
++            }
++            (None, None) => self.keyboard_holder = None,
++            (None, Some(_)) => {}
++        }
++        let mut active_window = None;
++        for window in self.space.elements() {
++            let active = active_surface.is_some()
++                && window.wl_surface().map(|s| s.into_owned()) == active_surface;
++            window.set_activated(active);
++            if active {
++                active_window = Some(window.clone());
++            }
++            if let Some(toplevel) = window.toplevel() {
++                if toplevel.is_initial_configure_sent() {
++                    toplevel.send_pending_configure();
++                }
++            }
++        }
++        // A window that wanted attention has it now.
++        if let Some(window) = active_window {
++            self.mark_wants_attention(&window, false);
++        }
++    }
++
+     pub fn set_pointer_location(&mut self, location: Point<f64, Logical>) {
+         self.pointer_location = location;
+         self.pointer_absolute_location = location;
+@@ -294,12 +374,36 @@ impl State {
+ 
+     pub fn pointer_button(&mut self, event_time_msec: u32, button_code: u32, state: ButtonState) {
+         self.last_pointer_movement = Instant::now();
++        // A grab left behind by a popup that has gone would swallow this click.
++        self.end_the_grab_of_a_gone_popup();
+         let serial = SERIAL_COUNTER.next_serial();
+ 
+         if ButtonState::Pressed == state {
+-            self.update_keyboard_focus(serial);
++            // The window under the pointer comes up, the pointer is in what is on top there
++            // now, and the keyboard goes where the button goes: never one window for the
++            // button and another for the keys.
++            let before: Vec<_> = self.space.elements().cloned().collect();
++            if let Some(clicked) = self.raise_the_window_clicked() {
++                self.pointer_to_what_is_under_it(true);
++                let target = self
++                    .seat
++                    .get_pointer()
++                    .unwrap()
++                    .current_focus()
++                    .unwrap_or(FocusTarget::from(clicked));
++                let keyboard = self.seat.get_keyboard().unwrap();
++                if !keyboard.is_grabbed() {
++                    keyboard.set_focus(self, Some(target), serial);
++                }
++                if !self.space.elements().eq(before.iter()) {
++                    crate::comp::picture_changed(self);
++                }
++            }
+         };
+         let pointer = self.seat.get_pointer().unwrap();
++        // The button goes to the client the pointer is in, now that it has been put there.
++        let to = crate::comp::client_of_focus(pointer.current_focus().as_ref());
++        self.input_serials.input(serial, to);
+         pointer.button(
+             self,
+             &ButtonEvent {
+@@ -558,7 +662,9 @@ impl State {
+         pos
+     }
+ 
+-    fn update_keyboard_focus(&mut self, serial: Serial) {
++    /// Raises the window under the pointer, as a click does, and returns it; the caller gives
++    /// it the keyboard. Nothing is raised when nothing is under the pointer or a grab is on.
++    fn raise_the_window_clicked(&mut self) -> Option<smithay::desktop::Window> {
+         let pointer = self.seat.get_pointer().unwrap();
+         let keyboard = self.seat.get_keyboard().unwrap();
+         // change the keyboard focus unless the pointer or keyboard is grabbed
+@@ -576,13 +682,20 @@ impl State {
+                 .element_under(self.pointer_location)
+                 .map(|(w, p)| (w.clone(), p))
+             {
+-                self.space.raise_element(&window, true);
++                self.space.raise_element(&window, false);
++                // A window that fills the output does not hide its application's smaller
++                // windows.
++                if window.toplevel().is_some_and(|t| t.parent().is_none())
++                    && crate::comp::fills_the_output(&window)
++                {
++                    self.raise_its_smaller_windows(&window);
++                }
+                 // Its dialogs stay in front of it.
+                 self.raise_children_of(&window);
+-                keyboard.set_focus(self, Some(FocusTarget::from(window)), serial);
+-                return;
++                return Some(window);
+             }
+         }
++        None
+     }
+ }
+ 
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 68e95df..4c76ee6 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -58,6 +58,7 @@ use smithay::{
+         shm::ShmState,
+         socket::ListeningSocketSource,
+         viewporter::ViewporterState,
++        xdg_activation::XdgActivationState,
+     },
+ };
+ use std::sync::Mutex;
+@@ -151,6 +152,19 @@ pub struct State {
+     pub shell_state: XdgShellState,
+     pub shm_state: ShmState,
+     viewporter_state: ViewporterState,
++    pub(crate) activation_state: XdgActivationState,
++    /// The last key presses and button presses, for telling an activation token that comes
++    /// of one from one made at will.
++    pub(crate) input_serials: windows::InputSerials<ClientId>,
++    /// Where the window the pointer was last told to be in lay then.
++    pub(crate) pointer_window_at: Option<Point<f64, Logical>>,
++    /// The window that has the keyboard (or whose popup has it) and its client, as of the
++    /// last move of the keyboard. A popup that has the keyboard and is gone keeps the
++    /// keyboard's focus until the next input; this still says whose it was.
++    pub(crate) keyboard_holder: Option<(
++        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
++        Option<ClientId>,
++    )>,
+     cursor_event_count: i32,
+     pub single_pixel_buffer_state: SinglePixelBufferState,
+ }
+@@ -175,6 +189,7 @@ impl State {
+         let mut seat_state = SeatState::new();
+         let shell_state = XdgShellState::new::<State>(&dh);
+         let viewporter_state = ViewporterState::new::<State>(&dh);
++        let activation_state = XdgActivationState::new::<State>(&dh);
+         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+ 
+         let render_node: Option<DrmNode> = render_target.clone().into();
+@@ -275,6 +290,10 @@ impl State {
+             shell_state,
+             shm_state,
+             viewporter_state,
++            activation_state,
++            input_serials: windows::InputSerials::default(),
++            pointer_window_at: None,
++            keyboard_holder: None,
+             single_pixel_buffer_state,
+         }
+     }
+@@ -402,18 +421,47 @@ pub(crate) fn apply_video_info(
+             .unwrap_or(new_size),
+         );
+ 
+-        let new_size = max_size
+-            .intersection(Rectangle::from_size(new_size))
+-            .map(|rect| rect.size);
++        // A window that fills the output (maximized, or fullscreen because it asked) is told
++        // the new size, kept to its largest size; any other keeps its size and is told how
++        // much room there is.
++        let full = windows::full_size(new_size, max_size.size);
+         toplevel.with_pending_state(|state| {
+-            state.size = new_size;
+-            state.states.set(XdgState::Fullscreen);
+-            state.states.set(XdgState::Activated);
++            if state.states.contains(XdgState::Maximized)
++                || state.states.contains(XdgState::Fullscreen)
++            {
++                state.size = Some(full);
++            } else {
++                state.bounds = Some(new_size);
++            }
++            // Whether it is the active window stays as it was told: a new size of the output
++            // does not make every window active.
+         });
+         toplevel.send_configure();
+     }
+ }
+ 
++/// The client a keyboard or pointer focus belongs to.
++pub(crate) fn client_of_focus(focus: Option<&FocusTarget>) -> Option<ClientId> {
++    use smithay::reexports::wayland_server::Resource;
++    use smithay::wayland::seat::WaylandFocus;
++    let surface = match focus? {
++        FocusTarget::Wayland(window) => window.wl_surface()?.into_owned(),
++        FocusTarget::Popup(popup) => popup.wl_surface().clone(),
++    };
++    surface.client().map(|client| client.id())
++}
++
++/// Whether a window has been told to fill the output: maximized, or fullscreen because it
++/// asked.
++pub(crate) fn fills_the_output(window: &Window) -> bool {
++    window.toplevel().is_some_and(|toplevel| {
++        toplevel.with_pending_state(|state| {
++            state.states.contains(XdgState::Maximized)
++                || state.states.contains(XdgState::Fullscreen)
++        })
++    })
++}
++
+ /// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
+ /// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
+ /// frame no longer counts.
+@@ -457,8 +505,252 @@ impl State {
+         }
+     }
+ 
++    /// The size of the output, in the units the windows are told their size in.
++    pub(crate) fn output_size(&self) -> Option<Size<i32, Logical>> {
++        let output = self.output.as_ref()?;
++        let mode = output.current_mode()?;
++        Some(
++            mode.size
++                .to_f64()
++                .to_logical(output.current_scale().fractional_scale())
++                .to_i32_round(),
++        )
++    }
++
++    /// Tells a window to fill the output, as a window that asks for fullscreen (`fullscreen`)
++    /// or to be maximized, and puts it at the corner, in front. One that is not shown yet is
++    /// told with its first configure.
++    pub(crate) fn fill_the_output(
++        &mut self,
++        toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
++        fullscreen: bool,
++    ) {
++        use smithay::wayland::seat::WaylandFocus;
++        let max_size = with_states(toplevel.wl_surface(), |states| {
++            states
++                .cached_state
++                .get::<SurfaceCachedState>()
++                .current()
++                .max_size
++        });
++        let size = self
++            .output_size()
++            .map(|size| windows::full_size(size, max_size));
++        toplevel.with_pending_state(|state| {
++            state.size = size;
++            if fullscreen {
++                state.states.set(XdgState::Fullscreen);
++            } else {
++                state.states.set(XdgState::Maximized);
++            }
++        });
++        if !toplevel.is_initial_configure_sent() {
++            return;
++        }
++        toplevel.send_configure();
++        let shown = self
++            .space
++            .elements()
++            .find(|w| w.wl_surface().is_some_and(|s| *s == *toplevel.wl_surface()))
++            .cloned();
++        if let Some(window) = shown {
++            // Only the window with the keyboard comes in front by asking; any other is put at
++            // the corner where it lies in the stack.
++            let has_the_keyboard = matches!(
++                self.seat.get_keyboard().unwrap().current_focus(),
++                Some(FocusTarget::Wayland(w)) if w == window
++            );
++            if has_the_keyboard {
++                self.space.map_element(window, (0, 0), false);
++            } else {
++                self.move_window(&window, (0, 0).into());
++            }
++            self.pointer_to_the_window_under_it();
++            picture_changed(self);
++        }
++    }
++
++    /// Whether a new window may take the keyboard when it is shown: when nothing has the
++    /// keyboard, or its own application has it (a second window, a dialog). No other
++    /// application takes the keyboard without the person doing something in it.
++    pub(crate) fn may_take_the_keyboard(&self, window: &Window) -> bool {
++        if self.seat.get_keyboard().unwrap().current_focus().is_none() {
++            return true;
++        }
++        let Some((_, holder)) = &self.keyboard_holder else {
++            return true;
++        };
++        let of_window = client_of_focus(Some(&FocusTarget::from(window.clone())));
++        of_window.is_some() && *holder == of_window
++    }
++
++    /// The client a window belongs to.
++    fn client_of_window(window: &Window) -> Option<ClientId> {
++        client_of_focus(Some(&FocusTarget::from(window.clone())))
++    }
++
++    /// The window of the keyboard's holder, if it is alive and shown.
++    fn holders_window(&self) -> Option<Window> {
++        use smithay::utils::IsAlive;
++        use smithay::wayland::seat::WaylandFocus;
++        let (surface, _) = self.keyboard_holder.as_ref()?;
++        self.space
++            .elements()
++            .find(|w| w.alive() && w.wl_surface().is_some_and(|s| *s == *surface))
++            .cloned()
++    }
++
++    /// Maps a new window of another application below every window of the application that
++    /// has the keyboard (at the bottom, when that application has none shown), so that it
++    /// covers nothing the person is using and catches none of the clicks meant for it.
++    pub(crate) fn map_below_the_window_in_use(&mut self, window: &Window, at: Point<i32, Logical>) {
++        let holder = self.keyboard_holder.as_ref().and_then(|(_, c)| c.clone());
++        let from_the_lowest: Vec<Window> = self
++            .space
++            .elements()
++            .skip_while(|w| holder.is_none() || Self::client_of_window(w) != holder)
++            .cloned()
++            .collect();
++        let from_the_lowest = if from_the_lowest.is_empty() {
++            self.space.elements().cloned().collect()
++        } else {
++            from_the_lowest
++        };
++        self.space.map_element(window.clone(), at, false);
++        for w in from_the_lowest {
++            self.space.raise_element(&w, false);
++        }
++    }
++
++    /// Ends the grab of a popup that has gone (a menu that closed when one of its items was
++    /// chosen, or whose client went): the seat would keep it until the next input, and let
++    /// nothing else have the keyboard meanwhile. The keyboard goes back to the window of its
++    /// holder, if that is shown (otherwise the caller decides).
++    pub(crate) fn end_the_grab_of_a_gone_popup(&mut self) {
++        use smithay::utils::IsAlive;
++        let keyboard = self.seat.get_keyboard().unwrap();
++        let gone = matches!(keyboard.current_focus(), Some(FocusTarget::Popup(p)) if !p.alive());
++        if !gone {
++            return;
++        }
++        // A submenu that closed while its menu is still open: the grab goes on with that menu
++        // (a click outside still dismisses it), and is left to the seat.
++        let a_menu_is_open = self.keyboard_holder.as_ref().is_some_and(|(root, _)| {
++            PopupManager::popups_for_surface(root).any(|(popup, _)| popup.alive())
++        });
++        if a_menu_is_open {
++            return;
++        }
++        if keyboard.is_grabbed() {
++            keyboard.unset_grab(self);
++        }
++        let pointer = self.seat.get_pointer().unwrap();
++        if pointer.is_grabbed() {
++            let time = std::time::Duration::from(self.clock.now()).as_millis() as u32;
++            pointer.unset_grab(self, smithay::utils::SERIAL_COUNTER.next_serial(), time);
++        }
++        if let Some(window) = self.holders_window() {
++            keyboard.set_focus(
++                self,
++                Some(FocusTarget::from(window)),
++                smithay::utils::SERIAL_COUNTER.next_serial(),
++            );
++        }
++    }
++
++    /// Gives the keyboard on when a toplevel has gone (`gone`, its parent and its client
++    /// read before it was let go). Only when it was the window of the keyboard's holder
++    /// (the window with the keyboard, or the window whose popup had it) does the keyboard
++    /// move: to its parent if that is shown, else to the top window of the same application,
++    /// and only when that application has no window left, to the top window. Any other
++    /// window going leaves the keyboard with its holder.
++    pub(crate) fn keyboard_after_a_window_has_gone(
++        &mut self,
++        gone: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
++        parent: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
++        client: Option<ClientId>,
++    ) {
++        use smithay::utils::IsAlive;
++        use smithay::wayland::seat::WaylandFocus;
++        let was_the_holder = self
++            .keyboard_holder
++            .as_ref()
++            .is_some_and(|(surface, _)| surface == gone);
++        // A popup that had the keyboard and has gone: back to its holder's window first.
++        self.end_the_grab_of_a_gone_popup();
++        let shown =
++            |w: &Window, space: &Space<Window>| w.alive() && space.elements().any(|e| e == w);
++        let lost = match self.seat.get_keyboard().unwrap().current_focus() {
++            Some(FocusTarget::Wayland(window)) => !shown(&window, &self.space),
++            Some(FocusTarget::Popup(popup)) => !popup.alive(),
++            None => true,
++        };
++        if !lost {
++            return;
++        }
++        // Whose keyboard it was: the gone window's, or (when another window went) its holder's.
++        let (parent, client) = if was_the_holder {
++            (parent, client)
++        } else {
++            (
++                None,
++                self.keyboard_holder.as_ref().and_then(|(_, c)| c.clone()),
++            )
++        };
++        let alive: Vec<Window> = self
++            .space
++            .elements()
++            .filter(|w| w.alive())
++            .cloned()
++            .collect();
++        let of_parent = parent.and_then(|parent| {
++            alive
++                .iter()
++                .find(|w| w.wl_surface().is_some_and(|s| *s == parent))
++                .cloned()
++        });
++        let of_client = || {
++            client.as_ref().and_then(|client| {
++                alive
++                    .iter()
++                    .rev()
++                    .find(|w| Self::client_of_window(w).as_ref() == Some(client))
++                    .cloned()
++            })
++        };
++        let next = of_parent
++            .or_else(of_client)
++            .or_else(|| alive.last().cloned());
++        if next.is_none() {
++            // Nobody has the keyboard now (the seat does not tell the change to nobody).
++            self.keyboard_holder = None;
++        }
++        self.seat.get_keyboard().unwrap().set_focus(
++            self,
++            next.map(FocusTarget::from),
++            smithay::utils::SERIAL_COUNTER.next_serial(),
++        );
++    }
++
++    /// Puts a shown window at `at` and leaves the order of the windows as it was (a space
++    /// puts a window it maps on top: the windows that were above it are put back above it).
++    pub(crate) fn move_window(&mut self, window: &Window, at: Point<i32, Logical>) {
++        let above: Vec<Window> = self
++            .space
++            .elements()
++            .skip_while(|w| *w != window)
++            .skip(1)
++            .cloned()
++            .collect();
++        self.space.map_element(window.clone(), at, false);
++        for w in above {
++            self.space.raise_element(&w, false);
++        }
++    }
++
+     /// Where a window that is about to be shown goes: over the middle of its parent if it
+-    /// has one that is shown, and at the corner otherwise ([`windows::place`]).
++    /// has one that is shown, at the corner if it fills the output, and over the middle of
++    /// the output otherwise ([`windows::place`]).
+     pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
+         use smithay::wayland::seat::WaylandFocus;
+         let parent = window
+@@ -479,30 +771,56 @@ impl State {
+             .and_then(|output| output.current_mode())
+             .map(|mode| mode.size.to_logical(1))
+             .unwrap_or_default();
++        let parent =
++            parent.or_else(|| (!fills_the_output(window)).then(|| Rectangle::from_size(output)));
+         windows::place(window.geometry().size, parent, output)
+     }
+ 
+-    /// Gives the keyboard to the window that is on top, when the window that had it is not
+-    /// shown any more or nothing has it. A dialog that closes hands the keyboard back to the
+-    /// window under it this way.
+-    pub(crate) fn keyboard_to_the_top_window(&mut self) {
+-        use smithay::utils::IsAlive;
+-        let keyboard = self.seat.get_keyboard().unwrap();
+-        let lost = match keyboard.current_focus() {
+-            Some(FocusTarget::Wayland(window)) => {
+-                !window.alive() || !self.space.elements().any(|w| *w == window)
+-            }
+-            Some(FocusTarget::Popup(_)) => false,
+-            None => true,
++    /// Puts the smaller windows without a parent that `window`'s client has above it again
++    /// (in the order they had), and their dialogs above them. Called when a window that fills
++    /// the output has been raised by a click: a second window of the same application, such
++    /// as Blender's Preferences, cannot be lost under it. Windows of other clients stay where
++    /// they are.
++    pub(crate) fn raise_its_smaller_windows(&mut self, window: &Window) {
++        use smithay::reexports::wayland_server::Resource;
++        use smithay::wayland::seat::WaylandFocus;
++        let client_of = |w: &Window| w.wl_surface().and_then(|s| s.client()).map(|c| c.id());
++        let Some(client) = client_of(window) else {
++            return;
+         };
+-        if lost {
+-            let top = self.space.elements().rev().find(|w| w.alive()).cloned();
++        let smaller: Vec<Window> = self
++            .space
++            .elements()
++            .filter(|w| {
++                *w != window
++                    && w.toplevel()
++                        .is_some_and(|toplevel| toplevel.parent().is_none())
++                    && !fills_the_output(w)
++                    && client_of(w).as_ref() == Some(&client)
++            })
++            .cloned()
++            .collect();
++        for w in smaller {
++            self.space.raise_element(&w, false);
++            self.raise_children_of(&w);
++        }
++    }
++
++    /// Brings a window forward because its application asked (`xdg_activation_v1`): it is
++    /// raised with its dialogs and has the keyboard.
++    pub(crate) fn activate_window(&mut self, window: &Window) {
++        self.space.raise_element(window, false);
++        self.raise_children_of(window);
++        let keyboard = self.seat.get_keyboard().unwrap();
++        if !keyboard.is_grabbed() {
+             keyboard.set_focus(
+                 self,
+-                top.map(FocusTarget::from),
++                Some(FocusTarget::from(window.clone())),
+                 smithay::utils::SERIAL_COUNTER.next_serial(),
+             );
+         }
++        self.pointer_to_the_window_under_it();
++        picture_changed(self);
+     }
+ 
+     /// Puts the windows that have `window` as their parent above it again, and theirs above
+@@ -523,7 +841,7 @@ impl State {
+             .cloned()
+             .collect();
+         for child in children {
+-            self.space.raise_element(&child, true);
++            self.space.raise_element(&child, false);
+             self.raise_children_of(&child);
+         }
+     }
+@@ -552,8 +870,46 @@ impl State {
+                 .iter()
+                 .filter(|window| window.alive() && Some(*window) != gone)
+                 .count();
+-            self.window_report.tell(windows);
++            let wanting_attention = self
++                .space
++                .elements()
++                .filter(|w| w.toplevel() != gone && windows::wants_attention(w))
++                .count();
++            self.window_report.tell(windows, wanting_attention);
++        }
++    }
++
++    /// Marks a window as wanting attention, or takes the mark off. A change is written to the
++    /// log (one line, with the application's id) and told with the number of windows.
++    pub(crate) fn mark_wants_attention(&mut self, window: &Window, wants: bool) {
++        if self.set_the_mark(window, wants) {
++            self.tell_windows(None);
++        }
++    }
++
++    /// Sets or takes off the mark and writes the change to the log, without telling the
++    /// windows (see [`Self::mark_wants_attention`]). Returns whether it changed. The line has
++    /// the window's id ([`windows::id_of`]) and its application's id.
++    pub(crate) fn set_the_mark(&mut self, window: &Window, wants: bool) -> bool {
++        if windows::wants_attention(window) == wants {
++            return false;
+         }
++        windows::set_wants_attention(window, wants);
++        let app_id = window.toplevel().and_then(|toplevel| {
++            with_states(toplevel.wl_surface(), |states| {
++                states
++                    .data_map
++                    .get::<XdgToplevelSurfaceData>()
++                    .and_then(|data| data.lock().unwrap().app_id.clone())
++            })
++        });
++        tracing::info!(
++            id = windows::id_of(window),
++            app_id = app_id.as_deref().unwrap_or("-"),
++            wants_attention = wants,
++            "window attention"
++        );
++        true
+     }
+ 
+     /// Tells `sink` how many windows there are, now and whenever that changes; with `None`,
+diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
+index 7813b6f..cf75392 100644
+--- a/wayland-display-core/src/comp/windows.rs
++++ b/wayland-display-core/src/comp/windows.rs
+@@ -13,10 +13,11 @@
+ //! "Windows" are toplevels: popups and the cursor do not count.
+ //!
+ //! A third thing is here because it is about windows that come later: where they go. The
+-//! compositor has one output and shows one picture. The first window fills it. A window that
+-//! has a parent (a dialog: `xdg_toplevel.set_parent`) keeps its own size and lies over the
+-//! middle of its parent, inside the output ([`place`]); any other window is put at the corner,
+-//! as the first is. Whatever comes later lies above what was there, and has the keyboard
++//! compositor has one output and shows one picture. The first window fills it, maximized. A
++//! window that has a parent (a dialog: `xdg_toplevel.set_parent`) keeps its own size and lies
++//! over the middle of its parent, inside the output ([`place`]). A window without a parent
++//! that comes while another fills the output keeps its own size too, and lies over the
++//! middle of the output. Whatever comes later lies above what was there, and has the keyboard
+ //! until it goes.
+ 
+ use smithay::utils::{Logical, Point, Rectangle, Size};
+@@ -43,14 +44,148 @@ pub fn place(
+         .into()
+ }
+ 
+-/// Receives the number of windows whenever it changes. Called on the compositor's thread.
+-pub type WindowSink = Box<dyn Fn(usize) + Send>;
++/// Marks a window without a parent that was not made as large as the output when it came
++/// (it came while another filled the output, or it has a largest size): it is not made so
++/// when it leaves fullscreen or maximized.
++pub struct KeepsItsOwnSize;
+ 
+-/// Tells a sink how many windows there are, and only when that is not what it was told last.
++/// How many of the last key and button events are kept: enough that fast typing does not
++/// push a click out within [`RECENT`].
++const EVENTS_KEPT: usize = 64;
++
++/// How long a key or button event counts as recent.
++pub const RECENT: std::time::Duration = std::time::Duration::from_secs(10);
++
++/// The serials of the last key and button events (pressed or released) on the seat, each with
++/// the client it went to and when. A request that moves the keyboard (`xdg_activation_v1`, a
++/// popup's grab) is followed only when it names one of them that went to the client asking,
++/// not longer ago than [`RECENT`]: it is then the answer to something a person did in it.
++pub struct InputSerials<C>(
++    std::collections::VecDeque<(smithay::utils::Serial, Option<C>, std::time::Instant)>,
++);
++
++impl<C> Default for InputSerials<C> {
++    fn default() -> Self {
++        Self(Default::default())
++    }
++}
++
++impl<C: PartialEq> InputSerials<C> {
++    /// A key or a button event with this serial went to `client` (or to no client) now.
++    pub fn input(&mut self, serial: smithay::utils::Serial, client: Option<C>) {
++        self.input_at(serial, client, std::time::Instant::now());
++    }
++
++    fn input_at(
++        &mut self,
++        serial: smithay::utils::Serial,
++        client: Option<C>,
++        at: std::time::Instant,
++    ) {
++        if self.0.len() == EVENTS_KEPT {
++            self.0.pop_front();
++        }
++        self.0.push_back((serial, client, at));
++    }
++
++    /// Whether `serial` is one of the last key or button events, went to `client`, and is
++    /// recent.
++    pub fn is_recent_for(&self, serial: smithay::utils::Serial, client: &C) -> bool {
++        self.is_recent_for_at(serial, client, std::time::Instant::now())
++    }
++
++    fn is_recent_for_at(
++        &self,
++        serial: smithay::utils::Serial,
++        client: &C,
++        now: std::time::Instant,
++    ) -> bool {
++        self.0.iter().any(|(s, to, at)| {
++            *s == serial
++                && to.as_ref() == Some(client)
++                && now.saturating_duration_since(*at) <= RECENT
++        })
++    }
++}
++
++/// Marks a window that wants attention: its application asked for it to come forward and
++/// was not let, or it came while another application had the keyboard. The number of such
++/// windows goes out with the number of windows (`WindowReport`); the viewer does not show it
++/// yet. Set it through `State::mark_wants_attention`, which also tells it.
++struct WantsAttention(std::cell::Cell<bool>);
++
++/// A window's id: a number given to it the first time it is asked for, never given to
++/// another window while the compositor runs. For telling windows apart outside (the log
++/// line of the mark now; later, a request to raise or close a given window).
++pub fn id_of(window: &smithay::desktop::Window) -> u64 {
++    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++    struct Id(u64);
++    window
++        .user_data()
++        .insert_if_missing(|| Id(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
++    window.user_data().get::<Id>().unwrap().0
++}
++
++/// Sets or clears the mark of a window that wants attention.
++pub fn set_wants_attention(window: &smithay::desktop::Window, wants: bool) {
++    window
++        .user_data()
++        .insert_if_missing(|| WantsAttention(std::cell::Cell::new(false)));
++    if let Some(mark) = window.user_data().get::<WantsAttention>() {
++        mark.0.set(wants);
++    }
++}
++
++/// Whether a window wants attention (see [`set_wants_attention`]).
++pub fn wants_attention(window: &smithay::desktop::Window) -> bool {
++    window
++        .user_data()
++        .get::<WantsAttention>()
++        .is_some_and(|mark| mark.0.get())
++}
++
++/// Marks a window that was shown before it had a size (it committed without a picture
++/// first): it is placed again when it has one.
++struct PlacedWithoutASize(std::cell::Cell<bool>);
++
++/// Remembers that `window` is being placed without a size, if it has none.
++pub fn placing(window: &smithay::desktop::Window) {
++    if window.geometry().size.is_empty() {
++        window
++            .user_data()
++            .insert_if_missing(|| PlacedWithoutASize(std::cell::Cell::new(true)));
++    }
++}
++
++/// Whether `window` was placed without a size and has one now: true once.
++pub fn to_be_placed_again(window: &smithay::desktop::Window) -> bool {
++    let Some(mark) = window.user_data().get::<PlacedWithoutASize>() else {
++        return false;
++    };
++    let again = mark.0.get() && !window.geometry().size.is_empty();
++    if again {
++        mark.0.set(false);
++    }
++    again
++}
++
++/// The size a window is told when it is to fill an output of this size: the output's, kept
++/// to the window's largest size where it has one (a largest size of 0 is no limit).
++pub fn full_size(output: Size<i32, Logical>, max: Size<i32, Logical>) -> Size<i32, Logical> {
++    let keep = |output: i32, max: i32| if max > 0 { output.min(max) } else { output };
++    (keep(output.w, max.w), keep(output.h, max.h)).into()
++}
++
++/// Receives the number of windows, and how many of them want attention (see
++/// [`set_wants_attention`]), whenever that changes. Called on the compositor's thread.
++pub type WindowSink = Box<dyn Fn(usize, usize) + Send>;
++
++/// Tells a sink how many windows there are and how many want attention, and only when that
++/// is not what it was told last.
+ #[derive(Default)]
+ pub struct WindowReport {
+     sink: Option<WindowSink>,
+-    last: Option<usize>,
++    last: Option<(usize, usize)>,
+ }
+ 
+ impl WindowReport {
+@@ -64,14 +199,15 @@ impl WindowReport {
+         self.sink.is_some()
+     }
+ 
+-    /// Tells the sink the number of windows, unless that is what it was told last.
+-    pub fn tell(&mut self, windows: usize) {
++    /// Tells the sink the number of windows and of those that want attention, unless that is
++    /// what it was told last.
++    pub fn tell(&mut self, windows: usize, wanting_attention: usize) {
+         let Some(sink) = &self.sink else {
+             return;
+         };
+-        if self.last != Some(windows) {
+-            sink(windows);
+-            self.last = Some(windows);
++        if self.last != Some((windows, wanting_attention)) {
++            sink(windows, wanting_attention);
++            self.last = Some((windows, wanting_attention));
+         }
+     }
+ }
+@@ -104,6 +240,41 @@ mod tests {
+         assert_eq!((at.x, at.y), (0, 0));
+     }
+ 
++    #[test]
++    fn a_window_that_fills_the_output_is_kept_to_its_largest_size() {
++        let output = Size::from((1720, 720));
++        assert_eq!(full_size(output, (0, 0).into()), output);
++        assert_eq!(full_size(output, (800, 0).into()), (800, 720).into());
++        assert_eq!(full_size(output, (4000, 600).into()), (1720, 600).into());
++    }
++
++    #[test]
++    fn only_the_last_key_and_button_events_to_that_client_and_not_too_old_are_recent() {
++        let mut serials = InputSerials::<u32>::default();
++        let now = std::time::Instant::now();
++        let first = smithay::utils::Serial::from(1);
++        assert!(!serials.is_recent_for_at(first, &7, now));
++        serials.input_at(first, Some(7), now);
++        assert!(serials.is_recent_for_at(first, &7, now));
++        // Not for another client, nor for an event that went to none.
++        assert!(!serials.is_recent_for_at(first, &8, now));
++        serials.input_at(2.into(), None, now);
++        assert!(!serials.is_recent_for_at(2.into(), &7, now));
++        // Not when it is older than RECENT.
++        assert!(serials.is_recent_for_at(first, &7, now + RECENT));
++        assert!(!serials.is_recent_for_at(
++            first,
++            &7,
++            now + RECENT + std::time::Duration::from_millis(1)
++        ));
++        // Not when it has been pushed out.
++        for n in 3..=(EVENTS_KEPT as u32 + 1) {
++            serials.input_at(n.into(), Some(7), now);
++        }
++        assert!(!serials.is_recent_for_at(first, &7, now));
++        assert!(serials.is_recent_for_at((EVENTS_KEPT as u32 + 1).into(), &7, now));
++    }
++
+     #[test]
+     fn a_window_without_a_parent_is_put_at_the_corner() {
+         let at = place((400, 300).into(), None, (1720, 720).into());
+@@ -112,27 +283,41 @@ mod tests {
+ 
+     #[test]
+     fn a_sink_is_told_a_change_once_and_a_new_sink_is_told_what_is() {
+-        let told = Arc::new(Mutex::new(Vec::new()));
+-        let sink = |told: &Arc<Mutex<Vec<usize>>>| -> WindowSink {
++        type Told = Arc<Mutex<Vec<(usize, usize)>>>;
++        let told = Told::default();
++        let sink = |told: &Told| -> WindowSink {
+             let told = told.clone();
+-            Box::new(move |windows| told.lock().unwrap().push(windows))
++            Box::new(move |windows, attention| told.lock().unwrap().push((windows, attention)))
+         };
+         let mut report = WindowReport::default();
+-        report.tell(1);
++        report.tell(1, 0);
+         assert!(!report.listening());
+ 
+         report.set_sink(Some(sink(&told)));
+-        for windows in [0, 0, 1, 1, 2, 1, 0, 0] {
+-            report.tell(windows);
++        for (windows, attention) in [
++            (0, 0),
++            (0, 0),
++            (1, 0),
++            (1, 0),
++            (2, 0),
++            (2, 1),
++            (2, 1),
++            (1, 0),
++            (0, 0),
++        ] {
++            report.tell(windows, attention);
+         }
+-        assert_eq!(*told.lock().unwrap(), [0, 1, 2, 1, 0]);
++        assert_eq!(
++            *told.lock().unwrap(),
++            [(0, 0), (1, 0), (2, 0), (2, 1), (1, 0), (0, 0)]
++        );
+ 
+-        let other = Arc::new(Mutex::new(Vec::new()));
++        let other = Told::default();
+         report.set_sink(Some(sink(&other)));
+-        report.tell(0);
+-        assert_eq!(*other.lock().unwrap(), [0]);
++        report.tell(0, 0);
++        assert_eq!(*other.lock().unwrap(), [(0, 0)]);
+         report.set_sink(None);
+-        report.tell(3);
++        report.tell(3, 0);
+         assert_eq!(other.lock().unwrap().len(), 1);
+     }
+ }
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index d552363..a91a10c 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -27,7 +27,8 @@ use wayland_protocols::{
+         viewporter::client::wp_viewport::WpViewport,
+         viewporter::client::wp_viewporter::WpViewporter,
+     },
+-    xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
++    xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1},
++    xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
+ };
+ 
+ pub struct WaylandClient {
+@@ -62,10 +63,24 @@ struct State {
+     shm: Option<wl_shm::WlShm>,
+     cursor_surface: Option<wl_surface::WlSurface>,
+     keyboard: Option<wl_keyboard::WlKeyboard>,
++    /// The surface the keyboard is in, going by what the compositor said.
++    keyboard_in: Option<wl_surface::WlSurface>,
+     windows: Vec<Window>,
+     pub mouse_events: Vec<MouseEvents>,
+     pub output: Option<wl_output::WlOutput>,
+     pub output_events: Vec<wl_output::Event>,
++    activation: Option<xdg_activation_v1::XdgActivationV1>,
++    /// The last activation token the compositor handed out.
++    activation_token: Option<String>,
++    popups: Vec<Popup>,
++}
++
++/// A popup the client has opened (a menu): whether the compositor has dismissed it.
++struct Popup {
++    surface: wl_surface::WlSurface,
++    xdg_surface: xdg_surface::XdgSurface,
++    xdg_popup: xdg_popup::XdgPopup,
++    dismissed: bool,
+ }
+ 
+ #[derive(Debug, Clone, Default)]
+@@ -144,6 +159,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
+                         registry.bind::<ZwpRelativePointerManagerV1, _, _>(name, version, qh, ()),
+                     );
+                 }
++                "xdg_activation_v1" => {
++                    state.activation =
++                        Some(registry.bind::<xdg_activation_v1::XdgActivationV1, _, _>(
++                            name,
++                            version,
++                            qh,
++                            (),
++                        ));
++                }
+                 "wl_output" => {
+                     // The compositor only advertises wl_output after the first
+                     // VideoInfo has created it, so this branch may fire well after
+@@ -168,6 +192,38 @@ delegate_noop!(State: ignore WpViewport);
+ delegate_noop!(State: ignore ZwpPointerConstraintsV1);
+ delegate_noop!(State: ignore ZwpLockedPointerV1);
+ delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
++delegate_noop!(State: ignore xdg_activation_v1::XdgActivationV1);
++delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
++
++impl Dispatch<xdg_popup::XdgPopup, usize> for State {
++    fn event(
++        state: &mut Self,
++        _: &xdg_popup::XdgPopup,
++        event: xdg_popup::Event,
++        popup: &usize,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let xdg_popup::Event::PopupDone = event {
++            state.popups[*popup].dismissed = true;
++        }
++    }
++}
++
++impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for State {
++    fn event(
++        state: &mut Self,
++        _: &xdg_activation_token_v1::XdgActivationTokenV1,
++        event: xdg_activation_token_v1::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let xdg_activation_token_v1::Event::Done { token } = event {
++            state.activation_token = Some(token);
++        }
++    }
++}
+ 
+ impl WaylandClient {
+     pub fn new(w_socket: UnixStream) -> Self {
+@@ -196,10 +252,14 @@ impl WaylandClient {
+             shm: None,
+             cursor_surface: None,
+             keyboard: None,
++            keyboard_in: None,
+             windows: Vec::new(),
+             mouse_events: Vec::new(),
+             output: None,
+             output_events: Vec::new(),
++            activation: None,
++            activation_token: None,
++            popups: Vec::new(),
+         };
+ 
+         WaylandClient {
+@@ -306,6 +366,12 @@ impl WaylandClient {
+             .set_cursor(state.pointer_entered, None, 0, 0);
+     }
+ 
++    /// Creates a window that says how large it may be at most (`xdg_toplevel.set_max_size`)
++    /// before its first commit.
++    pub fn create_window_with_largest_size(&mut self, size: (i32, i32)) {
++        self.state.create_window_with_largest_size(size);
++    }
++
+     /// Creates a window that is a child of the first, as an application does with a dialog:
+     /// the parent is named before the window is committed for the first time
+     /// (`xdg_toplevel.set_parent`).
+@@ -315,14 +381,15 @@ impl WaylandClient {
+     }
+ 
+     /// The size and bounds the compositor told the last window, and whether it told it to
+-    /// fill the screen.
++    /// fill the screen (maximized or fullscreen).
+     pub fn told_to_last_window(&self) -> ((i32, i32), Option<(i32, i32)>, bool) {
+         let window = self.state.windows.last().unwrap();
+         let (_, configure) = window.configures_received.last().unwrap();
+         (
+             configure.size,
+             configure.bounds,
+-            configure.states.contains(&xdg_toplevel::State::Fullscreen),
++            configure.states.contains(&xdg_toplevel::State::Fullscreen)
++                || configure.states.contains(&xdg_toplevel::State::Maximized),
+         )
+     }
+ 
+@@ -349,8 +416,23 @@ impl WaylandClient {
+     /// as its first: the window is as large as the picture, as a dialog is that knows its
+     /// own size.
+     pub fn setup_window_of_one_colour(&mut self, (width, height): (i32, i32), bgra: [u8; 4]) {
++        let buffer = self.state.buffer_of_one_colour((width, height), bgra);
++        let window = self.state.windows.last_mut().unwrap();
++        window.set_title("A question");
++        window.attach_new_buffer(&buffer);
++        window.set_size(width as u16, height as u16);
++        window.ack_last_and_commit();
++    }
++}
++
++impl State {
++    fn buffer_of_one_colour(
++        &mut self,
++        (width, height): (i32, i32),
++        bgra: [u8; 4],
++    ) -> wl_buffer::WlBuffer {
+         use std::io::Write;
+-        let state = &mut self.state;
++        let state = self;
+         let mut file = tempfile::tempfile().unwrap();
+         file.write_all(&bgra.repeat((width * height) as usize))
+             .unwrap();
+@@ -370,13 +452,11 @@ impl WaylandClient {
+             &state.qh,
+             (),
+         );
+-        let window = state.windows.last_mut().unwrap();
+-        window.set_title("A question");
+-        window.attach_new_buffer(&buffer);
+-        window.set_size(width as u16, height as u16);
+-        window.ack_last_and_commit();
++        buffer
+     }
++}
+ 
++impl WaylandClient {
+     /// Whether the compositor has asked the last window to close.
+     pub fn asked_to_close(&self) -> bool {
+         self.state.windows.last().is_some_and(|w| w.close_requested)
+@@ -392,6 +472,265 @@ impl WaylandClient {
+         }
+     }
+ 
++    /// The states the compositor told the last window in its last configure.
++    pub fn states_told_to_last_window(&self) -> Vec<xdg_toplevel::State> {
++        let window = self.state.windows.last().unwrap();
++        let (_, configure) = window.configures_received.last().unwrap();
++        configure.states.clone()
++    }
++
++    /// Asks for the last window to fill the screen (`xdg_toplevel.set_fullscreen`), or no
++    /// longer to, as a video player does.
++    pub fn ask_for_fullscreen(&mut self, fullscreen: bool) {
++        let last = self.state.windows.len() - 1;
++        self.ask_for_fullscreen_of(last, fullscreen);
++    }
++
++    /// As [`Self::ask_for_fullscreen`], for the window made in this place.
++    pub fn ask_for_fullscreen_of(&mut self, window: usize, fullscreen: bool) {
++        let toplevel = &self.state.windows[window].xdg_toplevel;
++        if fullscreen {
++            toplevel.set_fullscreen(None);
++        } else {
++            toplevel.unset_fullscreen();
++        }
++    }
++
++    /// Answers the last configure of the last window and commits its picture again.
++    pub fn ack_and_commit(&mut self) {
++        self.state.windows.last().unwrap().ack_last_and_commit();
++    }
++
++    /// Answers the last window's configure and commits without a picture, as some
++    /// applications do with a second window before they have drawn into it.
++    pub fn ack_and_commit_without_a_picture(&mut self) {
++        self.state.windows.last().unwrap().ack_last_and_commit();
++    }
++
++    /// Gives the last window a picture of one colour of this size, without answering a
++    /// configure (it has been answered already).
++    pub fn draw_last_window_of_one_colour(&mut self, size: (i32, i32), bgra: [u8; 4]) {
++        let buffer = self.state.buffer_of_one_colour(size, bgra);
++        let window = self.state.windows.last().unwrap();
++        window.attach_new_buffer(&buffer);
++        window.set_size(size.0 as u16, size.1 as u16);
++        window.commit();
++    }
++
++    /// Which of the client's windows (by the order they were made in) the pointer is in, and
++    /// how many button events each window has had, going by what the compositor said.
++    pub fn pointer_and_buttons(&self) -> (Option<usize>, Vec<usize>) {
++        let index = |surface: &wl_surface::WlSurface| {
++            self.state
++                .windows
++                .iter()
++                .position(|w| &w.surface == surface)
++        };
++        let mut over = None;
++        let mut buttons = vec![0; self.state.windows.len()];
++        for event in &self.state.mouse_events {
++            match event {
++                MouseEvents::Pointer(wl_pointer::Event::Enter { surface, .. }) => {
++                    over = index(surface)
++                }
++                MouseEvents::Pointer(wl_pointer::Event::Leave { .. }) => over = None,
++                MouseEvents::Pointer(wl_pointer::Event::Button { .. }) => {
++                    if let Some(i) = over {
++                        buttons[i] += 1;
++                    }
++                }
++                _ => {}
++            }
++        }
++        (over, buttons)
++    }
++
++    /// Whether the compositor last told this window (by the order they were made in) that it
++    /// is the active one.
++    pub fn told_active(&self, window: usize) -> bool {
++        let (_, configure) = self.state.windows[window]
++            .configures_received
++            .last()
++            .unwrap();
++        configure.states.contains(&xdg_toplevel::State::Activated)
++    }
++
++    /// Which of the client's windows has the keyboard.
++    pub fn keyboard_window(&self) -> Option<usize> {
++        let surface = self.state.keyboard_in.as_ref()?;
++        self.state
++            .windows
++            .iter()
++            .position(|w| &w.surface == surface)
++    }
++
++    /// Asks the compositor for an activation token (`xdg_activation_v1`), as an application
++    /// does before it asks for a window to come forward. The token comes with a round trip.
++    /// With `serial`, the token is asked for as the answer to the input event of that serial
++    /// on the seat (`xdg_activation_token_v1.set_serial`), as an application does after a
++    /// click; without, as one that asks at will.
++    pub fn ask_for_an_activation_token(&mut self, serial: Option<u32>) {
++        let activation = self
++            .state
++            .activation
++            .as_ref()
++            .expect("the compositor offers no xdg_activation_v1");
++        let token = activation.get_activation_token(&self.qh, ());
++        if let Some(serial) = serial {
++            token.set_serial(serial, self.state.seat.as_ref().unwrap());
++        }
++        token.commit();
++        self.state.activation_token = None;
++    }
++
++    /// Opens a popup (a menu) on the window made in this place. With `grab`, it asks for a
++    /// grab with that serial, as a menu opened by a click does. Returns the popup's number.
++    pub fn open_popup(&mut self, window: usize, grab: Option<u32>) -> usize {
++        let state = &mut self.state;
++        let wm_base = state.wm_base.as_ref().unwrap();
++        let positioner = wm_base.create_positioner(&state.qh, ());
++        positioner.set_size(20, 20);
++        positioner.set_anchor_rect(0, 0, 10, 10);
++        let surface = state
++            .compositor
++            .as_ref()
++            .unwrap()
++            .create_surface(&state.qh, ());
++        let xdg_surface = wm_base.get_xdg_surface(&surface, &state.qh, ());
++        let number = state.popups.len();
++        let popup = xdg_surface.get_popup(
++            Some(&state.windows[window].xdg_surface),
++            &positioner,
++            &state.qh,
++            number,
++        );
++        if let Some(serial) = grab {
++            popup.grab(state.seat.as_ref().unwrap(), serial);
++        }
++        surface.commit();
++        state.popups.push(Popup {
++            surface,
++            xdg_surface,
++            xdg_popup: popup,
++            dismissed: false,
++        });
++        number
++    }
++
++    /// Opens a popup on another popup (a submenu) that grabs with this serial. Returns the
++    /// popup's number.
++    pub fn open_popup_on_popup(&mut self, parent: usize, grab: u32) -> usize {
++        let state = &mut self.state;
++        let wm_base = state.wm_base.as_ref().unwrap();
++        let positioner = wm_base.create_positioner(&state.qh, ());
++        positioner.set_size(20, 20);
++        positioner.set_anchor_rect(0, 0, 10, 10);
++        let surface = state
++            .compositor
++            .as_ref()
++            .unwrap()
++            .create_surface(&state.qh, ());
++        let xdg_surface = wm_base.get_xdg_surface(&surface, &state.qh, ());
++        let number = state.popups.len();
++        let popup = xdg_surface.get_popup(
++            Some(&state.popups[parent].xdg_surface),
++            &positioner,
++            &state.qh,
++            number,
++        );
++        popup.grab(state.seat.as_ref().unwrap(), grab);
++        surface.commit();
++        state.popups.push(Popup {
++            surface,
++            xdg_surface,
++            xdg_popup: popup,
++            dismissed: false,
++        });
++        number
++    }
++
++    /// Closes a popup, as a menu does when one of its items is chosen.
++    pub fn close_popup(&mut self, popup: usize) {
++        let popup = &self.state.popups[popup];
++        popup.xdg_popup.destroy();
++        popup.xdg_surface.destroy();
++        popup.surface.destroy();
++    }
++
++    /// Whether the compositor has dismissed this popup (`xdg_popup.popup_done`).
++    pub fn popup_dismissed(&self, popup: usize) -> bool {
++        self.state.popups[popup].dismissed
++    }
++
++    /// Takes the last activation token the compositor handed out, to give it to another
++    /// client, as an application does that starts another.
++    pub fn take_activation_token(&mut self) -> String {
++        self.state
++            .activation_token
++            .take()
++            .expect("no activation token came")
++    }
++
++    /// Asks for the window made in this place to come forward with a token.
++    pub fn activate_window_with(&mut self, window: usize, token: String) {
++        let surface = &self.state.windows[window].surface;
++        self.state
++            .activation
++            .as_ref()
++            .unwrap()
++            .activate(token, surface);
++    }
++
++    /// Creates a window that asks for fullscreen and takes it back before its first commit.
++    pub fn create_window_asking_fullscreen_and_back(&mut self) {
++        self.state.create_window_of_with_requests(None, None, true);
++    }
++
++    /// The serial of the last button event the client had.
++    pub fn last_button_serial(&self) -> Option<u32> {
++        self.state
++            .mouse_events
++            .iter()
++            .rev()
++            .find_map(|event| match event {
++                MouseEvents::Pointer(wl_pointer::Event::Button { serial, .. }) => Some(*serial),
++                _ => None,
++            })
++    }
++
++    /// Where the pointer lies in the window it is in, by the last enter or motion.
++    pub fn last_pointer_position(&self) -> Option<(f64, f64)> {
++        self.state
++            .mouse_events
++            .iter()
++            .rev()
++            .find_map(|event| match event {
++                MouseEvents::Pointer(wl_pointer::Event::Motion {
++                    surface_x,
++                    surface_y,
++                    ..
++                })
++                | MouseEvents::Pointer(wl_pointer::Event::Enter {
++                    surface_x,
++                    surface_y,
++                    ..
++                }) => Some((*surface_x, *surface_y)),
++                _ => None,
++            })
++    }
++
++    /// Asks for the first window to come forward, with the token the compositor handed out.
++    pub fn activate_first_window(&mut self) {
++        let token = self
++            .state
++            .activation_token
++            .take()
++            .expect("no activation token came");
++        let surface = &self.state.windows.first().unwrap().surface;
++        let activation = self.state.activation.as_ref().unwrap();
++        activation.activate(token, surface);
++    }
++
+     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
+         self.state.mouse_events.as_mut()
+     }
+@@ -489,7 +828,29 @@ impl State {
+         self.create_window_of(None);
+     }
+ 
++    /// Creates a window that says how large it may be at most before its first commit.
++    pub fn create_window_with_largest_size(&mut self, (width, height): (i32, i32)) {
++        self.create_window_of_with(None, Some((width, height)));
++    }
++
+     pub fn create_window_of(&mut self, parent: Option<&xdg_toplevel::XdgToplevel>) {
++        self.create_window_of_with(parent, None);
++    }
++
++    fn create_window_of_with(
++        &mut self,
++        parent: Option<&xdg_toplevel::XdgToplevel>,
++        largest: Option<(i32, i32)>,
++    ) {
++        self.create_window_of_with_requests(parent, largest, false);
++    }
++
++    fn create_window_of_with_requests(
++        &mut self,
++        parent: Option<&xdg_toplevel::XdgToplevel>,
++        largest: Option<(i32, i32)>,
++        fullscreen_and_back: bool,
++    ) {
+         let compositor = self.compositor.as_ref().unwrap();
+         let xdg_wm_base = self.wm_base.as_ref().unwrap();
+         let viewporter = self.viewporter.as_ref().unwrap();
+@@ -500,6 +861,13 @@ impl State {
+         if parent.is_some() {
+             xdg_toplevel.set_parent(parent);
+         }
++        if let Some((width, height)) = largest {
++            xdg_toplevel.set_max_size(width, height);
++        }
++        if fullscreen_and_back {
++            xdg_toplevel.set_fullscreen(None);
++            xdg_toplevel.unset_fullscreen();
++        }
+         let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+ 
+         let window = Window {
+@@ -616,6 +984,10 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
+     ) {
+         match event {
+             xdg_surface::Event::Configure { serial } => {
++                if state.popups.iter().any(|p| p.xdg_surface == *xdg_surface) {
++                    xdg_surface.ack_configure(serial);
++                    return;
++                }
+                 let window = state
+                     .windows
+                     .iter_mut()
+@@ -696,7 +1068,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
+ 
+ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+     fn event(
+-        _state: &mut Self,
++        state: &mut Self,
+         _: &wl_keyboard::WlKeyboard,
+         event: wl_keyboard::Event,
+         _: &(),
+@@ -704,6 +1076,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+         _: &QueueHandle<Self>,
+     ) {
+         tracing::debug!("{:?}", event);
++        match event {
++            wl_keyboard::Event::Enter { surface, .. } => state.keyboard_in = Some(surface),
++            wl_keyboard::Event::Leave { .. } => state.keyboard_in = None,
++            _ => {}
++        }
+     }
+ }
+ 
+diff --git a/wayland-display-core/src/tests/fixture.rs b/wayland-display-core/src/tests/fixture.rs
+index 0cb8d65..bee225d 100644
+--- a/wayland-display-core/src/tests/fixture.rs
++++ b/wayland-display-core/src/tests/fixture.rs
+@@ -19,6 +19,8 @@ use std::time::Duration;
+ 
+ pub struct Fixture {
+     pub client: WaylandClient,
++    /// Where the compositor listens, for a second client.
++    socket_path: String,
+     pub server: State,
+     server_event_loop: EventLoop<'static, State>,
+ }
+@@ -72,12 +74,12 @@ impl Fixture {
+ 
+         // Setup Wayland client
+         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
+-        let wclient = WaylandClient::new(
+-            UnixStream::connect(format!("{}/{}", runtime_dir, socket_name)).unwrap(),
+-        );
++        let socket_path = format!("{}/{}", runtime_dir, socket_name);
++        let wclient = WaylandClient::new(UnixStream::connect(&socket_path).unwrap());
+ 
+         let mut f = Fixture {
+             client: wclient,
++            socket_path,
+             server: server_state,
+             server_event_loop: event_loop,
+         };
+@@ -143,6 +145,30 @@ impl Fixture {
+         }
+     }
+ 
++    /// Connects another client, as a second application does.
++    pub fn another_client(&mut self) -> WaylandClient {
++        let mut other = WaylandClient::new(UnixStream::connect(&self.socket_path).unwrap());
++        self.round_trip_with(&mut other);
++        self.round_trip_with(&mut other);
++        other
++    }
++
++    /// As [`Self::round_trip`], for another client; the first is kept going too.
++    pub fn round_trip_with(&mut self, other: &mut WaylandClient) {
++        let data = other.send_sync();
++        let mut run_times = 100;
++        while !data.done.load(Ordering::Relaxed) && run_times > 0 {
++            self.update_server();
++            other.dispatch();
++            self.update_client();
++            std::thread::sleep(Duration::from_millis(10));
++            run_times -= 1;
++        }
++        if run_times == 0 {
++            panic!("Timeout establishing connection to wayland server!");
++        }
++    }
++
+     pub fn update_server(&mut self) {
+         self.server
+             .dh
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index fc6caee..ad5c069 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -6,4 +6,5 @@ mod test_dialogs;
+ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
++mod test_trial_windows;
+ mod test_windows;
+diff --git a/wayland-display-core/src/tests/test_dialogs.rs b/wayland-display-core/src/tests/test_dialogs.rs
+index e64aad8..55a0b19 100644
+--- a/wayland-display-core/src/tests/test_dialogs.rs
++++ b/wayland-display-core/src/tests/test_dialogs.rs
+@@ -68,30 +68,31 @@ fn has_the_keyboard(f: &Fixture, window: &Window) -> bool {
+ fn a_window_that_draws_once_is_in_the_frame_and_takes_a_click() {
+     let mut f = fixture();
+     let (before, _) = white(&mut f, (0, 0, 0, 0));
+-    // A second window without a parent, as some applications open their dialogs. It is told
+-    // to fill the output like any window; this one keeps its own size all the same.
++    // A second window without a parent, as some applications open their dialogs. While the
++    // first fills the output it is not told to (gst-wayland-display-trial-windows.patch): it
++    // is told how much room there is, and keeps its own size.
+     open(&mut f, false, (120, 80));
+     assert_eq!(
+         f.client.told_to_last_window(),
+-        ((320, 240), Some((0, 0)), true)
++        ((0, 0), Some((320, 240)), false)
+     );
+ 
+-    // It has committed its picture exactly once, and it is in the frame: at the corner,
+-    // above the first window.
+-    let (_, at_the_corner) = white(&mut f, (0, 0, 120, 80));
+-    assert_eq!(at_the_corner, 120 * 80);
++    // It has committed its picture exactly once, and it is in the frame: over the middle of
++    // the output, above the first window.
++    let (_, in_the_middle) = white(&mut f, (100, 80, 220, 160));
++    assert_eq!(in_the_middle, 120 * 80);
+     let stack = windows(&f);
+     assert_eq!(stack.len(), 2);
+     assert_eq!(
+         f.server.space.element_location(&stack[1]).unwrap(),
+-        (0, 0).into()
++        (100, 80).into()
+     );
+     assert_eq!(stack[1].geometry().size, (120, 80).into());
+     assert!(has_the_keyboard(&f, &stack[1]));
+ 
+     // And the pointer reaches it.
+     f.server
+-        .pointer_motion_absolute(0, Point::from((60.0, 40.0)));
++        .pointer_motion_absolute(0, Point::from((110.0, 90.0)));
+     f.round_trip();
+     f.server.pointer_button(0, 0x110, ButtonState::Pressed);
+     f.server.pointer_button(0, 0x110, ButtonState::Released);
+@@ -209,14 +210,15 @@ fn a_child_larger_than_the_output_begins_at_the_corner() {
+ }
+ 
+ #[test]
+-fn two_ordinary_windows_are_both_told_to_fill_the_output_and_the_later_is_in_front() {
++fn two_ordinary_windows_the_later_keeps_its_size_and_is_in_front() {
+     let mut f = fixture();
+     let first = windows(&f)[0].clone();
+-    // A second ordinary window, which does as it is told.
++    // A second ordinary window: told how much room there is, not to fill the output
++    // (gst-wayland-display-trial-windows.patch). This one takes all of it.
+     open(&mut f, false, (320, 240));
+     assert_eq!(
+         f.client.told_to_last_window(),
+-        ((320, 240), Some((0, 0)), true)
++        ((0, 0), Some((320, 240)), false)
+     );
+     let stack = windows(&f);
+     assert_eq!(stack[0], first);
+diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
+new file mode 100644
+index 0000000..0ecf8de
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_trial_windows.rs
+@@ -0,0 +1,845 @@
++//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
++//! window, the one a person sees under the pointer; a window is told to be maximized, not
++//! fullscreen, unless it asks; a second window keeps its own size and is not lost under the
++//! first. A real Wayland client opens the windows.
++
++use crate::comp::apply_video_info;
++use crate::tests::fixture::Fixture;
++use crate::utils::RenderTarget;
++use crate::utils::video_info::GstVideoInfo;
++use smithay::backend::input::ButtonState;
++use smithay::utils::Point;
++use test_log::test;
++use wayland_protocols::xdg::shell::client::xdg_toplevel::State as Told;
++
++const WHITE: [u8; 4] = [255, 255, 255, 255];
++
++/// A first window that fills the output of 320 by 240, with the pointer in its middle.
++fn fixture() -> Fixture {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    f.server.set_cursor_sink(Some(Box::new(|_| {})));
++    f
++}
++
++fn click(f: &mut Fixture) {
++    f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    f.server.pointer_button(0, 0x110, ButtonState::Released);
++    f.round_trip();
++}
++
++#[test]
++fn a_window_shown_before_its_first_picture_has_the_pointer_from_that_picture_on() {
++    let mut f = fixture();
++    assert_eq!(f.client.pointer_and_buttons().0, Some(0));
++
++    // A second window without a parent that answers its configure and commits before it
++    // has drawn anything, as Blender does with its Preferences: it is shown, but has nothing
++    // in it yet that the pointer could be in.
++    f.client.create_window();
++    f.round_trip();
++    f.client.ack_and_commit_without_a_picture();
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(f.server.space.elements().count(), 2);
++    assert_eq!(f.client.keyboard_window(), Some(1));
++
++    // Its first picture covers the place of the pointer, which has not moved: the pointer
++    // is in it from then on.
++    f.client.draw_last_window_of_one_colour((320, 240), WHITE);
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(f.client.pointer_and_buttons().0, Some(1));
++
++    // A click without a move goes to it, and so does the keyboard.
++    click(&mut f);
++    assert_eq!(f.client.pointer_and_buttons(), (Some(1), vec![0, 2]));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    // And it is the active window; the first is told it is not.
++    assert!(f.client.told_active(1));
++    assert!(!f.client.told_active(0));
++}
++
++#[test]
++fn a_click_without_a_move_reaches_a_lone_window_with_the_keyboard() {
++    // The pointer has never moved: it stands where the output put it.
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    assert_eq!(f.client.pointer_and_buttons().0, None);
++
++    click(&mut f);
++    assert_eq!(f.client.pointer_and_buttons(), (Some(0), vec![2]));
++    assert_eq!(f.client.keyboard_window(), Some(0));
++}
++
++#[test]
++fn a_click_beside_a_dialog_gives_the_button_and_the_keyboard_to_the_parent() {
++    let mut f = fixture();
++    f.client.create_child_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip();
++    f.round_trip();
++    // The dialog lies over the middle, under the pointer, and has both.
++    assert_eq!(f.client.pointer_and_buttons().0, Some(1));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    click(&mut f);
++    assert_eq!(f.client.pointer_and_buttons(), (Some(0), vec![2, 0]));
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    // The parent is told it is the active window again, the dialog that it is not.
++    assert!(f.client.told_active(0));
++    assert!(!f.client.told_active(1));
++}
++
++#[test]
++fn the_first_window_is_told_maximized_at_the_size_of_the_output_not_fullscreen() {
++    let f = fixture();
++    let states = f.client.states_told_to_last_window();
++    assert!(states.contains(&Told::Maximized), "{states:?}");
++    assert!(!states.contains(&Told::Fullscreen), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (320, 240));
++}
++
++#[test]
++fn a_window_that_asks_for_fullscreen_has_it_and_is_maximized_again_when_it_leaves_it() {
++    let mut f = fixture();
++    f.client.ask_for_fullscreen(true);
++    f.round_trip();
++    let states = f.client.states_told_to_last_window();
++    assert!(states.contains(&Told::Fullscreen), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (320, 240));
++    f.client.ack_and_commit();
++    f.round_trip();
++
++    f.client.ask_for_fullscreen(false);
++    f.round_trip();
++    let states = f.client.states_told_to_last_window();
++    assert!(!states.contains(&Told::Fullscreen), "{states:?}");
++    assert!(states.contains(&Told::Maximized), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (320, 240));
++}
++
++#[test]
++fn a_maximized_window_is_told_the_new_size_of_the_output() {
++    let mut f = fixture();
++    let video_info = GstVideoInfo::RAW(
++        gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, 640, 360)
++            .fps(gst::Fraction::new(30, 1))
++            .build()
++            .unwrap(),
++    );
++    apply_video_info(&mut f.server, video_info, &RenderTarget::Software, None);
++    f.round_trip();
++    f.round_trip();
++    let states = f.client.states_told_to_last_window();
++    assert!(states.contains(&Told::Maximized), "{states:?}");
++    assert!(!states.contains(&Told::Fullscreen), "{states:?}");
++    assert_eq!(f.client.told_to_last_window().0, (640, 360));
++}
++
++/// Opens a second window without a parent that draws itself once at this size.
++fn open_a_second_window(f: &mut Fixture, size: (i32, i32)) {
++    f.client.create_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour(size, WHITE);
++    f.round_trip();
++    f.round_trip();
++}
++
++#[test]
++fn a_second_window_without_a_parent_keeps_its_size_and_lies_over_the_middle() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((0, 0), Some((320, 240)), false)
++    );
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (100, 80).into()
++    );
++    // It came up under the pointer, which stood in the middle: it has the pointer and the
++    // keyboard.
++    assert_eq!(f.client.pointer_and_buttons().0, Some(1));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++
++    // Fullscreen, and back: it has its own size again, not the output's.
++    f.client.ask_for_fullscreen(true);
++    f.round_trip();
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((320, 240), Some((320, 240)), true)
++    );
++    f.client.ack_and_commit();
++    f.round_trip();
++    f.client.ask_for_fullscreen(false);
++    f.round_trip();
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((0, 0), Some((320, 240)), false)
++    );
++}
++
++#[test]
++fn the_main_window_raised_by_a_click_brings_the_smaller_window_back_on_top() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    let (main, smaller) = {
++        let stack: Vec<_> = f.server.space.elements().cloned().collect();
++        (stack[0].clone(), stack[1].clone())
++    };
++
++    // A click in the smaller window, and the application asks, as the answer to it, for its
++    // main window to come forward (xdg_activation_v1): the main window is raised over the
++    // smaller one and has the keyboard.
++    click(&mut f);
++    let serial = f.client.last_button_serial();
++    f.client.ask_for_an_activation_token(serial);
++    f.round_trip();
++    f.client.activate_first_window();
++    f.round_trip();
++    f.round_trip();
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack, [smaller.clone(), main.clone()]);
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    assert!(f.client.told_active(0));
++    assert!(!f.client.told_active(1));
++    // The pointer, which stood over the smaller window, is in the main window now.
++    assert_eq!(f.client.pointer_and_buttons().0, Some(0));
++    let buttons_before = f.client.pointer_and_buttons().1;
++
++    // A click on the main window, beside where the smaller one lies: the main window has the
++    // button and the keyboard, and the smaller window is on top again.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    click(&mut f);
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack, [main, smaller]);
++    assert_eq!(
++        f.client.pointer_and_buttons(),
++        (Some(0), vec![buttons_before[0] + 2, buttons_before[1]])
++    );
++    assert_eq!(f.client.keyboard_window(), Some(0));
++
++    // And it takes the pointer and a click again where it lies.
++    f.server
++        .pointer_motion_absolute(0, Point::from((150.0, 100.0)));
++    f.round_trip();
++    click(&mut f);
++    assert_eq!(
++        f.client.pointer_and_buttons(),
++        (Some(1), vec![buttons_before[0] + 2, buttons_before[1] + 2])
++    );
++    assert_eq!(f.client.keyboard_window(), Some(1));
++}
++
++#[test]
++fn a_second_window_shown_before_its_picture_lies_over_the_middle_by_the_size_of_its_picture() {
++    let mut f = fixture();
++    f.client.create_window();
++    f.round_trip();
++    f.client.ack_and_commit_without_a_picture();
++    f.round_trip();
++    f.round_trip();
++    f.client.draw_last_window_of_one_colour((120, 80), WHITE);
++    f.round_trip();
++    f.round_trip();
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack.len(), 2);
++    assert_eq!(
++        f.server.space.element_location(&stack[1]).unwrap(),
++        (100, 80).into()
++    );
++    // The pointer, in the middle, is in it.
++    assert_eq!(f.client.pointer_and_buttons().0, Some(1));
++}
++
++/// Asks for an activation token with this serial, then for the first window to come forward
++/// with it. Returns whether the first window came to the top with the keyboard.
++fn activate_with(f: &mut Fixture, serial: Option<u32>) -> bool {
++    f.client.ask_for_an_activation_token(serial);
++    f.round_trip();
++    f.client.activate_first_window();
++    f.round_trip();
++    f.round_trip();
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    let main = f
++        .server
++        .space
++        .elements()
++        .find(|w| crate::comp::fills_the_output(w))
++        .cloned();
++    stack.last().cloned() == main && f.client.keyboard_window() == Some(0)
++}
++
++#[test]
++fn an_activation_is_followed_only_as_the_answer_to_an_input_of_the_application_in_use() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    let main = f.server.space.elements().next().cloned().unwrap();
++    let before: Vec<_> = f.server.space.elements().cloned().collect();
++    // Asked for at will: no serial, or a serial that is no key or button event. Nothing
++    // moves; the window is only marked as wanting attention.
++    assert!(!activate_with(&mut f, None));
++    assert!(crate::comp::windows::wants_attention(&main));
++    assert!(!activate_with(&mut f, Some(1)));
++    let after: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(after, before);
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    assert!(f.client.told_active(1));
++    // As the answer to a click in the window with the keyboard: it is followed, and the mark
++    // goes with the keyboard.
++    click(&mut f);
++    let serial = f.client.last_button_serial();
++    assert!(activate_with(&mut f, serial));
++    assert!(f.client.told_active(0));
++    assert!(!crate::comp::windows::wants_attention(&main));
++    // A token is used up by its request: none is kept.
++    assert_eq!(f.server.activation_state.tokens().count(), 0);
++}
++
++#[test]
++fn a_new_size_of_the_output_leaves_the_active_window_as_it_was() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    assert!(f.client.told_active(1));
++    let video_info = GstVideoInfo::RAW(
++        gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgba, 640, 360)
++            .fps(gst::Fraction::new(30, 1))
++            .build()
++            .unwrap(),
++    );
++    apply_video_info(&mut f.server, video_info, &RenderTarget::Software, None);
++    f.round_trip();
++    f.round_trip();
++    // Only the window with the keyboard is active (the fault of 2026-11-18: after a new size
++    // every window was told it was active, and Blender took keys in a window with modifiers
++    // it had seen in another).
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    assert!(!f.client.told_active(0));
++    assert!(f.client.told_active(1));
++    // The first window gets the keyboard back with a click: it was told it was inactive
++    // before, and is told it is active now.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    click(&mut f);
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    assert!(f.client.told_active(0));
++    assert!(!f.client.told_active(1));
++}
++
++#[test]
++fn a_window_without_the_keyboard_that_asks_for_fullscreen_stays_where_it_is_in_the_stack() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    let before: Vec<_> = f.server.space.elements().cloned().collect();
++    // The first window, under the second and without the keyboard, asks for fullscreen: it
++    // is told so, but is not put over the window that has the keyboard.
++    f.client.ask_for_fullscreen_of(0, true);
++    f.round_trip();
++    let after: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(after, before);
++    assert_eq!(f.client.keyboard_window(), Some(1));
++}
++
++#[test]
++fn a_window_that_moves_under_the_pointer_is_told_where_the_pointer_lies_in_it() {
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    // The pointer stands at 160,120 of the output, which is 60,40 of the window in the middle.
++    assert_eq!(f.client.last_pointer_position(), Some((60.0, 40.0)));
++    // It goes fullscreen, to the corner: the pointer lies at 160,120 of it now.
++    f.client.ask_for_fullscreen(true);
++    f.round_trip();
++    f.client.draw_last_window_of_one_colour((320, 240), WHITE);
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(f.client.pointer_and_buttons().0, Some(1));
++    assert_eq!(f.client.last_pointer_position(), Some((160.0, 120.0)));
++}
++
++#[test]
++fn a_window_with_a_largest_size_keeps_its_own_size_after_fullscreen() {
++    let mut f = Fixture::new();
++    f.client.create_window_with_largest_size((200, 150));
++    f.round_trip();
++    f.client.setup_window_of_one_colour((200, 150), WHITE);
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(f.client.told_to_last_window().2, false);
++    f.client.ask_for_fullscreen(true);
++    f.round_trip();
++    assert!(f.client.told_to_last_window().2);
++    f.client.ack_and_commit();
++    f.round_trip();
++    f.client.ask_for_fullscreen(false);
++    f.round_trip();
++    let (size, _, fills) = f.client.told_to_last_window();
++    assert_eq!((size, fills), ((0, 0), false));
++}
++
++#[test]
++fn ctrl_shift_tab_does_not_reach_the_compositors_own_key_with_a_us_keymap() {
++    use smithay::backend::input::KeyState;
++    // The compositor has a key of its own on Ctrl+Shift+Tab (it gives the keyboard to the
++    // window on top). With Shift the key is ISO_Left_Tab, not Tab, so the filter does not
++    // take it, and the keyboard stays where it is.
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    click(&mut f);
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    let key = |f: &mut Fixture, code: u32, state: KeyState| {
++        let keycode = f.server.scancode_to_keycode(code);
++        f.server.keyboard_input(0, keycode, state);
++    };
++    for code in [29, 42, 15] {
++        key(&mut f, code, KeyState::Pressed);
++    }
++    for code in [15, 42, 29] {
++        key(&mut f, code, KeyState::Released);
++    }
++    f.round_trip();
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    assert!(f.client.told_active(0));
++}
++
++/// Whether the server's keyboard is in this window, or in a popup of it.
++fn keyboard_in(f: &Fixture, window: &smithay::desktop::Window) -> (bool, bool) {
++    match f.server.seat.get_keyboard().unwrap().current_focus() {
++        Some(crate::comp::FocusTarget::Wayland(w)) => (&w == window, false),
++        Some(crate::comp::FocusTarget::Popup(_)) => (false, true),
++        None => (false, false),
++    }
++}
++
++#[test]
++fn a_window_of_another_application_goes_below_the_one_in_use_without_the_keyboard_marked() {
++    let mut f = fixture();
++    let told: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> = Default::default();
++    {
++        let told = told.clone();
++        f.server
++            .set_window_sink(Some(Box::new(move |windows, attention| {
++                told.lock().unwrap().push((windows, attention))
++            })));
++    }
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    // A second application maps a window while the first has the keyboard.
++    let mut other = f.another_client();
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack.len(), 2);
++    let theirs = stack[0].clone();
++    // It lies below the window in use, so that it catches no click meant for that one,
++    // without the keyboard, never told it is active, and marked; the mark is told with the
++    // windows.
++    assert_eq!(stack[1], in_use);
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++    assert!(!other.told_active(0));
++    assert!(f.client.told_active(0));
++    assert!(crate::comp::windows::wants_attention(&theirs));
++    assert_eq!(told.lock().unwrap().last(), Some(&(2, 1)));
++    // A click goes to the window in use.
++    click(&mut f);
++    assert_eq!(f.client.pointer_and_buttons().1, vec![2]);
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++    // When the application in use has no window left, the marked window has the keyboard,
++    // and the mark goes.
++    f.client.close_window();
++    f.round_trip();
++    f.round_trip_with(&mut other);
++    assert_eq!(keyboard_in(&f, &theirs), (true, false));
++    assert!(other.told_active(0));
++    assert!(!crate::comp::windows::wants_attention(&theirs));
++    assert_eq!(told.lock().unwrap().last(), Some(&(1, 0)));
++}
++
++#[test]
++fn a_new_window_of_the_application_in_use_takes_the_keyboard_as_before() {
++    // A second window, and a dialog, of the application that has the keyboard: each takes
++    // the keyboard when it is shown, and nothing is marked.
++    let mut f = fixture();
++    open_a_second_window(&mut f, (120, 80));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    f.client.create_child_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour((60, 40), WHITE);
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(f.client.keyboard_window(), Some(2));
++    assert!(f.client.told_active(2));
++    assert!(
++        !f.server
++            .space
++            .elements()
++            .any(crate::comp::windows::wants_attention)
++    );
++}
++
++#[test]
++fn a_popup_grabs_only_when_its_window_has_the_keyboard() {
++    let mut f = fixture();
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    // Another application's popup, on a window without the keyboard: dismissed.
++    let mut other = f.another_client();
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip_with(&mut other);
++    let popup = other.open_popup(0, Some(1));
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    assert!(other.popup_dismissed(popup));
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++
++    // The application in use: its menu has the keyboard, whatever serial it names (a menu
++    // opened with the keyboard, or long after a click, names an older one), and its window
++    // stays the active one.
++    let popup = f.client.open_popup(0, Some(1));
++    f.round_trip();
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(popup));
++    assert_eq!(keyboard_in(&f, &in_use), (false, true));
++    assert!(f.client.told_active(0));
++    assert!(!other.told_active(0));
++}
++
++/// The application in use opens a menu that grabs, as with a click.
++fn open_a_menu(f: &mut Fixture) -> usize {
++    click(f);
++    let serial = f.client.last_button_serial();
++    let popup = f.client.open_popup(0, serial);
++    f.round_trip();
++    f.round_trip();
++    popup
++}
++
++#[test]
++fn a_window_a_menu_item_opens_takes_the_keyboard() {
++    let mut f = fixture();
++    let menu = open_a_menu(&mut f);
++    assert!(!f.client.popup_dismissed(menu));
++    // An item is chosen: the menu goes, and the application opens a window before any other
++    // input comes.
++    f.client.close_popup(menu);
++    f.round_trip();
++    open_a_second_window(&mut f, (120, 80));
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    assert!(
++        !f.server
++            .space
++            .elements()
++            .any(crate::comp::windows::wants_attention)
++    );
++}
++
++#[test]
++fn after_a_menu_has_gone_the_next_menu_may_grab() {
++    let mut f = fixture();
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    let menu = open_a_menu(&mut f);
++    // Along a menu bar: the menu goes, and the next one opens and grabs at once.
++    f.client.close_popup(menu);
++    let next = f.client.open_popup(0, Some(1));
++    f.round_trip();
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(next));
++    assert_eq!(keyboard_in(&f, &in_use), (false, true));
++}
++
++#[test]
++fn a_window_that_comes_while_a_menu_is_open_is_marked() {
++    let mut f = fixture();
++    let menu = open_a_menu(&mut f);
++    // The application opens a window while its menu still has the grab: the seat keeps the
++    // keyboard in the menu, and the window is marked.
++    open_a_second_window(&mut f, (120, 80));
++    assert!(!f.client.popup_dismissed(menu));
++    let second = f.server.space.elements().last().cloned().unwrap();
++    assert!(crate::comp::windows::wants_attention(&second));
++}
++
++#[test]
++fn when_a_dialog_closes_the_keyboard_goes_back_to_its_parent_not_to_another_application() {
++    // (The other application's window lies below the dialog and above the parent: the top
++    // window after the dialog goes is the other application's.)
++    let mut f = fixture();
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    // A dialog of the application in use has the keyboard; another application's window
++    // comes, marked.
++    f.client.create_child_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour((60, 40), WHITE);
++    f.round_trip();
++    f.round_trip();
++    assert_eq!(f.client.keyboard_window(), Some(1));
++    let mut other = f.another_client();
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    let theirs = f
++        .server
++        .space
++        .elements()
++        .find(|w| crate::comp::windows::wants_attention(w))
++        .cloned()
++        .unwrap();
++    // The dialog closes: the keyboard goes to its parent, and the other window stays marked.
++    f.client.close_window();
++    f.round_trip();
++    f.round_trip_with(&mut other);
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++    assert!(f.client.told_active(0));
++    assert!(!other.told_active(0));
++    assert!(crate::comp::windows::wants_attention(&theirs));
++}
++
++#[test]
++fn a_token_handed_to_another_application_does_not_move_the_keyboard() {
++    let mut f = fixture();
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    let mut other = f.another_client();
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip_with(&mut other);
++    let theirs = f
++        .server
++        .space
++        .elements()
++        .find(|w| **w != in_use)
++        .cloned()
++        .unwrap();
++    // The application in use makes a token as the answer to a click (beside the other
++    // application's window), and hands it on; the other uses it for its own window.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    click(&mut f);
++    let serial = f.client.last_button_serial();
++    f.client.ask_for_an_activation_token(serial);
++    f.round_trip();
++    let token = f.client.take_activation_token();
++    other.activate_window_with(0, token);
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack.last(), Some(&in_use));
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++    assert!(crate::comp::windows::wants_attention(&theirs));
++}
++
++#[test]
++fn a_client_holds_a_limited_number_of_unused_tokens() {
++    let mut f = fixture();
++    for _ in 0..40 {
++        f.client.ask_for_an_activation_token(None);
++    }
++    f.round_trip();
++    assert_eq!(f.server.activation_state.tokens().count(), 32);
++}
++
++#[test]
++fn a_window_that_takes_fullscreen_back_before_its_first_configure_is_a_second_window_still() {
++    let mut f = fixture();
++    f.client.create_window_asking_fullscreen_and_back();
++    f.round_trip();
++    assert_eq!(
++        f.client.told_to_last_window(),
++        ((0, 0), Some((320, 240)), false)
++    );
++}
++
++#[test]
++fn a_window_is_told_it_is_active_only_with_the_keyboard() {
++    let mut f = Fixture::new();
++    f.client.create_window();
++    f.round_trip();
++    // The first configure, before the window is shown, does not say active.
++    assert!(!f.client.told_active(0));
++    f.client.setup_window(320, 240);
++    f.round_trip();
++    f.round_trip();
++    // Shown, it has the keyboard, and is told so.
++    assert!(f.client.told_active(0));
++}
++
++/// Another application, with one window of 120 by 80 shown (below the window in use).
++fn another_application_with_a_window(f: &mut Fixture) -> crate::tests::client::WaylandClient {
++    let mut other = f.another_client();
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    other
++}
++
++#[test]
++fn another_application_closing_its_window_after_a_menu_has_gone_takes_no_keyboard() {
++    let mut f = fixture();
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    // The other application has two windows.
++    let mut other = another_application_with_a_window(&mut f);
++    other.create_window();
++    f.round_trip_with(&mut other);
++    other.setup_window_of_one_colour((120, 80), WHITE);
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    // A menu of the application in use opens and goes; the seat still points at it.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    let menu = open_a_menu(&mut f);
++    f.client.close_popup(menu);
++    f.round_trip();
++    // The other application closes one of its windows: the keyboard stays with the
++    // application in use (not given to the other application's remaining window).
++    other.close_window();
++    f.round_trip_with(&mut other);
++    f.round_trip();
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++    assert!(f.client.told_active(0));
++}
++
++#[test]
++fn another_applications_window_goes_below_every_window_of_the_application_in_use() {
++    let mut f = fixture();
++    let main = f.server.space.elements().next().cloned().unwrap();
++    // A dialog of the application in use, above its main window, has the keyboard.
++    f.client.create_child_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour((60, 40), WHITE);
++    f.round_trip();
++    f.round_trip();
++    let _other = another_application_with_a_window(&mut f);
++    let stack: Vec<_> = f.server.space.elements().cloned().collect();
++    assert_eq!(stack.len(), 3);
++    // Below the main window too, not between it and its dialog.
++    assert!(crate::comp::windows::wants_attention(&stack[0]));
++    assert_eq!(stack[1], main);
++    // The click beside the dialog still goes to the main window.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    click(&mut f);
++    assert_eq!(keyboard_in(&f, &main), (true, false));
++}
++
++#[test]
++fn after_the_last_window_has_gone_a_new_applications_window_takes_the_keyboard() {
++    let mut f = fixture();
++    f.client.close_window();
++    f.round_trip();
++    assert!(f.server.space.elements().next().is_none());
++    let mut other = another_application_with_a_window(&mut f);
++    let theirs = f.server.space.elements().next().cloned().unwrap();
++    assert_eq!(keyboard_in(&f, &theirs), (true, false));
++    assert!(other.told_active(0));
++    assert!(!crate::comp::windows::wants_attention(&theirs));
++    f.round_trip_with(&mut other);
++}
++
++#[test]
++fn a_refused_menu_after_a_menu_has_gone_leaves_the_keyboard_with_the_window_in_use() {
++    let mut f = fixture();
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    let mut other = another_application_with_a_window(&mut f);
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    let menu = open_a_menu(&mut f);
++    f.client.close_popup(menu);
++    f.round_trip();
++    // The other application's menu is refused; the keyboard is back in the window in use,
++    // not left on the menu that has gone.
++    let theirs = other.open_popup(0, Some(1));
++    f.round_trip_with(&mut other);
++    f.round_trip_with(&mut other);
++    assert!(other.popup_dismissed(theirs));
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++}
++
++#[test]
++fn a_click_after_a_menu_has_gone_reaches_the_window() {
++    let mut f = fixture();
++    let menu = open_a_menu(&mut f);
++    let before = f.client.pointer_and_buttons().1[0];
++    f.client.close_popup(menu);
++    f.round_trip();
++    click(&mut f);
++    assert_eq!(f.client.pointer_and_buttons().1[0], before + 2);
++}
++
++#[test]
++fn a_marked_window_that_goes_takes_its_mark_with_it_and_windows_have_ids() {
++    let mut f = fixture();
++    let told: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> = Default::default();
++    {
++        let told = told.clone();
++        f.server
++            .set_window_sink(Some(Box::new(move |windows, attention| {
++                told.lock().unwrap().push((windows, attention))
++            })));
++    }
++    let in_use = f.server.space.elements().next().cloned().unwrap();
++    let mut other = another_application_with_a_window(&mut f);
++    let theirs = f.server.space.elements().next().cloned().unwrap();
++    assert!(crate::comp::windows::wants_attention(&theirs));
++    assert_eq!(told.lock().unwrap().last(), Some(&(2, 1)));
++    // Each window has an id of its own, the same every time it is asked for.
++    let (a, b) = (
++        crate::comp::windows::id_of(&in_use),
++        crate::comp::windows::id_of(&theirs),
++    );
++    assert_ne!(a, b);
++    assert_eq!(crate::comp::windows::id_of(&theirs), b);
++    // The marked window goes: one window, none marked.
++    other.close_window();
++    f.round_trip_with(&mut other);
++    f.round_trip();
++    assert!(!crate::comp::windows::wants_attention(&theirs));
++    assert_eq!(told.lock().unwrap().last(), Some(&(1, 0)));
++    assert_eq!(keyboard_in(&f, &in_use), (true, false));
++}
++
++#[test]
++fn after_a_submenu_has_closed_a_click_outside_still_dismisses_its_menu() {
++    // (With the order of the seat's grabs in this compositor, a submenu's grab leaves the
++    // keyboard on the window, so the submenu is never the keyboard's focus here and this
++    // test passes with or without the check for an open menu; it guards the outcome.)
++    let mut f = fixture();
++    let menu = open_a_menu(&mut f);
++    let serial = f.client.last_button_serial().unwrap();
++    let submenu = f.client.open_popup_on_popup(menu, serial);
++    f.round_trip();
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(submenu));
++    // The submenu closes (the person goes back to the menu); the menu stays open.
++    f.client.close_popup(submenu);
++    f.round_trip();
++    assert!(!f.client.popup_dismissed(menu));
++    // A click outside the menu, in the window: the menu is dismissed.
++    click(&mut f);
++    f.round_trip();
++    assert!(f.client.popup_dismissed(menu));
++}
+diff --git a/wayland-display-core/src/tests/test_windows.rs b/wayland-display-core/src/tests/test_windows.rs
+index 8d177dc..8c33648 100644
+--- a/wayland-display-core/src/tests/test_windows.rs
++++ b/wayland-display-core/src/tests/test_windows.rs
+@@ -13,7 +13,7 @@ fn listen(f: &mut Fixture) -> Told {
+     let told = Told::default();
+     let sink: WindowSink = {
+         let told = told.clone();
+-        Box::new(move |windows| told.lock().unwrap().push(windows))
++        Box::new(move |windows, _| told.lock().unwrap().push(windows))
+     };
+     f.server.set_window_sink(Some(sink));
+     told
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index 595d547..5d029f4 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -42,12 +42,26 @@ impl CompositorHandler for State {
+         }
+         crate::comp::client_committed(self);
+ 
+-        if let Some(window) = self
++        let shown = self
+             .space
+             .elements()
+             .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
+-        {
++            .cloned();
++        if let Some(window) = shown {
+             window.on_commit();
++            // A window that was shown before its first picture was put where a window of no
++            // size goes. It is put where it belongs once it has a size.
++            if crate::comp::windows::to_be_placed_again(&window) {
++                let loc = self.place_window(&window);
++                self.move_window(&window, loc);
++                // Its dialogs stay in front of it.
++                self.raise_children_of(&window);
++                crate::comp::picture_changed(self);
++            }
++            // What is under the pointer may have changed with this picture: a window that
++            // was shown before its first picture (as some applications do with a second
++            // window) is found by the pointer from its first picture on.
++            self.pointer_to_the_window_under_it();
+         }
+         self.popups.commit(surface);
+ 
+@@ -91,31 +105,48 @@ impl CompositorHandler for State {
+                     toplevel.with_pending_state(|state| {
+                         state.bounds = room;
+                     });
++                } else if max_size.w == 0
++                    && max_size.h == 0
++                    && self.space.elements().any(crate::comp::fills_the_output)
++                    && !toplevel
++                        .with_pending_state(|state| state.states.contains(XdgState::Fullscreen))
++                {
++                    // A second window without a parent, while a window that fills the output
++                    // is shown (Blender's Preferences, a second Firefox window): it is not made
++                    // as large as the output. It keeps the size it wants, is told how much room
++                    // there is, and lies over the middle of the output.
++                    let room = self.output_size();
++                    toplevel.with_pending_state(|state| {
++                        state.bounds = room;
++                    });
+                 } else if max_size.w == 0 && max_size.h == 0 {
++                    let size = self.output_size();
+                     toplevel.with_pending_state(|state| {
+-                        state.size = Some(
+-                            self.output
+-                                .as_ref()
+-                                .unwrap()
+-                                .current_mode()
+-                                .unwrap()
+-                                .size
+-                                .to_f64()
+-                                .to_logical(
+-                                    self.output
+-                                        .as_ref()
+-                                        .unwrap()
+-                                        .current_scale()
+-                                        .fractional_scale(),
+-                                )
+-                                .to_i32_round(),
+-                        );
+-                        state.states.set(XdgState::Fullscreen);
++                        state.size = size;
++                        // As large as the output, but maximized: the application keeps its
++                        // own bars (Firefox's toolbar slides away in fullscreen). Fullscreen
++                        // only when the application has asked for it.
++                        if !state.states.contains(XdgState::Fullscreen) {
++                            state.states.set(XdgState::Maximized);
++                        }
++                    });
++                }
++                // A window without a parent that is not made as large as the output (a second
++                // window, one with a largest size) keeps a size of its own, also after it
++                // leaves fullscreen or maximized.
++                if !is_child
++                    && !toplevel.with_pending_state(|state| {
++                        state.states.contains(XdgState::Maximized)
++                            || state.states.contains(XdgState::Fullscreen)
++                    })
++                {
++                    with_states(surface, |states| {
++                        states
++                            .data_map
++                            .insert_if_missing(|| crate::comp::windows::KeepsItsOwnSize)
+                     });
+                 }
+-                toplevel.with_pending_state(|state| {
+-                    state.states.set(XdgState::Activated);
+-                });
++                // Not told it is active: that comes with the keyboard.
+                 toplevel.send_configure();
+                 self.pending_windows.push(window);
+             } else {
+@@ -125,18 +156,37 @@ impl CompositorHandler for State {
+                 // pointer.
+                 window.on_commit();
+                 let loc = self.place_window(&window);
+-                self.space.map_element(window.clone(), loc, true);
+-                self.seat.get_keyboard().unwrap().set_focus(
+-                    self,
+-                    Some(FocusTarget::from(window)),
+-                    SERIAL_COUNTER.next_serial(),
+-                );
++                crate::comp::windows::placing(&window);
++                // Its id, given in the order the windows are shown.
++                crate::comp::windows::id_of(&window);
++                if self.may_take_the_keyboard(&window) {
++                    self.space.map_element(window.clone(), loc, false);
++                    // A menu item that opens a window: the menu has gone, its grab not yet.
++                    self.end_the_grab_of_a_gone_popup();
++                    let keyboard = self.seat.get_keyboard().unwrap();
++                    if keyboard.is_grabbed() {
++                        // A menu of the same application is still open: the seat keeps the
++                        // keyboard there. The window is marked; a click gives it the keyboard.
++                        self.mark_wants_attention(&window, true);
++                    } else {
++                        keyboard.set_focus(
++                            self,
++                            Some(FocusTarget::from(window)),
++                            SERIAL_COUNTER.next_serial(),
++                        );
++                    }
++                } else {
++                    // Another application has the keyboard: the new window does not take it,
++                    // and is put just below the window in use, so that it catches no click
++                    // meant for that one. It is marked as wanting attention; the mark goes out
++                    // with the windows, for the viewer to show.
++                    self.map_below_the_window_in_use(&window, loc);
++                    self.mark_wants_attention(&window, true);
++                }
+                 // If it has come up over another window and under the pointer, the pointer is
+                 // its own. (A first window is left as it was: it has the pointer from the
+                 // first move on.)
+-                if self.space.elements().count() > 1 {
+-                    self.pointer_to_the_window_under_it();
+-                }
++                self.pointer_to_the_window_under_it();
+             }
+ 
+             return;
+diff --git a/wayland-display-core/src/wayland/handlers/mod.rs b/wayland-display-core/src/wayland/handlers/mod.rs
+index e41c12b..b764f27 100644
+--- a/wayland-display-core/src/wayland/handlers/mod.rs
++++ b/wayland-display-core/src/wayland/handlers/mod.rs
+@@ -10,3 +10,4 @@ pub mod shm;
+ pub mod viewporter;
+ pub mod wl_drm;
+ pub mod xdg;
++pub mod xdg_activation;
+diff --git a/wayland-display-core/src/wayland/handlers/seat.rs b/wayland-display-core/src/wayland/handlers/seat.rs
+index 9bd9383..b0ef369 100644
+--- a/wayland-display-core/src/wayland/handlers/seat.rs
++++ b/wayland-display-core/src/wayland/handlers/seat.rs
+@@ -17,6 +17,7 @@ impl SeatHandler for State {
+     }
+ 
+     fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
++        self.tell_windows_which_is_active(focus);
+         if let Some(surface) = focus {
+             let client = match surface {
+                 FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
+diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
+index 4931ed6..f4b3114 100644
+--- a/wayland-display-core/src/wayland/handlers/xdg.rs
++++ b/wayland-display-core/src/wayland/handlers/xdg.rs
+@@ -5,7 +5,8 @@ use smithay::{
+         find_popup_root_surface, get_popup_toplevel_coords,
+     },
+     input::{Seat, pointer::Focus},
+-    reexports::wayland_server::protocol::wl_seat::WlSeat,
++    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
++    reexports::wayland_server::protocol::{wl_output::WlOutput, wl_seat::WlSeat},
+     utils::Serial,
+     wayland::{
+         seat::WaylandFocus,
+@@ -29,6 +30,17 @@ impl XdgShellHandler for State {
+     }
+ 
+     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
++        // A marked window that goes takes its mark with it (the log says so; the count of
++        // marked windows is told with the windows just below).
++        let marked = self
++            .space
++            .elements()
++            .find(|w| w.toplevel().is_some_and(|toplevel| *toplevel == surface))
++            .filter(|w| crate::comp::windows::wants_attention(w))
++            .cloned();
++        if let Some(marked) = marked {
++            self.set_the_mark(&marked, false);
++        }
+         self.tell_windows(Some(&surface));
+         // It is a window no longer: out of the picture at once, and the keyboard and the
+         // pointer go to what is there now.
+@@ -37,14 +49,71 @@ impl XdgShellHandler for State {
+             .elements()
+             .find(|w| w.toplevel().is_some_and(|toplevel| *toplevel == surface))
+             .cloned();
++        // Its parent and its application, read before the window is let go.
++        let parent = surface.parent();
++        let client = {
++            use smithay::reexports::wayland_server::Resource;
++            surface.wl_surface().client().map(|c| c.id())
++        };
+         if let Some(gone) = gone {
+             self.space.unmap_elem(&gone);
+         }
+-        self.keyboard_to_the_top_window();
++        self.keyboard_after_a_window_has_gone(surface.wl_surface(), parent, client);
+         self.pointer_to_the_window_under_it();
+         crate::comp::picture_changed(self);
+     }
+ 
++    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
++        self.fill_the_output(&surface, true);
++    }
++
++    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
++        // Before its first configure only the asking is taken back: what the window is told
++        // is decided with that configure.
++        if !surface.is_initial_configure_sent() {
++            surface.with_pending_state(|state| {
++                state.states.unset(XdgState::Fullscreen);
++                if !state.states.contains(XdgState::Maximized) {
++                    state.size = None;
++                }
++            });
++            return;
++        }
++        // Back to what it was told before it asked: a window without a parent fills the
++        // output, maximized; a dialog, and a second window that keeps its own size, have a
++        // size of their own.
++        if surface.parent().is_none() && !keeps_its_own_size(&surface) {
++            surface.with_pending_state(|state| state.states.unset(XdgState::Fullscreen));
++            self.fill_the_output(&surface, false);
++        } else {
++            surface.with_pending_state(|state| {
++                state.states.unset(XdgState::Fullscreen);
++                state.size = None;
++            });
++            if surface.is_initial_configure_sent() {
++                surface.send_configure();
++            }
++        }
++    }
++
++    fn maximize_request(&mut self, surface: ToplevelSurface) {
++        self.fill_the_output(&surface, false);
++    }
++
++    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
++        // The first window stays maximized: there is no desk behind it to show. A dialog or
++        // a second window has a size of its own again.
++        if surface.parent().is_some() || keeps_its_own_size(&surface) {
++            surface.with_pending_state(|state| {
++                state.states.unset(XdgState::Maximized);
++                state.size = None;
++            });
++        }
++        if surface.is_initial_configure_sent() {
++            surface.send_configure();
++        }
++    }
++
+     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+         self.unconstrain_popup(&surface);
+         if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
+@@ -55,6 +124,16 @@ impl XdgShellHandler for State {
+     fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+         let seat: Seat<State> = Seat::from_resource(&seat).unwrap();
+         let kind = PopupKind::Xdg(surface.clone());
++        // A popup that grabs takes the keyboard. It may only when its window has the keyboard
++        // (or had it, through a popup of it): the keyboard stays within the application in
++        // use. Otherwise it is dismissed. (No serial is asked for beyond the seat's own check:
++        // it would protect nothing more, and menus opened with the keyboard, or long after
++        // the last click, name an older button serial.)
++        self.end_the_grab_of_a_gone_popup();
++        if !self.may_grab(&kind) {
++            surface.send_popup_done();
++            return;
++        }
+         if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
+             self.space
+                 .elements()
+@@ -106,7 +185,27 @@ impl XdgShellHandler for State {
+     }
+ }
+ 
++/// Whether a window was shown as a second window, with a size of its own.
++fn keeps_its_own_size(surface: &ToplevelSurface) -> bool {
++    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
++        states
++            .data_map
++            .get::<crate::comp::windows::KeepsItsOwnSize>()
++            .is_some()
++    })
++}
++
+ impl State {
++    /// Whether a popup may grab (see [`XdgShellHandler::grab`] above).
++    fn may_grab(&self, popup: &PopupKind) -> bool {
++        let Ok(root) = find_popup_root_surface(popup) else {
++            return false;
++        };
++        self.keyboard_holder
++            .as_ref()
++            .is_some_and(|(holder, _)| *holder == root)
++    }
++
+     fn unconstrain_popup(&self, popup: &PopupSurface) {
+         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
+             return;
+diff --git a/wayland-display-core/src/wayland/handlers/xdg_activation.rs b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
+new file mode 100644
+index 0000000..905fd53
+--- /dev/null
++++ b/wayland-display-core/src/wayland/handlers/xdg_activation.rs
+@@ -0,0 +1,118 @@
++use smithay::{
++    delegate_xdg_activation,
++    input::Seat,
++    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
++    wayland::{
++        seat::WaylandFocus,
++        xdg_activation::{
++            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
++        },
++    },
++};
++
++use crate::comp::State;
++
++/// How long a token is good for: an application asks for a window to come forward right
++/// after a person did something in it (a click on a link, a menu item).
++const TOKEN_LIFETIME_S: u64 = 10;
++
++/// How many unused tokens one client may hold.
++const TOKENS_PER_CLIENT: usize = 32;
++
++impl State {
++    /// Lets go of the tokens that are older than their lifetime.
++    fn let_old_tokens_go(&mut self) {
++        self.activation_state
++            .retain_tokens(|_, data| data.timestamp.elapsed().as_secs() < TOKEN_LIFETIME_S);
++    }
++}
++
++impl XdgActivationHandler for State {
++    fn activation_state(&mut self) -> &mut XdgActivationState {
++        &mut self.activation_state
++    }
++
++    /// A token is kept (whether a request with it is followed is decided when it comes),
++    /// unless its client holds as many unused tokens as it may already. A request with a
++    /// token that was not kept, or has been let go, never reaches this handler: Smithay
++    /// drops it.
++    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
++        self.let_old_tokens_go();
++        let held = self
++            .activation_state
++            .tokens()
++            .filter(|(_, held)| held.client_id == data.client_id)
++            .count();
++        held < TOKENS_PER_CLIENT
++    }
++
++    /// The request is followed (the window comes forward with its dialogs and has the
++    /// keyboard) only when all of this holds; otherwise nothing moves, and the window is only
++    /// marked as wanting attention (unless it has the keyboard already):
++    ///
++    /// * the token is not older than its lifetime, and has not been used;
++    /// * the client that made the token has the keyboard now (one of its windows has it);
++    /// * the window to come forward is that client's own: a token handed to another
++    ///   process (a link opened in a browser started from it) does not move the keyboard;
++    /// * the token names the serial of a recent key or button event on this seat, and that
++    ///   event went to the same client.
++    fn request_activation(
++        &mut self,
++        token: XdgActivationToken,
++        token_data: XdgActivationTokenData,
++        surface: WlSurface,
++    ) {
++        // A token is used once, whatever comes of the request.
++        self.activation_state.remove_token(&token);
++        self.let_old_tokens_go();
++        let shown = self
++            .space
++            .elements()
++            .find(|w| w.wl_surface().is_some_and(|s| *s == surface))
++            .cloned();
++        // A window that is not shown yet is not remembered: the request is dropped. (A window
++        // that comes takes the keyboard when it may anyway.)
++        let Some(window) = shown else {
++            return;
++        };
++        if self.may_activate(&token_data, &surface) {
++            self.activate_window(&window);
++        } else {
++            let has_the_keyboard = self
++                .keyboard_holder
++                .as_ref()
++                .is_some_and(|(holder, _)| *holder == surface);
++            if !has_the_keyboard {
++                self.mark_wants_attention(&window, true);
++            }
++        }
++    }
++}
++
++impl State {
++    /// Whether a request with this token, for this surface, comes from the application a
++    /// person is using, as the answer to something the person did in it (see
++    /// `request_activation` above).
++    fn may_activate(&self, data: &XdgActivationTokenData, surface: &WlSurface) -> bool {
++        if data.timestamp.elapsed().as_secs() >= TOKEN_LIFETIME_S {
++            return false;
++        }
++        let Some(maker) = data.client_id.as_ref() else {
++            return false;
++        };
++        if surface.client().map(|c| c.id()).as_ref() != Some(maker) {
++            return false;
++        }
++        let keyboard = self.keyboard_holder.as_ref().and_then(|(_, c)| c.as_ref());
++        if keyboard != Some(maker) {
++            return false;
++        }
++        let Some((serial, seat)) = &data.serial else {
++            return false;
++        };
++        Seat::<State>::from_resource(seat).is_some_and(|s| s == self.seat)
++            && self.input_serials.is_recent_for(*serial, maker)
++    }
++}
++
++delegate_xdg_activation!(State);
