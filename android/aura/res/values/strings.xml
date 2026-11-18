@@ -32,4 +32,6 @@
     <string name="panel_title">仮のパネル %1$d（%2$s）</string>
     <string name="panel_note">映像なしの仮の画面。ホストには何もつながない。</string>
     <string name="panel_more">もう 1 枚</string>
+    <string name="middle_off">中ボタン：切</string>
+    <string name="middle_on">中ボタン：入（左が中になる）</string>
 </resources>

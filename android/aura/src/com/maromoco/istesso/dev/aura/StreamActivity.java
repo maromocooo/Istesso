@@ -48,6 +48,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private volatile int pictureHeight;
     private int buttons;
     private boolean touchDown;
+    /** The owner's stand-in for a middle button (Blender orbits with it): while on, the left button goes as the middle one. */
+    private boolean middle;
+    private int touchButton = 0x110;
+    private android.widget.Button middleToggle;
+    /** Each kind of pointer event is written to the log once (tag IstessoAura), to learn what the puck's touchpad sends. */
+    private final java.util.HashSet<String> seenKinds = new java.util.HashSet<>();
     private float scrollX;
     private float scrollY;
 
@@ -90,6 +96,17 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 ViewGroup.LayoutParams.MATCH_PARENT));
         // Bottom right, where an app has the fewest buttons; it goes away 5 s after it last changed and comes back
         // when something changes (the owner, 2026-11-18: at the top left it covered the editor's buttons).
+        middleToggle = new android.widget.Button(this);
+        middleToggle.setAllCaps(false);
+        middleToggle.setTextSize(12);
+        middleToggle.setAlpha(0.7f);
+        middleToggle.setText(getString(R.string.middle_off));
+        middleToggle.setOnClickListener(v -> {
+            middle = !middle;
+            middleToggle.setText(getString(middle ? R.string.middle_on : R.string.middle_off));
+        });
+        root.addView(middleToggle, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START));
         status.setClickable(false);
         status.setFocusable(false);
         root.addView(status, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -322,10 +339,23 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     }
 
     /** The buttons of a mouse that changed since last time, as BTN_LEFT, BTN_RIGHT, ... */
+    private int left() {
+        return middle ? 0x112 : 0x110;
+    }
+
+    private void noteKind(String where, MotionEvent e) {
+        String k = where + " source=0x" + Integer.toHexString(e.getSource()) + " tool=" + e.getToolType(0)
+                + " action=" + e.getActionMasked() + " class=" + e.getClassification() + " buttons=" + e.getButtonState()
+                + " pointers=" + e.getPointerCount();
+        if (seenKinds.add(k)) {
+            android.util.Log.i("IstessoAura", k);
+        }
+    }
+
     private void buttonsOf(MotionEvent e) {
         int now = e.getButtonState();
         int[][] map = {
-            {MotionEvent.BUTTON_PRIMARY, 0x110},
+            {MotionEvent.BUTTON_PRIMARY, left()},
             {MotionEvent.BUTTON_SECONDARY, 0x111},
             {MotionEvent.BUTTON_TERTIARY, 0x112},
             {MotionEvent.BUTTON_BACK, 0x113},
@@ -346,6 +376,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     }
 
     private boolean generic(MotionEvent e) {
+        noteKind("generic", e);
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_HOVER_ENTER:
             case MotionEvent.ACTION_HOVER_MOVE:
@@ -378,6 +409,24 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
 
     private boolean touch(MotionEvent e) {
         view.requestFocus();
+        noteKind("touch", e);
+        // The puck's touchpad: a two-finger swipe is a scroll; a three-or-more-finger swipe is left to the system.
+        int c = e.getClassification();
+        if (c == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE) {
+            scrollX += e.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_X_DISTANCE);
+            scrollY += e.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE);
+            int dx = (int) scrollX;
+            int dy = (int) scrollY;
+            if (dx != 0 || dy != 0) {
+                scrollX -= dx;
+                scrollY -= dy;
+                send(Native.INPUT_SCROLL, dx, dy);
+            }
+            return true;
+        }
+        if (c == 4) { // MotionEvent.CLASSIFICATION_MULTI_FINGER_SWIPE (API 34), not in the stubs this build compiles against
+            return true;
+        }
         if (!place(e)) {
             return true;
         }
@@ -390,14 +439,15 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             case MotionEvent.ACTION_DOWN:
                 if (!touchDown) {
                     touchDown = true;
-                    send(Native.INPUT_BUTTON, 0x110, 1);
+                    touchButton = left();
+                    send(Native.INPUT_BUTTON, touchButton, 1);
                 }
                 break;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
                 if (touchDown) {
                     touchDown = false;
-                    send(Native.INPUT_BUTTON, 0x110, 0);
+                    send(Native.INPUT_BUTTON, touchButton, 0);
                 }
                 break;
             default:
