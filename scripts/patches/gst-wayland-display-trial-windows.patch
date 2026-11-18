@@ -86,7 +86,7 @@ What it changes:
   once; a later read is only a fallback). A client whose session cannot be read, or reads
   as 0 or less (a session leader outside the reader's process namespace, as in a
   container), is the same application as no other client. A client's entry is let go when
-  it disconnects. One compositor shows one application session: a program
+  it disconnects, and a client that is gone is not written down again when asked about. One compositor shows one application session: a program
   that opens a dialog on a connection of its own (Chrome's file dialog) is the same
   application; a client from outside the session is another. The launcher has to start
   each application as the leader of a session of its own, with nothing else in it
@@ -140,7 +140,7 @@ that dismisses a menu gives the button and the keyboard to the other application
 reaches, and raises it; only the application in use may confine the pointer; a second
 connection from the same process session is the same application; a client whose session
 cannot be read is another application, and two such are not one; a session of 0 or less is
-none; a client that disconnects leaves no session behind; a click on the part of a
+none; a client that disconnects leaves no session behind, also when asked about later; a click on the part of a
 menu that reaches past its window stays with the menu; a marked window that goes takes its mark with it, and windows have
 ids of their own that do not change.
 
@@ -558,7 +558,7 @@ index ce1ce1a..fe48599 100644
  }
  
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 68e95df..94ce4aa 100644
+index 68e95df..8007d2c 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
 @@ -58,6 +58,7 @@ use smithay::{
@@ -705,7 +705,7 @@ index 68e95df..94ce4aa 100644
  /// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
  /// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
  /// frame no longer counts.
-@@ -457,8 +535,292 @@ impl State {
+@@ -457,8 +535,297 @@ impl State {
          }
      }
  
@@ -798,12 +798,17 @@ index 68e95df..94ce4aa 100644
 +        if let Some(session) = self.app_sessions.lock().unwrap().get(client) {
 +            return *session;
 +        }
-+        let session = self
++        // A client that is gone already (the remembered holder of the keyboard, say) has no
++        // credentials: it is no application, and is not written down (the table only holds
++        // connected clients).
++        let Ok(credentials) = self
 +            .dh
 +            .backend_handle()
 +            .get_client_credentials(client.clone())
-+            .ok()
-+            .and_then(|credentials| windows::session_of_process(credentials.pid));
++        else {
++            return None;
++        };
++        let session = windows::session_of_process(credentials.pid);
 +        self.app_sessions
 +            .lock()
 +            .unwrap()
@@ -999,7 +1004,7 @@ index 68e95df..94ce4aa 100644
      pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
          use smithay::wayland::seat::WaylandFocus;
          let parent = window
-@@ -479,30 +841,56 @@ impl State {
+@@ -479,30 +846,56 @@ impl State {
              .and_then(|output| output.current_mode())
              .map(|mode| mode.size.to_logical(1))
              .unwrap_or_default();
@@ -1071,7 +1076,7 @@ index 68e95df..94ce4aa 100644
      }
  
      /// Puts the windows that have `window` as their parent above it again, and theirs above
-@@ -523,7 +911,7 @@ impl State {
+@@ -523,7 +916,7 @@ impl State {
              .cloned()
              .collect();
          for child in children {
@@ -1080,7 +1085,7 @@ index 68e95df..94ce4aa 100644
              self.raise_children_of(&child);
          }
      }
-@@ -552,10 +940,48 @@ impl State {
+@@ -552,8 +945,46 @@ impl State {
                  .iter()
                  .filter(|window| window.alive() && Some(*window) != gone)
                  .count();
@@ -1091,9 +1096,9 @@ index 68e95df..94ce4aa 100644
 +                .filter(|w| w.toplevel() != gone && windows::wants_attention(w))
 +                .count();
 +            self.window_report.tell(windows, wanting_attention);
-         }
-     }
- 
++        }
++    }
++
 +    /// Marks a window as wanting attention, or takes the mark off. A change is written to the
 +    /// log (one line, with the application's id) and told with the number of windows.
 +    pub(crate) fn mark_wants_attention(&mut self, window: &Window, wants: bool) {
@@ -1108,7 +1113,7 @@ index 68e95df..94ce4aa 100644
 +    pub(crate) fn set_the_mark(&mut self, window: &Window, wants: bool) -> bool {
 +        if windows::wants_attention(window) == wants {
 +            return false;
-+        }
+         }
 +        windows::set_wants_attention(window, wants);
 +        let app_id = window.toplevel().and_then(|toplevel| {
 +            with_states(toplevel.wl_surface(), |states| {
@@ -1125,12 +1130,10 @@ index 68e95df..94ce4aa 100644
 +            "window attention"
 +        );
 +        true
-+    }
-+
+     }
+ 
      /// Tells `sink` how many windows there are, now and whenever that changes; with `None`,
-     /// nobody.
-     pub(crate) fn set_window_sink(&mut self, sink: Option<windows::WindowSink>) {
-@@ -988,11 +1414,16 @@ pub(crate) fn init(
+@@ -988,11 +1419,16 @@ pub(crate) fn init(
      event_loop
          .handle()
          .insert_source(source, |client_stream, _, state| {
@@ -2279,10 +2282,10 @@ index e64aad8..55a0b19 100644
      assert_eq!(stack[0], first);
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
-index 0000000..c440c10
+index 0000000..fed6032
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_windows.rs
-@@ -0,0 +1,1076 @@
+@@ -0,0 +1,1080 @@
 +//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
 +//! window, the one a person sees under the pointer; a window is told to be maximized, not
 +//! fullscreen, unless it asks; a second window keeps its own size and is not lost under the
@@ -3358,6 +3361,10 @@ index 0000000..c440c10
 +            .unwrap()
 +            .contains_key(&f.client_id(0))
 +    );
++    // Asking about it afterwards (as when the remembered holder of the keyboard is the gone
++    // client) does not write it down again.
++    assert!(!f.server.same_app(Some(&id), Some(&f.client_id(0))));
++    assert!(!f.server.app_sessions.lock().unwrap().contains_key(&id));
 +}
 diff --git a/wayland-display-core/src/tests/test_windows.rs b/wayland-display-core/src/tests/test_windows.rs
 index 8d177dc..8c33648 100644
