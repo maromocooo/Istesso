@@ -11,8 +11,9 @@
 #   1  built with a trial patch: must not be measured
 #   2  cannot tell (no such folder, no source to look at), or wrong use
 #
-# It goes by the source, when it is there (files only the trial patch adds), and by
-# DIR/.istesso-patches, which scripts/build-compositor.sh writes: either one saying trial is
+# It goes by the source, when it is there (files only the trial patch adds), by the built
+# plugin in DIR/target/release (a string only the trial patch puts in), and by
+# DIR/.istesso-patches, which scripts/build-compositor.sh writes: any one saying trial is
 # enough. A folder built by hand before that script (the plugin of the M1 gate) has no such
 # file: then the source alone decides.
 set -u
@@ -36,6 +37,15 @@ if [ -n "$trial_files" ]; then
     echo "trial build: the source has files of the trial patch:$trial_files"
     exit 1
 fi
+# The built plugin, when it is there: a string only the trial patch puts in (its log line of
+# the mark), so a source put back afterwards, or a plugin copied in, is still told as trial.
+for so in "$dir"/target/release/*.so; do
+    [ -f "$so" ] || continue
+    if grep -qa 'window attention' "$so"; then
+        echo "trial build: $(basename "$so") has the trial patch in it"
+        exit 1
+    fi
+done
 if [ -f "$dir/.istesso-patches" ]; then
     if grep -q '^gst-wayland-display-trial-' "$dir/.istesso-patches"; then
         echo "trial build: $(grep -o '^gst-wayland-display-trial-[^ ]*' "$dir/.istesso-patches" | tr '\n' ' ')"
