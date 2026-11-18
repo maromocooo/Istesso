@@ -38,7 +38,11 @@ final class Native {
     /** {id, name} of the host joined, or null: lastError(ERROR_PAIRING) on the same thread. */
     static native String[] pairJoin(String configDir, String address, String code, String name);
 
-    static native long watchOpen(String configDir, String address);
+    /**
+     * The picture of the paired host `peer` (its id, never empty) at `address`; 0 when no host
+     * is named (lastError(ERROR_PAIRING)) or it cannot be opened (lastError(ERROR_PICTURE)).
+     */
+    static native long watchOpen(String configDir, String address, String peer);
 
     /**
      * Waits up to waitMs. NEXT_FRAME: the frame is at the start of `into` and meta holds
@@ -56,6 +60,7 @@ final class Native {
 
     static native void watchClose(long watch);
 
+    /** The input for the paired host `peer` (its id, never empty); 0 as for watchOpen. */
     static native long inputOpen(String configDir, String peer, String address);
 
     static native void inputSend(long input, int[] events, int count);

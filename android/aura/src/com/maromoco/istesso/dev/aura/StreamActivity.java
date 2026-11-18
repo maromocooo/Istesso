@@ -107,10 +107,18 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (wifiLock != null) {
             wifiLock.acquire();
         }
+        // Both connections name the paired host; without one, nothing is connected.
         String peer = settings.hostId();
-        input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(), settings.inputPort()));
-        if (input == 0) {
-            inputLine = getString(R.string.input_over) + " " + Native.lastError(Native.ERROR_INPUT);
+        if (peer.trim().isEmpty()) {
+            input = 0;
+            inputLine = getString(R.string.need_pair);
+        } else {
+            input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(), settings.inputPort()));
+            if (input == 0) {
+                String why = Native.lastError(Native.ERROR_PAIRING);
+                inputLine = getString(R.string.input_over) + " "
+                        + (why.isEmpty() ? Native.lastError(Native.ERROR_INPUT) : why);
+            }
         }
         status.post(inputWatch);
         view.requestFocus();
@@ -138,7 +146,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             return;
         }
         picture = new Picture(settings.configDir, Settings.join(settings.host(), settings.picturePort()),
-                view.getHolder().getSurface(), this);
+                settings.hostId(), view.getHolder().getSurface(), this);
         picture.start();
     }
 
@@ -203,6 +211,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         String text;
         if ("no-decoder".equals(why)) {
             text = getString(R.string.no_decoder);
+        } else if ("no-peer".equals(why)) {
+            text = getString(R.string.need_pair);
         } else if (why != null && why.startsWith("unsupported:")) {
             int chroma = 0;
             try {

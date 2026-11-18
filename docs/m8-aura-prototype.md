@@ -38,10 +38,11 @@
 - `cdylib`。Android 向け（`aarch64-linux-android`）にだけ意味がある。ほかの台でもビルドとテストは通す（JNI の関数は、ただの `extern "system"` の関数なので）。
 - 中身は、既存の Rust の口を JNI に出すだけの薄い層。
   - ペアリング：`pairJoin(configDir, address, code, name)`。中は `istesso pair join`（`crates/istesso-cli`）と同じ順：`Identity::load_or_create` → `PairCode::parse` → `istesso_pair::tcp::join` → `PeerStore::add` → `cache::suggest_address`。**手順は変えない。** コードは、受けたらすぐ `PairCode` にして、文字列は使い終わったら消す。返すのは、成功か、理由の文（コードを含まない）だけ。
-  - 絵：`watchOpen(configDir, address)`、`watchNext(handle, waitMs, ByteBuffer)`（届いた 1 フレームを、`MediaCodec` の入力のバッファー（direct）へ 1 回だけ写す）、`watchInfo`、`watchState`、`watchAskKeyFrame`、`watchClose`。中は `istesso-media` の、Mac のクライアントと同じ「続く見る側」（`istesso_media_watch_*` の Rust の側）。
+  - 絵：`watchOpen(configDir, address, peer)`、`watchNext(handle, waitMs, ByteBuffer)`（届いた 1 フレームを、`MediaCodec` の入力のバッファー（direct）へ 1 回だけ写す）、`watchInfo`、`watchState`、`watchAskKeyFrame`、`watchClose`。中は `istesso-media` の、Mac のクライアントと同じ「続く見る側」（`istesso_media_watch_*` の Rust の側）。
   - 入力：`inputOpen(configDir, peer, address)`、`inputSend(handle, int[] events)`、`inputState`、`inputClose`。中は `istesso-client` の `Input`（`m1-own-client` ブランチ）。
-  - `lastError()`：理由の文。鍵もアドレスも含まない（既存の決まり）。
-- 入力の部品（`istesso-client`）は、まだ `main` に入っていない。このブランチに `origin/m1-own-client` を**合わせ込む（merge）**。相手のブランチは変えない。ぶつかりがないことは、`git merge-tree` で確かめた（2026-11-18）。`main` に入ったら、合わせ込みは要らなくなる。
+  - **どの接続も、ペアの相手（ホストの id）を名指しする。** 絵（`watchOpen`）も入力（`inputOpen`）も、`peer` が空なら何もつながず、0 を返す（「その場所で答えたペアの相手なら、どれでもよい」にはしない）。つなぎ直しは、最初につながった相手にだけ行く（`istesso_media_watch_open` の決まり）。入力のつなぎ直しも、名指しした相手にだけ。ペアリング（`pairJoin`）は、まだ相手を知らない段なので、コード（SPAKE2）で相手を確かめる（ADR 0006）。2026-11-18、自動の見直しの指摘で直した（最初の版は、絵の接続で相手を名指ししていなかった）。
+- `lastError()`：理由の文。鍵もアドレスも含まない（既存の決まり）。
+- 入力の部品（`istesso-client`）は、まだ `main` に入っていない。このブランチに `origin/m1-own-client` を**合わせ込んだ（merge。2026-11-18、コーディネーターの許し）**。相手のブランチは変えていない。ぶつかりはなかった。**だから、このブランチは、PR #23（自前のクライアント）が `main` に入るまで、`main` に入れられない。**
 - JNI の口：`jni-sys`（MIT OR Apache-2.0。入れる前に、ホストで `cargo deny check licenses`）。生の JNI の関数表だけを使う。重い `jni` クレートは使わない。
 - 依存の重さ：`istesso-media` は、場所（`Paths`）のためだけに `istesso-agent` を引き、その先に `istesso-doctor`（`if-addrs`）、`istesso-catalog`（`plist`）、`mdns-sd` が付く。どれも Android 向けにビルドできる見込みだが、確かめていない。通らなければ、`Paths` を切り出す（下調べ 3.1 の案）。
 - 受けるスレッドの優先度：Rust の側は、Android では何もしない（今のまま）。Java の側で `Process.setThreadPriority(THREAD_PRIORITY_URGENT_DISPLAY)` をかける。
@@ -51,6 +52,7 @@
 - 言葉は Java。使うのは Android のフレームワークだけ（AndroidX、Jetpack XR、Kotlin は使わない）。ふつうの 2D のアクティビティは、Home Space のパネル 1 枚として出る［資料：下調べ S20、S27］。
 - **ビルドは Gradle を使わない。** `android/aura/build.sh` が、SDK の道具を直に呼ぶ：`javac`（Android Studio に付いた JBR）→ `d8` → `aapt2 link`（`android.jar` は platform android-37.0）→ `.so` を `lib/arm64-v8a/` に入れる → `zipalign` → `apksigner`。理由：入れる道具が増えない（Gradle の wrapper も、Maven からの取り込みも要らない）。製品の形（Jetpack XR を使う）にするときに、Gradle に移す。
 - `minSdk 34`、`targetSdk 34`（API 37 の `ACCESS_LOCAL_NETWORK` の決まりの外。下調べ e-5）。権限は `INTERNET`、`ACCESS_NETWORK_STATE`、`WAKE_LOCK` だけ（どれも、問いの画面が出ない種類）。
+- 署名：開発用の鍵（RSA 3072、自分で作るもの）を、リポジトリの外の `~/.config/istesso/android-dev/` に置く（`build.sh keystore` で 1 回だけ作る。パスワードは同じフォルダーの、持ち主だけが読めるファイル。表示しない）。
 - `android:allowBackup="false"`、データの書き出しの決まり（`dataExtractionRules`、`fullBackupContent`）で、鍵のフォルダーを、端末のバックアップにも、端末どうしの移しにも出さない。
 - 画面：
   1. 始めの画面：ホストのアドレス（手で入れる。アプリの専用の設定に覚える）、ペアリングコードの欄（覚えない。入れる欄は、パスワードの種類にして、予測の変換と学習を切る）、「ペアにする」「つなぐ」、試作の印の文。
@@ -62,7 +64,7 @@
   - つなぎ直し（`watchNext` の 3 と 4）、復号の失敗：キーフレームを求めて（`watchAskKeyFrame`）、続ける。形式が変わったら、復号器を作り直す。
   - 使った復号器の名前と、低遅延の印を、画面の隅に出す（遅延の値は、この試作では測らない）。
 - Wi-Fi：絵を受けているあいだ、`WifiManager.WIFI_MODE_FULL_LOW_LATENCY` のロックを持つ（下調べ e-7）。画面が後ろに回ったら、絵を離し、ロックも返す。
-- 接続は、アクティビティの外（アプリ全体のもの）に持つ。パネルの大きさを変えて、アクティビティが作り直されても、つなぎ直さない（下調べ「既知の問題」）。
+- パネルの大きさを変えても、アクティビティを作り直させない（マニフェストの `configChanges`）。だから、試作では、接続をアクティビティが持つ（下調べ「既知の問題」）。製品の形では、アクティビティの外（サービス）に持つ。
 
 ### 2.3 ホストの側：4:2:0 の切り替え（試作の道だけ）
 

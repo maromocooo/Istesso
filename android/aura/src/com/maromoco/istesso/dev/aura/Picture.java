@@ -38,6 +38,8 @@ final class Picture {
 
     private final String configDir;
     private final String address;
+    /** The paired host's id: the connection is for that device only. */
+    private final String peer;
     private final Surface surface;
     private final Told told;
     private volatile boolean stop;
@@ -49,9 +51,10 @@ final class Picture {
     private int width;
     private int height;
 
-    Picture(String configDir, String address, Surface surface, Told told) {
+    Picture(String configDir, String address, String peer, Surface surface, Told told) {
         this.configDir = configDir;
         this.address = address;
+        this.peer = peer;
         this.surface = surface;
         this.told = told;
     }
@@ -83,9 +86,15 @@ final class Picture {
 
     private void receive() {
         urgent();
-        long watch = Native.watchOpen(configDir, address);
+        if (peer == null || peer.trim().isEmpty()) {
+            // Never a connection to whichever paired device answers there.
+            told.over("no-peer");
+            return;
+        }
+        long watch = Native.watchOpen(configDir, address, peer);
         if (watch == 0) {
-            told.over(Native.lastError(Native.ERROR_PICTURE));
+            String why = Native.lastError(Native.ERROR_PAIRING);
+            told.over(why.isEmpty() ? Native.lastError(Native.ERROR_PICTURE) : why);
             return;
         }
         told.connecting();

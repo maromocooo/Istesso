@@ -414,8 +414,16 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_pairJoin
     }
 }
 
-/// `long watchOpen(String configDir, String address)`: a viewer that lasts, or 0
-/// (`lastError(1)`). Nothing is connected yet.
+/// The paired device a connection is for, by its id: never empty. A connection that does not
+/// name it would take whichever paired device answers at the address.
+fn named_peer(peer: Option<CString>) -> Option<CString> {
+    peer.filter(|p| !p.as_bytes().iter().all(u8::is_ascii_whitespace))
+}
+
+/// `long watchOpen(String configDir, String address, String peer)`: a viewer that lasts, for
+/// the paired device `peer` (its id) only, or 0 (`lastError(0)` when no device was named,
+/// `lastError(1)` otherwise). Nothing is connected yet. Later connections go to the same
+/// device (istesso_media_watch_open).
 ///
 /// # Safety
 /// Called by the Java virtual machine.
@@ -426,13 +434,20 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_watchOpe
     _class: jclass,
     config_dir: jstring,
     address: jstring,
+    peer: jstring,
 ) -> jlong {
+    remember("");
     // SAFETY: the virtual machine's promises; the texts live until the call returns.
     unsafe {
         let (Some(dir), Some(address)) = (c_text(env, config_dir), c_text(env, address)) else {
+            remember("the folder and the address are needed");
             return 0;
         };
-        istesso_media_watch_open(dir.as_ptr(), address.as_ptr(), ptr::null()) as jlong
+        let Some(peer) = named_peer(c_text(env, peer)) else {
+            remember("no paired host was named: nothing is connected");
+            return 0;
+        };
+        istesso_media_watch_open(dir.as_ptr(), address.as_ptr(), peer.as_ptr()) as jlong
     }
 }
 
@@ -591,7 +606,8 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_watchClo
 }
 
 /// `long inputOpen(String configDir, String peer, String address)`: the input's connection
-/// to the paired device `peer` (its id) at `address`, or 0 (`lastError(2)`). Its thread keeps
+/// to the paired device `peer` (its id; never empty) at `address`, or 0 (`lastError(0)` when no
+/// device was named, `lastError(2)` otherwise). Its thread keeps
 /// trying until it has a conversation; `inputState` says how it stands.
 ///
 /// # Safety
@@ -605,9 +621,15 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputOpe
     peer: jstring,
     address: jstring,
 ) -> jlong {
+    remember("");
     // SAFETY: the virtual machine's promises; the texts live until the call returns.
     unsafe {
-        let (Some(dir), Some(peer)) = (c_text(env, config_dir), c_text(env, peer)) else {
+        let Some(dir) = c_text(env, config_dir) else {
+            remember("the folder is needed");
+            return 0;
+        };
+        let Some(peer) = named_peer(c_text(env, peer)) else {
+            remember("no paired host was named: nothing is connected");
             return 0;
         };
         let address = c_text(env, address);
@@ -775,6 +797,17 @@ mod tests {
         let err = pair_join(&dir, "192.0.2.1", typed, "aura-proto").unwrap_err();
         assert!(!err.contains(typed) && !err.contains('!'), "{err}");
         assert!(!dir.exists(), "nothing is made for a code that cannot be right");
+    }
+
+    #[test]
+    fn a_connection_names_its_host_or_is_not_made() {
+        assert!(named_peer(None).is_none());
+        assert!(named_peer(Some(CString::new("").unwrap())).is_none());
+        assert!(named_peer(Some(CString::new("  ").unwrap())).is_none());
+        assert_eq!(
+            named_peer(Some(CString::new("ab12").unwrap())).unwrap().as_bytes(),
+            b"ab12"
+        );
     }
 
     #[test]
