@@ -30,12 +30,14 @@ known="$known|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 known="$known|claude\.ai/(chat|code|share)|chatgpt\.com/(c|share)/"  # check-private: ok (the pattern itself)
 # Not private: loopback, "any address", the documentation ranges, version-like numbers in lock
 # files, GitHub's and Anthropic's noreply addresses (GitHub's own one commits the merges made on
-# its site), and the folders the scripts name on purpose. GitHub's two kinds count only as a whole
-# address: a longer address that merely contains one, or goes on after it, stays visible.
-end='(\.?([^A-Za-z0-9_.%+-]|$))'
+# its site), and the folders the scripts name on purpose. These addresses count only as a whole
+# address: a longer address that merely contains one, goes on after it, or is joined to it by an @,
+# stays visible.
+end='(\.?([^@A-Za-z0-9_.%+-]|$))'
+start='(^|[^@A-Za-z0-9_.%+-])'
 allowed='127\.0\.0\.[0-9]+|0\.0\.0\.0|192\.0\.2\.[0-9]+|198\.51\.100\.[0-9]+|203\.0\.113\.[0-9]+|255\.255\.255\.[0-9]+'
-allowed="$allowed|[0-9+]*[A-Za-z0-9-]*@users\.noreply\.github\.com$end|(^|[^A-Za-z0-9_.%+-])noreply@github\.com$end"
-allowed="$allowed|noreply@anthropic\.com|git@github\.com"
+allowed="$allowed|$start[0-9+]*[A-Za-z0-9-]*@users\.noreply\.github\.com$end|${start}noreply@github\.com$end"
+allowed="$allowed|${start}noreply@anthropic\.com$end|${start}git@github\.com$end"
 allowed="$allowed|02:00:00:00:00:[0-9a-fA-F]{2}"
 # A version number of four parts, said to be one; the folder every user of a Mac shares.
 allowed="$allowed|(firmware|version|版は|版（) ?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|/Users/Shared"
