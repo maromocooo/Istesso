@@ -10,7 +10,7 @@
 #   scripts/daily.sh bundle --finish  give the staged bundle its name as an application; the next
 #                                     `open` starts the windows through it (the first start asks
 #                                     whether it may use the local network)
-#   scripts/daily.sh                  open the launcher window (the same as `start`; not built yet)
+#   scripts/daily.sh                  what is open, and how to open, close, list and stop (= `start`)
 #   scripts/daily.sh apps             the applications that can be opened
 #   scripts/daily.sh open NAME        start the application on the host and show it; one that already
 #                                     runs is shown again
@@ -21,11 +21,24 @@
 #                                     trial on both machines
 #   scripts/daily.sh note TEXT        write down something that was noticed (trial-notes.md, not in git)
 #
+# Made to be typed by the owner in a terminal of their own as well as run by an agent: one command
+# of the trial runs at a time on each machine (a lock); a second one waits up to a minute for its
+# turn, and says so.
+#
 # Each application gets, on the host: a hidden compositor with its encoder (scripts/m1-step3-host.py)
 # on a port of its own, an agent of the trial's own on a port of its own that hands input to that
 # compositor only, and the application. At most three are open at once, in three slots: slot N has
 # the picture on port 4791N and the agent on 4792N. On the Mac: the prototype viewer and
 # `istesso input relay`.
+#
+# The application gets the language and the look of the owner's desk session (read from it, never
+# written): its LANG, LANGUAGE, LC_* and XDG_CURRENT_DESKTOP, and the theme, fonts, font size and
+# colour scheme as the desk shows them, copied into a settings file of the trial's own. Blender runs
+# on a copy of the owner's normal settings, taken once; whenever it ends, the owner's own settings
+# file is checked to be as it was.
+#
+# A window closed with its red button: the application goes on; the host stops its picture and
+# gives the encoder back within seconds, and `open` brings the picture back.
 #
 # The signal of a latency measurement (AGENTS.md) is obeyed: nothing starts while it says busy, and a
 # guard on each machine looks every two seconds. When it turns busy, the windows and relays here are
@@ -56,13 +69,19 @@
 #   DAILY_FRAME_LOGS=1  frame logs on both sides, for scripts/m1-channel-check.py
 #   DAILY_KEY_RECORD=1  the application's keyboard events (Wayland's own debug lines, keyboard only)
 #                       are written to key-events.log in its folder on the host: for synthetic test
-#                       keys only, never while a person types
+#                       keys only, never while a person types. Never remembered either
+#   DAILY_BLENDER_EVENTS=1
+#                       Blender is started with its own event log (--debug-events), written line by
+#                       line to blender-events.log in its folder on the host, which only the owner's
+#                       account can read. It records what is typed: for synthetic test keys only,
+#                       never while a person types. Never remembered: each start without it has none
 #   DAILY_MAC_CONFIG, DAILY_HOST_CONFIG
 #                       identity and paired devices of a pair made for the check (the istesso-media
 #                       example `picture pair`): this Mac's own and the host's own are not used
 #   DAILY_BLENDER_CONFIG
-#                       a settings folder of Blender's on the host for the check, so that the one the
-#                       owner set up for the trials stays as it is
+#                       Blender's settings folder (its XDG_CONFIG_HOME) on the host for the check,
+#                       instead of the trial's own; it gets its one copy of the owner's settings the
+#                       same way, so that the trial's own copy stays as the owner left it
 #   DAILY_TEST_SIGNAL=1 also obey a stand-in for the signal: test-signal in the state folder here and
 #                       in the trial's folder on the host (the real signal is obeyed as always)
 set -u
@@ -145,12 +164,108 @@ stop_written_down() { # FILE: asked to end, by its number
     for i in $(seq 1 20); do still_runs "$1" || return 0; sleep 0.1; done
 }
 
+# One command of the trial at a time on this Mac, whoever started it: the owner in a terminal of
+# their own, an agent, or the guard. The lock is held on file descriptor 9 and lets go by itself
+# when the command ends, however it ends; whatever a command starts to run on is started without
+# that descriptor (9>&-), so that it never holds the lock.
+lock_file="$state/lock"
+take_turn() { # SECONDS: how long to wait for it (0: not at all). Says 1 when the turn did not come.
+    exec 9>>"$lock_file"
+    perl -e 'use Fcntl qw(:flock); open(my $f, ">&=", 9) or exit 2; my $n = shift;
+        for (my $i = 0; ; $i++) { exit 0 if flock($f, LOCK_EX | LOCK_NB); exit 1 if $i >= $n * 10;
+            select(undef, undef, undef, 0.1) }' "$1" || { exec 9>&-; return 1; }
+    echo "$$ ${2:-} $(date '+%H:%M:%S')" > "$lock_file.holder"
+}
+my_turn() { # WHAT: waits up to a minute for the turn, or says why not and ends
+    take_turn 0 "$1" && return 0
+    echo "another command of the trial is running ($(cut -d' ' -f2- "$lock_file.holder" 2>/dev/null)): waiting for it, up to a minute"
+    take_turn 60 "$1" && return 0
+    echo "error: it is still running; nothing was done. Try again when it has finished (scripts/daily.sh list)"
+    exit 4
+}
+
 # ---- The host ----
 
 # What every command on the host begins with. The host's login shell is not bash: everything goes
 # through `bash -s`.
 IFS= read -r -d '' host_lib <<'LIB'
 D=$(eval echo "$DAILY_DIR"); src=$D/src; plugin=$D/plugin
+take_turn() { # one command of the trial at a time on the host, whoever sent it; held until it ends
+    mkdir -p "$D/run"
+    exec 9>>"$D/run/lock"
+    flock -w 60 9 && return 0
+    echo "fail another command of the trial is still running on the host: nothing was done; try again in a minute"
+    exit 6
+}
+desk_settings() { # the language and the desktop of the owner's desk session, read only: NAME=VALUE lines
+    local line lang=""
+    while IFS= read -r line; do
+        case "$line" in LANG=* | LANGUAGE=* | LC_*=* | XDG_CURRENT_DESKTOP=*) ;; *) continue ;; esac
+        [[ "${line#*=}" =~ ^[A-Za-z0-9_.@:,+-]+$ ]] || continue
+        echo "$line"
+        case "$line" in LANG=*) lang=1 ;; esac
+    done < <(systemctl --user show-environment 2>/dev/null)
+    [ -n "$lang" ] && return 0
+    # No desk session to ask: the language the system was set up with.
+    sed -n 's/^\(LANG\|LANGUAGE\|LC_[A-Z_]*\)="\{0,1\}\([A-Za-z0-9_.@:,+-]*\)"\{0,1\}$/\1=\2/p' /etc/default/locale 2>/dev/null
+}
+seed_look() { # DIR DESK: the desk's look, as the desk shows it (its own settings over the defaults of
+    # its desktop), read only, into the settings file of an application whose XDG_CONFIG_HOME is DIR
+    # and whose GSETTINGS_BACKEND is keyfile. The owner's settings are never written; what the
+    # application changes stays in that file. With DIR "-", nothing is written. Says the look in a
+    # few words, and on a second line the theme as GTK_THEME names it.
+    local file=-
+    [ "$1" = - ] || { mkdir -p "$1/glib-2.0/settings"; file=$1/glib-2.0/settings/keyfile; }
+    env -u GSETTINGS_BACKEND $2 python3 - "$file" <<'PY'
+import sys
+from gi.repository import Gio, GLib
+look = {
+    "org.gnome.desktop.interface": ["gtk-theme", "icon-theme", "cursor-theme", "cursor-size", "font-name",
+        "document-font-name", "monospace-font-name", "text-scaling-factor", "color-scheme", "accent-color",
+        "font-antialiasing", "font-hinting", "font-rgba-order"],
+    "org.gnome.desktop.wm.preferences": ["button-layout"],
+}
+keyfile = GLib.KeyFile()
+try:
+    if sys.argv[1] != "-":
+        keyfile.load_from_file(sys.argv[1], GLib.KeyFileFlags.KEEP_COMMENTS)
+except GLib.Error:
+    pass
+source = Gio.SettingsSchemaSource.get_default()
+shown = []
+for schema_id, keys in look.items():
+    schema = source.lookup(schema_id, True)
+    if schema is None:
+        continue
+    desk = Gio.Settings.new(schema_id)
+    group = schema.get_path().strip("/")
+    for key in keys:
+        if schema.has_key(key):
+            keyfile.set_value(group, key, desk.get_value(key).print_(False))
+            if key in ("gtk-theme", "font-name", "color-scheme"):
+                shown.append(desk.get_value(key).get_string())
+if sys.argv[1] != "-":
+    keyfile.save_to_file(sys.argv[1])
+print(", ".join(shown))
+interface = Gio.Settings.new("org.gnome.desktop.interface")
+print(interface.get_string("gtk-theme") + (":dark" if interface.get_string("color-scheme") == "prefer-dark" else ""))
+PY
+}
+normal_settings_state() { stat -c '%y %s %i' "$1" 2>/dev/null || echo absent; }
+blender_settings_check() { # WHEN: is the owner's normal userpref.blend as it was when the trial's
+    # Blender started? Said, and written into the trial's log of these checks (blender-settings.log).
+    local run=$D/run/blender file before now line
+    [ -s "$run/normal-settings" ] || return 0
+    { read -r file; read -r before; } < "$run/normal-settings"
+    now=$(normal_settings_state "$file")
+    if [ "$now" = "$before" ]; then
+        line="blender ($1): the owner's normal Blender settings are unchanged (userpref.blend: $before)"
+    else
+        line="WARNING blender ($1): THE OWNER'S NORMAL BLENDER SETTINGS CHANGED while the trial's Blender ran (by it, or by a Blender on the desk): userpref.blend was $before, is now $now"
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $line" >> "$D/blender-settings.log"
+    echo "$(date '+%H:%M:%S') $line"
+}
 signal_busy() {
     [ "$(cut -d' ' -f1 "$HOME/.local/state/istesso/measuring" 2>/dev/null)" = busy ] && return 0
     [ -n "$TEST_SIGNAL" ] && [ "$(cut -d' ' -f1 "$D/test-signal" 2>/dev/null)" = busy ]
@@ -194,13 +309,27 @@ picture_of() { # NAME: running, paused or refused, by the pipeline's last word a
     last=$(said "$1" | grep -o '"istesso":"\(paused\|resumed\|refused\)"' | tail -1 | cut -d'"' -f4)
     case "$last" in paused | refused) echo "$last" ;; *) echo running ;; esac
 }
-state_of() { # NAME: one line: name, slot, state, number of windows
+state_of() { # NAME: one line: name, slot, state, number of windows, picture
     local run=$D/run/$1 what
     if ! still_runs "$run/pipeline.pid"; then what=ended
     elif [ -s "$run/held" ]; then what=held
     elif [ -s "$run/close-asked" ]; then what=close-asked
     else what=running; fi
-    echo "$1 $(cat "$run/slot" 2>/dev/null || echo -) $what $(windows_of "$1")"
+    echo "$1 $(cat "$run/slot" 2>/dev/null || echo -) $what $(windows_of "$1" | grep . || echo -) $(picture_of "$1")"
+}
+picture_off() { # NAME: nobody watches (its window was closed): the picture stops and the encoder is
+    # given back; the application goes on. The next `open` resumes it.
+    local name=$1 before i
+    still_runs "$D/run/$name/pipeline.pid" || { echo "$name: is not running"; return 0; }
+    [ "$(picture_of "$name")" = running ] || { echo "$name: its picture was stopped already"; return 0; }
+    before=$(count_said "$name" paused)
+    tell "$name" detach
+    for i in $(seq 1 30); do [ "$(count_said "$name" paused)" -gt "$before" ] && break; sleep 0.1; done
+    if [ "$(count_said "$name" paused)" -gt "$before" ]; then
+        echo "$(date '+%H:%M:%S') $name: its window was closed: the picture stopped and its encoder was given back; the application goes on" | tee -a "$D/run/guard.log"
+    else
+        echo "$(date '+%H:%M:%S') $name: its window was closed, but the picture did NOT say that it stopped" | tee -a "$D/run/guard.log"
+    fi
 }
 hold_all() { # every running application: picture stopped, encoder given back, all of it held still
     local name run pid moving total before
@@ -249,6 +378,8 @@ let_go() { # NAME: the opposite of holding it
     done
     : > "$run/held"
     echo "$(date '+%H:%M:%S') let $1 go on"
+    [ "$1" = blender ] && blender_settings_check "after a measurement's pause"
+    return 0
 }
 end_members() { # RUN PART: asked to end by number; what is still there two seconds later is ended
     local pid i
@@ -295,15 +426,35 @@ close_apps() { # NAME...: each is asked to close; what is still there 10 s later
         fi
         end_run "$name"
         echo "$name: closed: $how (the pipeline said that its last window had gone: $empty)"
+        [ "$name" = blender ] && blender_settings_check "after it was closed"
     done
+    return 0
+}
+blender_ended_by_itself() { # for the guard: Blender ended while nobody had asked it to (its own Quit)
+    local run=$D/run/blender
+    still_runs "$run/pipeline.pid" || return 0
+    [ -s "$run/close-asked" ] || [ -s "$run/held" ] || [ -s "$run/ended-checked" ] && return 0
+    [ -s "$run/app.sid" ] && [ -z "$(members "$run" app)" ] || return 0
+    date +%s > "$run/ended-checked"
+    blender_settings_check "it ended by itself"
 }
 LIB
 
-on_host() { # the commands come on standard input
+limited() { # SECONDS COMMAND...: the command is ended when it takes longer
+    perl -e 'alarm shift; exec @ARGV or exit 127' "$@"
+}
+on_host() { # the commands come on standard input; with limit=SECONDS, ended after that long
+    # LC_ALL=C is for the trial's own commands there, whose output is read; the applications get
+    # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
-        ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps' HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-}; bash -s" 2>&1 |
+        ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps' HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
+    local ssh_status=${PIPESTATUS[1]}
+    if [ "$ssh_status" = 255 ]; then
+        echo "error: the host could not be reached over ssh (is your own ssh login to the host open in another terminal?)"
+    fi
+    return "$ssh_status"
 }
 
 # Where the host is, as this Mac reaches it, and which of the Mac's addresses lies on that way.
@@ -387,6 +538,7 @@ do_setup() {
             "LC_ALL=C bash -c 'D=\$(eval echo $host_dir); mkdir -p \$D/src \$D/run && chmod 700 \$D && tar -xzf - -C \$D/src 2> \$D/run/copy.log; s=\$?; grep -v \"extended header\" \$D/run/copy.log; exit \$s'" ||
         { echo "error: the copy did not reach the host"; exit 1; }
     on_host <<'HOST'
+take_turn
 signal_busy && { echo "host: a latency measurement is running: nothing is started"; exit 3; }
 tmux has-session -t '=daily-build' 2>/dev/null && { echo "host: a build of the trial runs already"; exit 1; }
 [ -n "$(running_names)" ] && echo "host: note: applications of the trial are open; they keep the programs they were started with until they are opened again"
@@ -408,7 +560,7 @@ echo "build: exit $status"
 exit $status
 SCRIPT
 chmod +x "$D/run/build.sh"; : > "$D/run/build.log"
-tmux new-session -d -s daily-build "bash -c '$D/run/build.sh $D > $D/run/build.log 2>&1'"
+tmux new-session -d -s daily-build "bash -c '$D/run/build.sh $D > $D/run/build.log 2>&1'" 9>&-
 for i in $(seq 1 600); do
     tmux has-session -t '=daily-build' 2>/dev/null || break
     sleep 1
@@ -445,6 +597,7 @@ do_apps() { for each in $apps; do printf '%s\t%s\n' "$each" "$(app_title "$each"
 # host's device id (for the relay and the viewer).
 host_open() {
     on_host <<'HOST'
+take_turn
 signal_busy && { echo "host: a latency measurement is running: nothing is started"; exit 3; }
 [ -e "$plugin/libgstwaylanddisplaysrc.so" ] || { echo "host: the compositor plugin is not in $plugin (scripts/daily.sh setup)"; exit 1; }
 [ -x "$src/target/release/istesso" ] && [ -e "$src/target/release/libistesso_media.so" ] || { echo "host: the trial's copy is not built in $src (scripts/daily.sh setup)"; exit 1; }
@@ -486,6 +639,13 @@ else
     fi
     mkdir -p "$run/rt/istesso" "$run/agent-cache"; chmod 700 "$run" "$run/rt" "$run/rt/istesso"
     echo "$slot" > "$run/slot"
+    # The language and the desktop of the owner's desk session, read only. The application gets
+    # them instead of the LC_ALL=C of the trial's own commands (and of tmux's environment).
+    desk=$(desk_settings | tr '\n' ' ')
+    [ -n "$desk" ] || echo "host: note: the desk's language could not be read; $NAME starts without one (English)"
+    # Where the look goes: a settings file of the trial's own in the application's XDG_CONFIG_HOME
+    # (GSETTINGS_BACKEND=keyfile), seeded from the desk at every start. Blender has a look of its own.
+    look=""; theme_by_env=""
     # What the application is started as, apart from what its owner uses every day.
     case "$NAME" in
     firefox)
@@ -497,29 +657,71 @@ else
             holder=$(readlink "$profile/lock" | sed -n 's/.*:+\([0-9]*\)$/\1/p')
             [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && { echo "fail the trial profile of Firefox is in use by another Firefox: not started"; exit 1; }
         fi
-        app="firefox --no-remote --profile $profile" ;;
+        # Firefox is a snap, which sets XDG_CONFIG_HOME to a folder of its own that the owner's
+        # Firefox uses too: no settings file of the trial can go there. Its settings stay in memory
+        # (written nowhere); it reads the defaults of the desk's desktop, and the desk's theme comes
+        # as GTK_THEME (with :dark when the desk prefers dark). Fonts and their size follow the
+        # desktop's defaults only.
+        look=-; theme_by_env=1
+        app="env GSETTINGS_BACKEND=memory firefox --no-remote --profile $profile" ;;
     blender)
         blender=$BLENDER
         [ -n "$blender" ] || blender=$(command -v blender)
         [ -n "$blender" ] || { [ -x "$HOME/.local/opt/blender/blender" ] && blender=$HOME/.local/opt/blender/blender; }
         [ -n "$blender" ] || blender=$(ls -d "$HOME"/*/blender-*-linux-x64/blender 2>/dev/null | sort | tail -1)
         [ -x "$blender" ] || { echo "fail blender was not found (DAILY_BLENDER)"; exit 1; }
-        # The settings folder of the trial of the evening before: what the owner set there stays.
-        # A check gives a folder of its own instead (DAILY_BLENDER_CONFIG).
-        settings=$HOME/.cache/istesso-try-blender/config
+        version=$(timeout 60 "$blender" --version 2>/dev/null | sed -n 's/^Blender \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
+        [ -n "$version" ] || { echo "fail blender did not say its version"; exit 1; }
+        # Its settings: a copy of the owner's normal settings, taken once into the trial's folder
+        # and used from then on, never copied over again; the owner's own folder is only read. A
+        # check gives a folder of its own instead (DAILY_BLENDER_CONFIG), copied the same way.
+        settings=$D/apps/blender/config
         [ -n "$BLENDER_CONFIG" ] && settings=$(eval echo "$BLENDER_CONFIG")
-        mkdir -p "$settings"
+        normal=$HOME/.config/blender/$version/config
+        if [ ! -e "$settings/copied-$version" ]; then
+            mkdir -p "$settings/blender/$version"
+            if [ -d "$normal" ] && [ ! -e "$settings/blender/$version/config" ]; then
+                cp -a "$normal" "$settings/blender/$version/config" || { echo "fail the owner's settings of Blender $version could not be copied"; exit 1; }
+                echo "$(date '+%Y-%m-%d %H:%M:%S') copied once from the owner's normal settings of Blender $version" > "$settings/copied-$version"
+                echo "host: Blender $version: the owner's normal settings were copied, once, into the trial's folder; that copy is used from now on"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') nothing copied: no normal settings of Blender $version, or a folder there already" > "$settings/copied-$version"
+            fi
+        fi
+        # The owner's own settings file as it is now: whenever this Blender ends, it is looked at again.
+        printf '%s\n%s\n' "$normal/userpref.blend" "$(normal_settings_state "$normal/userpref.blend")" > "$run/normal-settings"
+        : > "$run/ended-checked"
         app="env XDG_CONFIG_HOME=$settings $(printf '%q' "$blender") -noaudio" ;;
     editor)
         home=$D/apps/editor; mkdir -p "$home/data" "$home/config" "$home/state" "$home/cache" "$D/documents"
         [ -e "$D/documents/trial.txt" ] || : > "$D/documents/trial.txt"
-        app="env XDG_DATA_HOME=$home/data XDG_CONFIG_HOME=$home/config XDG_STATE_HOME=$home/state XDG_CACHE_HOME=$home/cache GSETTINGS_BACKEND=memory GIO_USE_VFS=local gnome-text-editor --standalone --ignore-session $D/documents/trial.txt" ;;
+        look=$home/config
+        app="env XDG_DATA_HOME=$home/data XDG_CONFIG_HOME=$home/config XDG_STATE_HOME=$home/state XDG_CACHE_HOME=$home/cache GSETTINGS_BACKEND=keyfile GIO_USE_VFS=local gnome-text-editor --standalone --ignore-session $D/documents/trial.txt" ;;
     chrome)
         # Its own profile. Never TMPDIR below ~/.cache: Chrome then ends at once.
         mkdir -p "$D/apps/chrome"
-        app="google-chrome --ozone-platform=wayland --user-data-dir=$D/apps/chrome/profile --no-first-run --no-default-browser-check --mute-audio --password-store=basic --disable-gpu" ;;
+        look=$D/apps/chrome/config
+        app="env XDG_CONFIG_HOME=$look GSETTINGS_BACKEND=keyfile google-chrome --ozone-platform=wayland --user-data-dir=$D/apps/chrome/profile --no-first-run --no-default-browser-check --mute-audio --password-store=basic --disable-gpu" ;;
     *) echo "fail no application is called $NAME"; exit 2 ;;
     esac
+    shown=""
+    if [ -n "$look" ]; then
+        said_look=$(seed_look "$look" "$desk" 2>/dev/null)
+        shown=$(printf '%s\n' "$said_look" | tail -2 | head -1)
+        theme=$(printf '%s\n' "$said_look" | tail -1)
+        [ -n "$theme_by_env" ] && [[ "$theme" =~ ^[A-Za-z0-9_.:+-]+$ ]] && app="env GTK_THEME=$theme $app"
+    fi
+    echo "host: $NAME gets the desk's language ($(printf '%s\n' $desk | sed -n 's/^LANG=//p' | grep . || echo none))$([ -n "$shown" ] && echo " and look ($shown)")"
+    events=""
+    if [ "$NAME" = blender ] && [ -n "$BLENDER_EVENTS" ]; then
+        # Blender's own event log, asked for at this start only. Line by line, so that nothing is
+        # lost when Blender is ended (a file is otherwise written in blocks, and what is still in
+        # the block when the process is ended is gone).
+        : > "$run/blender-events.log"; chmod 600 "$run/blender-events.log"
+        app="stdbuf -oL -eL $app --debug-events"
+        events="> $run/blender-events.log"
+        echo "host: Blender's event log is ON for this start (DAILY_BLENDER_EVENTS): what is typed into Blender is written to blender-events.log in its folder on the host. For synthetic test keys only"
+    fi
     node=""
     for n in /sys/class/drm/renderD*; do
         [ "$(basename "$(readlink -f "$n/device/driver")")" = nvidia ] && node=/dev/dri/$(basename "$n") && break
@@ -541,7 +743,7 @@ exec python3 -u $src/scripts/m1-step3-host.py --to-channel $port --cursor --inpu
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
     # Through bash, whatever the login shell (tmux starts the command with it), and how it ended is kept.
-    tmux new-session -d -s "daily-$NAME-pipe" "bash -c '$run/pipeline.sh > $run/pipeline.log 2>&1; echo \$? > $run/pipeline.exit'"
+    tmux new-session -d -s "daily-$NAME-pipe" "bash -c '$run/pipeline.sh > $run/pipeline.log 2>&1; echo \$? > $run/pipeline.exit'" 9>&-
     sock=""
     for i in $(seq 1 120); do
         sock=$(said "$NAME" | grep -o 'socket_name="[^"]*"' | head -1 | cut -d'"' -f2)
@@ -563,13 +765,17 @@ SCRIPT
 # opens there for it.
 unset DISPLAY DBUS_SESSION_BUS_ADDRESS
 export WAYLAND_DISPLAY=$sock XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland MOZ_ENABLE_WAYLAND=1 XDG_SESSION_TYPE=wayland GTK_USE_PORTAL=0
+# The language and the desktop of the owner's desk session, and nothing of the trial's LC_ALL=C.
+unset LC_ALL LANG LANGUAGE \$(compgen -e | grep '^LC_') XDG_CURRENT_DESKTOP
+${desk:+export $desk}
 ${KEY_RECORD:+export WAYLAND_DEBUG=1}
-echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/app.pid
-sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/app.sid
-exec $app $record
+# The moments are written as the trial reads them back (LC_ALL=C), whatever the language above.
+echo "\$\$ \$(LC_ALL=C ps -o lstart= -p \$\$)" > $run/app.pid
+sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(LC_ALL=C ps -o lstart= -p \$sid)" > $run/app.sid
+exec $app $events $record
 SCRIPT
-    chmod +x "$run/app.sh"
-    tmux new-session -d -s "daily-$NAME-app" "bash -c '$run/app.sh > $run/app.log 2>&1; echo \$? > $run/app.exit'"
+    chmod +x "$run/app.sh"; : > "$run/app.exit"
+    tmux new-session -d -s "daily-$NAME-app" "bash -c '$run/app.sh > $run/app.log 2>&1; echo \$? > $run/app.exit'" 9>&-
     # An agent of the trial's own for this application: its own port, no announcing, its own cache,
     # and the input socket of this application's compositor. The device's key and the list of paired
     # devices are only read.
@@ -580,8 +786,8 @@ echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/agent.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/agent.sid
 exec $src/target/release/istesso agent --port $agent_port --no-discovery
 SCRIPT
-    chmod +x "$run/agent.sh"
-    tmux new-session -d -s "daily-$NAME-agent" "bash -c '$run/agent.sh > $run/agent.log 2>&1; echo \$? > $run/agent.exit'"
+    chmod +x "$run/agent.sh"; : > "$run/agent.exit"
+    tmux new-session -d -s "daily-$NAME-agent" "bash -c '$run/agent.sh > $run/agent.log 2>&1; echo \$? > $run/agent.exit'" 9>&-
     for i in $(seq 1 80); do [ -n "$(windows_of "$NAME")" ] && [ "$(windows_of "$NAME")" != 0 ] && break; sleep 0.25; done
     if [ -z "$(members "$run" app)" ]; then
         echo "host: $NAME did NOT stay. It said:"; head -3 "$run/app.log" | cut -c1-200
@@ -597,18 +803,19 @@ if ! still_runs "$D/run/guard.pid"; then
 #!/bin/bash
 echo "\$\$ \$(ps -o lstart= -p \$\$)" > $D/run/guard.pid
 D=$D NAMES='$NAMES' TEST_SIGNAL='$TEST_SIGNAL'
-$(declare -f signal_busy still_runs number_in members to_hold running_names tell said count_said hold_all let_go)
+$(declare -f signal_busy still_runs number_in members to_hold running_names tell said count_said hold_all let_go normal_settings_state blender_settings_check blender_ended_by_itself)
 while sleep 2; do
     [ -n "\$(running_names)" ] || { echo "\$(date '+%H:%M:%S') nothing of the trial runs: the guard ends"; exit 0; }
     if signal_busy; then
         hold_all
     else
         for name in \$NAMES; do let_go "\$name"; done
+        blender_ended_by_itself
     fi
 done
 SCRIPT
     chmod +x "$D/run/guard.sh"
-    tmux new-session -d -s daily-guard "bash -c '$D/run/guard.sh >> $D/run/guard.log 2>&1'"
+    tmux new-session -d -s daily-guard "bash -c '$D/run/guard.sh >> $D/run/guard.log 2>&1'" 9>&-
 fi
 echo "slot $slot"
 echo "way $(ip -4 route get "$MAC" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
@@ -621,8 +828,10 @@ remember_settings() { # FOLDER
     # In single quotes, so that nothing in them is expanded when they are read back (a path of the
     # host that begins with ~ is the host's home, not this Mac's).
     quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+    # The recorders (DAILY_KEY_RECORD, DAILY_BLENDER_EVENTS) are never written down: an application
+    # that the guard has to start again is started without them, as a person may be typing by then.
     local setting
-    for setting in DAILY_NO_WINDOW DAILY_FRAME_LOGS DAILY_KEY_RECORD DAILY_MAC_CONFIG DAILY_HOST_CONFIG DAILY_BLENDER_CONFIG \
+    for setting in DAILY_NO_WINDOW DAILY_FRAME_LOGS DAILY_MAC_CONFIG DAILY_HOST_CONFIG DAILY_BLENDER_CONFIG \
         DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY; do
         eval "echo \"export $setting=\$(quoted \"\${$setting:-}\")\""
     done > "$1/settings"
@@ -656,8 +865,10 @@ do_open() {
     # What is done in the window goes to the trial's agent of this application, and nowhere else.
     if ! still_runs "$mine/relay.pid"; then
         : > "$mine/relay.log"
-        env ${config_env[@]+"${config_env[@]}"} ISTESSO_CACHE_DIR="$state/cache" "$istesso" input relay --to "$peer" --socket "$mine/in.sock" \
-            --address "$host_side:$((47920 + slot))" --keep-trying 30 > "$mine/relay.log" 2>&1 &
+        # Without the hang-up of the terminal it was started from, so that closing that terminal leaves
+        # it running; and without the lock's descriptor.
+        nohup env ${config_env[@]+"${config_env[@]}"} ISTESSO_CACHE_DIR="$state/cache" "$istesso" input relay --to "$peer" --socket "$mine/in.sock" \
+            --address "$host_side:$((47920 + slot))" --keep-trying 30 > "$mine/relay.log" 2>&1 9>&- &
         write_down "$mine/relay.pid" $!
         local i
         for i in $(seq 1 60); do grep -q "goes to the paired device" "$mine/relay.log" 2>/dev/null && break; sleep 0.25; done
@@ -688,7 +899,7 @@ do_open() {
             for i in $(seq 1 50); do [ -s "$mine/viewer.number" ] && break; sleep 0.2; done
             [ -s "$mine/viewer.number" ] && write_down "$mine/viewer.pid" "$(cat "$mine/viewer.number")"
         else
-            env "${settings[@]}" "$viewer" "${arguments[@]}" > "$mine/viewer.log" 2>&1 &
+            nohup env "${settings[@]}" "$viewer" "${arguments[@]}" > "$mine/viewer.log" 2>&1 9>&- &
             write_down "$mine/viewer.pid" $!
         fi
         sleep 2
@@ -708,8 +919,39 @@ do_open() {
 # done while it runs (no ssh, no build). When it is over, the windows are opened again.
 start_guard() {
     still_runs "$state/guard.pid" && return 0
-    nohup "$0" guard >> "$state/guard.log" 2>&1 &
+    nohup "$0" guard >> "$state/guard.log" 2>&1 9>&- &
     write_down "$state/guard.pid" $!
+}
+# A window closed with its red button (its viewer ended, and the trial did not end it): nobody
+# watches that application any more. Its picture is stopped and the encoder given back on the host;
+# the application goes on, and `open` brings the picture back. Done only while the signal is free,
+# with an ssh that is ended after six seconds at the most, so that a measurement that begins
+# meanwhile is still obeyed within ten.
+window_was_closed() { # NAME
+    local mine=$state/$1
+    (
+        take_turn 0 guard || exit 0 # another command of the trial runs: looked at again in two seconds
+        # Looked at again with the turn: an `open` may have opened a new window meanwhile.
+        window_gone "$1" || exit 0
+        signal_free || exit 0
+        answer=$(printf 'picture_off %s\n' "$1" | limit=6 on_host)
+        printf '%s\n' "$answer" | grep .
+        case "$answer" in
+        *"its window was closed"* | *"is not running"* | *"was stopped already"*)
+            stop_written_down "$mine/relay.pid"
+            : > "$mine/viewer.pid" ;;
+        esac
+    )
+}
+window_gone() { # NAME: its viewer has ended by itself, while its relay still runs (a file left
+    # behind by an earlier day, with both ended, is not taken for a closed window)
+    [ -s "$state/$1/viewer.pid" ] && ! still_runs "$state/$1/viewer.pid" && still_runs "$state/$1/relay.pid"
+}
+stop_window() { # NAME: its viewer and relay, by their numbers
+    stop_written_down "$state/$1/viewer.pid"
+    # Stopped by the trial, not closed with the red button: the guard leaves the picture as it is.
+    [ -f "$state/$1/viewer.pid" ] && ! still_runs "$state/$1/viewer.pid" && : > "$state/$1/viewer.pid"
+    stop_written_down "$state/$1/relay.pid"
 }
 do_guard() {
     local each
@@ -740,6 +982,11 @@ do_guard() {
             done
             continue
         fi
+        for each in $apps; do
+            window_gone "$each" || continue
+            signal_free || break
+            window_was_closed "$each"
+        done
         local anything=""
         for each in $apps; do
             { still_runs "$state/$each/viewer.pid" || still_runs "$state/$each/relay.pid"; } && anything=1
@@ -748,10 +995,7 @@ do_guard() {
     done
 }
 stop_windows() {
-    for each in $apps; do
-        stop_written_down "$state/$each/viewer.pid"
-        stop_written_down "$state/$each/relay.pid"
-    done
+    for each in $apps; do stop_window "$each"; done
 }
 
 # ---- Looking, closing, stopping ----
@@ -764,13 +1008,13 @@ exit 0
 HOST
     )
     [ -s "$state/held" ] && echo "held still for a latency measurement; the windows open again when it is over"
-    printf '%s\n' "$answer" | while read -r each slot what windows; do
+    printf '%s\n' "$answer" | while read -r each slot what windows picture; do
         known_name "$each" || continue
         local window=closed
         still_runs "$state/$each/viewer.pid" && window=open
         [ -s "$state/$each/not-back" ] && window="not-back: $(head -1 "$state/$each/not-back")"
         [ "$what" = ended ] && [ "$window" = closed ] && continue
-        printf '%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "$window"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "picture ${picture:--}" "window $window"
     done
 }
 
@@ -782,13 +1026,12 @@ do_close() {
 }
 close_some() { # NAME...
     local answer each
-    answer=$(printf 'close_apps %s\n' "$*" | on_host)
+    answer=$(printf 'take_turn\nclose_apps %s\n' "$*" | on_host)
     printf '%s\n' "$answer"
     for each in "$@"; do
         case "$answer" in
         *"$each: closed"* | *"$each: is not running"*)
-            stop_written_down "$state/$each/viewer.pid"
-            stop_written_down "$state/$each/relay.pid"
+            stop_window "$each"
             : > "$state/$each/not-back" 2>/dev/null ;;
         esac
     done
@@ -802,6 +1045,7 @@ do_stop() {
     stop_written_down "$state/guard.pid"
     : > "$state/held"
     on_host <<'HOST'
+take_turn
 if [ -z "$(running_names)" ]; then
     still_runs "$D/run/guard.pid" && kill "$(number_in "$D/run/guard.pid")" 2>/dev/null
     echo "nothing of the trial is left on the host"
@@ -815,29 +1059,32 @@ HOST
 do_note() {
     [ $# -ge 1 ] || { echo "usage: scripts/daily.sh note TEXT"; exit 2; }
     local open
-    open=$(do_list 2>/dev/null | awk -F'\t' 'NF == 5 {printf "%s(%s,%s) ", $1, $3, $5}')
+    open=$(do_list 2>/dev/null | awk -F'\t' 'NF == 6 {printf "%s(%s,%s,%s) ", $1, $3, $5, $6}')
     printf -- '- %s　%s　[%s]\n' "$(date '+%Y-%m-%d %H:%M')" "$*" "${open:-nothing open}" >> "$notes"
     echo "written down in $notes"
 }
 
 do_start() {
-    refuse_when_busy
-    echo "the launcher window is not built yet (docs/trial-daily.md, the order of the work, step 4)."
-    echo "until then: scripts/daily.sh open firefox; scripts/daily.sh open blender; scripts/daily.sh list"
-    exit 1
+    echo "open an application:    scripts/daily.sh open NAME     (NAME: $(echo $apps | sed 's/ /, /g'))"
+    echo "close its window only:  the window's red button (the application goes on; open brings it back)"
+    echo "close the application:  scripts/daily.sh close NAME"
+    echo "what is open:           scripts/daily.sh list"
+    echo "stop everything:        scripts/daily.sh stop"
+    echo
+    do_list
 }
 
 mkdir -p "$state"
 case "${1:-start}" in
--h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
-setup) do_setup ;;
-bundle) do_bundle "${2:-}" ;;
+-h | --help) sed -n '2,/^# Made to be typed/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
+setup) my_turn setup; do_setup ;;
+bundle) my_turn bundle; do_bundle "${2:-}" ;;
 start) do_start ;;
 apps) do_apps ;;
-open) do_open "${2:-}" ;;
+open) my_turn "open ${2:-}"; do_open "${2:-}" ;;
 list) do_list ;;
-close) do_close "${2:-}" ;;
-stop) do_stop ;;
+close) my_turn "close ${2:-}"; do_close "${2:-}" ;;
+stop) my_turn stop; do_stop ;;
 note) shift; do_note "$@" ;;
 guard) do_guard ;;
 *) echo "error: scripts/daily.sh --help says what there is"; exit 2 ;;
