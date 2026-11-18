@@ -21,6 +21,9 @@
 #   scripts/daily.sh stop             close every application that way, and stop everything of the
 #                                     trial on both machines
 #   scripts/daily.sh note TEXT        write down something that was noticed (trial-notes.md, not in git)
+#   scripts/daily.sh firefox-get [VERSION]
+#                                     fetch Mozilla's Firefox (the newest release), check its
+#                                     signature and sum, and unpack it into the trial's folder
 #
 # Made to be typed by the owner in a terminal of their own as well as run by an agent: one command
 # of the trial runs at a time on each machine (a lock); a second one waits up to a minute for its
@@ -42,10 +45,10 @@
 # gives the encoder back within seconds, and `open` brings the picture back.
 #
 # Each application runs on a session bus of its own, never on the desk's: what would ask a question
-# asks it inside the trial's window (the GTK file-chooser portal) or not at all. Firefox, a snap,
-# gets instead a filtering proxy of the desk's bus that lets through only the one call its launcher
-# needs to start it. A window that wants attention (marked by the compositor) is shown in the title
-# of the Mac window, and its Dock tile asks for attention once.
+# asks it inside the trial's window (the GTK file-chooser portal) or not at all. Firefox is
+# Mozilla's own build in the trial's folder (`firefox-get`), not the snap. A window that wants
+# attention (marked by the compositor) is shown in the title of the Mac window, and its Dock tile
+# asks for attention once.
 #
 # The signal of a latency measurement (AGENTS.md) is obeyed: nothing starts while it says busy, and a
 # guard on each machine looks every two seconds. When it turns busy, the windows and relays here are
@@ -462,7 +465,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps' HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-} PROXY_LOG=${DAILY_PROXY_LOG:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps' HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -611,6 +614,60 @@ HOST
     do_bundle
 }
 
+# ---- Mozilla's Firefox for the trial ----
+
+# Fetches a Firefox release (the newest, or VERSION) from Mozilla's own download host over https,
+# the Japanese build for Linux, checks it before anything of it runs, and unpacks it into the
+# trial's folder on the host (apps/firefox-VERSION). The check: SHA512SUMS is signed by Mozilla's
+# release key (its fingerprint is written here, not taken from the download), and the archive has
+# the sum written there. Updates are switched off by a policy in its folder; it is updated by
+# running this again. Nothing system-wide, no sudo; the owner's own key ring is not used.
+do_firefox_get() {
+    refuse_when_busy
+    { printf 'want=%q\n' "${1:-}"; cat <<'HOST'; } | on_host
+take_turn
+signal_busy && { echo "host: a latency measurement is running: nothing is started"; exit 3; }
+fail() { echo "fail $*"; exit 1; }
+key=14F26682D0916CDD81E37B6D61B7B526D98F0353 # Mozilla Software Releases
+base=https://archive.mozilla.org/pub/firefox/releases
+get() { curl -fsS --proto =https --tlsv1.2 --max-time 900 -o "$2" "$1"; }
+if [ -z "$want" ]; then
+    want=$(curl -fsS --proto =https --tlsv1.2 --max-time 30 https://product-details.mozilla.org/1.0/firefox_versions.json |
+        python3 -I -c 'import json, sys; print(json.load(sys.stdin)["LATEST_FIREFOX_VERSION"])')
+fi
+[[ "$want" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || fail "not a release of Firefox: '$want'"
+place=$D/apps/firefox-$want
+[ -x "$place/firefox/firefox" ] && { echo "host: Firefox $want is in the trial's folder already ($(cut -d' ' -f1-3 "$place/verified" 2>/dev/null))"; exit 0; }
+# The download, in a folder of its own; the key ring, in another, the trial's.
+dl=$D/download/firefox-$want-$(date +%s); keys=$D/download/keyring
+mkdir -p "$dl" "$keys"; chmod 700 "$D/download" "$keys"
+get "$base/$want/SHA512SUMS" "$dl/SHA512SUMS" && get "$base/$want/SHA512SUMS.asc" "$dl/SHA512SUMS.asc" &&
+    get "$base/$want/KEY" "$dl/KEY" || fail "the list of sums or its signature could not be fetched"
+name=$(awk -v n="linux-x86_64/ja/firefox-$want.tar.xz" -v m="linux-x86_64/ja/firefox-$want.tar.bz2" '$2 == n || $2 == m {print $2; exit}' "$dl/SHA512SUMS")
+[ -n "$name" ] || fail "SHA512SUMS names no Japanese build for Linux of $want"
+export GNUPGHOME=$keys
+gpg --batch --quiet --import "$dl/KEY" 2>/dev/null
+[ "$(gpg --batch --with-colons --fingerprint "$key" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')" = "$key" ] ||
+    fail "Mozilla's release key ($key) is not in the KEY that came: nothing is unpacked"
+said=$(gpg --batch --status-fd 1 --verify "$dl/SHA512SUMS.asc" "$dl/SHA512SUMS" 2>/dev/null)
+gpgconf --kill all 2>/dev/null
+printf '%s\n' "$said" | grep -q '^\[GNUPG:\] GOODSIG ' && printf '%s\n' "$said" | grep -q "^\[GNUPG:\] VALIDSIG .* $key\$" ||
+    fail "the signature of SHA512SUMS is not a good one by Mozilla's release key: nothing is unpacked"
+archive=$dl/$(basename "$name")
+get "$base/$want/$name" "$archive" || fail "the archive could not be fetched"
+sum=$(awk -v n="$name" '$2 == n {print $1}' "$dl/SHA512SUMS")
+[ -n "$sum" ] && [ "$(sha512sum "$archive" | cut -d' ' -f1)" = "$sum" ] || fail "the archive does not have the sum that Mozilla signed: nothing is unpacked"
+# Unpacked beside, and put in place whole.
+next=$D/apps/.firefox-$want-$(date +%s)
+mkdir -p "$next" && tar -xf "$archive" -C "$next" && [ -x "$next/firefox/firefox" ] || fail "the archive did not unpack"
+mkdir -p "$next/firefox/distribution"
+printf '{\n  "policies": {\n    "DisableAppUpdate": true\n  }\n}\n' > "$next/firefox/distribution/policies.json"
+echo "$want $name $(date '+%Y-%m-%d %H:%M') sha512 $sum signed-by $key" > "$next/verified"
+mv "$next" "$place" || fail "it could not be put in place"
+echo "host: Firefox $want (the Japanese build) is in the trial's folder: its signature by Mozilla's release key and its sum were checked; updates are off by policy"
+HOST
+}
+
 # ---- Opening ----
 
 do_apps() { for each in $apps; do printf '%s\t%s\n' "$each" "$(app_title "$each")"; done; }
@@ -668,31 +725,41 @@ else
     [ -n "$desk" ] || echo "host: note: the desk's language could not be read; $NAME starts without one (English)"
     # Where the look goes: a settings file of the trial's own in the application's XDG_CONFIG_HOME
     # (GSETTINGS_BACKEND=keyfile), seeded from the desk at every start. Blender has a look of its own.
-    look=""; theme_by_env=""; no_bus=""
+    look=""
     # What the application is started as, apart from what its owner uses every day.
     case "$NAME" in
     firefox)
-        # The trial's profile of the evening before (a test profile, not the owner's own).
-        profile=$HOME/snap/firefox/common/istesso-try-profile
+        # Mozilla's own build (the Japanese one), unpacked into the trial's folder by
+        # `scripts/daily.sh firefox-get` after its signature and sum were checked; the newest there
+        # is used. Not the snap: the snap keeps its settings where the owner's Firefox keeps its
+        # own, and its launcher needs systemd over the desk's session bus.
+        firefox=$(ls -d "$D"/apps/firefox-[0-9]*/firefox/firefox 2>/dev/null | sort -V | tail -1)
+        [ -x "$firefox" ] || { echo "fail Mozilla's Firefox is not in the trial's folder yet: scripts/daily.sh firefox-get"; exit 1; }
+        # The trial's own test profile, in the trial's folder, silent; its settings, cache and data
+        # folders are the trial's too, so that nothing goes to the owner's.
+        home=$D/apps/firefox; profile=$home/profile
+        mkdir -p "$profile" "$home/config" "$home/cache" "$home/data" "$home/state"; chmod 700 "$home"
+        cat > "$profile/user.js" <<'PREFS'
+// Written by scripts/daily.sh at every start: the trial's Firefox is silent, Japanese, and asks
+// nothing on its first start. Updates are switched off by the policy of its folder.
+user_pref("media.volume_scale", "0.0");
+user_pref("intl.locale.requested", "ja");
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+// Its own file dialog, not the portal's: the portal's dialog is another program's window, which
+// the trial compositor does not give the keyboard to (it marks it as calling instead).
+user_pref("widget.use-xdg-desktop-portal.file-picker", 0);
+PREFS
         grep -q '"media.volume_scale", *"0.0"' "$profile/user.js" 2>/dev/null ||
             { echo "fail the trial profile of Firefox does not say that it is silent: not started"; exit 1; }
         if [ -L "$profile/lock" ]; then
             holder=$(readlink "$profile/lock" | sed -n 's/.*:+\([0-9]*\)$/\1/p')
             [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && { echo "fail the trial profile of Firefox is in use by another Firefox: not started"; exit 1; }
         fi
-        # Firefox is a snap, which sets XDG_CONFIG_HOME to a folder of its own that the owner's
-        # Firefox uses too: no settings file of the trial can go there. Its settings stay in memory
-        # (written nowhere); it reads the defaults of the desk's desktop, and the desk's theme comes
-        # as GTK_THEME (with :dark when the desk prefers dark). Fonts and their size follow the
-        # desktop's defaults only.
-        look=-; theme_by_env=1
-        # Its launcher (snap run) asks systemd, on the session bus, for a scope of its own, and does
-        # not start without one: so Firefox gets a filtering proxy of the desk's bus that lets
-        # through that one call (StartTransientUnit) and its answer (JobRemoved), and nothing else:
-        # no portal, no keyring, no launcher of the desk. Firefox itself, once confined, cannot
-        # reach the proxy's socket either. The proxy ends when Firefox does.
-        no_bus=1
-        app="env GSETTINGS_BACKEND=memory firefox --no-remote --profile $profile" ;;
+        look=$home/config
+        app="env XDG_CONFIG_HOME=$home/config XDG_CACHE_HOME=$home/cache XDG_DATA_HOME=$home/data XDG_STATE_HOME=$home/state GSETTINGS_BACKEND=keyfile $firefox --no-remote --profile $profile" ;;
     blender)
         blender=$BLENDER
         [ -n "$blender" ] || blender=$(command -v blender)
@@ -737,8 +804,6 @@ else
     if [ -n "$look" ]; then
         said_look=$(seed_look "$look" "$desk" 2>/dev/null)
         shown=$(printf '%s\n' "$said_look" | tail -2 | head -1)
-        theme=$(printf '%s\n' "$said_look" | tail -1)
-        [ -n "$theme_by_env" ] && [[ "$theme" =~ ^[A-Za-z0-9_.:+-]+$ ]] && app="env GTK_THEME=$theme $app"
     fi
     echo "host: $NAME gets the desk's language ($(printf '%s\n' $desk | sed -n 's/^LANG=//p' | grep . || echo none))$([ -n "$shown" ] && echo " and look ($shown)")"
     events=""
@@ -792,12 +857,13 @@ SCRIPT
     # where nobody sees it. dbus-run-session starts it for the application and ends it, by its
     # process number, when the application ends; it is in the application's session, so that it is
     # held still and ended with it. DBUS_SESSION_BUS_ADDRESS points at it, so the desk's bus is not
-    # looked for ($XDG_RUNTIME_DIR/bus is only a fallback when that is not set). Only what is named
-    # here can be started on it: the file-chooser portal with its GTK dialogs (they open in the
-    # hidden compositor), and its permission store. No keyring. What those keep is kept in the
-    # bus's folder, not in the owner's.
+    # looked for ($XDG_RUNTIME_DIR/bus is only a fallback when that is not set). Nothing can be
+    # started on it: no keyring, and no portal either. A portal's file dialog did open inside the
+    # hidden compositor, but as another program's window, which the trial compositor does not give
+    # the keyboard to (it marks it as calling); without the portal, each application opens its own
+    # dialog, which does get the keyboard. Whatever runs on it keeps its files in the bus's folder.
     bus=$run/bus
-    mkdir -p "$bus/services" "$bus/store/data" "$bus/store/config/xdg-desktop-portal" "$bus/store/state" "$bus/store/cache"
+    mkdir -p "$bus/store/data" "$bus/store/config" "$bus/store/state" "$bus/store/cache"
     cat > "$bus/bus.conf" <<CONF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -805,7 +871,7 @@ SCRIPT
   <type>session</type>
   <keep_umask/>
   <listen>unix:tmpdir=/tmp</listen>
-  <servicedir>$bus/services</servicedir>
+  <servicedir>$bus/services-none</servicedir>
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
@@ -813,19 +879,10 @@ SCRIPT
   </policy>
 </busconfig>
 CONF
-    service() { printf '[D-BUS Service]\nName=%s\nExec=%s\n' "$1" "$2" > "$bus/services/$1.service"; }
-    [ -x /usr/libexec/xdg-desktop-portal ] && service org.freedesktop.portal.Desktop /usr/libexec/xdg-desktop-portal
-    [ -x /usr/libexec/xdg-desktop-portal-gtk ] && service org.freedesktop.impl.portal.desktop.gtk /usr/libexec/xdg-desktop-portal-gtk
-    [ -x /usr/libexec/xdg-permission-store ] && service org.freedesktop.impl.portal.PermissionStore /usr/libexec/xdg-permission-store
-    printf '[preferred]\ndefault=gtk\n' > "$bus/store/config/xdg-desktop-portal/portals.conf"
-    if [ -n "$no_bus" ]; then
-        proxy=$bus/systemd-only-$(date +%s%N)
-        start_line="exec 5> >(exec xdg-dbus-proxy unix:path=$XDG_RUNTIME_DIR/bus $proxy --fd=0 --filter --call=org.freedesktop.systemd1=org.freedesktop.systemd1.Manager.StartTransientUnit@/org/freedesktop/systemd1 --broadcast=org.freedesktop.systemd1=org.freedesktop.systemd1.Manager.JobRemoved@/org/freedesktop/systemd1 ${PROXY_LOG:+--log} 2>> $bus/proxy.log)
-for i in \$(seq 1 50); do [ -S $proxy ] && break; sleep 0.1; done
-exec env DBUS_SESSION_BUS_ADDRESS=unix:path=$proxy $app $events $record"
-    else
-        start_line="exec env XDG_DATA_HOME=$bus/store/data XDG_CONFIG_HOME=$bus/store/config XDG_STATE_HOME=$bus/store/state XDG_CACHE_HOME=$bus/store/cache dbus-run-session --config-file=$bus/bus.conf -- env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_STATE_HOME -u XDG_CACHE_HOME $app $events $record"
-    fi
+    # The bus's folder of services, which stays empty (an earlier version wrote the portal's into
+    # services/, which is no longer read).
+    mkdir -p "$bus/services-none"
+    start_line="exec env XDG_DATA_HOME=$bus/store/data XDG_CONFIG_HOME=$bus/store/config XDG_STATE_HOME=$bus/store/state XDG_CACHE_HOME=$bus/store/cache dbus-run-session --config-file=$bus/bus.conf -- env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_STATE_HOME -u XDG_CACHE_HOME $app $events $record"
     cat > "$run/app.sh" <<SCRIPT
 #!/bin/bash
 # The application inside the hidden compositor: Wayland only, so that it cannot open on the desk
@@ -1182,6 +1239,7 @@ bundle) my_turn bundle; do_bundle "${2:-}" ;;
 start) do_start ;;
 apps) do_apps ;;
 open) my_turn "open ${2:-}"; do_open "${2:-}" ;;
+firefox-get) my_turn firefox-get; do_firefox_get "${2:-}" ;;
 list) do_list ;;
 close) my_turn "close ${2:-}"; do_close "${2:-}" ;;
 stop) my_turn stop; do_stop ;;

@@ -54,7 +54,7 @@ Mac                                              ホスト（Ubuntu）
 | パイプライン（`scripts/m1-step3-host.py`） | 計測のワークツリーと、ホストの計測の作業フォルダーの写し（**触らない**） | ホストの試用版の写し。**中身は変えていない。** 窓を閉じたときに絵を止めるのも、前からある言葉（`detach`、`resume`）を使うだけで、フラグも足していない |
 | Blender の設定 | 持ち主のふだんの設定（`~/.config/blender/<版>/config`）。**読むだけ** | `apps/blender/config` の、1 回だけ取った写し |
 | 鍵（同時に動かさない） | — | Mac：`~/Library/Caches/istesso-daily/lock`。ホスト：`~/.cache/istesso-daily-wip/run/lock` |
-| セッションバス | 机のもの | アプリごとに自分のもの（`run/<アプリ>/bus`）。Firefox は、systemd への 1 つの頼みだけを通すふるい |
+| セッションバス | 机のもの | アプリごとに自分のもの（`run/<アプリ>/bus`）。何も起動できないバス（ポータルも鍵束もない） |
 
 ## 計測の合図
 
@@ -77,7 +77,7 @@ Mac                                              ホスト（Ubuntu）
 
 | 名前 | 起動 | 切り離し | 音 |
 |---|---|---|---|
-| `firefox` | snap の Firefox。昨夜の試し用のプロファイル（snap のデータの中の `istesso-try-profile`）。`--no-remote` | ふだんのプロファイルとは別。そのプロファイルを、ほかの Firefox が使っていれば、開かない。設定はメモリーの中だけ（`GSETTINGS_BACKEND=memory`。下の「言葉と見た目」） | プロファイルの設定で無音。**無音の設定が読めなければ、起動しない** |
+| `firefox` | **Mozilla のビルド**（日本語のもの）を、試用版のフォルダー（`apps/firefox-<版>/`）に置いたもの（下の「Firefox（Mozilla のビルド）」）。`--no-remote`、試用版のフォルダーのテスト用のプロファイル（`apps/firefox/profile`） | ふだんの Firefox（snap）とは、プログラムもプロファイルも別。プロファイルを、ほかの Firefox が使っていれば、開かない。設定、キャッシュ、データのフォルダーも試用版のもの（`apps/firefox/…`、設定ファイルは `keyfile`） | プロファイルの設定で無音（`user.js`。起動のたびに書く）。**無音の設定が読めなければ、起動しない** |
 | `blender` | ホームの下の Blender（`DAILY_BLENDER` で言える。なければ `~/.local/opt/blender` などを探す） | **持ち主のふだんの設定の写し**で動く（下の「Blender の設定」）。ふだんの設定のフォルダーは、読むだけ | `-noaudio` |
 | `editor` | `gnome-text-editor --standalone --ignore-session`、文書は試用版のフォルダーの `documents/trial.txt` | データ、設定、状態、キャッシュを、試用版のフォルダーへ。設定は試用版のフォルダーの設定ファイル（`GSETTINGS_BACKEND=keyfile`）。`GIO_USE_VFS=local` | 出さない |
 | `chrome` | `google-chrome --ozone-platform=wayland`、試用版のフォルダーのプロファイル。`--password-store=basic`（鍵束の問いを、机に出さない）、`--disable-gpu` | ふだんのプロファイルとは別。`XDG_CONFIG_HOME` も試用版のフォルダー（`apps/chrome/config`）、設定はそこの設定ファイル（`keyfile`）。**`TMPDIR` を `~/.cache` の下にしない**（Chrome が、すぐ落ちる） | `--mute-audio` |
@@ -92,7 +92,7 @@ Mac                                              ホスト（Ubuntu）
 - アプリには、机のログインの言葉を渡します。起動のたびに、ホストの `systemctl --user show-environment` から `LANG`、`LANGUAGE`、`LC_*`、`XDG_CURRENT_DESKTOP` を読みます（読むだけ。読めなければ `/etc/default/locale`）。いまの値は `LANG=ja_JP.UTF-8`、`XDG_CURRENT_DESKTOP=ubuntu:GNOME`。アプリの起動の中で、`LC_ALL` と、ほかの `LC_*` を外してから、これを入れます。試用版の自分のコマンド（ホストの出力を読むもの）は、`LC_ALL=C` のままです。
 - 見た目（テーマ、アイコン、カーソル、字、字の大きさ、濃淡、窓のボタンの並び）は、机が見せている値を読みます：持ち主の設定と、`ubuntu` のデスクトップの既定（Ubuntu は、`XDG_CURRENT_DESKTOP` が `ubuntu` のときだけ Yaru と Ubuntu Sans を既定にする）。読むだけで、持ち主の dconf と gsettings には、何も書きません。
 - 読んだ値は、アプリごとの、**試用版の設定ファイル**（`<XDG_CONFIG_HOME>/glib-2.0/settings/keyfile`、`GSETTINGS_BACKEND=keyfile`）に、起動のたびに入れ直します。アプリが自分で変えた設定も、そのファイルにだけ残ります。Text Editor は `apps/editor/config`、Chrome は `apps/chrome/config`。
-- **Firefox だけは違います。** snap が `XDG_CONFIG_HOME` を、自分のフォルダー（持ち主のふだんの Firefox と同じ所）に替えるので、そこへ試用版のファイルは置きません。設定はメモリーの中だけ（`GSETTINGS_BACKEND=memory`。どこにも書かない）で、デスクトップの既定を読みます。テーマは `GTK_THEME`（机が濃い色を選んでいれば `Yaru:dark` の形）で、机に合わせます。**字と字の大きさは、デスクトップの既定だけ**です（いまは机と同じ。持ち主が机で字を変えても、試用版の Firefox には届きません）。Firefox の画面の言葉は、試用のプロファイルの言語の設定（`ja`）によります。
+- Firefox（Mozilla のビルド）も、Chrome と同じく、試用版の設定ファイル（`apps/firefox/config`）で見た目を受け取ります（4 回目から。snap のときは、snap が `XDG_CONFIG_HOME` を替えたので、メモリーの中だけだった）。画面の言葉は、日本語のビルドなので、言語パックは要りません。
 - Blender は、自分の設定（言語を含む）で見た目が決まります。写した持ち主の設定が、日本語でした（下の「確かめたこと（2 回目）」）。
 - 日本語の入力（IME）は、ここには入れていません（別の ADR で決める）。
 
@@ -102,9 +102,22 @@ Mac                                              ホスト（Ubuntu）
 
 - 前の版は `DBUS_SESSION_BUS_ADDRESS` を外していただけでした。GLib は、その変数がないと `$XDG_RUNTIME_DIR/bus`（机のバス）を自分で探すので、Text Editor は机のバスにつながっていました。
 - いまは、**アプリごとに、自分のセッションバス**を持たせます。`dbus-run-session` が、アプリのために `dbus-daemon` を起動し、`DBUS_SESSION_BUS_ADDRESS` をそこに向け、アプリが終わると、その番号で止めます。どれもアプリの tmux のセッションの中にあるので、計測の合図で一緒に止まり（SIGSTOP）、`close` と `stop` で一緒に終わります。変数がそこを指しているので、`$XDG_RUNTIME_DIR/bus` は探されません（`XDG_RUNTIME_DIR` は、コンポジターの口があるので、変えていません）。
-- そのバスで起動できるのは、名前を挙げたものだけです（バスの設定は、試用版のフォルダーの `run/<アプリ>/bus/bus.conf`）：ファイルを選ぶポータル（`xdg-desktop-portal`）、その GTK の窓（`xdg-desktop-portal-gtk`）、その許可の記録（`xdg-permission-store`）。**鍵束は、起動できません。** ポータルは、GTK のものだけを使う設定です。それらが書くもの（許可の記録など）は、バスのフォルダー（`run/<アプリ>/bus/store`）に入り、持ち主のフォルダーには行きません。アプリ自身のフォルダーは、前と同じです。
-- **Firefox だけは違います。** snap の起動（`snap run`）は、セッションバスで systemd に頼んで、自分用の scope を作ります。自分のバスには systemd がいないので、起動しません（`cannot create transient scope`）。バスなし（つながらない宛先）でも、`not a snap cgroup` で起動しません。そこで Firefox には、机のバスの**ふるいを通した口**（`xdg-dbus-proxy --filter`）を渡します。通すのは、その 1 つの頼み（`org.freedesktop.systemd1.Manager.StartTransientUnit`）と、その答え（`JobRemoved`）だけです。ポータルも鍵束も、机のランチャーも、通しません。Firefox 自身は、閉じ込められたあと、その口のソケットに届きません（`Permission denied` と記録された）。口は、Firefox が終わると終わります。
+- そのバスでは、何も起動できません（バスの設定は、試用版のフォルダーの `run/<アプリ>/bus/bus.conf`。サービスのフォルダーは空）。**鍵束も、ポータルも、起動できません**（3 回目は、ファイルを選ぶポータルとその GTK の窓、許可の記録を置いていた。4 回目に外した。下）。バスの上で動くものが書くものは、バスのフォルダー（`run/<アプリ>/bus/store`）に入ります。アプリ自身のフォルダーは、前と同じです。
+- Firefox も、4 回目から、ほかと同じく自分のバスです。snap だったとき、snap の起動（`snap run`）は、セッションバスで systemd に頼んで自分用の scope を作らないと起動しなかったので、机のバスへ systemd への頼み 1 つだけを通すふるい（`xdg-dbus-proxy`）を渡していました。Mozilla のビルドには要らないので、ふるいは消しました。
+- **ポータルも、バスに置かない**ことにしました（4 回目から）。ポータルのファイルを選ぶ窓は、隠れたコンポジターの中に出ました。ただし、別のプログラム（`xdg-desktop-portal-gtk`）の窓なので、試用版のコンポジターはキーボードを渡さず、「見てほしい」の印を付けました（Firefox と Chrome で見た。Esc が届かない）。ポータルがなければ、アプリは自分のファイルを選ぶ窓を開きます。Firefox と Text Editor では、それがキーボードを受け取りました（Esc で閉じた）。Chrome の自分の窓は、Chrome が別の Wayland の接続で開くので、やはり印付きで出ます（下の「危うさ」）。ポータルだけが尋ねる問い（画面の共有など）は、出ずに断られます。
 - ブラウザーは、机のパスワードの保管庫を使えません（試用のプロファイルなので、かまわない。持ち主の決め）。
+
+### Firefox（Mozilla のビルド）
+
+持ち主の決め（2026-11-18）：試用版の Firefox は、snap ではなく、Mozilla のビルドを試用版のフォルダーに置いたもの。snap をやめたわけ：snap は、設定を持ち主のふだんの Firefox と同じフォルダーに置き（試用版が、そこに書いてしまった）、起動に机のセッションバス（systemd）が要る。
+
+- 取り方：`scripts/daily.sh firefox-get [版]`。版を言わなければ、Mozilla の `product-details.mozilla.org` の最新のリリース。Mozilla の配布元（`archive.mozilla.org`）から https だけで、日本語のビルド（`linux-x86_64/ja/firefox-<版>.tar.xz`）、`SHA512SUMS`、その署名（`SHA512SUMS.asc`）、鍵（`KEY`）を取ります。
+- 確かめ方（どれかが合わなければ、何も展開しない）：(1) 来た鍵の中に、Mozilla のリリースの鍵（`14F2 6682 D091 6CDD 81E3 7B6D 61B7 B526 D98F 0353`、Mozilla Software Releases。指紋はスクリプトに書いてあり、ダウンロードからは取らない）がある。(2) `SHA512SUMS` の署名が、その鍵の良い署名（`GOODSIG` と `VALIDSIG … <その指紋>`）。(3) アーカイブの SHA-512 が、`SHA512SUMS` の行と同じ。鍵束は試用版のフォルダーのもの（`download/keyring`）で、持ち主の鍵束は使いません。
+- 置き場所：`~/.cache/istesso-daily-wip/apps/firefox-<版>/`（確かめた中身を `verified` に 1 行）。`open firefox` は、そこにあるいちばん新しい版を使います。ダウンロードは `download/firefox-<版>-<時刻>/` に残ります。
+- 更新：自動の更新は、置き場所のポリシー（`firefox/distribution/policies.json` の `DisableAppUpdate`）で止めてあります。新しい版は、`firefox-get` をもう 1 度打って入れます（古い版は残る。開いている Firefox は、閉じて開き直すまで古い版）。
+- リリース（ESR ではない）を選んだわけ：持ち主のふだんの Firefox（snap）がリリースの系列（159）で、同じ動きを試せるため。どちらにしても、更新は手で入れます。
+- プロファイル：試用版のフォルダーの `apps/firefox/profile`（新しく作った。snap の中の前のテスト用のプロファイルは、もう使わない）。`user.js` を起動のたびに書きます：無音（`media.volume_scale` が `0.0`）、日本語、既定のブラウザーを尋ねない、最初の案内を出さない、ファイルを選ぶ窓はポータルでなく Firefox 自身のもの。
+- 試用版は、もう `~/snap/firefox` に何も書きません（`daily.sh` から snap の道を消した）。前に試用版が snap の中に作ったもの（前のテスト用のプロファイル `istesso-try-profile` と、2 回目の確かめの最初の版が作った設定ファイルのフォルダー `istesso-try-config`）は、ルール 22 により、こちらでは消していません。消すかは持ち主が決めます。
 
 ### Blender の設定
 
@@ -264,12 +277,24 @@ Mac にも、ホストの机にも、何も出していません。Mac のビュ
 | 4. 呼んでいる窓 | Text Editor を開き、確かめのための 2 つ目の Text Editor（別のプロセス、別のフォルダー）を同じコンポジターへ。コンポジター：`window attention app_id="org.gnome.TextEditor" wants_attention=true`。2 秒で、Mac の見張り：`editor: the window's title: ● Text Editor — a window is calling`。ビューアー：`title: ● Text Editor — a window is calling (asks for attention)`。`list`：`calling 1`。2 つ目を閉じたとき、`false` の行は出なかった（上の「分かっている欠け」） | 通った（欠けが 1 つ） |
 | 5. プラグインの入れ替え | `setup`（19:48、11 秒）：両方でビルドし、`gwd-trial10` を写し、包みを作り直して、名前を変えずに置いた（`.staged`、登録していない。前と同じ証明書） | 済み |
 
+## 確かめたこと（4 回目。2026-11-18 20:40〜20:47、実機 2 台、窓を出さずに）
+
+| 確かめ | 見たこと | 結果 |
+|---|---|---|
+| 1. Firefox を取って確かめる | `scripts/daily.sh firefox-get`（11 秒）：160.0.1 の日本語のビルド。鍵束（試用版のもの）の鍵：`uid Mozilla Software Releases`、主鍵の指紋が書いてあるものと同じ。`[GNUPG:] GOODSIG 678E455D76767AA3 Mozilla Software Releases`、`VALIDSIG … 14F26682D0916CDD81E37B6D61B7B526D98F0353`（副鍵の期限は 2028 年）。アーカイブの SHA-512 は `SHA512SUMS` の行と同じ（頭 `ffc69bb0`）。`policies.json` に `DisableAppUpdate: true`。持ち主の `~/.gnupg` は 11 月 15 日のまま | 通った |
+| 2. 起動と日本語 | `open firefox`：起動した。主のプロセスは `apps/firefox-160.0.1/firefox/firefox --no-remote --profile …`、環境に `LANG=ja_JP.UTF-8`、`MOZ_ENABLE_WAYLAND=1`、`GSETTINGS_BACKEND=keyfile`、`XDG_CONFIG_HOME` は試用版のフォルダー、`DISPLAY` なし。確かめのための隠れたコンポジターの絵：「新しいタブ」「Google で検索、または URL を入力します」「前回のタブを開きますか？」 | 通った |
+| 3. 机のバスに 0 | Firefox の全部のプロセス（コンテンツのプロセスも）の `DBUS_SESSION_BUS_ADDRESS` は自分のバス。自分のバスの上は Firefox だけ（ポータルを消したあと）。机のバスに、このセッションのプロセスは 0。Chrome と Text Editor も 0 | 通った |
+| 4. ファイルを選ぶ窓 | 試しのキー Ctrl＋O：Firefox は窓が 1 → 2、印なし。Esc で 2 → 1（窓がキーボードを持っていた）。ポータルがあったときは、`window attention app_id="xdg-desktop-portal-gtk" wants_attention=true` で、Esc が届かなかった。Text Editor も 1 → 2 → 1。Chrome は 1 → 2 で `app_id="GTK Application"` に印、Esc は届かなかった | Firefox と Text Editor は通った。Chrome は印付き（危うさ） |
+| 5. 持ち主のフォルダー | `~/.mozilla` と `~/.cache/mozilla` は、前も後もない。試用版の起動の中身（`run/*/app.sh`）に `snap` は 0 | 通った |
+
 ## 危うさ
 
 - **エンコーダーの数**：このホストのカードとドライバーでは、同時に開けるのは、PC 全体で 12。試用版は、アプリ 1 つにつき 1 つ使います（多くて 3）。ふだんの試用のパイプライン、ほかの流れの試験、机の人の録画も、同じ 12 の中です。断られたときは、パイプラインが `refused` と言い、その窓だけ「戻せなかった」になります。
 - Mac の窓を赤いボタンで閉じると、2 秒ほどで、エンコーダーを手放します（2 回目から）。Mac の見張りが動いていないとき（たとえば、Mac が眠っていた、ホストに届かない）は、届くまで手放しません。
 - **エンコーダーを数える `nvidia-smi --query-gpu=encoder.stats.sessionCount` は、このカードとドライバーでは、試用版のエンコーダーを数えません**（絵を作っているときも 0。`nvidia-smi -q -d ENCODER_STATS` も `Active Sessions: 0`）。手放したかは、パイプラインの `paused` の行と、`nvidia-smi pmon -s um` のプロセスごとの `enc` とフレームバッファで見ます。
-- 机のセッションバスからは、3 回目から切り離しました（上の「机のセッションバスから切り離す」）。Firefox だけは、systemd への 1 つの頼みを、机のバスへ通します。snap の Firefox は、起動するたびに、snap の自分のフォルダー（持ち主のふだんの Firefox と同じもの）に、キャッシュなどを書くことがあります。これは試用版の前からのことで、避けるには、Firefox を snap でないもので動かすしかありません（まとめ役と決める）。
+- 机のセッションバスからは、3 回目から切り離しました（上の「机のセッションバスから切り離す」）。4 回目から、Firefox も同じです。
+- **Mozilla のビルドの Firefox の、中身の囲い（サンドボックス）が弱くなります。** 起動のたびに `Sandbox: CanCreateUserNamespace() unshare(CLONE_NEWPID): EPERM` と出ます。この Ubuntu は、ふつうのユーザーが新しい名前空間を作るのを AppArmor で止めていて、Firefox は、それを使う囲いを使えません（ほかの囲いは残る）。snap のときは snap の囲いがあった。強めるには、Firefox の置き場所に AppArmor の許しを足す（`sudo` が要る。持ち主の判断）。試用版では、試しのプロファイルで、ふだんのサイトを見るくらいにとどめる。
+- Chrome のファイルを選ぶ窓は、印付きで前に出て、キーボードは渡りません（Chrome が、別の Wayland の接続で窓を開くため。`app_id` は `GTK Application`）。持ち主がクリックすれば使える見込みです（コンポジターの決め：人の操作で、キーボードが移る。確かめていない）。コンポジターの流れに、同じアプリのダイアログとして扱えるかを頼みます。
 - `dbus-run-session` を番号で終わらせると、その `dbus-daemon` が残ることがあります（確かめのための 2 つ目のエディターで見た。番号で止めた）。試用版では、バスはアプリのセッションの中にあるので、`close` と `stop` がセッションごと終わらせます。
 - 試用版の Blender は、持ち主のふだんの設定の写しで動きます。写したあとに、ふだんの Blender で変えた設定は、試用版には入りません（写し直すときは、上の「Blender の設定」）。
 - **絵は、次の 1 枚が来たときに止まる。** 何も描かないアプリでは、`detach` の答えが来ないことがありえます（今日の 3 つは、どれも 33 ms 以内に答えた。Blender も）。そのときは、見張りの行が「止まったと言わなかった」と言い、プロセスは止めます（エンコーダーは開いたまま）。
@@ -296,10 +321,10 @@ Mac にも、ホストの机にも、何も出していません。Mac のビュ
 2. `scripts/daily.sh open blender` → 出力に `copied once` の行（最初の 1 回だけ）。持ち主のふだんの設定（日本語、Emulate Numpad など）が入っていること
 3. Blender の窓の赤いボタン → 数秒後に `scripts/daily.sh list` で `picture paused` と `window closed`。`open blender` で、同じ Blender が戻ること（何も失っていない）
 4. `scripts/daily.sh close blender` → `the owner's normal Blender settings are unchanged` の行
-5. `scripts/daily.sh open firefox`、`scripts/daily.sh open chrome` → 日本語であること
+5. `scripts/daily.sh open firefox`（初めての起動は、Mozilla のビルドと新しいテスト用のプロファイル）、`scripts/daily.sh open chrome` → 日本語であること。Firefox で Ctrl＋O のファイルを選ぶ窓が、試用版の窓の中に出て、そのまま打てること
 6. 持ち主のターミナルから打って、ローカルネットワークの問いが出たら「許可」。出たかどうかを、まとめ役に
 7. アプリの窓が、人の操作なしに前に出ようとしたとき（たとえば、遅れて出てきた 2 つ目の窓）、Mac の窓の題名に `●` と `a window is calling` が出て、Dock のタイルが 1 回跳ねること。その窓を使うと、題名が元に戻ること
-8. Chrome でファイルを選ぶ窓を開くと、試用版の窓の中に出ること（机には出ない）
+8. Chrome でファイルを選ぶ窓を開くと、試用版の窓の中に、印付きで出ること（机には出ない）。クリックすると打てるようになるか
 9. `scripts/daily.sh stop`
 
 確かめていないこと：本当の赤いボタン（確かめでは、ビューアーを番号で終わらせた）、持ち主のターミナルからの起動、ターミナルを閉じても動き続けること、試用版の本当の写し（`apps/blender/config`）を作るところ、人の目で見た見た目（確かめの絵は、エンコーダーを通さない PNG）、人の手で打ったキー。Chrome は、試用のプロファイルで「Chrome を更新できません」と知らせる（確かめの絵で見た。どうするかは持ち主が決める）。
@@ -322,3 +347,4 @@ Mac にも、ホストの机にも、何も出していません。Mac のビュ
 5. 持ち主の手での確認（まとめ役が、窓が出ることを先に知らせる）。1 回目は**済み**（18:44〜18:50）。2 回目は、上の「持ち主に残すもの」。
 6. 1 回目の手の確認で出た 4 つ（言葉と見た目、Blender の設定の写し、Blender のイベントの記録、赤いボタンでエンコーダーを手放す）と、持ち主が自分で開け閉めする形（鍵）。**済み**（上の「確かめたこと（2 回目）」）
 7. 机のセッションバスから切り離す。呼んでいる窓を、題名と Dock で知らせる。コンポジターを `gwd-trial10` に。**済み**（上の「確かめたこと（3 回目）」）。窓の一覧は、あとで（上の「窓が呼んでいるとき」）
+8. Firefox を、snap から Mozilla のビルド（試用版のフォルダー）へ。バスからポータルを外す。**済み**（上の「確かめたこと（4 回目）」）
