@@ -1486,10 +1486,25 @@ static NSCursor *empty_cursor(void) {
                                            | NSTrackingInVisibleRect
                                      owner:self
                                   userInfo:nil]];
+    // Keys go to the other side only while this window is the one typed into: when it stops
+    // being that (another window, another application, Command-Tab, the screenshot keys), what
+    // is down over there comes up; when it is that again, the modifiers held now go down there.
     [NSNotificationCenter.defaultCenter addObserver:self
                                            selector:@selector(letGo)
                                                name:NSWindowDidResignKeyNotification
                                              object:self.window];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(letGo)
+                                               name:NSApplicationDidResignActiveNotification
+                                             object:NSApp];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(keyboardIsBack)
+                                               name:NSWindowDidBecomeKeyNotification
+                                             object:self.window];
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(keyboardIsBack)
+                                               name:NSApplicationDidBecomeActiveNotification
+                                             object:NSApp];
     for (NSNotificationName name in @[NSWindowDidResignKeyNotification, NSWindowDidBecomeKeyNotification]) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(windowIsKeyOrNot) name:name object:self.window];
     }
@@ -1505,6 +1520,30 @@ static NSCursor *empty_cursor(void) {
 - (void)letGo {
     KeyChange changes[256];
     [self send:changes count:keys_let_go(&_keys, changes)];
+}
+
+// The window is the one typed into again: the modifiers held on this keyboard now go down on the
+// other side (nothing else: a letter pressed again would be typed). Not while the picture is
+// being reconnected; fallInLine does it when the picture is back.
+- (void)keyboardIsBack {
+    if (!self.window.isKeyWindow || !NSApp.isActive || picture_stale) {
+        return;
+    }
+    [self fallInLine];
+}
+
+// Before a button or a scroll is sent the modifiers over there are brought in line with the
+// event's flags (keys.h): a modifier whose release went elsewhere comes up, one that is held and
+// whose press went elsewhere goes down. Nothing goes down while the picture is being reconnected.
+- (void)modifiersInLine:(NSEvent *)event {
+    KeyChange changes[KEYS_MOST];
+    _keys.command_is_control = command_is_control;
+    size_t count = keys_fall_in_line(&_keys, event.modifierFlags, changes);
+    if (picture_stale) {
+        bool dropped = false;
+        count = keys_hold_back(&_keys, changes, count, &dropped);
+    }
+    [self send:changes count:count];
 }
 
 // The line that says "what you type does not arrive" has come up: whatever is held on the other
@@ -1600,6 +1639,7 @@ static NSCursor *empty_cursor(void) {
     if (!pressed && !(_buttons & bit)) {
         return;  // It never went down over there, or was let go there already.
     }
+    [self modifiersInLine:event];
     _buttons = pressed ? (_buttons | bit) : (_buttons & ~bit);
     if (pressed) {
         note_press();
@@ -1636,6 +1676,7 @@ static NSCursor *empty_cursor(void) {
     if (dx != 0 || dy != 0) {
         _scroll[0] -= dx;
         _scroll[1] -= dy;
+        [self modifiersInLine:event];
         send_input("{\"kind\":\"scroll\",\"dx\":%d,\"dy\":%d}", dx, dy);
     }
 }
