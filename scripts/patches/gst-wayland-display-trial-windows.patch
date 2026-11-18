@@ -83,8 +83,10 @@ What it changes:
   same session (`setsid`; read from /proc/PID/stat with the process id the connection
   carries, when it connects, and kept: the process that connected may end while the
   connection stays, as with a program that hands it to a child and exits, so it is read at
-  once; a later read is only a fallback). A client whose session cannot be read is the same
-  application as no other client. One compositor shows one application session: a program
+  once; a later read is only a fallback). A client whose session cannot be read, or reads
+  as 0 or less (a session leader outside the reader's process namespace, as in a
+  container), is the same application as no other client. A client's entry is let go when
+  it disconnects. One compositor shows one application session: a program
   that opens a dialog on a connection of its own (Chrome's file dialog) is the same
   application; a client from outside the session is another. The launcher has to start
   each application as the leader of a session of its own, with nothing else in it
@@ -137,7 +139,8 @@ serial has the keyboard, and after it closes a click outside dismisses its menu;
 that dismisses a menu gives the button and the keyboard to the other application's window it
 reaches, and raises it; only the application in use may confine the pointer; a second
 connection from the same process session is the same application; a client whose session
-cannot be read is another application, and two such are not one; a click on the part of a
+cannot be read is another application, and two such are not one; a session of 0 or less is
+none; a client that disconnects leaves no session behind; a click on the part of a
 menu that reaches past its window stays with the menu; a marked window that goes takes its mark with it, and windows have
 ids of their own that do not change.
 
@@ -555,7 +558,7 @@ index ce1ce1a..fe48599 100644
  }
  
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 68e95df..c36f3db 100644
+index 68e95df..94ce4aa 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
 @@ -58,6 +58,7 @@ use smithay::{
@@ -566,7 +569,42 @@ index 68e95df..c36f3db 100644
      },
  };
  use std::sync::Mutex;
-@@ -151,6 +152,25 @@ pub struct State {
+@@ -92,11 +93,33 @@ use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
+ #[derive(Debug, Default)]
+ pub struct ClientState {
+     pub compositor_state: CompositorClientState,
++    /// The compositor's table of client sessions ([`State::app_sessions`]), for letting go of
++    /// this client's entry when it disconnects.
++    pub(crate) sessions: Option<AppSessions>,
++}
++
++/// The session of each client's process, by client.
++pub(crate) type AppSessions = Arc<Mutex<std::collections::HashMap<ClientId, Option<i64>>>>;
++
++impl ClientState {
++    /// The data of a client the compositor accepts.
++    pub(crate) fn of(state: &State) -> Self {
++        ClientState {
++            sessions: Some(state.app_sessions.clone()),
++            ..Default::default()
++        }
++    }
+ }
+ 
+ impl ClientData for ClientState {
+     fn initialized(&self, _client_id: ClientId) {}
+-    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
++    fn disconnected(&self, client_id: ClientId, _reason: DisconnectReason) {
++        // Its session is not needed any more (a program that connects again and again must
++        // not make the table grow).
++        if let Some(sessions) = &self.sessions {
++            sessions.lock().unwrap().remove(&client_id);
++        }
++    }
+ }
+ 
+ #[allow(dead_code)]
+@@ -151,6 +174,25 @@ pub struct State {
      pub shell_state: XdgShellState,
      pub shm_state: ShmState,
      viewporter_state: ViewporterState,
@@ -581,7 +619,7 @@ index 68e95df..c36f3db 100644
 +    pub(crate) grabbing_popups: Vec<smithay::desktop::PopupKind>,
 +    /// The session of each client's process, read when it connects (see
 +    /// [`State::same_app`]). Tests may put their own in.
-+    pub(crate) app_sessions: std::cell::RefCell<std::collections::HashMap<ClientId, Option<i64>>>,
++    pub(crate) app_sessions: AppSessions,
 +    /// The window that has the keyboard (or whose popup has it) and its client, as of the
 +    /// last move of the keyboard. A popup that has the keyboard and is gone keeps the
 +    /// keyboard's focus until the next input; this still says whose it was.
@@ -592,7 +630,7 @@ index 68e95df..c36f3db 100644
      cursor_event_count: i32,
      pub single_pixel_buffer_state: SinglePixelBufferState,
  }
-@@ -175,6 +195,7 @@ impl State {
+@@ -175,6 +217,7 @@ impl State {
          let mut seat_state = SeatState::new();
          let shell_state = XdgShellState::new::<State>(&dh);
          let viewporter_state = ViewporterState::new::<State>(&dh);
@@ -600,7 +638,7 @@ index 68e95df..c36f3db 100644
          let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
  
          let render_node: Option<DrmNode> = render_target.clone().into();
-@@ -275,6 +296,12 @@ impl State {
+@@ -275,6 +318,12 @@ impl State {
              shell_state,
              shm_state,
              viewporter_state,
@@ -613,7 +651,7 @@ index 68e95df..c36f3db 100644
              single_pixel_buffer_state,
          }
      }
-@@ -402,18 +429,47 @@ pub(crate) fn apply_video_info(
+@@ -402,18 +451,47 @@ pub(crate) fn apply_video_info(
              .unwrap_or(new_size),
          );
  
@@ -667,7 +705,7 @@ index 68e95df..c36f3db 100644
  /// Lets the frame the element is waiting for start rendering after `wait`, or as soon after
  /// that as the frame rate allows (see [`pacing`]). Whatever was scheduled before for the same
  /// frame no longer counts.
-@@ -457,8 +513,291 @@ impl State {
+@@ -457,8 +535,292 @@ impl State {
          }
      }
  
@@ -757,7 +795,7 @@ index 68e95df..c36f3db 100644
 +    /// read again later only when it was not read then. When it cannot be read, it is `None`,
 +    /// and the client is the same application as no other client.
 +    pub(crate) fn session_of_client(&self, client: &ClientId) -> Option<i64> {
-+        if let Some(session) = self.app_sessions.borrow().get(client) {
++        if let Some(session) = self.app_sessions.lock().unwrap().get(client) {
 +            return *session;
 +        }
 +        let session = self
@@ -767,7 +805,8 @@ index 68e95df..c36f3db 100644
 +            .ok()
 +            .and_then(|credentials| windows::session_of_process(credentials.pid));
 +        self.app_sessions
-+            .borrow_mut()
++            .lock()
++            .unwrap()
 +            .insert(client.clone(), session);
 +        session
 +    }
@@ -960,7 +999,7 @@ index 68e95df..c36f3db 100644
      pub(crate) fn place_window(&self, window: &Window) -> Point<i32, Logical> {
          use smithay::wayland::seat::WaylandFocus;
          let parent = window
-@@ -479,30 +818,56 @@ impl State {
+@@ -479,30 +841,56 @@ impl State {
              .and_then(|output| output.current_mode())
              .map(|mode| mode.size.to_logical(1))
              .unwrap_or_default();
@@ -1032,7 +1071,7 @@ index 68e95df..c36f3db 100644
      }
  
      /// Puts the windows that have `window` as their parent above it again, and theirs above
-@@ -523,7 +888,7 @@ impl State {
+@@ -523,7 +911,7 @@ impl State {
              .cloned()
              .collect();
          for child in children {
@@ -1041,7 +1080,7 @@ index 68e95df..c36f3db 100644
              self.raise_children_of(&child);
          }
      }
-@@ -552,10 +917,48 @@ impl State {
+@@ -552,10 +940,48 @@ impl State {
                  .iter()
                  .filter(|window| window.alive() && Some(*window) != gone)
                  .count();
@@ -1091,14 +1130,15 @@ index 68e95df..c36f3db 100644
      /// Tells `sink` how many windows there are, now and whenever that changes; with `None`,
      /// nobody.
      pub(crate) fn set_window_sink(&mut self, sink: Option<windows::WindowSink>) {
-@@ -988,11 +1391,16 @@ pub(crate) fn init(
+@@ -988,11 +1414,16 @@ pub(crate) fn init(
      event_loop
          .handle()
          .insert_source(source, |client_stream, _, state| {
 -            if let Err(err) = state
 +            match state
                  .dh
-                 .insert_client(client_stream, Arc::new(ClientState::default()))
+-                .insert_client(client_stream, Arc::new(ClientState::default()))
++                .insert_client(client_stream, Arc::new(ClientState::of(state)))
              {
 -                tracing::error!(?err, "Error adding wayland client.");
 +                // Which application session it is, read now, while the process that
@@ -1111,7 +1151,7 @@ index 68e95df..c36f3db 100644
          })
          .expect("Failed to init wayland socket source");
 diff --git a/wayland-display-core/src/comp/windows.rs b/wayland-display-core/src/comp/windows.rs
-index 7813b6f..f7ebfb7 100644
+index 7813b6f..a907e4a 100644
 --- a/wayland-display-core/src/comp/windows.rs
 +++ b/wayland-display-core/src/comp/windows.rs
 @@ -13,10 +13,11 @@
@@ -1130,7 +1170,7 @@ index 7813b6f..f7ebfb7 100644
  //! until it goes.
  
  use smithay::utils::{Logical, Point, Rectangle, Size};
-@@ -43,14 +44,163 @@ pub fn place(
+@@ -43,14 +44,171 @@ pub fn place(
          .into()
  }
  
@@ -1210,10 +1250,18 @@ index 7813b6f..f7ebfb7 100644
 +/// their own) share it unless one of them starts a session of its own. `None` when it cannot
 +/// be read.
 +pub fn session_of_process(pid: i32) -> Option<i64> {
-+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
++    session_in_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
++}
++
++/// The session in the text of `/proc/PID/stat`. 0 or less is no session: 0 is what a process
++/// shows whose session leader lies outside the reader's process namespace (a compositor in a
++/// container), and would make clients that have nothing to do with each other one
++/// application.
++fn session_in_stat(stat: &str) -> Option<i64> {
 +    // pid (comm) state ppid pgrp session ...; comm may hold spaces and parentheses.
 +    let after = &stat[stat.rfind(')')? + 1..];
-+    after.split_whitespace().nth(3)?.parse().ok()
++    let session: i64 = after.split_whitespace().nth(3)?.parse().ok()?;
++    (session > 0).then_some(session)
 +}
 +
 +/// Marks a window that wants attention: its application asked for it to come forward and
@@ -1298,7 +1346,7 @@ index 7813b6f..f7ebfb7 100644
  }
  
  impl WindowReport {
-@@ -64,14 +214,15 @@ impl WindowReport {
+@@ -64,14 +222,15 @@ impl WindowReport {
          self.sink.is_some()
      }
  
@@ -1319,7 +1367,7 @@ index 7813b6f..f7ebfb7 100644
          }
      }
  }
-@@ -104,6 +255,48 @@ mod tests {
+@@ -104,6 +263,56 @@ mod tests {
          assert_eq!((at.x, at.y), (0, 0));
      }
  
@@ -1359,6 +1407,14 @@ index 7813b6f..f7ebfb7 100644
 +    }
 +
 +    #[test]
++    fn a_session_is_read_from_the_stat_line_and_zero_is_none() {
++        assert_eq!(session_in_stat("12 (a (b) c) S 1 12 34 0 -1"), Some(34));
++        assert_eq!(session_in_stat("12 (x) S 1 12 0 0 -1"), None);
++        assert_eq!(session_in_stat("12 (x) S 1 12 -3 0 -1"), None);
++        assert_eq!(session_in_stat("garbage"), None);
++    }
++
++    #[test]
 +    fn a_process_has_a_session() {
 +        let me = std::process::id() as i32;
 +        assert!(session_of_process(me).is_some());
@@ -1368,7 +1424,7 @@ index 7813b6f..f7ebfb7 100644
      #[test]
      fn a_window_without_a_parent_is_put_at_the_corner() {
          let at = place((400, 300).into(), None, (1720, 720).into());
-@@ -112,27 +305,41 @@ mod tests {
+@@ -112,27 +321,41 @@ mod tests {
  
      #[test]
      fn a_sink_is_told_a_change_once_and_a_new_sink_is_told_what_is() {
@@ -2008,7 +2064,7 @@ index d552363..831b3c8 100644
  }
  
 diff --git a/wayland-display-core/src/tests/fixture.rs b/wayland-display-core/src/tests/fixture.rs
-index 0cb8d65..c0895d1 100644
+index 0cb8d65..4fd36b4 100644
 --- a/wayland-display-core/src/tests/fixture.rs
 +++ b/wayland-display-core/src/tests/fixture.rs
 @@ -11,14 +11,21 @@ use smithay::output;
@@ -2064,7 +2120,7 @@ index 0cb8d65..c0895d1 100644
 +                move |client_stream, _, state| {
 +                    match state
 +                        .dh
-+                        .insert_client(client_stream, Arc::new(ClientState::default()))
++                        .insert_client(client_stream, Arc::new(ClientState::of(state)))
 +                    {
 +                        Ok(client) => {
 +                            // As the compositor does: the client's session, read at once.
@@ -2119,7 +2175,7 @@ index 0cb8d65..c0895d1 100644
 +    pub fn another_client_with_session(&mut self, session: Option<i64>) -> WaylandClient {
 +        let other = self.another_client();
 +        let id = self.connected.borrow().last().cloned().unwrap();
-+        self.server.app_sessions.borrow_mut().insert(id, session);
++        self.server.app_sessions.lock().unwrap().insert(id, session);
 +        other
 +    }
 +
@@ -2223,10 +2279,10 @@ index e64aad8..55a0b19 100644
      assert_eq!(stack[0], first);
 diff --git a/wayland-display-core/src/tests/test_trial_windows.rs b/wayland-display-core/src/tests/test_trial_windows.rs
 new file mode 100644
-index 0000000..0865229
+index 0000000..c440c10
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_windows.rs
-@@ -0,0 +1,1057 @@
+@@ -0,0 +1,1076 @@
 +//! Integration tests for everyday use: the pointer, the button and the keyboard go to the same
 +//! window, the one a person sees under the pointer; a window is told to be maximized, not
 +//! fullscreen, unless it asks; a second window keeps its own size and is not lost under the
@@ -3283,6 +3339,25 @@ index 0000000..0865229
 +    assert_eq!(other.pointer_and_buttons().1[0], other_buttons);
 +    let (in_ours, in_a_popup) = keyboard_in(&f, &ours);
 +    assert!(in_ours || in_a_popup);
++}
++
++#[test]
++fn a_client_that_disconnects_leaves_no_session_behind() {
++    let mut f = fixture();
++    let other = f.another_client();
++    let id = f.client_id(1);
++    assert!(f.server.app_sessions.lock().unwrap().contains_key(&id));
++    drop(other);
++    f.round_trip();
++    f.round_trip();
++    assert!(!f.server.app_sessions.lock().unwrap().contains_key(&id));
++    assert!(
++        f.server
++            .app_sessions
++            .lock()
++            .unwrap()
++            .contains_key(&f.client_id(0))
++    );
 +}
 diff --git a/wayland-display-core/src/tests/test_windows.rs b/wayland-display-core/src/tests/test_windows.rs
 index 8d177dc..8c33648 100644
