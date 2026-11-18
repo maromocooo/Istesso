@@ -59,8 +59,10 @@ public final class MainActivity extends Activity {
         inputPort.setText(String.valueOf(settings.inputPort()));
         column.addView(inputPort);
 
-        code = field(R.string.code_hint, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
-                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        // The code has letters and digits (ABCD-EFGH), so it is a text field; shown while typed (the owner types it
+        // with the headset's own on-screen keyboard and must see it), in capitals, without suggestions.
+        code = field(R.string.code_hint, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         code.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         code.setSaveEnabled(false);
         column.addView(code);
