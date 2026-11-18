@@ -39,6 +39,9 @@ if-addrs = "0.15"
 mdns-sd = { version = "0.21", default-features = false }
 unicode-width = "0.2"
 zeroize = "1"
+# The JNI function table, for the Android prototype's library (istesso-aura) only. Raw bindings,
+# no wrappers.
+jni-sys = "0.3"
 # Window and pixels for the test application (istesso-flash) only. X11 and Wayland are loaded at
 # run time, so building needs no system headers. No client-side decorations: inside the
 # streaming compositor the window is borderless, and elsewhere the window manager draws them.

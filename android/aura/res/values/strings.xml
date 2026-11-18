@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- PROTOTYPE, for home use only (docs/m8-aura-prototype.md). What the person reads, in Japanese. -->
+<resources>
+    <string name="app_name">Istesso 試作（家の中だけ）</string>
+    <string name="mark">試作。家の中だけで使う</string>
+    <string name="about">Istesso の AURA 向けの試作です。家の中の Wi-Fi で、ホストのアプリ 1 つの絵を見て、キーボードとマウスで操作します。鍵は、このアプリの中だけに置きます（ほかのアプリからは読めません）。製品ではありません。</string>
+    <string name="host_hint">ホストのアドレス（数字の形）</string>
+    <string name="picture_port_hint">絵のポート</string>
+    <string name="input_port_hint">入力のポート</string>
+    <string name="code_hint">ペアリングコード（ホストに出た 8 文字）</string>
+    <string name="pair">ペアにする</string>
+    <string name="connect">つなぐ</string>
+    <string name="pairing">ペアにしています…</string>
+    <string name="paired_with">ペアの相手：%1$s</string>
+    <string name="not_paired">まだペアにしていません</string>
+    <string name="pair_failed">ペアにできませんでした：%1$s</string>
+    <string name="need_host">ホストのアドレスを入れてください</string>
+    <string name="need_pair">先にペアにしてください</string>
+    <string name="connecting">つないでいます…</string>
+    <string name="connected">絵：%1$d×%2$d、毎秒 %3$d 枚、色 %4$d</string>
+    <string name="cut">切れました。つなぎ直しています（%1$d 回目）</string>
+    <string name="over">終わりました：%1$s</string>
+    <string name="decoder">復号器：%1$s%2$s</string>
+    <string name="low_latency">（低遅延）</string>
+    <string name="no_decoder">機械の HEVC の復号器が見つかりません</string>
+    <string name="unsupported">この形の絵は出せません（HEVC の 4:2:0 だけ）：色 %1$d</string>
+    <string name="input_open">入力：つながっています</string>
+    <string name="input_waiting">入力：つないでいます</string>
+    <string name="input_over">入力：受け付けられません</string>
+</resources>

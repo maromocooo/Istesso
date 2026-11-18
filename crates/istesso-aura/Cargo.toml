@@ -1,0 +1,25 @@
+[package]
+name = "istesso-aura"
+description = "PROTOTYPE, for home use only: the Android client's Rust part on AURA, behind JNI (docs/m8-aura-prototype.md)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# Loaded by the Android application (android/aura) with System.loadLibrary("istesso_aura").
+# The library for Rust callers is only there for the tests.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+istesso-pair.workspace = true
+istesso-link.workspace = true
+istesso-agent.workspace = true
+jni-sys.workspace = true
+
+# The picture's and the input's connections, used through their own C interfaces
+# (istesso_media.h, istesso_client.h), as the Mac client uses them.
+[target.'cfg(unix)'.dependencies]
+istesso-media = { path = "../istesso-media" }
+istesso-client = { path = "../istesso-client" }
