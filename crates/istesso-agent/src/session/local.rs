@@ -208,7 +208,25 @@ fn unexpected() -> String {
 }
 
 #[cfg(unix)]
+pub(super) use unix::users_alone;
+#[cfg(unix)]
 pub use unix::{listen, serve, HostLink};
+
+/// Tells the agent that runs on this machine that the list of paired
+/// devices changed (a right was granted or withdrawn): it reads the list
+/// again now instead of within its second. `Ok(false)` when no agent runs.
+pub fn pairings_changed(paths: &Paths) -> Result<bool, String> {
+    let mut link = match HostLink::open(paths) {
+        Ok(link) => link,
+        Err(NoLink::NoAgent) => return Ok(false),
+        Err(other) => return Err(other.to_string()),
+    };
+    match link.ask(&HostRequest::PairingsChanged)? {
+        HostAnswer::Done => Ok(true),
+        HostAnswer::Refused { message, .. } => Err(message),
+        _ => Err(unexpected()),
+    }
+}
 
 #[cfg(unix)]
 mod unix {
@@ -239,7 +257,7 @@ mod unix {
     /// can enter: that is all that keeps other users from the socket in
     /// it. With `make` it is created, and closed to others if it was open;
     /// without, a directory that is open to others is an error.
-    pub(super) fn users_alone(dir: &Path, make: bool) -> std::io::Result<()> {
+    pub(in crate::session) fn users_alone(dir: &Path, make: bool) -> std::io::Result<()> {
         if make {
             crate::session::private_dir(dir)?;
         }

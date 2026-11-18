@@ -1455,6 +1455,18 @@ fn set_permission(
         peer.id,
         permission_names(&peer.permissions)
     );
+    // The agent here reads rights for every request anyway; told, it also
+    // looks at the sessions and the conversations now (ADR 0010, 12).
+    #[cfg(unix)]
+    match istesso_agent::session::local::pairings_changed(&Paths::from_env()) {
+        Ok(true) => println!("The agent on this machine was told: it applies now."),
+        Ok(false) => println!("No agent runs on this machine: it applies when one starts."),
+        Err(why) => println!(
+            "The agent on this machine could not be told ({why}). It applies within a second: \
+             the agent reads the list of paired devices every second."
+        ),
+    }
+    #[cfg(not(unix))]
     println!("This applies from the device's next connection at the latest.");
     Ok(())
 }

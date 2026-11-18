@@ -2437,3 +2437,98 @@ fn nobody_is_sent_the_picture_while_an_application_is_given_time_to_end() {
         ["runner detach", "app asked to end", "runner stop"]
     );
 }
+
+#[test]
+fn a_detach_of_a_window_that_was_replaced_does_not_reach_the_next_one() {
+    // The laptop is shown the session; the tablet is being attached.
+    let host = host();
+    let id = host.running().id;
+    let tablet = pair(&host.paths, "tablet", Permission::defaults());
+    host.runner.on_attach(OnAttach::Ignore);
+    let (sessions, asker) = (host.sessions.clone(), tablet.clone());
+    let wanted = id.clone();
+    let held = std::thread::spawn(move || {
+        sessions.answer(
+            &Request::SessionAttach {
+                session: wanted,
+                display: mode(),
+                offer: serde_json::json!({"port": 50010}),
+            },
+            &asker,
+            "192.0.2.88:50000".parse().unwrap(),
+            Vec::new,
+        )
+    });
+    host.journal.wait_for("runner attach", 1);
+    // In one tick: the laptop's window leaves (its attachment, 1), and the
+    // runner says that the tablet is attached.
+    {
+        let mut table = host.sessions.inner.lock();
+        let entry = table.sessions.get_mut(&id.0).unwrap();
+        entry.orders.detach = Some(1);
+        host.runner.say(StreamEvent::Said(RunnerEvent::Attached {
+            display: mode(),
+            answer: serde_json::json!({"fake": "tablet"}),
+        }));
+    }
+    host.sessions.inner.changed.notify_all();
+    let shown = session(held.join().unwrap());
+    assert_eq!(shown.attachment, 2);
+    // The answer is the tablet's: it is the one that is shown the session.
+    assert_eq!(shown.answer, Some(serde_json::json!({"fake": "tablet"})));
+    // The laptop's leaving was for its own attachment: the tablet stays.
+    std::thread::sleep(Duration::from_millis(300));
+    let now = host.sessions.look(&id).unwrap();
+    assert_eq!(
+        (now.state, now.attachment, now.shown_on.as_deref()),
+        (SessionState::Running, 2, Some("tablet"))
+    );
+    assert_eq!(host.journal.count("runner detach"), 0);
+}
+
+#[test]
+fn a_session_whose_input_folder_is_not_private_does_not_start() {
+    let host = host();
+    // Where the session's input socket would go is a file, not a folder of
+    // this user's alone.
+    let probe = host.paths.session_input_socket(&SessionId("0".repeat(16)));
+    let dir = probe.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    std::fs::write(&dir, b"not a folder").unwrap();
+    let id = host.start().id;
+    let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
+    assert_eq!(end.reason, EndReason::StreamFailed);
+    assert!(
+        end.message.contains("not this user's alone"),
+        "{}",
+        end.message
+    );
+    assert_eq!(host.journal.count("runner start"), 0);
+}
+
+#[test]
+fn an_attach_in_flight_is_detached_when_the_session_ends() {
+    let host = host();
+    let id = host.running().id;
+    host.runner.on_attach(OnAttach::Ignore);
+    let held = asking(
+        &host,
+        Request::SessionAttach {
+            session: id.clone(),
+            display: mode(),
+            offer: serde_json::json!({"port": 50010}),
+        },
+    );
+    host.journal.wait_for("runner attach", 1);
+    // The application goes by itself while the runner has not answered.
+    host.launcher.end_app("exit status 0");
+    host.follow_until(&id, SessionState::Ended);
+    let _ = held.join();
+    assert_eq!(
+        host.since_running(),
+        ["runner attach", "runner detach", "runner stop"]
+    );
+}

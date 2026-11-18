@@ -440,8 +440,10 @@ struct Orders {
     force: bool,
     /// Ask the application to close.
     close: bool,
-    /// The client that is shown the session leaves.
-    detach: bool,
+    /// The client that is shown the session leaves: the attachment it
+    /// was. An order for an attachment that has been replaced since is
+    /// nobody's any more.
+    detach: Option<u64>,
     /// Show the session to this client.
     attach: Option<Attach>,
 }
@@ -908,7 +910,9 @@ impl Sessions {
             };
             if let Some(at) = entry.attached.iter().position(|(n, _)| *n == number) {
                 return match entry.attached.swap_remove(at).1 {
-                    Ok(()) => report(&entry.info),
+                    // What the media path agreed on, for the caller only
+                    // while it is the one that is shown the session.
+                    Ok(()) => report_to(&entry.info, entry.shows(caller, entry.info.attachment)),
                     Err(why) => refuse(ErrorCode::Unavailable, why),
                 };
             }
@@ -948,7 +952,7 @@ impl Sessions {
                     SessionState::Starting | SessionState::Running
                 );
             if shown {
-                entry.orders.detach = true;
+                entry.orders.detach = Some(attachment);
                 inner.changed.notify_all();
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -1498,7 +1502,7 @@ impl Inner {
             );
             if showing && attaching.is_none() && round.attach.is_none() {
                 let lost_after = self.rules.client_lost_after;
-                if orders.detach {
+                if orders.detach == Some(entry.info.attachment) {
                     round.leave = Some("its client left".to_string());
                 } else if entry.waiting == 0 && entry.seen.elapsed() > lost_after {
                     round.leave = Some(format!(
@@ -1579,12 +1583,20 @@ impl Inner {
         // Whether a person asked to end the application by force: the one
         // way that ends it so (ADR 0010, 3).
         let mut forced = false;
+        // Whether the runner was told to attach a client and has not said
+        // that it did: it is detached before the session ends.
+        let mut attach_in_flight = false;
 
         let mut end = 'session: {
             // The host's side of the stream comes first: it makes the
             // display the application appears on.
-            if let Some(socket) = job.input_socket.parent() {
-                let _ = private_dir(socket);
+            if let Some(dir) = job.input_socket.parent() {
+                if let Err(why) = input_dir(dir) {
+                    let why = format!(
+                        "the folder of the session's input socket is not this user's alone ({why})"
+                    );
+                    break 'session ending(EndReason::StreamFailed, why);
+                }
             }
             let running = match job.runner.start(&job.start) {
                 Ok(running) => stream.insert(running),
@@ -1691,6 +1703,9 @@ impl Inner {
             // try again.
             let mut try_encoder_at: Option<Instant> = None;
             loop {
+                // Read at every turn: every way out of this loop leaves
+                // from a turn.
+                attach_in_flight = attaching.is_some();
                 if let Some(how) = application.poll() {
                     let why = format!("the application ended ({how})");
                     break 'session ending(EndReason::AppExited, why);
@@ -1872,6 +1887,13 @@ impl Inner {
         // it is asked to end, and what does not listen is left as it is,
         // for a person to see and decide on (ADR 0010, 3).
         let mut stays = None;
+        // A client that was being attached is not sent the picture either,
+        // whatever became of the application.
+        if attach_in_flight {
+            if let Some(stream) = stream.as_mut() {
+                let _ = stream.tell(&RunnerCommand::Detach);
+            }
+        }
         if let Some(app) = app
             .as_mut()
             .and_then(|app| app.poll().is_none().then_some(app))
@@ -1879,7 +1901,7 @@ impl Inner {
             // The session is over for its client: nobody is sent its picture
             // while the application is given time to end (ADR 0010, 12: an
             // unpaired device is cut within 0.1 s).
-            if let Some(stream) = stream.as_mut().filter(|_| was_shown) {
+            if let Some(stream) = stream.as_mut().filter(|_| was_shown && !attach_in_flight) {
                 let _ = stream.tell(&RunnerCommand::Detach);
             }
             if forced {
@@ -2027,6 +2049,19 @@ fn add_to(end: &mut SessionEnd, more: &str) {
         end.message = more.to_string();
     } else {
         end.message = format!("{}; {more}", end.message);
+    }
+}
+
+/// The folder the session's input socket is made in: made, and this
+/// user's alone (keys go through the socket), or an error.
+fn input_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        local::users_alone(dir, true)
+    }
+    #[cfg(not(unix))]
+    {
+        private_dir(dir)
     }
 }
 

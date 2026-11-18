@@ -61,8 +61,8 @@ pub enum Request {
     /// How is my session? Answered at once when it changed after revision
     /// `after`; otherwise the host may hold the answer back for up to
     /// `timeout_ms`. A request that names the attachment that is shown the
-    /// session also tells the host that this client is still there. Only
-    /// the device that started the session may ask.
+    /// session also tells the host that this client is still there. Any
+    /// paired device that may view and control the host may ask.
     SessionWait {
         session: SessionId,
         /// The revision the caller has seen; 0 for none.
@@ -82,7 +82,8 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
-    /// Which of my sessions are not over? Answered with
+    /// Which of the host's sessions are not over, whichever device started
+    /// them? Answered with
     /// [`Response::Sessions`].
     SessionList,
     /// Show me this session (again). Whoever is shown it now is not any
