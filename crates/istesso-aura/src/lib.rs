@@ -143,8 +143,7 @@ extern "C" {
         addr: *const c_char,
         peer: *const c_char,
     ) -> *mut c_void;
-    fn istesso_media_watch_next(watch: *const c_void, wait_ms: u32, frame: *mut MediaFrame)
-        -> i32;
+    fn istesso_media_watch_next(watch: *const c_void, wait_ms: u32, frame: *mut MediaFrame) -> i32;
     fn istesso_media_watch_info(watch: *const c_void, info: *mut MediaStreamInfo) -> i32;
     fn istesso_media_watch_state(watch: *const c_void, state: *mut MediaWatchState) -> i32;
     fn istesso_media_watch_ask_key_frame(watch: *const c_void);
@@ -220,7 +219,12 @@ fn host_part(address: &str) -> String {
 /// Joins the host that waits at `address` with the pairing code `code`, and keeps it in the
 /// list of paired devices below `config_dir`. This device's identity is made there the first
 /// time. The texts of the errors never contain the code.
-pub fn pair_join(config_dir: &Path, address: &str, code: &str, name: &str) -> Result<Joined, String> {
+pub fn pair_join(
+    config_dir: &Path,
+    address: &str,
+    code: &str,
+    name: &str,
+) -> Result<Joined, String> {
     // The code first, so that a typing error is reported before anything is made or sent.
     let code = PairCode::parse(code).map_err(|_| {
         "the pairing code is not valid: 8 letters and digits, as the host shows them".to_string()
@@ -295,7 +299,13 @@ unsafe fn c_text(env: *mut JNIEnv, s: jstring) -> Option<CString> {
 unsafe fn java_text(env: *mut JNIEnv, text: &str) -> jstring {
     let plain: String = text
         .chars()
-        .map(|c| if c == '\0' || (c as u32) > 0xFFFF { '?' } else { c })
+        .map(|c| {
+            if c == '\0' || (c as u32) > 0xFFFF {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect();
     let Ok(c) = CString::new(plain) else {
         return ptr::null_mut();
@@ -796,7 +806,10 @@ mod tests {
         let typed = "WRONG-C0D3!";
         let err = pair_join(&dir, "192.0.2.1", typed, "aura-proto").unwrap_err();
         assert!(!err.contains(typed) && !err.contains('!'), "{err}");
-        assert!(!dir.exists(), "nothing is made for a code that cannot be right");
+        assert!(
+            !dir.exists(),
+            "nothing is made for a code that cannot be right"
+        );
     }
 
     #[test]
@@ -805,7 +818,9 @@ mod tests {
         assert!(named_peer(Some(CString::new("").unwrap())).is_none());
         assert!(named_peer(Some(CString::new("  ").unwrap())).is_none());
         assert_eq!(
-            named_peer(Some(CString::new("ab12").unwrap())).unwrap().as_bytes(),
+            named_peer(Some(CString::new("ab12").unwrap()))
+                .unwrap()
+                .as_bytes(),
             b"ab12"
         );
     }
@@ -816,8 +831,16 @@ mod tests {
         assert_eq!(
             list,
             vec![
-                InputEvent { kind: 1, a: 30, b: 1 },
-                InputEvent { kind: 2, a: 100, b: 200 }
+                InputEvent {
+                    kind: 1,
+                    a: 30,
+                    b: 1
+                },
+                InputEvent {
+                    kind: 2,
+                    a: 100,
+                    b: 200
+                }
             ]
         );
     }

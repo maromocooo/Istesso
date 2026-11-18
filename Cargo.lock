@@ -888,6 +888,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "istesso-aura"
+version = "0.0.1"
+dependencies = [
+ "istesso-agent",
+ "istesso-client",
+ "istesso-link",
+ "istesso-media",
+ "istesso-pair",
+ "jni-sys 0.3.1",
+]
+
+[[package]]
 name = "istesso-catalog"
 version = "0.0.1"
 dependencies = [

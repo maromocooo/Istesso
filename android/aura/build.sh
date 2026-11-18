@@ -75,11 +75,12 @@ do_keystore() {
     mkdir -p "$key_dir"
     chmod 700 "$key_dir"
     # A random password in a file of this user's only; never printed.
-    (umask 077 && LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 > "$key_pass")
+    # (Not `tr < /dev/urandom | head`: under pipefail, tr's broken pipe would end this script.)
+    (umask 077 && od -An -tx1 -N24 /dev/urandom | tr -d ' \n' > "$key_pass")
     "$java_home/bin/keytool" -genkeypair -keystore "$keystore" -storetype PKCS12 \
         -storepass:file "$key_pass" -keypass:file "$key_pass" \
         -alias istesso-dev -keyalg RSA -keysize 3072 -validity 3650 \
-        -dname "CN=Istesso prototype, home use only" > /dev/null 2>&1
+        -dname "CN=Istesso prototype (home use only)" > /dev/null
     chmod 600 "$keystore"
     echo "made the development signing key: $keystore (password in $key_pass, this user only)"
 }
@@ -125,7 +126,7 @@ do_build() {
     (cd "$out/stage" && zip -q -r "$out/unsigned.apk" classes.dex lib)
     guarded "$build_tools/zipalign" -f -P 16 4 "$out/unsigned.apk" "$out/aligned.apk"
     guarded "$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias istesso-dev \
-        --ks-pass "file:$key_pass" --key-pass "file:$key_pass" --out "$apk" "$out/aligned.apk"
+        --ks-pass "file:$key_pass" --out "$apk" "$out/aligned.apk"
     rm -f "$out/unsigned.apk" "$out/aligned.apk"
     echo "built: $apk"
     do_check
@@ -135,10 +136,13 @@ do_check() {
     need "$apk" "android/aura/build.sh"
     local badging
     badging=$("$build_tools/aapt2" dump badging "$apk")
-    echo "$badging" | grep -q "^package: name='$package'" || { echo "fail: the identifier is not $package" >&2; exit 1; }
-    echo "$badging" | grep -q "versionName='$version_name'" || { echo "fail: the version is not $version_name" >&2; exit 1; }
-    echo "$badging" | grep -q "application-label:'.*試作" || { echo "fail: the name does not say that it is a prototype" >&2; exit 1; }
-    unzip -l "$apk" | grep -q "lib/arm64-v8a/libistesso_aura.so" || { echo "fail: the library is not in the package" >&2; exit 1; }
+    grep -q "^package: name='$package'" <<< "$badging" || { echo "fail: the identifier is not $package" >&2; exit 1; }
+    grep -q "versionName='$version_name'" <<< "$badging" || { echo "fail: the version is not $version_name" >&2; exit 1; }
+    grep -q "application-label:'.*試作" <<< "$badging" || { echo "fail: the name does not say that it is a prototype" >&2; exit 1; }
+    # Read whole before searching: under pipefail, grep -q ending early fails the pipe.
+    local listing
+    listing=$(unzip -l "$apk")
+    grep -q "lib/arm64-v8a/libistesso_aura.so" <<< "$listing" || { echo "fail: the library is not in the package" >&2; exit 1; }
     "$build_tools/apksigner" verify "$apk" > /dev/null || { echo "fail: the signature does not verify" >&2; exit 1; }
     echo "ok: $package $version_name, the library for arm64-v8a, signed"
 }
