@@ -282,7 +282,8 @@ def _said(fields):
 
 def _groups(run, seconds, gap):
     """The lines that lie less than `gap` seconds apart, together; each group in a few words,
-    with a count where the same words come in a row. A group of nothing but focus is "apart"."""
+    with a count where the same words come in a row. A group of nothing but focus, and the
+    modifier state told with it, is "apart": nobody pressed anything for it."""
     groups, last = [], None
     for fields in run:
         at = seconds(fields)
@@ -300,7 +301,7 @@ def _groups(run, seconds, gap):
             else:
                 words.append([said, 1])
         text = ", ".join(said if count == 1 else "%s x%d" % (said, count) for said, count in words)
-        told.append((all(fields.get("kind") == "focus" for fields in group), text))
+        told.append((all(fields.get("kind") in ("focus", "modifiers") for fields in group), text))
     return told
 
 

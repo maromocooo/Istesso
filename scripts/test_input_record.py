@@ -268,7 +268,8 @@ class TheTwoRecordsNextToEachOther(unittest.TestCase):
         ]
         application = [
             '{"kind":"header","record":"application"}',
-            '{"t_ms":500.0,"kind":"focus","name":"pointer","state":"enter"}',
+            '{"t_ms":500.0,"kind":"focus","name":"keyboard","state":"enter"}',
+            '{"t_ms":500.1,"kind":"modifiers","name":"state","depressed":0,"latched":0,"locked":0,"held":[]}',
             '{"t_ms":5000.0,"kind":"modifier","name":"shift_l","state":"down"}',
             '{"t_ms":5000.1,"kind":"modifiers","name":"state","depressed":1,"latched":0,"locked":16,"held":["shift"]}',
             '{"t_ms":5000.2,"kind":"key","name":"key","state":"down"}',
@@ -286,7 +287,7 @@ class TheTwoRecordsNextToEachOther(unittest.TestCase):
                 "group 2",
                 "  pipeline got:     scroll vertical [held: shift_l] x2",
                 "  application told: scroll vertical",
-                "focus changes apart from any group, in the application's record: pointer enter",
+                "focus changes apart from any group, in the application's record: keyboard enter, told depressed=0 (none)",
             ],
         )
 
