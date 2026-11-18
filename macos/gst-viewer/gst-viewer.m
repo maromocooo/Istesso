@@ -35,6 +35,9 @@
 //                              with nothing on the screen)
 //   ISTESSO_PID_FILE=PATH      write this program's process number to PATH once it runs: for a
 //                              program started through `open`, which does not say it
+//   ISTESSO_TITLE_FILE=PATH    the signal USR1 sets the window's title to the first line of PATH
+//                              (a window of the application wants attention, and back); when the
+//                              second line is "attention", the Dock tile asks for attention once
 //
 // Decoding with VideoToolbox. GStreamer's own VideoToolbox element holds frames back, so the
 // pipeline may instead end in an application sink called "vt" that hands over H.265 access
@@ -1819,6 +1822,31 @@ int main(int argc, char *argv[]) {
                 }
             });
             dispatch_resume(front);
+        }
+        const char *title_file = getenv("ISTESSO_TITLE_FILE");
+        if (title_file != NULL) {
+            // The everyday trial: the title says when a window of the application is calling.
+            static dispatch_source_t retitle;
+            NSString *path = [NSString stringWithUTF8String:title_file];
+            signal(SIGUSR1, SIG_IGN);
+            retitle = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
+            dispatch_source_set_event_handler(retitle, ^{
+                NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+                NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+                if (lines.count == 0 || lines[0].length == 0) {
+                    return;
+                }
+                window.title = lines[0];
+                BOOL calling = lines.count > 1 && [lines[1] isEqualToString:@"attention"];
+                if (calling && !no_window) {
+                    [NSApp requestUserAttention:NSInformationalRequest];
+                }
+                fprintf(stderr, "title: %s%s\n", lines[0].UTF8String, calling ? " (asks for attention)" : "");
+            });
+            dispatch_resume(retitle);
+            // Said, so that USR1 is sent only to a program that takes it (it would end one that
+            // does not).
+            fprintf(stderr, "title file: ready\n");
         }
         // Moved after it exists: at creation macOS pulls a window that is placed on another
         // display than the one in use back onto that one. Coordinates count from the top left

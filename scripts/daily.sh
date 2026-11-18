@@ -9,7 +9,8 @@
 #   scripts/daily.sh bundle           build and stage the signed viewer bundle only (not started)
 #   scripts/daily.sh bundle --finish  give the staged bundle its name as an application; the next
 #                                     `open` starts the windows through it (the first start asks
-#                                     whether it may use the local network)
+#                                     whether it may use the local network); one that is there
+#                                     already is moved aside (no window of it may be open)
 #   scripts/daily.sh                  what is open, and how to open, close, list and stop (= `start`)
 #   scripts/daily.sh apps             the applications that can be opened
 #   scripts/daily.sh open NAME        start the application on the host and show it; one that already
@@ -39,6 +40,12 @@
 #
 # A window closed with its red button: the application goes on; the host stops its picture and
 # gives the encoder back within seconds, and `open` brings the picture back.
+#
+# Each application runs on a session bus of its own, never on the desk's: what would ask a question
+# asks it inside the trial's window (the GTK file-chooser portal) or not at all. Firefox, a snap,
+# gets instead a filtering proxy of the desk's bus that lets through only the one call its launcher
+# needs to start it. A window that wants attention (marked by the compositor) is shown in the title
+# of the Mac window, and its Dock tile asks for attention once.
 #
 # The signal of a latency measurement (AGENTS.md) is obeyed: nothing starts while it says busy, and a
 # guard on each machine looks every two seconds. When it turns busy, the windows and relays here are
@@ -90,7 +97,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial3/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial10/target/release'}
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 state="$HOME/Library/Caches/istesso-daily"
@@ -309,14 +316,21 @@ picture_of() { # NAME: running, paused or refused, by the pipeline's last word a
     last=$(said "$1" | grep -o '"istesso":"\(paused\|resumed\|refused\)"' | tail -1 | cut -d'"' -f4)
     case "$last" in paused | refused) echo "$last" ;; *) echo running ;; esac
 }
-state_of() { # NAME: one line: name, slot, state, number of windows, picture
+state_of() { # NAME: one line: name, slot, state, number of windows, picture, windows calling
     local run=$D/run/$1 what
     if ! still_runs "$run/pipeline.pid"; then what=ended
     elif [ -s "$run/held" ]; then what=held
     elif [ -s "$run/close-asked" ]; then what=close-asked
     else what=running; fi
-    echo "$1 $(cat "$run/slot" 2>/dev/null || echo -) $what $(windows_of "$1" | grep . || echo -) $(picture_of "$1")"
+    echo "$1 $(cat "$run/slot" 2>/dev/null || echo -) $what $(windows_of "$1" | grep . || echo -) $(picture_of "$1") $(attention_of "$1")"
 }
+attention_of() { # NAME: how many of its windows want attention, by the compositor's lines in the
+    # pipeline's log (the pipeline itself says only the number of windows): each "wants_attention=true"
+    # counts one up, each "=false" one down, never more than there are windows
+    said "$1" | grep -oE 'window attention app_id=("[^"]*"|[^ ]*) wants_attention=(true|false)|"istesso":"windows","count":[0-9]+' |
+        awk '/=true$/ {n++} /=false$/ {if (n > 0) n--} /"count":/ {split($0, a, ":"); c = a[3] + 0; if (n > c) n = c} END {print n + 0}'
+}
+attention_all() { local name; for name in $(running_names); do echo "$name $(attention_of "$name")"; done; }
 picture_off() { # NAME: nobody watches (its window was closed): the picture stops and the encoder is
     # given back; the application goes on. The next `open` resumes it.
     local name=$1 before i
@@ -448,7 +462,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps' HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps' HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-} PROXY_LOG=${DAILY_PROXY_LOG:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -471,7 +485,16 @@ find_the_way() {
 do_bundle() {
     if [ "${1:-}" = --finish ]; then
         [ -d "$staged" ] || { echo "nothing is staged: scripts/daily.sh bundle"; exit 1; }
-        [ -e "$bundle" ] && { echo "$bundle is there already: move it away first (the next start of a new bundle asks again whether it may use the local network)"; exit 1; }
+        if [ -e "$bundle" ]; then
+            # The one there is replaced: none of its windows may be open (they run its program).
+            local each
+            for each in $apps; do
+                still_runs "$state/$each/viewer.pid" && { echo "a window of the trial is open ($each): close it first (scripts/daily.sh stop)"; exit 1; }
+            done
+            mkdir -p "$state/bundle-build"
+            mv "$bundle" "$state/bundle-build/replaced.$(date +%s).app" || exit 1
+            echo "the bundle that was there was moved aside (into $state/bundle-build)"
+        fi
         mv "$staged" "$bundle" || exit 1
         echo "the viewer's bundle is now an application: $bundle (not started)"
         echo "the next \`scripts/daily.sh open NAME\` starts its window through it; the first start asks whether it may use the local network"
@@ -645,7 +668,7 @@ else
     [ -n "$desk" ] || echo "host: note: the desk's language could not be read; $NAME starts without one (English)"
     # Where the look goes: a settings file of the trial's own in the application's XDG_CONFIG_HOME
     # (GSETTINGS_BACKEND=keyfile), seeded from the desk at every start. Blender has a look of its own.
-    look=""; theme_by_env=""
+    look=""; theme_by_env=""; no_bus=""
     # What the application is started as, apart from what its owner uses every day.
     case "$NAME" in
     firefox)
@@ -663,6 +686,12 @@ else
         # as GTK_THEME (with :dark when the desk prefers dark). Fonts and their size follow the
         # desktop's defaults only.
         look=-; theme_by_env=1
+        # Its launcher (snap run) asks systemd, on the session bus, for a scope of its own, and does
+        # not start without one: so Firefox gets a filtering proxy of the desk's bus that lets
+        # through that one call (StartTransientUnit) and its answer (JobRemoved), and nothing else:
+        # no portal, no keyring, no launcher of the desk. Firefox itself, once confined, cannot
+        # reach the proxy's socket either. The proxy ends when Firefox does.
+        no_bus=1
         app="env GSETTINGS_BACKEND=memory firefox --no-remote --profile $profile" ;;
     blender)
         blender=$BLENDER
@@ -758,13 +787,52 @@ SCRIPT
         : > "$run/key-events.log"; chmod 600 "$run/key-events.log"
         record="2> >(grep --line-buffered -oE 'wl_keyboard[@#][0-9]+\\.(enter|leave|key)\\([^)]*\\)' > $run/key-events.log)"
     fi
+    # A session bus of the application's own (the owner's decision, 2026-11-18): a question of a
+    # portal or a keyring is shown inside the trial's window, or not at all, never on the desk,
+    # where nobody sees it. dbus-run-session starts it for the application and ends it, by its
+    # process number, when the application ends; it is in the application's session, so that it is
+    # held still and ended with it. DBUS_SESSION_BUS_ADDRESS points at it, so the desk's bus is not
+    # looked for ($XDG_RUNTIME_DIR/bus is only a fallback when that is not set). Only what is named
+    # here can be started on it: the file-chooser portal with its GTK dialogs (they open in the
+    # hidden compositor), and its permission store. No keyring. What those keep is kept in the
+    # bus's folder, not in the owner's.
+    bus=$run/bus
+    mkdir -p "$bus/services" "$bus/store/data" "$bus/store/config/xdg-desktop-portal" "$bus/store/state" "$bus/store/cache"
+    cat > "$bus/bus.conf" <<CONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:tmpdir=/tmp</listen>
+  <servicedir>$bus/services</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+CONF
+    service() { printf '[D-BUS Service]\nName=%s\nExec=%s\n' "$1" "$2" > "$bus/services/$1.service"; }
+    [ -x /usr/libexec/xdg-desktop-portal ] && service org.freedesktop.portal.Desktop /usr/libexec/xdg-desktop-portal
+    [ -x /usr/libexec/xdg-desktop-portal-gtk ] && service org.freedesktop.impl.portal.desktop.gtk /usr/libexec/xdg-desktop-portal-gtk
+    [ -x /usr/libexec/xdg-permission-store ] && service org.freedesktop.impl.portal.PermissionStore /usr/libexec/xdg-permission-store
+    printf '[preferred]\ndefault=gtk\n' > "$bus/store/config/xdg-desktop-portal/portals.conf"
+    if [ -n "$no_bus" ]; then
+        proxy=$bus/systemd-only-$(date +%s%N)
+        start_line="exec 5> >(exec xdg-dbus-proxy unix:path=$XDG_RUNTIME_DIR/bus $proxy --fd=0 --filter --call=org.freedesktop.systemd1=org.freedesktop.systemd1.Manager.StartTransientUnit@/org/freedesktop/systemd1 --broadcast=org.freedesktop.systemd1=org.freedesktop.systemd1.Manager.JobRemoved@/org/freedesktop/systemd1 ${PROXY_LOG:+--log} 2>> $bus/proxy.log)
+for i in \$(seq 1 50); do [ -S $proxy ] && break; sleep 0.1; done
+exec env DBUS_SESSION_BUS_ADDRESS=unix:path=$proxy $app $events $record"
+    else
+        start_line="exec env XDG_DATA_HOME=$bus/store/data XDG_CONFIG_HOME=$bus/store/config XDG_STATE_HOME=$bus/store/state XDG_CACHE_HOME=$bus/store/cache dbus-run-session --config-file=$bus/bus.conf -- env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_STATE_HOME -u XDG_CACHE_HOME $app $events $record"
+    fi
     cat > "$run/app.sh" <<SCRIPT
 #!/bin/bash
 # The application inside the hidden compositor: Wayland only, so that it cannot open on the desk
-# instead, and without the desk's session bus, so that no dialog of the desk (a portal, a keyring)
+# instead, and on a session bus of its own, so that no dialog of the desk (a portal, a keyring)
 # opens there for it.
 unset DISPLAY DBUS_SESSION_BUS_ADDRESS
-export WAYLAND_DISPLAY=$sock XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland MOZ_ENABLE_WAYLAND=1 XDG_SESSION_TYPE=wayland GTK_USE_PORTAL=0
+export WAYLAND_DISPLAY=$sock XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland MOZ_ENABLE_WAYLAND=1 XDG_SESSION_TYPE=wayland GTK_USE_PORTAL=0 NO_AT_BRIDGE=1
 # The language and the desktop of the owner's desk session, and nothing of the trial's LC_ALL=C.
 unset LC_ALL LANG LANGUAGE \$(compgen -e | grep '^LC_') XDG_CURRENT_DESKTOP
 ${desk:+export $desk}
@@ -772,7 +840,9 @@ ${KEY_RECORD:+export WAYLAND_DEBUG=1}
 # The moments are written as the trial reads them back (LC_ALL=C), whatever the language above.
 echo "\$\$ \$(LC_ALL=C ps -o lstart= -p \$\$)" > $run/app.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(LC_ALL=C ps -o lstart= -p \$sid)" > $run/app.sid
-exec $app $events $record
+# The bus and what it starts keep their files in the bus's folder; the application gets its own
+# folders back as they were.
+$start_line
 SCRIPT
     chmod +x "$run/app.sh"; : > "$run/app.exit"
     tmux new-session -d -s "daily-$NAME-app" "bash -c '$run/app.sh > $run/app.log 2>&1; echo \$? > $run/app.exit'" 9>&-
@@ -884,7 +954,9 @@ do_open() {
         if [ -n "${POSITION:-}" ]; then x=${POSITION%,*}; y=${POSITION#*,}; else x=$((60 + 48 * n)); y=$((60 + 36 * n)); fi
         [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="$mine/frames-$(date +%s).jsonl"
         local settings=(ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
-            ISTESSO_PID_FILE="$mine/viewer.number" ${config_env[@]+"${config_env[@]}"})
+            ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
+        # The title the window has; the guard changes it while a window of the application is calling.
+        printf '%s\n\n' "$(app_title "$name")" > "$mine/title"
         [ "${DAILY_DOCK_TILE:-}" = none ] && settings+=(ISTESSO_DOCK_TILE=none)
         [ -n "${ISTESSO_COMMAND_KEY:-}" ] && settings+=(ISTESSO_COMMAND_KEY="$ISTESSO_COMMAND_KEY")
         [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
@@ -943,6 +1015,33 @@ window_was_closed() { # NAME
         esac
     )
 }
+# A window of an application that wants attention (the compositor marks it: another application's
+# window that asked to come to the front without the person, for example): the title of that
+# application's window here says so, and its Dock tile asks for attention once. Looked at every two
+# seconds while windows are open and the signal is free, with an ssh ended after six seconds at
+# the most. Only a window whose program said that it takes the signal USR1 is told.
+show_attention() {
+    local each open_ones="" answer
+    for each in $apps; do
+        still_runs "$state/$each/viewer.pid" && grep -q '^title file: ready' "$state/$each/viewer.log" 2>/dev/null && open_ones="$open_ones $each"
+    done
+    [ -n "$open_ones" ] && signal_free || return 0
+    answer=$(printf 'attention_all\n' | limit=6 on_host) || return 0
+    printf '%s\n' "$answer" | while read -r each count; do
+        case " $open_ones " in *" $each "*) ;; *) continue ;; esac
+        [[ "$count" =~ ^[0-9]+$ ]] || continue
+        title=$(app_title "$each")
+        if [ "$count" -gt 1 ]; then title="● $title — $count windows are calling"
+        elif [ "$count" = 1 ]; then title="● $title — a window is calling"; fi
+        before=$(head -1 "$state/$each/title" 2>/dev/null)
+        [ "$before" = "$title" ] && continue
+        ask=""
+        [ "$count" -gt 0 ] && [ "${before#●}" = "$before" ] && ask=attention
+        printf '%s\n%s\n' "$title" "$ask" > "$state/$each/title"
+        kill -USR1 "$(number_in "$state/$each/viewer.pid")" 2>/dev/null
+        echo "$(date '+%H:%M:%S') $each: the window's title: $title"
+    done
+}
 window_gone() { # NAME: its viewer has ended by itself, while its relay still runs (a file left
     # behind by an earlier day, with both ended, is not taken for a closed window)
     [ -s "$state/$1/viewer.pid" ] && ! still_runs "$state/$1/viewer.pid" && still_runs "$state/$1/relay.pid"
@@ -987,6 +1086,7 @@ do_guard() {
             signal_free || break
             window_was_closed "$each"
         done
+        show_attention
         local anything=""
         for each in $apps; do
             { still_runs "$state/$each/viewer.pid" || still_runs "$state/$each/relay.pid"; } && anything=1
@@ -1008,13 +1108,13 @@ exit 0
 HOST
     )
     [ -s "$state/held" ] && echo "held still for a latency measurement; the windows open again when it is over"
-    printf '%s\n' "$answer" | while read -r each slot what windows picture; do
+    printf '%s\n' "$answer" | while read -r each slot what windows picture calling; do
         known_name "$each" || continue
         local window=closed
         still_runs "$state/$each/viewer.pid" && window=open
         [ -s "$state/$each/not-back" ] && window="not-back: $(head -1 "$state/$each/not-back")"
         [ "$what" = ended ] && [ "$window" = closed ] && continue
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "picture ${picture:--}" "window $window"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window $window"
     done
 }
 
@@ -1059,7 +1159,7 @@ HOST
 do_note() {
     [ $# -ge 1 ] || { echo "usage: scripts/daily.sh note TEXT"; exit 2; }
     local open
-    open=$(do_list 2>/dev/null | awk -F'\t' 'NF == 6 {printf "%s(%s,%s,%s) ", $1, $3, $5, $6}')
+    open=$(do_list 2>/dev/null | awk -F'\t' 'NF == 7 {printf "%s(%s,%s,%s,%s) ", $1, $3, $5, $6, $7}')
     printf -- '- %s　%s　[%s]\n' "$(date '+%Y-%m-%d %H:%M')" "$*" "${open:-nothing open}" >> "$notes"
     echo "written down in $notes"
 }
