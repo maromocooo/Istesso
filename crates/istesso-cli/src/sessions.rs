@@ -73,6 +73,7 @@ pub fn state_words(state: SessionState) -> &'static str {
         SessionState::Running => "shown in a window",
         SessionState::Detached => "running, not shown",
         SessionState::Stopping => "ending",
+        SessionState::LeftOver => "ended, its processes stay",
         SessionState::Ended => "ended",
         SessionState::Unknown => "unknown",
     }
@@ -85,6 +86,14 @@ pub fn words(info: &SessionInfo) -> String {
         (Some(device), SessionState::Running) => format!("shown in a window on {device}"),
         _ => state_words(info.state).to_string(),
     };
+    if info.opening {
+        state.push_str(", opening: no window yet");
+    }
+    // Asked to end, its processes stayed: nothing ends them but a person's
+    // --force (ADR 0010, 3).
+    if let (SessionState::LeftOver, Some(group)) = (info.state, info.left_over) {
+        state.push_str(&format!(" (process group {group}; --force ends them)"));
+    }
     // Open and attached, with no picture being made for now.
     match info.paused {
         Some(PauseReason::Hidden) => state.push_str(", picture stopped while it cannot be seen"),
@@ -435,6 +444,13 @@ fn after_asking_here(last: &HostSession, name: &str) -> String {
     if last.info.state == SessionState::Ended {
         return format!("{name} ended.");
     }
+    if let (SessionState::LeftOver, Some(group)) = (last.info.state, last.info.left_over) {
+        return format!(
+            "{name} has no window any more, and its processes stay after they were asked to end \
+             (process group {group}). `istesso sessions stop {} --local --force` ends them.",
+            last.info.id
+        );
+    }
     format!(
         "{name} is still running: it may be asking whether to save, which a device that is \
          shown it can answer. `istesso sessions stop {} --local --force` ends it.",
@@ -446,6 +462,13 @@ fn after_asking_here(last: &HostSession, name: &str) -> String {
 fn after_asking(last: &SessionInfo, name: &str, host: &str) -> String {
     if last.state == SessionState::Ended {
         return format!("{name} ended on {host}.");
+    }
+    if let (SessionState::LeftOver, Some(group)) = (last.state, last.left_over) {
+        return format!(
+            "{name} has no window any more on {host}, and its processes stay after they were \
+             asked to end (process group {group}). `istesso sessions stop {} --force` ends them.",
+            last.id
+        );
     }
     format!(
         "{name} is still running on {host}: it may be asking whether to save. \
@@ -478,6 +501,8 @@ mod tests {
                 left_by: None,
                 shown_on: None,
                 paused: None,
+                opening: false,
+                left_over: None,
             },
         }
     }

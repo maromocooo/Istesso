@@ -482,6 +482,8 @@ mod tests {
                 left_by: None,
                 shown_on: None,
                 paused: None,
+                opening: false,
+                left_over: None,
             }],
         };
         let json = serde_json::to_string(&listed).unwrap();
@@ -512,6 +514,8 @@ mod tests {
                 left_by: None,
                 shown_on: None,
                 paused: None,
+                opening: false,
+                left_over: None,
             }),
         };
         let json = serde_json::to_string(&response).unwrap();

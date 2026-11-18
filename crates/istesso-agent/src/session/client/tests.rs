@@ -299,7 +299,6 @@ fn a_window_opens_for_an_application_of_another_device() {
         [
             "runner start",
             "app launch editor WAYLAND_DISPLAY=wayland-fake",
-            "app stop",
             "runner stop"
         ]
     );
@@ -409,10 +408,7 @@ fn closing_the_window_asks_the_application_and_waits_for_it() {
     );
     assert_eq!(heard[..3], ["starting", "running", "asked to close"]);
     pair.journal.wait_for("runner stop", 1);
-    assert_eq!(
-        pair.on_host()[2..],
-        ["runner close", "app stop", "runner stop"]
-    );
+    assert_eq!(pair.on_host()[2..], ["runner close", "runner stop"]);
 }
 
 #[test]
@@ -443,7 +439,7 @@ fn a_session_can_be_asked_to_close_or_ended_from_elsewhere() {
     );
     assert_eq!(
         pair.on_host()[2..],
-        ["runner close", "app stop", "runner stop"]
+        ["runner close", "app ended by force", "runner stop"]
     );
     assert!(sessions_on(&link, &quick_client()).unwrap().is_empty());
 
@@ -745,6 +741,8 @@ fn a_host_that_goes_away_closes_the_window() {
                 left_by: None,
                 shown_on: None,
                 paused: None,
+                opening: false,
+                left_over: None,
             }),
         };
         for answer in [

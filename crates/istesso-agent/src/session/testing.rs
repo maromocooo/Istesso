@@ -53,6 +53,7 @@ pub fn quick_rules() -> Rules {
         client_lost_after: Duration::from_secs(30),
         runner_ready_within: Duration::from_secs(5),
         attach_within: Duration::from_secs(5),
+        app_end_wait: Duration::from_millis(200),
         app_stop_grace: Duration::from_millis(50),
         runner_stop_grace: Duration::from_millis(50),
         remember_ended_for: Duration::from_secs(60),
@@ -262,6 +263,8 @@ pub struct FakeLauncher {
     launch_failure: Mutex<Option<String>>,
     /// How the applications end. One list for all of them.
     ends: Arc<Mutex<VecDeque<String>>>,
+    /// Applications ignore being asked to end, as long as this is set.
+    deaf: Arc<Mutex<bool>>,
 }
 
 impl FakeLauncher {
@@ -271,7 +274,14 @@ impl FakeLauncher {
             plan_refusal: Mutex::new(None),
             launch_failure: Mutex::new(None),
             ends: Arc::default(),
+            deaf: Arc::default(),
         }
+    }
+
+    /// From now on applications stay when they are asked to end, as long as
+    /// `deaf` is true; set to false, they end when asked again.
+    pub fn deaf_to_asking(&self, deaf: bool) {
+        *self.deaf.lock().unwrap() = deaf;
     }
 
     /// From now on no application can be shown as a window.
@@ -322,6 +332,8 @@ impl Launcher for FakeLauncher {
         Ok(Box::new(FakeApp {
             journal: self.journal.clone(),
             ends: self.ends.clone(),
+            deaf: self.deaf.clone(),
+            over: None,
         }))
     }
 }
@@ -329,15 +341,35 @@ impl Launcher for FakeLauncher {
 struct FakeApp {
     journal: Journal,
     ends: Arc<Mutex<VecDeque<String>>>,
+    deaf: Arc<Mutex<bool>>,
+    /// Once over, over: how it ended.
+    over: Option<String>,
 }
 
 impl RunningApp for FakeApp {
-    fn poll(&mut self) -> Option<String> {
-        self.ends.lock().unwrap().pop_front()
+    fn group(&self) -> Option<u32> {
+        Some(4242)
     }
 
-    fn stop(&mut self, _grace: Duration) {
-        self.journal.note("app stop");
+    fn poll(&mut self) -> Option<String> {
+        if self.over.is_none() {
+            self.over = self.ends.lock().unwrap().pop_front();
+        }
+        self.over.clone()
+    }
+
+    fn ask_to_end(&mut self) {
+        self.journal.note("app asked to end");
+        if self.over.is_none() && !*self.deaf.lock().unwrap() {
+            self.over = Some("signal 15".to_string());
+        }
+    }
+
+    fn end_by_force(&mut self, _grace: Duration) {
+        self.journal.note("app ended by force");
+        if self.over.is_none() {
+            self.over = Some("signal 9".to_string());
+        }
     }
 }
 

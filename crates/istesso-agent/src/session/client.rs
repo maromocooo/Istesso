@@ -253,7 +253,9 @@ pub fn stop_session(
         .set_timeout(rules.hold + rules.answer_within)
         .map_err(failed)?;
     let until = Instant::now() + watch;
-    while info.state != SessionState::Ended {
+    // Left over is as far as asking goes: what stays is the person's to
+    // end by force (ADR 0010, 3).
+    while !matches!(info.state, SessionState::Ended | SessionState::LeftOver) {
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -432,7 +434,7 @@ pub fn open_window(
         match reports.recv_timeout(rules.tick) {
             Ok(HostSaid::Report(info)) => {
                 match info.state {
-                    SessionState::Stopping | SessionState::Ended => {
+                    SessionState::Stopping | SessionState::LeftOver | SessionState::Ended => {
                         progress(Progress::Session(&info));
                         break Outcome::Ended(info.end.unwrap_or(SessionEnd {
                             reason: EndReason::Other,
@@ -612,7 +614,7 @@ fn follow(
                 heard = Instant::now();
                 let news = info.revision > after;
                 after = info.revision;
-                let over = info.state == SessionState::Ended;
+                let over = matches!(info.state, SessionState::Ended | SessionState::LeftOver);
                 let nobody_listens = news && said.send(HostSaid::Report(info)).is_err();
                 if nobody_listens || over {
                     return;

@@ -156,7 +156,12 @@ fn sessions_of<'a>(
 ) -> Vec<&'a Running> {
     running
         .iter()
-        .filter(|r| !matches!(r.info.state, SessionState::Stopping | SessionState::Ended))
+        .filter(|r| {
+            !matches!(
+                r.info.state,
+                SessionState::Stopping | SessionState::LeftOver | SessionState::Ended
+            )
+        })
         .filter(|r| {
             app.instances
                 .iter()
@@ -636,6 +641,8 @@ mod tests {
                 left_by: None,
                 shown_on: None,
                 paused: None,
+                opening: false,
+                left_over: None,
             },
         }
     }

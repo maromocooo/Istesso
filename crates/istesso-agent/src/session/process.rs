@@ -357,6 +357,10 @@ mod unix {
             Some(self.child.id())
         }
 
+        fn group(&self) -> Option<u32> {
+            u32::try_from(self.group.as_raw_nonzero().get()).ok()
+        }
+
         fn poll(&mut self) -> Option<String> {
             if self.status.is_none() {
                 self.status = self.child.try_wait().ok().flatten();
@@ -370,11 +374,20 @@ mod unix {
             self.gone.then(|| how_it_ended(status))
         }
 
+        /// Tells the application and what it started to end (SIGTERM),
+        /// once. What does not listen is left as it is.
+        fn ask_to_end(&mut self) {
+            if self.poll().is_none() {
+                let _ = kill_process_group(self.group, Signal::TERM);
+            }
+        }
+
         /// Ends the application by force: tells it to end (SIGTERM), and
-        /// ends it (SIGKILL) when it has not after `grace`. Asking it to
-        /// close, which it may answer with a question, is not done here:
-        /// that goes through the runner, to the application's windows.
-        fn stop(&mut self, grace: Duration) {
+        /// ends it (SIGKILL) when it has not after `grace`. Only on a
+        /// person's `force`. Asking it to close, which it may answer with a
+        /// question, is not done here: that goes through the runner, to the
+        /// application's windows.
+        fn end_by_force(&mut self, grace: Duration) {
             if self.poll().is_some() {
                 return;
             }
@@ -635,11 +648,41 @@ while :; do sleep 1; done"#,
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(app.poll(), None);
-        // Stopping reaches what was left behind.
-        let asked = Instant::now();
-        app.stop(Duration::from_secs(5));
-        assert!(asked.elapsed() < Duration::from_secs(2));
-        assert_eq!(app.poll().as_deref(), Some("exit status 0"));
+        // Asking reaches what was left behind.
+        app.ask_to_end();
+        assert_eq!(wait_until_gone(&mut app), "exit status 0");
+    }
+
+    #[test]
+    fn an_application_that_ignores_being_asked_stays() {
+        let dir = TempDir::new("app-stays");
+        let ready = dir.paths().config.join("ready");
+        let env = BTreeMap::from([(
+            "ISTESSO_TEST_READY".to_string(),
+            ready.display().to_string(),
+        )]);
+        let mut app = DesktopLauncher
+            .launch(
+                &sh(r#"trap '' TERM; : > "$ISTESSO_TEST_READY"; while :; do sleep 1; done"#),
+                &env,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "the application did not start");
+            std::thread::sleep(LOOK_EVERY);
+        }
+        assert_eq!(app.group(), app.pid());
+        app.ask_to_end();
+        std::thread::sleep(Duration::from_millis(500));
+        // Asked, it is still there: nothing was sent that it cannot ignore.
+        assert_eq!(app.poll(), None);
+        app.ask_to_end();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(app.poll(), None);
+        // A person's force ends it.
+        app.end_by_force(Duration::from_millis(100));
+        assert_eq!(wait_until_gone(&mut app), "signal 9");
     }
 
     #[test]
@@ -663,7 +706,7 @@ while :; do sleep 1; done"#,
             std::thread::sleep(LOOK_EVERY);
         }
         let asked = Instant::now();
-        app.stop(Duration::from_millis(300));
+        app.end_by_force(Duration::from_millis(300));
         let took = asked.elapsed();
         assert!(took >= Duration::from_millis(300), "{took:?}");
         assert!(took < Duration::from_secs(3), "{took:?}");

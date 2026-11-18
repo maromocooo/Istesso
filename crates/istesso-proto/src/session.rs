@@ -77,6 +77,10 @@ pub enum SessionState {
     Detached,
     /// The host is stopping the application and the stream; `end` says why.
     Stopping,
+    /// The session is over, and the application's processes are still
+    /// there after they were asked to end: `left_over` says which group.
+    /// Nothing ends them by force but a person's `force`.
+    LeftOver,
     /// Over.
     Ended,
     #[serde(other)]
@@ -163,6 +167,14 @@ pub struct SessionInfo {
     /// session is there and holds no encoder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<PauseReason>,
+    /// The application has been started and has no window yet: a client
+    /// can show that it is opening.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opening: bool,
+    /// Set while `left_over`: the process group of the application, still
+    /// there after it was asked to end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_over: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +281,17 @@ pub enum RunnerEvent {
     },
     /// The last window on the display has closed.
     Empty,
+    /// How many windows the application has, whenever that changes.
+    Windows { count: u32 },
+    /// The application has been started and has no window yet.
+    Opening,
+    /// So long after `opening` the application still has no window. The
+    /// runner concludes nothing; the agent, which knows whether the
+    /// application's processes live, decides.
+    NoWindowYet {
+        #[serde(default)]
+        after_s: u32,
+    },
     /// It cannot go on; it ends after this, and the application with it.
     Error { message: String },
     /// The encoder was refused: when the picture was to be made again, or
@@ -452,6 +475,8 @@ mod tests {
             left_by: None,
             shown_on: None,
             paused: None,
+            opening: false,
+            left_over: None,
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
@@ -696,6 +721,57 @@ mod tests {
     }
 
     #[test]
+    fn the_runner_says_how_many_windows_and_when_there_is_none_yet() {
+        // The lines of the own host's runner (ADR 0019), as it writes them.
+        assert_eq!(
+            decode_line::<RunnerEvent>(r#"{"v":1,"event":"windows","count":2}"#),
+            Some(RunnerEvent::Windows { count: 2 })
+        );
+        assert_eq!(
+            decode_line::<RunnerEvent>(r#"{"v":1,"event":"opening"}"#),
+            Some(RunnerEvent::Opening)
+        );
+        assert_eq!(
+            decode_line::<RunnerEvent>(r#"{"v":1,"event":"no_window_yet","after_s":60}"#),
+            Some(RunnerEvent::NoWindowYet { after_s: 60 })
+        );
+    }
+
+    #[test]
+    fn a_left_over_session_reads_as_unknown_to_an_older_reader() {
+        let info = serde_json::json!({
+            "id": "5b0c9e3a7f21d684", "app": "editor.desktop", "kind": "app_window",
+            "state": "left_over", "revision": 7, "left_over": 4242, "opening": false
+        });
+        let now: SessionInfo = serde_json::from_value(info.clone()).unwrap();
+        assert_eq!(
+            (now.state, now.left_over),
+            (SessionState::LeftOver, Some(4242))
+        );
+        // What a reader that knows neither the state nor the field makes of it.
+        #[derive(serde::Deserialize)]
+        struct Older {
+            state: OlderState,
+        }
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderState {
+            Ended,
+            #[serde(other)]
+            Unknown,
+        }
+        let older: Older = serde_json::from_value(info).unwrap();
+        assert_eq!(older.state, OlderState::Unknown);
+        // Nothing new is written for a session that is neither.
+        let plain = serde_json::to_value(&SessionInfo {
+            left_over: None,
+            ..now
+        })
+        .unwrap();
+        assert!(plain.get("left_over").is_none() && plain.get("opening").is_none());
+    }
+
+    #[test]
     fn lines_that_are_not_understood_are_skipped() {
         for line in [
             // A kind of line from a later version.
@@ -784,8 +860,8 @@ mod tests {
         // A host that listens on IPv6 sees an IPv4 caller like this.
         assert_eq!(text("[::ffff:192.0.2.10]:47801"), "192.0.2.10");
         // An address of one link is useless without the link.
-        let link_local: Ipv6Addr = "fe80::1c2d:3e4f:5a6b:7c8d".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1c2d:3e4f:5a6b:7c8d".parse().unwrap(); // check-private: ok (invented for the test)
         let scoped = SocketAddr::V6(SocketAddrV6::new(link_local, 47801, 0, 4));
-        assert_eq!(address_text(&scoped), "fe80::1c2d:3e4f:5a6b:7c8d%4");
+        assert_eq!(address_text(&scoped), "fe80::1c2d:3e4f:5a6b:7c8d%4"); // check-private: ok (invented for the test)
     }
 }

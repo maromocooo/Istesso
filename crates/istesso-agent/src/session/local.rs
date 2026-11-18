@@ -192,7 +192,11 @@ pub fn stop_here(
         force,
     })?;
     let until = Instant::now() + watch;
-    while last.info.state != SessionState::Ended && Instant::now() < until {
+    while !matches!(
+        last.info.state,
+        SessionState::Ended | SessionState::LeftOver
+    ) && Instant::now() < until
+    {
         std::thread::sleep(Duration::from_millis(100));
         last = ask(&HostRequest::Session {
             session: session.clone(),
@@ -470,6 +474,8 @@ mod tests {
                 left_by: None,
                 shown_on: None,
                 paused: None,
+                opening: false,
+                left_over: None,
             },
             app_name: "Editor".to_string(),
             started_by: StartedBy {

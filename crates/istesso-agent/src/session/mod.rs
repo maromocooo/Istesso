@@ -124,6 +124,10 @@ pub struct Rules {
     pub runner_ready_within: Duration,
     /// How long a runner may take to answer an `attach`.
     pub attach_within: Duration,
+    /// How long an application that was asked to end (SIGTERM) is waited
+    /// for, with its display still there, before what is left is left as
+    /// it is (ADR 0010, 3). Never followed by force.
+    pub app_end_wait: Duration,
     /// How long an application that is ended by force gets to end by
     /// itself.
     pub app_stop_grace: Duration,
@@ -161,6 +165,7 @@ impl Default for Rules {
             client_lost_after: policy::CLIENT_LOST_AFTER,
             runner_ready_within: Duration::from_secs(15),
             attach_within: Duration::from_secs(10),
+            app_end_wait: Duration::from_secs(5),
             app_stop_grace: Duration::from_secs(3),
             runner_stop_grace: Duration::from_secs(2),
             remember_ended_for: Duration::from_secs(60),
@@ -225,11 +230,19 @@ pub trait RunningApp: Send {
     fn pid(&self) -> Option<u32> {
         None
     }
+    /// The process group the application and what it started are in,
+    /// where there is one: what a person is told when it stays.
+    fn group(&self) -> Option<u32> {
+        None
+    }
     /// `Some` once it has ended by itself, with how.
     fn poll(&mut self) -> Option<String>;
-    /// Ends it: tells it to end, and makes it when that takes longer than
-    /// `grace`.
-    fn stop(&mut self, grace: Duration);
+    /// Asks it to end (SIGTERM to its group), once, and returns at once.
+    /// Never by force: what does not listen stays (ADR 0010, 3).
+    fn ask_to_end(&mut self);
+    /// Ends it by force: asks, and makes it end (SIGKILL) when that takes
+    /// longer than `grace`. Only ever on a person's `force`.
+    fn end_by_force(&mut self, grace: Duration);
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +724,8 @@ impl Sessions {
             left_by: None,
             shown_on: None,
             paused: None,
+            opening: false,
+            left_over: None,
         };
         {
             let mut table = inner.lock();
@@ -1540,8 +1555,11 @@ impl Inner {
         let mut stream: Option<Box<dyn RunningStream>> = None;
         let mut app: Option<Box<dyn RunningApp>> = None;
         let mut checked = Checked::default();
+        // Whether a person asked to end the application by force: the one
+        // way that ends it so (ADR 0010, 3).
+        let mut forced = false;
 
-        let end = 'session: {
+        let mut end = 'session: {
             // The host's side of the stream comes first: it makes the
             // display the application appears on.
             if let Some(socket) = job.input_socket.parent() {
@@ -1582,6 +1600,7 @@ impl Inner {
                 }
                 let round = self.round(&job, &mut checked, None);
                 if round.force {
+                    forced = true;
                     break 'session ending(EndReason::Stopped, "");
                 }
                 if round.revoked {
@@ -1654,6 +1673,26 @@ impl Inner {
                             EndReason::AppExited,
                             "the application closed its last window",
                         )
+                    }
+                    Some(StreamEvent::Said(RunnerEvent::Opening)) => {
+                        // A client can show that the application is opening.
+                        self.update(id, |entry| entry.info.opening = true);
+                        continue;
+                    }
+                    Some(StreamEvent::Said(RunnerEvent::Windows { count })) => {
+                        if count > 0 {
+                            self.update(id, |entry| entry.info.opening = false);
+                        }
+                        continue;
+                    }
+                    Some(StreamEvent::Said(RunnerEvent::NoWindowYet { after_s })) => {
+                        // The runner concludes nothing. The application's
+                        // processes live (it would have ended above
+                        // otherwise): it is ended as after `empty`, asked
+                        // and never forced.
+                        let why =
+                            format!("the application showed no window within {after_s} seconds");
+                        break 'session ending(EndReason::AppExited, why);
                     }
                     Some(StreamEvent::Said(RunnerEvent::Error { message })) => {
                         break 'session ending(EndReason::StreamFailed, message)
@@ -1733,6 +1772,7 @@ impl Inner {
                 let being_attached = attaching.as_ref().map(|(_, _, device)| device);
                 let round = self.round(&job, &mut checked, being_attached);
                 if round.force {
+                    forced = true;
                     break 'session ending(EndReason::Stopped, "");
                 }
                 if round.close {
@@ -1792,19 +1832,38 @@ impl Inner {
             entry.info.state = SessionState::Stopping;
             entry.info.answer = None;
             entry.info.shown_on = None;
+            entry.info.opening = false;
             entry.info.end = Some(end.clone());
         });
         // The application first: it can end while its display is still
-        // there.
-        if let Some(mut app) = app {
-            app.stop(rules.app_stop_grace);
+        // there. Only a person's force ends it by force. On every other way
+        // it is asked to end, and what does not listen is left as it is,
+        // for a person to see and decide on (ADR 0010, 3).
+        let mut stays = None;
+        if let Some(app) = app.as_mut() {
+            if forced {
+                app.end_by_force(rules.app_stop_grace);
+            } else if app.poll().is_none() {
+                app.ask_to_end();
+                match self.ends_within(app.as_mut(), rules.app_end_wait) {
+                    Some(how) => add_to(&mut end, &format!("it ended when asked to ({how})")),
+                    None => stays = Some(app.group()),
+                }
+            }
         }
         if let Some(mut stream) = stream {
             stream.stop(rules.runner_stop_grace);
         }
         // The runner made the socket; it is of no use to anyone now.
         let _ = std::fs::remove_file(&job.input_socket);
-        self.update(id, |entry| entry.info.state = SessionState::Ended);
+        if let (Some(group), Some(app)) = (stays, app.as_mut()) {
+            self.left_over(id, &mut end, group, app.as_mut());
+        }
+        self.update(id, |entry| {
+            entry.info.state = SessionState::Ended;
+            entry.info.left_over = None;
+            entry.info.end = Some(end.clone());
+        });
         (self.log)(format!(
             "session {id}: {} ended: {:?}{}{}",
             job.app_name,
@@ -1812,6 +1871,90 @@ impl Inner {
             if end.message.is_empty() { "" } else { ", " },
             end.message
         ));
+    }
+}
+
+impl Inner {
+    /// Waits for an application that was asked to end. `Some` with how it
+    /// ended, `None` when it is still there after `time`.
+    fn ends_within(&self, app: &mut dyn RunningApp, time: Duration) -> Option<String> {
+        let deadline = Instant::now() + time;
+        loop {
+            if let Some(how) = app.poll() {
+                return Some(how);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(self.rules.tick.min(Duration::from_millis(50)));
+        }
+    }
+
+    /// The session is over, and the application's processes stay after they
+    /// were asked to end. They are shown as they are (`left_over`) until they
+    /// are gone, or a person ends them by force. Asked again when a person
+    /// asks without force. Nothing else is ever sent to them.
+    fn left_over(
+        &self,
+        id: &SessionId,
+        end: &mut SessionEnd,
+        group: Option<u32>,
+        app: &mut dyn RunningApp,
+    ) {
+        let Some(group) = group else {
+            // Nothing to show a person by: it is left without a word more.
+            add_to(end, "it did not end when asked to");
+            return;
+        };
+        add_to(
+            end,
+            &format!(
+                "its processes are still there after they were asked to end (process group {group}); \
+                 to end them by force: istesso sessions stop {id} --force (on the host: add --local)"
+            ),
+        );
+        self.update(id, |entry| {
+            entry.info.state = SessionState::LeftOver;
+            entry.info.left_over = Some(group);
+            entry.info.end = Some(end.clone());
+            entry.orders = Orders::default();
+        });
+        (self.log)(format!(
+            "session {id}: the application's processes stay after they were asked to end (process group {group})"
+        ));
+        loop {
+            if let Some(how) = app.poll() {
+                add_to(end, &format!("they ended later ({how})"));
+                return;
+            }
+            let orders = {
+                let mut table = self.lock();
+                match table.sessions.get_mut(&id.0) {
+                    Some(entry) => std::mem::take(&mut entry.orders),
+                    None => Orders::default(),
+                }
+            };
+            if orders.force {
+                // A person's word: the one way to end it by force.
+                app.end_by_force(self.rules.app_stop_grace);
+                add_to(end, "a person ended them by force");
+                end.reason = EndReason::Stopped;
+                return;
+            }
+            if orders.close {
+                app.ask_to_end();
+            }
+            self.pause();
+        }
+    }
+}
+
+/// Adds a sentence to the message of a session's end.
+fn add_to(end: &mut SessionEnd, more: &str) {
+    if end.message.is_empty() {
+        end.message = more.to_string();
+    } else {
+        end.message = format!("{}; {more}", end.message);
     }
 }
 

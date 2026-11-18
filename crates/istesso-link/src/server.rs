@@ -435,6 +435,8 @@ mod tests {
                             left_by: None,
                             shown_on: None,
                             paused: None,
+                            opening: false,
+                            left_over: None,
                         }),
                     };
                     let response = match &request {

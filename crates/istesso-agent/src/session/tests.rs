@@ -539,7 +539,7 @@ fn asking_an_application_to_close_leaves_the_answer_to_it() {
     assert_eq!(end.message, "the application ended (exit status 0)");
     assert_eq!(
         host.since_running(),
-        ["runner close", "runner close", "app stop", "runner stop"]
+        ["runner close", "runner close", "runner stop"]
     );
     // Asking something that is over to close does nothing.
     assert_eq!(session(host.stop(&id, false)).state, SessionState::Ended);
@@ -557,7 +557,20 @@ fn a_session_nobody_is_shown_can_be_asked_to_close_too() {
     host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
     let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
     assert_eq!(end.reason, EndReason::AppExited);
-    assert_eq!(end.message, "the application closed its last window");
+    // Its processes were still there: asked to end, they did.
+    assert_eq!(
+        end.message,
+        "the application closed its last window; it ended when asked to (signal 15)"
+    );
+    assert_eq!(
+        host.since_running(),
+        [
+            "runner detach",
+            "runner close",
+            "app asked to end",
+            "runner stop"
+        ]
+    );
 }
 
 #[test]
@@ -576,7 +589,7 @@ fn ending_by_force_stops_the_application_before_the_stream() {
     assert_eq!(ended.answer, None);
     // The application is not asked to close first: the two ways are kept
     // apart.
-    assert_eq!(host.since_running(), ["app stop", "runner stop"]);
+    assert_eq!(host.since_running(), ["app ended by force", "runner stop"]);
     // Asking again does no harm and says the same.
     let again = session(host.stop(&id, true));
     assert_eq!(again.state, SessionState::Ended);
@@ -619,8 +632,8 @@ fn an_application_that_ends_takes_its_session_with_it() {
     assert_eq!(end.reason, EndReason::AppExited);
     assert_eq!(end.message, "the application ended (exit status 0)");
     // Both are stopped in the usual order. For an application that is
-    // already gone there is nothing left to do.
-    assert_eq!(host.since_running(), ["app stop", "runner stop"]);
+    // already gone there is nothing left to do: nothing is sent to it.
+    assert_eq!(host.since_running(), ["runner stop"]);
 
     // The same when nobody is shown it.
     let id = host.running().id;
@@ -697,11 +710,12 @@ fn a_stream_that_dies_ends_the_application() {
     host.runner.say(StreamEvent::Exited("signal 9".into()));
     let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
     assert_eq!(end.reason, EndReason::StreamFailed);
+    // Without its display the application is asked to end, never forced.
     assert_eq!(
         end.message,
-        "the host's side of the stream ended (signal 9)"
+        "the host's side of the stream ended (signal 9); it ended when asked to (signal 15)"
     );
-    assert_eq!(host.since_running(), ["app stop", "runner stop"]);
+    assert_eq!(host.since_running(), ["app asked to end", "runner stop"]);
 }
 
 #[test]
@@ -821,14 +835,19 @@ fn a_session_nobody_is_shown_is_closed_to_a_device_that_was_unpaired() {
     let asked = host.sessions.host_stop(&id, false).unwrap();
     assert_eq!(asked.info.state, SessionState::Detached);
     host.journal.wait_for("runner close", 1);
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
     // ... or end it.
     host.sessions.host_stop(&id, true).unwrap();
     let over = host.settles(&id, |s| s.info.state == SessionState::Ended);
     assert_eq!(over.info.end.unwrap().reason, EndReason::Stopped);
     assert_eq!(
         host.since_running(),
-        ["runner detach", "runner close", "app stop", "runner stop"]
+        [
+            "runner detach",
+            "runner close",
+            "app ended by force",
+            "runner stop"
+        ]
     );
     assert!(host.sessions.host_list().is_empty());
     assert_eq!(
@@ -1076,7 +1095,7 @@ fn a_list_of_paired_devices_that_cannot_be_read_is_not_an_unpairing() {
             (false, &None),
             "{broken}"
         );
-        assert_eq!(host.journal.count("app stop"), 0, "{broken}");
+        assert_eq!(host.journal.count("app asked to end"), 0, "{broken}");
         // Whoever asks is refused, the device that started the session
         // included, whatever it asks: to start, to list, to follow, to be
         // shown, to leave, to stop. Nothing is widened.
@@ -1111,7 +1130,7 @@ fn a_list_of_paired_devices_that_cannot_be_read_is_not_an_unpairing() {
         (
             host.journal.count("runner detach"),
             host.journal.count("runner attach"),
-            host.journal.count("app stop"),
+            host.journal.count("app asked to end"),
             host.journal.count("runner stop")
         ),
         (3, 3, 0, 0)
@@ -1298,7 +1317,7 @@ fn an_encoder_that_is_refused_stops_the_picture_of_a_window_nobody_looks_at() {
     // After a while the host tries what it is set to again.
     host.settles(&first, |s| s.info.paused.is_none());
     host.settles(&second, |s| s.info.paused.is_none());
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
     assert_eq!(host.journal.count("runner stop"), 0);
 }
 
@@ -1331,7 +1350,7 @@ fn a_single_window_whose_encoder_is_refused_waits_and_tries_again() {
         message: String::new(),
     }));
     host.settles(&id, |s| s.info.paused == Some(PauseReason::NoSlot));
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
 }
 
 #[test]
@@ -1412,7 +1431,7 @@ fn a_session_can_be_there_and_hold_no_encoder() {
         host.since_running()[2..],
         ["runner pause", "runner detach", "runner attach"]
     );
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
 }
 
 #[test]
@@ -1487,7 +1506,7 @@ fn a_window_beyond_the_encoder_slots_is_opened_with_its_picture_stopped() {
     host.settles(&second, |s| s.info.paused == Some(PauseReason::NoSlot));
     host.detach(&third, 1);
     host.settles(&second, |s| s.info.paused.is_none());
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
     assert_eq!(Rules::default().encoder_slots, 8);
 }
 
@@ -1558,7 +1577,7 @@ fn a_question_that_is_held_back_is_not_answered_once_the_list_cannot_be_read() {
         (seen.info.state, seen.info.attachment, &seen.info.left_by),
         (SessionState::Detached, 1, &None)
     );
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
 }
 
 #[test]
@@ -2022,7 +2041,7 @@ fn a_full_host_refuses_and_names_what_nobody_is_shown() {
         message,
         format!("{full}; nobody is shown: Editor ({first}), Paint ({second})")
     );
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
 
     // What an unpaired device left behind keeps its place, and says whose
     // it was. Another device can end one to make room.
@@ -2037,7 +2056,7 @@ fn a_full_host_refuses_and_names_what_nobody_is_shown() {
              Paint ({second}, opened by laptop)"
         )
     );
-    assert_eq!(host.journal.count("app stop"), 0);
+    assert_eq!(host.journal.count("app asked to end"), 0);
     session(host.ask(
         &tablet,
         Request::SessionStop {
@@ -2103,4 +2122,172 @@ fn a_session_that_is_over_is_remembered_for_a_while() {
     std::thread::sleep(Duration::from_millis(400));
     let (code, _) = refusal(host.wait_as(&id, 0, 0, 0));
     assert_eq!(code, ErrorCode::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// Ending an application: asked, never forced but on a person's word
+// (ADR 0010, 3; the owner's decisions of 2026-11-17)
+// ---------------------------------------------------------------------------
+
+/// One way a session can come to its end, done to a running session.
+type Ending = fn(&Host, &SessionId);
+
+#[test]
+fn no_way_of_ending_but_a_persons_force_ends_an_application_by_force() {
+    // Every way a session ends, each with an application that is still
+    // there when it does.
+    let ways: [(&str, Ending); 6] = [
+        ("its last window closed", |host, _| {
+            host.runner.say(StreamEvent::Said(RunnerEvent::Empty))
+        }),
+        ("no window came", |host, _| {
+            host.runner
+                .say(StreamEvent::Said(RunnerEvent::NoWindowYet { after_s: 60 }))
+        }),
+        ("the stream died", |host, _| {
+            host.runner.say(StreamEvent::Exited("signal 9".into()))
+        }),
+        ("the runner failed", |host, _| {
+            host.runner.say(StreamEvent::Said(RunnerEvent::Error {
+                message: "no display".into(),
+            }))
+        }),
+        ("asked to close, then empty", |host, id| {
+            session(host.stop(id, false));
+            host.journal.wait_for("runner close", 1);
+            host.runner.say(StreamEvent::Said(RunnerEvent::Empty))
+        }),
+        ("left, then empty", |host, id| {
+            host.detach(id, 1);
+            host.runner.say(StreamEvent::Said(RunnerEvent::Empty))
+        }),
+    ];
+    for (way, end) in ways {
+        for deaf in [false, true] {
+            let host = host();
+            host.launcher.deaf_to_asking(deaf);
+            let id = host.running().id;
+            end(&host, &id);
+            let state = if deaf {
+                SessionState::LeftOver
+            } else {
+                SessionState::Ended
+            };
+            host.follow_until(&id, state);
+            assert_eq!(
+                host.journal.count("app ended by force"),
+                0,
+                "{way}, deaf {deaf}"
+            );
+            assert_eq!(
+                host.journal.count("app asked to end"),
+                1,
+                "{way}, deaf {deaf}"
+            );
+        }
+    }
+    // The person's word is the one way.
+    let host = host();
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    session(host.stop(&id, true));
+    host.follow_until(&id, SessionState::Ended);
+    assert_eq!(host.journal.count("app ended by force"), 1);
+    assert_eq!(host.journal.count("app asked to end"), 0);
+}
+
+#[test]
+fn an_application_that_stays_when_asked_is_left_over_for_a_person_to_see() {
+    let host = host();
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    let left = host.follow_until(&id, SessionState::LeftOver);
+    assert_eq!(left.left_over, Some(4242));
+    let end = left.end.unwrap();
+    assert_eq!(end.reason, EndReason::AppExited);
+    assert!(
+        end.message.contains("process group 4242") && end.message.contains("--force"),
+        "{}",
+        end.message
+    );
+    // The runner is gone; the session is listed, for the device and for the
+    // person at the host, and cannot be shown any more.
+    host.journal.wait_for("runner stop", 1);
+    assert_eq!(host.list(&host.laptop)[0].state, SessionState::LeftOver);
+    assert_eq!(host.sessions.host_list()[0].info.left_over, Some(4242));
+    let (code, _) = refusal(host.attach(&id));
+    assert_eq!(code, ErrorCode::Unavailable);
+    // Asking again asks again; nothing more.
+    assert_eq!(session(host.stop(&id, false)).state, SessionState::LeftOver);
+    host.journal.wait_for("app asked to end", 2);
+    assert_eq!(host.look(&id).state, SessionState::LeftOver);
+    assert_eq!(host.journal.count("app ended by force"), 0);
+    // A person's force ends it.
+    host.sessions.host_stop(&id, true).unwrap();
+    let over = host.follow_until(&id, SessionState::Ended);
+    assert_eq!(over.left_over, None);
+    let end = over.end.unwrap();
+    assert_eq!(end.reason, EndReason::Stopped);
+    assert!(
+        end.message.ends_with("a person ended them by force"),
+        "{}",
+        end.message
+    );
+    assert_eq!(host.journal.count("app ended by force"), 1);
+    assert!(host.list(&host.laptop).is_empty());
+}
+
+#[test]
+fn what_was_left_over_ends_the_session_when_it_goes() {
+    let host = host();
+    host.launcher.deaf_to_asking(true);
+    let id = host.running().id;
+    host.runner.say(StreamEvent::Said(RunnerEvent::Empty));
+    host.follow_until(&id, SessionState::LeftOver);
+    // It listens this time.
+    host.launcher.deaf_to_asking(false);
+    session(host.stop(&id, false));
+    let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
+    assert_eq!(end.reason, EndReason::AppExited);
+    assert!(
+        end.message.ends_with("they ended later (signal 15)"),
+        "{}",
+        end.message
+    );
+    assert_eq!(host.journal.count("app ended by force"), 0);
+}
+
+#[test]
+fn an_application_is_opening_until_its_first_window() {
+    let host = host();
+    let id = host.running().id;
+    assert!(!host.look(&id).opening);
+    host.runner.say(StreamEvent::Said(RunnerEvent::Opening));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !host.look(&id).opening {
+        assert!(Instant::now() < deadline, "not opening");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // No window yet is no change; the first window is.
+    host.runner
+        .say(StreamEvent::Said(RunnerEvent::Windows { count: 0 }));
+    host.runner
+        .say(StreamEvent::Said(RunnerEvent::Windows { count: 1 }));
+    while host.look(&id).opening {
+        assert!(Instant::now() < deadline, "still opening");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(host.look(&id).state, SessionState::Running);
+    // A session that showed no window for long is ended as after `empty`.
+    host.runner
+        .say(StreamEvent::Said(RunnerEvent::NoWindowYet { after_s: 60 }));
+    let end = host.follow_until(&id, SessionState::Ended).end.unwrap();
+    assert_eq!(end.reason, EndReason::AppExited);
+    assert!(
+        end.message
+            .starts_with("the application showed no window within 60 seconds"),
+        "{}",
+        end.message
+    );
 }
