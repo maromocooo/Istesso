@@ -66,6 +66,12 @@ int main(void) {
         check(!window_address("192.0.2.1:47911", 0, out, sizeof out), "no port listed");  // check-private: ok (documentation address)
         check(!window_address("192.0.2.1:47911", 50001, out, 8), "no room");  // check-private: ok (documentation address)
 
+        // Review 3: the focus is told again with the windows (the first window, another, none).
+        check(window_focus_line(true, 1, out, sizeof out) && strcmp(out, "{\"kind\":\"focus\"}") == 0, "the first window typed into");
+        check(window_focus_line(true, 3, out, sizeof out) && strcmp(out, "{\"kind\":\"focus\",\"window\":3}") == 0, "another window typed into");
+        check(!window_focus_line(false, 3, out, sizeof out) && !window_focus_line(true, 0, out, sizeof out),
+              "nothing while another application is active, or no window of this one is typed into");
+
         // Where a new window goes.
         NSRect room = NSMakeRect(0, 0, 1470, 919);
         NSPoint at = window_top_left(NSMakeRect(100, 200, 800, 600), NSMakeSize(400, 300), 0, room);

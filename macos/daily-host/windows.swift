@@ -177,6 +177,29 @@ func extraPlace(bounds: CGRect, width: Int, height: Int) -> WindowPlace {
     WindowPlace(origin: bounds.origin, scaleX: bounds.width / Double(max(1, width)), scaleY: bounds.height / Double(max(1, height)))
 }
 
+/// Which window keys go to (see ExtraWindows.focus).
+enum KeyFocus: Equatable {
+    case first
+    case window(UInt32)
+    case none
+}
+
+/// A focus from the viewer: none or 1, the first window; a listed number, that window; any other
+/// number, no window (a stale or unknown focus never sends keys to the first window).
+func focusFor(_ number: UInt32, listed: Bool) -> KeyFocus {
+    number <= 1 ? .first : listed ? .window(number) : .none
+}
+
+/// The window keys go to now, and its place: the first window's; a listed window's; nothing (no id,
+/// no place: keysMayGo lets no key go and nothing is raised) for none or a window gone meanwhile.
+func keyTarget(_ focus: KeyFocus, first: (CGWindowID?, CGRect), listed: (UInt32) -> (CGWindowID, CGRect)?) -> (id: CGWindowID?, bounds: CGRect) {
+    switch focus {
+    case .first: return first
+    case let .window(n): return listed(n).map { ($0.0, $0.1) } ?? (nil, .zero)
+    case .none: return (nil, .zero)
+    }
+}
+
 /// While the pointer is nowhere, a button event goes only when it releases a button that is down.
 func passesNowhere(pressed: Bool, held: Bool) -> Bool { !pressed && held }
 
@@ -292,8 +315,9 @@ final class ExtraWindows {
     var serial: UInt32 = 0
     /// The list told last, without its serial.
     var told: String?
-    /// The window keys go to, when it is not the first (a focus with its number).
-    var focus: UInt32?
+    /// The window keys go to: the first, a listed one (a focus with its number), or none (a focus
+    /// for a window not listed, or the focused window went away): no key goes until a focus comes.
+    var focus = KeyFocus.first
     var viewerAwaySince: TimeInterval?
     /// The windows that are never another window (--windows; recorded by lookAtApp).
     var baseline = WindowBaseline()
@@ -313,8 +337,9 @@ final class ExtraWindows {
 
 extension DailyHost {
     /// The window keys go to: the one the viewer last focused, else the first.
-    var keyWindowId: CGWindowID? { extras.focus.flatMap { extras.streams[$0]?.windowId } ?? windowId }
-    var keyWindowBounds: CGRect { extras.focus.flatMap { extras.streams[$0]?.bounds } ?? windowBounds }
+    var keyWindowId: CGWindowID? { keyTarget(extras.focus, first: (windowId, windowBounds), listed: listedWindow).id }
+    var keyWindowBounds: CGRect { keyTarget(extras.focus, first: (windowId, windowBounds), listed: listedWindow).bounds }
+    private func listedWindow(_ number: UInt32) -> (CGWindowID, CGRect)? { extras.streams[number].map { ($0.windowId, $0.bounds) } }
 
     /// {"kind":"windows"}: the viewer shows windows one by one.
     func windowsDeclared() {
@@ -372,7 +397,7 @@ extension DailyHost {
             guard let s = extras.stream(id) else { continue }
             s.stop()
             extras.streams[s.number] = nil
-            if extras.focus == s.number { extras.focus = nil }
+            if extras.focus == .window(s.number) { extras.focus = .none }
             logWindow(s.number, "gone")
             if !resized.contains(id) { extras.numbers.forget(id) }
             changed = true
@@ -411,7 +436,7 @@ extension DailyHost {
                 s.stop()
                 extras.streams[s.number] = nil
                 extras.fallback.insert(s.windowId)
-                if extras.focus == s.number { extras.focus = nil }
+                if extras.focus == .window(s.number) { extras.focus = .none }
                 logWindow(s.number, "fallback")
                 say("window-fallback", [("window", Int(s.number)), ("reason", "nobody watched its stream within one second")])
                 changed = true
@@ -447,7 +472,7 @@ extension DailyHost {
         let entries = extras.streams.values.sorted { $0.number < $1.number }.compactMap { s -> ListedWindow? in
             let port = s.transport.port
             guard port > 0 else { return nil }
-            let key = settings.generated ? extras.focus == s.number : focused.map { samePlace($0, s.bounds) } ?? false
+            let key = settings.generated ? extras.focus == .window(s.number) : focused.map { samePlace($0, s.bounds) } ?? false
             return ListedWindow(number: s.number, port: port, width: s.width, height: s.height, title: s.title, modal: s.modal, key: key)
         }
         let body = windowListJSON(serial: 0, entries)
@@ -469,7 +494,7 @@ extension DailyHost {
         let had = !extras.streams.isEmpty
         extras.streams.removeAll()
         extras.fallback.removeAll()
-        extras.focus = nil
+        extras.focus = .first
         extras.declared = false
         extras.pretend = []
         extras.viewerAwaySince = nil
@@ -514,10 +539,12 @@ extension DailyHost {
         }
     }
 
-    /// {"kind":"focus"} with a window's number (none or 1: the first): keys go to that window.
+    /// {"kind":"focus"} with a window's number (none or 1: the first): keys go to that window; a
+    /// number not listed lets no key go until the next focus.
     func focusWindowAsked(_ number: UInt32) {
         guard settings.windows else { return }
-        extras.focus = number > 1 && extras.streams[number] != nil ? number : nil
+        extras.focus = focusFor(number, listed: extras.streams[number] != nil)
+        if extras.focus == .none { say("window-focus", [("window", Int(number)), ("listed", false)]) }
         publishWindows()
     }
 
@@ -671,6 +698,16 @@ func windowsSelfTest() -> Int {
     } else {
         check(false, "its bottom right pixel is at the window's bottom right")
     }
+    // Review 3: a focus for a window not listed, or a focused window gone, sends no key anywhere.
+    check(focusFor(0, listed: false) == .first && focusFor(1, listed: false) == .first, "a focus without a number: the first window")
+    check(focusFor(2, listed: true) == .window(2) && focusFor(9, listed: false) == .none, "a listed number; a number not listed is no window")
+    let firstWin = (CGWindowID(10), CGRect(x: 0, y: 0, width: 800, height: 600))
+    let streamed: (UInt32) -> (CGWindowID, CGRect)? = { $0 == 2 ? (11, CGRect(x: 40, y: 40, width: 600, height: 400)) : nil }
+    check(keyTarget(.first, first: firstWin, listed: streamed) == (10, firstWin.1) && keyTarget(.window(2), first: firstWin, listed: streamed).id == 11,
+          "keys go to the first or the listed window")
+    check(keyTarget(.none, first: firstWin, listed: streamed).bounds == .zero && keyTarget(.window(3), first: firstWin, listed: streamed).bounds == .zero
+              && !keysMayGo(appInFront: true, focused: firstWin.1, shown: keyTarget(.none, first: firstWin, listed: streamed).bounds),
+          "no window, or one gone: no key goes, also when the first window has the host's keyboard")
     // Review 9: without --windows Accessibility is asked nothing more than before.
     check(!axAsksTitle(windows: false) && axAsksTitle(windows: true), "a window's title is read only with --windows")
     return failed

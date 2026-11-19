@@ -39,11 +39,19 @@ static void log_window(uint32_t number, const char *event) {
     }
 }
 
+static uint32_t key_window_number(void);
+
 // Tells the host that this viewer shows windows one by one: only while the way there passes window
-// numbers on. Idempotent on the host's side.
+// numbers on. Idempotent on the host's side. Said again on a new connection, and with it which
+// window here is typed into: the host may have lost it (a relay connected again passes on the
+// pointer and the held keys only).
 static void declare_windows(void) {
     if (windows_on && relay_takes_windows) {
         send_input("{\"kind\":\"windows\",\"version\":1}");
+        char line[64];
+        if (window_focus_line(NSApp.isActive, key_window_number(), line, sizeof line)) {
+            send_input("%s", line);
+        }
     }
 }
 
@@ -253,6 +261,23 @@ static gboolean extra_decode(ExtraDecoder *d, IstessoMediaWatch *watch, const Is
 
 static NSMutableDictionary<NSNumber *, ExtraWindow *> *extra_windows = nil;
 static void *extra_thread(void *raw);
+
+// The number of this application's window typed into: 1 the first, 2 and up another, 0 none.
+static uint32_t key_window_number(void) {
+    NSWindow *key = NSApp.keyWindow;
+    if (key == nil) {
+        return 0;
+    }
+    if (key == picture_window) {
+        return 1;
+    }
+    for (ExtraWindow *extra in extra_windows.allValues) {
+        if (extra.window == key) {
+            return extra.number;
+        }
+    }
+    return 0;
+}
 
 @implementation ExtraWindow {
     atomic_bool _stop;

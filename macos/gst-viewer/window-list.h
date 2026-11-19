@@ -137,6 +137,18 @@ static bool window_address(const char *channel, uint16_t port, char *out, size_t
     return length > 0 && (size_t)length < room;
 }
 
+// The focus told again when the host is told that windows are shown one by one (a new connection
+// of the relay or of the picture: the host may have lost which window keys go to). Only while
+// this application is the active one: `key` is the number of its window typed into (1: the
+// first), or 0 for none. false: nothing to tell.
+static bool window_focus_line(bool active, uint32_t key, char *out, size_t room) {
+    if (!active || key == 0) {
+        return false;
+    }
+    int length = key == 1 ? snprintf(out, room, "{\"kind\":\"focus\"}") : snprintf(out, room, "{\"kind\":\"focus\",\"window\":%u}", key);
+    return length > 0 && (size_t)length < room;
+}
+
 // Where a new window goes (the top left of its frame, in screen points from the bottom left, as
 // AppKit counts): a little below and to the right of the first window for the first one, one step
 // more for each one after it, and kept inside `room` (the visible part of the screen).

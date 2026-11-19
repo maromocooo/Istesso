@@ -3600,6 +3600,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         if pasteGate.waitingFor != nil { return pasteGate.hold(data) }
         // Behind whatever waits for a raise, in order: a copy right after a select-all goes after it.
         if !waiting.isEmpty { return waiting.append(data) }
+        // Keys for no window (a focus for a window not listed; windows.swift): nothing is raised,
+        // and the injector lets none of them go.
+        if extras.focus == .none && isKeyOrText(data) { return dispatch(data) }
         let notRaised = app != nil && raisedWindow != keyWindowId && isKeyOrText(data)
         if needsFront(data), !screenLocked(), let running = frontCandidate(data),
            notRaised || running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
