@@ -669,6 +669,8 @@ pub struct IstessoMediaTextInput {
     pub height: u32,
     /// The field's serial (0 to 255): changes whenever another field has the keyboard.
     pub serial: u32,
+    /// Pieces of committed text the host had nowhere to put so far (0 to 65535).
+    pub dropped: u32,
 }
 
 /// # Safety
@@ -683,11 +685,12 @@ pub unsafe extern "C" fn istesso_media_host_set_text_input(
         remember("no host, or no field, was given");
         return -1;
     };
-    let (Ok(state), Ok(width), Ok(height), Ok(serial)) = (
+    let (Ok(state), Ok(width), Ok(height), Ok(serial), Ok(dropped)) = (
         u8::try_from(field.state),
         u16::try_from(field.width),
         u16::try_from(field.height),
         u8::try_from(field.serial),
+        u16::try_from(field.dropped),
     ) else {
         remember("the text field's numbers are out of range");
         return -1;
@@ -695,6 +698,7 @@ pub unsafe extern "C" fn istesso_media_host_set_text_input(
     let field = crate::wire::TextField {
         state,
         serial,
+        dropped,
         x: field.x,
         y: field.y,
         width,
@@ -736,6 +740,7 @@ pub unsafe extern "C" fn istesso_media_watch_text_input(
             width: u32::from(now.width),
             height: u32::from(now.height),
             serial: u32::from(now.serial),
+            dropped: u32::from(now.dropped),
         }
     };
     1

@@ -61,6 +61,8 @@
 //!   8       4      y
 //!   12      2      width
 //!   14      2      height
+//!   16      2      pieces of committed text the host had nowhere to put so far (mod 65536;
+//!                  added 2026-11-19, fixed part 18; an earlier writer's 16 reads as 0)
 //! ```
 //!
 //! No typed text is in it. A viewer that does not know kind 5 passes the packet over.
@@ -92,8 +94,10 @@ pub const MAX_CURSOR_SCALE: u16 = 8;
 pub const MAX_CURSOR_NAME: usize = 64;
 /// Bytes in front of a cursor's name or pixels, as this version writes them.
 pub const CURSOR_FIXED_LEN: usize = 16;
-/// The fixed part of what a packet of kind 5 carries.
-pub const TEXT_FIELD_FIXED_LEN: usize = 16;
+/// The fixed part of what a packet of kind 5 carries (16 in its first version).
+pub const TEXT_FIELD_FIXED_LEN: usize = 18;
+/// The fixed part of kind 5 as its first version wrote it: still read.
+const TEXT_FIELD_FIRST_LEN: usize = 16;
 
 const FLAG_KEY_FRAME: u32 = 1;
 const FLAG_DISCONTINUITY: u32 = 2;
@@ -259,6 +263,9 @@ pub struct TextField {
     pub y: i32,
     pub width: u16,
     pub height: u16,
+    /// Pieces of committed text the host had nowhere to put so far (mod 65536): when it grows,
+    /// the viewer keeps what it sent last for the person.
+    pub dropped: u16,
 }
 
 /// What the pointer's cursor looks like on the host.
@@ -532,6 +539,7 @@ pub fn encode_text_field(field: &TextField, seq: u64, out: &mut Vec<u8>) -> Resu
     body.extend_from_slice(&field.y.to_le_bytes());
     body.extend_from_slice(&field.width.to_le_bytes());
     body.extend_from_slice(&field.height.to_le_bytes());
+    body.extend_from_slice(&field.dropped.to_le_bytes());
     encode(&Header::without_frame(Kind::TextField, seq), &body, out);
     Ok(())
 }
@@ -539,11 +547,11 @@ pub fn encode_text_field(field: &TextField, seq: u64, out: &mut Vec<u8>) -> Resu
 /// Reads what a packet of kind [`Kind::TextField`] carries. Fields a later version adds after
 /// the fixed part are passed over; a state this version does not know is refused.
 pub fn decode_text_field(body: &[u8]) -> Result<TextField, WireError> {
-    if body.len() < TEXT_FIELD_FIXED_LEN {
+    if body.len() < TEXT_FIELD_FIRST_LEN {
         return Err(WireError::TextField);
     }
     let fixed = usize::from(u16::from_le_bytes([body[2], body[3]]));
-    if fixed < TEXT_FIELD_FIXED_LEN || fixed > body.len() || body[0] > 3 {
+    if fixed < TEXT_FIELD_FIRST_LEN || fixed > body.len() || body[0] > 3 {
         return Err(WireError::TextField);
     }
     let quad = |at: usize| i32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
@@ -555,6 +563,11 @@ pub fn decode_text_field(body: &[u8]) -> Result<TextField, WireError> {
         y: quad(8),
         width: pair(12),
         height: pair(14),
+        dropped: if fixed >= TEXT_FIELD_FIXED_LEN {
+            pair(16)
+        } else {
+            0
+        },
     })
 }
 
@@ -766,6 +779,7 @@ mod tests {
             y: 191,
             width: 0,
             height: 28,
+            dropped: 513,
         };
         let mut packet = Vec::new();
         encode_text_field(&field, 7, &mut packet).unwrap();
@@ -775,9 +789,20 @@ mod tests {
         assert_eq!(decode_text_field(&packet[at.clone()]), Ok(field));
         // A later version's longer fixed part is passed over.
         let mut longer = packet[at.clone()].to_vec();
-        longer[2] = 20;
+        longer[2] = 22;
         longer.extend_from_slice(&[9, 9, 9, 9]);
         assert_eq!(decode_text_field(&longer), Ok(field));
+        // The first version's 16 bytes still read, with nothing dropped.
+        let mut first = packet[at.clone()].to_vec();
+        first.truncate(16);
+        first[2] = 16;
+        assert_eq!(
+            decode_text_field(&first),
+            Ok(TextField {
+                dropped: 0,
+                ..field
+            })
+        );
         let mut unknown = packet[at.clone()].to_vec();
         unknown[0] = 4;
         assert_eq!(decode_text_field(&unknown), Err(WireError::TextField));

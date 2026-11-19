@@ -290,6 +290,7 @@ fn replay(mut args: Args) -> Result<(), Failure> {
             y: 40,
             width: 0,
             height: 20,
+            dropped: 0,
         })?;
     }
     println!(
