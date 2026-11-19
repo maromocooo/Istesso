@@ -74,20 +74,44 @@ mkdir -p "$state"
 
 # ---- Small things ----
 
-# Whether this command was started by "Istesso Dev Open" (the handler the owner's own click on a
-# Spotlight or launcher entry starts; it sets DAILY_OPEN_HANDLER=1): that application's program is
-# among this process's ancestors. A discipline guard for agents, not a security boundary.
+# Only the owner starts the per-app shortcuts. A shortcut may open its own app.
+# Opening the whole desktop requires the owner's terminal.
+# BEGIN started_by_open_handler
 started_by_open_handler() {
     [ "${DAILY_OPEN_HANDLER:-}" = 1 ] || return 1
-    local pid=$$ i command
+    local app=$1 pid=$$ i account record folder expected_bundle bundle
+    local listing line executable seen_txt
+    [[ -n $app && $app != desktop && $app != */* ]] || return 1
+    account=$(/usr/bin/id -un) || return 1
+    record=$(/usr/bin/dscl . -read "/Users/$account" NFSHomeDirectory 2>/dev/null) || return 1
+    [[ $record == 'NFSHomeDirectory: /'* && $record != *$'\n'* ]] || return 1
+    folder="${record#NFSHomeDirectory: }/Applications/Istesso Dev"
+    expected_bundle=$(printf '%s (Studio).app' "$app" | /usr/bin/tr '[:upper:]' '[:lower:]')
     for i in 1 2 3 4 5 6 7 8; do
-        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-        [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != 1 ] || return 1
-        command=$(ps -o comm= -p "$pid" 2>/dev/null)
-        case "$command" in */"Istesso Dev Open.app"/Contents/MacOS/*) return 0 ;; esac
+        pid=$(/bin/ps -o ppid= -p "$pid" 2>/dev/null | /usr/bin/tr -d ' ')
+        [[ $pid =~ ^[0-9]+$ && $pid != 0 && $pid != 1 ]] || return 1
+        listing=$(/usr/sbin/lsof -p "$pid" -a -d txt -Fn 2>/dev/null) || continue
+        executable=''
+        seen_txt=''
+        while IFS= read -r line; do
+            case "$line" in
+                ftxt) seen_txt=1 ;;
+                n*)
+                    [[ -n $seen_txt ]] || continue
+                    executable=${line#n}
+                    break ;;
+            esac
+        done <<< "$listing"
+        # The launcher names the bundle exactly "<requested app> (Studio).app", ignoring case.
+        if [[ $executable == "$folder/"*'/Contents/MacOS/istesso-owner-shim' ]]; then
+            bundle=${executable#"$folder/"}
+            bundle=${bundle%/Contents/MacOS/istesso-owner-shim}
+            [[ $(printf '%s' "$bundle" | /usr/bin/tr '[:upper:]' '[:lower:]') == "$expected_bundle" ]] && return 0
+        fi
     done
     return 1
 }
+# END started_by_open_handler
 
 signal_free() { "$repo/scripts/measuring.sh" status >/dev/null 2>&1; }
 refuse_when_busy() {
@@ -232,7 +256,7 @@ do_open() {
     # are not an application's windows). It shows everything on the Mac: the owner's only.
     if [ "$app" = desktop ]; then
         display=1
-        if [ "${DAILY_OWNER:-}" != 1 ] || { { [ ! -t 0 ] || [ ! -t 1 ]; } && ! started_by_open_handler; }; then
+        if [ "${DAILY_OWNER:-}" != 1 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
             echo "error: desktop shows the whole Mac: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
             exit 2
         fi
@@ -251,11 +275,10 @@ do_open() {
         [ -n "$entry" ] || { echo "error: $app is not in the list of applications that may be opened (scripts/daily-mac-apps.txt, ~/.config/istesso/daily-mac-apps.txt)"; exit 2; }
         local who
         read -r what start who <<< "$entry"
-        # Applications that show the owner's own content: only the owner opens them (the owner's
-        # rule). The owner says so with DAILY_OWNER=1, from a terminal; an agent never sets it,
-        # and an agent's command has no terminal.
-        if [ "$who" = owner ] && { [ "${DAILY_OWNER:-}" != 1 ] || { { [ ! -t 0 ] || [ ! -t 1 ]; } && ! started_by_open_handler; }; }; then
-            echo "error: $app shows the owner's own content: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
+        # The owner opens these apps from a terminal or the matching per-app shortcut.
+        # Agents never set DAILY_OWNER.
+        if [ "$who" = owner ] && { [ "${DAILY_OWNER:-}" != 1 ] || { { [ ! -t 0 ] || [ ! -t 1 ]; } && ! started_by_open_handler "$app"; }; }; then
+            echo "error: $app shows the owner's own content: only the owner opens it (DAILY_OWNER=1, from the owner's terminal or the matching shortcut)"
             exit 2
         fi
         [[ "$what" =~ ^[A-Za-z0-9._~/-]+$ ]] || { echo "error: the list's entry for $app is not a bundle id or a ~/ path"; exit 2; }
