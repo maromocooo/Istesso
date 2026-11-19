@@ -461,6 +461,12 @@ HOST
         echo "$name: for AURA on picture port $((base_pic + slot)), input port $((base_in + slot)) (4:2:0, $size, $fps a second)"
         return 0
     fi
+    # Picture pixels to a host point, for the viewer (ISTESSO_PICTURE_DENSITY): 2 when the window
+    # goes onto the 2x virtual display at its own size; 1 otherwise (DAILY_VIRTUAL=0, a size asked
+    # for, the whole display). A virtual display that fails on the host is not known here.
+    local density=1
+    [ -n "$virtual_arg" ] && [ -z "$size_given" ] && density=2
+    echo "$density" > "$mine/density"
     echo "$app" > "$mine/app"; echo "$clipboard_on" > "$mine/clipboard"; echo "$slot" > "$mine/slot"; echo "$size" > "$mine/size"; echo "$peer" > "$mine/peer"
     open_here "$name"
     start_guard
@@ -493,6 +499,12 @@ open_here() {
     # the host takes it; and connects again by itself after a cut.
     local clip_env=()
     [ "$(cat "$mine/clipboard" 2>/dev/null)" = 1 ] && clip_env=(ISTESSO_CLIPBOARD=1)
+    # Always said, never left to the viewer's default; a run written down before this was there
+    # had the virtual display by default.
+    local density
+    density=$(cat "$mine/density" 2>/dev/null)
+    [ "$density" = 1 ] || [ "$density" = 2 ] || density=2
+    clip_env+=(ISTESSO_PICTURE_DENSITY="$density")
     local settings=(${clip_env[@]+"${clip_env[@]}"} ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
