@@ -2331,6 +2331,11 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     // Clicks and keys that may move the focus over there (not plain typing), sent since the
     // host last said what the field is.
     unsigned long _movesSinceNotice;
+    // The last committed text sent, and when: kept for the person when the host says it had
+    // nowhere to put it (the field's count of dropped text grows).
+    NSString *_lastCommit;
+    guint64 _lastCommitNs;
+    BOOL _fieldSeen;
 }
 
 // Cancel the local composition and clear any preedit still visible on the host.
@@ -2413,6 +2418,8 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     NSString *text = [_marked copy];
     [self discardComposition];
     if (_field.state != 2 && host_takes_text && !picture_stale && input_socket >= 0) {
+        _lastCommit = [text copy];
+        _lastCommitNs = now_ns();
         if (!text_input_packets(text, ^BOOL(const char *packet, size_t length) {
                 return send_text_datagram(packet, length);
             })) {
@@ -2551,6 +2558,10 @@ static NSString *plain_text(id value) {
 
 // Whether a key may move the focus over there: anything but plain typing.
 static BOOL moves_focus(NSEvent *event) {
+    // Eisu and Kana only switch this Mac's input method: nothing goes over there.
+    if (event.keyCode == 0x66 || event.keyCode == 0x68) {
+        return NO;
+    }
     if (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) {
         return YES;
     }
@@ -2565,6 +2576,17 @@ static BOOL moves_focus(NSEvent *event) {
 
 - (void)setTextInputField:(IstessoMediaTextInput)field {
     _movesSinceNotice = 0;
+    if (_fieldSeen && field.dropped != _field.dropped && _lastCommit != nil
+        && now_ns() - _lastCommitNs < 3000000000ull) {
+        // What was typed did not arrive over there: it stays here, in the strip, for the person
+        // to see (never logged).
+        NSString *kept = _lastCommit;
+        _lastCommit = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showNotice:[NSString stringWithFormat:@"届かなかった文字：%@", kept]];
+        });
+    }
+    _fieldSeen = YES;
     BOOL toPassword = field.state == 2 && _field.state != 2;
     // Another field has the keyboard (the application moved it by itself, or it was enabled
     // again): what was being composed ends here, on this Mac too, without being committed.
@@ -2653,6 +2675,8 @@ static BOOL moves_focus(NSEvent *event) {
         [self showNotice:@"このホストは文字の入力にまだ対応していません"];
         return;
     }
+    _lastCommit = [text copy];
+    _lastCommitNs = now_ns();
     if (input_socket >= 0 && !text_input_packets(text, ^BOOL(const char *packet, size_t length) {
             note_press();
             return send_text_datagram(packet, length);

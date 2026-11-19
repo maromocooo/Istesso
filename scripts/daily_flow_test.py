@@ -198,7 +198,7 @@ class Counting(unittest.TestCase):
             def get_name(self):
                 return "wayland.text-input"
 
-            values = {"state": 2, "x": 10, "y": 20, "width": 1, "height": 16, "serial": 257}
+            values = {"state": 2, "x": 10, "y": 20, "width": 1, "height": 16, "serial": 257, "dropped": 65538}
 
             def get_value(self, key):
                 return self.values[key]
@@ -214,9 +214,11 @@ class Counting(unittest.TestCase):
         self.assertEqual(args[0], 4660)
         self.assertEqual(args[1]._obj.state, 2)
         self.assertEqual((args[1]._obj.x, args[1]._obj.height), (10, 16))
-        # The field's serial goes as 0 to 255 (the struct of istesso_media.h has 24 bytes now).
+        # The field's serial goes as 0 to 255, and the count of committed text that had nowhere to
+        # go as 0 to 65535 (the struct of istesso_media.h has 28 bytes now).
         self.assertEqual(args[1]._obj.serial, 1)
-        self.assertEqual(ctypes.sizeof(pipeline.MediaTextInput), 24)
+        self.assertEqual(args[1]._obj.dropped, 2)
+        self.assertEqual(ctypes.sizeof(pipeline.MediaTextInput), 28)
 
     def test_the_line_says_what_went_through(self):
         flow, _ = flow_with(lambda now: 0)
