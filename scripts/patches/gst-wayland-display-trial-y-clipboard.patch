@@ -16,7 +16,10 @@ loop source with a deadline of 0.5 s from the key and at most 64 KiB and a byte,
 client never stops the compositor. A paste holds the input that follows its mark (keys, pointer,
 committed text, further marks) until its text is there, at most 0.2 s, then makes the
 compositor the owner of the selection with it and presses Control-V; a paste without text first
-withdraws the compositor's own earlier selection. The primary selection is never read or set.
+withdraws the compositor's own earlier selection, and an offer a client was sent of an earlier
+selection gives nothing (seen in a test of this patch: before, it still gave the earlier text).
+The primary selection is never read or set. A text input's purpose is logged when it changes
+(a word such as "password"), for the trial's checks.
 The text, its size and the nonces are never logged (the element's debug line of an event no
 longer prints TextCommit and the clipboard's marks), only how many of each answer there were.
 
@@ -74,10 +77,10 @@ index 8d36da5..a8fd314 100644
                      // Trial only: committed text (never logged).
 diff --git a/wayland-display-core/src/comp/clipboard.rs b/wayland-display-core/src/comp/clipboard.rs
 new file mode 100644
-index 0000000..5011f04
+index 0000000..2a649c7
 --- /dev/null
 +++ b/wayland-display-core/src/comp/clipboard.rs
-@@ -0,0 +1,832 @@
+@@ -0,0 +1,854 @@
 +//! Trial only: copy and paste of text between the device a person types on and the client that
 +//! has the keyboard (Istesso's ADR 0022). Off unless `ISTESSO_CLIPBOARD_DIR` names the folder of
 +//! the session's local sockets (the one that holds `input.sock`, open to its owner only).
@@ -239,6 +242,9 @@ index 0000000..5011f04
 +    copy: Option<PendingCopy>,
 +    hold: Option<Hold>,
 +    pub(crate) held: VecDeque<Command>,
++    /// The text the compositor offers as the selection now. An offer a client was sent earlier
++    /// may still be asked for after the selection changed: only this one is served.
++    offered: Option<Offered>,
 +    next: u64,
 +    counts: std::collections::BTreeMap<&'static str, u64>,
 +}
@@ -521,6 +527,8 @@ index 0000000..5011f04
 +
 +    /// A client set the clipboard's selection (Smithay lets only the client with the keyboard).
 +    pub(crate) fn clipboard_selection_set(&mut self, source: Option<&SelectionSource>) {
++        // A client's selection (or none) takes the place of the compositor's.
++        self.clipboard.offered = None;
 +        let Some(source) = source else { return };
 +        let focused = self.focused_client();
 +        let Some(copy) = self.clipboard.copy.as_mut() else {
@@ -633,6 +641,7 @@ index 0000000..5011f04
 +            if ours {
 +                clear_data_device_selection(&self.dh, &seat);
 +            }
++            self.clipboard.offered = None;
 +            if self.focused_client().is_none() {
 +                self.clipboard.answer(&nonce, Outcome::Nothing, None);
 +                return;
@@ -682,11 +691,13 @@ index 0000000..5011f04
 +            return;
 +        }
 +        let seat = self.seat.clone();
++        let offered = Arc::new(text);
++        self.clipboard.offered = Some(offered.clone());
 +        set_data_device_selection(
 +            &self.dh,
 +            &seat,
 +            OFFERED_TYPES.iter().map(|t| t.to_string()).collect(),
-+            Some(Arc::new(text)),
++            Some(offered),
 +        );
 +        self.press_with_control(KEY_V);
 +        self.clipboard.answer(nonce, Outcome::Pasted, None);
@@ -696,6 +707,20 @@ index 0000000..5011f04
 +    /// for the client, and given up after [`SERVE_WITHIN`].
 +    pub(crate) fn serve_selection(&mut self, fd: OwnedFd, text: &Offered) {
 +        use rustix::fs::{OFlags, fcntl_setfl};
++        // Asked through an offer of a selection that is no longer the compositor's: nothing
++        // (the end is closed, and the reader reads nothing).
++        if !self
++            .clipboard
++            .offered
++            .as_ref()
++            .is_some_and(|now| Arc::ptr_eq(now, text))
++        {
++            *self.clipboard.counts.entry("stale offer").or_default() += 1;
++            tracing::info!(
++                "clipboard: an offer of an earlier selection was asked for; nothing given"
++            );
++            return;
++        }
 +        if fcntl_setfl(&fd, OFlags::NONBLOCK).is_err() {
 +            return;
 +        }
@@ -1064,7 +1089,7 @@ index 442eb42..4f0837b 100644
  }
  
 diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
-index 831b3c8..1c6d4fd 100644
+index 831b3c8..004e5df 100644
 --- a/wayland-display-core/src/tests/client.rs
 +++ b/wayland-display-core/src/tests/client.rs
 @@ -7,8 +7,14 @@ use wayland_backend::client::Backend;
@@ -1083,7 +1108,7 @@ index 831b3c8..1c6d4fd 100644
      protocol::{
          wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool,
          wl_surface,
-@@ -75,8 +81,19 @@ struct State {
+@@ -75,8 +81,21 @@ struct State {
      /// The last activation token the compositor handed out.
      activation_token: Option<String>,
      popups: Vec<Popup>,
@@ -1093,6 +1118,8 @@ index 831b3c8..1c6d4fd 100644
 +    data_device: Option<wl_data_device::WlDataDevice>,
 +    selection: Option<wl_data_offer::WlDataOffer>,
 +    offering: Option<String>,
++    /// Keep the ends a reader asks to have the selection written to, and write nothing.
++    stalling: Option<Vec<std::os::fd::OwnedFd>>,
 +    keys: Vec<(u32, bool)>,
 +    text_input_manager: Option<ZwpTextInputManagerV3>,
  }
@@ -1103,7 +1130,7 @@ index 831b3c8..1c6d4fd 100644
  /// A popup the client has opened (a menu): whether the compositor has dismissed it.
  struct Popup {
      surface: wl_surface::WlSurface,
-@@ -170,6 +187,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
+@@ -170,6 +189,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                              (),
                          ));
                  }
@@ -1121,7 +1148,7 @@ index 831b3c8..1c6d4fd 100644
                  "wl_output" => {
                      // The compositor only advertises wl_output after the first
                      // VideoInfo has created it, so this branch may fire well after
-@@ -196,6 +224,65 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
+@@ -196,6 +226,69 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
  delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
  delegate_noop!(State: ignore xdg_activation_v1::XdgActivationV1);
  delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
@@ -1173,6 +1200,10 @@ index 831b3c8..1c6d4fd 100644
 +        _: &QueueHandle<Self>,
 +    ) {
 +        if let wl_data_source::Event::Send { fd, .. } = event {
++            if let Some(kept) = state.stalling.as_mut() {
++                kept.push(fd);
++                return;
++            }
 +            // In a thread of its own: the compositor reads while the test turns its loop, and a
 +            // text larger than the pipe would otherwise block here.
 +            use std::io::Write;
@@ -1187,7 +1218,7 @@ index 831b3c8..1c6d4fd 100644
  
  impl Dispatch<xdg_popup::XdgPopup, usize> for State {
      fn event(
-@@ -263,6 +350,12 @@ impl WaylandClient {
+@@ -263,6 +356,13 @@ impl WaylandClient {
              activation: None,
              activation_token: None,
              popups: Vec::new(),
@@ -1195,12 +1226,13 @@ index 831b3c8..1c6d4fd 100644
 +            data_device: None,
 +            selection: None,
 +            offering: None,
++            stalling: None,
 +            keys: Vec::new(),
 +            text_input_manager: None,
          };
  
          WaylandClient {
-@@ -286,6 +379,81 @@ impl WaylandClient {
+@@ -286,6 +386,105 @@ impl WaylandClient {
          self.queue.dispatch_pending(&mut self.state).unwrap();
      }
  
@@ -1258,6 +1290,30 @@ index 831b3c8..1c6d4fd 100644
 +        reader
 +    }
 +
++    /// From now on, a reader of this client's selection gets nothing, and its pipe is kept
++    /// open: a client that hangs.
++    pub fn stall_selection(&mut self) {
++        self.state.stalling = Some(Vec::new());
++    }
++
++    /// The selection's offer as it is now, to be asked again later.
++    pub fn selection_offer(&self) -> Option<wl_data_offer::WlDataOffer> {
++        self.state.selection.clone()
++    }
++
++    /// Asks an offer (perhaps an old one) for its contents in this kind.
++    pub fn receive_from(
++        &mut self,
++        offer: &wl_data_offer::WlDataOffer,
++        kind: &str,
++    ) -> std::io::PipeReader {
++        let (reader, writer) = std::io::pipe().unwrap();
++        offer.receive(kind.to_string(), writer.as_fd());
++        drop(writer);
++        self.conn.flush().unwrap();
++        reader
++    }
++
 +    /// The keys this client was sent (Linux numbers, pressed or not), since the last time.
 +    pub fn take_keys(&mut self) -> Vec<(u32, bool)> {
 +        std::mem::take(&mut self.state.keys)
@@ -1282,7 +1338,7 @@ index 831b3c8..1c6d4fd 100644
      pub fn send_sync(&self) -> Arc<SyncData> {
          let data = Arc::new(SyncData::default());
          self.display.sync(&self.qh, data.clone());
-@@ -1140,7 +1308,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+@@ -1140,7 +1339,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
          match event {
              wl_keyboard::Event::Enter { surface, .. } => state.keyboard_in = Some(surface),
              wl_keyboard::Event::Leave { .. } => state.keyboard_in = None,
@@ -1313,10 +1369,10 @@ index ad5c069..cea3dd4 100644
  mod test_windows;
 diff --git a/wayland-display-core/src/tests/test_trial_clipboard.rs b/wayland-display-core/src/tests/test_trial_clipboard.rs
 new file mode 100644
-index 0000000..f248213
+index 0000000..9a19e84
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_clipboard.rs
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,353 @@
 +//! Trial only (Istesso's ADR 0022): copy and paste with the device a person types on. A real
 +//! Wayland client has the keyboard; the agent's side is played by sockets of the test's own.
 +
@@ -1631,6 +1687,45 @@ index 0000000..f248213
 +    a.turn(3);
 +    assert_eq!(a.f.client.take_keys(), Vec::new());
 +}
++
++#[test]
++fn a_client_that_hangs_on_the_copy_gets_none_in_time_and_others_are_served_meanwhile() {
++    let mut a = agent();
++    let mut other = a.f.another_client();
++    a.f.client.stall_selection();
++    let asked = Instant::now();
++    a.input(copy("n9", false));
++    a.turn(2);
++    a.f.client.set_selection("never sent", &["text/plain"]);
++    a.turn(4);
++    // The compositor goes on serving another client while it waits for this one.
++    a.f.round_trip_with(&mut other);
++    let answer = a.answer(Duration::from_secs(2)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("none")));
++    let took = asked.elapsed();
++    assert!(took < Duration::from_millis(900), "took {took:?}");
++    a.f.round_trip_with(&mut other);
++}
++
++#[test]
++fn an_offer_of_a_withdrawn_paste_gives_nothing() {
++    let mut a = agent();
++    a.send(r#"{"kind":"paste_text","nonce":"p7","text":"withdrawn"}"#);
++    a.turn(3);
++    a.input(paste("p7", true));
++    a.answer(Duration::from_secs(1)).unwrap();
++    a.turn(3);
++    let old = a.f.client.selection_offer().unwrap();
++    a.input(paste("p8", false));
++    a.answer(Duration::from_secs(1)).unwrap();
++    a.turn(3);
++    assert_eq!(a.f.client.selection_kinds(), None);
++    let mut reader = a.f.client.receive_from(&old, "text/plain");
++    a.turn(10);
++    let mut read = String::new();
++    let _ = reader.read_to_string(&mut read);
++    assert_eq!(read, "");
++}
 diff --git a/wayland-display-core/src/wayland/handlers/data_device.rs b/wayland-display-core/src/wayland/handlers/data_device.rs
 index a51dbf4..6e207fd 100644
 --- a/wayland-display-core/src/wayland/handlers/data_device.rs
@@ -1675,10 +1770,10 @@ index a51dbf4..6e207fd 100644
  
  impl DataDeviceHandler for State {
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
-index a5d91e4..c0a032e 100644
+index a5d91e4..c2c6009 100644
 --- a/wayland-display-core/src/wayland/handlers/text_input.rs
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -104,6 +104,11 @@ struct Instance {
+@@ -104,6 +104,15 @@ struct Instance {
      /// What the client asked for since its last `commit`.
      pending: Option<bool>,
      enabled: bool,
@@ -1687,19 +1782,26 @@ index a5d91e4..c0a032e 100644
 +    /// from such a field is refused (ADR 0022).
 +    secret: bool,
 +    pending_secret: Option<bool>,
++    /// The purpose the client last told (for the log: a word, never what is typed).
++    purpose: &'static str,
++    pending_purpose: Option<&'static str>,
++    enabled_logged: bool,
      /// The surface it was told it entered, if any.
      entered: Option<WlSurface>,
  }
-@@ -123,6 +128,8 @@ impl TextInputs {
+@@ -123,6 +132,11 @@ impl TextInputs {
              commits: 0,
              pending: None,
              enabled: false,
 +            secret: false,
 +            pending_secret: None,
++            purpose: "normal",
++            pending_purpose: None,
++            enabled_logged: false,
              entered: None,
          };
          if let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) {
-@@ -158,6 +165,8 @@ impl TextInputs {
+@@ -158,6 +172,8 @@ impl TextInputs {
              // Until the client enables it again for the new surface.
              instance.enabled = false;
              instance.pending = None;
@@ -1708,7 +1810,7 @@ index a5d91e4..c0a032e 100644
          }
          self.focus = surface;
          if let Some(focus) = &self.focus {
-@@ -184,6 +193,17 @@ impl TextInputs {
+@@ -184,6 +200,17 @@ impl TextInputs {
              .then_some(focus)
      }
  
@@ -1726,21 +1828,36 @@ index a5d91e4..c0a032e 100644
      /// Hands `text` to the enabled text input of the client that has the keyboard. False when
      /// there is none.
      pub fn commit(&mut self, text: &str) -> bool {
-@@ -349,6 +369,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -349,6 +376,9 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
              zwp_text_input_v3::Request::Enable => {
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.pending = Some(true);
 +                    // Enabling starts the state again: the content type is told after it.
 +                    instance.pending_secret = Some(false);
++                    instance.pending_purpose = Some("normal");
                  }
              }
              zwp_text_input_v3::Request::Disable => {
-@@ -363,12 +385,25 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -363,12 +393,49 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                          // Only a text input that was told it entered a surface may be enabled.
                          instance.enabled = enable && instance.entered.is_some();
                      }
++                    let was = (instance.enabled_logged, instance.purpose);
 +                    if let Some(secret) = instance.pending_secret.take() {
 +                        instance.secret = secret;
++                    }
++                    if let Some(purpose) = instance.pending_purpose.take() {
++                        instance.purpose = purpose;
++                    }
++                    // What the trial's checks look for (ADR 0022): whether a field said it is
++                    // for a password. Only when it changes; never anything typed.
++                    if was != (instance.enabled, instance.purpose) {
++                        instance.enabled_logged = instance.enabled;
++                        tracing::info!(
++                            enabled = instance.enabled,
++                            purpose = instance.purpose,
++                            "text input: state"
++                        );
 +                    }
 +                }
 +            }
@@ -1752,6 +1869,16 @@ index a5d91e4..c0a032e 100644
 +                        purpose,
 +                        WEnum::Value(ContentPurpose::Password | ContentPurpose::Pin)
 +                    ));
++                    instance.pending_purpose = Some(match purpose {
++                        WEnum::Value(ContentPurpose::Normal) => "normal",
++                        WEnum::Value(ContentPurpose::Password) => "password",
++                        WEnum::Value(ContentPurpose::Pin) => "pin",
++                        WEnum::Value(ContentPurpose::Email) => "email",
++                        WEnum::Value(ContentPurpose::Url) => "url",
++                        WEnum::Value(ContentPurpose::Terminal) => "terminal",
++                        WEnum::Value(_) => "other",
++                        WEnum::Unknown(_) => "unknown",
++                    });
                  }
              }
              zwp_text_input_v3::Request::Destroy => {

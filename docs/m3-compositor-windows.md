@@ -400,3 +400,24 @@ Istesso の ADR 0022（`trial-daily-clipboard` ブランチ）の、Ubuntu の�
 - `scripts/check-plugin.sh`：試用の修正だけが足すファイルに `wayland/handlers/text_input.rs` と `comp/clipboard.rs`、プラグインの中の文字列に `clipboard: answered` を足した。
 
 確かめたこと（ホスト、2026-11-19）：`scripts/build-compositor.sh <自分のフォルダー>/gwd-trial28 --trial --test` で、7 つの修正が当たり、テストは 127 本すべて通った（このうち 15 本が新しい。本物の Wayland クライアントで、`hello`、コピー、切り取り、前からある選択は取らない、ほかのアプリがキーボードを取ったら取らない、パスワードの欄、秘密の印、上限と制御文字、貼り付け、文字を待つあいだのキー、期限、文字のない貼り付けの取り下げ、上限を超えた貼り付け。ほかに、上限と JSON の 2 本）。クリップボードのテストだけを 3 回続けて流して、3 回とも通った。`check-plugin.sh` は 1（試用）。試用版には、まだ組み込んでいない。本物のアプリ（Firefox、Blender、Text Editor）では、まだ試していない。
+
+### レビューのあとの確かめ（`gwd-trial29`、2026-11-19 14:2x〜14:32、ホストだけ）
+
+別の目のレビューの指摘（パスワードの拒みは、text-input-v3 で目的が password か pin のときにしか効かない）を、本物のツールキットで確かめた。どれも、自分のフォルダーの、窓を出さないコンポジター（fakesink）の中で、自分の XDG のフォルダー、`HOME`、`GSETTINGS_BACKEND=memory`、`GIO_USE_VFS=local`、試用と同じ何も起動できないバスで動かした。ダミーの語を打ち、Control-A、`ClipboardCopy` の印を送り、答えの result と why だけを見た（文字は出していない）。
+
+| アプリ、欄 | 答え | text-input-v3（コンポジターのログの語） | だれが止めたか |
+|---|---|---|---|
+| GTK 3 の `Gtk.Entry`（ふつう、対照） | text | 有効、normal | —（コピーされる） |
+| GTK 3 の `Gtk.Entry`、visibility を切ったもの | none | 有効、**normal** | アプリ自身（コピーしない） |
+| GTK 4 の `Gtk.Entry`（ふつう、対照） | text | 有効、normal | — |
+| GTK 4 の `Gtk.Entry`、visibility を切ったもの | none | 有効、**normal** | アプリ自身 |
+| GTK 4 の `Gtk.PasswordEntry` | refused、password_field | 有効、**password** | この修正（キーを押さない） |
+| Chrome（試用と同じ引数）、`<input type=text>`（対照） | text | 有効、normal（いったん無効も） | — |
+| Chrome、`<input type=password>` | none | 有効、**normal** | アプリ自身 |
+| Firefox | 動かしていない | — | ホストの Firefox は snap だけ（`/usr/bin/firefox` は snap への移行用のパッケージ）。持ち主の snap のフォルダーに触れないため |
+| Blender | 動かしていない | — | ホストの PATH にない。パスワードの欄もない |
+
+- 見たこと：text-input-v3 の目的が password になったのは、GTK 4 の `Gtk.PasswordEntry` だけ。visibility を切った GTK の欄と、Chrome のパスワードの欄は、normal と言う。そこからのコピーを止めたのは、アプリ自身だった（Control-C を押しても、選択を置かない）。この修正の拒みは、アプリが止めないときの第 2 の線にはならない。
+- アクセシビリティ（AT-SPI）：試用と同じ形のバス（サービスの置き場が空）の中から `org.a11y.Bus` を呼ぶと、`ServiceUnknown`（見た）。試用版はアプリに `NO_AT_BRIDGE=1` も渡している（`scripts/daily.sh` から。考えただけ）。試用のセッションの中では、2 つ目の目印として使えない。
+- 記録（ADR 0022 の確かめ 7）：`trial-daily-clipboard` の `scripts/daily-pipeline.py --clipboard`（a1a21fc）を、`m1-step3-host.py` の代わりの自前の小さなホストの台本（同じ入力の受け渡し、エンコーダーなし）で動かし、`GST_DEBUG='*:7'`、`RUST_LOG=trace` で、決めたダミーの語を貼り付けて、コピーし直した（貼り付け pasted、コピー text、同じ語に戻った）。標準出力（4 MB）、標準エラー、GStreamer のデバッグの記録（11 MB）、アプリの出力に、その語は 0 回。合い言葉は、GStreamer のデバッグの記録に 2 行（`GST_EVENT` の段の、印のイベントの中身。分かっていて受け入れたもの）。
+- テスト（2 本足した。129 本すべて通った）：(a) コピーの選択を書かず、パイプも閉じないクライアント：キーから 0.9 秒より前に `none`、そのあいだにほかのクライアントの往復が通る。(b) 貼り付けを取り下げたあと、前の `wl_data_offer` から読む：**直す前は、取り下げた文字が読めた**（見た）。直した：コンポジターが、いま出している文字のときだけ書き、ほかは何も書かずに閉じる。テキスト入力の目的は、変わったときだけ、語（password など）でログに書くようにした。
