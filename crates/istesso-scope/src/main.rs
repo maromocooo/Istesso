@@ -204,6 +204,12 @@ enum ProbeCmd {
         seconds: u64,
         reply: String,
     },
+    /// Asks for an io_uring instance.
+    IoUring,
+    /// Connects with MPTCP (IPv4 address:port).
+    Mptcp {
+        addr: String,
+    },
     /// Binds a TCP socket to "any address" (IPv6 with --v6) and prints where it was bound.
     /// It never listens, so nothing can connect to it.
     BindAny {
@@ -718,6 +724,8 @@ fn probe(what: ProbeCmd) -> i32 {
             reply,
         } => p::serve_tcp(port, seconds, &reply),
         ProbeCmd::BindAny { port, v6 } => p::bind_any(port, v6),
+        ProbeCmd::IoUring => p::io_uring(),
+        ProbeCmd::Mptcp { addr } => p::mptcp(&addr),
         ProbeCmd::ServeAbstract {
             name,
             seconds,

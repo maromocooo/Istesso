@@ -104,12 +104,24 @@ fn calls(opts: &Options) -> (Vec<libc::c_long>, Vec<libc::c_long>) {
     if opts.loopback {
         notify.extend([libc::SYS_bind, libc::SYS_listen]);
     }
-    if opts.loopback || opts.hold_files || opts.hold_connect {
-        // io_uring can open, connect, bind and listen without these system calls.
-        enosys.push(libc::SYS_io_uring_setup);
-    }
+    // Always, with or without the supervisor: io_uring can open, connect, bind, listen and send
+    // (with MSG_FASTOPEN too) without the system calls above, and open_by_handle_at opens a file
+    // without a path. Landlock still checks what they open and connect, but not Fast Open, and
+    // nothing of it would be held.
+    enosys.extend(ALWAYS_ENOSYS);
     (notify, enosys)
 }
+
+/// System calls answered `ENOSYS` by every filter (see `calls`).
+const ALWAYS_ENOSYS: [libc::c_long; 4] = [
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_open_by_handle_at,
+];
+
+/// `IPPROTO_MPTCP` (linux/in.h).
+const IPPROTO_MPTCP: u32 = 262;
 
 /// `MSG_FASTOPEN` (linux/socket.h).
 const MSG_FASTOPEN: u32 = 0x2000_0000;
@@ -122,15 +134,20 @@ const fn arg_low(i: u32) -> u32 {
 /// The seccomp program: the calls of `calls` go to the supervisor or get `ENOSYS`; everything
 /// else is allowed. Other architectures and the x32 ABI are refused.
 ///
-/// Always, whatever the options: `sendto`, `sendmsg` and `sendmmsg` with `MSG_FASTOPEN` get
-/// `EOPNOTSUPP`. TCP Fast Open makes the connection inside the send, and on the host (kernel
-/// 6.17, Landlock ABI 7) Landlock's connect rule did not see it: a port refused to `connect`
-/// was reached with `sendto(MSG_FASTOPEN)` (docs/research/agent-scope-proto.md).
+/// Always, whatever the options, two ways past Landlock's TCP rule are closed (seen on the host,
+/// kernel 6.17, Landlock ABI 7; docs/research/agent-scope-proto.md, 10.5):
+///
+/// - `sendto`, `sendmsg` and `sendmmsg` with `MSG_FASTOPEN` get `EOPNOTSUPP`. TCP Fast Open makes
+///   the connection inside the send, and a port refused to `connect` was reached that way.
+/// - `socket` with `IPPROTO_MPTCP` gets `EPROTONOSUPPORT`. Landlock's rule covers TCP sockets
+///   only, and an MPTCP socket reached a refused TCP port (MPTCP falls back to plain TCP).
+///
+/// And the calls of `ALWAYS_ENOSYS` get `ENOSYS`.
 pub fn filter(opts: &Options) -> Vec<libc::sock_filter> {
     use libc::{
         BPF_ABS, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W,
-        ENOSYS, EOPNOTSUPP, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS,
-        SECCOMP_RET_USER_NOTIF,
+        ENOSYS, EOPNOTSUPP, EPROTONOSUPPORT, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
+        SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_USER_NOTIF,
     };
     let eq = BPF_JMP | BPF_JEQ | BPF_K;
     let ld = BPF_LD | BPF_W | BPF_ABS;
@@ -154,6 +171,13 @@ pub fn filter(opts: &Options) -> Vec<libc::sock_filter> {
         /* 12 */ jump(BPF_JMP | BPF_JSET | BPF_K, MSG_FASTOPEN, 0, 1),
         /* 13 */ stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EOPNOTSUPP as u32),
         /* 14 */ stmt(ld, 0), // seccomp_data.nr again
+        // MPTCP: the protocol is the 3rd argument of socket.
+        /* 15 */
+        jump(eq, libc::SYS_socket as u32, 0, 3),
+        /* 16 */ stmt(ld, arg_low(2)),
+        /* 17 */ jump(eq, IPPROTO_MPTCP, 0, 1),
+        /* 18 */ stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPROTONOSUPPORT as u32),
+        /* 19 */ stmt(ld, 0), // seccomp_data.nr again
     ];
     let checks = notify.len() + enosys.len();
     let allow = f.len() + checks;
@@ -610,8 +634,11 @@ fn decide_open(fd: RawFd, req: &libc::seccomp_notif, plan: &Plan) -> Option<Held
         Err(_) if flags & libc::O_CREAT != 0 => {}
         Err(_) => return None, // missing: "not found" from the kernel, as without the hold
     }
-    // A path that cannot be shown as it is will not be asked about.
-    real.to_str()?;
+    // A path that cannot be shown as it is (not UTF-8, a control character, a bidi control or
+    // another invisible one) is never asked about: the kernel refuses it.
+    if !ask::showable(real.to_str()?) {
+        return None;
+    }
     let asked_as = (path != real).then_some(path);
     Some(Held::Open {
         id: req.id,
@@ -1308,6 +1335,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mptcp_sockets_are_refused_by_every_filter() {
+        let refuse = libc::SECCOMP_RET_ERRNO | libc::EPROTONOSUPPORT as u32;
+        let allow = libc::SECCOMP_RET_ALLOW;
+        let (inet, inet6, stream) = (
+            libc::AF_INET as u64,
+            libc::AF_INET6 as u64,
+            libc::SOCK_STREAM as u64,
+        );
+        for o in [opts(false, false, false), opts(true, true, true)] {
+            let f = filter(&o);
+            let mp = IPPROTO_MPTCP as u64;
+            assert_eq!(
+                verdict_args(&f, libc::SYS_socket, [inet, stream, mp, 0, 0, 0]),
+                refuse
+            );
+            assert_eq!(
+                verdict_args(&f, libc::SYS_socket, [inet6, stream, mp, 0, 0, 0]),
+                refuse
+            );
+            // TCP (by number and by default), UDP and UNIX sockets pass.
+            let tcp = libc::IPPROTO_TCP as u64;
+            assert_eq!(
+                verdict_args(&f, libc::SYS_socket, [inet, stream, tcp, 0, 0, 0]),
+                allow
+            );
+            assert_eq!(
+                verdict_args(&f, libc::SYS_socket, [inet, stream, 0, 0, 0, 0]),
+                allow
+            );
+            let udp = libc::SOCK_DGRAM as u64;
+            assert_eq!(
+                verdict_args(&f, libc::SYS_socket, [inet, udp, 0, 0, 0, 0]),
+                allow
+            );
+            let unix = libc::AF_UNIX as u64;
+            assert_eq!(
+                verdict_args(&f, libc::SYS_socket, [unix, stream, 0, 0, 0, 0]),
+                allow
+            );
+            // The checks after the block still see the call number.
+            assert_eq!(verdict(&f, libc::SYS_read), allow);
+        }
+    }
+
     fn opts(hold_files: bool, hold_connect: bool, loopback: bool) -> Options {
         Options {
             hold_files,
@@ -1346,14 +1418,10 @@ mod tests {
                     );
                     assert_eq!(verdict(&f, libc::SYS_bind), net);
                     assert_eq!(verdict(&f, libc::SYS_listen), net);
-                    assert_eq!(
-                        verdict(&f, libc::SYS_io_uring_setup),
-                        if hold_files || hold_connect || loopback {
-                            enosys
-                        } else {
-                            allow
-                        }
-                    );
+                    for nr in ALWAYS_ENOSYS {
+                        assert_eq!(verdict(&f, nr), enosys);
+                    }
+                    assert_eq!(verdict(&f, libc::SYS_name_to_handle_at), allow);
                     assert_eq!(verdict(&f, libc::SYS_read), allow);
                     assert_eq!(verdict(&f, libc::SYS_renameat2), allow);
                     assert_eq!(verdict(&f, 0x4000_0000 + 2), enosys); // x32

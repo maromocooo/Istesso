@@ -251,3 +251,64 @@ pub fn bind_any(port: u16, v6: bool) -> i32 {
         })(),
     )
 }
+
+/// Asks the kernel for an io_uring instance (and closes it at once when it gets one).
+pub fn io_uring() -> i32 {
+    outcome(
+        "io_uring_setup",
+        (|| {
+            let mut params = [0u8; 120];
+            // SAFETY: io_uring_setup with a zeroed parameter block of the kernel's size.
+            let fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 4u32, params.as_mut_ptr()) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: the descriptor we just got.
+            unsafe { libc::close(fd as i32) };
+            Ok(String::new())
+        })(),
+    )
+}
+
+/// An MPTCP connection (IPv4) to `addr`, reading the first line of the answer.
+pub fn mptcp(addr: &str) -> i32 {
+    outcome(
+        &format!("mptcp connect {addr}"),
+        (|| {
+            let sa: std::net::SocketAddrV4 = addr
+                .parse()
+                .map_err(|_| std::io::Error::other("not an IPv4 address with a port"))?;
+            // SAFETY: plain socket calls on a descriptor owned below.
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 262) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: a new descriptor we own.
+            let sock = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: sa.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(sa.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: connect with a correctly sized address.
+            let r = unsafe {
+                libc::connect(
+                    fd,
+                    (&sin as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut s = TcpStream::from(sock);
+            s.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).unwrap_or(0);
+            Ok(String::from_utf8_lossy(&buf[..n]).trim().to_string())
+        })(),
+    )
+}

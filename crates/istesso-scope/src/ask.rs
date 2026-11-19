@@ -165,29 +165,39 @@ pub enum Grant {
 }
 
 impl Grant {
-    pub fn line(&self) -> String {
-        match self {
-            Grant::Read(p) => format!("read {}", p.display()),
-            Grant::Write(p) => format!("write {}", p.display()),
-            Grant::Connect(a) => format!("connect {a}"),
-        }
+    /// The grant's line, or `None` when the path could not be read back exactly: not UTF-8, or
+    /// holding a character that is not [`showable`] (a line break, a carriage return, a bidi
+    /// control).
+    pub fn line(&self) -> Option<String> {
+        let (kind, p) = match self {
+            Grant::Read(p) => ("read", p),
+            Grant::Write(p) => ("write", p),
+            Grant::Connect(a) => return Some(format!("connect {a}")),
+        };
+        let text = p.to_str()?;
+        (showable(text) && is_plain_absolute(p)).then(|| format!("{kind} {text}"))
     }
 }
 
 const GRANTS_HEADER: &str =
     "# istesso-scope grants: added by the owner's \"widen and keep\" answers, read at each start\n";
 
-/// Reads a grants file. Lines are `read <absolute path>`, `write <absolute path>` or
-/// `connect <address:port>`; `#` starts a comment. Anything else is an error, so a damaged file
-/// stops the start instead of granting something nobody meant.
+/// Reads a grants file. Lines end with `\n` alone and are `read <absolute path>`,
+/// `write <absolute path>` or `connect <address:port>`, with one space after the kind; the path
+/// is the rest of the line, byte for byte. `#` starts a comment line. Anything else is an
+/// error, so a damaged file stops the start instead of granting something nobody meant: a
+/// carriage return or any other control character, and anything [`showable`] refuses, is never
+/// stripped or skipped.
 pub fn parse_grants(text: &str) -> Result<Vec<Grant>, String> {
     let mut out = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim_end_matches('\r');
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+    for (n, line) in text.split('\n').enumerate() {
+        let bad = |why: &str| format!("grants line {}: {why}", n + 1);
+        if !showable(line) {
+            return Err(bad("a control or invisible character"));
+        }
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let bad = |why: &str| format!("grants line {}: {why}", n + 1);
         let (kind, rest) = line.split_once(' ').ok_or_else(|| bad("no value"))?;
         let grant = match kind {
             "read" | "write" => {
@@ -237,9 +247,14 @@ pub fn append_grant(file: &Path, grant: &Grant) -> io::Result<()> {
     if existing.contains(grant) {
         return Ok(());
     }
-    let line = grant.line();
-    if line.contains('\n') {
-        return Err(io::Error::other("a grant cannot hold a line break"));
+    let Some(line) = grant.line() else {
+        return Err(io::Error::other(
+            "the path cannot be kept exactly (not UTF-8, or a control or invisible character)",
+        ));
+    };
+    // What is written must read back as the same grant, or it is not written.
+    if parse_grants(&line).ok().as_deref() != Some(std::slice::from_ref(grant)) {
+        return Err(io::Error::other("the grant would not read back the same"));
     }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -505,13 +520,37 @@ pub enum Answers<R: BufRead> {
     Script(Vec<Choice>),
 }
 
-/// Replaces control characters, so that a name chosen by the confined program cannot move the
-/// cursor or redraw the form.
+/// Characters that show nothing, or change how the text around them is shown: Unicode format
+/// characters (Cf: the bidi controls, zero-width characters, the byte-order mark, tags),
+/// separators that break lines, spaces other than the plain space, fillers and variation
+/// selectors. A name holding one can look like another name.
+pub fn is_invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00A0 | 0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+        | 0x1680 | 0x2000..=0x200F | 0x2028..=0x202F | 0x205F..=0x206F | 0x2800 | 0x3000
+        | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0xFFF9..=0xFFFB
+        | 0x0600..=0x0605 | 0x06DD | 0x070F | 0x0890 | 0x0891 | 0x08E2
+        | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0000..=0xE0FFF)
+}
+
+/// Whether `text` can be shown as it is: no control character and nothing of
+/// [`is_invisible`]. Paths that cannot are never asked about (the kernel refuses them), and
+/// never kept as grants.
+pub fn showable(text: &str) -> bool {
+    !text.chars().any(|c| c.is_control() || is_invisible(c))
+}
+
+/// Replaces control characters and the characters of [`is_invisible`] with escapes, so that a
+/// name chosen by the confined program cannot move the cursor, redraw the form, or look like
+/// another name. (Letters that look alike in different scripts are not caught.)
 pub fn printable(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
             if c.is_control() {
                 c.escape_default().collect::<Vec<_>>()
+            } else if is_invisible(c) {
+                c.escape_unicode().collect::<Vec<_>>()
             } else {
                 vec![c]
             }
@@ -720,9 +759,21 @@ mod tests {
                 Grant::Connect("127.0.0.1:26888".parse().unwrap()),
             ]
         );
-        for line in g.iter().map(Grant::line) {
+        for line in g.iter().map(|g| g.line().unwrap()) {
             assert_eq!(parse_grants(&line).unwrap().len(), 1);
         }
+        // A path with spaces is the rest of the line, as it is.
+        assert_eq!(
+            parse_grants("read /w/a b \n").unwrap(),
+            vec![Grant::Read(PathBuf::from("/w/a b "))]
+        );
+        // A carriage return is refused, never stripped (it would name another file).
+        assert!(parse_grants("read /w/a\r\n").is_err());
+        assert!(parse_grants("read /w/a\r").is_err());
+        assert!(parse_grants("read /w/\u{202e}txt.a\n").is_err());
+        assert!(parse_grants("read /w/a\u{200b}\n").is_err());
+        assert!(parse_grants("read /w/a\tb\n").is_err());
+        assert!(parse_grants("read  /w/a").is_err());
         assert!(parse_grants("read relative/x").is_err());
         assert!(parse_grants("read /work/../etc/shadow").is_err());
         assert!(parse_grants("read /work/./x").is_err());
@@ -750,6 +801,44 @@ mod tests {
             folder: true,
         };
         assert_eq!(folder.widen_target(), "read /w/d and everything below it");
+    }
+
+    #[test]
+    fn paths_that_would_not_read_back_are_never_kept() {
+        for bad in [
+            "/w/b.txt\r",
+            "/w/b\n.txt",
+            "/w/\u{202e}txt.exe",
+            "/w/a\u{200b}",
+            "/w/a\u{feff}",
+            "/w/a\u{a0}b",
+            "/w/../etc",
+        ] {
+            assert_eq!(Grant::Write(PathBuf::from(bad)).line(), None, "{bad:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let not_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/w/\xff"));
+            assert_eq!(Grant::Read(not_utf8).line(), None);
+        }
+        let d = temp_dir("bad-grants");
+        let f = d.join("grants");
+        let _ = std::fs::remove_file(&f);
+        assert!(append_grant(&f, &Grant::Write(PathBuf::from("/w/b.txt\r"))).is_err());
+        assert!(!f.exists(), "nothing is written for a refused grant");
+        let _ = std::fs::remove_dir(&d);
+    }
+
+    #[test]
+    fn invisible_and_reordering_characters_are_shown_escaped() {
+        assert_eq!(printable("a\u{202e}b"), "a\\u{202e}b");
+        assert_eq!(printable("x\u{200b}y\u{feff}"), "x\\u{200b}y\\u{feff}");
+        assert_eq!(printable("a\u{a0}b"), "a\\u{a0}b");
+        assert_eq!(printable("日本語 ok"), "日本語 ok");
+        assert!(showable("/w/日本語/a b.txt"));
+        assert!(!showable("/w/a\u{2066}b"));
+        assert!(!showable("/w/a\rb"));
     }
 
     #[test]

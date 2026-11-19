@@ -90,6 +90,8 @@ impl Drop for Fixture {
             "outside/secret.txt",
             "outside/grants",
             "outside/x.txt",
+            "outside/cr.txt\r",
+            "outside/\u{202e}txt.exe",
         ] {
             let _ = std::fs::remove_file(self.p(f));
         }
@@ -360,6 +362,53 @@ fn a_link_put_in_place_after_the_question_is_not_followed() {
     assert!(text.contains(": once"), "{text}");
     assert!(text.contains("symbolic links"), "{text}");
     assert!(!text.contains("outside\n"), "{text}");
+}
+
+/// Names that cannot be shown as they are (a carriage return, a bidi control) are never asked
+/// about: the kernel refuses them, even with a stand-in that would allow everything.
+#[test]
+fn names_that_cannot_be_shown_are_not_asked_about() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    for name in ["outside/cr.txt\r", "outside/\u{202e}txt.exe"] {
+        let path = f.p(name);
+        std::fs::write(&path, "x").unwrap();
+        let (ok, text) = f.probe(
+            "1",
+            &["--hold-files", "--ask-cmd", "exit 0"],
+            &["read", &path.display().to_string()],
+        );
+        assert!(!ok, "{text}");
+        assert!(text.contains(" 0 asked"), "{text}");
+    }
+}
+
+/// io_uring (which could open, connect and send around the hold) and MPTCP (which Landlock's
+/// TCP rule does not cover) are refused at level 1, with and without the supervisor.
+#[test]
+fn io_uring_and_mptcp_are_refused_with_or_without_the_supervisor() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = format!("127.0.0.1:{}", other.local_addr().unwrap().port());
+    for extra in [
+        &["--listen-anywhere"][..],
+        &["--hold-files", "--hold-connect"][..],
+    ] {
+        let (ok, text) = f.probe("1", extra, &["io-uring"]);
+        assert!(!ok, "{text}");
+        assert!(text.contains("os error 38"), "{text}"); // ENOSYS
+        let (ok, text) = f.probe("1", extra, &["mptcp", &target]);
+        assert!(!ok, "{text}");
+        assert!(text.contains("os error 93"), "{text}"); // EPROTONOSUPPORT
+    }
+    // Level 4 is not confined.
+    let (ok, text) = f.probe("4", &[], &["io-uring"]);
+    assert!(ok, "{text}");
 }
 
 #[test]
