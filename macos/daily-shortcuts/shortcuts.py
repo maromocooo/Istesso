@@ -24,7 +24,8 @@ SCHEME = "istesso-dev-open"
 MANIFEST = ".daily-shortcuts.json"
 LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
               "LaunchServices.framework/Support/lsregister")
-OWNER_ONLY = {"safari", "notes", "finder", "preview", "dia", "desktop"}
+OWNER_LIST = Path.home() / ".config/istesso/daily-shortcuts-owner-apps.txt"
+OWNER_APPS = {app.lower(): app for app in ("Safari", "Notes", "Finder", "Preview", "Dia")}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_ICON_BYTES = 8 << 20
 
@@ -35,10 +36,11 @@ def valid_bundle_component(name):
 
 
 def valid_app_name(name):
-    return valid_bundle_component(name) and name.lower().removesuffix(".app") not in OWNER_ONLY
+    app = name.lower().removesuffix(".app")
+    return valid_bundle_component(name) and app != "desktop" and app not in OWNER_APPS
 
 
-def app_list(ubuntu, mac_list):
+def app_list(ubuntu, mac_list, owner_list=None):
     rows = []
     for line in ubuntu.splitlines():
         app, title = line.split("\t")
@@ -50,6 +52,19 @@ def app_list(ubuntu, mac_list):
             if not valid_app_name(app):
                 raise ValueError("invalid app name in mac-apps.txt")
             rows.append(("mac", app, app + " (Studio)"))
+    if owner_list is not None:
+        try:
+            lines = owner_list.read_text().splitlines()
+        except FileNotFoundError:
+            lines = []
+        for number, line in enumerate(lines, 1):
+            if not line:
+                continue
+            app = line.lower().removesuffix(".app")
+            if app not in OWNER_APPS:
+                raise ValueError(f"daily-shortcuts-owner-apps.txt line {number}: "
+                                 "only Safari, Notes, Finder, Preview and Dia are allowed")
+            rows.append(("mac", app, OWNER_APPS[app] + " (Studio)"))
     if len({unicodedata.normalize("NFC", title).casefold() for _, _, title in rows}) != len(rows):
         raise ValueError("duplicate shortcut name")
     return rows
@@ -73,26 +88,33 @@ def sign(bundle, identifier):
     subprocess.run(["/bin/bash", ROOT / "scripts/daily-sign.sh", bundle, identifier], check=True)
 
 
-def build_bundle(folder, title, source, flags, extra, routes=None):
+def build_bundle(folder, title, source, flags, extra, routes=None, executable="Shortcut"):
     check_measurement()
     contents = (folder / (title + ".staged")) / "Contents"
     (contents / "MacOS").mkdir(parents=True)
     identifier = bundle_id(title)
     write_plist(contents / "Info.plist", dict(
-        CFBundleIdentifier=identifier, CFBundleExecutable="Shortcut", CFBundleName=title,
+        CFBundleIdentifier=identifier, CFBundleExecutable=executable, CFBundleName=title,
         CFBundleDisplayName=title, CFBundlePackageType="APPL", CFBundleShortVersionString="0.0.1",
         **extra))
     if routes is not None:
         (contents / "Resources").mkdir()
         write_plist(contents / "Resources/Routes.plist", routes)
     subprocess.run(["clang", "-O2", "-Wall", "-Wextra", "-Werror", SOURCE / source, *flags,
-                    "-o", contents / "MacOS/Shortcut"], check=True)
+                    "-o", contents / "MacOS" / executable], check=True)
     sign(contents.parent, identifier)
 
 
 def build(folder, rows, checkout):
     routes = {}
     for host, app, title in rows:
+        if host == "mac" and app in OWNER_APPS:
+            build_bundle(folder, title, "owner-shim.c", [
+                "-DDAILY_SCRIPT=" + json.dumps(str(checkout / "scripts/daily.sh")),
+                "-DOWNER_APP=" + json.dumps(app),
+            ], dict(NSLocalNetworkUsageDescription="This shortcut starts the relay to the paired computer."),
+                executable="istesso-owner-shim")
+            continue
         base = f"{SCHEME}://open/{quote(app, safe='')}?"
         url = base + "host=" + host
         argv = ["open", app, "--host", host]
@@ -260,7 +282,7 @@ def run(action, host, ubuntu):
                     names = installed_names(DEST)
                     remove(DEST, names, names.copy())
             return
-        rows = app_list(ubuntu, SOURCE / "mac-apps.txt")
+        rows = app_list(ubuntu, SOURCE / "mac-apps.txt", OWNER_LIST)
         current = STAGE / "bundles"
         if action == "build":
             with tempfile.TemporaryDirectory(dir=STAGE) as tmp:

@@ -63,8 +63,13 @@ class ShortcutsTest(unittest.TestCase):
             with self.subTest(app=app):
                 contents = self.bundles / (title + ".staged") / "Contents"
                 info = plistlib.loads((contents / "Info.plist").read_bytes())
-                self.assertNotIn("NSLocalNetworkUsageDescription", info)
                 self.assertNotIn("CFBundleURLTypes", info)
+                if host == "mac" and app in sc.OWNER_APPS:
+                    self.assertEqual(info["CFBundleExecutable"], "istesso-owner-shim")
+                    self.assertTrue((contents / "MacOS/istesso-owner-shim").is_file())
+                    self.assertFalse(any(args[1] == app for args in self.config["routes"].values()))
+                    continue
+                self.assertNotIn("NSLocalNetworkUsageDescription", info)
                 base = "istesso-dev-open://open/" + quote(app, safe="") + "?"
                 url = base + "host=" + host
                 self.assertIn(url.encode() + b"\0", (contents / "MacOS/Shortcut").read_bytes())
@@ -107,7 +112,7 @@ class ShortcutsTest(unittest.TestCase):
                                          "open", app, "--host", host)
                 self.assertEqual(flags.read_text().splitlines(), ["unset", "unset"])
 
-    def test_owner_apps_refused_at_build_and_dispatch(self):
+    def test_owner_apps_refused_in_url_shortcuts_and_at_dispatch(self):
         apps = self.checkout / "mac-apps.txt"
         for app in ("Safari", "Notes", "Finder", "Preview", "Dia", "desktop", "SAFARI.app"):
             with self.subTest(app=app):
@@ -122,6 +127,52 @@ class ShortcutsTest(unittest.TestCase):
                 for link in routes:
                     self.assertNotEqual(self.dispatch(link).returncode, 0)
                     self.assertFalse(self.record.exists())
+
+    def test_owner_list_accepts_only_the_five_apps(self):
+        owner_list = self.checkout / "daily-shortcuts-owner-apps.txt"
+        mac_list = sc.SOURCE / "mac-apps.txt"
+        self.assertEqual(sc.app_list("", mac_list, owner_list), sc.app_list("", mac_list))
+        owner_list.write_text("sAfArI.app\nNOTES\nFinder.App\nPreview\nDia\n")
+        self.assertEqual(sc.app_list("", mac_list, owner_list)[-5:], [
+            ("mac", name.lower(), name + " (Studio)")
+            for name in ("Safari", "Notes", "Finder", "Preview", "Dia")])
+        for invalid in ("desktop", "DESKTOP.App", "TextEdit", "../Dia", "Dia.app.app"):
+            with self.subTest(invalid=invalid):
+                owner_list.write_text("Dia\n" + invalid + "\n")
+                with self.assertRaisesRegex(ValueError, "line 2: only Safari, Notes, Finder, Preview and Dia"):
+                    sc.app_list("", mac_list, owner_list)
+
+    def test_listed_owner_shim_spawns_fixed_child(self):
+        owner_list = self.checkout / "daily-shortcuts-owner-apps.txt"
+        owner_list.write_text("dIA.ApP\n")
+        stage = self.checkout / "stage"
+        (self.scripts / "measuring.sh").symlink_to(sc.ROOT / "scripts/measuring.sh")
+        with patch.object(sc, "OWNER_LIST", owner_list), patch.object(sc, "STAGE", stage), \
+                patch.object(sc, "ROOT", self.checkout), patch.object(sc, "sign"):
+            sc.run("build", "", "")
+        bundles = stage / "bundles"
+        title = "Dia (Studio)"
+        declared = json.loads((bundles / "apps.json").read_text())["apps"]
+        self.assertIn(["mac", "dia", title], declared)
+        self.assertEqual({p.stem for p in bundles.glob("*.staged")},
+                         {title, "TextEdit (Studio)", sc.HANDLER})
+        contents = bundles / (title + ".staged") / "Contents"
+        info = plistlib.loads((contents / "Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleExecutable"], "istesso-owner-shim")
+        self.assertEqual(info["CFBundleIdentifier"], sc.bundle_id(title))
+        self.assertNotIn("CFBundleURLTypes", info)
+        config = plistlib.loads((bundles / (sc.HANDLER + ".staged") /
+                                 "Contents/Resources/Routes.plist").read_bytes())
+        self.assertFalse(any(args[1].lower() == "dia" for args in config["routes"].values()))
+        with self.daily.open("a") as script:
+            script.write('echo "$PPID" > parent\nexit 37\n')
+        env = dict(os.environ, DAILY_OWNER="0", DAILY_OPEN_HANDLER="0")
+        with subprocess.Popen([contents / "MacOS/istesso-owner-shim", "--for", "aura", "--slot", "3"],
+                              cwd=self.checkout, env=env) as shim:
+            self.assertEqual(shim.wait(timeout=10), 37)
+            self.assertEqual((self.checkout / "parent").read_text().strip(), str(shim.pid))
+        self.assert_recorded("open", "dia", "--host", "mac")
+        self.assertEqual((self.checkout / "flags").read_text().splitlines(), ["1", "1"])
 
     def test_repeated_refusals_log_once(self):
         url = f"{sc.SCHEME}://open/desktop?host=mac"
@@ -211,7 +262,8 @@ class ShortcutsTest(unittest.TestCase):
         ubuntu = "editor\tText Editor"
         rows = sc.app_list(ubuntu, sc.SOURCE / "mac-apps.txt")
         (stage / "bundles/apps.json").write_text(json.dumps(rows))
-        with patch.object(sc, "STAGE", stage), patch.object(sc, "DEST", self.checkout / "dest"):
+        with patch.object(sc, "STAGE", stage), patch.object(sc, "DEST", self.checkout / "dest"), \
+                patch.object(sc, "OWNER_LIST", self.checkout / "missing"):
             with patch.object(sc, "install") as install, self.assertRaisesRegex(ValueError, "build first"):
                 sc.run("install", "", ubuntu)
             install.assert_not_called()
