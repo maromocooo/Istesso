@@ -255,6 +255,7 @@ final class Transport {
     func close() { guarded.close { istesso_media_host_close(native) } }
     func keyFrameWanted() -> Bool { guarded.use { istesso_media_host_key_frame_wanted(native) != 0 } ?? false }
     func offer(_ on: Bool) { _ = guarded.use { istesso_media_host_offer(native, on ? 1 : 0) } }
+    func admitPaired() { _ = guarded.use { istesso_media_host_admit_paired(native) } }
     func admit(_ id: String?, _ key: String?) -> Bool { guarded.use { istesso_media_host_admit(native, id, key) == 0 } ?? false }
     func send(_ data: [UInt8], pts: UInt64, encoded: UInt64, key: Bool) -> IstessoMediaSent? {
         guarded.use { () -> IstessoMediaSent? in
@@ -1050,6 +1051,31 @@ func selfTest() -> Never {
     checkPanel(clicks(list: []) == 0, true, "injector: a window that closed since the last look is not pressed")
     checkPanel(clicks(list: [moved]) == 0, true, "injector: a window that moved away since the last look is not pressed")
     checkPanel(clicks(list: [appWin], lockAfterPress: true) == 2, true, "injector: a press made before the lock is released in it")
+    do {
+        // While a new stream is made: nothing but releases.
+        let injector = Injector()
+        var gate = false
+        var downs = 0, ups = 0
+        injector.mayPost = true
+        injector.clickForm = 4
+        injector.listNow = { [appWin] }
+        injector.lockedNow = { false }
+        injector.gateClosed = { gate }
+        injector.inRange = { _, top in top?.pid == 100 }
+        injector.windowAt = { point in appWin.bounds.contains(point) ? appWin : nil }
+        injector.postSession = { event in
+            if event.type == .leftMouseDown { downs += 1 }
+            if event.type == .leftMouseUp { ups += 1 }
+        }
+        injector.postProcess = { _, _ in }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        send(["kind": "pointer_at", "x": 150, "y": 150])
+        send(["kind": "button", "code": 0x110, "pressed": true])
+        gate = true
+        send(["kind": "button", "code": 0x110, "pressed": false])
+        send(["kind": "button", "code": 0x110, "pressed": true])
+        checkPanel(downs == 1 && ups == 1, true, "restarting: a held button is released, a new press is dropped")
+    }
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: []), true, "resize: a running picture comes back")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["pause"]), false, "resize: a pause during the restart is kept")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["detach"]), false, "resize: a detach during the restart is kept")
@@ -1178,6 +1204,8 @@ final class Injector {
     /// the tests go through the same path as the input does.
     var listNow: () -> [WindowInfo] = { windowList() }
     var lockedNow: () -> Bool = screenLocked
+    /// Closed while the host makes a new stream (a resize): as when locked, only releases pass.
+    var gateClosed: () -> Bool = { false }
     var postSession: (CGEvent) -> Void = { $0.post(tap: .cgSessionEventTap) }
     var postProcess: (CGEvent, pid_t) -> Void = { $0.postToPid($1) }
     /// When each modifier key went down (uptime).
@@ -1287,7 +1315,7 @@ final class Injector {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return count("unreadable") }
         lastInput = ProcessInfo.processInfo.systemUptime
-        if !settings.inputDry && lockedNow() {
+        if !settings.inputDry && (lockedNow() || gateClosed()) {
             // Locked, or not on the console: nothing but the release of what is down here, in every
             // form (ADR 0017, "守ること" 3).
             let pressed = object["pressed"] as? Bool
@@ -1498,6 +1526,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var generated: Generated?
     let injector = Injector()
     let lookout = Lookout()
+    private lazy var gateWired: Void = { injector.gateClosed = { [weak self] in self?.restarting ?? false } }()
     var width = 0, height = 0
     var app: NSRunningApplication?
     var display: SCDisplay?
@@ -1539,6 +1568,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         }
         watchdog.resume()
         timers.append(watchdog)
+        _ = gateWired
         mayCapture = settings.generated || CGPreflightScreenCaptureAccess()
         injector.mayPost = CGPreflightPostEventAccess()
         say("permissions", [("screen_recording", mayCapture), ("accessibility", injector.mayPost)])
@@ -2020,7 +2050,17 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var controlSource: DispatchSourceRead?
 
     func word(_ line: String) {
-        if restarting, !line.isEmpty { return wordsDuringRestart.append(line) }
+        if restarting, !line.isEmpty {
+            // What closes is done at once (nobody is shown anything, nothing more is passed on);
+            // the rest is said to the new stream, in order.
+            if line.hasPrefix("detach") {
+                detached = true
+                offered = false
+                injector.releaseAll()
+            }
+            if line.hasPrefix("admit") { injector.releaseAll() }
+            return wordsDuringRestart.append(line)
+        }
         let words = line.split(separator: " ").map(String.init)
         switch words.first {
         case "pause":
@@ -2318,7 +2358,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 // stream ended (nobody may use it afterwards) and its port taken again.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     old.close()
-                    guard let made = Transport(settings: settings, width: w, height: h, admitting: self.admitState) else {
+                    guard let made = Transport(settings: settings, width: w, height: h, admitting: .nobody) else {
                         // The old stream is closed: every call on it does nothing now; the program ends.
                         say("refused", [("word", "resize"), ("reason", "cannot listen again for paired devices")])
                         self.restarting = false
@@ -2326,9 +2366,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     }
                     self.width = w
                     self.height = h
+                    // Shown to nobody and not offered until the words that came meanwhile are said.
+                    made.offer(false)
                     self.transport = made
                     made.ownCursor()
-                    if !self.offered { made.offer(false) }
                     self.pump = Pump(transport: made, width: w, height: h)
                     self.pictureWindowSize = windowSize
                     self.startTimers()
@@ -2340,11 +2381,19 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     // said first.
                     let words = self.wordsDuringRestart
                     self.wordsDuringRestart = []
-                    if restartResumes(picture: self.picture, detached: self.detached, offered: self.offered,
-                                      held: self.heldForSignal, wordsMeanwhile: words) {
+                    let resumes = restartResumes(picture: self.picture, detached: self.detached, offered: self.offered,
+                                                 held: self.heldForSignal, wordsMeanwhile: words)
+                    for word in words { self.word(word) }
+                    // Only now who may look, and whether the picture is offered, as they stand.
+                    switch self.admitState {
+                    case .nobody: _ = made.admit(nil, nil)
+                    case .paired: made.admitPaired()
+                    case let .only(id, key): _ = made.admit(id, key)
+                    }
+                    made.offer(self.offered && !self.detached)
+                    if resumes && self.picture == "running" && !self.detached && self.offered && !self.heldForSignal {
                         self.openPicture { why in if let why { note("after the resize: \(why)") } }
                     }
-                    for word in words { self.word(word) }
                 }
             }
         }
