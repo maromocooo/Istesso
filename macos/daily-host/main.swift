@@ -9,8 +9,12 @@
 //            paired devices that may look)
 //   input    one JSON event per datagram on a socket, as `istesso agent` hands them over
 //            (istesso_proto::InputEvent: key, pointer_at, button, scroll, and the trial's text),
-//            posted to the application's own process only (CGEventPostToPid; ADR 0017, "守ること"
-//            3). The session tap is never used.
+//            keys and committed text posted to the application's own process (CGEventPostToPid);
+//            pointer events either to the process (forms 1-3: other processes ignore such clicks)
+//            or, with --click-form 4 (the everyday trial's default for an application's windows),
+//            through the session onto the range only: the application's own windows, or the
+//            whole display in the display form. Never anything but releases while the screen is
+//            locked (ADR 0017, "守ること" 3, and the proposal added to it).
 //   words    pause, detach, resume, admit ID KEY | admit nobody, close: one a line, on a pipe
 //            (--control); the answers are the same JSON lines, each with the key "istesso", on
 //            standard output.
@@ -30,6 +34,7 @@ import AppKit
 import ApplicationServices
 import CoreMedia
 import CoreVideo
+import IOKit.pwr_mgt
 import ScreenCaptureKit
 import VideoToolbox
 
@@ -737,7 +742,21 @@ struct WindowInfo {
 }
 
 /// The windows on the screen, front to back.
+/// The on-screen list, kept for a few milliseconds: one input event asks for it several times, and
+/// each call costs about half a millisecond on the main thread.
+private var listCache: (at: UInt64, list: [WindowInfo])?
 func windowList(onScreenOnly: Bool = true, desktop: Bool = false) -> [WindowInfo] {
+    if onScreenOnly && !desktop, let cache = listCache, nowNs() - cache.at < 8_000_000 { return cache.list }
+    let list = readWindowList(onScreenOnly: onScreenOnly, desktop: desktop)
+    if onScreenOnly && !desktop { listCache = (nowNs(), list) }
+    return list
+}
+
+/// Right before a press or a scroll: the next look at the window list is a fresh one (one call,
+/// answered by WindowServer, which waits for no application).
+func freshWindowList() { listCache = nil }
+
+func readWindowList(onScreenOnly: Bool, desktop: Bool) -> [WindowInfo] {
     var options: CGWindowListOption = onScreenOnly ? [.optionOnScreenOnly] : [.optionAll]
     if !desktop { options.insert(.excludeDesktopElements) }
     guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
@@ -947,14 +966,94 @@ func selfTest() -> Never {
     checkPanel(capturedWindows(appWindows: [1, 2], serviceWindows: [10, 11], allowed: [10]) == [1, 2, 10], true,
                "a new window of the panel service (another application's) is not captured")
     checkPanel(capturedWindows(appWindows: [1], serviceWindows: [10], allowed: []) == [1], true, "nothing of the service by default")
+    checkPanel(passesWhileLocked(kind: "key", pressed: true, held: false), false, "locked: a key press is dropped")
+    checkPanel(passesWhileLocked(kind: "key", pressed: false, held: true), true, "locked: the release of a held key passes")
+    checkPanel(passesWhileLocked(kind: "key", pressed: false, held: false), false, "locked: a release of a key not held is dropped")
+    checkPanel(passesWhileLocked(kind: "text", pressed: nil, held: false), false, "locked: text is dropped")
+    checkPanel(passesWhileLocked(kind: "pointer_at", pressed: nil, held: false), false, "locked: a move is dropped")
+    checkPanel(passesWhileLocked(kind: "button", pressed: false, held: true), true, "locked: the release of a held button passes")
+    checkPanel(modifierFlags(of: [42, 30]) == .maskShift, true, "flags from the keys held: Shift")
+    checkPanel(modifierFlags(of: [30]) == [], true, "flags from the keys held: none once the modifier is up")
+    checkPanel(modifierFlags(of: [125, 29]) == [.maskCommand, .maskControl], true, "flags from the keys held: Command and Control")
+    let slow = Lookout()
+    slow.lookup = { _ in Thread.sleep(forTimeInterval: 1.0); return [] }
+    let began = ProcessInfo.processInfo.systemUptime
+    slow.refresh(1)
+    _ = slow.windows
+    slow.refresh(1)
+    checkPanel(ProcessInfo.processInfo.systemUptime - began < 0.05, true, "a slow Accessibility lookup never holds the input up")
+    let appWin = WindowInfo(id: 7, pid: 100, layer: 0, bounds: win, alpha: 1, onScreen: true)
+    let other = WindowInfo(id: 8, pid: 200, layer: 0, bounds: win, alpha: 1, onScreen: true)
+    let mine: (WindowInfo) -> Bool = { $0.pid == 100 }
+    checkPanel(pressOnTarget(fresh: [appWin], at: inside, allowed: mine), true, "a press onto the application's window")
+    checkPanel(pressOnTarget(fresh: [other, appWin], at: inside, allowed: mine), false, "a window that came in front since the last look is not pressed through")
+    checkPanel(pressOnTarget(fresh: [], at: inside, allowed: mine), false, "a window that closed since the last look is not pressed")
+    let moved = WindowInfo(id: 7, pid: 100, layer: 0, bounds: win.offsetBy(dx: 500, dy: 0), alpha: 1, onScreen: true)
+    checkPanel(pressOnTarget(fresh: [moved], at: inside, allowed: mine), false, "a window that moved away since the last look is not pressed")
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
+}
+
+/// Accessibility calls, away from the input: an application that hangs can hold such a call for
+/// seconds (0.25 s with the timeout set), so they run on a queue of their own, and the input uses
+/// what they found last. Work that is asked for while some is running replaces what waits.
+final class Lookout {
+    let queue = DispatchQueue(label: "istesso.daily-host.accessibility", qos: .userInitiated)
+    private let lock = NSLock()
+    private var cached: [AXWindowInfo] = []
+    private var asked = false
+    /// The lookup itself; a stand-in in --self-test.
+    var lookup: (pid_t) -> [AXWindowInfo] = axWindows
+
+    /// The application's windows as Accessibility listed them last; never waits.
+    var windows: [AXWindowInfo] { lock.lock(); defer { lock.unlock() }; return cached }
+
+    /// Asks for a fresh look; returns at once.
+    func refresh(_ pid: pid_t) {
+        lock.lock()
+        if asked { lock.unlock(); return }
+        asked = true
+        lock.unlock()
+        queue.async {
+            let found = self.lookup(pid)
+            self.lock.lock()
+            self.cached = found
+            self.asked = false
+            self.lock.unlock()
+        }
+    }
+
+    /// Runs one Accessibility action away from the input; returns at once.
+    func act(_ work: @escaping () -> Void) { queue.async(execute: work) }
+}
+
+/// Whether a press at a point may go through: decided on a window list read right before the press
+/// (WindowServer answers it; no application is waited for), not on one kept from before. A window
+/// that moved or closed since is not pressed.
+func pressOnTarget(fresh: [WindowInfo], at point: CGPoint, allowed: (WindowInfo) -> Bool) -> Bool {
+    guard let top = fresh.first(where: { $0.bounds.contains(point) && $0.alpha > 0.01 }) else { return false }
+    return allowed(top)
+}
+
+/// Whether an input event may pass while the screen is locked or the session is not on the
+/// console (ADR 0017, "守ること" 3): only the release of a key or a button that is down here.
+func passesWhileLocked(kind: String, pressed: Bool?, held: Bool) -> Bool {
+    (kind == "key" || kind == "button") && pressed == false && held
+}
+
+/// The modifiers that are down, derived from the keys that are down (never kept on their own: a
+/// release that was lost would leave a modifier held for good).
+func modifierFlags(of keysDown: Set<UInt32>) -> CGEventFlags {
+    var flags: CGEventFlags = []
+    for code in keysDown { if let flag = modifierFlag(code) { flags.insert(flag) } }
+    return flags
 }
 
 /// Whether the login session's screen is locked now (unreadable counts as locked).
 func screenLocked() -> Bool {
     guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
-    return (session["CGSSessionScreenIsLocked"] as? Bool) ?? false
+    let onConsole = (session[kCGSessionOnConsoleKey as String] as? Bool) ?? false
+    return !onConsole || ((session["CGSSessionScreenIsLocked"] as? Bool) ?? false)
 }
 
 /// Makes an application the one in front, and the window at `bounds` its front window, through
@@ -1041,7 +1140,7 @@ final class Injector {
         switch sessionStep(type: event.type, at: event.location, onTarget: onTarget,
                            pressWindow: sessionPresses[button], window: window.bounds) {
         case let .post(place, remember):
-            event.location = place
+            event.location = offCorners(place)
             switch remember {
             case let .press(bounds): sessionPresses[button] = bounds
             case .release: sessionPresses[button] = nil
@@ -1051,11 +1150,6 @@ final class Injector {
         case .toProcess:
             event.postToPid(pid)
         case .drop:
-            if !onTarget, let top = windowList().first(where: { $0.bounds.contains(event.location) && $0.alpha > 0.01 && !isDockCover($0) }) {
-                // Which window was in the way: its layer, its owner's bundle id, its size. No titles.
-                let owner = NSRunningApplication(processIdentifier: top.pid)?.bundleIdentifier ?? "pid-\(top.pid)"
-                log("{\"kind\":\"not_on_top\",\"t_ns\":\(nowNs()),\"layer\":\(top.layer),\"owner\":\"\(owner)\",\"alpha\":\(String(format: "%.2f", top.alpha)),\"size\":\"\(Int(top.bounds.width))x\(Int(top.bounds.height))\"}")
-            }
             count("dropped_not_on_top")
         }
     }
@@ -1074,11 +1168,32 @@ final class Injector {
         sessionPresses.removeAll()
     }
 
+    /// Keeps a point posted through the session at least 2 points from every corner of a display:
+    /// a corner may start a hot-corner action of the Mac.
+    private func offCorners(_ point: CGPoint) -> CGPoint {
+        var count: UInt32 = 0
+        var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+        CGGetActiveDisplayList(16, &displays, &count)
+        guard let display = displays.prefix(Int(count)).map(CGDisplayBounds).first(where: { $0.contains(point) }) else { return point }
+        var p = point
+        let nearLeft = p.x < display.minX + 2, nearRight = p.x > display.maxX - 3
+        let nearTop = p.y < display.minY + 2, nearBottom = p.y > display.maxY - 3
+        if (nearLeft || nearRight) && (nearTop || nearBottom) {
+            p.x = nearLeft ? display.minX + 2 : display.maxX - 3
+            p.y = nearTop ? display.minY + 2 : display.maxY - 3
+        }
+        return p
+    }
+
     func setClickForm(_ form: Int) {
         if clickForm == 4 && form != 4 { releaseSessionPresses() }
+        if clickForm != 4 && form == 4 { for code in buttonsDown { button(code, false) }; buttonsDown.removeAll() }
         clickForm = form
     }
     private var flags: CGEventFlags = []
+    /// When the last input came (uptime): the watchdog lets go of what is held after a silence.
+    var lastInput: TimeInterval = 0
+    var holding: Bool { !keysDown.isEmpty || !buttonsDown.isEmpty }
     private var keysDown: Set<UInt32> = []
     private var buttonsDown: Set<UInt32> = []
     private var point = CGPoint.zero
@@ -1092,6 +1207,15 @@ final class Injector {
     func handle(_ data: Data) {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return count("unreadable") }
+        lastInput = ProcessInfo.processInfo.systemUptime
+        if !settings.inputDry && screenLocked() {
+            // Locked, or not on the console: nothing but the release of what is down here, in every
+            // form (ADR 0017, "守ること" 3).
+            let pressed = object["pressed"] as? Bool
+            let code = (object["code"] as? NSNumber)?.uint32Value ?? 0
+            let held = kind == "key" ? keysDown.contains(code) : buttonsDown.contains(code)
+            guard passesWhileLocked(kind: kind, pressed: pressed, held: held) else { return count("dropped_locked") }
+        }
         if settings.inputDry || !mayPost {
             if settings.inputDry, kind == "text", let text = object["text"] as? String {
                 // For checks: how many characters, in which order of pieces; never what.
@@ -1126,10 +1250,8 @@ final class Injector {
         // A release is always let through for a key that went down, so that none stays down.
         guard keysAllowed() || (!pressed && keysDown.contains(code)) else { return count("dropped_not_in_front") }
         guard let virtual = virtualKeys[code] else { return count("unknown_key") }
-        if let flag = modifierFlag(code) {
-            if pressed { flags.insert(flag) } else if !otherHeld(flag, besides: code) { flags.remove(flag) }
-        }
         if pressed { keysDown.insert(code) } else { keysDown.remove(code) }
+        flags = modifierFlags(of: keysDown)
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: virtual, keyDown: pressed) else { return }
         withHeld(event)
         // Posted to a process, a modifier key is not turned into a change of the modifiers by
@@ -1173,6 +1295,7 @@ final class Injector {
     }
 
     private func button(_ code: UInt32, _ pressed: Bool) {
+        if pressed { freshWindowList() }
         guard let window = windowAt(point) else { return count("dropped_no_window") }
         let pid = window.pid
         if pressed { buttonsDown.insert(code) } else { buttonsDown.remove(code) }
@@ -1218,6 +1341,7 @@ final class Injector {
     }
 
     private func scroll(dx: Int32, dy: Int32) {
+        freshWindowList()
         guard let window = windowAt(point) else { return count("dropped_no_window") }
         let pid = window.pid
         // The other side says how far to scroll; the Mac, how far the content moves.
@@ -1282,6 +1406,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var capture: Capture?
     var generated: Generated?
     let injector = Injector()
+    let lookout = Lookout()
     var width = 0, height = 0
     var app: NSRunningApplication?
     var display: SCDisplay?
@@ -1299,6 +1424,29 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         if let path = settings.pidFile {
             try? "\(getpid())\n".write(toFile: path, atomically: true, encoding: .utf8)
         }
+        // An application that hangs must not hold the input up for seconds.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25)
+        // Locked: everything that is down is let go at once, not at the next event.
+        for name in ["com.apple.screenIsLocked", "com.apple.sessionDidMoveOffConsole"] {
+            DistributedNotificationCenter.default().addObserver(forName: Notification.Name(name), object: nil, queue: .main) { [weak self] _ in
+                self?.injector.releaseAll()
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.injector.releaseAll()
+        }
+        // Something held, and no input for 8 s: a release was lost on the way; let go.
+        let watchdog = DispatchSource.makeTimerSource(queue: .main)
+        watchdog.schedule(deadline: .now() + 1, repeating: .seconds(1))
+        watchdog.setEventHandler { [weak self] in
+            self?.keepAwakeAndTellLock()
+            guard let self, self.injector.holding,
+                  ProcessInfo.processInfo.systemUptime - self.injector.lastInput > 8 else { return }
+            note("input held for 8 s without anything new: everything is let go")
+            self.injector.releaseAll()
+        }
+        watchdog.resume()
+        timers.append(watchdog)
         mayCapture = settings.generated || CGPreflightScreenCaptureAccess()
         injector.mayPost = CGPreflightPostEventAccess()
         say("permissions", [("screen_recording", mayCapture), ("accessibility", injector.mayPost)])
@@ -1375,7 +1523,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.injector.origin = CGPoint(x: frame.minX - barX / k, y: frame.minY - barY / k)
                 self.injector.scale = 1 / k
                 // Keys go to the application in front; the pointer to the window under it, in its process.
-                self.injector.target = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+                self.injector.target = {
+                    // Never the login window (the lock screen's password field).
+                    guard let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier != "com.apple.loginwindow" else { return nil }
+                    return front.processIdentifier
+                }
                 // The whole display is the range: any application.
                 self.injector.inRange = { _, _ in true }
                 self.injector.keysAllowed = { true }
@@ -1457,7 +1609,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         guard let pid = app?.processIdentifier else { return [] }
         let services = windowList().filter { isPanelService($0.pid) && $0.layer >= 0 && $0.alpha > 0.05 }
         guard !services.isEmpty else { return [] }
-        let own = axWindows(pid)
+        // What Accessibility found last (never waited for here), and a fresh look asked for.
+        lookout.refresh(pid)
+        let own = lookout.windows
         let front = appInFront()
         return services.filter { panelAllowed(serviceWindow: $0.bounds, appWindows: own, appInFront: front) }
     }
@@ -1539,30 +1693,34 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let room = screen.visibleFrame.size
         let shrink = min(1, room.width / size.width, room.height / size.height)
         size = CGSize(width: (size.width * shrink).rounded(.down), height: (size.height * shrink).rounded(.down))
-        let element = AXUIElementCreateApplication(pid)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement] else { return }
-        for candidate in windows {
-            var position: CFTypeRef?, extent: CFTypeRef?
-            AXUIElementCopyAttributeValue(candidate, kAXPositionAttribute as CFString, &position)
-            AXUIElementCopyAttributeValue(candidate, kAXSizeAttribute as CFString, &extent)
-            var p = CGPoint.zero, s = CGSize.zero
-            if let position { AXValueGetValue(position as! AXValue, .cgPoint, &p) }
-            if let extent { AXValueGetValue(extent as! AXValue, .cgSize, &s) }
-            guard abs(p.x - window.bounds.minX) < 2, abs(p.y - window.bounds.minY) < 2,
-                  abs(s.width - window.bounds.width) < 2, abs(s.height - window.bounds.height) < 2 else { continue }
-            // Keep it on its screen: its top left moves up and left as far as needed.
-            let visible = screen.visibleFrame
-            let top = NSScreen.screens[0].frame.maxY - visible.maxY
-            var origin = p
-            origin.x = max(visible.minX, min(origin.x, visible.maxX - size.width))
-            origin.y = max(top, min(origin.y, top + visible.height - size.height))
-            var newOrigin = origin
-            var newSize = size
-            if let place = AXValueCreate(.cgPoint, &newOrigin) { AXUIElementSetAttributeValue(candidate, kAXPositionAttribute as CFString, place) }
-            if let extent = AXValueCreate(.cgSize, &newSize) { AXUIElementSetAttributeValue(candidate, kAXSizeAttribute as CFString, extent) }
-            return
+        // The Accessibility calls themselves away from the input (an application may hang).
+        let visibleFrame = screen.visibleFrame, mainTop = NSScreen.screens[0].frame.maxY
+        lookout.act {
+            let element = AXUIElementCreateApplication(pid)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value) == .success,
+                  let windows = value as? [AXUIElement] else { return }
+            for candidate in windows {
+                var position: CFTypeRef?, extent: CFTypeRef?
+                AXUIElementCopyAttributeValue(candidate, kAXPositionAttribute as CFString, &position)
+                AXUIElementCopyAttributeValue(candidate, kAXSizeAttribute as CFString, &extent)
+                var p = CGPoint.zero, s = CGSize.zero
+                if let position { AXValueGetValue(position as! AXValue, .cgPoint, &p) }
+                if let extent { AXValueGetValue(extent as! AXValue, .cgSize, &s) }
+                guard abs(p.x - window.bounds.minX) < 2, abs(p.y - window.bounds.minY) < 2,
+                      abs(s.width - window.bounds.width) < 2, abs(s.height - window.bounds.height) < 2 else { continue }
+                // Keep it on its screen: its top left moves up and left as far as needed.
+                let visible = visibleFrame
+                let top = mainTop - visible.maxY
+                var origin = p
+                origin.x = max(visible.minX, min(origin.x, visible.maxX - size.width))
+                origin.y = max(top, min(origin.y, top + visible.height - size.height))
+                var newOrigin = origin
+                var newSize = size
+                if let place = AXValueCreate(.cgPoint, &newOrigin) { AXUIElementSetAttributeValue(candidate, kAXPositionAttribute as CFString, place) }
+                if let extent = AXValueCreate(.cgSize, &newSize) { AXUIElementSetAttributeValue(candidate, kAXSizeAttribute as CFString, extent) }
+                return
+            }
         }
     }
 
@@ -1850,6 +2008,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         guard bound == 0 else { return note("cannot take input on \(path): \(String(cString: strerror(errno)))") }
         chmod(path, 0o600)
         _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        // Room for a burst: a release that does not fit would be lost, and a key would stay down.
+        var room: Int32 = 1 << 20
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &room, socklen_t(MemoryLayout<Int32>.size))
         inputSocket = fd
         injector.log = { line in frameLog.write(line) }
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
@@ -1880,7 +2041,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             // The window under the pointer for a press, else the application's shown window.
             let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
             let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
-            bringToFront(running.processIdentifier, bounds: bounds)
+            let pid = running.processIdentifier
+            lookout.act { bringToFront(pid, bounds: bounds) }
             waiting = [data]
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
                 let events = self.waiting
@@ -1941,6 +2103,38 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         timers.append(timer)
     }
     var heldForSignal = false
+
+    /// While a device is shown the picture, the Mac's display does not sleep (and so does not lock
+    /// from idleness): an assertion of this program, let go 10 s after the last viewer left
+    /// (m4-plan.md 4.5b). No permission, no setting changed.
+    var awake: IOPMAssertionID = 0
+    var lastViewed: TimeInterval = 0
+    var wasLocked: Bool?
+    func keepAwakeAndTellLock() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let viewed = transport != nil && transport.viewers > 0
+        if viewed { lastViewed = now }
+        if viewed && awake == 0 {
+            var id: IOPMAssertionID = 0
+            if IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleDisplaySleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                           "Istesso: a device is shown a session" as CFString, &id) == kIOReturnSuccess {
+                awake = id
+                var activity: IOPMAssertionID = 0
+                IOPMAssertionDeclareUserActivity("Istesso: a device is shown a session" as CFString, kIOPMUserActiveLocal, &activity)
+                note("the display is kept awake while a device is shown the picture")
+            }
+        } else if !viewed && awake != 0 && now - lastViewed > 10 {
+            IOPMAssertionRelease(awake)
+            awake = 0
+            note("nobody is shown the picture: the display may sleep again")
+        }
+        // Said when the screen locks or unlocks, for the window on the other side to show.
+        let locked = screenLocked()
+        if locked != wasLocked {
+            wasLocked = locked
+            say(locked ? "locked" : "unlocked")
+        }
+    }
 
     /// The Mac's cursor, as large as the host's screen looks in the viewer's window, and of the
     /// shape it has now (an I-beam over text, for one); looked at ten times a second.

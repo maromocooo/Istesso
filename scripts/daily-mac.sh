@@ -56,6 +56,10 @@ set -u
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 host_name=${ISTESSO_MAC_HOST:-istesso-mac}
 host_dir=${DAILY_MAC_DIR:-'~/.cache/istesso-daily-mac'}
+# A folder below the host's home, written as ~/...: nothing else is ever put into a command there.
+[[ "$host_dir" =~ ^~/[A-Za-z0-9._/-]+$ ]] && [[ "$host_dir" != *..* ]] || { echo "error: DAILY_MAC_DIR is a folder below the home, as ~/name"; exit 2; }
+[[ "${DAILY_HOST_EXTRA:-}" =~ ^[A-Za-z0-9\ ._/-]*$ ]] || { echo "error: DAILY_HOST_EXTRA holds only words of letters, digits, . _ / -"; exit 2; }
+[ -z "${DAILY_CLICK_FORM:-}" ] || [[ "$DAILY_CLICK_FORM" =~ ^[1-4]$ ]] || { echo "error: DAILY_CLICK_FORM is 1, 2, 3 or 4"; exit 2; }
 state=${DAILY_MAC_STATE:-"$HOME/Library/Caches/istesso-daily-mac"}
 istesso="$repo/target/release/istesso"
 bundle_name="Istesso Dev Daily Host.app"
@@ -89,13 +93,13 @@ host_address() {
     ssh -G "$host_name" 2>/dev/null | awk '/^hostname / {print $2}'
 }
 # A name for the run folders: letters, digits, dots and dashes of the application's name.
-run_name() { basename "$1" .app | tr -c 'A-Za-z0-9.\n-' '-' ; }
+run_name() { printf '%s' "$(basename "$1" .app)" | tr -c 'A-Za-z0-9.-' '-'; }
 
 # What the host runs: the same small functions there, then the command given.
 host_functions() {
     cat <<'HOST'
 set -u
-D=$(eval echo "$DIR")
+D="$HOME/${DIR#\~/}"
 mkdir -p "$D/run"
 write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
 still_runs() {
@@ -150,8 +154,10 @@ do_setup() {
         4) echo "error: a host program is running there; scripts/daily-mac.sh stop first"; exit 1 ;;
         *) echo "error: the host could not be reached over ssh ($host_name)"; exit 1 ;;
     esac
-    tar -C "$state/build" -cf - "$bundle_name" | ssh "$host_name" "D=\$(eval echo $host_dir); mkdir -p \"\$D/bin\" && rm -rf \"\$D/$bundle_name\" && tar -C \"\$D\" -xf -" || { echo "error: copying the host program failed"; exit 1; }
-    ssh "$host_name" "D=\$(eval echo $host_dir); cat > \"\$D/bin/istesso.new\" && chmod 755 \"\$D/bin/istesso.new\" && mv \"\$D/bin/istesso.new\" \"\$D/bin/istesso\"" < "$istesso" || { echo "error: copying istesso failed"; exit 1; }
+    # The bundle that was there is moved aside (into replaced/, never removed), and the new one is put
+    # at the very same place: the owner's grants follow its signature there.
+    tar -C "$state/build" -cf - "$bundle_name" | ssh "$host_name" "D=\"\$HOME/${host_dir#\~/}\"; mkdir -p \"\$D/bin\" \"\$D/replaced\" && { [ ! -e \"\$D/$bundle_name\" ] || mv \"\$D/$bundle_name\" \"\$D/replaced/\$(date +%Y%m%d-%H%M%S)-$bundle_name\"; } && tar -C \"\$D\" -xf -" || { echo "error: copying the host program failed"; exit 1; }
+    ssh "$host_name" "D=\"\$HOME/${host_dir#\~/}\"; cat > \"\$D/bin/istesso.new\" && chmod 755 \"\$D/bin/istesso.new\" && mv \"\$D/bin/istesso.new\" \"\$D/bin/istesso\"" < "$istesso" || { echo "error: copying istesso failed"; exit 1; }
     echo "the host has: $bundle_name, bin/istesso (in $host_dir)"
     printf 'ISTESSO_CONFIG_DIR=$D/config "$D/bin/istesso" id 2>/dev/null | grep -i fingerprint || echo "no trial identity yet: scripts/daily-mac.sh pair-line"\n' | on_host
 }
@@ -178,7 +184,9 @@ do_open() {
             *) echo "error: unknown: $1"; exit 2 ;;
         esac
     done
-    [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { echo "error: --size is WxH"; exit 2; }
+    [[ "$size" =~ ^[0-9]{2,4}x[0-9]{2,4}$ ]] || { echo "error: --size is WxH"; exit 2; }
+    [ -z "$fps" ] || { [[ "$fps" =~ ^[0-9]{1,3}$ ]] && [ "$fps" -ge 1 ] && [ "$fps" -le 240 ]; } || { echo "error: --fps is 1 to 240"; exit 2; }
+    [ -z "$slot" ] || [[ "$slot" =~ ^[1-3]$ ]] || { echo "error: --slot is 1, 2 or 3"; exit 2; }
     [ -z "$for_whom" ] || [ "$for_whom" = aura ] || { echo "error: --for knows only aura"; exit 2; }
     refuse_when_busy
     local name chroma=444 base_pic=47910 base_in=47920
@@ -242,7 +250,7 @@ else
         write_down "\$run/agent.pid" \$!
     fi
     [ -p "\$run/control" ] || mkfifo "\$run/control"
-    : > "\$run/host.log"; : > "\$run/host.err"; rm -f "\$run/host.number"
+    : > "\$run/host.log"; : > "\$run/host.err"; : > "\$run/host.number"
     document=""
     if [ -n "$document_arg" ]; then
         mkdir -p "\$D/documents"
@@ -332,7 +340,7 @@ open_here() {
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
     local arguments=("$x" "$y" "$width" "$height" "$title" - "$frames" 0 "$mine/in.sock")
-    : > "$mine/viewer.number"; : > "$mine/viewer.log"; : > "$mine/viewer.pid"; rm -f "$mine/window-closed"
+    : > "$mine/viewer.number"; : > "$mine/viewer.log"; : > "$mine/viewer.pid"; : > "$mine/window-closed"
     if [ -z "${DAILY_VIEWER:-}" ] && [ -d "$viewer_bundle" ] && [ -z "${DAILY_NO_WINDOW:-}" ]; then
         local with=() setting i
         for setting in "${settings[@]}"; do with+=(--env "$setting"); done
@@ -369,7 +377,7 @@ do_guard() {
                 for mine in "$state"/*/; do
                     name=$(basename "$mine")
                     still_runs "$mine/viewer.pid" || continue
-                    : > "$mine/held"
+                    echo 1 > "$mine/held"
                     close_here "$name"
                 done
                 echo "$(date '+%H:%M:%S') a measurement began: the windows and relays here were stopped"
@@ -379,8 +387,8 @@ do_guard() {
                 held=""
                 for mine in "$state"/*/; do
                     name=$(basename "$mine")
-                    [ -e "$mine/held" ] || continue
-                    rm -f "$mine/held"
+                    [ -s "$mine/held" ] || continue
+                    : > "$mine/held"
                     open_here "$name" || echo "$(date '+%H:%M:%S') $name: NOT back"
                 done
                 echo "$(date '+%H:%M:%S') the measurement is over: the windows were opened again"
@@ -392,14 +400,30 @@ do_guard() {
                 [ -s "$mine/viewer.pid" ] || continue
                 if still_runs "$mine/viewer.pid"; then
                     open_ones=1
-                elif [ ! -e "$mine/window-closed" ] && [ ! -e "$mine/held" ]; then
-                    : > "$mine/window-closed"
+                elif [ ! -s "$mine/window-closed" ] && [ ! -s "$mine/held" ]; then
+                    echo 1 > "$mine/window-closed"
                     stop_written_down "$mine/relay.pid"
                     printf 'tell %q detach\n' "$name" | on_host > /dev/null 2>&1
                     echo "$(date '+%H:%M:%S') $name: its window was closed: the host stopped its picture; the application goes on"
                 fi
             done
             [ "$open_ones" = 1 ] || { echo "$(date '+%H:%M:%S') no window is open: the guard ends"; exit 0; }
+            # Whether the host's screen is locked (its host programs say so): shown in the titles.
+            local states
+            states=$(printf 'for r in "$D"/run/*/; do n=$(basename "$r"); w=$(grep -o "\"istesso\":\"\\(locked\\|unlocked\\)\"" "$r/host.log" 2>/dev/null | tail -1 | cut -d\\" -f4); echo "$n ${w:-unlocked}"; done\n' | on_host 2>/dev/null)
+            for mine in "$state"/*/; do
+                name=$(basename "$mine")
+                still_runs "$mine/viewer.pid" || continue
+                local lock_word base wanted
+                lock_word=$(printf '%s\n' "$states" | awk -v n="$name" '$1 == n {print $2}')
+                base="$(cat "$mine/app" 2>/dev/null) (Mac host)"
+                wanted=$base
+                [ "$lock_word" = locked ] && wanted="$base — Studio はロック中"
+                if [ "$(head -1 "$mine/title" 2>/dev/null)" != "$wanted" ]; then
+                    printf '%s\n\n' "$wanted" > "$mine/title"
+                    kill -USR1 "$(number_in "$mine/viewer.pid")" 2>/dev/null
+                fi
+            done
         fi
         sleep 2
     done
@@ -430,14 +454,14 @@ fi
 stop_written_down "\$run/agent.pid"
 HOST
     close_here "$name"
-    rm -f "$state/$name/viewer.pid" "$state/$name/held"
+    : > "$state/$name/viewer.pid"; : > "$state/$name/held"
 }
 
 do_hide() {
     [ $# -ge 1 ] || { echo "usage: scripts/daily-mac.sh hide APP"; exit 2; }
     local name
     name=$(run_name "$1")
-    : > "$state/$name/window-closed"
+    echo 1 > "$state/$name/window-closed"
     close_here "$name"
     printf 'tell %q detach\n' "$name" | on_host > /dev/null 2>&1
     echo "$name: window closed; the host stopped its picture; the application goes on"
@@ -476,7 +500,7 @@ HOST
     for mine in "$state"/*/; do
         [ -d "$mine" ] || continue
         close_here "$(basename "$mine")"
-        rm -f "$mine/viewer.pid" "$mine/held"
+        : > "$mine/viewer.pid"; : > "$mine/held"
     done
     stop_written_down "$state/guard.pid"
     echo "here: windows, relays and the guard are stopped"
