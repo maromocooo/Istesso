@@ -137,7 +137,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         long window = statsSince == 0 ? 1_000_000_000L : now - statsSince;
         statsSince = now;
         Picture p = picture;
-        StringBuilder b = new StringBuilder("stats panel=").append(app.name).append(' ');
+        StringBuilder b = new StringBuilder("stats panel=").append(app.tag()).append(' ');
         b.append(p == null ? "picture=none" : p.statsLine(window));
         long[] s = input == 0 ? null : Native.inputState(input);
         if (s == null) {
@@ -161,7 +161,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (app == null) {
             app = HostApp.ALL[0];
         }
-        setTitle(getString(R.string.panel_name, getString(app.titleRes)));
+        setTitle(getString(R.string.panel_name, app.fullTitle(this)));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         frame = new Fitted(this);
@@ -217,7 +217,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     protected void onNewIntent(android.content.Intent intent) {
         super.onNewIntent(intent);
         HostApp asked = HostApp.of(intent.getData());
-        Log.i(TAG, "panel brought to the front for " + (asked == null ? "?" : asked.name) + " (this panel: " + app.name + ")");
+        Log.i(TAG, "panel brought to the front for " + (asked == null ? "?" : asked.tag()) + " (this panel: " + app.tag() + ")");
     }
 
     @Override
@@ -250,8 +250,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (!resumed || !surfaceReady || picture != null) {
             return;
         }
-        picture = new Picture(settings.configDir, Settings.join(settings.host(), app.picturePort()),
-                settings.hostId(), view.getHolder().getSurface(), this);
+        picture = new Picture(settings.configDir, Settings.join(settings.host(app.host), app.picturePort()),
+                settings.hostId(app.host), view.getHolder().getSurface(), this);
         picture.start();
     }
 
@@ -363,14 +363,14 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         wifiLock.acquire();
         // Whether the device supports the mode (WifiManager.isLowLatencyModeSupported) is not in the
         // public SDK this builds against, and whether the system applied it cannot be read either.
-        Log.i("IstessoAura", "wifi lock taken panel=" + app.name + " mode=low-latency held=" + wifiLock.isHeld()
+        Log.i("IstessoAura", "wifi lock taken panel=" + app.tag() + " mode=low-latency held=" + wifiLock.isHeld()
                 + " applied=not-readable");
     }
 
     private void releaseWifi(String why) {
         if (wifiLock != null && wifiLock.isHeld()) {
             wifiLock.release();
-            Log.i("IstessoAura", "wifi lock released panel=" + app.name + " (" + why + ")");
+            Log.i("IstessoAura", "wifi lock released panel=" + app.tag() + " (" + why + ")");
         }
     }
 
@@ -394,12 +394,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
 
     private void openInput() {
         // Both connections name the paired host; without one, nothing is connected.
-        String peer = settings.hostId();
+        String peer = settings.hostId(app.host);
         if (peer.trim().isEmpty()) {
             input = 0;
             inputLine = getString(R.string.need_pair);
         } else {
-            input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(), app.inputPort()));
+            input = Native.inputOpen(settings.configDir, peer, Settings.join(settings.host(app.host), app.inputPort()));
             if (input == 0) {
                 String why = Native.lastError(Native.ERROR_PAIRING);
                 inputLine = getString(R.string.input_over) + " "
@@ -433,7 +433,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     }
 
     private void show() {
-        StringBuilder b = new StringBuilder(getString(R.string.mark));
+        // Which host this panel shows, always first (the owner, 2026-11-19: two hosts).
+        StringBuilder b = new StringBuilder(app.fullTitle(this)).append('\n').append(getString(R.string.mark));
         for (String s : new String[] {pictureLine, decoderLine, inputLine}) {
             if (!s.isEmpty()) {
                 b.append('\n').append(s);
