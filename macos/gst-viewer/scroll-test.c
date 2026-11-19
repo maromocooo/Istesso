@@ -26,6 +26,19 @@ static void run(ScrollState *state, ScrollIn in, double now) { scroll_event(stat
 #define EXPECT(state, in, now, want) (run(state, in, now), check(want, __LINE__))
 #define EXPECT_DUE(state, now, want) (scroll_due(state, now, collect, NULL), check(want, __LINE__))
 
+// With something done before the first datagram (the window's modifiers): "<first>".
+static void mark_first(void *context) {
+    (void)context;
+    collect(NULL, "<first>");
+}
+static bool sent_around(ScrollState *state, ScrollIn in, double now) {
+    ScrollAround a = {collect, NULL, mark_first, false};
+    return scroll_event_around(state, &in, now, &a);
+}
+#define EXPECT_AROUND(state, in, now, sends, want) \
+    ((sent_around(state, in, now) != (sends) ? (fprintf(stderr, "scroll: failed (line %d): sent\n", __LINE__), failed = 1) : 0), \
+     check(want, __LINE__))
+
 #define FINGER(dy_, phase_, momentum_) ((ScrollIn){.precise = true, .dy = dy_, .phase = phase_, .momentum = momentum_, .scale_x = 2, .scale_y = 2})
 #define WHEEL(dx_, dy_, lx, ly) ((ScrollIn){.dx = dx_, .dy = dy_, .has_lines = true, .lines_x = lx, .lines_y = ly})
 
@@ -93,6 +106,18 @@ int main(void) {
     // An unknown scale counts as one pixel a point.
     EXPECT(&s, ((ScrollIn){.precise = true, .dy = 2, .phase = SCROLL_PHASE_CHANGED}), 0,
            F(0, -2, "0.000", "-2.000", ",\"phase\":\"changed\""));
+
+    // The modifiers go only around an event that sends: never for one that sends nothing, once
+    // before the first datagram of one that sends two.
+    s = (ScrollState){0};
+    EXPECT_AROUND(&s, FINGER(0, SCROLL_PHASE_MAY_BEGIN, 0), 0, false, "");
+    EXPECT_AROUND(&s, FINGER(-1, SCROLL_PHASE_CHANGED, 0), 8, true, "<first>|" F(0, 1, "0.000", "2.000", ",\"phase\":\"changed\""));
+    EXPECT_AROUND(&s, FINGER(0, SCROLL_PHASE_STATIONARY, 0), 16, false, "");
+    EXPECT_AROUND(&s, FINGER(0, SCROLL_PHASE_ENDED, 0), 24, false, "");
+    EXPECT_AROUND(&s, FINGER(0, SCROLL_PHASE_BEGAN, 0), 40, true,
+                  "<first>|" F(0, 0, "0.000", "0.000", ",\"phase\":\"ended\"") "|" F(0, 0, "0.000", "0.000", ",\"phase\":\"began\""));
+    EXPECT_AROUND(&s, WHEEL(0, -0.01, 0, 0), 50, false, "");
+    EXPECT_AROUND(&s, WHEEL(0, -1, 0, -1), 60, true, "<first>|{\"kind\":\"scroll\",\"dx\":0,\"dy\":15,\"source\":\"wheel\",\"v120\":[0,120]}");
 
     if (!failed) printf("scroll: all passed\n");
     return failed;

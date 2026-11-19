@@ -152,4 +152,31 @@ static inline void scroll_event(ScrollState *s, const ScrollIn *in, double now_m
     scroll_finger(send, context, dx, dy, px, py, phase, momentum, false);
 }
 
+// An event's datagrams with something done once before the first of them, and only when there is
+// one: the window brings the modifiers over there in line with the event (and lends them when it
+// is not the one typed into) around a scroll that is sent, never around an event that sends
+// nothing (a gesture that may begin, a stationary one, an end held back, less than a line).
+typedef struct {
+    ScrollSend send;              // where the datagrams go
+    void *context;                // given to `send` and to `first`
+    void (*first)(void *context); // before the first datagram of the event, once
+    bool sent;                    // a datagram of the event went
+} ScrollAround;
+
+static inline void scroll_around_send(void *around, const char *message) {
+    ScrollAround *a = (ScrollAround *)around;
+    if (!a->sent) {
+        a->sent = true;
+        if (a->first) a->first(a->context);
+    }
+    a->send(a->context, message);
+}
+
+// scroll_event, with `a->first` before its first datagram. Says whether one went.
+static inline bool scroll_event_around(ScrollState *s, const ScrollIn *in, double now_ms, ScrollAround *a) {
+    a->sent = false;
+    scroll_event(s, in, now_ms, scroll_around_send, a);
+    return a->sent;
+}
+
 #endif

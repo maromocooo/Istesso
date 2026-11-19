@@ -2177,6 +2177,21 @@ static void send_scroll(void *context, const char *message) {
     send_input("%s", message);
 }
 
+// The modifiers around one scroll event: brought in line before its first datagram (and lent
+// when the window is not the one typed into; keys_around_pointer() in keys.h), and the rest of
+// the changes after its last. Nothing for an event that sends nothing.
+typedef struct {
+    __unsafe_unretained InputView *view;
+    __unsafe_unretained NSEvent *event;
+    KeyChange around[KEYS_MOST];
+    size_t after, end;
+} ScrollModifiers;
+
+static void scroll_modifiers_first(void *context) {
+    ScrollModifiers *m = context;
+    m->after = [m->view modifiersBefore:m->event changes:m->around end:&m->end];
+}
+
 - (void)scrollWheel:(NSEvent *)event {
     if (picture_stale) {
         // Scrolling a picture that is not there moves something nobody sees. An end held back
@@ -2201,13 +2216,12 @@ static void send_scroll(void *context, const char *message) {
         .scale_x = size.width > 0 && picture_width > 0 ? picture_width / size.width : 1.0,
         .scale_y = size.height > 0 && picture_height > 0 ? picture_height / size.height : 1.0,
     };
-    // The modifiers over there are brought in line with this event's around what it sends (lent
-    // around it when the window is not the one typed into; keys_around_pointer() in keys.h).
-    KeyChange around[KEYS_MOST];
-    size_t end = 0, after = [self modifiersBefore:event changes:around end:&end];
-    scroll_event(&_scroll, &in, event.timestamp * 1000.0, send_scroll, NULL);
-    if (end > after) {
-        [self send:around + after count:end - after];
+    // The modifiers over there are brought in line with this event's around what it sends, and
+    // only when it sends something (a Command-scroll carries Command).
+    ScrollModifiers modifiers = {.view = self, .event = event};
+    ScrollAround around = {send_scroll, &modifiers, scroll_modifiers_first, false};
+    if (scroll_event_around(&_scroll, &in, event.timestamp * 1000.0, &around) && modifiers.end > modifiers.after) {
+        [self send:modifiers.around + modifiers.after count:modifiers.end - modifiers.after];
     }
     if (_scroll.held) {
         // The end of the gesture waits here for macOS's inertia; it goes without it once the
