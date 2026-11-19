@@ -61,9 +61,15 @@ pub struct AgentOptions {
     /// instead of [`Paths::input_socket`]. For tests, which must never
     /// write to the socket of a pipeline that is really running.
     pub input_socket: Option<std::path::PathBuf>,
+    /// Daily trial: end the channel when the pipeline replaces its local socket.
+    pub follow_input_restarts: bool,
     /// For measuring: write down when input was passed on, and never what it
     /// was ([`crate::passing`]). `None`, the default, writes nothing.
     pub input_timings: Option<std::path::PathBuf>,
+    /// Daily trial: copy and paste of text (docs/adr/0022-clipboard-text.md). The agent listens
+    /// for answers next to the input socket, and says it takes copy and paste whenever the
+    /// program behind the input socket answers its hello.
+    pub clipboard: bool,
 }
 
 impl Default for AgentOptions {
@@ -75,7 +81,9 @@ impl Default for AgentOptions {
             refresh_peers: Some(Duration::from_secs(300)),
             verbose: false,
             input_socket: None,
+            follow_input_restarts: false,
             input_timings: None,
+            clipboard: false,
         }
     }
 }
@@ -96,11 +104,36 @@ struct Shared {
     verbose: bool,
     /// Where input is handed over on this machine.
     input_socket: std::path::PathBuf,
+    follow_input_restarts: bool,
     /// The conversation each device sends its input on, by the device's id:
     /// one for each device. A device that opens another ends the one before.
     inputs: Mutex<HashMap<String, InputHold>>,
     passing: Option<crate::PassLog>,
+    /// Copy and paste, when they were asked for (trial only).
+    #[cfg(unix)]
+    clipboard: Option<Arc<crate::clipboard::Hub>>,
     log: Log,
+}
+
+#[cfg(unix)]
+use crate::clipboard::Answer as ClipboardAnswer;
+
+/// What became of a copy or paste, where there are no local sockets.
+#[cfg(not(unix))]
+struct ClipboardAnswer {
+    id: u32,
+    result: istesso_proto::ClipboardResult,
+    text: Option<istesso_proto::SecretText>,
+    why: Option<istesso_proto::ClipboardWhy>,
+}
+
+/// How many copies and pastes one conversation asked for, and how many were answered: for the
+/// log, which never says more.
+#[derive(Default)]
+struct ClipboardCounts {
+    asked: u64,
+    copies: u64,
+    answered: u64,
 }
 
 /// What is kept of a conversation that carries input, for ending it from
@@ -130,6 +163,22 @@ impl Agent {
             None => None,
         };
         let paths_input_socket = paths.input_socket();
+        let input_socket = options.input_socket.clone().unwrap_or(paths_input_socket);
+        #[cfg(unix)]
+        let clipboard = if options.clipboard {
+            Some(crate::clipboard::Hub::start(&input_socket).map_err(|e| {
+                format!(
+                    "cannot listen for answers next to {}: {e}",
+                    input_socket.display()
+                )
+            })?)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        if options.clipboard {
+            return Err("copy and paste are only on Linux and macOS".into());
+        }
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -141,9 +190,12 @@ impl Agent {
                 apps: Mutex::new(None),
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
-                input_socket: options.input_socket.clone().unwrap_or(paths_input_socket),
+                input_socket,
+                follow_input_restarts: options.follow_input_restarts,
                 inputs: Mutex::new(HashMap::new()),
                 passing,
+                #[cfg(unix)]
+                clipboard,
                 log,
             }),
         })
@@ -230,6 +282,8 @@ impl Agent {
 struct InputSink {
     #[cfg(unix)]
     socket: std::os::unix::net::UnixDatagram,
+    #[cfg(unix)]
+    file_id: Option<(u64, u64)>,
     /// What this conversation has down on the application's side.
     held: Arc<Mutex<Held>>,
 }
@@ -245,12 +299,21 @@ struct Held {
 
 impl InputSink {
     #[cfg(unix)]
-    fn open(path: &std::path::Path) -> std::io::Result<InputSink> {
+    fn file_id(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    #[cfg(unix)]
+    fn open(path: &std::path::Path, follow_restarts: bool) -> std::io::Result<InputSink> {
+        let file_id = follow_restarts.then(|| Self::file_id(path)).transpose()?;
         let socket = std::os::unix::net::UnixDatagram::unbound()?;
         socket.connect(path)?;
         socket.set_nonblocking(true)?;
         Ok(InputSink {
             socket,
+            file_id,
             held: Arc::default(),
         })
     }
@@ -261,6 +324,7 @@ impl InputSink {
     fn another(&self) -> std::io::Result<InputSink> {
         Ok(InputSink {
             socket: self.socket.try_clone()?,
+            file_id: self.file_id,
             held: self.held.clone(),
         })
     }
@@ -273,7 +337,13 @@ impl InputSink {
     /// Passes events on, and notes which keys and buttons are down because
     /// of them. Nothing is passed on once the conversation is over.
     /// Says how many pieces of committed text were dropped for not being within the limits.
-    fn pass(&self, events: &[InputEvent]) -> usize {
+    /// Copy and paste go to `clipboard`, which says what to send among the events in their
+    /// place (a mark without the text), or nothing.
+    fn pass(
+        &self,
+        events: &[InputEvent],
+        clipboard: &mut dyn FnMut(&InputEvent) -> Option<serde_json::Value>,
+    ) -> usize {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         if held.over {
             return 0;
@@ -326,6 +396,13 @@ impl InputSink {
                         continue;
                     }
                 }
+                // Copy and paste (trial only): their text never goes this way.
+                InputEvent::Copy { .. } | InputEvent::Paste { .. } => {
+                    if let Some(mark) = clipboard(event) {
+                        self.send_value(&mark);
+                    }
+                    continue;
+                }
             }
             self.send(event);
         }
@@ -353,8 +430,18 @@ impl InputSink {
     }
 
     #[cfg(not(unix))]
-    fn open(_path: &std::path::Path) -> std::io::Result<InputSink> {
+    fn open(_path: &std::path::Path, _follow_restarts: bool) -> std::io::Result<InputSink> {
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// A mark of copy or paste, one datagram, in its place among the events.
+    fn send_value(&self, mark: &serde_json::Value) {
+        #[cfg(unix)]
+        if let Ok(bytes) = serde_json::to_vec(mark) {
+            let _ = self.socket.send(&bytes);
+        }
+        #[cfg(not(unix))]
+        let _ = mark;
     }
 
     /// One event, one datagram. A program that has gone away, or does not
@@ -423,7 +510,17 @@ impl Shared {
         // The device asked to be answered when it says "still here".
         let mut answers_alive = false;
         let mut checked = Instant::now();
+        // Copy and paste on this conversation (trial only): whether the program behind the
+        // input socket said it takes them, when input was opened, and their answers.
+        let mut clipboard_on = false;
+        let (answering, answers) = std::sync::mpsc::channel::<ClipboardAnswer>();
+        let mut clipboard_counts = ClipboardCounts::default();
         while let Ok(Some(request)) = session.next_request() {
+            // Answers to copy and paste are written when the device next says something: it
+            // says "still here" often while it waits for one.
+            if !self.answer_clipboard(&mut session, &answers, &mut clipboard_counts) {
+                break;
+            }
             let response = match request {
                 Request::Input { events } => {
                     // Passed on and not answered. Input that was not asked for first, or
@@ -442,7 +539,10 @@ impl Shared {
                             break;
                         }
                     }
-                    let dropped = sink.pass(&events);
+                    let mut clipboard = |event: &InputEvent| {
+                        self.clipboard_mark(clipboard_on, event, &answering, &mut clipboard_counts)
+                    };
+                    let dropped = sink.pass(&events, &mut clipboard);
                     if dropped > 0 {
                         // How many, never what.
                         (self.log)(format!(
@@ -459,39 +559,54 @@ impl Shared {
                     if !(events.is_empty() && answers_alive) {
                         continue;
                     }
+                    // A heartbeat must not vouch for a pipeline whose socket was replaced.
+                    #[cfg(unix)]
+                    if sink
+                        .file_id
+                        .is_some_and(|id| InputSink::file_id(&self.input_socket).ok() != Some(id))
+                    {
+                        break;
+                    }
                     Response::InputAlive
                 }
                 Request::InputOpen { .. } if !session.allows(Permission::Control) => {
                     Response::error(ErrorCode::Forbidden, "this device may not control the host")
                 }
-                Request::InputOpen { alive } => match InputSink::open(&self.input_socket) {
-                    Ok(sink) => {
-                        // One conversation carries a device's input. An earlier one (cut
-                        // off somewhere on the way, perhaps, without either end having
-                        // been told) is over now, and what it had down comes up before
-                        // this one presses anything.
-                        if let Some(earlier) = input.take() {
-                            earlier.let_go();
-                            // Asked twice in one conversation: it is not its own
-                            // predecessor, and is not ended for it.
-                            self.forget_input(session.peer(), &earlier);
+                Request::InputOpen { alive } => {
+                    match InputSink::open(&self.input_socket, self.follow_input_restarts) {
+                        Ok(sink) => {
+                            // One conversation carries a device's input. An earlier one (cut
+                            // off somewhere on the way, perhaps, without either end having
+                            // been told) is over now, and what it had down comes up before
+                            // this one presses anything.
+                            if let Some(earlier) = input.take() {
+                                earlier.let_go();
+                                // Asked twice in one conversation: it is not its own
+                                // predecessor, and is not ended for it.
+                                self.forget_input(session.peer(), &earlier);
+                            }
+                            self.take_over_input(&session, &sink);
+                            input = Some(sink);
+                            answers_alive = alive;
+                            if alive {
+                                // It says "still here" twice a second from now on.
+                                let _ = session.set_wait(INPUT_SILENCE);
+                            }
+                            asked.push("input");
+                            clipboard_on = self.clipboard_is_taken();
+                            // This agent takes committed text (InputEvent::Text).
+                            Response::InputOpen {
+                                alive,
+                                text: true,
+                                clipboard: clipboard_on,
+                            }
                         }
-                        self.take_over_input(&session, &sink);
-                        input = Some(sink);
-                        answers_alive = alive;
-                        if alive {
-                            // It says "still here" twice a second from now on.
-                            let _ = session.set_wait(INPUT_SILENCE);
-                        }
-                        asked.push("input");
-                        // This agent takes committed text (InputEvent::Text).
-                        Response::InputOpen { alive, text: true }
+                        Err(_) => Response::error(
+                            ErrorCode::Internal,
+                            "nothing on this host takes input at the moment",
+                        ),
                     }
-                    Err(_) => Response::error(
-                        ErrorCode::Internal,
-                        "nothing on this host takes input at the moment",
-                    ),
-                },
+                }
                 request if session.allows(Permission::View) => self.answer(&request, &mut asked),
                 _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
@@ -505,6 +620,16 @@ impl Shared {
             sink.let_go();
             self.forget_input(session.peer(), &sink);
         }
+        if clipboard_counts.asked > 0 {
+            // How many, never what, how long, or the nonces.
+            (self.log)(format!(
+                "clipboard: {} copy and {} paste asked by {}, {} answered",
+                clipboard_counts.copies,
+                clipboard_counts.asked - clipboard_counts.copies,
+                session.peer().name,
+                clipboard_counts.answered
+            ));
+        }
         if self.verbose && !asked.is_empty() {
             (self.log)(format!(
                 "{} asked for {}",
@@ -512,6 +637,92 @@ impl Shared {
                 asked.join(", ")
             ));
         }
+    }
+
+    /// Whether copy and paste are taken at this moment: asked for, and the program behind the
+    /// input socket answered a hello.
+    fn clipboard_is_taken(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.clipboard.as_ref().is_some_and(|hub| hub.probe())
+        }
+        #[cfg(not(unix))]
+        false
+    }
+
+    /// The mark to send in the place of a copy or a paste, or nothing. Without copy and paste
+    /// on this conversation, they are dropped; one that cannot be asked is answered at once.
+    fn clipboard_mark(
+        &self,
+        on: bool,
+        event: &InputEvent,
+        answering: &std::sync::mpsc::Sender<ClipboardAnswer>,
+        counts: &mut ClipboardCounts,
+    ) -> Option<serde_json::Value> {
+        #[cfg(unix)]
+        {
+            let hub = self.clipboard.as_ref().filter(|_| on)?;
+            let at_once = |id: u32, result: istesso_proto::ClipboardResult| {
+                let _ = answering.send(ClipboardAnswer {
+                    id,
+                    result,
+                    text: None,
+                    why: None,
+                });
+                None
+            };
+            counts.asked += 1;
+            match event {
+                InputEvent::Copy { id, cut } => {
+                    counts.copies += 1;
+                    match hub.copy(*id, *cut, answering) {
+                        Some(mark) => Some(mark),
+                        None => at_once(*id, istesso_proto::ClipboardResult::Nothing),
+                    }
+                }
+                InputEvent::Paste { id, text } => match hub.paste(*id, text.as_ref(), answering) {
+                    Ok(mark) => Some(mark),
+                    Err(result) => at_once(*id, result),
+                },
+                _ => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (on, event, answering, counts);
+            None
+        }
+    }
+
+    /// Writes the answers to copy and paste that have come. Each goes only after the list of
+    /// paired devices has been read again: a device that lost its right in the meantime is
+    /// told nothing more, and the conversation ends (`false`).
+    fn answer_clipboard(
+        &self,
+        session: &mut Session,
+        answers: &std::sync::mpsc::Receiver<ClipboardAnswer>,
+        counts: &mut ClipboardCounts,
+    ) -> bool {
+        while let Ok(answer) = answers.try_recv() {
+            if !may_still_control(&self.paths, session.peer()) {
+                (self.log)(format!(
+                    "stopped taking input from {}: it is no longer allowed to control this host",
+                    session.peer().name
+                ));
+                return false;
+            }
+            counts.answered += 1;
+            let response = Response::Clipboard {
+                id: answer.id,
+                result: answer.result,
+                text: answer.text,
+                why: answer.why,
+            };
+            if session.respond(&response).is_err() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Notes that `session` carries its device's input from now on, and ends
@@ -665,13 +876,13 @@ mod tests {
         let dir = TempDir::new("in");
         let path = dir.paths().config.join("i.sock");
         // Nobody listens: there is nothing to open.
-        assert!(InputSink::open(&path).is_err());
+        assert!(InputSink::open(&path, false).is_err());
 
         let listener = UnixDatagram::bind(&path).unwrap();
         listener
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let sink = InputSink::open(&path).unwrap();
+        let sink = InputSink::open(&path, false).unwrap();
         sink.send(&InputEvent::Key {
             code: 30,
             pressed: true,
@@ -723,6 +934,179 @@ mod tests {
             false
         }
 
+        /// The next datagram the agent hands over, as JSON.
+        fn handed_raw(pair: &InputPair, wait: Duration) -> Option<serde_json::Value> {
+            pair.taken.set_read_timeout(Some(wait)).unwrap();
+            let mut buffer = [0u8; 512];
+            let length = pair.taken.recv(&mut buffer).ok()?;
+            Some(serde_json::from_slice(&buffer[..length]).unwrap())
+        }
+
+        /// A stand-in for the compositor's clipboard socket: answers hellos, and hands over the
+        /// texts of pastes.
+        fn stand_in(pair: &InputPair) -> std::sync::mpsc::Receiver<serde_json::Value> {
+            use crate::clipboard::{set_buffers, ANSWER_SOCKET, CLIPBOARD_SOCKET, SOCKET_BUFFER};
+            use std::os::unix::net::UnixDatagram;
+            let dir = pair.host.path().to_path_buf();
+            let socket = UnixDatagram::bind(dir.join(CLIPBOARD_SOCKET)).unwrap();
+            set_buffers(&socket, SOCKET_BUFFER);
+            let (texts, given) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 192 * 1024];
+                while let Ok(length) = socket.recv(&mut buffer) {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&buffer[..length]).unwrap();
+                    if value["kind"] == "hello" {
+                        let _ = socket.send_to(&buffer[..length], dir.join(ANSWER_SOCKET));
+                    } else if texts.send(value).is_err() {
+                        break;
+                    }
+                }
+            });
+            given
+        }
+
+        fn answer_as_the_compositor(pair: &InputPair, answer: serde_json::Value) {
+            use std::os::unix::net::UnixDatagram;
+            UnixDatagram::unbound()
+                .unwrap()
+                .send_to(
+                    &serde_json::to_vec(&answer).unwrap(),
+                    pair.host.path().join(crate::clipboard::ANSWER_SOCKET),
+                )
+                .unwrap();
+        }
+
+        /// Says "still here" often, as the relay does while it waits, until an answer comes.
+        fn hear_clipboard(
+            client: &mut istesso_link::Client,
+        ) -> Option<istesso_link::ClipboardAnswer> {
+            let began = Instant::now();
+            while began.elapsed() < SOON {
+                client.send_input(&[]).unwrap();
+                if let Some(answer) = client.heard().unwrap().clipboard.pop() {
+                    return Some(answer);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+
+        #[test]
+        fn copy_and_paste_go_as_marks_among_the_keys_and_the_answer_comes_back() {
+            use istesso_proto::{ClipboardResult, SecretText};
+            let pair = InputPair::with_clipboard("ic");
+            let texts = stand_in(&pair);
+            let mut client = pair.connect();
+            assert_eq!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Open {
+                    alive: true,
+                    text: true,
+                    clipboard: true,
+                }
+            );
+            client
+                .send_input(&[
+                    key(29, true),
+                    InputEvent::Copy { id: 1, cut: false },
+                    key(29, false),
+                ])
+                .unwrap();
+            assert_eq!(handed_raw(&pair, SOON).unwrap()["kind"], "key");
+            let mark = handed_raw(&pair, SOON).unwrap();
+            assert_eq!(mark["kind"], "clipboard_copy");
+            assert_eq!(mark["cut"], false);
+            // The device's number does not go to the compositor; a nonce of the agent's does.
+            assert!(mark.get("id").is_none());
+            assert_eq!(handed_raw(&pair, SOON).unwrap()["pressed"], false);
+            answer_as_the_compositor(
+                &pair,
+                serde_json::json!({"kind":"answer","nonce":mark["nonce"],"result":"text","text":"from the host"}),
+            );
+            let answer = hear_clipboard(&mut client).unwrap();
+            assert_eq!((answer.id, answer.result), (1, ClipboardResult::Text));
+            assert_eq!(answer.text.unwrap().as_str(), "from the host");
+
+            // The text of a paste is at the compositor's own socket before its mark comes.
+            client
+                .send_input(&[InputEvent::Paste {
+                    id: 2,
+                    text: Some(SecretText("from the laptop".into())),
+                }])
+                .unwrap();
+            let text = texts.recv_timeout(SOON).unwrap();
+            assert_eq!(text["kind"], "paste_text");
+            assert_eq!(text["text"], "from the laptop");
+            let mark = handed_raw(&pair, SOON).unwrap();
+            assert_eq!(mark["kind"], "clipboard_paste");
+            assert_eq!(mark["with_text"], true);
+            assert_eq!(mark["nonce"], text["nonce"]);
+            // Text over the limits is answered at once, and nothing is handed over.
+            client
+                .send_input(&[InputEvent::Paste {
+                    id: 3,
+                    text: Some(SecretText(
+                        "x".repeat(istesso_proto::CLIPBOARD_MOST_BYTES + 1),
+                    )),
+                }])
+                .unwrap();
+            let answer = hear_clipboard(&mut client).unwrap();
+            assert_eq!((answer.id, answer.result), (3, ClipboardResult::TooLarge));
+            assert!(handed_raw(&pair, A_MOMENT).is_none());
+        }
+
+        #[test]
+        fn without_a_compositor_that_answers_copy_and_paste_are_not_taken() {
+            let pair = InputPair::with_clipboard("in");
+            let mut client = pair.connect();
+            assert_eq!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Open {
+                    alive: true,
+                    text: true,
+                    clipboard: false,
+                }
+            );
+            // Sent anyway, they are dropped; the keys around them arrive.
+            client
+                .send_input(&[InputEvent::Copy { id: 1, cut: true }, key(30, true)])
+                .unwrap();
+            assert_eq!(handed_raw(&pair, SOON).unwrap()["code"], 30);
+        }
+
+        #[test]
+        fn a_device_that_loses_its_right_before_the_answer_is_told_nothing() {
+            let pair = InputPair::with_clipboard("ir");
+            let _texts = stand_in(&pair);
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client
+                .send_input(&[InputEvent::Copy { id: 1, cut: false }])
+                .unwrap();
+            let mark = handed_raw(&pair, SOON).unwrap();
+            let mut peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+            let id = peers.peers()[0].id.clone();
+            peers.remove(&id).unwrap();
+            answer_as_the_compositor(
+                &pair,
+                serde_json::json!({"kind":"answer","nonce":mark["nonce"],"result":"text","text":"secret"}),
+            );
+            let began = Instant::now();
+            let mut heard_text = false;
+            while began.elapsed() < Duration::from_secs(1) {
+                if client.send_input(&[]).is_err() {
+                    break;
+                }
+                match client.heard() {
+                    Ok(heard) => heard_text |= !heard.clipboard.is_empty(),
+                    Err(_) => break,
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!heard_text);
+        }
+
         #[test]
         fn still_here_is_answered_when_that_was_asked_for_and_keys_never_are() {
             let pair = InputPair::new("ia");
@@ -731,7 +1115,8 @@ mod tests {
                 asking.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    clipboard: false,
                 }
             );
             asking.send_input(&[]).unwrap();
@@ -858,7 +1243,8 @@ mod tests {
                 first.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    clipboard: false,
                 }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
@@ -872,7 +1258,8 @@ mod tests {
                 second.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    clipboard: false,
                 }
             );
             second.send_input(&[key(29, true)]).unwrap();
@@ -913,7 +1300,8 @@ mod tests {
                 client.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    clipboard: false,
                 }
             );
             // What was down comes up, and the conversation carries on.
