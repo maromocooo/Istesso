@@ -82,4 +82,5 @@
 ## 文体
 
 - コードとコメント、CLI の出力は英語。
-- `docs/` と README は日本語。
+- `README.md` は英語で正本。翻訳は `README.<言語>.md`。`docs/` は日本語。
+  - 翻訳の 1 行目には、合わせた英語版の印（`README.md` の中身のハッシュ）を置きます。`README.md` を変えたら、同じ PR で `scripts/check-translations.sh --mark-stale` を走らせ、古くなった翻訳に、見える知らせを付けます（翻訳し直しは待ちません）。翻訳し直して、別の目の見直しが済んだら、`scripts/check-translations.sh --stamp README.<言語>.md` で印を新しくします。

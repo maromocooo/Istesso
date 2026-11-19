@@ -1,77 +1,109 @@
+**English** · [日本語](README.ja.md) · [简体中文](README.zh-Hans.md) · [한국어](README.ko.md) · [Español](README.es.md)
+
 # Istesso
 
-Istesso は、Mac と Ubuntu の PC をひとつの作業環境として使うためのソフトウェアです。手元で動くアプリはそのまま使い、ほかの PC にしかないアプリは手元の窓に映すことを目指しています。目標は、有線 LAN で操作したときに遅れを感じないことです。[要件](docs/requirements.md)
+Istesso shows apps that run on your other computers as ordinary windows on the one in front of you, over its own encrypted channel. Its one rule: if it feels remote, even slightly, it has failed.
 
-まだ開発の初期です。コマンド名は `istesso` です。名前は音楽用語の *l’istesso tempo*（拍子が変わっても同じ速さで）から取りました。
+<!-- Picture to come (docs/images/): part of one screen with three windows that look the same — an app
+     running here, one on a Linux host, one on a Mac host — labelled only outside the picture.
+     Istesso's own test app and made-up content only. -->
 
-## 実機でできたこと
+> [!IMPORTANT]
+> Istesso is at the trial stage. The author uses it every day to find what is still missing, and much of that work lives on branches that are not in `main` yet. There are no binaries to download: you build it from source. What works today, and on which machines, is in the table below.
 
-- **端末とアプリの一覧（M0）**。Mac と Ubuntu を短いコードでペアリングし、両方向で相手の鍵を確かめて通信できました。各 PC の役割、負荷、空きメモリが見えます。両方の PC にある同じアプリは、一覧の 1 行にまとまります。片方が応答しなくなると、その PC にしかないアプリに `!` が付きます。この 2 台で M0 の受け入れ条件を満たしました。[進捗表](docs/milestones.md)
-- **映像と入力の試作（M1）**。Ubuntu のテストアプリを Mac の窓に映し、キー入力を返しました。Linux ホストで映像の圧縮に NVENC を使ったため、この経路には NVENC 対応の NVIDIA GPU が必要です。
+## What it is
 
-  2 台を有線でつなぎ、3440×1440、85 Hz で 2,000 回測りました。入力から画面が変わるまでの時間を、中継した窓と手元の窓で同じ分位どうしで比べます。差の合格ラインは中央値 12 ms 以下、95 パーセンタイル 24 ms 以下、99 パーセンタイル 47 ms 以下です。中央値の差は 10.32 ms でした。これは試作のビューアーと計測用ホストでの**仮の値**です。M1 は関門を通過しました。受け入れは、自前のクライアントとホストでの確定の判定のあとです。[M1 の計画](docs/m1-plan.md)・[測定記録](docs/measurements/2026-11-17-m1-gate.md)
+Istesso puts each piece of work where it costs the least delay, in this order:
 
-日常利用向けの試用版、AURA の試作、自前のクライアントとホスト、ランチャーとアプリ管理、音声、Mac ホストは、開発の多くが `main` に入る前のブランチで進んでおり、まだ受け入れ条件を満たしていません。
+1. What can run on the machine in front of you runs there. Only its state is kept in step with the others.
+2. Text work goes over a direct terminal connection.
+3. Only what is left — apps that need a screen and live on another machine — is relayed as video, one app to one window, with the pointer drawn on your side.
 
-## ソースから試す
+The rule above is checked in a form that can fail: you should not be able to tell which window is remote. A relayed window is measured against the same app running locally on the same screen, and a person tries to pick out the relayed one by eye. The rule covers machines on a wired home network; Wi-Fi and connections over the internet are outside it.
 
-CLI には Rust 1.85 以上が必要です。実機で一覧とペアリングを確かめた組み合わせは macOS 26 と Ubuntu 24.04 です。次の手順では、`main` の CLI で端末をつなぎ、一覧を見ます。
+The name comes from *l'istesso tempo*, a direction in music: keep the same pace even when the metre changes.
 
-1. 各 PC でリポジトリの先頭に移り、CLI をビルドして入れます。まず、その PC の役割、アプリ、接続機器を見ます。
+## What works today
 
-   ```sh
-   cargo install --path crates/istesso-cli --locked
-   istesso doctor
-   istesso apps list
-   istesso devices list
-   ```
+Each column says where the app runs and where you see it.
 
-2. 同じ LAN の 1 台目で `istesso pair host` を実行します。そこに表示された `istesso pair join <アドレス> <コード>` を 2 台目で実行します。コードは 1 回限りです。入力を間違えたら、1 台目からやり直します。
+| What | Linux host → Mac | Mac host → Mac | Linux host → Android XR headset |
+|---|---|---|---|
+| Pair two machines with a one-time code; list every machine and its apps in one list | `Verified` 2026-11-16 ([record](docs/milestones.md#m0-共通の土台), Japanese) | `Trial` | `Planned` |
+| Open an app on a host and use it as one window: picture, keys, pointer, scrolling | `Trial` | `Trial` | `Trial` |
+| Copy and paste text between that window and the machine in front of you | `Trial` | `Trial` | `Planned` |
+| Type Japanese through an input method | `Trial` | `Trial` | `Planned` |
+| Hear a host's sound where you are | `Planned` | `Planned` | `Planned` |
+| A launcher window that opens an app wherever it is installed | `Planned` | `Planned` | `Planned` |
+| Move a USB device from one machine to another | `Out of scope` | `Out of scope` | `Out of scope` |
 
-   新しくペアリングした端末には、閲覧（`view`）と操作（`control`、キーやポインターの入力）の権限だけがあります。許可を与えた側の PC で `istesso peers deny <端末> <権限>` を実行すると、その権限を取り消せます。[ペアリングと権限](docs/adr/0006-pairing.md)
+- `Verified`: run from `main`, on real machines in that role, with the steps a reader would use. It always carries the date and a link to the record.
+- `Trial`: works in the author's trial build, which lives on branches. You cannot reproduce it from `main` yet.
+- `Planned`: being designed, or not started.
+- `Out of scope`: not part of this release.
 
-3. 両方の PC で `istesso agent` を起動し、そのまま動かしておきます。どちらかの PC の別のターミナルで、端末とアプリの一覧を見ます。
+The latency bar, for a relayed window against the same app run locally on the same screen (both machines wired, an 85 Hz display, a 3440×1440 picture): no more than 12 ms added at the median, 24 ms at the 95th percentile and 47 ms at the 99th percentile. The relay passed the gate on 2026-11-17 with a prototype viewer; it is accepted only after the final verdict, measured with Istesso's own client and host ([gate record](docs/measurements/2026-11-17-m1-gate.md), Japanese).
 
-   ```sh
-   istesso hosts
-   istesso apps list --all
-   ```
+## What comes later
 
-   信頼できないネットワークでは、`istesso agent --no-discovery` で起動すると、自分の端末の広告と相手の探索を止められます。
+- Istesso's own client and host in `main`, then the final latency verdict
+- Sound from any host to one output you choose, for hours without a gap
+- A launcher across machines, which can wake a host that is asleep
+- Shared storage across machines, and a dedicated user that keeps Istesso's apps and agents away from your own files
+- Running builds and jobs on the machine that suits them
+- Devices across machines, starting with one programmable keypad
+- A client for Android XR headsets
+- Signed packages for macOS and Ubuntu, updates, and an external review of pairing
+- Windows, after this release
 
-### 相手が一覧に出ないとき
+Each step and the test it has to pass: [docs/milestones.md](docs/milestones.md) (Japanese).
 
-`istesso hosts` の表示で、相手の状態を確かめます。ファイアウォールを使っている場合は、ペアリング用の TCP 47800、エージェント用の TCP 47801、自動発見用の UDP 5353 を確認してください。macOS でターミナルにローカルネットワークの許可を求められたら、許可してください。
+## Known limits
 
-ペアリング後の自動発見は、1 台で 2 台分を動かして確認しました。実機でアドレスの変更に追従するかは未確認です。自動発見が届かない経路では、`istesso peers address <名前> <アドレス>` で相手の到達先を指定できます。接続のたびに、ペアリングで固定した鍵で相手を確かめます。[通信の仕組み](docs/adr/0007-control-channel.md)
+- Istesso is not protected from other programs running as the same user on the same machine. Use it on your own machines, where only programs you trust run.
+- The latency rule covers a wired home network. Wi-Fi and the internet are outside it ([notes on Wi-Fi](docs/wifi.md), Japanese).
+- A Linux host needs an NVIDIA GPU with NVENC, its hardware video encoder.
+- After a restart, a Mac host cannot be used until someone logs in on it once.
+- There is no installer, no automatic update and no signed binary. Pairing has not had an external review.
+- The latency figures so far come from a prototype viewer. Acceptance waits for the final verdict.
+- Windows is not supported in this release.
 
-## まだできていないこと
+## How it differs from similar tools
 
-M0 には、ペアリングのときに、アドレスを打たずに相手を見つけること、QR コードでの接続、ペアリングのエージェントへの統合、エージェントの常駐サービス化が残っています。M2 以降も開発中です。[マイルストーンと受け入れ条件](docs/milestones.md)
+| Kind of tool | What it gives you | How Istesso is built | When that kind fits better |
+|---|---|---|---|
+| Remote desktop (VNC, RDP and the like) | The whole desktop of another machine, including its login screen, also over the internet | Each app becomes one window on your own desktop, next to your local windows and windows from other machines | You need a whole desktop, the login screen, use over the internet, or Windows |
+| A terminal over ssh, with a terminal multiplexer | Text with the least delay, over any link, in sessions that outlive a dropped connection | Istesso does not replace it: text over a terminal is the second of its three layers, and video is kept for apps that need a screen | Your work is text |
+| Window forwarding (X11 over ssh, for example) | Single windows of remote X11 apps on your screen, carried inside an ssh connection | Each window is sent as hardware-encoded video and measured against a local window | Your apps are X11 apps and an ssh connection is all you want to set up |
+| Game streaming | Full screen, relative mouse movement, gamepads, play over the internet | Made for app windows: absolute pointer positions, the cursor drawn on your side. Games are outside this release | You want to play games |
 
-| 段階 | 現在の範囲と残っていること |
-|---|---|
-| M2 音声 | `main` に音声中継はありません。選んだ出力先で 8 時間途切れずに再生することが目標です。 |
-| M3 アプリの起動 | 試作で Firefox と Blender の窓を開きました。ランチャーからの日常利用には、修飾キーや複数の窓の扱いが残っています。[試用の記録](docs/m3-everyday-apps.md) |
-| M4 Mac ホスト | 実機で映像の圧縮を測りました。別の Mac の窓で操作して遅延の基準を満たすかは未確認です。再起動後は人が一度ログインする必要があります。 |
-| M5 ストレージと隔離 | `main` では、複数台の空き容量をまとめて見る仕組みと、専用ユーザーでのインストールは設計段階です。 |
-| M6 作業の振り分け | 実機の役割表を使って行き先を選べました。その PC でのビルド、実行、配備はこれからです。 |
-| M7 機器 | CLI で一覧にできるのは手元の機器です。Mac では機器 1 種類でボタン入力と絵の表示を試しました。全端末の機器一覧は未完成です。USB の付け替えは今回の公開の対象外です。 |
-| M8 XR | `main` では、Android XR クライアントは下調べの段階です。 |
-| M9 配布 | 署名付きインストーラー、自動更新、ペアリングの外部レビューが残っています。 |
+## Quick start
 
-Windows は将来の対象です。有線 LAN での試作の遅延値は、Wi-Fi やインターネット越しの値には使えません。[Wi-Fi で使うときの手引き](docs/wifi.md)
+These steps use one machine. They show what Istesso finds on it — its roles, the apps installed, the devices plugged in — and nothing more. Connecting two machines and showing a remote app are not in this README yet, because those steps have not been run again from a clean clone.
 
-## ライセンスと開発への参加
+You need `git` and Rust 1.85 or later.
 
-Istesso のライセンスは `MIT OR Apache-2.0` です。利用者はどちらかを選べます。[MIT](LICENSE-MIT) ・ [Apache-2.0](LICENSE-APACHE)
+```sh
+git clone https://github.com/maromocooo/Istesso.git
+cd Istesso
+cargo build --release --locked -p istesso-cli
+./target/release/istesso doctor
+./target/release/istesso apps list
+./target/release/istesso devices list
+```
 
-- 外部のコードを読む前に、ライセンスと参照できる実装の一覧を確認してください。GPL・AGPL のコードは取り込みません。[部品の採否](docs/components.md)
-- 仕様や手順を借りる前には特許の条件も確かめます。条件がはっきりしないものは採りません。[特許の扱い](AGENTS.md#1-ライセンス)
-- 変更はブランチで行い、新しい振る舞いにはテストを付けてください。映像・入力・音の経路を変えたら、変更前後の計測値を PR に書きます。測れなかった場合はその旨を書きます。[開発の規約](AGENTS.md)
-- 機器アダプターの仕様はまだ固まっていません。いまは外部からの機器アダプターの PR を受け付けていません。[機器対応の方針](docs/adr/0012-device-framework.md)
+- `doctor` prints this machine's roles: for example, whether it has a hardware video encoder, can build for Apple platforms, or suits being a host that is always on.
+- `apps list` prints the apps installed on this machine.
+- `devices list` prints the devices plugged into this machine.
 
-開発時の確認には次のコマンドを使います。`cargo deny check` には cargo-deny が必要です。
+Last run from a clean clone on 2026-11-19, on macOS 26.5 (Apple silicon).
+
+## Build from source
+
+- Rust 1.85 or later. It builds on macOS and Linux; CI builds and tests every change on both.
+- No signed binaries are published, and how Istesso will be distributed has not been decided.
+
+Before sending a change, run these (CI runs the same checks):
 
 ```sh
 cargo fmt --all
@@ -79,3 +111,45 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check
 ```
+
+`cargo deny check` needs [cargo-deny](https://github.com/EmbarkStudios/cargo-deny).
+
+## Security
+
+- Pairing: one machine shows a one-time code of eight characters, and you type it on the other. The two run a PAKE (SPAKE2) on the code, then exchange and pin each other's long-term keys ([ADR 0006](docs/adr/0006-pairing.md), Japanese).
+- Every later connection authenticates both sides against the pinned keys and is encrypted, using the Noise protocol framework; the picture travels under the same keys ([ADR 0007](docs/adr/0007-control-channel.md), [ADR 0015](docs/adr/0015-media-transport.md), Japanese).
+- A newly paired machine may only view and control. Each permission can be taken back on the machine that gave it.
+
+Pairing has not had an external review yet; one is planned before a release. Istesso is not protected from other programs running as the same user on the same machine.
+
+To report a vulnerability, use GitHub's private vulnerability reporting (the Security tab, "Report a vulnerability"). Please do not open a public issue for it.
+
+## Documentation
+
+The longer documents are in Japanese.
+
+- [Requirements](docs/requirements.md) (Japanese)
+- [Milestones and their acceptance tests](docs/milestones.md) (Japanese)
+- [Architecture](docs/architecture.md) (Japanese)
+- [Decisions (ADRs)](docs/adr/) (Japanese)
+- [Measurements](docs/measurements/) (Japanese)
+- [Components and their licences](docs/components.md) (Japanese)
+
+## Contributing
+
+- The working rules for people and coding agents are in [AGENTS.md](AGENTS.md) (Japanese). Work on a branch, and add tests for new behaviour.
+- No GPL or AGPL code comes in. Before using outside code, check it against [docs/components.md](docs/components.md) (Japanese); before borrowing a specification or protocol, check its patent terms as well as its licence. What is unclear is left out.
+- A change to the video, input or sound path carries measurements from before and after it in the pull request, or says that it could not be measured.
+- Pull requests that add device adapters are not accepted yet: the interface for them is not settled ([ADR 0012](docs/adr/0012-device-framework.md), Japanese).
+
+## Licence
+
+Istesso is available under the MIT licence or the Apache License 2.0, whichever you choose: [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE).
+
+## Author
+
+[maromocooo](https://github.com/maromocooo)
+
+## Trademarks
+
+Apple, Mac and macOS are trademarks of Apple Inc. Ubuntu is a trademark of Canonical Ltd. Linux is a registered trademark of Linus Torvalds. NVIDIA and NVENC are trademarks of NVIDIA Corporation. Android is a trademark of Google LLC. Rust is a trademark of the Rust Foundation. Istesso is not affiliated with or endorsed by any of them.
