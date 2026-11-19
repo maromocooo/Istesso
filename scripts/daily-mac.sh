@@ -74,9 +74,9 @@ mkdir -p "$state"
 
 # ---- Small things ----
 
-# Whether this command was started by "Istesso Dev Open" (the handler the owner's own click on a
-# Spotlight or launcher entry starts; it sets DAILY_OPEN_HANDLER=1): that application's program is
-# among this process's ancestors. A discipline guard for agents, not a security boundary.
+# This is a discipline guard for agents, not a security boundary. Only the owner starts the
+# shortcuts. For desktop, only the original Open.app handler qualifies as a launcher.
+# BEGIN started_by_open_handler
 started_by_open_handler() {
     [ "${DAILY_OPEN_HANDLER:-}" = 1 ] || return 1
     local pid=$$ i command
@@ -85,9 +85,13 @@ started_by_open_handler() {
         [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != 1 ] || return 1
         command=$(ps -o comm= -p "$pid" 2>/dev/null)
         case "$command" in */"Istesso Dev Open.app"/Contents/MacOS/*) return 0 ;; esac
+        if [[ ${1:-} != desktop && $command =~ ^"$HOME/Applications/Istesso Dev/"[^/]+[.]app/Contents/MacOS/istesso-owner-shim$ ]]; then
+            return 0
+        fi
     done
     return 1
 }
+# END started_by_open_handler
 
 signal_free() { "$repo/scripts/measuring.sh" status >/dev/null 2>&1; }
 refuse_when_busy() {
@@ -232,7 +236,7 @@ do_open() {
     # are not an application's windows). It shows everything on the Mac: the owner's only.
     if [ "$app" = desktop ]; then
         display=1
-        if [ "${DAILY_OWNER:-}" != 1 ] || { { [ ! -t 0 ] || [ ! -t 1 ]; } && ! started_by_open_handler; }; then
+        if [ "${DAILY_OWNER:-}" != 1 ] || { { [ ! -t 0 ] || [ ! -t 1 ]; } && ! started_by_open_handler desktop; }; then
             echo "error: desktop shows the whole Mac: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
             exit 2
         fi
