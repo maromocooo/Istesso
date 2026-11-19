@@ -1,0 +1,20 @@
+[package]
+name = "istesso-scope"
+description = "Prototype: runs a command under an agent scope level (Landlock on Linux). Not part of the trial build."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "istesso-scope"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Landlock system calls (ADR 0026, docs/research/agent-scope-proto.md). MIT OR Apache-2.0.
+landlock = "0.4.7"
+libc = "0.2"
