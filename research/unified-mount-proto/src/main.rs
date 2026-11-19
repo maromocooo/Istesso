@@ -136,7 +136,7 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
                 None => {
-                    say!("usage: unified-mount-proto ensure <device> <folder-id> --base DIR --machine-folder NAME [--address ADDR[:PORT]] [--state DIR] [--wait-ms N]");
+                    say!("usage: unified-mount-proto ensure <device> <folder-id> --base DIR --machine-folder NAME [--address ADDR[:PORT]] [--state DIR] [--wait-ms N] [--unmount-when-unused SECS]");
                     ExitCode::from(2)
                 }
             }

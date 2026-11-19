@@ -342,6 +342,9 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
     }
     wait_for_earlier(&pid_file);
 
+    // A new log for this run: an earlier `mount` that has not ended yet writes on in the old
+    // one, not in this one.
+    let _ = std::fs::remove_file(&log_path);
     let log = OpenOptions::new()
         .create(true)
         .write(true)
