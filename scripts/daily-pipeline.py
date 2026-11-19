@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""The everyday trial's way of starting scripts/m1-step3-host.py with an encoder setting that the
-measuring tool does not have (docs/trial-daily.md, "静止画の質の下限"). Trial only: started by
-scripts/daily.sh when DAILY_MIN_QP (or `open ... --min-qp N`) is given, and never otherwise.
+"""The everyday trial's way of starting scripts/m1-step3-host.py with what the measuring tool does
+not have: an encoder setting (docs/trial-daily.md, "静止画の質の下限") and committed text for the
+application ("日本語の入力"). Trial only: started by scripts/daily.sh, never by a measurement.
 
-    daily-pipeline.py --min-qp N HOST_SCRIPT [its arguments...]
+    daily-pipeline.py [--min-qp N] [--text] HOST_SCRIPT [its arguments...]
     daily-pipeline.py --min-qp N --check     print the encoder part as it would be, and end
+
+--text: input events of the kind "text" (committed text, docs/adr/0007-control-channel.md,
+"確定した文字") that `istesso agent` hands over on the input socket are given to the compositor
+as the custom upstream event TextCommit (text=string), which the trial compositor (gwd-trial20 and
+later) hands to the client that has the keyboard. The host script skips kinds it does not know;
+this program takes those events out of what the host script reads (it wraps json.loads for the
+datagrams of that kind only) and sends them itself, in order, on the same main loop. The text is
+never written anywhere, only checked against the limits (256 characters, 1024 bytes, no control
+characters) and passed on.
 
 A quality floor for the NVENC encoder: min-qp-i, min-qp-p and min-qp-b are all set to N (0-51), so
 that a picture that stands still is encoded in very few bytes. m1-step3-host.py and m1_encoder.py
@@ -29,27 +38,69 @@ def floor(description, qp):
     return description.replace(head, head + words + " ")
 
 
+MOST_CHARS = 256
+MOST_BYTES = 1024
+
+
+def acceptable(text):
+    """Whether committed text may be passed on (docs/adr/0007-control-channel.md, "確定した文字")."""
+    return (
+        isinstance(text, str)
+        and 0 < len(text) <= MOST_CHARS
+        and len(text.encode("utf-8", "surrogatepass")) <= MOST_BYTES
+        and not any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in text)
+    )
+
+
+def take_text(hand_over):
+    """Wraps json.loads so that a datagram of the kind "text" goes to hand_over(text) and reads,
+    for the host script, as an object of no kind (which it skips). Nothing else changes."""
+    import json
+
+    loads = json.loads
+
+    def taking(document, *args, **kwargs):
+        value = loads(document, *args, **kwargs)
+        if isinstance(document, (bytes, bytearray)) and isinstance(value, dict) and value.get("kind") == "text":
+            hand_over(value.get("text"))
+            return {}
+        return value
+
+    json.loads = taking
+
+
 def main():
     arguments = sys.argv[1:]
-    if len(arguments) < 3 or arguments[0] != "--min-qp":
+    qp = None
+    text = False
+    while arguments and arguments[0] in ("--min-qp", "--text"):
+        if arguments[0] == "--text":
+            text = True
+            arguments = arguments[1:]
+            continue
+        if len(arguments) < 2:
+            raise SystemExit(__doc__.split("\n\n")[1])
+        try:
+            qp = int(arguments[1])
+        except ValueError:
+            qp = -1
+        if not 0 <= qp <= 51:
+            raise SystemExit("daily-pipeline: --min-qp is a number from 0 to 51")
+        arguments = arguments[2:]
+    if not arguments or (qp is None and not text):
         raise SystemExit(__doc__.split("\n\n")[1])
-    try:
-        qp = int(arguments[1])
-    except ValueError:
-        qp = -1
-    if not 0 <= qp <= 51:
-        raise SystemExit("daily-pipeline: --min-qp is a number from 0 to 51")
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
     import m1_encoder
 
-    original = m1_encoder.encoder
+    if qp is not None:
+        original = m1_encoder.encoder
 
-    def encoder(*args, **kwargs):
-        return floor(original(*args, **kwargs), qp)
+        def encoder(*args, **kwargs):
+            return floor(original(*args, **kwargs), qp)
 
-    m1_encoder.encoder = encoder
-    if arguments[2] == "--check":
+        m1_encoder.encoder = encoder
+    if arguments[0] == "--check":
         print(m1_encoder.encoder())
         return 0
 
@@ -60,17 +111,41 @@ def main():
     from gi.repository import Gst
 
     parse_launch = Gst.parse_launch
+    made_pipelines = []
 
     def made(description):
         pipeline = parse_launch(description)
-        enc = pipeline.get_by_name("enc")
-        got = [enc.get_property(name) for name in ("min-qp-i", "min-qp-p", "min-qp-b")] if enc else []
-        print(f"daily: encoder quality floor (trial only): asked {qp}, the encoder has min-qp-i/p/b {got}", file=sys.stderr, flush=True)
+        made_pipelines.append(pipeline)
+        if qp is not None:
+            enc = pipeline.get_by_name("enc")
+            got = [enc.get_property(name) for name in ("min-qp-i", "min-qp-p", "min-qp-b")] if enc else []
+            print(f"daily: encoder quality floor (trial only): asked {qp}, the encoder has min-qp-i/p/b {got}", file=sys.stderr, flush=True)
         return pipeline
 
     Gst.parse_launch = made
-    script = arguments[2]
-    sys.argv = [script] + arguments[3:]
+
+    if text:
+        dropped = {"count": 0}
+
+        def hand_over(piece):
+            compositor = None
+            for pipeline in reversed(made_pipelines):
+                compositor = pipeline.get_by_name("compositor")
+                if compositor is not None:
+                    break
+            if compositor is None or not acceptable(piece):
+                dropped["count"] += 1
+                print(f"daily: committed text dropped ({dropped['count']} so far; never shown)", file=sys.stderr, flush=True)
+                return
+            structure = Gst.Structure.new_empty("TextCommit")
+            structure.set_value("text", piece)
+            compositor.get_static_pad("src").send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+
+        take_text(hand_over)
+        print("daily: committed text goes to the compositor (trial only)", file=sys.stderr, flush=True)
+
+    script = arguments[0]
+    sys.argv = [script] + arguments[1:]
     runpy.run_path(script, run_name="__main__")
     return 0
 
