@@ -314,6 +314,12 @@ impl InputSink {
                         continue;
                     }
                 }
+                InputEvent::Preedit { text, cursor } => {
+                    if !istesso_proto::preedit_is_acceptable(text, *cursor) {
+                        dropped += 1;
+                        continue;
+                    }
+                }
             }
             self.send(event);
         }
@@ -473,7 +479,11 @@ impl Shared {
                         }
                         asked.push("input");
                         // This agent takes committed text (InputEvent::Text).
-                        Response::InputOpen { alive, text: true }
+                        Response::InputOpen {
+                            alive,
+                            text: true,
+                            preedit: true,
+                        }
                     }
                     Err(_) => Response::error(
                         ErrorCode::Internal,
@@ -719,7 +729,8 @@ mod tests {
                 asking.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    preedit: true
                 }
             );
             asking.send_input(&[]).unwrap();
@@ -799,7 +810,8 @@ mod tests {
                 first.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    preedit: true
                 }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
@@ -813,7 +825,8 @@ mod tests {
                 second.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    preedit: true
                 }
             );
             second.send_input(&[key(29, true)]).unwrap();
@@ -854,7 +867,8 @@ mod tests {
                 client.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    preedit: true
                 }
             );
             // What was down comes up, and the conversation carries on.

@@ -66,6 +66,9 @@ pub enum Response {
         alive: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         text: bool,
+        /// Composing text (`InputEvent::Preedit`) is taken too.
+        #[serde(default, skip_serializing_if = "is_false")]
+        preedit: bool,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
@@ -166,7 +169,8 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                preedit: false
             })
             .unwrap(),
             plain
@@ -179,7 +183,8 @@ mod tests {
             serde_json::from_str::<Response>(plain).unwrap(),
             Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                preedit: false
             }
         );
         // Asked for, and agreed to.
@@ -192,7 +197,8 @@ mod tests {
             serde_json::from_str::<Response>(asking).unwrap(),
             Response::InputOpen {
                 alive: true,
-                text: false
+                text: false,
+                preedit: false
             }
         );
         assert_eq!(
@@ -200,7 +206,8 @@ mod tests {
                 .unwrap(),
             Response::InputOpen {
                 alive: true,
-                text: true
+                text: true,
+                preedit: false
             }
         );
         // An earlier version reads both as what it knows, and its own answer says
@@ -214,7 +221,8 @@ mod tests {
                 .unwrap(),
             Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                preedit: false
             }
         );
         assert_eq!(

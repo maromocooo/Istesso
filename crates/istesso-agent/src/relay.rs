@@ -123,6 +123,8 @@ pub struct InputLine {
     alive: bool,
     /// The device takes committed text; without, none is sent to it.
     text: bool,
+    /// The device takes composing text; without, none is sent to it.
+    preedit: bool,
     /// Pieces of committed text not sent because the device does not take them.
     text_dropped: u64,
     /// When "still here" was last said.
@@ -152,13 +154,14 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let (alive, text) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let (alive, text, preedit) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let now = Instant::now();
         Ok(InputLine {
             connect,
             client: Some(client),
             alive,
             text,
+            preedit,
             text_dropped: 0,
             said: now,
             unanswered_since: None,
@@ -190,7 +193,13 @@ impl InputLine {
         self.text
     }
 
-    /// How many pieces of committed text were not sent because the device
+    /// Whether the device takes composing text, as it said when the
+    /// conversation was last opened.
+    pub fn takes_preedit(&self) -> bool {
+        self.preedit
+    }
+
+    /// How many pieces of committed or composing text were not sent because the device
     /// does not take them.
     pub fn text_dropped(&self) -> u64 {
         self.text_dropped
@@ -206,13 +215,15 @@ impl InputLine {
     pub fn pass(&mut self, events: &[InputEvent], now: Instant) -> Passed {
         // A device that did not say it takes committed text cannot read a message with
         // it, keys and all: none goes to it.
+        let (text, preedit) = (self.text, self.preedit);
+        let refused = |e: &InputEvent| match e {
+            InputEvent::Text { .. } => !text,
+            InputEvent::Preedit { .. } => !preedit,
+            _ => false,
+        };
         let kept: Vec<InputEvent>;
-        let events = if !self.text && events.iter().any(|e| matches!(e, InputEvent::Text { .. })) {
-            kept = events
-                .iter()
-                .filter(|e| !matches!(e, InputEvent::Text { .. }))
-                .cloned()
-                .collect();
+        let events = if events.iter().any(refused) {
+            kept = events.iter().filter(|e| !refused(e)).cloned().collect();
             self.text_dropped += (events.len() - kept.len()) as u64;
             &kept[..]
         } else {
@@ -325,7 +336,7 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let (alive, text) = match ask(&mut client, AGAIN_WITHIN) {
+        let (alive, text, preedit) = match ask(&mut client, AGAIN_WITHIN) {
             Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
@@ -352,6 +363,7 @@ impl InputLine {
         self.client = Some(client);
         self.alive = alive;
         self.text = text;
+        self.preedit = preedit;
         self.unanswered_since = None;
         (self.said, self.listened, self.made_at) = (now_open, now_open, now_open);
         Ok(Some(Happened::Back { after }))
@@ -362,7 +374,9 @@ impl InputLine {
 /// here"; the answer has `within` this time. `Ok` says whether the device
 /// answers; `Err` what to do about its refusal, and the refusal in a
 /// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
-fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool), (Again, String)> {
+/// `Ok`: whether the device answers "still here", takes committed text, and
+/// takes composing text.
+fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, bool), (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
@@ -371,7 +385,11 @@ fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool), (Again, St
     let answer = client.open_input_alive().map_err(link)?;
     client.set_timeout(AGAIN_WITHIN).map_err(link)?;
     match answer {
-        InputAnswer::Open { alive, text } => Ok((alive, text)),
+        InputAnswer::Open {
+            alive,
+            text,
+            preedit,
+        } => Ok((alive, text, preedit)),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -628,6 +646,7 @@ mod tests {
                         .respond(&Response::InputOpen {
                             alive: false,
                             text: false,
+                            preedit: false,
                         })
                         .unwrap();
                 }
