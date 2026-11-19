@@ -24,6 +24,9 @@ one before it, so that nothing queues up on a link slower than the bit rate, and
 follows the link (--no-adapt: it stays what it was started with). One line a second on standard
 error (scripts/daily_flow.py).
 
+The pipeline is started only with --to-channel (the encrypted channel); --to (the host script's
+plain RTP stream) is refused.
+
 m1-step3-host.py and m1_encoder.py are not changed, here or in any copy: this program replaces
 m1_encoder.encoder for this one run, before the host script imports it, puts its watches on the
 pipeline once the host script has made it, and then runs the host script as it is. The host
@@ -128,6 +131,15 @@ def main():
         return 0
 
     script, rest = arguments[0], arguments[1:]
+    # The trial's pictures go only over the encrypted channel (--to-channel, ADR 0015). The host
+    # script's plain RTP stream (--to) is a measuring tool's, and is never started from here.
+    plain = [word for word in rest if word == "--to" or word.startswith("--to=")]
+    channel = [word for word in rest if word == "--to-channel" or word.startswith("--to-channel=")]
+    if plain or not channel:
+        raise SystemExit(
+            "daily-pipeline: the trial's picture goes only over the encrypted channel: "
+            "--to-channel is needed, and --to (plain RTP) is refused; nothing is started"
+        )
     watcher = None
     if flow:
         channel = option(rest, "--to-channel", None)
