@@ -643,17 +643,17 @@ fn another_spelling_of_a_hidden_name_is_not_a_way_in() {
 }
 
 /// A file stored as `.ENV`, or with a decomposed name, is the file the rule
-/// names on the Mac (as Git sees it there), and is hidden; where names are
-/// compared byte for byte (Linux), it is another file, as for Git there.
+/// names on the Mac's default volume. In doubt, it is hidden on every volume:
+/// on Linux too, where Git would take it for another file.
 #[test]
-fn a_stored_name_is_compared_with_the_rules_as_the_volume_compares_it() {
+fn a_stored_name_that_matches_a_rule_when_folded_is_hidden() {
     let base = TempDir::new("mount-folding");
     let root = base.path().join("project");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join(".gitignore"), ".env\ncaf\u{e9}-key.txt\n").unwrap();
     fs::write(root.join(".ENV"), b"TOKEN=not-a-real-one\n").unwrap();
     fs::write(root.join("cafe\u{301}-key.txt"), b"key").unwrap();
-    let folds_case = !volume_tells_case_apart(&root);
+    fs::write(root.join("README.md"), b"read me\n").unwrap();
     let mut export = Export::open(&root, false, None).unwrap();
     let listed = match export
         .handle(Question::ReadDir {
@@ -668,12 +668,47 @@ fn a_stored_name_is_compared_with_the_rules_as_the_volume_compares_it() {
             .collect::<Vec<_>>(),
         other => panic!("unexpected: {other:?}"),
     };
-    let stored_upper = listed.iter().any(|name| name == ".ENV");
-    let stored_nfd = listed.iter().any(|name| name == "cafe\u{301}-key.txt");
-    if cfg!(target_os = "macos") {
-        assert_eq!(stored_upper, !folds_case, "{listed:?}");
-        assert!(!stored_nfd, "{listed:?}");
-    } else {
-        assert!(stored_upper && stored_nfd, "{listed:?}");
+    assert_eq!(listed, [".gitignore", "README.md"]);
+    for stored in [".ENV", "cafe\u{301}-key.txt"] {
+        assert_eq!(
+            lookup_path(&mut export, stored),
+            Err(Failure::NoEnt),
+            "{stored:?}"
+        );
     }
+}
+
+/// An entry handed out under one spelling and then renamed to another
+/// (`notes.txt` to `NOTES.txt`) is not reached through the old spelling,
+/// although the Mac's default volume would still open it.
+#[test]
+fn an_entry_no_longer_stored_under_its_name_is_missing() {
+    let base = TempDir::new("mount-renamed");
+    let root = base.path().join("project");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/notes.txt"), b"notes").unwrap();
+    let mut export = Export::open(&root, false, None).unwrap();
+    let notes = lookup_path(&mut export, "docs/notes.txt").unwrap();
+    let docs = lookup_path(&mut export, "docs").unwrap();
+    fs::rename(root.join("docs/notes.txt"), root.join("docs/NOTES.txt")).unwrap();
+    fs::rename(root.join("docs"), root.join("Docs")).unwrap();
+    for question in [
+        Question::Stat { id: notes },
+        Question::Read {
+            id: notes,
+            offset: 0,
+            count: 5,
+        },
+        Question::ReadDir { id: docs, start: 0 },
+    ] {
+        assert_eq!(
+            export.handle(question.clone()).0,
+            Answer::Failed {
+                error: Failure::NoEnt
+            },
+            "{question:?}"
+        );
+    }
+    // The new spellings are reached as they are stored.
+    assert!(lookup_path(&mut export, "Docs/NOTES.txt").is_ok());
 }

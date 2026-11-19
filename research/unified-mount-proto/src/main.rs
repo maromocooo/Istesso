@@ -238,7 +238,7 @@ fn run_mount(options: Options) -> ExitCode {
             tokio::time::sleep(hold).await;
         }
         let opts =
-            format!("vers=3,tcp,port={port},mountport={port},rdonly,nobrowse,nolocks,soft,actimeo=2");
+            format!("vers=3,tcp,port={port},mountport={port},rdonly,nobrowse,nolocks,soft,actimeo=2,rsize=1048576");
         let at = point.clone();
         let status = tokio::task::spawn_blocking(move || {
             Command::new("/sbin/mount_nfs")

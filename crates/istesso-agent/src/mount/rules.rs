@@ -11,15 +11,14 @@
 //! folder, is ignored: Git does not look into an ignored folder, and an
 //! entry handed out before a `.gitignore` changed is hidden from then on.
 //!
-//! Names are compared the way the folder's file system compares them
-//! ([`Folding`]): on a volume that does not tell upper from lower case (the
-//! Mac's default), `.ENV` is the file `.env` and is hidden by a rule for
-//! `.env`, as Git does there (`core.ignorecase`); on the Mac, names and rules
-//! are compared in their precomposed Unicode form (NFC), as Git does there
-//! (`core.precomposeunicode`). `.git` is hidden in any case. The caller only
-//! asks about names as they are stored on disk ([`super::export`]), so a
-//! device cannot pick a spelling that the file system finds and these rules
-//! do not.
+//! Hiding keeps secrets in, so in doubt it hides (the owner, 2026-11-19).
+//! File systems fold names differently (the Mac's default volume takes
+//! `.ENV` for `.env` and a decomposed name for its composed form; Linux
+//! compares bytes), so every name is judged twice: as it is, and folded
+//! (upper and lower case the same, Unicode in its composed form, NFC). It is
+//! hidden when either says so; a `!` rule that matches only when folded
+//! does not let it out. `.git` is hidden in any spelling. The caller asks
+//! only about names as they are stored on disk ([`super::export`]).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -41,52 +40,81 @@ pub const MAX_RULES_FILE: usize = 1 << 20;
 /// names from the shown folder and the file's name, without following links.
 pub type ReadSmall<'a> = &'a dyn Fn(&[Vec<u8>], &[u8]) -> Option<Vec<u8>>;
 
-/// How the shown folder's file system compares names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Folding {
-    /// Upper and lower case are the same name.
-    pub case: bool,
-    /// A name and its other Unicode form (NFC, NFD) are the same name.
-    pub unicode: bool,
+/// The two ways a name is judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Way {
+    /// Byte for byte, as Git on Linux.
+    AsIs,
+    /// Upper and lower case the same, for every script and not for ASCII
+    /// only (the patterns' own case-insensitive mode folds ASCII only), and
+    /// in composed form (NFC): see [`fold`].
+    Folded,
 }
 
-impl Folding {
-    /// A name as it is compared with the rules.
-    fn name(&self, name: &[u8]) -> Vec<u8> {
-        match std::str::from_utf8(name) {
-            Ok(text) if self.unicode => text.nfc().collect::<String>().into_bytes(),
-            _ => name.to_vec(),
+/// Text with upper and lower case made the same and in composed form: NFC,
+/// then upper case, then lower case (so that `ſ` and `K` (Kelvin) become `s`
+/// and `k`, `ß` becomes `ss`), then NFC again. Names and patterns are folded
+/// alike, so folding more than a file system does only hides more.
+fn fold(text: &str) -> String {
+    let composed: String = text.nfc().collect();
+    composed.to_uppercase().to_lowercase().nfc().collect()
+}
+
+const WAYS: [Way; 2] = [Way::AsIs, Way::Folded];
+
+/// A name as it is compared with the rules in one way.
+fn spelled(name: &[u8], way: Way) -> Vec<u8> {
+    match (way, std::str::from_utf8(name)) {
+        (Way::Folded, Ok(text)) => fold(text).into_bytes(),
+        _ => name.to_vec(),
+    }
+}
+
+/// Whether `name` is `.git` in any spelling.
+fn is_git(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b".git")
+        || std::str::from_utf8(name).is_ok_and(|text| fold(text) == ".git")
+}
+
+/// The rules of one ignore file, read both ways.
+struct Set {
+    as_is: Gitignore,
+    folded: Gitignore,
+}
+
+impl Set {
+    fn empty() -> Self {
+        Set {
+            as_is: Gitignore::empty(),
+            folded: Gitignore::empty(),
         }
     }
 
-    /// Whether `name` is `.git` on this file system. Any spelling counts:
-    /// hiding a folder named `.GIT` on a volume that tells case apart costs
-    /// nothing.
-    fn is_git(&self, name: &[u8]) -> bool {
-        name.eq_ignore_ascii_case(b".git")
+    fn parse(contents: &[u8]) -> Self {
+        Set {
+            as_is: build(contents, Way::AsIs),
+            folded: build(contents, Way::Folded),
+        }
+    }
+
+    fn way(&self, way: Way) -> &Gitignore {
+        match way {
+            Way::AsIs => &self.as_is,
+            Way::Folded => &self.folded,
+        }
     }
 }
 
-pub struct Rules {
-    show_all: bool,
-    folding: Folding,
-    global: Gitignore,
-    /// The rules of each folder, by its names from the shown folder.
-    folders: HashMap<Vec<Vec<u8>>, (Instant, Gitignore)>,
-    exclude: Option<(Instant, Gitignore)>,
-}
-
-/// The rules in one ignore file.
-fn parse(contents: &[u8], folding: Folding) -> Gitignore {
+/// The rules in one ignore file, for one way of judging names.
+fn build(contents: &[u8], way: Way) -> Gitignore {
     let text = String::from_utf8_lossy(contents);
-    let text: String = if folding.unicode {
-        text.nfc().collect()
-    } else {
-        text.into_owned()
+    let text: String = match way {
+        Way::AsIs => text.into_owned(),
+        Way::Folded => fold(&text),
     };
     // Paths are always given relative to the folder the file is in.
     let mut builder = GitignoreBuilder::new(".");
-    let _ = builder.case_insensitive(folding.case);
+    let _ = builder.case_insensitive(way == Way::Folded);
     for (i, line) in text.lines().enumerate() {
         let line = if i == 0 {
             line.trim_start_matches('\u{feff}')
@@ -99,26 +127,32 @@ fn parse(contents: &[u8], folding: Folding) -> Gitignore {
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-fn relative(names: &[Vec<u8>], folding: Folding) -> PathBuf {
-    let names: Vec<Vec<u8>> = names.iter().map(|name| folding.name(name)).collect();
+fn relative(names: &[Vec<u8>], way: Way) -> PathBuf {
+    let names: Vec<Vec<u8>> = names.iter().map(|name| spelled(name, way)).collect();
     Path::new(OsStr::from_bytes(&names.join(&b'/'))).to_path_buf()
 }
 
+pub struct Rules {
+    show_all: bool,
+    global: Set,
+    /// The rules of each folder, by its names from the shown folder.
+    folders: HashMap<Vec<Vec<u8>>, (Instant, Set)>,
+    exclude: Option<(Instant, Set)>,
+}
+
 impl Rules {
-    /// `global` is the user's global ignore file, read now. `folding` is how
-    /// the shown folder's file system compares names.
-    pub fn new(show_all: bool, global: Option<&Path>, folding: Folding) -> Self {
+    /// `global` is the user's global ignore file, read now.
+    pub fn new(show_all: bool, global: Option<&Path>) -> Self {
         let global = match (show_all, global) {
             (false, Some(path)) => std::fs::read(path)
                 .ok()
                 .filter(|contents| contents.len() <= MAX_RULES_FILE)
-                .map(|contents| parse(&contents, folding))
-                .unwrap_or_else(Gitignore::empty),
-            _ => Gitignore::empty(),
+                .map(|contents| Set::parse(&contents))
+                .unwrap_or_else(Set::empty),
+            _ => Set::empty(),
         };
         Rules {
             show_all,
-            folding,
             global,
             folders: HashMap::new(),
             exclude: None,
@@ -131,7 +165,7 @@ impl Rules {
         if self.show_all || names.is_empty() {
             return false;
         }
-        if names.iter().any(|name| self.folding.is_git(name)) {
+        if names.iter().any(|name| is_git(name)) {
             return true;
         }
         (1..=names.len()).any(|k| self.ignored(&names[..k], k < names.len() || is_dir, read))
@@ -143,53 +177,60 @@ impl Rules {
         if self.show_all || names.is_empty() {
             return false;
         }
-        names.last().is_some_and(|name| self.folding.is_git(name))
-            || self.ignored(names, is_dir, read)
+        names.last().is_some_and(|name| is_git(name)) || self.ignored(names, is_dir, read)
     }
 
-    /// Whether Git's rules ignore `names` itself.
+    /// Whether Git's rules ignore `names` itself, judged either way.
     fn ignored(&mut self, names: &[Vec<u8>], is_dir: bool, read: ReadSmall<'_>) -> bool {
-        let folding = self.folding;
+        WAYS.iter()
+            .any(|&way| self.ignored_one_way(names, is_dir, way, read))
+    }
+
+    fn ignored_one_way(
+        &mut self,
+        names: &[Vec<u8>],
+        is_dir: bool,
+        way: Way,
+        read: ReadSmall<'_>,
+    ) -> bool {
         // The folder the entry is in first, then each folder above it.
         for j in (0..names.len()).rev() {
             let folder = &names[..j];
-            let rules = self.folder_rules(folder, read);
-            match rules.matched(relative(&names[j..], folding), is_dir) {
+            let rules = self.folder_rules(folder, read).way(way);
+            match rules.matched(relative(&names[j..], way), is_dir) {
                 Match::Ignore(_) => return true,
                 Match::Whitelist(_) => return false,
                 Match::None => {}
             }
         }
-        let path = relative(names, folding);
-        match self.exclude_rules(read).matched(&path, is_dir) {
+        let path = relative(names, way);
+        match self.exclude_rules(read).way(way).matched(&path, is_dir) {
             Match::Ignore(_) => return true,
             Match::Whitelist(_) => return false,
             Match::None => {}
         }
-        self.global.matched(&path, is_dir).is_ignore()
+        self.global.way(way).matched(&path, is_dir).is_ignore()
     }
 
-    fn folder_rules(&mut self, folder: &[Vec<u8>], read: ReadSmall<'_>) -> &Gitignore {
+    fn folder_rules(&mut self, folder: &[Vec<u8>], read: ReadSmall<'_>) -> &Set {
         let fresh = matches!(self.folders.get(folder), Some((at, _)) if at.elapsed() < KEEP);
         if !fresh {
-            let folding = self.folding;
             let rules = read(folder, b".gitignore")
-                .map(|contents| parse(&contents, folding))
-                .unwrap_or_else(Gitignore::empty);
+                .map(|contents| Set::parse(&contents))
+                .unwrap_or_else(Set::empty);
             self.folders
                 .insert(folder.to_vec(), (Instant::now(), rules));
         }
         &self.folders[folder].1
     }
 
-    fn exclude_rules(&mut self, read: ReadSmall<'_>) -> &Gitignore {
+    fn exclude_rules(&mut self, read: ReadSmall<'_>) -> &Set {
         let fresh = matches!(&self.exclude, Some((at, _)) if at.elapsed() < KEEP);
         if !fresh {
             let folder = [b".git".to_vec(), b"info".to_vec()];
-            let folding = self.folding;
             let rules = read(&folder, b"exclude")
-                .map(|contents| parse(&contents, folding))
-                .unwrap_or_else(Gitignore::empty);
+                .map(|contents| Set::parse(&contents))
+                .unwrap_or_else(Set::empty);
             self.exclude = Some((Instant::now(), rules));
         }
         &self.exclude.as_ref().expect("just set").1
@@ -230,7 +271,7 @@ mod tests {
             ("web/.gitignore", "dist/\n!.env\n"),
             (".git/info/exclude", "notes.txt\n"),
         ]);
-        let mut rules = Rules::new(false, None, Folding::default());
+        let mut rules = Rules::new(false, None);
         let mut hides = |path: &str, is_dir: bool| rules.hides(&names(path), is_dir, &read);
         assert!(hides(".env", false));
         assert!(hides("target", true));
@@ -258,7 +299,7 @@ mod tests {
     #[test]
     fn showing_everything_shows_git_and_what_it_ignores() {
         let read = files(&[(".gitignore", ".env\n")]);
-        let mut rules = Rules::new(true, None, Folding::default());
+        let mut rules = Rules::new(true, None);
         assert!(!rules.hides(&names(".env"), false, &read));
         assert!(!rules.hides(&names(".git/config"), false, &read));
     }
@@ -266,7 +307,7 @@ mod tests {
     #[test]
     fn the_last_name_alone_is_checked_for_listed_entries() {
         let read = files(&[(".gitignore", "secret/\n")]);
-        let mut rules = Rules::new(false, None, Folding::default());
+        let mut rules = Rules::new(false, None);
         assert!(rules.hides_last(&names("secret"), true, &read));
         // Only the last name: the caller has checked the folders on its way.
         assert!(!rules.hides_last(&names("secret/inner"), false, &read));
@@ -275,14 +316,14 @@ mod tests {
     }
 
     #[test]
-    fn on_a_volume_that_folds_names_rules_fold_them_too() {
-        let read = files(&[(".gitignore", ".env\ncaf\u{e9}.txt\nSecrets/\n")]);
-        let folds = Folding {
-            case: true,
-            unicode: true,
-        };
-        let mut rules = Rules::new(false, None, folds);
+    fn a_name_that_matches_a_rule_when_folded_is_hidden_wherever_it_is() {
+        let read = files(&[(
+            ".gitignore",
+            ".env\ncaf\u{e9}.txt\nSecrets/\n*.log\n!keep.log\nsecret-key\n",
+        )]);
+        let mut rules = Rules::new(false, None);
         let mut hides = |path: &str, is_dir: bool| rules.hides(&names(path), is_dir, &read);
+        // On any volume: the Mac's would open .env for these, and in doubt we hide.
         assert!(hides(".ENV", false));
         assert!(hides(".Env", false));
         assert!(hides("secrets", true));
@@ -290,22 +331,22 @@ mod tests {
         // The same name decomposed (NFD) is the same name.
         assert!(hides("cafe\u{301}.txt", false));
         assert!(hides("caf\u{e9}.txt", false));
+        assert!(hides("CAF\u{c9}.TXT", false));
+        // Long s folds to s: Unicode case folding, not only ASCII.
+        assert!(hides("\u{17f}ecret-key", false));
+        // A ! rule that matches only when folded does not let a file out.
+        assert!(!hides("keep.log", false));
+        assert!(hides("KEEP.log", false));
         assert!(hides(".GIT", true));
         assert!(hides(".Git/config", false));
         assert!(!hides("README.md", false));
-
-        // A volume that tells them apart: other spellings are other files,
-        // except that .git is hidden in any spelling.
-        let mut exact = Rules::new(false, None, Folding::default());
-        assert!(!exact.hides(&names(".ENV"), false, &read));
-        assert!(!exact.hides(&names("cafe\u{301}.txt"), false, &read));
-        assert!(exact.hides(&names(".GIT"), true, &read));
+        assert!(!hides("Read me.txt", false));
     }
 
     #[test]
     fn a_file_with_a_byte_order_mark_and_windows_lines_is_read() {
         let read = files(&[(".gitignore", "\u{feff}.env\r\n*.tmp\r\n")]);
-        let mut rules = Rules::new(false, None, Folding::default());
+        let mut rules = Rules::new(false, None);
         assert!(rules.hides(&names(".env"), false, &read));
         assert!(rules.hides(&names("a.tmp"), false, &read));
     }

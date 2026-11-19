@@ -23,7 +23,7 @@ use istesso_link::mount::{
     valid_name, Answer, Attr, Entry, Failure, Kind, Question, MAX_ENTRIES, MAX_READ, ROOT_ID,
 };
 
-use super::rules::{Folding, Rules, MAX_RULES_FILE};
+use super::rules::{Rules, MAX_RULES_FILE};
 use super::MAX_IDS;
 
 pub struct Export {
@@ -128,27 +128,6 @@ fn to_attr(st: &libc::stat) -> Attr {
     }
 }
 
-/// How the file system of the folder `root` compares names. On a Mac, as
-/// the volume says (`_PC_CASE_SENSITIVE`; unknown counts as folding, which
-/// hides more), and always in either Unicode form, as APFS does. Elsewhere,
-/// byte for byte.
-fn folding(root: &OwnedFd) -> Folding {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: valid descriptor; fpathconf only reads.
-        let sensitive = unsafe { libc::fpathconf(root.as_raw_fd(), libc::_PC_CASE_SENSITIVE) };
-        Folding {
-            case: sensitive != 1,
-            unicode: true,
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = root;
-        Folding::default()
-    }
-}
-
 /// Opens a folder below `root`, one name at a time, refusing links.
 fn open_dir(root: &OwnedFd, names: &[Vec<u8>]) -> io::Result<OwnedFd> {
     let mut cur = openat(root, b".", libc::O_RDONLY | libc::O_DIRECTORY)?;
@@ -156,6 +135,24 @@ fn open_dir(root: &OwnedFd, names: &[Vec<u8>]) -> io::Result<OwnedFd> {
         cur = openat(&cur, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
     }
     Ok(cur)
+}
+
+/// Whether every name of `names` is still in its folder, spelled byte for
+/// byte as it is stored. On a volume that folds case or Unicode forms the
+/// file system would also find another spelling; such a name is answered as
+/// missing, so that the rules are only ever asked about stored names (in
+/// doubt, hide).
+fn stored_as_named(root: &OwnedFd, names: &[Vec<u8>]) -> Result<(), Failure> {
+    let mut dir = openat(root, b".", libc::O_RDONLY | libc::O_DIRECTORY).map_err(io_failure)?;
+    for (i, name) in names.iter().enumerate() {
+        if !read_names(&dir).map_err(io_failure)?.contains(name) {
+            return Err(Failure::NoEnt);
+        }
+        if i + 1 < names.len() {
+            dir = openat(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(io_failure)?;
+        }
+    }
+    Ok(())
 }
 
 /// The contents of a small regular file below `root`, never through a link.
@@ -204,7 +201,7 @@ impl Export {
             paths,
             ids,
             next_id: ROOT_ID + 1,
-            rules: Rules::new(show_ignored, global_rules, folding(&root_fd)),
+            rules: Rules::new(show_ignored, global_rules),
             root: root_fd,
             bytes_read: 0,
         })
@@ -240,8 +237,10 @@ impl Export {
         self.paths.get(&id).cloned().ok_or(Failure::Stale)
     }
 
-    /// An entry that is not shown is answered as one that is not there.
+    /// An entry that is not shown, or no longer stored under the name it was
+    /// handed out with, is answered as one that is not there.
     fn shown(&mut self, names: &[Vec<u8>], is_dir: bool) -> Result<(), Failure> {
+        stored_as_named(&self.root, names)?;
         let root = &self.root;
         let read = |folder: &[Vec<u8>], name: &[u8]| read_small(root, folder, name);
         if self.rules.hides(names, is_dir, &read) {
@@ -276,12 +275,10 @@ impl Export {
                 }
                 let mut names = self.names(dir)?;
                 let dir_fd = open_dir(&self.root, &names).map_err(io_failure)?;
-                // Only a name as it is stored: on a volume that folds case or Unicode
-                // forms, another spelling would reach the same file without being the
-                // name the rules were asked about (`.GIT`, `.Env`, a decomposed name).
-                if !read_names(&dir_fd).map_err(io_failure)?.contains(&name) {
-                    return Err(Failure::NoEnt);
-                }
+                // Only a name as it is stored (checked in `shown`, before anything
+                // is handed out): on a volume that folds case or Unicode forms,
+                // another spelling would reach the same file (`.GIT`, `.Env`, a
+                // decomposed name).
                 let st = lstat_at(&dir_fd, &name).map_err(io_failure)?;
                 names.push(name);
                 self.shown(&names, is_type(&st, libc::S_IFDIR))?;
