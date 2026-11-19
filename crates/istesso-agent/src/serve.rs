@@ -70,6 +70,16 @@ pub struct AgentOptions {
     /// The program to run as a shell instead of the user's login shell. For
     /// tests only, which must not run the login files of whoever runs them.
     pub shell_program: Option<std::path::PathBuf>,
+    /// Start a shell whose device asked for forwards in a scope of its own
+    /// (Linux, `systemd-run --user --scope`), when this user's service
+    /// manager makes them. Off in tests, which must not add scopes to the
+    /// service manager of whoever runs them; the shell's session tells its
+    /// workspace apart then.
+    pub workspace_scopes: bool,
+    /// Take requests to open a page from the workspaces of shells
+    /// ([`crate::workspace::opener`]), on a socket in a folder of this
+    /// user's. Off in tests that do not need it.
+    pub open_requests: bool,
 }
 
 impl Default for AgentOptions {
@@ -84,6 +94,8 @@ impl Default for AgentOptions {
             input_timings: None,
             shell_for: Vec::new(),
             shell_program: None,
+            workspace_scopes: true,
+            open_requests: true,
         }
     }
 }
@@ -117,7 +129,19 @@ struct Shared {
     /// Shells open now, by the id of the device they are open for.
     #[cfg(unix)]
     shells: Mutex<HashMap<String, usize>>,
+    /// The workspaces of the shells open now, whose ports are forwarded.
+    #[cfg(unix)]
+    workspaces: Arc<crate::workspace::watch::Workspaces>,
+    /// Forwarded connections open now ([`MAX_FORWARDS`]).
+    #[cfg(unix)]
+    forwards_open: AtomicUsize,
 }
+
+/// Forwarded connections served at the same time: half of
+/// [`MAX_CONNECTIONS`], so that forwards cannot take every place and keep a
+/// device from sending input or opening a shell.
+#[cfg(unix)]
+const MAX_FORWARDS: usize = MAX_CONNECTIONS / 2;
 
 /// What is kept of a conversation that carries input, for ending it from
 /// another one.
@@ -157,6 +181,44 @@ impl Agent {
         if !options.shell_for.is_empty() {
             return Err("this machine cannot open shells for other devices".into());
         }
+        #[cfg(unix)]
+        let workspaces = Arc::new(crate::workspace::watch::Workspaces::default());
+        // What a shell whose device asked for forwards is started with.
+        #[cfg(unix)]
+        let (opener, scope_tool) = if shell_policy.is_on() {
+            let opener = match options
+                .open_requests
+                .then(|| crate::workspace::opener::start(&paths, workspaces.clone(), log.clone()))
+            {
+                None => None,
+                Some(Ok(opener)) => Some(opener),
+                Some(Err(err)) => {
+                    log(format!(
+                        "requests to open a page from a shell's workspace are off: {err}"
+                    ));
+                    None
+                }
+            };
+            #[cfg(target_os = "linux")]
+            let scope_tool = if options.workspace_scopes {
+                match crate::workspace::watch::scope_tool() {
+                    Ok(tool) => Some(tool),
+                    Err(why) => {
+                        log(format!(
+                            "a shell's workspace is told apart by its session: {why}"
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let scope_tool = None;
+            (opener, scope_tool)
+        } else {
+            (None, None)
+        };
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -177,9 +239,19 @@ impl Agent {
                 #[cfg(unix)]
                 shell_settings: crate::remote_shell::host::ShellSettings {
                     program: options.shell_program.clone(),
+                    scope_tool,
+                    workspace_env: opener
+                        .as_ref()
+                        .map(|opener| opener.environment())
+                        .unwrap_or_default(),
+                    workspace_bin: opener.as_ref().and_then(|opener| opener.bin.clone()),
                 },
                 #[cfg(unix)]
                 shells: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                workspaces,
+                #[cfg(unix)]
+                forwards_open: AtomicUsize::new(0),
             }),
         })
     }
@@ -413,6 +485,30 @@ impl Drop for ShellSlot<'_> {
     }
 }
 
+/// The workspace of a shell, whose ports are forwarded.
+#[cfg(unix)]
+struct Workspace(Arc<crate::workspace::watch::Workspace>);
+
+/// A forwarded connection, made on the host's side.
+#[cfg(unix)]
+struct Forwarded<'a> {
+    stream: TcpStream,
+    workspace: Arc<crate::workspace::watch::Workspace>,
+    port: u16,
+    _slot: ForwardSlot<'a>,
+}
+
+/// A forwarded connection counted against [`MAX_FORWARDS`] while it lives.
+#[cfg(unix)]
+struct ForwardSlot<'a>(&'a AtomicUsize);
+
+#[cfg(unix)]
+impl Drop for ForwardSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Whether the device is, at this moment, still paired and still allowed to
 /// control this host: read from the list on disk, not remembered from when
 /// the conversation began.
@@ -467,7 +563,15 @@ impl Shared {
         // A shell that was opened on this conversation: the conversation carries
         // it from then on, and nothing else.
         #[cfg(unix)]
-        let mut shell: Option<(crate::remote_shell::host::Shell, ShellSlot<'_>)> = None;
+        let mut shell: Option<(
+            crate::remote_shell::host::Shell,
+            ShellSlot<'_>,
+            Option<Workspace>,
+        )> = None;
+        // A forwarded connection that was opened on this conversation: it
+        // carries the bytes from then on.
+        #[cfg(unix)]
+        let mut forwarded: Option<Forwarded<'_>> = None;
         // The device asked to be answered when it says "still here".
         let mut answers_alive = false;
         let mut checked = Instant::now();
@@ -540,6 +644,14 @@ impl Shared {
                     }
                     Err(refused) => refused,
                 },
+                #[cfg(unix)]
+                Request::ForwardOpen { forward } => match self.open_forward(&session, &forward) {
+                    Ok(opened) => {
+                        forwarded = Some(opened);
+                        Response::ForwardOpen
+                    }
+                    Err(refused) => refused,
+                },
                 request if session.allows(Permission::View) => self.answer(&request, &mut asked),
                 _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
@@ -547,7 +659,7 @@ impl Shared {
                 break;
             }
             #[cfg(unix)]
-            if shell.is_some() {
+            if shell.is_some() || forwarded.is_some() {
                 break;
             }
         }
@@ -565,12 +677,52 @@ impl Shared {
             ));
         }
         #[cfg(unix)]
-        if let Some((shell, _slot)) = shell {
+        if let Some(forwarded) = forwarded {
+            let peer = session.peer().clone();
+            let Forwarded {
+                stream,
+                workspace,
+                port,
+                _slot,
+            } = forwarded;
+            let carried =
+                crate::workspace::pump::carry(stream, session.into_channel(), b"", || {
+                    !workspace.is_over() && may_have_shell(&self.paths, &peer, &self.shell_policy)
+                });
+            // Port numbers, counts and times only.
+            (self.log)(format!(
+                "a forwarded connection to port {port} for {} is over after {:.1} s{}: {} bytes from the device, {} bytes to it",
+                peer.name,
+                carried.lasted.as_secs_f64(),
+                if carried.stopped {
+                    " (the shell is over, or the device lost its right)"
+                } else {
+                    ""
+                },
+                carried.sent,
+                carried.received,
+            ));
+            return;
+        }
+        #[cfg(unix)]
+        if let Some((shell, _slot, workspace)) = shell {
             let peer = session.peer().clone();
             let pid = shell.pid();
-            let served = shell.serve(session.into_channel(), || {
-                may_have_shell(&self.paths, &peer, &self.shell_policy)
-            });
+            let channel = session.into_channel();
+            let still = || may_have_shell(&self.paths, &peer, &self.shell_policy);
+            let served = match &workspace {
+                Some(workspace) => {
+                    let (watched, log) = (workspace.0.clone(), self.log.clone());
+                    shell.serve_with(channel, still, move |outlet| {
+                        crate::workspace::watch::start(watched, outlet, log)
+                    })
+                }
+                None => shell.serve(channel, still),
+            };
+            if let Some(workspace) = &workspace {
+                workspace.0.end();
+                self.workspaces.remove(&workspace.0);
+            }
             // Counts and times only: never what was typed or printed.
             (self.log)(format!(
                 "the shell for {} (process {pid}) is over after {:.1} s: {}; {} bytes in {} frames from the device, {} bytes in {} frames to it, {} new sizes",
@@ -593,7 +745,14 @@ impl Shared {
         &self,
         session: &Session,
         request: &istesso_link::ShellRequest,
-    ) -> Result<(crate::remote_shell::host::Shell, ShellSlot<'_>), Response> {
+    ) -> Result<
+        (
+            crate::remote_shell::host::Shell,
+            ShellSlot<'_>,
+            Option<Workspace>,
+        ),
+        Response,
+    > {
         use crate::remote_shell::{host::Shell, MAX_ON_HOST, MAX_PER_DEVICE};
         let peer = session.peer();
         if !self.shell_policy.names(peer) {
@@ -626,23 +785,84 @@ impl Shared {
         };
         match Shell::start(request, &self.shell_settings) {
             Ok(shell) => {
+                use crate::workspace::watch::{How, Workspace as Watched};
+                let workspace = request.forward.then(|| {
+                    let how = if !cfg!(target_os = "linux") {
+                        How::Not("this host does not look for ports yet".into())
+                    } else if let Some(unit) = shell.scope() {
+                        How::Scope(unit.to_string())
+                    } else {
+                        How::Session
+                    };
+                    let workspace = Watched::new(peer, shell.pid(), how);
+                    self.workspaces.add(workspace.clone());
+                    Workspace(workspace)
+                });
                 (self.log)(format!(
-                    "opened a shell for {} (process {}), {}",
+                    "opened a shell for {} (process {}), {}{}",
                     peer.name,
                     shell.pid(),
                     if request.project.is_some() {
                         "in a project folder"
                     } else {
                         "at home"
+                    },
+                    match workspace.as_ref().map(|w| w.0.how()) {
+                        Some(How::Scope(_)) => ", its ports forwarded (a scope of its own)",
+                        Some(How::Session) => ", its ports forwarded (by its session)",
+                        Some(How::Not(_)) => ", its ports not looked for",
+                        None => "",
                     }
                 ));
-                Ok((shell, slot))
+                Ok((shell, slot, workspace))
             }
             Err(why) => {
                 (self.log)(format!("could not open a shell for {}: {why}", peer.name));
                 Err(Response::error(ErrorCode::Internal, why))
             }
         }
+    }
+
+    /// Makes the connection to the port behind `forward` for the device of
+    /// `session`, when that port is in the workspace of a shell this device
+    /// has open here and the device may still have a shell. The refusal is
+    /// the answer to send; it does not say whether the id was ever known.
+    #[cfg(unix)]
+    fn open_forward(&self, session: &Session, forward: &str) -> Result<Forwarded<'_>, Response> {
+        let peer = session.peer();
+        let refused = || {
+            Response::error(
+                ErrorCode::Forbidden,
+                "there is no such forward for this device",
+            )
+        };
+        if !istesso_link::forward::is_forward_id(forward)
+            || !may_have_shell(&self.paths, peer, &self.shell_policy)
+        {
+            return Err(refused());
+        }
+        let (workspace, target, port) =
+            self.workspaces.target(peer, forward).ok_or_else(refused)?;
+        if self.forwards_open.fetch_add(1, Ordering::SeqCst) >= MAX_FORWARDS {
+            self.forwards_open.fetch_sub(1, Ordering::SeqCst);
+            return Err(Response::error(
+                ErrorCode::Internal,
+                "too many forwarded connections are open on this host",
+            ));
+        }
+        let slot = ForwardSlot(&self.forwards_open);
+        let stream = TcpStream::connect_timeout(&target, Duration::from_secs(2)).map_err(|_| {
+            Response::error(
+                ErrorCode::Internal,
+                "nothing answers on that port of the host any more",
+            )
+        })?;
+        Ok(Forwarded {
+            stream,
+            workspace,
+            port,
+            _slot: slot,
+        })
     }
 
     /// Notes that `session` carries its device's input from now on, and ends
@@ -708,6 +928,10 @@ impl Shared {
             Request::ShellOpen(_) => Response::error(
                 ErrorCode::Unsupported,
                 "this machine cannot open shells for other devices",
+            ),
+            Request::ForwardOpen { .. } => Response::error(
+                ErrorCode::Unsupported,
+                "this machine cannot forward ports to other devices",
             ),
         }
     }

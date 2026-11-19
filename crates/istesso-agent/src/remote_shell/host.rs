@@ -56,6 +56,15 @@ pub struct ShellSettings {
     /// login shell. For tests, which must not run the login files of the
     /// person who runs them.
     pub program: Option<PathBuf>,
+    /// For a shell whose device asked for forwards: `systemd-run`, to start
+    /// it in a scope of its own (Linux), which tells its workspace apart
+    /// ([`crate::workspace::watch`]). Without it, the shell's session does.
+    pub scope_tool: Option<PathBuf>,
+    /// For a shell whose device asked for forwards: what goes into its
+    /// environment for requests to open a page (`BROWSER` and the agent's
+    /// socket), and the folder put first on its `PATH`.
+    pub workspace_env: Vec<(String, String)>,
+    pub workspace_bin: Option<PathBuf>,
 }
 
 /// A shell that has started and has not been handed its conversation yet.
@@ -65,6 +74,31 @@ pub struct Shell {
     master: Option<OwnedFd>,
     pid: u32,
     started: Instant,
+    /// The scope it was started in, by its unit's name.
+    scope: Option<String>,
+}
+
+/// Where the workspace of a shell sends frames of its own on the shell's
+/// conversation (the list of ports, requests to open a page), next to what
+/// the shell prints.
+#[derive(Clone)]
+pub struct ShellOutlet {
+    writer: Arc<Mutex<ChannelWriter>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ShellOutlet {
+    /// Sends one frame; false once the conversation is over.
+    pub fn send(&self, frame: &ShellFrame) -> bool {
+        if self.stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(&frame.encode())
+            .is_ok()
+    }
 }
 
 /// What a shell's conversation came to, for the one line about it.
@@ -214,14 +248,44 @@ impl Shell {
                 format!("-{}", program_name(&account.shell)),
             ),
         };
-        let env = environment(&account, &program, request, |name| std::env::var(name).ok());
+        let mut env = environment(&account, &program, request, |name| std::env::var(name).ok());
+        if request.forward {
+            workspace_environment(&mut env, settings);
+        }
 
-        let mut command = Command::new(&program);
-        command
-            .arg0(argv0)
-            .env_clear()
-            .envs(env)
-            .current_dir(&folder);
+        // A shell whose ports are forwarded starts in a scope of its own,
+        // when there is a way to make one: `systemd-run` registers the scope
+        // and then becomes the shell, in the same process. It cannot give the
+        // shell a name that starts with `-`, so a login shell is asked for
+        // with `-l` instead.
+        let scope = match (&settings.scope_tool, request.forward) {
+            (Some(_), true) => Some(format!(
+                "istesso-shell-{}",
+                &crate::workspace::random_id()
+                    .map_err(|e| format!("cannot name the shell's scope: {e}"))?[..16]
+            )),
+            _ => None,
+        };
+        let mut command = match (&settings.scope_tool, &scope) {
+            (Some(tool), Some(unit)) => {
+                let mut command = Command::new(tool);
+                command
+                    .args(["--user", "--scope", "--quiet", "--collect"])
+                    .arg(format!("--unit={unit}"))
+                    .arg("--")
+                    .arg(&program);
+                if settings.program.is_none() {
+                    command.arg("-l");
+                }
+                command
+            }
+            _ => {
+                let mut command = Command::new(&program);
+                command.arg0(argv0);
+                command
+            }
+        };
+        command.env_clear().envs(env).current_dir(&folder);
 
         let started = Instant::now();
         let (child, master) = {
@@ -277,6 +341,7 @@ impl Shell {
             child: Some(child),
             master: Some(master),
             started,
+            scope,
         })
     }
 
@@ -285,12 +350,24 @@ impl Shell {
         self.pid
     }
 
+    /// The scope the shell was started in, by its unit's name.
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
     /// Carries the shell over `channel` until it ends, the device goes, or
     /// `still_allowed` says no (asked every [`RECHECK`]).
-    pub fn serve(
+    pub fn serve(self, channel: Channel<TcpStream>, still_allowed: impl FnMut() -> bool) -> Served {
+        self.serve_with(channel, still_allowed, |_| {})
+    }
+
+    /// As [`Shell::serve`], and hands `attach` the conversation's outlet once
+    /// the shell is carried, for the shell's workspace to send on.
+    pub fn serve_with(
         mut self,
         channel: Channel<TcpStream>,
         mut still_allowed: impl FnMut() -> bool,
+        attach: impl FnOnce(ShellOutlet),
     ) -> Served {
         let counts = Arc::new(Counts::default());
         let (Some(master), Some(child)) = (self.master.take(), self.child.take()) else {
@@ -343,6 +420,10 @@ impl Shell {
             std::thread::spawn(move || pass_input(reader, fd, writer, stop, counts, events))
         });
         child_exit_watch(child, events_in);
+        attach(ShellOutlet {
+            writer: writer.clone(),
+            stop: stop.clone(),
+        });
 
         let mut exited: Option<(Instant, ShellEnd)> = None;
         let mut printed_all = printing.is_none();
@@ -395,6 +476,21 @@ impl Shell {
             hang_up(master, &events);
         }
         counts.served(ending, self.started)
+    }
+}
+
+/// Adds what a shell of a workspace gets: the variables for requests to open
+/// a page, and the folder with `istesso-open` (and `xdg-open`) first on its
+/// `PATH`.
+fn workspace_environment(env: &mut Vec<(String, String)>, settings: &ShellSettings) {
+    for (name, value) in &settings.workspace_env {
+        env.retain(|(known, _)| known != name);
+        env.push((name.clone(), value.clone()));
+    }
+    if let Some(bin) = &settings.workspace_bin {
+        if let Some((_, path)) = env.iter_mut().find(|(name, _)| name == "PATH") {
+            *path = format!("{}:{path}", bin.display());
+        }
     }
 }
 
@@ -550,8 +646,12 @@ fn pass_input(
                     break;
                 }
             }
-            // Only the host ends a shell; frames of a later version are skipped.
-            ShellFrame::Exit(_) | ShellFrame::Unknown(_) => {}
+            // Only the host ends a shell, lists ports and asks to open pages; frames
+            // of a later version are skipped.
+            ShellFrame::Exit(_)
+            | ShellFrame::Ports(_)
+            | ShellFrame::OpenUrl(_)
+            | ShellFrame::Unknown(_) => {}
         }
         if stop.load(Ordering::SeqCst) {
             return;
@@ -635,6 +735,7 @@ mod tests {
             term: Some("xterm-ghostty".into()),
             locale: None,
             project: None,
+            forward: false,
         };
         let inherited = |name: &str| match name {
             "TMPDIR" | "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),

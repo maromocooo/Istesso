@@ -41,6 +41,10 @@ pub struct Options {
     pub address: Option<String>,
     /// The folder on the device to start in.
     pub project: Option<String>,
+    /// Whether and how the ports of the shell's workspace are forwarded to
+    /// this machine, and its requests to open a page taken
+    /// ([`crate::workspace::device`]).
+    pub forward: crate::workspace::device::Settings,
 }
 
 /// Opens a shell on another device in this terminal and returns when it is
@@ -79,7 +83,9 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
             .or_else(|| variable("LC_CTYPE"))
             .or_else(|| variable("LANG")),
         project: options.project.clone(),
+        forward: options.forward.enabled,
     };
+    let peer_id = client.peer().id.clone();
     match client.open_shell(request) {
         Ok(ShellAnswer::Open) => {}
         Ok(ShellAnswer::Refused { message, .. }) => {
@@ -111,6 +117,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
         }
     };
     let writer = Arc::new(Mutex::new(writer));
+    let address = reader.stream().peer_addr();
 
     // Signals are taken by one thread of their own, from here on: the window
     // changing size, and the terminal or someone else ending this program.
@@ -121,6 +128,32 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
         libc::SIGINT,
         libc::SIGQUIT,
     ]);
+    // The shell's workspace: its ports are forwarded here, and its requests
+    // to open a page are taken here. Notices go on a line of their own.
+    // Made after the signals are blocked: its threads must not take them
+    // (they would go to the handler that does nothing, and be lost).
+    let forwarder = match (options.forward.enabled, address) {
+        (true, Ok(address)) => {
+            let notice: crate::workspace::device::Notice = Arc::new(|line: &str| {
+                let _ = write!(std::io::stderr(), "\r\nistesso: {line}\r\n");
+            });
+            match crate::workspace::device::Forwarder::new(
+                paths,
+                &device,
+                &peer_id,
+                address,
+                options.forward.clone(),
+                notice,
+            ) {
+                Ok(forwarder) => Some(forwarder),
+                Err(err) => {
+                    say(&format!("ports are not forwarded: {err}"));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     if terminal {
         if let Err(err) = sys::RawMode::enter(STDIN) {
             say(&format!("cannot pass keys on as they are typed: {err}"));
@@ -181,6 +214,16 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
                 };
                 break (end.exit_status(), why);
             }
+            Ok(ShellFrame::Ports(list)) => {
+                if let Some(forwarder) = &forwarder {
+                    forwarder.update(list);
+                }
+            }
+            Ok(ShellFrame::OpenUrl(address)) => {
+                if let Some(forwarder) = &forwarder {
+                    forwarder.open_url(&address);
+                }
+            }
             // "Still here" is heard by the read itself; frames of a later version are
             // skipped.
             Ok(ShellFrame::Alive | ShellFrame::Resize { .. } | ShellFrame::Unknown(_)) => {}
@@ -201,6 +244,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
 /// not end by itself, and ends this program. The other threads end with it.
 fn finish(status: u8, why: Option<&str>) -> ! {
     sys::RawMode::restore(STDIN);
+    crate::workspace::device::cleanup();
     if let Some(why) = why {
         // On a line of its own: the shell may have left the cursor anywhere.
         let _ = writeln!(std::io::stderr(), "\r\nistesso shell: {why}\r");

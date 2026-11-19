@@ -46,6 +46,13 @@ pub enum Request {
     /// no more JSON. Proposed in ADR 0007 ("文字のシェル"); off unless the
     /// host was told to allow it for this device.
     ShellOpen(ShellRequest),
+    /// May I have a connection to the port behind this forward? `forward`
+    /// is an id the host gave in the list of ports of a shell this device
+    /// has open ([`crate::forward::PortList`]); the host alone knows which
+    /// port it stands for. Answered with [`Response::ForwardOpen`] or an
+    /// error. Once it is open, the connection carries only the frames of
+    /// [`crate::forward::ForwardFrame`]. Proposed in ADR 0007 ("ポートの転送").
+    ForwardOpen { forward: String },
 }
 
 /// What a device says when it asks for a shell ([`Request::ShellOpen`]).
@@ -65,6 +72,12 @@ pub struct ShellRequest {
     /// (`~/...`). The home folder when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Send the ports that the shell and what it starts listen on, and
+    /// their requests to open a web page, on this conversation
+    /// ([`crate::shell::ShellFrame::Ports`], [`crate::shell::ShellFrame::OpenUrl`]).
+    /// A host that does not know this passes over it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forward: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,6 +106,9 @@ pub enum Response {
     /// The shell is running. From now on the connection carries the frames
     /// of [`crate::shell`] only.
     ShellOpen,
+    /// The connection to the port is made. From now on the conversation
+    /// carries the frames of [`crate::forward::ForwardFrame`] only.
+    ForwardOpen,
     Error {
         code: ErrorCode,
         message: String,
@@ -233,6 +249,7 @@ mod tests {
             term: None,
             locale: None,
             project: None,
+            forward: false,
         });
         let json = serde_json::to_string(&bare).unwrap();
         assert_eq!(json, r#"{"type":"shell_open","cols":80,"rows":24}"#);
@@ -256,6 +273,40 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Response::ShellOpen).unwrap(),
             r#"{"type":"shell_open"}"#
+        );
+    }
+
+    #[test]
+    fn asking_for_forwards_is_one_field_and_a_forward_is_asked_for_by_id_only() {
+        let asked = Request::ShellOpen(ShellRequest {
+            cols: 80,
+            rows: 24,
+            term: None,
+            locale: None,
+            project: None,
+            forward: true,
+        });
+        assert_eq!(
+            serde_json::to_string(&asked).unwrap(),
+            r#"{"type":"shell_open","cols":80,"rows":24,"forward":true}"#
+        );
+        let id = "ab".repeat(16);
+        let open = Request::ForwardOpen {
+            forward: id.clone(),
+        };
+        let json = serde_json::to_string(&open).unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"type":"forward_open","forward":"{id}"}}"#)
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), open);
+        // A port or an address is not part of the request; whatever else a
+        // device sends is passed over.
+        let with_more = format!(r#"{{"type":"forward_open","forward":"{id}","port":22}}"#);
+        assert_eq!(serde_json::from_str::<Request>(&with_more).unwrap(), open);
+        assert_eq!(
+            serde_json::to_string(&Response::ForwardOpen).unwrap(),
+            r#"{"type":"forward_open"}"#
         );
     }
 

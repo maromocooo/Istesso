@@ -32,6 +32,17 @@ pub enum ShellAnswer {
     Refused { code: ErrorCode, message: String },
 }
 
+/// What the other device said to a request for a connection to a port of
+/// a shell's workspace ([`Client::open_forward`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardAnswer {
+    /// The connection is made. The conversation carries the frames of
+    /// [`crate::forward::ForwardFrame`] from now on: [`Client::into_channel`].
+    Open,
+    /// It is not, and this is why.
+    Refused { code: ErrorCode, message: String },
+}
+
 /// An open conversation with one paired device.
 pub struct Client {
     channel: Channel<TcpStream>,
@@ -208,6 +219,22 @@ impl Client {
         match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
             Response::ShellOpen => Ok(ShellAnswer::Open),
             Response::Error { code, message } => Ok(ShellAnswer::Refused { code, message }),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Asks the other device for a connection to the port behind `forward`,
+    /// an id from the list of ports of a shell this device has open there.
+    pub fn open_forward(&mut self, forward: &str) -> Result<ForwardAnswer> {
+        let request = Request::ForwardOpen {
+            forward: forward.to_string(),
+        };
+        let bytes = serde_json::to_vec(&request).map_err(|_| Error::Malformed)?;
+        self.channel.send(&bytes)?;
+        let answer = self.channel.recv()?;
+        match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
+            Response::ForwardOpen => Ok(ForwardAnswer::Open),
+            Response::Error { code, message } => Ok(ForwardAnswer::Refused { code, message }),
             _ => Err(Error::Malformed),
         }
     }

@@ -104,6 +104,33 @@ enum Command {
         /// was last seen
         #[arg(long, value_name = "ADDRESS[:PORT]")]
         address: Option<String>,
+        /// Do not forward the ports that the shell, and what it starts,
+        /// listen on, and do not take its requests to open a page. They are
+        /// forwarded to this machine's 127.0.0.1 and ::1 by default (a
+        /// prototype, ADR 0007, proposal)
+        #[arg(long)]
+        no_forward: bool,
+        /// Forward the device's port PORT to LOCAL here (PORT itself when
+        /// LOCAL is not given), and never to another number: when it is
+        /// taken here, that port is not forwarded. May be given more than
+        /// once; ISTESSO_FORWARD_PINS adds more, separated by commas
+        #[arg(long, value_name = "PORT[:LOCAL]")]
+        forward_pin: Vec<String>,
+        /// Which requests of the shell's workspace to open a page are
+        /// opened here: `forwarded` (pages on its forwarded ports only) or
+        /// `all` (pages elsewhere too). The program that opens them is the
+        /// system's, or ISTESSO_URL_OPENER
+        #[arg(long, value_name = "WHICH", default_value = "forwarded")]
+        open_urls: OpenUrls,
+    },
+    /// Show the ports forwarded to this machine from the shells open here
+    /// (`istesso shell`), or stop forwarding them
+    Forwards {
+        /// Print the list as JSON
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<ForwardsAction>,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -125,6 +152,25 @@ enum Command {
     Input {
         #[command(subcommand)]
         action: InputAction,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum OpenUrls {
+    Forwarded,
+    All,
+}
+
+#[derive(Subcommand)]
+enum ForwardsAction {
+    /// Stop forwarding PORT (the number here or on the device), or every
+    /// port with --all; a stopped port stays stopped while its shell is
+    /// open, and after --all no new port is forwarded either
+    Stop {
+        #[arg(value_name = "PORT", required_unless_present = "all")]
+        port: Option<u16>,
+        #[arg(long, conflicts_with = "port")]
+        all: bool,
     },
 }
 
@@ -477,7 +523,118 @@ fn permission_names(permissions: &[istesso_pair::Permission]) -> String {
         .join(", ")
 }
 
+/// `PORT` or `PORT:LOCAL`, as `--forward-pin` takes it.
+fn parse_pin(text: &str) -> Option<(u16, u16)> {
+    let (there, here) = text.split_once(':').unwrap_or((text, text));
+    let (there, here) = (there.parse::<u16>().ok()?, here.parse::<u16>().ok()?);
+    (there != 0 && here != 0).then_some((there, here))
+}
+
+#[cfg(unix)]
+fn run_forwards(json: bool, action: Option<ForwardsAction>) -> Result<(), String> {
+    use istesso_agent::workspace::device;
+    let paths = Paths::from_env();
+    match action {
+        Some(ForwardsAction::Stop { port, all }) => {
+            let port = if all { None } else { port };
+            let stopped = device::stop_forwards(&paths, port)?;
+            match port {
+                Some(port) if stopped == 0 => Err(format!("no port {port} is forwarded here")),
+                _ => {
+                    println!("Stopped {stopped} forward(s).");
+                    Ok(())
+                }
+            }
+        }
+        None => {
+            let shells = device::list(&paths)?;
+            if json {
+                return print_json(&shells);
+            }
+            let forwards: Vec<_> = shells.iter().flat_map(|shell| &shell.forwards).collect();
+            if forwards.is_empty() {
+                println!("No port is forwarded to this machine.");
+            } else {
+                println!(
+                    "{:<20} {:>7} {:>7}  {:<16} {:<16} {:>4} {:>6} {:>7}",
+                    "DEVICE", "THERE", "HERE", "NOTE", "PROGRAM", "OPEN", "TAKEN", "REFUSED"
+                );
+                for forward in &forwards {
+                    let mut notes = Vec::new();
+                    if forward.pinned {
+                        notes.push("pinned");
+                    } else if forward.shifted {
+                        notes.push("shifted");
+                    }
+                    if forward.exposed {
+                        notes.push("all-networks");
+                    }
+                    let note = notes.join(",");
+                    println!(
+                        "{:<20} {:>7} {:>7}  {:<16} {:<16} {:>4} {:>6} {:>7}",
+                        forward.device,
+                        forward.there,
+                        forward.here,
+                        note,
+                        forward.process,
+                        forward.open,
+                        forward.connections,
+                        forward.refused,
+                    );
+                }
+            }
+            if forwards.iter().any(|forward| forward.exposed) {
+                println!(
+                    "all-networks: the program listens on every network of its machine, so other machines there reach it too; the forward needs only 127.0.0.1."
+                );
+            }
+            for shell in &shells {
+                if shell.all_stopped {
+                    println!("Forwarding is stopped for a shell on {}.", shell.device);
+                } else if !shell.stopped.is_empty() {
+                    println!(
+                        "Stopped for a shell on {}: port {}.",
+                        shell.device,
+                        shell
+                            .stopped
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_forwards(_json: bool, _action: Option<ForwardsAction>) -> Result<(), String> {
+    Err("this machine has no shells of other devices".into())
+}
+
 fn main() -> ExitCode {
+    // Started under the name of a program that opens pages, inside a shell
+    // whose ports are forwarded (`BROWSER`, `xdg-open`).
+    #[cfg(unix)]
+    {
+        let mut args = std::env::args_os();
+        let name = args.next().map(PathBuf::from).and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+        if let Some(name) = name.filter(|name| {
+            [
+                istesso_agent::workspace::opener::OPEN_NAME,
+                istesso_agent::workspace::opener::XDG_OPEN_NAME,
+            ]
+            .contains(&name.as_str())
+        }) {
+            let rest: Vec<std::ffi::OsString> = args.collect();
+            return ExitCode::from(istesso_agent::workspace::opener::run_as(&name, &rest));
+        }
+    }
     let cli = Cli::parse();
     // The shell ends with the status of the shell on the other machine, not
     // with success or failure.
@@ -486,12 +643,38 @@ fn main() -> ExitCode {
         device,
         project,
         address,
+        no_forward,
+        forward_pin,
+        open_urls,
     } = &cli.command
     {
+        let mut pins = Vec::new();
+        let from_env = std::env::var("ISTESSO_FORWARD_PINS").unwrap_or_default();
+        for pin in forward_pin
+            .iter()
+            .map(String::as_str)
+            .chain(from_env.split(',').map(str::trim).filter(|p| !p.is_empty()))
+        {
+            match parse_pin(pin) {
+                Some(pin) => pins.push(pin),
+                None => {
+                    eprintln!("istesso shell: --forward-pin {pin}: give PORT or PORT:LOCAL");
+                    return ExitCode::from(255);
+                }
+            }
+        }
         let options = istesso_agent::remote_shell::client::Options {
             device: device.clone(),
             address: address.clone(),
             project: project.clone(),
+            forward: istesso_agent::workspace::device::Settings {
+                enabled: !no_forward,
+                pins,
+                open_outside: *open_urls == OpenUrls::All,
+                opener: std::env::var_os("ISTESSO_URL_OPENER")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from),
+            },
         };
         return ExitCode::from(istesso_agent::remote_shell::client::run(
             &Paths::from_env(),
@@ -562,6 +745,7 @@ fn run(cli: Cli) -> Result<(), String> {
             ..AgentOptions::default()
         }),
         Command::Shell { .. } => Err("this machine cannot open shells on other devices".into()),
+        Command::Forwards { json, action } => run_forwards(json, action),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
         Command::Id => {
             let paths = Paths::from_env();

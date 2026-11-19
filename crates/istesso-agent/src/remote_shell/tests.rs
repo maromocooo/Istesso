@@ -53,6 +53,8 @@ impl ShellPair {
                 Vec::new()
             },
             shell_program: Some("/bin/sh".into()),
+            workspace_scopes: false,
+            open_requests: false,
             ..crate::AgentOptions::default()
         };
         let agent = crate::Agent::bind(
@@ -127,6 +129,7 @@ fn request(cols: u16, rows: u16) -> ShellRequest {
         term: None,
         locale: None,
         project: None,
+        forward: false,
     }
 }
 

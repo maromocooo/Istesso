@@ -10,6 +10,8 @@
 //!   [`paths`] says where files live.
 //! * [`remote_shell`] opens a shell on another machine over the same
 //!   channel, and answers a device that asks for one.
+//! * [`workspace`] forwards the ports of such a shell's workspace to the
+//!   device that opened it, and passes on its requests to open a page.
 
 pub mod cache;
 pub mod discovery;
@@ -21,6 +23,8 @@ pub mod remote_shell;
 pub mod serve;
 pub mod status;
 pub mod survey;
+#[cfg(unix)]
+pub mod workspace;
 
 pub use passing::PassLog;
 pub use paths::Paths;

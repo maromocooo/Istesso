@@ -10,6 +10,7 @@
 //! A frame of a kind this version does not know is read as
 //! [`ShellFrame::Unknown`] and skipped by the receiver.
 
+use crate::forward::{PortList, MAX_URL};
 use crate::{Error, Result};
 
 /// The most terminal bytes a sender puts into one frame.
@@ -23,6 +24,8 @@ const DATA: u8 = 0x01;
 const RESIZE: u8 = 0x02;
 const EXIT: u8 = 0x03;
 const ALIVE: u8 = 0x04;
+const PORTS: u8 = 0x05;
+const OPEN_URL: u8 = 0x06;
 
 const END_CODE: u8 = 0;
 const END_SIGNAL: u8 = 1;
@@ -43,6 +46,14 @@ pub enum ShellFrame {
     /// Still here. The device says it every few seconds; the host answers
     /// with the same.
     Alive,
+    /// The ports the shell's workspace listens on now, all of them (from
+    /// the host, when the device asked with `forward`). Proposed in ADR
+    /// 0007 ("ポートの転送").
+    Ports(PortList),
+    /// Something in the workspace asks to open this web page (from the
+    /// host, when the device asked with `forward`). The device decides
+    /// whether it does.
+    OpenUrl(String),
     /// A kind this version does not know.
     Unknown(u8),
 }
@@ -106,6 +117,16 @@ impl ShellFrame {
                 frame
             }
             ShellFrame::Alive => vec![ALIVE],
+            ShellFrame::Ports(list) => {
+                let mut frame = vec![PORTS];
+                frame.extend_from_slice(&list.encode());
+                frame
+            }
+            ShellFrame::OpenUrl(url) => {
+                let mut frame = vec![OPEN_URL];
+                frame.extend_from_slice(url.as_bytes());
+                frame
+            }
             ShellFrame::Unknown(kind) => vec![*kind],
         }
     }
@@ -139,6 +160,11 @@ impl ShellFrame {
             },
             ALIVE if rest.is_empty() => Ok(ShellFrame::Alive),
             ALIVE => Err(Error::Malformed),
+            PORTS => Ok(ShellFrame::Ports(PortList::decode(rest)?)),
+            OPEN_URL if rest.len() > MAX_URL => Err(Error::TooLarge),
+            OPEN_URL => String::from_utf8(rest.to_vec())
+                .map(ShellFrame::OpenUrl)
+                .map_err(|_| Error::Malformed),
             other => Ok(ShellFrame::Unknown(other)),
         }
     }
@@ -165,6 +191,14 @@ mod tests {
             ShellFrame::Exit(ShellEnd::Revoked),
             ShellFrame::Exit(ShellEnd::Host),
             ShellFrame::Alive,
+            ShellFrame::Ports(PortList {
+                watching: false,
+                reason: Some("not on this system".into()),
+                how: None,
+                ports: Vec::new(),
+                elsewhere: Vec::new(),
+            }),
+            ShellFrame::OpenUrl("http://localhost:5173/".into()),
         ];
         for frame in frames {
             assert_eq!(ShellFrame::decode(&frame.encode()).unwrap(), frame);
@@ -210,6 +244,20 @@ mod tests {
         assert!(matches!(
             ShellFrame::decode(&[0x04, 0]),
             Err(Error::Malformed)
+        ));
+        assert!(matches!(
+            ShellFrame::decode(&[0x05, b'{']),
+            Err(Error::Malformed)
+        ));
+        assert!(matches!(
+            ShellFrame::decode(&[0x06, 0xff, 0xfe]),
+            Err(Error::Malformed)
+        ));
+        let mut long_url = vec![0x06];
+        long_url.resize(2 + MAX_URL, b'a');
+        assert!(matches!(
+            ShellFrame::decode(&long_url),
+            Err(Error::TooLarge)
         ));
         let mut huge = vec![0x01];
         huge.resize(2 + MAX_DATA_ACCEPTED, b'a');
