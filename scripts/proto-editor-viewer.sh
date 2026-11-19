@@ -36,7 +36,7 @@ still_runs() { # FILE: the process written down there (number and start time) st
     local pid started
     [ -s "$1" ] || return 1
     read -r pid started < "$1"
-    [ -n "$pid" ] && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
+    [ -n "$pid" ] && [ -n "$started" ] && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
 }
 write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
 stop_written_down() { still_runs "$1" && kill "$(read -r pid _ < "$1"; echo "$pid")" 2>/dev/null; return 0; }

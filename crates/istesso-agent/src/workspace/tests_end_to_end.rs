@@ -307,10 +307,14 @@ fn a_server_started_in_the_shell_is_reached_through_the_forward() {
     let answer = ask(&format!("rebind.example:{here}"));
     assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
     assert!(!answer.contains("hello from the host"));
-    assert!(pair
-        .log()
-        .iter()
-        .any(|line| line.contains(&format!("forwarded connection to port {there}"))));
+    // The host writes the line when the connection is over, which may be
+    // a moment after the answer has come here.
+    let forwarded = format!("forwarded connection to port {there}");
+    let began = Instant::now();
+    while !pair.log().iter().any(|line| line.contains(&forwarded)) {
+        assert!(began.elapsed() < SOON, "{:?}", pair.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // The host's log has numbers, never what was carried.
     assert!(!pair.log().iter().any(|line| line.contains("hello")));
 

@@ -58,7 +58,33 @@ class LauncherTest(unittest.TestCase):
             owner.write_text(record + "\n")
             self.open("fail EDITOR_WINDOW_BIND does not name one address to listen on", 1)
 
-    def test_rotation_uses_only_complete_valid_records(self):
+    def test_a_record_without_a_start_time_is_not_a_running_process(self):
+        self.program("ps", "echo 'fixture start'")
+        self.program("timeout", "exit 0")
+        for part in ("app", "pipeline"):
+            (self.run / (part + ".pid")).write_text("123\n")
+        (self.run / "device").write_text("abcd\n")
+        (self.run / "bus-address").write_text("fixture\n")
+        (self.run / "owner.pid").write_text(f"{os.getpid()}\n")
+        self.open("fail EDITOR_WINDOW_BIND does not name one address to listen on", 1)
+
+    def test_a_running_editor_that_does_not_take_the_file_names_the_log(self):
+        self.program("ps", "echo 'fixture start'")
+        for part in ("app", "pipeline"):
+            (self.run / (part + ".pid")).write_text("123 fixture start\n")
+        (self.run / "device").write_text("abcd\n")
+        (self.run / "bus-address").write_text("fixture\n")
+        (self.run / "owner.pid").write_text(f"{os.getpid()} fixture start\n")
+        for status, why in (
+            (4, "its own session bus did not start (see run/bus.log in EDITOR_WINDOW_DIR)"),
+            (5, "it did not appear on its session bus within 10 s (see run/bus.log; "
+                "run/app.log with EDITOR_WINDOW_APP_LOG=1)"),
+            (124, "handing the file over failed or took too long (status 124; see run/bus.log)"),
+        ):
+            self.program("timeout", f"exit {status}")  # Stands in for the handoff.
+            self.open("fail the running editor did not take the file: " + why, 1)
+
+    def test_every_start_has_fresh_folders_and_none_is_removed(self):
         self.env["EDITOR_WINDOW_BIND"] = "192.0.2.1"  # check-private: ok documentation address
         for name in ("ss", "gnome-text-editor", "target/release/istesso"):
             self.program(name, "exit 0")
@@ -69,31 +95,26 @@ class LauncherTest(unittest.TestCase):
             path.write_text("fixture")
         # Each start stops just after preparing its folders.
         (self.root / "peers.json").write_text('{"peers":[]}')
-        listing = self.runtime / "istesso-editor-runs.list"
-        unlisted = self.runtime / "istesso-editor-run.unlisted"
-        unlisted.mkdir()
-        cache_marker = self.runtime / "istesso-editor-cache" / "marker"
+        earlier = self.runtime / "istesso-editor.earlier1"
+        earlier.mkdir()
+        (earlier / "draft").write_text("kept")
         starts = []
         for _ in range(3):
             self.open("fail the asking device is not in the host's pairing list", 1)
             fresh = Path((self.run / "fresh").read_text().strip())
-            self.assertTrue(fresh.is_dir())
-            self.assertFalse((fresh / "editor/cache").exists())
+            self.assertEqual(fresh.parent, self.runtime)
+            self.assertRegex(fresh.name, r"^istesso-editor\.[A-Za-z0-9]{8}$")
+            self.assertEqual(fresh.stat().st_mode & 0o777, 0o700)
+            # The editor's cache is this start's own, like its settings, data and state.
+            for part in ("data", "config", "state", "cache"):
+                self.assertTrue((fresh / "editor" / part).is_dir(), part)
+            self.assertNotIn(fresh, starts)
             starts.append(fresh)
-            self.assertEqual(listing.read_text().splitlines(), [p.name for p in starts[-2:]])
-            if len(starts) == 1:
-                (fresh / "link").symlink_to(unlisted, target_is_directory=True)
-                cache_marker.touch()
-        self.assertFalse(starts[0].exists())
-        self.assertTrue(cache_marker.is_file())
-        self.assertTrue(unlisted.is_dir())
-
-        good = listing.read_bytes()
-        for bad in (b"../outside\n", b"istesso-editor-run.*\n", b"istesso-editor-run.12345678"):
-            listing.write_bytes(good + bad)
-            self.open("fail could not prepare the editor run folders", 1)
-            self.assertEqual(listing.read_bytes(), good + bad)
-            self.assertTrue(all(p.is_dir() for p in starts[-2:]))
+        # Nothing of an earlier start is removed, and no list of starts or shared cache is made.
+        self.assertTrue(all(p.is_dir() for p in starts))
+        self.assertEqual((earlier / "draft").read_text(), "kept")
+        self.assertEqual(sorted(p.name for p in self.runtime.iterdir()),
+                         sorted([earlier.name] + [p.name for p in starts]))
 
 
 if __name__ == "__main__":
