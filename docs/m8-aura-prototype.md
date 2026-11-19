@@ -244,4 +244,8 @@ ADR 0007（m3-ime-route-d）の「確定した文字」の形。AURA の入力�
   - **指（タッチパッド）**：`source` は `finger`、`pixels` は、システムの量 × `ViewConfiguration` の画面のスクロールの倍率 × 絵の画素とビューの画素の比（縦は符号を反転、`dy` と同じ向き）。段階（`phase`）は付けない（ホストのコンポジターは、100 ms 何も来なければ止まったとする）。パックのタッチパッドはマウスとして来るので、機器がタッチパッドと言うとき、または量が目盛りの整数でないときを、指とみなす。2 本指の身ぶり（`CLASSIFICATION_TWO_FINGER_SWIPE`）は、その距離（ビューの画素）を絵の画素に直して送る。
   - **ホイール**：`source` は `wheel`、`v120` = round(−量 × 120)（縦。横は round(量 × 120)）。
 - 共通の部品：`istesso-proto` の `InputEvent::Scroll` の 5 つの欄、`scroll_is_acceptable`、エージェントの受け取りは trial-daily-scroll と同じ中身（窓の前出しと大きさの知らせは、ここには入れていない）。`istesso-client` に `scroll_event` と C の `istesso_input_send_scroll`、JNI に `inputScroll`。
-- 確かめたこと：`istesso-client` の試し（ホイールと指の JSON、古い形）。ホストのコンポジターまでの確かめは、まとめ役の合図を待っている。
+- 確かめたこと：`istesso-client` の試し（ホイールと指の JSON、古い形）。
+- ホストで確かめたこと（2026-11-19 14:3x、AURA なし、流れの自分のフォルダー、試しのペア、ポート 47971／47973）：Mac の代わりの見る側（`run.sh … scroll`、アプリの `Native.java` と Rust のライブラリー）→ このブランチのエージェント → trial-daily-scroll の `daily-pipeline.py --scroll --flow` → スクロールの流れの試用のコンポジター（gwd-scroll1、読むだけ。試しのあいだ変わらなかった）→ 軸の出来事を書く試しのアプリ（`scroll-log`）。
+  - ホイール 1 目盛り（`v120` 120）を送った → アプリには `axis_source wheel`、`value120 120`、軸 10.0。
+  - 指（`pixels` 縦 2.75 を 8 ms ごとに 20 回）を送った → アプリには `axis_source finger` と軸 2.75 が 20 回、最後のあと 145 ms で `axis_stop`（縦と横）。
+  - 一度目は、ホストのエージェントが古い作り（新しい欄を知らない）で、欄が落ちて古い形（軸 0.375 と 0）で届いた。作り直して、上のとおり。
