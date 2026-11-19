@@ -200,6 +200,14 @@ final class SourceSwitch {
     func forgetRestored() { restoredTo = nil }
 }
 
+/// Whether a viewer counts as shown for the inline part: a new stream after a resize has no
+/// viewer for a moment, and that is not a disconnect (seen on the Studio, 2026-11-19 21:46: each
+/// resize put the source back and selected Istesso's again, and the input source was activated and
+/// deactivated with it). Only nobody for 1.5 s is.
+func inlineViewerShown(viewers: Int, restarting: Bool, sinceShown: Double) -> Bool {
+    viewers > 0 || restarting || sinceShown < 1.5
+}
+
 /// Whether Istesso's source should be selected now (ADR 0023, 2.): while a viewer is shown the
 /// picture, the screen is not locked, and this Mac's own keyboard has been idle for `idle` seconds.
 func inlineSourceWanted(connected: Bool, locked: Bool, localIdle: Double, idle: Double) -> Bool {
@@ -900,7 +908,8 @@ final class InlineHost {
         composer.tick()
     }
 
-    /// Disconnect, stop, a crash's next start: Istesso's source is let go.
+    /// The end of this object (the program stops): what is shown is cleared, Istesso's source is
+    /// let go of, the socket closed; nothing is selected again afterwards.
     func shutdown() {
         guard !stopped else { return }
         stopped = true
@@ -971,6 +980,10 @@ func inlineSelfTest() -> Int {
     check(!inlineSourceWanted(connected: true, locked: false, localIdle: 0.4, idle: 3), "the local keyboard first: typing there puts the source back")
     check(!inlineSourceWanted(connected: false, locked: false, localIdle: 99, idle: 3), "not without a viewer")
     check(!inlineSourceWanted(connected: true, locked: true, localIdle: 99, idle: 3), "not while the screen is locked")
+    check(inlineViewerShown(viewers: 0, restarting: true, sinceShown: 0.2) && inlineViewerShown(viewers: 0, restarting: false, sinceShown: 1.0),
+          "a new stream after a resize is not a disconnect")
+    check(!inlineViewerShown(viewers: 0, restarting: false, sinceShown: 1.6) && inlineViewerShown(viewers: 1, restarting: false, sinceShown: 99),
+          "nobody for 1.5 s is")
     // 2x virtual display: the window at (1000, 200) points, the picture 2 pixels a point.
     let px = caretPixels(CGRect(x: 1010, y: 210, width: 0, height: 20), origin: CGPoint(x: 1000, y: 200), pointsPerPixel: 0.5,
                          picture: CGSize(width: 800, height: 600))

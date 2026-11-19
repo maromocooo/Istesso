@@ -2622,6 +2622,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// The inline composition (--inline only), and the kind 5 said last (told again to a new stream).
     var inline: InlineHost?
     var lastField: FieldReport?
+    /// A stop has begun (a signal, or quit): the inline part is not started any more.
+    var stopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let path = settings.pidFile {
@@ -2671,6 +2673,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
 
     func quit(_ code: Int32) {
+        stopping = true
         inline?.shutdown()
         promptMonitor?.stop()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(code) }
@@ -3527,6 +3530,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     // ---- Composing text inline (--inline only; inline.swift) ----
 
     func startInline(_ running: NSRunningApplication) {
+        // A stop that came before the application opened: nothing is started any more.
+        guard !stopping else { return }
         guard settings.inline else {
             // Off. Only if an earlier run with --inline ended without putting the source back (its
             // file is still there) is that source put back now; otherwise nothing is touched.
@@ -3560,6 +3565,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         inline = made
         note("inline: on, slot \(settings.virtualSlot)")
         var ticks = 0
+        var inlineShownAt = -1000.0
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 0.1, repeating: .milliseconds(10))
         timer.setEventHandler { [weak self] in
@@ -3571,7 +3577,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             composer.origin = self.injector.origin
             composer.pointsPerPixel = self.injector.scale
             composer.picture = CGSize(width: self.width, height: self.height)
-            let connected = self.transport != nil && self.transport.viewers > 0 && self.picture == "running" && !self.detached && !self.heldForSignal
+            let now = ProcessInfo.processInfo.systemUptime
+            let viewers = self.transport?.viewers ?? 0
+            if viewers > 0 { inlineShownAt = now }
+            let shown = self.transport != nil && inlineViewerShown(viewers: viewers, restarting: self.restarting, sinceShown: now - inlineShownAt)
+            let connected = shown && self.picture == "running" && !self.detached && !self.heldForSignal
             inline.tick(connected: connected, locked: screenLocked(), pid: self.app?.processIdentifier)
             if ticks % 100 == 0, frameLog.on, !composer.counts.isEmpty {
                 let counts = composer.counts.map { "\"\($0.key)\":\($0.value)" }.joined(separator: ",")
@@ -3714,6 +3724,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let target = fitInto(CGRect(x: frame.minX, y: frame.minY + 30, width: before.width, height: before.height),
                              CGRect(x: frame.minX, y: frame.minY + 30, width: frame.width, height: frame.height - 30))
         lookout.act { setWindowFrame(pid, matching: before, to: target) }
+        if settings.inline {
+            // Seen on the Studio (2026-11-19 21:37 and 21:46): moving the window onto the virtual
+            // display made WindowServer resign its key appearance ("for space"), the input source
+            // was deactivated and never activated again. With the application in front, the moved
+            // window is raised and made main again, so that it is key and its field active.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, self.appInFront() else { return }
+                self.lookout.act { bringToFront(pid, bounds: target) }
+            }
+        }
     }
 
     /// Every moved window back to where it was; a place that is on no display now is fitted into
@@ -3916,6 +3936,7 @@ for name in [SIGTERM, SIGINT] {
     source.setEventHandler {
         daily.injector.releaseAll()
         // Istesso's input source is let go of before anything else (the Mac's own keyboard).
+        daily.stopping = true
         daily.inline?.shutdown()
         // A stop: the windows go back where they were and the virtual display away, then the end.
         if daily.virtualScreen != nil {
