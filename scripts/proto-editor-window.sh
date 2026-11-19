@@ -15,7 +15,7 @@
 # machine can read): EDITOR_WINDOW_PLACE, the place it checked inside the project folder of the
 # asking shell; EDITOR_WINDOW_DEVICE_ID and EDITOR_WINDOW_DEVICE_KEY, that shell's device as the
 # host's pairing list has it. The picture is shown to that device only, and the input agent knows
-# that device only. When the editor of an earlier request of the same device still runs, the file
+# that device only. When the editor of the same agent and device still runs, the file
 # is handed to it (a new tab of the same window). The agent ends the editor (`stop`) when the shell
 # that asked is over, and before it starts one for another shell; the editor never outlives the
 # agent either. One editor at a time.
@@ -23,8 +23,8 @@
 # Every start has fresh folders of its own for the editor (its settings, state, session and drafts),
 # its session bus and the input agent's list of paired devices, in a new folder below the user's
 # runtime folder ($XDG_RUNTIME_DIR, which the system empties at logout and at a restart): nothing of
-# an earlier start, and nothing of the owner's editor, is restored. They are not removed here (no
-# folder whose name is built from a variable is removed by a script of this project).
+# an earlier editor session is restored. Only the editor cache is shared across starts. The launcher
+# keeps the newest two run folders, removing older ones by exact names from its list.
 #
 # Its settings come from the environment of the agent (the host's own, never the request's):
 #   EDITOR_WINDOW_DIR     its own folder for the records of what runs (required)
@@ -42,9 +42,9 @@
 #   EDITOR_WINDOW_TEST_SIGNAL  a file that is obeyed like the measuring signal as well (for checking
 #                         the guard; the real signal is obeyed as always, and never written here)
 #
-# The place is never written down by this script, never put into a generated script, a log or an
-# argument. The measuring signal (AGENTS.md) is obeyed: nothing starts while it says busy, and a
-# guard that reads it every two seconds ends everything of the editor (told to end, killed two
+# The launcher keeps the requested place out of its own logs, generated scripts and arguments.
+# The editor keeps its own session, recent files and drafts. Nothing starts while the measuring
+# signal (AGENTS.md) says busy. A guard reads it every two seconds and ends the editor (killed two
 # seconds later if still there). Everything is ended by the process numbers written down when it
 # started.
 set -u
@@ -68,12 +68,13 @@ busy() {
     [ "$(head -c 4 "$signal" 2>/dev/null)" = busy ] ||
         { [ -n "$test_signal" ] && [ "$(head -c 4 "$test_signal" 2>/dev/null)" = busy ]; }
 }
-# The process written down in FILE (number and start time) still runs and is the one started.
+# The recorded process still runs. If given, the second argument is the required pid.
 still_runs() {
     local pid started
     [ -s "$1" ] || return 1
     read -r pid started < "$1"
-    [ -n "$pid" ] && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
+    [ -n "$started" ] && [ "$pid" = "${2:-$pid}" ] &&
+        [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
 }
 write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
 # Ends the session of the process written down in FILE (each part was started as the leader of a
@@ -161,8 +162,9 @@ device=${EDITOR_WINDOW_DEVICE_ID:-}
 device_key=${EDITOR_WINDOW_DEVICE_KEY:-}
 [[ "$device" =~ ^[0-9a-f-]{4,64}$ && "$device_key" =~ ^[0-9a-f]{64}$ ]] || say_fail "no device was given"
 
-# The editor of an earlier request of the same device still runs: the file goes to it.
+# Reuse only the editor of this agent and device, even before the old guard next wakes.
 if still_runs "$run/app.pid" && still_runs "$run/pipeline.pid" && [ -s "$run/bus-address" ] &&
+    still_runs "$run/owner.pid" "$PPID" &&
     [ "$(cat "$run/device" 2>/dev/null)" = "$device" ]; then
     hand_to_editor "$run/bus-address" || say_fail "the running editor did not take the file"
     echo "window $picture $input Text Editor"
@@ -190,10 +192,51 @@ began=$(date +%s%N)
 
 # Fresh folders of this start: the editor's, its bus's, and the input agent's paired devices (the
 # asking device only; the host's identity is linked, never copied).
-fresh=$(mktemp -d "$runtime/istesso-editor.XXXXXXXX") || say_fail "no fresh folder could be made"
-chmod 700 "$fresh"
+fresh_name=$(python3 -I - "$runtime" 2>/dev/null <<'PY'
+import fcntl, os, re, secrets, shutil, sys
+from pathlib import Path
+
+os.chdir(sys.argv[1])
+os.umask(0o077)
+# Lock the directory, since the list itself is replaced on each start.
+fcntl.flock(os.open(".", os.O_RDONLY), fcntl.LOCK_EX)
+listing = Path("istesso-editor-runs.list")
+names = []
+if listing.is_symlink() or (listing.exists() and not listing.is_file()):
+    sys.exit(1)
+if listing.exists():
+    with listing.open("rb") as records:
+        for line in records:
+            if not re.fullmatch(rb"istesso-editor-run\.[a-zA-Z0-9]{8}\n", line):
+                sys.exit(1)
+            names.append(line[:-1].decode("ascii"))
+if len(set(names)) != len(names):
+    sys.exit(1)
+
+# A previous launcher may have stopped after recording a name but before mkdir.
+names = [name for name in names if os.path.lexists(name)]
+for old in names[:-1]:
+    shutil.rmtree(old)
+while True:
+    fresh = "istesso-editor-run." + secrets.token_hex(4)
+    if not os.path.lexists(fresh):
+        break
+# Publish the new name before creating its folder, so an interrupted start cannot orphan it.
+pending = Path("istesso-editor-runs.next")
+pending.unlink(missing_ok=True)
+with pending.open("x", encoding="ascii") as records:
+    for name in names[-1:] + [fresh]:
+        print(name, file=records)
+os.replace(pending, listing)
+os.mkdir(fresh, 0o700)
+print(fresh)
+PY
+) || say_fail "could not prepare the editor run folders"
+fresh=$runtime/$fresh_name
+cache=$runtime/istesso-editor-cache
+mkdir -m 700 -p "$cache" || say_fail "could not prepare the editor cache"
 echo "$fresh" > "$run/fresh"
-mkdir -p "$fresh/editor/data" "$fresh/editor/config" "$fresh/editor/state" "$fresh/editor/cache" \
+mkdir -p "$fresh/editor/data" "$fresh/editor/config" "$fresh/editor/state" \
     "$fresh/bus/store" "$fresh/bus/services-none" "$fresh/input"
 ln -s "$config/identity.key" "$fresh/input/identity.key"
 python3 -I - "$config/peers.json" "$fresh/input/peers.json" "$device" "$device_key" <<'PY' || say_fail "the asking device is not in the host's pairing list"
@@ -290,7 +333,7 @@ export WAYLAND_DISPLAY=$sock XDG_RUNTIME_DIR=$runtime GDK_BACKEND=wayland GTK_IM
 ${desk:+export $desk}
 exec env XDG_DATA_HOME=$fresh/bus/store XDG_CONFIG_HOME=$fresh/bus/store XDG_STATE_HOME=$fresh/bus/store XDG_CACHE_HOME=$fresh/bus/store \
     dbus-run-session --config-file=$fresh/bus/bus.conf -- \
-    bash -c 'echo "\$DBUS_SESSION_BUS_ADDRESS" > $run/bus-address; exec env XDG_DATA_HOME=$fresh/editor/data XDG_CONFIG_HOME=$fresh/editor/config XDG_STATE_HOME=$fresh/editor/state XDG_CACHE_HOME=$fresh/editor/cache GSETTINGS_BACKEND=keyfile GIO_USE_VFS=local gnome-text-editor --ignore-session'
+    bash -c 'echo "\$DBUS_SESSION_BUS_ADDRESS" > $run/bus-address; exec env XDG_DATA_HOME=$fresh/editor/data XDG_CONFIG_HOME=$fresh/editor/config XDG_STATE_HOME=$fresh/editor/state XDG_CACHE_HOME=$cache GSETTINGS_BACKEND=keyfile GIO_USE_VFS=local gnome-text-editor --ignore-session'
 SCRIPT
 chmod +x "$run/app.sh"
 app_log=/dev/null

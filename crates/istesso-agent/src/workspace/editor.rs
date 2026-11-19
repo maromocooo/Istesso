@@ -12,13 +12,14 @@
 //!   without following a link ([`checked_place`]).
 //! * Which editor, and how it is started, is the host's own setting
 //!   (`istesso agent --main-editor <launcher>`), never the request's: the
-//!   launcher is given one argument, the place the agent built itself from
-//!   the project folder and the names it checked ([`MainEditor::open`]).
+//!   agent passes the checked place in the launcher's environment
+//!   ([`MainEditor::open`]).
 //! * The launcher says on which ports the window's picture and input wait,
 //!   and the device is told so on the shell's conversation
 //!   ([`istesso_link::shell::ShellFrame::OpenWindow`]).
 //!
-//! Never written down: the place, the file's name, or any part of them.
+//! The agent keeps the place and file name out of its request logs. The
+//! editor keeps its own session, recent files and drafts on the host.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{BufRead, BufReader, Write};
