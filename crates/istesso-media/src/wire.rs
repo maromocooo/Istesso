@@ -81,7 +81,9 @@
 //! input do. `port` is where the host shows that window's picture (0: not yet), `width` and
 //! `height` its size in pixels (at most 8192), `title` its title (at most 256 bytes; never
 //! logged), `modal` whether it keeps the rest of the application from being used, `key`
-//! whether it is the one typed into, `attention` whether it asks for the person's attention.
+//! whether it is the one typed into, `attention` whether it asks for the person's attention,
+//! and, when the host says it, `points` its size on the host in points (`[W, H]`, each 1 to
+//! 8192), so that the viewer's window has that size whatever density its picture has.
 //! At most 16 windows. Neither end takes a list that is not within these limits, and fields a
 //! later version adds are passed over. The latest list is the whole of it: a window that is
 //! not in it is gone. A viewer that does not know kind 6 passes the packet over.
@@ -329,6 +331,11 @@ pub struct Window {
     /// It asks for the person's attention.
     #[serde(default)]
     pub attention: bool,
+    /// Its size on the host, in the host's points (each 1 to [`MAX_WINDOW_SIDE`]): the viewer's
+    /// window takes this size, whatever the density of the screen it was captured from (added
+    /// 2026-11-20; left out by an earlier writer, and then not written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub points: Option<[u32; 2]>,
 }
 
 /// Written without the title: a window's title may say what a person is working on.
@@ -342,6 +349,7 @@ impl std::fmt::Debug for Window {
             .field("modal", &self.modal)
             .field("key", &self.key)
             .field("attention", &self.attention)
+            .field("points", &self.points)
             .finish_non_exhaustive()
     }
 }
@@ -357,6 +365,9 @@ impl Windows {
                     && window.width <= MAX_WINDOW_SIDE
                     && window.height <= MAX_WINDOW_SIDE
                     && window.title.len() <= MAX_WINDOW_TITLE
+                    && window
+                        .points
+                        .is_none_or(|p| p.iter().all(|&side| (1..=MAX_WINDOW_SIDE).contains(&side)))
             });
         if fits {
             Ok(())
@@ -971,6 +982,31 @@ mod tests {
             modal: true,
             key: true,
             attention: false,
+            points: None,
+        }
+    }
+
+    #[test]
+    fn a_windows_size_in_points_travels_when_said_and_is_checked() {
+        let sized = Windows {
+            serial: 1,
+            windows: vec![Window {
+                points: Some([640, 400]),
+                ..a_dialog()
+            }],
+        };
+        let json = String::from_utf8(sized.to_json().unwrap()).unwrap();
+        assert!(json.contains(r#""points":[640,400]"#), "{json}");
+        assert_eq!(Windows::from_json(json.as_bytes()), Ok(sized));
+        for odd in [[0, 400], [640, 9000]] {
+            let wrong = Windows {
+                serial: 1,
+                windows: vec![Window {
+                    points: Some(odd),
+                    ..a_dialog()
+                }],
+            };
+            assert_eq!(wrong.check(), Err(WireError::Windows));
         }
     }
 

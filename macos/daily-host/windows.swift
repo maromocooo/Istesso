@@ -141,6 +141,19 @@ struct ListedWindow: Equatable {
     let title: String
     let modal: Bool
     let key: Bool
+    /// Its size on the host, in points: the viewer's window takes it, whatever the density of the
+    /// display the window is on (2 on the virtual display, 1 on the Mac's own screen).
+    var points: (Int, Int)? = nil
+
+    static func == (a: ListedWindow, b: ListedWindow) -> Bool {
+        a.number == b.number && a.port == b.port && a.width == b.width && a.height == b.height && a.title == b.title
+            && a.modal == b.modal && a.key == b.key && a.points?.0 == b.points?.0 && a.points?.1 == b.points?.1
+    }
+}
+
+/// A window's size in points for the list: whole points, 1 to 8192 each.
+func listedPoints(_ bounds: CGRect) -> (Int, Int) {
+    (max(1, min(8192, Int(bounds.width.rounded()))), max(1, min(8192, Int(bounds.height.rounded()))))
 }
 
 /// The list as packet kind 6 carries it (JSON, keys in a fixed order); titles cut to 256 bytes
@@ -149,8 +162,10 @@ func windowListJSON(serial: UInt32, _ windows: [ListedWindow]) -> String {
     let entries: [[String: Any]] = windows.map { w in
         var title = w.title
         while title.utf8.count > 256 { title.removeLast() }
-        return ["id": w.number, "port": w.port, "width": w.width, "height": w.height, "title": title,
-                "modal": w.modal, "key": w.key, "attention": false]
+        var entry: [String: Any] = ["id": w.number, "port": w.port, "width": w.width, "height": w.height, "title": title,
+                                    "modal": w.modal, "key": w.key, "attention": false]
+        if let points = w.points { entry["points"] = [points.0, points.1] }
+        return entry
     }
     let root: [String: Any] = ["serial": serial, "windows": entries]
     guard let data = try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]),
@@ -175,7 +190,7 @@ func pointerTarget(x: Double, y: Double, window: UInt32?, first: (origin: CGPoin
 }
 
 /// Where another window's picture lies on the screen: its top left, and points to one pixel of
-/// the picture across and down (the picture's sides are capped one by one: extraPictureSize).
+/// the picture across and down (whole pixels make the two differ a little: extraPictureSize).
 struct WindowPlace: Equatable {
     let origin: CGPoint
     let scaleX: Double
@@ -228,8 +243,12 @@ func keyTarget(_ focus: KeyFocus, first: (CGWindowID?, CGRect), listed: (UInt32)
 func passesNowhere(pressed: Bool, held: Bool) -> Bool { !pressed && held }
 
 /// A window's picture size: its points at the density of its display, even, 64 to 3840 x 2160.
+/// Made smaller as a whole when it would be larger than 3840 x 2160, so that the picture keeps the
+/// window's shape (the viewer's window has the window's points: see ListedWindow.points).
 func extraPictureSize(_ bounds: CGRect, density: Double) -> (Int, Int) {
-    (max(64, min(3840, Int(bounds.width * density)) & ~1), max(64, min(2160, Int(bounds.height * density)) & ~1))
+    let w = bounds.width * density, h = bounds.height * density
+    let fit = min(1, 3840 / max(w, 1), 2160 / max(h, 1))
+    return (max(64, Int(w * fit) & ~1), max(64, Int(h * fit) & ~1))
 }
 
 // MARK: - One other window's stream
@@ -501,7 +520,8 @@ extension DailyHost {
             let port = s.transport.port
             guard port > 0 else { return nil }
             let key = settings.generated ? extras.focus == .window(s.number) : focused.map { samePlace($0, s.bounds) } ?? false
-            return ListedWindow(number: s.number, port: port, width: s.width, height: s.height, title: s.title, modal: s.modal, key: key)
+            return ListedWindow(number: s.number, port: port, width: s.width, height: s.height, title: s.title, modal: s.modal, key: key,
+                                points: listedPoints(s.bounds))
         }
         let body = windowListJSON(serial: 0, entries)
         guard body != extras.told else { return }
@@ -699,9 +719,10 @@ func windowsSelfTest() -> Int {
     plan = streamPlan(candidates: [4], streaming: [], fallback: [4], most: 3)
     check(plan.start.isEmpty && plan.over.isEmpty, "a window back in the first picture is not streamed again")
 
-    let json = windowListJSON(serial: 7, [ListedWindow(number: 2, port: 50001, width: 1200, height: 800, title: "Untitled 2", modal: false, key: true)])
-    check(json == "{\"serial\":7,\"windows\":[{\"attention\":false,\"height\":800,\"id\":2,\"key\":true,\"modal\":false,\"port\":50001,\"title\":\"Untitled 2\",\"width\":1200}]}",
-          "the list's JSON")
+    let json = windowListJSON(serial: 7, [ListedWindow(number: 2, port: 50001, width: 1200, height: 800, title: "Untitled 2", modal: false, key: true,
+                                                       points: listedPoints(CGRect(x: 0, y: 0, width: 600, height: 400.4)))])
+    check(json == "{\"serial\":7,\"windows\":[{\"attention\":false,\"height\":800,\"id\":2,\"key\":true,\"modal\":false,\"points\":[600,400],\"port\":50001,\"title\":\"Untitled 2\",\"width\":1200}]}",
+          "the list's JSON, with the window's size in points")
     let long = windowListJSON(serial: 1, [ListedWindow(number: 2, port: 1, width: 64, height: 64, title: String(repeating: "あ", count: 100), modal: false, key: false)])
     if let data = long.data(using: .utf8), let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
        let title = (root["windows"] as? [[String: Any]])?.first?["title"] as? String {
@@ -721,14 +742,19 @@ func windowsSelfTest() -> Int {
     check(pointerTarget(x: 10, y: 20, window: 9, first: firstPlace, place: listed) == .nowhere(9), "a number not listed is nowhere")
     check(!passesNowhere(pressed: true, held: false) && passesNowhere(pressed: false, held: true) && !passesNowhere(pressed: false, held: false),
           "nowhere: no press; only the release of a button that is down")
-    // Review 7: a picture capped on one side only maps each side by its own scale.
+    // Review 7, and the density (2026-11-20): a picture too large is made smaller as a whole (the
+    // window's shape kept); each side maps by its own scale (whole pixels make them differ a little).
     let tall = CGRect(x: 10, y: 20, width: 1000, height: 1500)
     let (tw, th) = extraPictureSize(tall, density: 2)
     let tallPlace = extraPlace(bounds: tall, width: tw, height: th)
-    check(tw == 2000 && th == 2160 && tallPlace.scaleX == 0.5 && abs(tallPlace.scaleY - 1500.0 / 2160.0) < 1e-9,
-          "a window's picture capped in height: its own scale down")
+    check(tw == 1440 && th == 2160 && abs(Double(tw) / Double(th) - 1000.0 / 1500.0) < 0.002
+              && abs(tallPlace.scaleX - 1000.0 / 1440.0) < 1e-9 && abs(tallPlace.scaleY - 1500.0 / 2160.0) < 1e-9,
+          "a window's picture too tall: smaller as a whole, its shape kept")
+    check(extraPictureSize(CGRect(x: 0, y: 0, width: 800, height: 600), density: 1) == (800, 600)
+              && extraPictureSize(CGRect(x: 0, y: 0, width: 800, height: 600), density: 2) == (1600, 1200),
+          "a window on a 1x display: one pixel a point; on the 2x virtual display: two")
     if case let .at(corner, window: 2) = pointerTarget(x: Double(tw - 1), y: Double(th - 1), window: 2, first: firstPlace, place: { _ in tallPlace }) {
-        check(abs(corner.x - (10 + 999.5)) < 1e-6 && abs(corner.y - (20 + 1500 - 1500.0 / 2160.0)) < 1e-6,
+        check(abs(corner.x - (10 + 1000 - 1000.0 / 1440.0)) < 1e-6 && abs(corner.y - (20 + 1500 - 1500.0 / 2160.0)) < 1e-6,
               "its bottom right pixel is at the window's bottom right")
     } else {
         check(false, "its bottom right pixel is at the window's bottom right")

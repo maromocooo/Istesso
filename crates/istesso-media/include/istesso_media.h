@@ -210,10 +210,10 @@ int32_t istesso_media_host_set_text_input(const IstessoMediaHost *host, const Is
  * frames, to viewers that may be sent the frames, and to one that connects later). `json` is
  * UTF-8, at most ISTESSO_MEDIA_WINDOWS_MAX_BYTES bytes:
  *   {"serial":N,"windows":[{"id":2,"port":P,"width":W,"height":H,"title":"...",
- *                           "modal":false,"key":false,"attention":false}]}
+ *                           "modal":false,"key":false,"attention":false,"points":[W,H]}]}
  * `id` 2 or more (the first window is 1, and is not listed), `port` where that window's picture
- * is shown (0: not yet), sides of at most 8192 pixels, a title of at most 256 bytes, at most 16
- * windows. Fields this version does not know are passed over; what goes out is the list as this
+ * is shown (0: not yet), sides of at most 8192 pixels, a title of at most 256 bytes, `points`
+ * (may be left out) its size on the host in points, each 1 to 8192, at most 16 windows. Fields this version does not know are passed over; what goes out is the list as this
  * version knows it. Nothing is sent until this is first called. The titles are never logged.
  * 0, or -1 when it is not of that form or not within the limits (nothing is sent then).
  */

@@ -1726,6 +1726,7 @@ fn windows(serial: u64, title: &str) -> crate::wire::Windows {
             modal: true,
             key: true,
             attention: false,
+            points: None,
         }],
     }
 }

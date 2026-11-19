@@ -294,13 +294,17 @@ static uint32_t key_window_number(void) {
     if (!window_address(channel_address, listed.port, _address, sizeof _address)) {
         return nil;
     }
-    // One picture pixel at 1 / the density told, as the first window (window-size.h), on any screen
-    // here, made smaller as a whole to fit the screen.
+    // As large as the host's window in points (the host says them; else one picture pixel at 1 /
+    // the density told, as the first window: window-size.h), on any screen here, made smaller as a
+    // whole to fit the screen.
     NSScreen *screen = picture_window.screen ?: NSScreen.mainScreen;
-    double each = sizing.each;
+    double each = window_points_per_pixel(listed, sizing.each);
     NSRect room = screen.visibleFrame;
     double w, h;
     window_size_for_picture((unsigned)listed.width, (unsigned)listed.height, each, room.size.width, room.size.height - 28, &w, &h);
+    // Sizes only (never the title): for checking the density of another window's picture.
+    fprintf(stderr, "window %u: %.0fx%.0f points for a picture of %dx%d (%g points a pixel%s)\n", listed.number, w, h, listed.width,
+            listed.height, each, listed.pointsWidth > 0 ? ", the host's points" : ", the density told");
     NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, fmax(w, 64), fmax(h, 64))
                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
                                                      backing:NSBackingStoreBuffered

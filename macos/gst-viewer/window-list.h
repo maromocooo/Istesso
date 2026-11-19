@@ -25,6 +25,8 @@ enum { WINDOWS_MOST_EXTRA = 3, WINDOW_TITLE_MOST = 256, WINDOW_SIDE_MOST = 8192 
 @property(nonatomic) int width, height;
 @property(nonatomic, copy) NSString *title;
 @property(nonatomic) BOOL modal, key, attention;
+// Its size on the host in points, when the host says it (0 otherwise).
+@property(nonatomic) int pointsWidth, pointsHeight;
 @end
 
 @implementation ListedWindow
@@ -83,6 +85,15 @@ static NSArray<ListedWindow *> *windows_from_list(NSData *json) {
         listed.modal = [w[@"modal"] isKindOfClass:NSNumber.class] && [w[@"modal"] boolValue];
         listed.key = [w[@"key"] isKindOfClass:NSNumber.class] && [w[@"key"] boolValue];
         listed.attention = [w[@"attention"] isKindOfClass:NSNumber.class] && [w[@"attention"] boolValue];
+        NSArray *points = w[@"points"];
+        if ([points isKindOfClass:NSArray.class] && points.count == 2 && [points[0] isKindOfClass:NSNumber.class] &&
+            [points[1] isKindOfClass:NSNumber.class]) {
+            long long pw = [points[0] longLongValue], ph = [points[1] longLongValue];
+            if (pw >= 1 && pw <= WINDOW_SIDE_MOST && ph >= 1 && ph <= WINDOW_SIDE_MOST) {
+                listed.pointsWidth = (int)pw;
+                listed.pointsHeight = (int)ph;
+            }
+        }
         [out addObject:listed];
     }
     return out;
@@ -135,6 +146,17 @@ static bool window_address(const char *channel, uint16_t port, char *out, size_t
     }
     int length = snprintf(out, room, "%.*s:%u", (int)(colon - channel), channel, (unsigned)port);
     return length > 0 && (size_t)length < room;
+}
+
+// Points of this viewer's window to one pixel of another window's picture: the host's window's
+// points over its picture's pixels when the host says them (its picture may be 2x from the virtual
+// display, 1x from the Mac's own screen, or made smaller as a whole), else `fallback` (1 / the
+// density the viewer was told, ISTESSO_PICTURE_DENSITY: the first window's rule, window-size.h).
+static double window_points_per_pixel(ListedWindow *w, double fallback) {
+    if (w.pointsWidth > 0 && w.width > 0) {
+        return (double)w.pointsWidth / w.width;
+    }
+    return fallback > 0 ? fallback : 0.5;
 }
 
 // The focus told again when the host is told that windows are shown one by one (a new connection

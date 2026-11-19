@@ -72,6 +72,16 @@ int main(void) {
         check(!window_focus_line(false, 3, out, sizeof out) && !window_focus_line(true, 0, out, sizeof out),
               "nothing while another application is active, or no window of this one is typed into");
 
+        // The size of another window here (2026-11-20): the host's points when it says them, else 1 / the density.
+        NSArray<ListedWindow *> *sized = list(@"{\"windows\":[{\"id\":2,\"port\":5,\"width\":1600,\"height\":1200,\"points\":[800,600]},"
+                                               "{\"id\":3,\"port\":6,\"width\":800,\"height\":600,\"points\":[800,600]},"
+                                               "{\"id\":4,\"port\":7,\"width\":1600,\"height\":1200,\"points\":[0,600]}]}");
+        check(sized.count == 3 && sized[0].pointsWidth == 800 && sized[2].pointsWidth == 0, "a window's points are read; out of range, not");
+        check(window_points_per_pixel(sized[0], 0.5) == 0.5, "a 2x picture of an 800-point window: half a point a pixel");
+        check(window_points_per_pixel(sized[1], 0.5) == 1.0, "a window captured from a 1x display: a point a pixel, whatever the density told");
+        check(window_points_per_pixel(sized[2], 0.5) == 0.5 && window_points_per_pixel(sized[2], 1.0) == 1.0,
+              "without points from the host: the density told (ISTESSO_PICTURE_DENSITY)");
+
         // Where a new window goes.
         NSRect room = NSMakeRect(0, 0, 1470, 919);
         NSPoint at = window_top_left(NSMakeRect(100, 200, 800, 600), NSMakeSize(400, 300), 0, room);
