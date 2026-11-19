@@ -1,7 +1,9 @@
 Committed text for the client that has the keyboard (Istesso's ADR 0007, "確定した文字", and
 ADR 0020, route d): the compositor offers zwp_text_input_v3 to its clients, without an input
 method, and the custom upstream event TextCommit (text=string) hands a piece of committed text to
-the enabled text input of the client that has the keyboard (commit_string, then done). A client
+the enabled text input of the client that has the keyboard (commit_string, then done). The text
+inputs of a client are told they entered before its keyboard is (GTK 4.14 enables its text input
+only in that order, seen on the host). A client
 without an enabled text input gets printable ASCII as key presses (US layout; on another layout
 only letters, digits and the space); anything else is dropped. The text is never logged, only
 how many characters went which way.
@@ -33,6 +35,26 @@ index 5dafbc7..8d36da5 100644
                      return true;
                  } else if structure.has_name("TouchDown") {
                      let x = structure.get::<f64>("x").expect("Should contain x");
+diff --git a/wayland-display-core/src/comp/focus.rs b/wayland-display-core/src/comp/focus.rs
+index f4bd241..d3151aa 100644
+--- a/wayland-display-core/src/comp/focus.rs
++++ b/wayland-display-core/src/comp/focus.rs
+@@ -54,6 +54,15 @@ impl KeyboardTarget<State> for FocusTarget {
+         keys: Vec<KeysymHandle<'_>>,
+         serial: Serial,
+     ) {
++        // Trial only: the text inputs of this client are told they entered before the keyboard
++        // is (GTK enables its text input only then, seen on the host).
++        let surface = match self {
++            FocusTarget::Wayland(w) => match w.underlying_surface() {
++                WindowSurface::Wayland(w) => w.wl_surface().clone(),
++            },
++            FocusTarget::Popup(p) => p.wl_surface().clone(),
++        };
++        data.text_inputs.focus_changed(Some(surface));
+         match self {
+             FocusTarget::Wayland(w) => match w.underlying_surface() {
+                 WindowSurface::Wayland(w) => {
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
 index 8007d2c..6a3c352 100644
 --- a/wayland-display-core/src/comp/mod.rs
