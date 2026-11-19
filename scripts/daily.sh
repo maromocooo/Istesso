@@ -150,7 +150,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/src-text/gwd-c8/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-scroll-wip/gwd-trial34/target/release'}
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 state="$HOME/Library/Caches/istesso-daily"
@@ -998,6 +998,18 @@ PY2
         app="env XDG_CONFIG_HOME=$look GSETTINGS_BACKEND=keyfile google-chrome --ozone-platform=wayland --user-data-dir=$D/apps/chrome/profile --no-first-run --no-default-browser-check --mute-audio --password-store=basic --disable-gpu --disable-breakpad --disable-crash-reporter --metrics-recording-only${doc:+ $doc}" ;;
     *) echo "fail no application is called $APP"; exit 2 ;;
     esac
+    # How far a trackpad's scroll moves the content (docs/trial-daily.md, "スクロール"): the
+    # applications scale touchpad values by factors of their own, so the compositor of each
+    # (one per application) is told the inverse, to move the content as far as the fingers on
+    # the Mac. Measured in the trial: Chrome 12, GTK 4 (Text Editor) 2.5; Blender 1, but it
+    # drops the parts of a pixel of each value, so it gets whole pixels; Firefox is set in its
+    # profile instead (above).
+    finger=""
+    case "$APP" in
+    chrome) finger="ISTESSO_SCROLL_FINGER_SCALE=0.0833" ;;
+    editor) finger="ISTESSO_SCROLL_FINGER_SCALE=0.4" ;;
+    blender) finger="ISTESSO_SCROLL_WHOLE_PIXELS=1" ;;
+    esac
     shown=""
     if [ -n "$look" ]; then
         said_look=$(seed_look "$look" "$desk" 2>/dev/null)
@@ -1028,6 +1040,7 @@ export GST_PLUGIN_PATH=$plugin GST_REGISTRY=$run/gst-registry.bin XDG_RUNTIME_DI
 # Whose inertia a trackpad's scroll gets (docs/adr/0007-control-channel.md): the Mac's, or with
 # DAILY_SCROLL_MOMENTUM=app the application's own.
 ${SCROLL_MOMENTUM:+export ISTESSO_SCROLL_MOMENTUM=$SCROLL_MOMENTUM}
+${finger:+export $finger}
 # The keys arrive as places on the keyboard; this says what is printed on them.
 export XKB_DEFAULT_LAYOUT=$LAYOUT
 echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
