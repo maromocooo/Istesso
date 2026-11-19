@@ -13,7 +13,8 @@ how many characters went which way.
 
 Composing text (Istesso's ADR 0007, "変換中の文字"): the upstream event TextPreedit (text,
 cursor-begin, cursor-end as UTF-8 byte offsets) goes to the same text input as preedit_string and
-done, so that the application draws it in its own font; empty text clears it. With the property
+done, so that the application draws it in its own font; empty text clears it. Never into a
+password field (by its content type), whatever the device thought the field was. With the property
 text-input-messages the element posts wayland.text-input (state: 0 no field, 1 a field, 2 a
 password field by its content type; and the text cursor's rectangle in the output) whenever that
 changes; no typed text is in it (ADR 0015, "文字の入力の欄").
@@ -258,10 +259,10 @@ index b0ef369..9d884af 100644
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
 new file mode 100644
-index 0000000..b878c84
+index 0000000..3b5c968
 --- /dev/null
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,568 @@
 +//! Trial only: committed text for the client that has the keyboard (Istesso's ADR 0007,
 +//! "確定した文字", and ADR 0020, route d). The device a person types on composes the text with
 +//! its own input method and sends only what was committed; here it is handed to the text input
@@ -515,6 +516,11 @@ index 0000000..b878c84
 +        else {
 +            return false;
 +        };
++        // Never into a password field, whatever the device thought the field was (its notice
++        // of the field may still be on its way). Clearing is still done.
++        if instance.secret && !text.is_empty() {
++            return false;
++        }
 +        let text = (!text.is_empty()).then(|| text.to_string());
 +        instance.object.preedit_string(text, begin as i32, end as i32);
 +        instance.object.done(instance.commits);
