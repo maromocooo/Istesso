@@ -36,6 +36,9 @@ protocol InputSourceSystem: AnyObject {
     func currentID() -> String?
     /// Selects an enabled source; true when the system says it is the current one afterwards.
     func select(_ id: String) -> Bool
+    /// The input method a source belongs to (its bundle), so that the modes of one input method
+    /// (kana, Roman) count as one choice; a keyboard layout is its own.
+    func family(_ id: String) -> String
 }
 
 /// The real input sources (Text Input Sources). Used only by a host started with --inline.
@@ -50,11 +53,20 @@ final class TISInputSources: InputSourceSystem {
         return property(current, kTISPropertyInputSourceID)
     }
 
-    func select(_ id: String) -> Bool {
+    private func source(_ id: String) -> TISInputSource? {
         let filter = [kTISPropertyInputSourceID as String: id] as CFDictionary
-        guard let source = (TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource])?.first else { return false }
+        return (TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource])?.first
+    }
+
+    func select(_ id: String) -> Bool {
+        guard let source = source(id) else { return false }
         _ = TISSelectInputSource(source)
         return currentID() == id
+    }
+
+    func family(_ id: String) -> String {
+        guard let source = source(id), let bundle: String = property(source, kTISPropertyBundleID) else { return id }
+        return bundle
     }
 }
 
@@ -72,6 +84,9 @@ final class SourceSwitch {
     var alive: (pid_t) -> Bool = { kill($0, 0) == 0 || errno == EPERM }
     var pid: pid_t = getpid()
     private(set) var holding = false
+    /// The source this slot put back last (kept in memory only, never written down or logged):
+    /// a source the owner picks by hand afterwards is respected until the next connection.
+    private(set) var restoredTo: String?
 
     init(folder: String, slot: Int, system: InputSourceSystem) {
         self.folder = folder
@@ -161,12 +176,28 @@ final class SourceSwitch {
     /// back from the system). A source the owner chose by hand meanwhile (not Istesso's) is left
     /// as it is.
     private func restoreWrittenDown() -> Bool {
-        guard let id = read(previousFile) else { unlink(previousFile); return system.currentID() != Self.ours }
-        if system.currentID() != Self.ours { unlink(previousFile); return true }
+        guard let id = read(previousFile) else {
+            unlink(previousFile)
+            restoredTo = system.currentID()
+            return restoredTo != Self.ours
+        }
+        if let current = system.currentID(), current != Self.ours { unlink(previousFile); restoredTo = current; return true }
         let back = system.select(id)
-        if back { unlink(previousFile) }
+        if back { unlink(previousFile); restoredTo = id }
         return back
     }
+
+    /// The owner picked another input method by hand since this slot put the source back (or
+    /// while Istesso's was selected): it is not taken away from them until the next connection.
+    func ownerChoseAnother() -> Bool {
+        guard let current = system.currentID(), current != Self.ours else { return false }
+        if holding { return true }
+        guard let restoredTo else { return false }
+        return system.family(current) != system.family(restoredTo)
+    }
+
+    /// A new connection: the owner's earlier choice no longer stands in the way.
+    func forgetRestored() { restoredTo = nil }
 }
 
 /// Whether Istesso's source should be selected now (ADR 0023, 2.): while a viewer is shown the
@@ -360,6 +391,14 @@ final class InlineComposer {
     private(set) var awaiting: (seq: Int, until: TimeInterval)?
     private(set) var report = FieldReport()
     private var reported = false
+    /// Compositions the input source said were ended (committed once by the application): a commit
+    /// of one of them that comes back refused is never typed again.
+    private var endedSerials: [Int] = []
+    /// Commits whose "inserted" did not come in time: the keys after them went on, so a refusal
+    /// that comes later is not typed again either (it would land after those keys).
+    private var timedOut: [Int] = []
+    private var compStartedAt: TimeInterval = -1
+    private var lastViewerPress: TimeInterval = -1
     private(set) var counts: [String: Int] = [:]
     static let insertedWithin = 0.05
     static let notTextAfter = 0.1
@@ -383,7 +422,8 @@ final class InlineComposer {
         object["seq"] = seq
         guard send(object) else { return nil }
         pending[seq] = (object["op"] as? String ?? "", comp, text)
-        if pending.count > 256, let oldest = pending.keys.min() { pending[oldest] = nil }
+        // Bounded, but never the commit being waited on.
+        if pending.count > 256, let oldest = pending.keys.filter({ $0 != awaiting?.seq }).min() { pending[oldest] = nil }
         return seq
     }
 
@@ -413,6 +453,24 @@ final class InlineComposer {
         recompute()
     }
 
+    private func remember(ended c: Int) {
+        endedSerials.append(c)
+        if endedSerials.count > 64 { endedSerials.removeFirst(endedSerials.count - 64) }
+    }
+
+    func isPending(_ s: Int) -> Bool { pending[s] != nil }
+
+    /// Before Istesso's source is let go of on a disconnect or a stop: what is shown is cleared
+    /// (never committed into the document by the switch). The seq of the clear, to wait for.
+    func clearNow() -> Int? {
+        guard linked, let c = comp else { return nil }
+        remember(ended: c)
+        comp = nil
+        stripComposition = true
+        recompute()
+        return ask(["op": "clear"], comp: c)
+    }
+
     func message(_ m: [String: Any]) {
         let op = m["op"] as? String ?? ""
         if let s = m["seq"] as? Int, let asked = pending.removeValue(forKey: s) {
@@ -434,11 +492,18 @@ final class InlineComposer {
             // The application ended the composition (a click elsewhere, the focus moved, the source
             // switched back): the input source committed it once. The viewer is told by a new field
             // serial and ends its own without committing; what crosses that on the way is dropped.
-            if let c = m["comp"] as? Int, c == comp {
-                comp = nil
-                endedUntil = now() + 1.0
-                serial = (serial + 1) % 256
-                count("ended_by_application")
+            if let c = m["comp"] as? Int {
+                remember(ended: c)
+                if c == comp {
+                    comp = nil
+                    endedUntil = now() + 1.0
+                    serial = (serial + 1) % 256
+                    count("ended_by_application")
+                } else {
+                    // A composition whose commit is on its way: that commit will be refused, and
+                    // must not be typed again.
+                    count("ended_while_committing")
+                }
             }
         default:
             count("unknown_op")
@@ -466,10 +531,20 @@ final class InlineComposer {
                 count("commit_inserted")
             } else if why == "stale" {
                 count("commit_stale")
+            } else if let c = asked.comp, endedSerials.contains(c) {
+                // The application ended it: the input source committed it once already.
+                count("commit_refused_after_end")
+            } else if why == nil {
+                // Refused without a reason: whether it went in is not known (an older input
+                // source); not typed again.
+                count("commit_unknown")
+            } else if timedOut.contains(seq) {
+                count("commit_refused_after_timeout")
             } else if let text = asked.text {
                 count("commit_refused_text_path")
                 deliverText(text)
             }
+            timedOut.removeAll { $0 == seq }
             if awaiting?.seq == seq { awaiting = nil; releaseHold() }
         case "caret":
             if ok, m["x"] != nil {
@@ -529,6 +604,7 @@ final class InlineComposer {
             count("preedit_not_inline")
             return recompute()
         }
+        if comp == nil { compStartedAt = now() }
         let c = comp ?? { defer { nextComp += 1 }; return nextComp }()
         comp = c
         if ask(["op": "mark", "text": text, "sel": cursor, "comp": c], comp: c) == nil {
@@ -573,6 +649,7 @@ final class InlineComposer {
     /// A key went down from the viewer: no composition is going on there (the input method takes
     /// the keys while it composes).
     func keyPressed() {
+        lastViewerPress = now()
         if stripComposition || endedUntil != nil {
             stripComposition = false
             endedUntil = nil
@@ -580,8 +657,24 @@ final class InlineComposer {
         }
     }
 
-    /// Another element of the relayed application has the keyboard now.
+    /// A press of the viewer's (a click may move the focus over here).
+    func buttonPressed() { lastViewerPress = now() }
+
+    /// Another element of the relayed application has the keyboard now (Accessibility, read a
+    /// little later than the click or key that moved it).
     func fieldChanged() {
+        if let c = comp {
+            if compStartedAt > lastViewerPress {
+                // Begun after the click or key that moved the focus: it is in the new field
+                // already, and the viewer keeps it (no new serial, which would wipe it there).
+                count("field_changed_composition_kept")
+                return recompute()
+            }
+            // Begun before: the input source ends it in the old field (and says so).
+            remember(ended: c)
+            comp = nil
+            endedUntil = now() + 1.0
+        }
         serial = (serial + 1) % 256
         recompute()
     }
@@ -590,6 +683,8 @@ final class InlineComposer {
     func tick() {
         if let waiting = awaiting, now() > waiting.until {
             count("inserted_timeout")
+            timedOut.append(waiting.seq)
+            if timedOut.count > 64 { timedOut.removeFirst(timedOut.count - 64) }
             awaiting = nil
             releaseHold()
         }
@@ -661,9 +756,16 @@ final class InlineHost {
     private var timer: DispatchSourceTimer?
     /// Events held after a commit, in order.
     var held: [Data] = []
+    static let mostHeld = 256
+    private(set) var heldDropped = 0
+    /// The owner picked another input method by hand: Istesso's is not selected again until the
+    /// next connection.
+    private(set) var ownerChose = false
+    private var wasConnected = false
+    var pid: () -> pid_t? = { nil }
 
-    init?(app: String, slot: Int, idle: Double, system: InputSourceSystem = TISInputSources()) {
-        guard let path = Wire.socketPath(slot: slot) else { return nil }
+    init?(app: String, slot: Int, idle: Double, system: InputSourceSystem = TISInputSources(), path given: String? = nil) {
+        guard let path = given ?? Wire.socketPath(slot: slot) else { return nil }
         composer = InlineComposer(app: app)
         link = InlineLink(path: path)
         switcher = SourceSwitch(folder: (path as NSString).deletingLastPathComponent, slot: slot, system: system)
@@ -683,11 +785,63 @@ final class InlineHost {
         return true
     }
 
+    /// An event while a commit waits for "inserted": held in order (true), or, past the bound,
+    /// dropped and counted (true as well: it never goes ahead of the queue).
+    func hold(_ data: Data) -> Bool {
+        guard composer.holding || !held.isEmpty else { return false }
+        if held.count < Self.mostHeld { held.append(data) } else { heldDropped += 1 }
+        return true
+    }
+
+    /// What is shown is cleared, and the answer waited for (100 ms at most), before the source is
+    /// put back: switching first would make the input source commit it into the document.
+    func clearBeforeRestore() {
+        guard let s = composer.clearNow() else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.1
+        while composer.isPending(s), link.connected, ProcessInfo.processInfo.systemUptime < deadline {
+            var poller = pollfd(fd: link.fd, events: Int16(POLLIN), revents: 0)
+            _ = poll(&poller, 1, 10)
+            link.poll()
+        }
+        note("inline: cleared before the source went back: \(composer.isPending(s) ? "no answer" : "yes")")
+    }
+
+    /// The viewer pressed a button: the focus may have moved; Accessibility is asked at once.
+    func viewerPressed() {
+        composer.buttonPressed()
+        askField()
+    }
+
+    private func askField() {
+        guard let pid = pid(), !axAsked else { return }
+        axAsked = true
+        axQueue.async {
+            let (found, identity) = readFieldClass(pid)
+            DispatchQueue.main.async {
+                self.axAsked = false
+                if identity != nil, identity != self.lastIdentity, self.lastIdentity != nil { self.composer.fieldChanged() }
+                if identity != nil { self.lastIdentity = identity }
+                self.composer.fieldClass = found
+            }
+        }
+    }
+
     /// Every 100 ms (10 ms while a commit is held): which source, whether inline, what the field is.
     func tick(connected: Bool, locked: Bool, pid: pid_t?) {
+        if connected && !wasConnected { ownerChose = false; switcher.forgetRestored() }
+        wasConnected = connected
         let wanted = inlineSourceWanted(connected: connected, locked: locked, localIdle: localIdle(), idle: idle)
         let now = ProcessInfo.processInfo.systemUptime
-        if wanted && !switcher.holding && now - selectFailedAt > 10 {
+        if switcher.holding && switcher.ownerChoseAnother() {
+            // Picked by hand while Istesso's was selected: left as chosen.
+            ownerChose = true
+            _ = switcher.release()
+            note("inline: the owner picked another input source: left as it is until the next connection")
+        } else if wanted && !switcher.holding && !ownerChose && switcher.ownerChoseAnother() {
+            ownerChose = true
+            note("inline: the owner picked another input source: left as it is until the next connection")
+        }
+        if wanted && !switcher.holding && !ownerChose && now - selectFailedAt > 10 {
             let selected = switcher.acquire()
             note("inline: Istesso's source selected: \(selected ? "yes" : "no")")
             if !selected {
@@ -696,29 +850,22 @@ final class InlineHost {
                 note("inline: restored: \(restored.map { $0 ? "yes" : "no" } ?? "another slot holds it")")
             }
         } else if !wanted && switcher.holding {
+            // Gone or locked: cleared first. Local typing: the input source ends it as an input
+            // method does (committed once, "ended"), and the viewer goes on with the strip.
+            if !connected || locked { clearBeforeRestore() }
             let restored = switcher.release()
             note("inline: \(connected ? (locked ? "locked" : "local typing") : "nobody shown"): restored: \(restored.map { $0 ? "yes" : "no" } ?? "another slot holds it")")
         }
         composer.sourceOurs = switcher.holding && switcher.system.currentID() == SourceSwitch.ours
         ticks += 1
-        if let pid, connected, !axAsked {
-            axAsked = true
-            axQueue.async {
-                let (found, identity) = readFieldClass(pid)
-                DispatchQueue.main.async {
-                    self.axAsked = false
-                    if identity != nil, identity != self.lastIdentity, self.lastIdentity != nil { self.composer.fieldChanged() }
-                    if identity != nil { self.lastIdentity = identity }
-                    self.composer.fieldClass = found
-                }
-            }
-        }
+        if pid != nil, connected { askField() }
         if ticks % 5 == 0 { composer.probe() }
         composer.tick()
     }
 
     /// Disconnect, stop, a crash's next start: Istesso's source is let go.
     func shutdown() {
+        clearBeforeRestore()
         if switcher.holding {
             let restored = switcher.release()
             note("inline: stop: restored: \(restored.map { $0 ? "yes" : "no" } ?? "another slot holds it")")
@@ -735,7 +882,10 @@ final class FakeSources: InputSourceSystem {
     var selects = 0
     init(current: String, enabled: Set<String>) { self.current = current; self.enabled = enabled }
     func currentID() -> String? { current }
+    var onSelect: (String) -> Void = { _ in }
+    func family(_ id: String) -> String { id.components(separatedBy: "#").first ?? id }
     func select(_ id: String) -> Bool {
+        onSelect(id)
         selects += 1
         if enabled.contains(id) { current = id }
         return current == id
@@ -1003,9 +1153,74 @@ func inlineSelfTest() -> Int {
     im.caret("active", seq: nil, x: 1010, top: 210)
     link.poll()
     check(composer.report.state == 1, "back in a text field: inline")
+    composer.preedit("", cursor: [0, 0])
+    _ = im.take()
     let serialNow = composer.report.serial
     composer.fieldChanged()
     check(composer.report.serial == (serialNow + 1) % 256, "another focused element: a new serial")
+
+    // A composition begun after the viewer's click that moved the focus is in the new field: the
+    // late Accessibility answer neither ends it nor wipes it on the viewer (no new serial).
+    _ = im.take()
+    composer.buttonPressed()
+    clock += 0.01
+    composer.preedit("た", cursor: [3, 3])
+    let newField = im.take().first
+    im.caret("mark", seq: newField?["seq"], x: 1010, top: 210)
+    link.poll()
+    let serialKept = composer.report.serial
+    composer.fieldChanged()
+    check(composer.report.serial == serialKept && composer.comp != nil, "begun after the click: kept, no new serial")
+    // Begun before the press: the focus moved away from it; it ends here, the viewer is told.
+    clock += 0.01
+    composer.buttonPressed()
+    composer.fieldChanged()
+    check(composer.comp == nil && composer.report.serial == (serialKept + 1) % 256, "begun before the click: ended, a new serial")
+    composer.preedit("", cursor: [0, 0])
+    clock += 2
+    _ = im.take()
+
+    // HIGH-2 of the review: the application ended a composition whose commit is on its way; the
+    // refusal that follows is never typed again.
+    composer.preedit("ち", cursor: [3, 3])
+    let chiMark = im.take().first
+    im.caret("mark", seq: chiMark?["seq"], x: 1010, top: 210)
+    link.poll()
+    _ = composer.commit("ち")
+    let chiCommit = im.take().first
+    im.say(["op": "ended", "by": "application", "comp": chiCommit?["comp"] ?? 0])
+    im.say(["op": "commit", "ok": false, "why": "relayed app not active", "seq": chiCommit?["seq"] ?? 0])
+    link.poll()
+    check(delivered.isEmpty && composer.counts["commit_refused_after_end"] == 1 && !composer.holding,
+          "a commit refused after its composition was ended by the application is not typed again")
+    // A refusal without a reason: not known whether it went in; not typed again.
+    _ = composer.commit("つ")
+    let noWhy = im.take().first
+    im.say(["op": "commit", "ok": false, "seq": noWhy?["seq"] ?? 0])
+    link.poll()
+    check(delivered.isEmpty && composer.counts["commit_unknown"] == 1, "a refusal without a reason is taken as unknown, not typed again")
+    // A refusal that comes after the 50 ms wait ran out: the keys went on; not typed again.
+    _ = composer.commit("て")
+    let late = im.take().first
+    clock += 0.06
+    composer.tick()
+    im.say(["op": "commit", "ok": false, "why": "relayed app not active", "seq": late?["seq"] ?? 0])
+    link.poll()
+    check(delivered.isEmpty && composer.counts["commit_refused_after_timeout"] == 1, "a refusal after the wait ran out is not typed after later keys")
+    // The bound on questions waiting for answers never drops the commit waited on.
+    _ = composer.commit("と")
+    let waited = im.take().first
+    for i in 0..<300 {
+        composer.preedit(i % 2 == 0 ? "な" : "なに", cursor: [3, 3])
+        if i % 20 == 0 { _ = im.take() }
+    }
+    _ = im.take()
+    im.say(["op": "commit", "ok": false, "why": "text", "seq": waited?["seq"] ?? 0])
+    link.poll()
+    check(delivered == ["と"] && !composer.holding, "after 300 more questions the waited commit's answer is still known")
+    delivered.removeAll()
+    composer.preedit("", cursor: [0, 0])
+    _ = im.take()
 
     // The input source goes away during a composition: the rest on the strip, its commit by text.
     composer.preedit("さ", cursor: [3, 3])
@@ -1020,5 +1235,109 @@ func inlineSelfTest() -> Int {
     check(!["にほ", "日本", "か", "さ", "ああ"].contains { written.contains($0) }, "no text in the notes or counts")
     link.close()
     check(access(path, F_OK) != 0, "the socket is removed at the end")
+    failed += inlineHostSelfTest(folder: folder)
+    return failed
+}
+
+/// The host's side as a whole (switching, clearing before the source goes back, the owner's choice,
+/// the held events), with a stand-in input source answering on a thread of its own.
+func inlineHostSelfTest(folder: String) -> Int {
+    var failed = 0
+    func check(_ ok: Bool, _ what: String) {
+        if ok { print("ok   inline: \(what)") } else { failed += 1; print("FAIL inline: \(what)") }
+    }
+    let path = (folder as NSString).appendingPathComponent("slot-1")
+    let system = FakeSources(current: "test.ime#kana", enabled: ["test.ime#kana", "test.ime#roman", "test.layout", SourceSwitch.ours])
+    guard let host = InlineHost(app: "com.example.relayed", slot: 1, idle: 3, system: system, path: path), // check-private: ok synthetic bundle identifier
+          host.link.open() else { print("FAIL inline: host not made"); return 1 }
+    defer { host.link.close() }
+    host.link.peerCheck = { fd in
+        var uid: uid_t = 0, gid: gid_t = 0
+        return getpeereid(fd, &uid, &gid) == 0 && uid == getuid() ? .ok("stand-in") : .refused("user")
+    }
+    var idle = 99.0
+    host.localIdle = { idle }
+    let lock = NSLock()
+    var seen: [String] = []
+    var clearBeforeSelect: Bool?
+    system.onSelect = { id in
+        if id != SourceSwitch.ours { lock.lock(); clearBeforeSelect = seen.contains("clear"); lock.unlock() }
+    }
+    let stop = DispatchSemaphore(value: 0)
+    let done = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+        guard let im = StandInInputSource(path: path) else { done.signal(); return }
+        im.say(["op": "active", "ok": true, "x": 1010, "y": 0, "w": 0, "h": 20, "top": 210, "scale": 2])
+        while stop.wait(timeout: .now()) == .timedOut {
+            for m in im.take() {
+                let op = m["op"] as? String ?? ""
+                lock.lock(); seen.append(op); lock.unlock()
+                switch op {
+                case "hello": im.say(["op": "hello", "ok": true, "slot": 1, "seq": m["seq"] ?? 0])
+                case "mark", "clear", "caret": im.caret(op, seq: m["seq"], x: 1010, top: 210)
+                default: break
+                }
+            }
+        }
+        close(im.fd)
+        done.signal()
+    }
+    let composer = host.composer
+    func pump(_ seconds: Double, until: () -> Bool = { false }) {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end && !until() { host.link.poll(); usleep(2000) }
+    }
+    pump(1) { composer.linked && composer.active }
+    check(composer.linked && composer.active, "the host's link: hello taken, active")
+    composer.shownWindow = CGRect(x: 1000, y: 200, width: 400, height: 300)
+    composer.origin = CGPoint(x: 1000, y: 200)
+    composer.pointsPerPixel = 0.5
+    composer.picture = CGSize(width: 800, height: 600)
+    composer.fieldClass = .text
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == SourceSwitch.ours && composer.sourceOurs, "connected, the local keyboard idle: Istesso's source")
+    composer.recompute()
+    composer.preedit("にほ", cursor: [6, 6])
+    pump(0.3) { composer.comp != nil && !composer.isPending(1_000_000) && { lock.lock(); defer { lock.unlock() }; return seen.contains("mark") }() }
+    pump(0.05)
+    check(composer.comp != nil, "a composition is shown")
+    host.tick(connected: false, locked: false, pid: nil)
+    check(clearBeforeSelect == true && system.current == "test.ime#kana", "disconnected: cleared first, then the source before put back")
+    // The owner's own choice.
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == SourceSwitch.ours, "connected again: Istesso's")
+    idle = 0.5
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == "test.ime#kana" && clearBeforeSelect == true, "local typing: the source before is back")
+    system.current = "test.ime#roman"
+    idle = 99
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == SourceSwitch.ours, "another mode of the same input method is not a choice: Istesso's again")
+    idle = 0.5
+    host.tick(connected: true, locked: false, pid: nil)
+    system.current = "test.layout"
+    idle = 99
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == "test.layout" && host.ownerChose, "another input source picked by hand: left as chosen")
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == "test.layout", "and still after more idle time")
+    host.tick(connected: false, locked: false, pid: nil)
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == SourceSwitch.ours && !host.ownerChose, "the next connection: Istesso's again")
+    system.current = "test.layout"
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == "test.layout" && !host.switcher.holding, "picked by hand while Istesso's was selected: let go, left as chosen")
+    host.tick(connected: false, locked: false, pid: nil)
+    stop.signal()
+    _ = done.wait(timeout: .now() + 2)
+    pump(0.05)
+    // Held events: in order while a commit waits; past the bound dropped and counted, never ahead.
+    check(!host.hold(Data([1])), "nothing waits: an event is not held")
+    host.held = [Data([0])]
+    check(host.hold(Data([1])) && host.held == [Data([0]), Data([1])], "behind what is held, in order")
+    host.held = Array(repeating: Data([2]), count: InlineHost.mostHeld)
+    check(host.hold(Data([3])) && host.held.count == InlineHost.mostHeld && host.heldDropped == 1, "past the bound: dropped and counted, never ahead of the queue")
+    host.held = []
+    for name in ["previous-source", "hold-slot-1", "switch.lock"] { unlink((folder as NSString).appendingPathComponent(name)) }
     return failed
 }

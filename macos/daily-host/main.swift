@@ -1834,6 +1834,29 @@ func selfTest() -> Never {
     }
     checkPanel(!chordMayChangeWindow(47) && !chordMayChangeWindow(46) && chordMayChangeWindow(49), true, "chords: Command-V and -C pass straight on, Command-N is looked at")
     do {
+        // A chord's hold holds composing text too, and lets everything go through the host's own
+        // order (where a commit's wait for "inserted" may hold it again), never straight here.
+        let injector = Injector()
+        var preedits = 0
+        var again: [String] = []
+        injector.mayPost = true
+        injector.target = { 100 }
+        injector.keysAllowed = { true }
+        injector.lockedNow = { false }
+        injector.postProcess = { _, _ in }
+        injector.onPreedit = { _, _ in preedits += 1 }
+        injector.onText = { _ in true }
+        injector.redispatch = { data in again.append(((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["kind"] as? String ?? "?") }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        injector.beginHold()
+        send(["kind": "text", "text": "a"])
+        send(["kind": "preedit", "text": "b", "cursor": [1, 1]])
+        send(["kind": "key", "code": 30, "pressed": true])
+        checkPanel(preedits == 0 && injector.counts["held"] == 3, true, "chords: text, composing text and keys are held alike")
+        injector.endHold(flush: true)
+        checkPanel(again == ["text", "preedit", "key"] && preedits == 0, true, "chords: let go through the host's dispatch, in order")
+    }
+    do {
         // Command-V then typing: nothing is held at all.
         let injector = Injector()
         var posted = 0
@@ -2152,6 +2175,9 @@ final class Injector {
     /// With --inline only (inline.swift): composing text, committed text and key presses go to the
     /// inline composition first. Without, `preedit` is unknown here and text goes as before.
     var onPreedit: ((String, [Int]) -> Void)?
+    var onButtonPressed: (() -> Void)?
+    /// Where events let go of after a chord's hold go: the host's dispatch (set by the host).
+    var redispatch: ((Data) -> Void)?
     var onText: ((String) -> Bool)?
     var onKeyPressed: (() -> Void)?
     func beginHold() { holdingForChord = true }
@@ -2161,7 +2187,9 @@ final class Injector {
         held = []
         heldPresses = []
         if flush {
-            for event in events { handle(event) }
+            // Through the host's own order (a commit's wait for "inserted" begun meanwhile holds
+            // them too), or straight here when nothing else is in the way.
+            for event in events { if let redispatch { redispatch(event) } else { handle(event) } }
         } else if !events.isEmpty {
             counts["held_discarded", default: 0] += events.count
             onKeysDropped(true)
@@ -2284,7 +2312,7 @@ final class Injector {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return count("unreadable") }
         lastInput = ProcessInfo.processInfo.systemUptime
-        if holdingForChord && (kind == "key" || kind == "text") {
+        if holdingForChord && (kind == "key" || kind == "text" || kind == "preedit") {
             let code = (object["code"] as? NSNumber)?.uint32Value ?? 0
             let pressed = object["pressed"] as? Bool ?? true
             // The release of a key that was sent before the chord's hold goes at once.
@@ -2428,7 +2456,7 @@ final class Injector {
     }
 
     private func button(_ code: UInt32, _ pressed: Bool) {
-        if pressed { freshWindowList() }
+        if pressed { freshWindowList(); onButtonPressed?() }
         guard let window = windowAt(point) else { return count("dropped_no_window") }
         let pid = window.pid
         if pressed { buttonsDown.insert(code) } else { buttonsDown.remove(code) }
@@ -3463,7 +3491,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// injector. After a commit through the input source, everything waits (in order) until it is
     /// inserted (inline.swift; 50 ms at most).
     func dispatch(_ data: Data) {
-        if let inline, inline.composer.holding, inline.held.count < 256 { return inline.held.append(data) }
+        if let inline, inline.hold(data) { return }
+        dispatchNow(data)
+    }
+
+    /// One event that waits for nothing any more.
+    func dispatchNow(_ data: Data) {
         if settings.clipboard, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let kind = object["kind"] as? String, kind == "clipboard_copy" || kind == "clipboard_paste",
            let nonce = object["nonce"] as? String {
@@ -3521,6 +3554,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         injector.onPreedit = { made.composer.preedit($0, cursor: $1) }
         injector.onText = { made.composer.commit($0) }
         injector.onKeyPressed = { made.composer.keyPressed() }
+        injector.onButtonPressed = { made.viewerPressed() }
+        injector.redispatch = { [weak self] event in self?.dispatch(event) }
+        made.pid = { [weak self] in self?.app?.processIdentifier }
         inline = made
         note("inline: on, slot \(settings.virtualSlot)")
         var ticks = 0
@@ -3552,7 +3588,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         while !inline.held.isEmpty && !inline.composer.holding {
             let event = inline.held.removeFirst()
             guard !detached, picture == "running" else { continue }
-            dispatch(event)
+            dispatchNow(event)
         }
     }
 
