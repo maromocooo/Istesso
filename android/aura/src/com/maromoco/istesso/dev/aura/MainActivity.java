@@ -19,6 +19,7 @@ import android.widget.TextView;
  */
 public final class MainActivity extends Activity {
     private Settings settings;
+    private ScrollView scroll;
 
     /** One host's part of the screen. */
     private final class Section {
@@ -27,6 +28,10 @@ public final class MainActivity extends Activity {
         EditText code;
         TextView status;
         Button pair;
+        /** The section's title, where its button at the top jumps to. */
+        TextView title;
+        /** Its button in the row at the top: the host and its paired device, at a glance. */
+        Button summary;
 
         Section(Host host) {
             this.host = host;
@@ -48,16 +53,28 @@ public final class MainActivity extends Activity {
         mark.setTextSize(22);
         column.addView(mark);
 
+        // The two hosts side by side at the top, each with its paired device: that there are two
+        // sections is seen without scrolling (the owner, 2026-11-19). A tap goes to the section.
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(0, pad / 2, 0, 0);
+        column.addView(row);
+
         TextView about = new TextView(this);
         about.setText(getString(R.string.about) + "\n" + getString(R.string.mark) + "  (" + BuildConfig.VERSION + ")");
         about.setPadding(0, pad / 2, 0, pad / 2);
         column.addView(about);
 
+        scroll = new ScrollView(this);
         for (Host host : Host.ALL) {
-            addSection(column, new Section(host), pad);
+            Section s = new Section(host);
+            s.summary = new Button(this);
+            s.summary.setAllCaps(false);
+            s.summary.setOnClickListener(v -> scroll.smoothScrollTo(0, s.title.getTop()));
+            row.addView(s.summary, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            addSection(column, s, pad);
         }
 
-        ScrollView scroll = new ScrollView(this);
         scroll.addView(column);
         setContentView(scroll);
     }
@@ -68,6 +85,7 @@ public final class MainActivity extends Activity {
         title.setTextSize(20);
         title.setPadding(0, pad, 0, pad / 4);
         column.addView(title);
+        s.title = title;
 
         s.address = field(R.string.host_hint, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI
                 | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -131,6 +149,10 @@ public final class MainActivity extends Activity {
     private void showPaired(Section s) {
         String name = settings.hostName(s.host);
         s.status.setText(name.isEmpty() ? getString(R.string.not_paired) : getString(R.string.paired_with, name));
+        if (s.summary != null) {
+            s.summary.setText(getString(s.host.labelRes) + "\n"
+                    + (name.isEmpty() ? getString(R.string.not_paired) : getString(R.string.paired_with, name)));
+        }
     }
 
     private void pairNow(Section s) {
