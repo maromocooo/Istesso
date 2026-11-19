@@ -1125,7 +1125,8 @@ final class VirtualScreen {
         descriptor.sizeInMillimeters = CGSize(width: size.width / 110 * 25.4, height: size.height / 110 * 25.4)
         descriptor.vendorID = 0x1234
         descriptor.productID = 0x0003
-        descriptor.serialNum = 0x0001
+        // One per slot: two virtual displays with the same serial number are not both made.
+        descriptor.serialNum = UInt32(slot)
         descriptor.redPrimary = CGPoint(x: 0.64, y: 0.33)
         descriptor.greenPrimary = CGPoint(x: 0.30, y: 0.60)
         descriptor.bluePrimary = CGPoint(x: 0.15, y: 0.06)
@@ -1608,6 +1609,47 @@ func selfTest() -> Never {
         checkPanel(before && !during && after, true, "keys: stopped after a Command chord until the key window is known again")
     }
     checkPanel(!keysMayGo(appInFront: true, focused: shownWin, shown: shownWin, shownIsFront: false), true, "keys: a window at the same place in front of the shown one does not pass")
+    func chordRun(flush: Bool) -> (posted: Int, discarded: Int) {
+        let injector = Injector()
+        var posted = 0
+        injector.mayPost = true
+        injector.target = { 100 }
+        injector.keysAllowed = { true }
+        injector.lockedNow = { false }
+        injector.postProcess = { event, _ in if event.type == .keyDown { posted += 1 } }
+        injector.onCommandChord = { code in if chordMayChangeWindow(code) { injector.beginHold() } }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        send(["kind": "key", "code": 125, "pressed": true])   // Command
+        send(["kind": "key", "code": 49, "pressed": true])    // N: the chord, sent; the hold begins
+        send(["kind": "key", "code": 49, "pressed": false])
+        send(["kind": "key", "code": 125, "pressed": false])  // the release of a key sent before: goes
+        send(["kind": "key", "code": 45, "pressed": true])    // typing after the chord: held
+        send(["kind": "key", "code": 45, "pressed": false])
+        let before = posted
+        injector.endHold(flush: flush)
+        return (posted - before, injector.counts["held_discarded"] ?? 0)
+    }
+    checkPanel(!chordMayChangeWindow(47) && !chordMayChangeWindow(46) && chordMayChangeWindow(49), true, "chords: Command-V and -C pass straight on, Command-N is looked at")
+    do {
+        // Command-V then typing: nothing is held at all.
+        let injector = Injector()
+        var posted = 0
+        injector.mayPost = true
+        injector.target = { 100 }
+        injector.keysAllowed = { true }
+        injector.lockedNow = { false }
+        injector.postProcess = { event, _ in if event.type == .keyDown { posted += 1 } }
+        injector.onCommandChord = { code in if chordMayChangeWindow(code) { injector.beginHold() } }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        send(["kind": "key", "code": 125, "pressed": true]); send(["kind": "key", "code": 47, "pressed": true])
+        send(["kind": "key", "code": 47, "pressed": false]); send(["kind": "key", "code": 125, "pressed": false])
+        send(["kind": "key", "code": 30, "pressed": true]); send(["kind": "key", "code": 30, "pressed": false])
+        checkPanel(posted == 2 && !injector.holdingForChord, true, "Command-V then typing: the letter goes at once")
+    }
+    let flushed = chordRun(flush: true)
+    checkPanel(flushed.posted == 1 && flushed.discarded == 0, true, "chord then typing: the held keys go once the key window is confirmed")
+    let dropped = chordRun(flush: false)
+    checkPanel(dropped.posted == 0 && dropped.discarded > 0, true, "chord that opened a new window: the held keys are let go of, with the notice")
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -1683,6 +1725,11 @@ func axFocusedWindowBounds(_ pid: pid_t) -> CGRect? {
     AXValueGetValue(extent as! AXValue, .cgSize, &s)
     return CGRect(origin: p, size: s)
 }
+
+/// Command chords that edit or format and never open or switch a window: no hold after them
+/// (C, V, X, Z, A, L, F, B, I, U, G, E, by the Linux key numbers).
+let chordsWithoutWindows: Set<UInt32> = [46, 47, 45, 44, 30, 38, 33, 48, 23, 22, 34, 18]
+func chordMayChangeWindow(_ code: UInt32) -> Bool { !chordsWithoutWindows.contains(code) }
 
 /// Whether keys may go to the application now: it is in front, and the window keys go to (its
 /// focused window, by Accessibility) is the very window that is shown, by its place and size in
@@ -1780,7 +1827,27 @@ final class Injector {
     /// A key was not taken because the application was not in front (said once until one is).
     var onKeysDropped: (Bool) -> Void = { _ in }
     /// A key went down with Command held (a chord that may change windows).
-    var onCommandChord: () -> Void = {}
+    var onCommandChord: (UInt32) -> Void = { _ in }
+    /// After such a chord, keys and text are held (in order, at most 64) until the host has looked
+    /// again which window takes the keys: then they all go, or, only if that moved to a window
+    /// that is not shown, they are let go of with a notice. Releases of keys already sent always go.
+    private(set) var holdingForChord = false
+    private var held: [Data] = []
+    private var heldPresses: Set<UInt32> = []
+    var onHoldFull: () -> Void = {}
+    func beginHold() { holdingForChord = true }
+    func endHold(flush: Bool) {
+        holdingForChord = false
+        let events = held
+        held = []
+        heldPresses = []
+        if flush {
+            for event in events { handle(event) }
+        } else if !events.isEmpty {
+            counts["held_discarded", default: 0] += events.count
+            onKeysDropped(true)
+        }
+    }
     private var keysDroppedSaid = false
     /// What the injector looks at and where it posts; replaced by stand-ins in --self-test, so that
     /// the tests go through the same path as the input does.
@@ -1897,6 +1964,18 @@ final class Injector {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return count("unreadable") }
         lastInput = ProcessInfo.processInfo.systemUptime
+        if holdingForChord && (kind == "key" || kind == "text") {
+            let code = (object["code"] as? NSNumber)?.uint32Value ?? 0
+            let pressed = object["pressed"] as? Bool ?? true
+            // The release of a key that was sent before the chord's hold goes at once.
+            if !(kind == "key" && !pressed && keysDown.contains(code) && !heldPresses.contains(code)) {
+                if kind == "key" && pressed { heldPresses.insert(code) }
+                held.append(data)
+                count("held")
+                if held.count >= 64 { onHoldFull() }
+                return
+            }
+        }
         if !settings.inputDry && (lockedNow() || gateClosed()) {
             // Locked, or not on the console: nothing but the release of what is down here, in every
             // form (ADR 0017, "守ること" 3).
@@ -1961,7 +2040,7 @@ final class Injector {
         if modifierFlag(code) != nil { event.type = .flagsChanged }
         if pressed { log("{\"kind\":\"key_in\",\"t_ns\":\(nowNs())}") }
         postProcess(event, pid)
-        if pressed && modifierFlag(code) == nil && flags.contains(.maskCommand) { onCommandChord() }
+        if pressed && modifierFlag(code) == nil && flags.contains(.maskCommand) { onCommandChord(code) }
         count("key")
     }
 
@@ -2318,10 +2397,29 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                                      shownIsFront: front != nil && front == self.windowId)
                 }
                 self.injector.onFocus = { [weak self] in self?.raiseShownWindow() }
-                self.injector.onCommandChord = { [weak self] in
-                    guard let self, let pid = self.app?.processIdentifier else { return }
-                    self.lookout.invalidateFocused()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.lookout.refreshFocused(pid) }
+                self.injector.onCommandChord = { [weak self] code in
+                    // Editing chords pass straight on; others are held for at most 30 ms while the
+                    // window list (WindowServer, which answers at once) is looked at every 5 ms for
+                    // a new front window of the application. None: the keys go. A new one that is
+                    // not the shown window: they are let go of, with the notice.
+                    guard let self, let pid = self.app?.processIdentifier, chordMayChangeWindow(code), !self.injector.holdingForChord else { return }
+                    self.injector.beginHold()
+                    let shown = self.windowId
+                    var looks = 0
+                    func look() {
+                        guard self.injector.holdingForChord else { return }
+                        looks += 1
+                        let front = readWindowList(onScreenOnly: true, desktop: false).first { $0.pid == pid && $0.layer == 0 }?.id
+                        if let front, front != shown {
+                            self.lookout.invalidateFocused()
+                            self.lookout.refreshFocused(pid)
+                            return self.injector.endHold(flush: false)
+                        }
+                        if looks >= 6 { return self.injector.endHold(flush: true) }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.005) { look() }
+                    }
+                    self.injector.onHoldFull = { self.injector.endHold(flush: true) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.005) { look() }
                 }
                 self.injector.onResize = { [weak self] w, h in self?.resizeAsked(width: w, height: h) }
                 self.injector.onKeysDropped = { dropped in say(dropped ? "keys-dropped" : "keys-taken") }
@@ -3025,6 +3123,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var windowsAtOpen: Set<CGWindowID>?
     var askedNewWindow = false
     var makingVirtual = false
+    var virtualFailedAt: TimeInterval = -1000
     var movedFrom: [CGWindowID: CGRect] = [:]
 
     /// Looked at every second: while a device is shown the picture (and the Mac is not locked),
@@ -3034,12 +3133,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         guard let spec = settings.virtualDisplay, app != nil, transport != nil, windowId != nil else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let viewed = transport.viewers > 0 || settings.virtualNow
-        if viewed && !screenLocked() && virtualScreen == nil && !makingVirtual {
+        if viewed && !screenLocked() && virtualScreen == nil && !makingVirtual && now - virtualFailedAt > 30 {
             makingVirtual = true
             let screen = VirtualScreen(width: spec.width, height: spec.height, hertz: spec.hertz, slot: settings.virtualSlot)
             screen.make { frame in
                 self.makingVirtual = false
-                guard let frame else { return note("the virtual display could not be made: the window stays where it is") }
+                guard let frame else {
+                    // Tried again only after a while, not every second.
+                    self.virtualFailedAt = ProcessInfo.processInfo.systemUptime
+                    return note("the virtual display could not be made: the window stays where it is")
+                }
                 self.virtualScreen = screen
                 if frameLog.on { frameLog.write("{\"kind\":\"virtual\",\"t_ns\":\(nowNs()),\"state\":\"made\",\"points\":\"\(Int(frame.width))x\(Int(frame.height))\"}") }
                 say("virtual", [("state", "made"), ("points", "\(Int(frame.width))x\(Int(frame.height))")])
