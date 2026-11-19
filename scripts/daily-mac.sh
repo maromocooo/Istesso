@@ -171,7 +171,7 @@ HOST
 on_host() { # COMMANDS on standard input
     # The host is reached through the owner's open ssh login (its connection is shared); without
     # it, say so plainly.
-    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$host_name" true 2>/dev/null; then
+    if ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$host_name" true 2>/dev/null; then
         echo "Studio につながっていません（ssh studio のタブを開いてください）" >&2
         return 255
     fi
