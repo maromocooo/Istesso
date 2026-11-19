@@ -125,7 +125,9 @@ enum InputAction {
         /// The paired device: its name or the beginning of its id
         #[arg(long)]
         to: String,
-        /// The socket to listen on; one left by an earlier run is replaced
+        /// The socket to listen on; one left by an earlier run is replaced.
+        /// It has to be directly in Istesso's cache directory (`istesso id`
+        /// shows it)
         #[arg(long, value_name = "PATH")]
         socket: PathBuf,
         /// Reach the device at this address only, instead of at whichever
@@ -613,6 +615,12 @@ fn relay_input(
     use std::io::ErrorKind;
     use std::os::unix::net::UnixDatagram;
 
+    // Only in a place of Istesso's own, before anything else is done: the
+    // relay speaks for this device to another one, so whoever starts it does
+    // not choose where it listens.
+    let socket = &Paths::from_env()
+        .local_socket(socket)
+        .map_err(|e| e.to_string())?;
     let passing = match timings {
         Some(path) => Some(
             istesso_agent::PassLog::create(path)

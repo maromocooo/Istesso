@@ -225,11 +225,19 @@ unsafe fn text(text: *const c_char) -> Result<Option<String>> {
 }
 
 /// Where this device keeps its identity and its list of paired devices:
-/// below `config_dir`, or where `istesso` keeps them when none is given.
-fn paths(config_dir: Option<String>) -> Paths {
+/// where `istesso` keeps them. A program that links this library may hold
+/// the system's permissions (screen recording, accessibility), and whoever
+/// starts it chooses its arguments: only development builds (`dev-paths`)
+/// and tests take another directory.
+fn paths(config_dir: Option<String>) -> Result<Paths> {
     match config_dir {
-        Some(dir) => Paths::at(PathBuf::from(dir)),
-        None => Paths::from_env(),
+        Some(dir) if cfg!(any(test, feature = "dev-paths")) => Ok(Paths::at(PathBuf::from(dir))),
+        Some(_) => Err(Error::Refused(
+            "this build keeps its identity and its paired devices where istesso does; \
+             pass no directory"
+                .into(),
+        )),
+        None => Ok(Paths::from_env()),
     }
 }
 
@@ -254,7 +262,7 @@ fn listen(
     info: IstessoMediaStreamInfo,
     admit: Admit,
 ) -> Result<Host> {
-    let paths = paths(config_dir);
+    let paths = paths(config_dir)?;
     let bind = bind.ok_or_else(|| Error::Refused("no address to listen on was given".into()))?;
     let log = Arc::new(|line: String| eprintln!("istesso-media: {line}"));
     Host::listen_admitting(
@@ -300,7 +308,7 @@ fn connect(
     peer: Option<String>,
     within: Duration,
 ) -> Result<Viewer> {
-    let paths = paths(config_dir);
+    let paths = paths(config_dir)?;
     let addr = addr.ok_or_else(|| Error::Refused("no address to connect to was given".into()))?;
     let keys = LocalKeys::new(&identity(&paths)?)?;
     let peers = PeerStore::open(paths.peers())?;
@@ -719,10 +727,12 @@ pub unsafe extern "C" fn istesso_media_watch_open(
         let addr =
             addr.ok_or_else(|| Error::Refused("no address to connect to was given".into()))?;
         let addr = address(&addr)?;
+        // Refused at once rather than on every try.
+        paths(dir.clone())?;
         Ok(Lasting::new(
             Box::new(move |began_with, within| {
                 // Read anew for every connection: the pairing may have changed.
-                let paths = paths(dir.clone());
+                let paths = paths(dir.clone())?;
                 let keys = LocalKeys::new(&identity(&paths)?)?;
                 let peers = PeerStore::open(paths.peers())?;
                 // Later connections go to the device the first one reached; the first

@@ -116,8 +116,11 @@ typedef struct IstessoMediaWatchState {
 
 /*
  * Starts listening for paired devices on `bind` ("0.0.0.0:47803", "[::]:47803", an address of
- * one adapter). `config_dir` is where this device's identity and list of paired devices are;
- * NULL for where `istesso` keeps them. `info` is what viewers are told about the picture.
+ * one adapter). `config_dir` must be NULL: the identity and the list of paired devices are
+ * where `istesso` keeps them. Only a development build of the library (feature `dev-paths`)
+ * takes another directory there; any other build refuses it, because a program that holds the
+ * system's permissions must not be pointed at a list of paired devices by whoever starts it.
+ * The same holds for `config_dir` below. `info` is what viewers are told about the picture.
  * NULL on failure.
  */
 IstessoMediaHost *istesso_media_host_listen(const char *config_dir, const char *bind,

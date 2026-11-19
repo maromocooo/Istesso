@@ -198,7 +198,7 @@ def main():
     parser.add_argument(
         "--config-dir",
         metavar="DIR",
-        help="with --to-channel: where this device's identity and list of paired devices are (where `istesso` keeps them unless given)",
+        help="with --to-channel: where this device's identity and list of paired devices are (where `istesso` keeps them unless given). Only a library built with `--features dev-paths` takes it",
     )
     parser.add_argument("--log", required=True, metavar="FILE", help="the frame log to write; an existing file is not overwritten. `-` for none: when the pipeline only shows something and nothing is measured")
     parser.add_argument("--render-node", metavar="PATH", help="DRM render node for the compositor, for example /dev/dri/renderD129")

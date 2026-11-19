@@ -16,3 +16,16 @@ istesso-catalog.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mdns-sd.workspace = true
+
+[features]
+# Development builds only: take the configuration and cache directories from
+# `ISTESSO_CONFIG_DIR` and `ISTESSO_CACHE_DIR`, and let `istesso input relay`
+# listen anywhere. Never in a build that is given permissions or a real key:
+# a program of the same user could point it at a peers list of its own.
+dev-paths = []
+
+# The account's home and runtime directories, from the system rather than from
+# the environment. Not through the workspace table yet, as in
+# crates/istesso-media/Cargo.toml.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

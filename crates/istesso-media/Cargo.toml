@@ -29,3 +29,8 @@ thiserror.workspace = true
 # this becomes `libc.workspace = true`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+# Development builds only: the C interface takes a configuration directory
+# other than istesso's (`config_dir`). See crates/istesso-agent/Cargo.toml.
+dev-paths = ["istesso-agent/dev-paths"]
