@@ -165,7 +165,7 @@ do_pair_line() {
 
 do_open() {
     [ $# -ge 1 ] || { echo "usage: scripts/daily-mac.sh open APP [--display] [--for aura] [--size WxH] [--fps N] [--slot N]"; exit 2; }
-    local app=$1 display="" for_whom="" size=${SIZE:-1720x720} fps="" slot="" size_given=${SIZE:+1}
+    local app=$1 new_document="" display="" for_whom="" size=${SIZE:-1720x720} fps="" slot="" size_given=${SIZE:+1}
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -174,6 +174,7 @@ do_open() {
             --size) size=${2:-}; size_given=1; shift 2 ;;
             --fps) fps=${2:-}; shift 2 ;;
             --slot) slot=${2:-}; shift 2 ;;
+            --new-document) new_document=${2:-}; shift 2 ;;
             *) echo "error: unknown: $1"; exit 2 ;;
         esac
     done
@@ -193,6 +194,13 @@ do_open() {
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$app")"; fi
     # The whole display keeps its own shape unless a size was asked for.
     [ -n "$display" ] && [ -z "$size_given" ] && size_arg=""
+    # A new, empty document of the trial's own (EXT: its kind, e.g. txt), so that the application
+    # opens with it and not with a panel or one of the owner's documents.
+    local document_arg=""
+    if [ -n "$new_document" ]; then
+        [[ "$new_document" =~ ^[a-z0-9]+$ ]] || { echo "error: --new-document takes a file kind such as txt"; exit 2; }
+        document_arg=$new_document
+    fi
     local answer
     answer=$(on_host <<HOST
 NAME=$name; SLOT=$slot; BASE_PIC=$base_pic; BASE_IN=$base_in
@@ -231,7 +239,13 @@ else
     fi
     [ -p "\$run/control" ] || mkfifo "\$run/control"
     : > "\$run/host.log"; : > "\$run/host.err"; rm -f "\$run/host.number"
-    set -- $target_args --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
+    document=""
+    if [ -n "$document_arg" ]; then
+        mkdir -p "\$D/documents"
+        document=\$D/documents/\$NAME-\$(date +%Y%m%d-%H%M%S).$document_arg
+        : > "\$document"
+    fi
+    set -- $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
         $size_arg --fps $fps --click-form ${DAILY_CLICK_FORM:-1} --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &

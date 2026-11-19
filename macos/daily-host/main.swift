@@ -60,6 +60,7 @@ struct Settings {
     var fitWindow = true
     var clickForm = 1
     var pidFile: String?
+    var document: String?
     var signal = NSHomeDirectory() + "/.local/state/istesso/measuring"
 }
 
@@ -99,6 +100,7 @@ func readSettings() -> Settings {
         case "--log": let v = value(); s.log = v == "-" ? nil : v
         case "--display": s.target = .display
         case "--app": s.target = .app(value())
+        case "--document": s.document = value()
         case "--size":
             let parts = value().split(separator: "x").compactMap { Int($0) }
             guard parts.count == 2, parts[0] >= 64, parts[1] >= 64, parts[0] <= 8192, parts[1] <= 8192 else { usage() }
@@ -770,6 +772,11 @@ func applicationURL(_ name: String) -> URL? {
 
 // MARK: - Input
 
+/// The system's process that shows an application's open and save panel.
+func isPanelService(_ pid: pid_t) -> Bool {
+    NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.appkit.xpc.openAndSavePanelService"
+}
+
 /// What to do with one pointer event of the session form (form 4).
 enum SessionStep: Equatable {
     enum Remember: Equatable { case press(CGRect), release, nothing }
@@ -879,6 +886,10 @@ final class Injector {
     /// 1, 2, 3: to the window's process only (m4-plan.md 5c); 4: through the session, the Mac's
     /// own pointer moves with it (for comparing; never while the screen is locked).
     var clickForm = settings.clickForm
+    /// The range input may reach (the owner's rule): whether a point whose top window belongs to
+    /// this process is in it, and whether keys may be sent now. Set by the host for its mode.
+    var inRange: (CGPoint, pid_t?) -> Bool = { _, _ in false }
+    var keysAllowed: () -> Bool = { false }
 
     /// The process of the window that is on top at a point of the screen, whatever its layer.
     private func topWindowPid(at point: CGPoint) -> pid_t? {
@@ -912,7 +923,7 @@ final class Injector {
             return count("dropped_locked_session_tap")
         }
         let button = UInt32(event.getIntegerValueField(.mouseEventButtonNumber))
-        let onTarget = topWindowPid(at: event.location) == pid
+        let onTarget = inRange(event.location, topWindowPid(at: event.location))
         switch sessionStep(type: event.type, at: event.location, onTarget: onTarget,
                            pressWindow: sessionPresses[button], window: window.bounds) {
         case let .post(place, remember):
@@ -998,6 +1009,8 @@ final class Injector {
 
     private func key(_ code: UInt32, _ pressed: Bool) {
         guard let pid = target() else { return count("dropped_no_target") }
+        // A release is always let through for a key that went down, so that none stays down.
+        guard keysAllowed() || (!pressed && keysDown.contains(code)) else { return count("dropped_not_in_front") }
         guard let virtual = virtualKeys[code] else { return count("unknown_key") }
         if let flag = modifierFlag(code) {
             if pressed { flags.insert(flag) } else if !otherHeld(flag, besides: code) { flags.remove(flag) }
@@ -1112,6 +1125,7 @@ final class Injector {
             return count("text_dropped")
         }
         guard let pid = target() else { return count("dropped_no_target") }
+        guard keysAllowed() else { return count("dropped_not_in_front") }
         // A keyboard event carries at most 20 UTF-16 units; whole characters only in each.
         var chunk: [UniChar] = []
         func post() {
@@ -1221,6 +1235,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             guard listen(width: w, height: h) else { return }
             injector.target = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
             injector.windowAt = { _ in nil }  // nothing to point at: the input is only counted
+            injector.keysAllowed = { true }
             openPicture { why in self.started(why) }
             return
         }
@@ -1247,6 +1262,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.injector.scale = 1 / k
                 // Keys go to the application in front; the pointer to the window under it, in its process.
                 self.injector.target = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+                // The whole display is the range: any application.
+                self.injector.inRange = { _, _ in true }
+                self.injector.keysAllowed = { true }
                 self.injector.windowAt = { [weak self] point in self?.topWindow(at: point) }
                 self.openPicture { why in self.started(why) }
             }
@@ -1281,7 +1299,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
-        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { running, error in
+        let opened: (NSRunningApplication?, Error?) -> Void = { running, error in
             DispatchQueue.main.async {
                 guard let running else {
                     say("refused", [("word", "start"), ("reason", "the application did not open: \(error?.localizedDescription ?? "unknown")")])
@@ -1290,10 +1308,31 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.app = running
                 say("opened", [("pid", Int(running.processIdentifier)), ("bundle", running.bundleIdentifier ?? "")])
                 self.injector.target = { [weak self] in self?.app?.processIdentifier }
+                // Every window of the application is the range (its menus, pop-ups, sheets, other
+                // windows); the open and save panel, shown by a process of the system's own for it,
+                // while the application is in front. Keys only while it is in front.
+                self.injector.inRange = { [weak self] _, top in
+                    guard let self, let pid = self.app?.processIdentifier, let top else { return false }
+                    return top == pid || (self.appInFront() && isPanelService(top))
+                }
+                self.injector.keysAllowed = { [weak self] in self?.appInFront() ?? false }
                 self.injector.windowAt = { [weak self] point in self?.appWindow(at: point) }
                 self.watchApp()
             }
         }
+        if let document = settings.document {
+            // With a document of the trial's own, so that the application opens no panel of its
+            // own at the start and none of the owner's documents.
+            let file = URL(fileURLWithPath: (document as NSString).expandingTildeInPath)
+            NSWorkspace.shared.open([file], withApplicationAt: url, configuration: configuration, completionHandler: opened)
+        } else {
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration, completionHandler: opened)
+        }
+    }
+
+    func appInFront() -> Bool {
+        guard let pid = app?.processIdentifier, let front = NSWorkspace.shared.frontmostApplication else { return false }
+        return front.processIdentifier == pid
     }
 
     /// The window of the application under the point (its menus and sheets are windows of its own
