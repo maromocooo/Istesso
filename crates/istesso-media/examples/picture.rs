@@ -14,13 +14,16 @@
 //!     says what the cursor is: a made-up image (a magenta triangle of 64
 //!     pixels with a white edge, its tip the hot spot), hidden, or one
 //!     without an image.
-//! picture stay ADDR [--config DIR] [--peer NAME] [--seconds S]
+//! picture stay ADDR [--config DIR] [--peer NAME] [--seconds S] [--every-second]
 //!     A viewer that lasts: it takes the host's frames as `watch` does, and
 //!     when the connection is cut it connects again. Says each thing that
 //!     happens to the connection as it happens (connected, cut, the first
 //!     key frame after a cut and how long that took, over and why), and
 //!     ends when the host said that it is over or after S seconds (20
-//!     unless given).
+//!     unless given). With --every-second it also says, once a second, how
+//!     many frames came, how many bits, and how long after the host's
+//!     encoder had finished them they were whole here: meaningful only when
+//!     the host runs on the same machine (one clock).
 //! picture between LISTEN TO [--silent-after S] [--close-after S]
 //!     Stands between a viewer and a host: what connects to LISTEN is
 //!     passed on to TO, both ways. For trying what a viewer does when its
@@ -323,6 +326,13 @@ fn stay(mut args: Args) -> Result<(), Failure> {
     let paths = args.paths();
     let peer = args.option("--peer");
     let seconds: f64 = args.option("--seconds").map_or(Ok(20.0), |s| s.parse())?;
+    let every_second = match args.0.iter().position(|arg| arg == "--every-second") {
+        Some(at) => {
+            args.0.remove(at);
+            true
+        }
+        None => false,
+    };
     let addr = args
         .0
         .first()
@@ -356,14 +366,20 @@ fn stay(mut args: Args) -> Result<(), Failure> {
     let began = Instant::now();
     let at = |began: Instant| format!("{:7.2} s", began.elapsed().as_secs_f64());
     let (mut frames, mut since_cut, mut waiting_for_key) = (0u64, None::<Instant>, false);
+    let mut second = Second::new();
     let over = loop {
         if began.elapsed().as_secs_f64() >= seconds {
             break None;
+        }
+        if every_second && second.began.elapsed() >= Duration::from_secs(1) {
+            println!("{}  this second: {}", at(began), second.said());
+            second = Second::new();
         }
         match viewer.next(Duration::from_millis(100)) {
             Ok(None) => {}
             Ok(Some(Step::Event(Event::Frame(frame)))) => {
                 frames += 1;
+                second.add(&frame);
                 if waiting_for_key && frame.key_frame {
                     waiting_for_key = false;
                     match since_cut.take() {
@@ -405,6 +421,49 @@ fn stay(mut args: Args) -> Result<(), Failure> {
         ),
     }
     Ok(())
+}
+
+/// What came in one second, for `stay --every-second`.
+struct Second {
+    began: Instant,
+    frames: u64,
+    keys: u64,
+    bytes: u64,
+    /// For each frame, from the host's encoder having finished it to its being whole here.
+    lags: Vec<u64>,
+}
+
+impl Second {
+    fn new() -> Self {
+        Second {
+            began: Instant::now(),
+            frames: 0,
+            keys: 0,
+            bytes: 0,
+            lags: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, frame: &istesso_media::Frame<'_>) {
+        self.frames += 1;
+        self.keys += u64::from(frame.key_frame);
+        self.bytes += frame.data.len() as u64;
+        self.lags
+            .push(frame.whole_ns.saturating_sub(frame.encoded_ns));
+    }
+
+    fn said(&mut self) -> String {
+        self.lags.sort_unstable();
+        let took = self.began.elapsed().as_secs_f64();
+        format!(
+            "{} frames, {} key frames, {:.2} Mbit/s; from the encoder to here: median {:.1} ms, longest {:.1} ms",
+            self.frames,
+            self.keys,
+            self.bytes as f64 * 8.0 / took / 1e6,
+            percentile(&self.lags, 50),
+            percentile(&self.lags, 100)
+        )
+    }
 }
 
 /// What `between` does with the connections there are.
