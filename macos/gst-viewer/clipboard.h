@@ -5,6 +5,29 @@
 
 #import <AppKit/AppKit.h>
 
+#include <stddef.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+// The address of this window's own socket at PATH, and the length to bind it with: the path and
+// its terminating NUL, as Rust's standard library binds and reads such an address. macOS hands the
+// sender's address to the receiver at the length it was bound with, and the relay reads the path
+// as all of it but the last byte: bound with the whole structure, the path came with NULs after
+// it; bound with SUN_LEN (without the NUL), it lost its last character. 0 for a path too long.
+static inline socklen_t clipboard_address(struct sockaddr_un *own, const char *path) {
+    memset(own, 0, sizeof *own);
+    own->sun_family = AF_UNIX;
+    size_t length = strlen(path);
+    if (length + 1 > sizeof own->sun_path) {
+        return 0;
+    }
+    memcpy(own->sun_path, path, length + 1);
+    socklen_t whole = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + length + 1);
+    own->sun_len = (unsigned char)whole;
+    return whole;
+}
+
 // The most bytes (UTF-8) of text copied or pasted: 64 KiB.
 #define CLIPBOARD_MOST_BYTES 65536
 // How long an answer is waited for, in seconds.

@@ -2181,13 +2181,14 @@ mod tests {
         );
     }
 
-    /// The trial viewer bound its socket with the whole `sockaddr_un` as the length; macOS then
-    /// gives the address back at that length, with NULs after the path. Such a window is found.
+    /// A window's socket bound by hand, as the trial viewer binds it: `length` is the address's
+    /// length given to `bind` (macOS hands the address back to the receiver at that length).
     #[cfg(target_os = "macos")]
-    #[test]
-    fn a_window_that_bound_with_the_whole_address_is_answered() {
+    fn window_bound_at(
+        name: &std::path::Path,
+        length: impl Fn(usize) -> u32,
+    ) -> std::os::unix::net::UnixDatagram {
         use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixDatagram;
         #[repr(C)]
         struct Address {
             len: u8,
@@ -2197,20 +2198,33 @@ mod tests {
         extern "C" {
             fn bind(socket: i32, address: *const Address, length: u32) -> i32;
         }
-        let dir = std::env::temp_dir().join(format!("istesso-whole-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let relay = UnixDatagram::bind(dir.join("r.sock")).unwrap();
-        let window = UnixDatagram::unbound().unwrap();
-        let name = dir.join("w.sock");
+        let window = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        let bytes = name.to_str().unwrap().as_bytes();
         let mut address = Address {
             len: 0,
             family: 1, // AF_UNIX
             path: [0; 104],
         };
-        let bytes = name.to_str().unwrap().as_bytes();
         address.path[..bytes.len()].copy_from_slice(bytes);
-        let whole = std::mem::size_of::<Address>() as u32;
-        assert_eq!(unsafe { bind(window.as_raw_fd(), &address, whole) }, 0);
+        let length = length(bytes.len());
+        address.len = length as u8;
+        assert_eq!(unsafe { bind(window.as_raw_fd(), &address, length) }, 0);
+        window
+    }
+
+    /// Whether the relay notes a request from a window bound with `length`, and where it would
+    /// answer.
+    #[cfg(target_os = "macos")]
+    fn noted_from(
+        tag: &str,
+        length: impl Fn(usize) -> u32,
+    ) -> (bool, Option<std::path::PathBuf>, std::path::PathBuf) {
+        use std::os::unix::net::UnixDatagram;
+        let dir = std::env::temp_dir().join(format!("istesso-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let relay = UnixDatagram::bind(dir.join("r.sock")).unwrap();
+        let name = dir.join("w.sock");
+        let window = window_bound_at(&name, length);
         let nonce = "0123456789abcdef0123456789abcdef";
         let request = format!(r#"{{"kind":"paste","id":7,"nonce":"{nonce}"}}"#);
         window
@@ -2219,9 +2233,39 @@ mod tests {
         let mut buffer = [0u8; 256];
         let (length, from) = relay.recv_from(&mut buffer).unwrap();
         let mut askers = Askers::default();
-        assert!(askers.note(7, &buffer[..length], &from));
-        assert_eq!(askers.answer_to(7), Some((nonce.to_string(), name)));
+        let noted = askers.note(7, &buffer[..length], &from);
+        let to = askers.answer_to(7).map(|(_, to)| to);
         let _ = std::fs::remove_dir_all(&dir);
+        (noted, to, name)
+    }
+
+    /// The path and its NUL (as the trial viewer binds since 2026-11-19, and as Rust binds).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_bound_with_its_path_and_nul_is_answered() {
+        let (noted, to, name) = noted_from("nul", |path| 2 + path as u32 + 1);
+        assert!(noted);
+        assert_eq!(to, Some(name));
+    }
+
+    /// The whole `sockaddr_un` (the viewer before 2026-11-19): the path comes with NULs after
+    /// it, which the relay leaves out.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_that_bound_with_the_whole_address_is_answered() {
+        let (noted, to, name) = noted_from("whole", |_| 106);
+        assert!(noted);
+        assert_eq!(to, Some(name));
+    }
+
+    /// SUN_LEN, without the NUL: the standard library reads the path as all but the last byte,
+    /// so the relay cannot find it and answers nothing. The viewer must not bind so.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_bound_without_its_nul_is_not_found() {
+        let (noted, to, _) = noted_from("sunlen", |path| 2 + path as u32);
+        assert!(!noted);
+        assert_eq!(to, None);
     }
 
     #[cfg(unix)]

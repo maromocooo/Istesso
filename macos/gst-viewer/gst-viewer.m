@@ -1796,16 +1796,17 @@ static BOOL clipboard_start(void) {
     if (mkdtemp(clipboard_folder) == NULL) {
         return NO;
     }
-    struct sockaddr_un own = {.sun_family = AF_UNIX};
-    if ((size_t)snprintf(own.sun_path, sizeof own.sun_path, "%s/w.sock", clipboard_folder) >= sizeof own.sun_path) {
+    struct sockaddr_un own;
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/w.sock", clipboard_folder);
+    // Bound at the path's length with its NUL (clipboard.h): the relay must find this path as a
+    // file (2026-11-19, the owner's first copy and paste went nowhere).
+    socklen_t length = clipboard_address(&own, path);
+    if (length == 0) {
         rmdir(clipboard_folder);
         return NO;
     }
-    // The address's length is the path's own (SUN_LEN), not the whole structure's: macOS hands
-    // the address back to the receiver at the length it was bound with, and the relay could not
-    // find a path with NULs after it as a file (2026-11-19, the owner's first copy and paste).
-    own.sun_len = (unsigned char)SUN_LEN(&own);
-    if (bind(input_socket, (const struct sockaddr *)&own, (socklen_t)SUN_LEN(&own)) != 0) {
+    if (bind(input_socket, (const struct sockaddr *)&own, length) != 0) {
         rmdir(clipboard_folder);
         return NO;
     }

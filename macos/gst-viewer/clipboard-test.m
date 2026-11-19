@@ -33,6 +33,19 @@ int main(void) {
         CHECK(clipboard_key(8, @"c", 0) == 0);
         CHECK(clipboard_key(0, @"a", command) == 0);
 
+        // The window's socket address: the path and its NUL, nothing after (the relay reads all
+        // but the last byte as the path).
+        struct sockaddr_un own;
+        const char *at = "/var/folders/ab/cd/T/istesso-viewer-abcdef/w.sock";
+        socklen_t length = clipboard_address(&own, at);
+        CHECK(length == offsetof(struct sockaddr_un, sun_path) + strlen(at) + 1);
+        CHECK(own.sun_len == length && own.sun_family == AF_UNIX);
+        CHECK(strcmp(own.sun_path, at) == 0 && own.sun_path[strlen(at)] == 0);
+        char too_long[200];
+        memset(too_long, 'a', sizeof too_long - 1);
+        too_long[sizeof too_long - 1] = 0;
+        CHECK(clipboard_address(&own, too_long) == 0);
+
         // In a password field of the host (state 2) a copy or a cut is refused here; a paste is
         // not, and nothing is refused in another field or without one.
         CHECK(clipboard_refused_here('c', 2));
