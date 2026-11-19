@@ -13,6 +13,8 @@
 #                                     `open` starts the windows through it (the first start asks
 #                                     whether it may use the local network); one that is there
 #                                     already is moved aside (no window of it may be open)
+#   scripts/daily.sh shortcuts build|install|remove
+#                                     manage the trial's Spotlight, Alfred and Dock shortcuts
 #   scripts/daily.sh                  what is open, and how to open, close, list and stop (= `start`)
 #   scripts/daily.sh apps             the applications that can be opened
 #   scripts/daily.sh open NAME [--host ubuntu|mac] [--document PATH] [--min-qp N] [--for aura [--size WxH]]
@@ -600,11 +602,9 @@ do_bundle() {
     fi
     refuse_when_busy
     # The certificate's name comes from outside and is never written into the repository or printed.
-    local identity=-
-    if [ -f "$HOME/.config/istesso/sign.env" ]; then
-        identity=$(set +u; . "$HOME/.config/istesso/sign.env" >/dev/null 2>&1; printf '%s' "${ISTESSO_SIGN_IDENTITY:-}")
-        [ -n "$identity" ] || identity=-
-    fi
+    . "$repo/scripts/daily-sign.sh"
+    local identity
+    identity=$(daily_sign_identity)
     mkdir -p "$state" "$bundle_place"
     local work="$state/bundle-build"
     mkdir -p "$work"
@@ -630,13 +630,7 @@ do_bundle() {
 PLIST
     # No hardened runtime: the program loads GStreamer's libraries, which are not signed by Apple or
     # by this certificate.
-    codesign --force --sign "$identity" --identifier "$bundle_id" "$next" > "$work/codesign.log" 2>&1 ||
-        { echo "error: signing failed (the reason is in $work/codesign.log, which may name the certificate)"; exit 1; }
-    codesign --verify --strict "$next" 2>/dev/null || { echo "error: the signature does not hold"; exit 1; }
-    local signed
-    signed=$(codesign -dvv "$next" 2>&1)
-    echo "$signed" | grep -q "^Identifier=$bundle_id\$" || { echo "error: the signature's identifier is not the bundle's"; exit 1; }
-    echo "$signed" | grep -q "^Info.plist entries=" || { echo "error: Info.plist is not inside the seal"; exit 1; }
+    daily_sign_bundle "$next" "$bundle_id" "$identity" || exit 1
     uuid() { dwarfdump --uuid "$1" 2>/dev/null | awk '{print $2}' | head -1; }
     [ "$(uuid "$next/Contents/MacOS/$bundle_name")" != "$(uuid "$viewer")" ] ||
         { echo "error: the bundle's program shares its build UUID with $viewer"; exit 1; }
@@ -1549,6 +1543,15 @@ do_start() {
     echo
     do_list
 }
+
+if [ "${1:-}" = shortcuts ]; then
+    case "${2:-}:$#" in
+    build:2 | install:2 | remove:2) ;;
+    *) echo "usage: scripts/daily.sh shortcuts build|install|remove"; exit 2 ;;
+    esac
+    refuse_when_busy
+    exec python3 "$repo/macos/daily-shortcuts/shortcuts.py" "$2" "$host_name" "$(do_apps)"
+fi
 
 mkdir -p "$state"
 case "${1:-start}" in

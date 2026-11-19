@@ -275,6 +275,27 @@ scripts/daily.sh note "気づいたこと"
 - Mac の窓の Dock のタイルは、いまは窓ごとに 1 つです（窓 2 枚の形）。ランチャーができたら、`DAILY_DOCK_TILE=none` で、タイルをランチャーの 1 つだけにします。
 - 持ち主の Mac に窓が初めて出るときは、まとめ役が、先に知らせます。
 
+## Spotlight、Alfred、Dock から開く
+
+試用版のチェックアウトで、次を順に実行します。**新しいアプリを登録すると、この Mac の LAN 接続が一時的に切れます。** 計測が走っていないときに登録してください。
+
+```sh
+scripts/daily.sh shortcuts build
+scripts/daily.sh shortcuts install
+```
+
+`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ設定で署名します。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。Ubuntu のアイコンは、このときだけ `ISTESSO_HOST` のホストから読みます。Ubuntu のアイコンを取得できないときと、Mac ホスト用の近道には、標準のアイコンを使います。
+
+Spotlight か Alfred で `Blender (Ubuntu)`、`Firefox (Ubuntu)`、`Text Editor (Ubuntu)`、`Chrome (Ubuntu)` を検索して開きます。Dock に置くには、Finder で使いたい近道を Dock にドラッグします。
+
+近道は受付役に URL を渡すだけです。たとえば Text Editor の近道は `istesso-dev-open://open/editor?host=ubuntu` を開きます。URL に `&for=aura` を足すと、AURA に開きます。受付役が試用版の `daily.sh open` を呼び、中継が LAN に接続します。初回に「ローカルネットワーク」の許可を尋ねられたら、`Istesso Dev Open` に許可してください。近道ごとの許可は要りません。ビューアーの許可はこれまでどおりです。[許可をまとめた理由](adr/trial-daily-shortcuts.md)。
+
+Mac ホスト用の近道は `TextEdit (Studio)` から始めます。`macos/daily-shortcuts/mac-apps.txt` にアプリ名を 1 行ずつ書き、作成と登録をやり直すと一覧が替わります。受付役は、この一覧のアプリを開くときだけ `DAILY_OWNER=1` と `DAILY_OPEN_HANDLER=1` を付けて `daily.sh` を呼びます。Mac ホスト用のスクリプトの場所は `daily.sh` が決めます。
+
+近道は作成時のチェックアウトを使います。場所を移したときも作成と登録をやり直してください。起動には `daily.sh open <アプリ名> --host ubuntu|mac` に対応した試用版が要ります。開けなかったときは受付役が知らせます。
+
+外すときは、先に近道を Dock から外し、`scripts/daily.sh shortcuts remove` を実行します。登録時に名前を記録した近道と受付役だけを消します。
+
 ## 持ち主が自分で開け閉めするとき（毎日）
 
 持ち主の求め（2026-11-18）：エージェントに頼まずに、毎日、自分で開け閉めできること。
