@@ -443,15 +443,19 @@ fn nothing_typed_or_printed_is_written_down() {
         project: Some("/".into()),
         ..request(80, 24)
     });
-    terminal.type_in("echo typed-$((40+2)); exit\n");
-    assert!(terminal.shows("typed-42"));
+    // Letters that no number, size or time in a log line can contain: the
+    // typed line holds them split by quotes, what the shell prints holds
+    // them whole.
+    terminal.type_in("echo qzx''wvj-typed; exit\n");
+    assert!(terminal.shows("qzxwvj-typed"));
     assert_eq!(terminal.ended(), Some(ShellEnd::Code(0)));
     pair.over();
     let log = pair.log();
     assert_eq!(log.len(), 2, "{log:?}");
     for line in log {
+        assert!(!line.contains("qzx"), "{line}");
+        assert!(!line.contains("wvj"), "{line}");
         assert!(!line.contains("typed"), "{line}");
-        assert!(!line.contains("42"), "{line}");
         assert!(!line.contains("echo"), "{line}");
     }
 }
