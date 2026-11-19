@@ -2394,7 +2394,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     // The shown window must also be the application's front window in the window list (a
                     // window opened at exactly the same place does not pass for it).
                     let pid = self.app?.processIdentifier
-                    let front = windowList().first { $0.pid == pid && $0.layer == 0 && $0.onScreen }?.id
+                    let front = windowList().first { $0.pid == pid && $0.layer == 0 && $0.onScreen && $0.bounds.width > 40 && $0.bounds.height > 40 }?.id
                     return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.windowBounds,
                                      shownIsFront: front != nil && front == self.windowId)
                 }
@@ -2411,7 +2411,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     func look() {
                         guard self.injector.holdingForChord else { return }
                         looks += 1
-                        let front = readWindowList(onScreenOnly: true, desktop: false).first { $0.pid == pid && $0.layer == 0 }?.id
+                        let front = readWindowList(onScreenOnly: true, desktop: false).first { $0.pid == pid && $0.layer == 0 && $0.bounds.width > 40 && $0.bounds.height > 40 }?.id
                         if let front, front != shown {
                             self.lookout.invalidateFocused()
                             self.lookout.refreshFocused(pid)
