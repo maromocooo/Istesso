@@ -139,6 +139,21 @@ stop_written_down() {
     for i in $(seq 1 30); do still_runs "$1" || return 0; sleep 0.1; done
 }
 signal_busy() { [ "$(cut -d' ' -f1 ~/.local/state/istesso/measuring 2>/dev/null)" = busy ]; }
+prompt_owners() {
+    local LC_ALL=C owner count=0
+    local label='[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?'
+    local bundle_id="^$label([.]$label)+$"
+    # Bash variables cannot hold NUL. Map it to an invalid character before read.
+    while IFS= read -r owner || [ -n "$owner" ]; do
+        case "$owner" in ''|'#'*) continue ;; esac
+        if [[ $count -ge 16 || ${#owner} -gt 128 || ! $owner =~ $bundle_id ]]; then
+            echo "skipped a line in daily-mac-system-prompts.txt: not a bundle id" >&2
+            continue
+        fi
+        printf '%s\n' "$owner"
+        count=$((count + 1))
+    done < <(LC_ALL=C tr '\000' '/' < "$1")
+}
 # A word for the host program of run $1; never waits more than two seconds.
 tell() {
     local run=$D/run/$1 writer i
@@ -307,11 +322,9 @@ else
     prompt_file="\$HOME/.config/istesso/daily-mac-system-prompts.txt"
     if [ -e "\$prompt_file" ]; then
         [ -f "\$prompt_file" ] && [ -r "\$prompt_file" ] || { echo "fail cannot read the system prompt owner list"; exit 0; }
-        while read -r owner || [ -n "\$owner" ]; do
-            case "\$owner" in ''|'#'*) continue ;; esac
-            [ "\$((\$# / 2))" -lt 16 ] && [ "\${#owner}" -le 128 ] || { echo "fail system prompt owner list exceeds its limits"; exit 0; }
+        while IFS= read -r owner; do
             set -- "\$@" --system-prompt-owner "\$owner"
-        done < "\$prompt_file"
+        done < <(prompt_owners "\$prompt_file")
     fi
     # An agent left from an earlier run of this name may listen on another slot's port: never kept.
     stop_written_down "\$run/agent.pid"

@@ -936,6 +936,40 @@ struct SystemPromptState {
     }
 }
 
+final class SystemPromptMonitor {
+    private let queue = DispatchQueue(label: "istesso.daily-host.system-prompt", qos: .utility)
+    private let sample: () -> Bool?
+    private var state = SystemPromptState() // Accessed only on the timer's queue.
+    private var timer: DispatchSourceTimer? // Started and stopped on main.
+
+    init(sample: @escaping () -> Bool?) { self.sample = sample }
+
+    deinit { timer?.cancel() }
+
+    func start() {
+        guard timer == nil else { return }
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now() + 1)
+        source.setEventHandler { [weak self] in
+            guard let self, !source.isCancelled else { return }
+            let present = self.sample()
+            // A measurement can start while WindowServer is answering.
+            guard !source.isCancelled else { return }
+            if let changed = self.state.observe(present) {
+                say("system-prompt", [("present", changed)])
+            }
+            source.schedule(deadline: .now() + 1)
+        }
+        timer = source
+        source.resume()
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+}
+
 func readWindowList(onScreenOnly: Bool, desktop: Bool) -> [WindowInfo] {
     var options: CGWindowListOption = onScreenOnly ? [.optionOnScreenOnly] : [.optionAll]
     if !desktop { options.insert(.excludeDesktopElements) }
@@ -1500,6 +1534,15 @@ func selfTest() -> Never {
         let expected: [Bool?] = [nil, nil, nil, nil, nil, nil, true, nil, nil, nil, nil, false, nil]
         checkPanel(samples.map { state.observe($0) } == expected, true,
                    "prompt: two consecutive reads in either direction, one report per change")
+        let sampled = DispatchSemaphore(value: 0)
+        let monitor = SystemPromptMonitor {
+            precondition(!Thread.isMainThread)
+            sampled.signal()
+            return nil
+        }
+        monitor.start()
+        checkPanel(sampled.wait(timeout: .now() + 3) == .success, true, "prompt: timer samples off the main thread")
+        monitor.stop()
         let limit = owner + String(repeating: "a", count: 128 - owner.utf8.count)
         checkPanel(validSystemPromptOwner(limit) && !validSystemPromptOwner(limit + "a")
                    && !validSystemPromptOwner(owner + "\n") && !validSystemPromptOwner("--flag"),
@@ -2411,6 +2454,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var offered = true
     var inputSocket: Int32 = -1
     var timers: [DispatchSourceTimer] = []
+    var promptMonitor: SystemPromptMonitor?
     var mayCapture = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2434,7 +2478,6 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         watchdog.schedule(deadline: .now() + 1, repeating: .seconds(1))
         watchdog.setEventHandler { [weak self] in
             self?.keepAwakeAndTellLock()
-            self?.checkSystemPrompt()
             self?.manageVirtualDisplay()
             self?.injector.releaseStaleModifiers(olderThan: 8)
             guard let self, self.injector.holding,
@@ -2462,6 +2505,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
 
     func quit(_ code: Int32) {
+        promptMonitor?.stop()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(code) }
     }
 
@@ -3325,6 +3369,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// shown anything and no input is passed; when it is free again the picture comes back. The
     /// file is only read.
     func watchSignal() {
+        let owners = settings.promptOwners
+        if !settings.generated, !owners.isEmpty {
+            promptMonitor = SystemPromptMonitor {
+                let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [NSDictionary]
+                return windows.map {
+                    systemPromptCount($0, owners: owners) { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier } > 0
+                }
+            }
+        }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: .seconds(2))
         timer.setEventHandler { [weak self] in
@@ -3332,6 +3385,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             let first = (try? String(contentsOfFile: settings.signal, encoding: .utf8))?
                 .split(whereSeparator: { $0 == " " || $0 == "\n" }).first.map(String.init)
             let busy = first == "busy"
+            if busy {
+                self.promptMonitor?.stop()
+            } else {
+                self.promptMonitor?.start()
+            }
             if busy && !self.heldForSignal {
                 self.heldForSignal = true
                 note("a latency measurement runs on this Mac: the picture stops until it is over")
@@ -3434,20 +3492,6 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var awake: IOPMAssertionID = 0
     var lastViewed: TimeInterval = 0
     var wasLocked: Bool?
-    var promptState = SystemPromptState()
-    var nextPromptRead: TimeInterval = 0
-
-    func checkSystemPrompt() {
-        guard !settings.generated, !settings.promptOwners.isEmpty, !heldForSignal else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        guard now >= nextPromptRead else { return }
-        nextPromptRead = now + 1
-        let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [NSDictionary]
-        let present = windows.map {
-            systemPromptCount($0, owners: settings.promptOwners) { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier } > 0
-        }
-        if let changed = promptState.observe(present) { say("system-prompt", [("present", changed)]) }
-    }
 
     var pausedForLock = false
     func keepAwakeAndTellLock() {
