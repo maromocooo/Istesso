@@ -72,7 +72,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                     (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
             boolean wasPassword = fieldState == 2;
             boolean toPassword = state == 2 && !wasPassword;
-            if (fieldSerial >= 0 && serial != fieldSerial) {
+            boolean wasActive = fieldActive();
+            boolean otherSerial = fieldSerial >= 0 && serial != fieldSerial;
+            if (otherSerial) {
                 manualOff = false; // another field: the keyboard follows the host again
             }
             // Another field has the keyboard over there, or the field became a password field:
@@ -83,7 +85,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             }
             fieldState = state;
             fieldSerial = serial;
-            followField();
+            boolean becameActive = fieldActive() && (!wasActive || otherSerial);
             // A password field: the input method is told so (no composing, nothing learnt).
             if ((state == 2) != wasPassword) {
                 view.setPassword(state == 2);
@@ -101,6 +103,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 lastSent = null;
             }
             fieldDropped = dropped;
+            // After the password block: a password field's input is restarted before the keyboard
+            // is asked for, never the other way round.
+            followField(becameActive);
         });
     }
 
@@ -399,6 +404,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         @Override
         public void run() {
             if (resumed && autoTyping && fieldState == 3 && view.typing()) {
+                // What is being composed is taken as it stands, never dropped without a word.
+                if (view.composing()) {
+                    view.commitComposing((android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE));
+                }
                 autoTyping = false;
                 setTyping(false);
             }
@@ -415,21 +424,26 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
      * keyboard goes away (a commit or a brief change does not hide it). Nothing known (state 0)
      * changes nothing. Turned off by hand, it stays off until another field has the keyboard.
      */
-    private void followField() {
-        if (!resumed || !hostTextKnown || !hostTakesText) {
-            return;
+    private void followField(boolean becameActive) {
+        if (fieldState != 3) {
+            status.removeCallbacks(fieldGone);
         }
-        status.removeCallbacks(fieldGone);
-        if (fieldActive()) {
-            if (!view.typing() && !manualOff) {
+        switch (FieldFollow.decide(fieldState, becameActive, view.typing(), manualOff, autoTyping,
+                hostTextKnown && hostTakesText, resumed)) {
+            case SHOW:
                 autoTyping = true;
                 setTyping(true);
-            } else if (view.typing()) {
+                break;
+            case RESHOW:
                 status.removeCallbacks(keepKeyboard);
                 status.post(keepKeyboard);
-            }
-        } else if (fieldState == 3 && autoTyping) {
-            status.postDelayed(fieldGone, FIELD_GONE_MS);
+                break;
+            case ARM_CLOSE:
+                status.removeCallbacks(fieldGone);
+                status.postDelayed(fieldGone, FIELD_GONE_MS);
+                break;
+            default:
+                break;
         }
     }
 
@@ -650,7 +664,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 hostTextKnown = true;
                 showTypingToggle();
                 if (!known) {
-                    followField();
+                    followField(true);
                 }
                 // Once a connection: a host that does not take the kinds of scroll gets dx and dy
                 // only, and a scroll whose dx and dy are both 0 is not sent (the input library).
