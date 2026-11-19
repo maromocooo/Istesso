@@ -1320,6 +1320,11 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         echo "error: the host did not start $name" | tee "$mine/not-back"
         return 1
     fi
+    # Only a slot of the three is acted on (it names ports, and the windows below follow it).
+    case "$slot" in
+    1 | 2 | 3) ;;
+    *) echo "error: the host answered no slot of 1, 2 or 3 for $name: nothing was changed here" | tee "$mine/not-back"; return 1 ;;
+    esac
     # A window and relay here have the ports of the slot they were started for (written down in
     # ports). When the host has started the application afresh in another slot, this one's have
     # the old slot's ports, and a window of another application written down for this slot has

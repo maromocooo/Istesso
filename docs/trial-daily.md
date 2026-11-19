@@ -595,6 +595,7 @@ ADR 0020 の「変換中の文字を、アプリの中に」、ADR 0007 の「�
 - Mac：窓と中継を起動するとき、その枠とポートの基（`47900` か `27900`）を、窓の状態のフォルダー（`~/Library/Caches/istesso-daily/<アプリ>/ports`）に書きます。`open` で、ホストが答えた枠が、書いた枠と違えば、その窓と中継を番号で止めてから、答えた枠で起動し直します（`NAME: its window had the ports of slot 2; NAME runs in slot 1 now: the window opens again`）。ほかのアプリの窓で、いまその枠を書いているものも、番号で止めます（`firefox: its window had the ports of slot 1, where blender runs now: it was closed`）。そのアプリは、自分の `open` で、自分の枠に戻ります。
 - 比べるのは枠だけです。ポートの基は書くだけで、比べません（`ports low` に替えたあとも、動いているアプリは前のポートのまま。比べると、つながっている窓を止めてしまう）。
 - `ports` のファイルがない窓（この変更の前に開いた窓）は、比べずに、これまでどおり前に出すだけです。
+- ホストが答えた枠が 1、2、3 のどれでもなければ（`1x` など）、`error: the host answered no slot of 1, 2 or 3 …` と言って、窓にも、書いたものにも、何もしません。
 - 確かめ：`scripts/daily_slot_test.py`。Mac の側は、スクリプトの写しと、ホストの答えを返すだけの `ssh`、ポートを書き留めて待つだけのビューアーと中継の代わりで（窓は出ない）、Air とホストの両方で通った。ホストの側（`app_ended` と `end_run`）は、自分のフォルダーの代わりのプロセスで、ホストで通った（Linux だけ。Air では飛ばす）。本物の試用版では、まだ確かめていません。
 
 ## 窓が呼んでいるとき（「見てほしい」の印）

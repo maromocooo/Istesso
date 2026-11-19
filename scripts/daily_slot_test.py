@@ -98,10 +98,10 @@ class WindowsFollowTheSlot(unittest.TestCase):
                 if len(words) == 2 and started(words[0]) == " ".join(words[1].split()):
                     os.kill(int(words[0]), 15)
 
-    def open(self, name, slot):
+    def open(self, name, slot, ends=0):
         write(self.answer, f"host: {name} started (slot {slot}; windows: 1)\nslot {slot}\nway host-side\npeer stand-in-peer\n")
         done = subprocess.run([self.daily, "open", name], env=self.env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.returncode, ends, done.stdout + done.stderr)
         return done.stdout
 
     def window(self, name):
@@ -147,6 +147,18 @@ class WindowsFollowTheSlot(unittest.TestCase):
         self.assertNotIn("ports of slot", said)
         self.assertEqual(self.window("firefox")[1:], ("host-side:47912", "host-side:47922"))
         self.assertEqual(self.window("blender"), blender)
+
+    def test_a_slot_that_is_not_one_of_the_three_changes_nothing(self):
+        self.open("firefox", 1)
+        self.open("blender", 2)
+        firefox, blender = self.window("firefox"), self.window("blender")
+        for answer in ("1x", "4", "aura1", "0"):
+            said = self.open("firefox", answer, ends=1)
+            self.assertIn("error: the host answered no slot of 1, 2 or 3 for firefox: nothing was changed here", said)
+            self.assertNotIn("ports of slot", said)
+            self.assertEqual((self.window("firefox"), self.window("blender")), (firefox, blender))
+            with open(os.path.join(self.state, "firefox", "ports")) as f:
+                self.assertEqual(f.read(), "1 47900\n")
 
     def test_a_window_opened_before_the_slot_was_written_down_is_kept(self):
         # Nothing to compare with (a window opened by the script before this change): as before.
