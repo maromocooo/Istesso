@@ -39,9 +39,14 @@ enum Wire {
         return (base as NSString).appendingPathComponent("istesso-dev-input/slot-\(slot)")
     }
 
-    /// The probe's slot: ISTESSO_IME_SLOT, or 1.
+    /// The probe's slot: ISTESSO_IME_SLOT, or 1. ISTESSO_IME_SOCKET=socket names the single
+    /// socket of the 0.2 trial build instead (trial only, to talk to the build placed before 0.3).
     static func defaultSocketPath() -> String? {
-        socketPath(slot: Int(ProcessInfo.processInfo.environment["ISTESSO_IME_SLOT"] ?? "") ?? 1)
+        let environment = ProcessInfo.processInfo.environment
+        if environment["ISTESSO_IME_SOCKET"] == "socket", let base = userTemporaryFolder() {
+            return (base as NSString).appendingPathComponent("istesso-dev-input/socket")
+        }
+        return socketPath(slot: Int(environment["ISTESSO_IME_SLOT"] ?? "") ?? 1)
     }
 
     /// Text that may be shown or committed: not empty unless allowed, within the limits, no

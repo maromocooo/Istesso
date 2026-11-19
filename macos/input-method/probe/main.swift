@@ -410,6 +410,7 @@ final class Session {
             var ours = currentSourceID() == Wire.inputMethodIdentifier
             var inline = false
             func say(_ text: String) { print(String(format: "%7.2f s ", Date().timeIntervalSince(began)) + text) }
+            say("connected: start, Istesso's selected: \(ours), local idle \(String(format: "%.1f", localKeyboardIdle())) s")
             while Date().timeIntervalSince(began) < seconds {
                 let localIdle = localKeyboardIdle()
                 if localIdle < idle {

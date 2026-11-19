@@ -1,0 +1,5 @@
+# The local keyboard comes first (ADR 0023, 2.): 90 s; the owner types 3-5 letters into the
+# TextEdit window when told (about 20 s in), then leaves the keyboard alone. Posts nothing.
+wait 1
+caret
+connected 90 3
