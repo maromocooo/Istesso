@@ -1,6 +1,7 @@
 # istesso-ime-probe serve macos/input-method/trial-textedit.txt
-# Run only with the agent's own TextEdit document in front and the input source selected.
-# Checks by reading back through the input method (no screenshot, no Accessibility).
+# Run only with the agent's own TextEdit document in front and the input source selected, with an
+# input source built with --trial-check. Checks by reading back through the input method (no
+# screenshot, no Accessibility); only "match: true/false" is printed, never a hash.
 caret
 # Raw input, caret at the end (9 bytes = 3 kana).
 mark 9 9 にほん
@@ -8,11 +9,25 @@ check marked にほん
 # Converted, the first clause (日本, 6 bytes) selected.
 mark 0 6 日本語
 check marked 日本語
-wait 1
 commit 日本語
-check before 日本語
-# A second composition, then cleared: nothing is left (expect "match: false", ok false).
-mark 0 0 か
-clear
-check marked か
+# The same commit again (crossed on the wire): refused as stale, nothing lands twice.
+recommit 日本語
+# An emoji before the clause: 4 bytes = 2 UTF-16 units; the clause あ is bytes 4..7 = units 2..3.
+mark 4 7 😀あ
+check marked 😀あ
+commit 😀あ
+# A click elsewhere during a composition: the application ends it, the text lands once ("ended"),
+# no composition is left, and a commit that crossed "ended" is refused.
+mark 6 6 かな
+click -40 0
+check none
+recommit かな
+# The host goes away during a composition: nothing is left in the application.
+mark 3 3 て
+drop
+check none
+# Order of committed text and keys, fast: without and with holding the key for "inserted".
+post-access
+burst 30 noack
+burst 30 ack
 caret
