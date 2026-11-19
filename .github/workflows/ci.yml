@@ -23,6 +23,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Test the private details checker
+        run: bash scripts/tests/check-private-test.sh
       - name: Check that the measurement scripts parse
         run: python3 -m py_compile scripts/*.py
       - name: Build the screen probe
