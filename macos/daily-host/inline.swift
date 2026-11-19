@@ -207,9 +207,36 @@ final class SourceSwitch {
 /// source was activated and deactivated with it). The rule: nobody shown counts only after 10 s
 /// without a viewer. The owner loses nothing by it: their own keyboard takes their source back at
 /// once (local typing first), and a lock or a stop puts it back at once too.
+/// A new stream being made (`restarting`) counts only inside that same grace: the owner resizing
+/// a window at the Studio while no viewer has been shown for long must never select the source
+/// (review, 2026-11-19).
 let inlineNobodyAfter = 10.0
 func inlineViewerShown(viewers: Int, restarting: Bool, sinceShown: Double) -> Bool {
-    viewers > 0 || restarting || sinceShown < inlineNobodyAfter
+    _ = restarting  // adds nothing beyond the grace: it counts only inside it
+    return viewers > 0 || sinceShown < inlineNobodyAfter
+}
+
+/// What the switching does in one tick (ADR 0023, 2.). Istesso's source is selected only while a
+/// viewer is really there (never in the grace after the last one left); once selected it is kept
+/// through the grace; it goes back on local typing, a lock, the end of the grace. `clearFirst`:
+/// what is shown is cleared before it goes back (no viewer is there to end the composition, or the
+/// screen locks); with a viewer there, local typing lets the input source end it as an input method
+/// does (committed once, "ended").
+enum SourceStep: Equatable { case none, acquire, keep, release(clearFirst: Bool) }
+func inlineSourceStep(holding: Bool, connected: Bool, viewers: Int, locked: Bool, localIdle: Double, idle: Double) -> SourceStep {
+    let idleEnough = localIdle >= idle
+    if !holding {
+        return connected && viewers > 0 && !locked && idleEnough ? .acquire : .none
+    }
+    if connected && !locked && idleEnough { return .keep }
+    return .release(clearFirst: !connected || locked || viewers == 0)
+}
+
+/// Whether the moved window may be raised and made main again: the application is in front, and
+/// the Mac's own keyboard has been idle (an owner typing in another window of the same application
+/// keeps their window). Checked when it is decided and again right before the call.
+func inlineMayRekey(appInFront: Bool, localIdle: Double, idle: Double) -> Bool {
+    appInFront && localIdle >= idle
 }
 
 /// Whether Istesso's source should be selected now (ADR 0023, 2.): while a viewer is shown the
@@ -430,6 +457,9 @@ final class InlineComposer {
 
     /// The host posted a key (or text by the key path) to the application.
     func keyPosted() { keyPostedAt = now() }
+
+    /// The stop: nothing waits any more (what waited is dropped by the host).
+    func dropWaits() { afterKeyUntil = nil }
 
     /// Whether this event (composing text, or a commit) must wait because a key was posted just
     /// before it while composing inline; the wait then begins (everything after it waits too).
@@ -874,8 +904,17 @@ final class InlineHost {
     /// The next held event that may go now (taken off the queue), or nil: something waits, or a
     /// mark right after a key just let go of from this same queue must wait its moment too.
     func nextToFlush() -> Data? {
-        guard !composer.holding, let first = held.first, !waitsAfterKey(first) else { return nil }
+        guard !stopped, !composer.holding, let first = held.first, !waitsAfterKey(first) else { return nil }
         return held.removeFirst()
+    }
+
+    /// Events a chord's hold lets go of are older than anything held here: they go in front, in
+    /// their order. False when nothing is held (they then go their usual way).
+    func holdInFront(_ events: [Data]) -> Bool {
+        guard composer.holding || !held.isEmpty else { return false }
+        held.insert(contentsOf: events, at: 0)
+        if held.count > Self.mostHeld { heldDropped += held.count - Self.mostHeld; held.removeLast(held.count - Self.mostHeld) }
+        return true
     }
 
     func hold(_ data: Data) -> Bool {
@@ -922,11 +961,13 @@ final class InlineHost {
     }
 
     /// Every 100 ms (10 ms while a commit is held): which source, whether inline, what the field is.
-    func tick(connected: Bool, locked: Bool, pid: pid_t?) {
+    func tick(connected: Bool, viewers: Int = 1, locked: Bool, pid: pid_t?) {
         guard !stopped else { return }
         if connected && !wasConnected { ownerChose = false; switcher.forgetRestored() }
         wasConnected = connected
-        let wanted = inlineSourceWanted(connected: connected, locked: locked, localIdle: localIdle(), idle: idle)
+        let step = inlineSourceStep(holding: switcher.holding, connected: connected, viewers: viewers, locked: locked,
+                                    localIdle: localIdle(), idle: idle)
+        let wanted = step == .acquire
         let now = ProcessInfo.processInfo.systemUptime
         if switcher.holding && switcher.ownerChoseAnother() {
             // Picked by hand while Istesso's was selected: left as chosen.
@@ -945,12 +986,10 @@ final class InlineHost {
                 let restored = switcher.release()
                 note("inline: restored: \(restored.map { $0 ? "yes" : "no" } ?? "another slot holds it")")
             }
-        } else if !wanted && switcher.holding {
-            // Gone or locked: cleared first. Local typing: the input source ends it as an input
-            // method does (committed once, "ended"), and the viewer goes on with the strip.
-            if !connected || locked { clearBeforeRestore() }
+        } else if case let .release(clearFirst) = step, switcher.holding {
+            if clearFirst { clearBeforeRestore() }
             let restored = switcher.release()
-            note("inline: \(connected ? (locked ? "locked" : "local typing") : "nobody shown"): restored: \(restored.map { $0 ? "yes" : "no" } ?? "another slot holds it")")
+            note("inline: \(connected ? (locked ? "locked" : (viewers == 0 ? "local typing, nobody shown" : "local typing")) : "nobody shown"): restored: \(restored.map { $0 ? "yes" : "no" } ?? "another slot holds it")")
         }
         composer.sourceOurs = switcher.holding && switcher.system.currentID() == SourceSwitch.ours
         ticks += 1
@@ -964,6 +1003,11 @@ final class InlineHost {
     func shutdown() {
         guard !stopped else { return }
         stopped = true
+        // What waited is dropped, never typed at the stop (a held key-down would be posted and
+        // never released; a held commit would land after the source went back).
+        heldDropped += held.count
+        held.removeAll()
+        composer.dropWaits()
         clearBeforeRestore()
         if switcher.holding {
             let restored = switcher.release()
@@ -1033,6 +1077,22 @@ func inlineSelfTest() -> Int {
     check(!inlineSourceWanted(connected: true, locked: true, localIdle: 99, idle: 3), "not while the screen is locked")
     check(inlineViewerShown(viewers: 0, restarting: true, sinceShown: 0.2) && inlineViewerShown(viewers: 0, restarting: false, sinceShown: 1.0),
           "a new stream after a resize is not a disconnect")
+    check(!inlineViewerShown(viewers: 0, restarting: true, sinceShown: 999), "a resize with no viewer for long counts as nobody (the owner resizing at the Studio)")
+    check(inlineSourceStep(holding: false, connected: true, viewers: 0, locked: false, localIdle: 99, idle: 3) == .none,
+          "in the grace with nobody there: never selected")
+    check(inlineSourceStep(holding: true, connected: true, viewers: 0, locked: false, localIdle: 99, idle: 3) == .keep,
+          "in the grace: kept")
+    check(inlineSourceStep(holding: true, connected: true, viewers: 0, locked: false, localIdle: 0.5, idle: 3) == .release(clearFirst: true),
+          "local typing in the grace: cleared first, then put back")
+    check(inlineSourceStep(holding: true, connected: true, viewers: 1, locked: false, localIdle: 0.5, idle: 3) == .release(clearFirst: false),
+          "local typing with a viewer: the input source ends it (no clear)")
+    check(inlineSourceStep(holding: true, connected: false, viewers: 0, locked: false, localIdle: 99, idle: 3) == .release(clearFirst: true)
+          && inlineSourceStep(holding: true, connected: true, viewers: 1, locked: true, localIdle: 99, idle: 3) == .release(clearFirst: true),
+          "gone or locked: cleared first")
+    check(inlineSourceStep(holding: false, connected: true, viewers: 1, locked: false, localIdle: 99, idle: 3) == .acquire,
+          "a viewer there, the local keyboard idle: selected")
+    check(!inlineMayRekey(appInFront: true, localIdle: 0.2, idle: 3) && !inlineMayRekey(appInFront: false, localIdle: 99, idle: 3)
+          && inlineMayRekey(appInFront: true, localIdle: 5, idle: 3), "the moved window is made key again only with the app in front and no local typing")
     check(inlineViewerShown(viewers: 0, restarting: false, sinceShown: 5) && !inlineViewerShown(viewers: 0, restarting: false, sinceShown: 10.1)
           && inlineViewerShown(viewers: 1, restarting: false, sinceShown: 99),
           "a start's gap (seconds) is not a disconnect either; nobody for 10 s is")
@@ -1526,7 +1586,11 @@ func inlineHostSelfTest(folder: String) -> Int {
     host.tick(connected: false, locked: false, pid: nil)
     host.tick(connected: true, locked: false, pid: nil)
     check(system.current == SourceSwitch.ours, "connected: Istesso's (before the stop)")
+    host.held = [Data([1]), Data([2])]
+    let droppedBefore = host.heldDropped
     host.shutdown()
+    check(host.held.isEmpty && host.heldDropped == droppedBefore + 2 && host.nextToFlush() == nil && !composer.holding,
+          "the stop drops what waited (never typed at the stop)")
     check(system.current != SourceSwitch.ours && !host.switcher.holding, "the stop puts the source back")
     host.tick(connected: true, locked: false, pid: nil)
     check(system.current != SourceSwitch.ours && !host.switcher.holding, "and a tick after the stop selects nothing")
@@ -1538,8 +1602,13 @@ func inlineHostSelfTest(folder: String) -> Int {
     host.held = [Data([0])]
     check(host.hold(Data([1])) && host.held == [Data([0]), Data([1])], "behind what is held, in order")
     host.held = Array(repeating: Data([2]), count: InlineHost.mostHeld)
-    check(host.hold(Data([3])) && host.held.count == InlineHost.mostHeld && host.heldDropped == 1, "past the bound: dropped and counted, never ahead of the queue")
+    let boundBefore = host.heldDropped
+    check(host.hold(Data([3])) && host.held.count == InlineHost.mostHeld && host.heldDropped == boundBefore + 1, "past the bound: dropped and counted, never ahead of the queue")
+    host.held = [Data([9])]
+    check(host.holdInFront([Data([7]), Data([8])]) && host.held == [Data([7]), Data([8]), Data([9])],
+          "a chord's held events go in front of what waits here, in their order")
     host.held = []
+    check(!host.holdInFront([Data([7])]), "nothing waits: a chord's events go their usual way")
     for name in ["previous-source", "hold-slot-1", "switch.lock"] { unlink((folder as NSString).appendingPathComponent(name)) }
     return failed
 }

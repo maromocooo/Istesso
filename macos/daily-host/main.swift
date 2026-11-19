@@ -2185,6 +2185,8 @@ final class Injector {
     var onKeyPosted: (() -> Void)?
     /// Where events let go of after a chord's hold go: the host's dispatch (set by the host).
     var redispatch: ((Data) -> Void)?
+    /// The same for all of them at once (the host puts them in front of what waits there).
+    var redispatchAll: (([Data]) -> Void)?
     var onText: ((String) -> Bool)?
     var onKeyPressed: (() -> Void)?
     func beginHold() { holdingForChord = true }
@@ -2196,7 +2198,7 @@ final class Injector {
         if flush {
             // Through the host's own order (a commit's wait for "inserted" begun meanwhile holds
             // them too), or straight here when nothing else is in the way.
-            for event in events { if let redispatch { redispatch(event) } else { handle(event) } }
+            if let redispatchAll { redispatchAll(events) } else { for event in events { if let redispatch { redispatch(event) } else { handle(event) } } }
         } else if !events.isEmpty {
             counts["held_discarded", default: 0] += events.count
             onKeysDropped(true)
@@ -3583,6 +3585,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         injector.onButtonPressed = { made.viewerPressed() }
         injector.onKeyPosted = { made.composer.keyPosted() }
         injector.redispatch = { [weak self] event in self?.dispatch(event) }
+        injector.redispatchAll = { [weak self] events in
+            // Older than anything that waits for an "inserted" or after a key: in front of it.
+            guard let self else { return }
+            if let inline = self.inline, inline.holdInFront(events) { return }
+            for event in events { self.dispatch(event) }
+        }
         made.pid = { [weak self] in self?.app?.processIdentifier }
         inline = made
         note("inline: on, slot \(settings.virtualSlot)")
@@ -3604,7 +3612,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             if viewers > 0 { inlineShownAt = now }
             let shown = self.transport != nil && inlineViewerShown(viewers: viewers, restarting: self.restarting, sinceShown: now - inlineShownAt)
             let connected = shown && self.picture == "running" && !self.detached && !self.heldForSignal
-            inline.tick(connected: connected, locked: screenLocked(), pid: self.app?.processIdentifier)
+            inline.tick(connected: connected, viewers: viewers, locked: screenLocked(), pid: self.app?.processIdentifier)
             if ticks % 100 == 0, frameLog.on, !composer.counts.isEmpty {
                 let counts = composer.counts.map { "\"\($0.key)\":\($0.value)" }.joined(separator: ",")
                 frameLog.write("{\"kind\":\"inline\",\"t_ns\":\(nowNs()),\(counts)}")
@@ -3616,7 +3624,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
 
     /// What waited for an "inserted", in order, until something waits again.
     func flushHeld() {
-        guard let inline else { return }
+        guard let inline, !inline.stopped else { return }
         while let event = inline.nextToFlush() {
             guard !detached, picture == "running" else { continue }
             dispatchNow(event)
@@ -3750,9 +3758,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             // display made WindowServer resign its key appearance ("for space"), the input source
             // was deactivated and never activated again. With the application in front, the moved
             // window is raised and made main again, so that it is key and its field active.
+            // Not while the owner types at the Studio (they may be in another window of the same
+            // application): checked now and again right before the call.
+            let idle = settings.inlineIdle
+            func localIdle() -> Double { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown) }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                guard let self, self.appInFront() else { return }
-                self.lookout.act { bringToFront(pid, bounds: target) }
+                guard let self, inlineMayRekey(appInFront: self.appInFront(), localIdle: localIdle(), idle: idle) else { return }
+                self.lookout.act {
+                    guard localIdle() >= idle else { return }
+                    bringToFront(pid, bounds: target)
+                }
             }
         }
     }
