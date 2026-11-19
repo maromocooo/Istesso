@@ -13,7 +13,7 @@ Istesso shows apps that run on your other computers as ordinary windows on the o
 
 ## What it is
 
-Istesso puts each piece of work where it costs the least delay, in this order:
+Istesso is designed to put each piece of work where it costs the least delay, in this order:
 
 1. What can run on the machine in front of you runs there. Only its state is kept in step with the others.
 2. Text work goes over a direct terminal connection.
@@ -42,7 +42,7 @@ Each column says where the app runs and where you see it.
 - `Planned`: being designed, or not started.
 - `Out of scope`: not part of this release.
 
-The latency bar, for a relayed window against the same app run locally on the same screen (both machines wired, an 85 Hz display, a 3440×1440 picture): no more than 12 ms added at the median, 24 ms at the 95th percentile and 47 ms at the 99th percentile. The relay passed the gate on 2026-11-17 with a prototype viewer; it is accepted only after the final verdict, measured with Istesso's own client and host ([gate record](docs/measurements/2026-11-17-m1-gate.md), Japanese).
+The latency bar, for a relayed window against the same app run locally on the same screen (both machines wired, an 85 Hz display, a 3440×1440 picture): no more than 12 ms added at the median, 24 ms at the 95th percentile and 47 ms at the 99th percentile. The relay passed the gate on 2026-11-17, measured with a prototype viewer and a host made for measuring; it is accepted only after the final verdict, measured with Istesso's own client and host ([gate record](docs/measurements/2026-11-17-m1-gate.md), Japanese).
 
 ## What comes later
 
@@ -64,6 +64,7 @@ Each step and the test it has to pass: [docs/milestones.md](docs/milestones.md) 
 - The latency rule covers a wired home network. Wi-Fi and the internet are outside it ([notes on Wi-Fi](docs/wifi.md), Japanese).
 - A Linux host needs an NVIDIA GPU with NVENC, its hardware video encoder.
 - After a restart, a Mac host cannot be used until someone logs in on it once.
+- When a Mac is a host, macOS asks on that Mac's screen every 30 days to confirm that the app may keep capturing the screen without the system's picker. This is Apple's rule for apps that capture the screen this way, not something Istesso adds, and builds from source are asked too. No signed build is distributed; how Istesso will be distributed is still open.
 - There is no installer, no automatic update and no signed binary. Pairing has not had an external review.
 - The latency figures so far come from a prototype viewer. Acceptance waits for the final verdict.
 - Windows is not supported in this release.
@@ -81,7 +82,7 @@ Each step and the test it has to pass: [docs/milestones.md](docs/milestones.md) 
 
 These steps use one machine. They show what Istesso finds on it — its roles, the apps installed, the devices plugged in — and nothing more. Connecting two machines and showing a remote app are not in this README yet, because those steps have not been run again from a clean clone.
 
-You need `git` and Rust 1.85 or later.
+You need `git`, Rust 1.85 or later, and a C toolchain (on macOS, the Xcode Command Line Tools).
 
 ```sh
 git clone https://github.com/maromocooo/Istesso.git
@@ -92,11 +93,11 @@ cargo build --release --locked -p istesso-cli
 ./target/release/istesso devices list
 ```
 
-- `doctor` prints this machine's roles: for example, whether it has a hardware video encoder, can build for Apple platforms, or suits being a host that is always on.
+- `doctor` prints this machine's roles: for example, whether it has a hardware video encoder, can build for Apple platforms, or suits being a host that is always on. It also prints the machine's name and network addresses, so look before you paste its output anywhere.
 - `apps list` prints the apps installed on this machine.
 - `devices list` prints the devices plugged into this machine.
 
-Last run from a clean clone on 2026-11-19, on macOS 26.5 (Apple silicon).
+Last run from a clean clone on 2026-11-19, on macOS 26.5 (Apple silicon) ([record](docs/readme-checks.md), Japanese).
 
 ## Build from source
 
@@ -152,4 +153,4 @@ Istesso is available under the MIT licence or the Apache License 2.0, whichever 
 
 ## Trademarks
 
-Apple, Mac and macOS are trademarks of Apple Inc. Ubuntu is a trademark of Canonical Ltd. Linux is a registered trademark of Linus Torvalds. NVIDIA and NVENC are trademarks of NVIDIA Corporation. Android is a trademark of Google LLC. Rust is a trademark of the Rust Foundation. Istesso is not affiliated with or endorsed by any of them.
+Apple, Mac, macOS and Xcode are trademarks of Apple Inc. Ubuntu is a trademark of Canonical Ltd. Linux is a registered trademark of Linus Torvalds. NVIDIA and NVENC are trademarks of NVIDIA Corporation. Android is a trademark of Google LLC. Rust is a trademark of the Rust Foundation. Istesso is not affiliated with or endorsed by any of them.
