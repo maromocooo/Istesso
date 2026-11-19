@@ -12,7 +12,7 @@
 //   istesso-ime-probe secure              is the focused element a password field (needs
 //                                         Accessibility; says "unknown" without it), and is secure
 //                                         event input on
-//   istesso-ime-probe self-test <input method binary>
+//   istesso-ime-probe self-test <input method binary> [stand-in]
 //                                         the link without InputMethodKit: peer checks both ways,
 //                                         a refused stranger, a socket that is not private, the
 //                                         byte-to-UTF-16 selection
@@ -540,7 +540,7 @@ func serve(script: String?, selectFirst: Bool = false) {
 
 // MARK: - Self-test
 
-func selfTest(_ binary: String) {
+func selfTest(_ binary: String, standin: String? = nil) {
     var failures = 0
     func check(_ ok: Bool, _ what: String) {
         print("\(ok ? "ok  " : "FAIL") \(what)")
@@ -563,11 +563,24 @@ func selfTest(_ binary: String) {
     let listener = listen(at: path)
     defer { close(listener); unlink(path); rmdir(folder) }
 
-    // A stranger: this program itself is not the input method, so it is refused.
+    // A properly signed stranger: this program, signed with the same certificate, but not with the
+    // input method's identifier, so the real requirement refuses it.
     if let stranger = Wire.connect(path) {
-        check(acceptInputMethod(listener, timeout: 1) == nil, "a peer that is not the input method is refused")
+        check(acceptInputMethod(listener, timeout: 1) == nil, "a peer with the same certificate and another identifier is refused")
         close(stranger)
     } else { check(false, "connect to own socket") }
+
+    // The input method's identifier and certificate, but running without the hardened runtime.
+    if let standin {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: standin)
+        process.arguments = ["--wire-test", path]
+        process.standardOutput = FileHandle.nullDevice
+        if (try? process.run()) != nil {
+            check(acceptInputMethod(listener, timeout: 3) == nil, "the input method's identifier without the hardened runtime is refused")
+            process.waitUntilExit()
+        } else { check(false, "stand-in started") }
+    } else { print("skip: no stand-in given (the hardened-runtime refusal is not tested)") }
 
     // A socket that is not private: the input method does not connect.
     chmod(path, 0o666)
@@ -620,6 +633,6 @@ case "register": register()
 case "restore": restoreCommand()
 case "secure": secure()
 case "serve": serve(script: arguments.count >= 3 ? arguments[2] : nil, selectFirst: arguments.count == 4 && arguments[3] == "--select")
-case "self-test" where arguments.count == 3: selfTest(arguments[2])
-default: fail("usage: status | register | serve [script] | select | restore | secure | self-test <input method binary>")
+case "self-test" where arguments.count >= 3: selfTest(arguments[2], standin: arguments.count == 4 ? arguments[3] : nil)
+default: fail("usage: status | register | serve [script] | select | restore | secure | self-test <input method binary> [stand-in]")
 }

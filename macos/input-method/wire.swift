@@ -148,15 +148,19 @@ enum Wire {
               let requirement else { return .refused("requirement not made") }
         let status = SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement)
         guard status == errSecSuccess else { return .refused("peer signature does not match (\(status))") }
-        var staticCode: SecStaticCode?
+        // The RUNNING process's state, not only the file's: SecCodeCopySigningInformation takes the
+        // dynamic code too, and kSecCSDynamicInformation adds its live status (the kernel's code
+        // signing flags). Required: valid (0x1) and the hardened runtime (0x10000), so that no
+        // library is loaded into the peer from elsewhere.
         var info: CFDictionary?
-        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
-              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+        guard SecCodeCopySigningInformation(unsafeBitCast(code, to: SecStaticCode.self),
+                                            SecCSFlags(rawValue: kSecCSSigningInformation | kSecCSDynamicInformation), &info) == errSecSuccess,
               let dict = info as? [String: Any] else { return .refused("peer signing information not read") }
-        // The hardened runtime (0x10000 in the code directory's flags), so that no library is
-        // loaded into the peer from elsewhere.
-        let flags = (dict[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
-        guard flags & 0x10000 != 0 else { return .refused("peer without the hardened runtime") }
+        guard let status = (dict[kSecCodeInfoStatus as String] as? NSNumber)?.uint32Value else {
+            return .refused("peer's running state not read")
+        }
+        guard status & 0x1 != 0 else { return .refused("peer's running code is not valid") }
+        guard status & 0x10000 != 0 else { return .refused("peer runs without the hardened runtime") }
         let identifier = dict[kSecCodeInfoIdentifier as String] as? String ?? "?"
         return .ok(identifier)
     }

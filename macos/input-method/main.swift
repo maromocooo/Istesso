@@ -62,16 +62,19 @@ final class HostConnection {
     var source: DispatchSourceRead?
     var reader = Wire.LineReader()
     var app: String?
-    /// Compositions of this host that have ended (serials are the host's own).
-    var ended: [Int] = []
+    /// Compositions of this host that have ended, and how: "committed", "application" (the
+    /// application ended it and it was committed), "cleared" (never inserted). Serials are the host's.
+    var ended: [(serial: Int, reason: String)] = []
     var toldActive = false
 
     init(slot: Int, fd: Int32) { self.slot = slot; self.fd = fd }
 
-    func end(_ serial: Int) {
-        ended.append(serial)
+    func end(_ serial: Int, _ reason: String) {
+        ended.append((serial, reason))
         if ended.count > 64 { ended.removeFirst(ended.count - 64) }
     }
+
+    func endedReason(_ serial: Int) -> String? { ended.last { $0.serial == serial }?.reason }
 }
 
 /// The connections to the hosts, and which controller shows which composition.
@@ -153,6 +156,7 @@ final class Link {
             if let controller = active, controller.clientIdentifier == app, let client = controller.client() {
                 var message = caret(client, controller)
                 message["op"] = "active"
+                message["ok"] = true
                 send(message, to: host)
                 host.toldActive = true
             } else if host.toldActive {
@@ -181,6 +185,16 @@ final class Link {
             send(["op": op, "ok": false, "why": "no hello"], to: host, seq: seq)
             return
         }
+        // A commit or a clear of this host's composition goes where that composition is shown,
+        // whether or not its session is still the active one (its deactivation may be on the way),
+        // and is checked against the ended serials BEFORE anything else: an answer must never make
+        // the host type again a text that already landed.
+        if op == "commit" { commit(message, from: host, app: app, seq: seq); return }
+        if op == "clear" { clear(from: host, seq: seq); return }
+        if op == "mark", let serial = message["comp"] as? Int, let reason = host.endedReason(serial) {
+            send(["op": "mark", "ok": false, "why": "ended", "ended": reason, "comp": serial], to: host, seq: seq)
+            return
+        }
         guard let controller = active, controller.clientIdentifier == app, let client = controller.client() else {
             send(["op": op, "ok": false, "why": "relayed app not active"], to: host, seq: seq)
             return
@@ -197,10 +211,6 @@ final class Link {
             switch Commands.mark(message) {
             case .failure(let refusal): send(["op": "mark", "ok": false, "why": refusal.field], to: host, seq: seq)
             case .success(let mark):
-                if host.ended.contains(mark.serial) {
-                    send(["op": "mark", "ok": false, "why": "stale", "comp": mark.serial], to: host, seq: seq)
-                    return
-                }
                 // A composition still shown in another session (its deactivation not come yet), or
                 // another host's, ends there first, so that it lands in its own application.
                 if let other = showing, other !== controller || other.shown?.slot != host.slot { applicationEnded(other) }
@@ -214,62 +224,14 @@ final class Link {
                     showing = controller
                 }
                 log.info("mark: \(mark.text.utf16.count) units")
+                // "ok" is whether the mark was shown, never whether a caret rectangle was found
+                // ("rect_ok").
                 var answer = caret(client, controller)
                 answer["op"] = "mark"
+                answer["ok"] = true
                 answer["comp"] = mark.serial
                 send(answer, to: host, seq: seq)
             }
-        case "commit":
-            switch Commands.commit(message) {
-            case .failure(let refusal): send(["op": "commit", "ok": false, "why": refusal.field], to: host, seq: seq)
-            case .success(let commit):
-                // Ended already (committed by the application, or cleared): it landed or was
-                // dropped once; never again. The host does NOT deliver a stale commit elsewhere.
-                if host.ended.contains(commit.serial) {
-                    send(["op": "commit", "ok": false, "why": "stale", "comp": commit.serial], to: host, seq: seq)
-                    return
-                }
-                // Where this host's composition is shown, or else where the caret is now (a commit
-                // with no composition before it).
-                let mine = showing?.shown.map { $0.slot == host.slot && $0.mark.serial == commit.serial } ?? false
-                let target = mine ? showing! : controller
-                guard let targetClient = target.client(), target.clientIdentifier == app else {
-                    send(["op": "commit", "ok": false, "why": "no client"], to: host, seq: seq)
-                    return
-                }
-                if let shown = target.shown, !(shown.slot == host.slot && shown.mark.serial == commit.serial) {
-                    send(["op": "commit", "ok": false, "why": "other composition", "comp": commit.serial], to: host, seq: seq)
-                    return
-                }
-                let at = target.shown != nil ? targetClient.markedRange().location : targetClient.selectedRange().location
-                targetClient.insertText(IstessoDevInputController.japanese(commit.text), replacementRange: nowhere)
-                target.shown = nil
-                if showing === target { showing = nil }
-                host.end(commit.serial)
-                log.info("commit: \(commit.text.utf16.count) units")
-                // "inserted": the answer is made after a call that returns a value from the client
-                // (caret() asks for its ranges), which the client answers only after the insert
-                // before it. Keys the host posts after a commit wait for this (bounded), so that text
-                // and keys never change places.
-                var answer = caret(targetClient, target)
-                answer["op"] = "commit"
-                answer["inserted"] = true
-                answer["comp"] = commit.serial
-                #if ISTESSO_TRIAL_CHECK
-                answer["at"] = at == NSNotFound ? -1 : at
-                #else
-                _ = at
-                #endif
-                send(answer, to: host, seq: seq)
-            }
-        case "clear":
-            if let shown = controller.shown, shown.slot == host.slot {
-                host.end(shown.mark.serial)
-                client.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
-                controller.shown = nil
-                if showing === controller { showing = nil }
-            }
-            send(caret(client, controller), to: host, seq: seq)
         case "caret":
             send(caret(client, controller), to: host, seq: seq)
         #if ISTESSO_TRIAL_CHECK
@@ -279,6 +241,81 @@ final class Link {
         default:
             send(["op": op, "ok": false, "why": "unknown"], to: host, seq: seq)
         }
+    }
+
+    /// commit: "ok" means it is in (or was already in); "ok": false only for a real refusal with a
+    /// "why", after which the host delivers the text by its text path.
+    private func commit(_ message: [String: Any], from host: HostConnection, app: String, seq: Any?) {
+        let commit: Commands.Commit
+        switch Commands.commit(message) {
+        case .failure(let refusal):
+            send(["op": "commit", "ok": false, "why": refusal.field], to: host, seq: seq)
+            return
+        case .success(let value): commit = value
+        }
+        if let reason = host.endedReason(commit.serial) {
+            if reason == "cleared" {
+                // Cleared, never inserted: a refusal, so the host delivers it by the text path.
+                send(["op": "commit", "ok": false, "why": "cleared", "comp": commit.serial], to: host, seq: seq)
+            } else {
+                // Landed already (the application ended it, or this is a repeat): not again, and
+                // not by the text path either.
+                send(["op": "commit", "ok": true, "inserted": false, "ended": reason, "comp": commit.serial], to: host, seq: seq)
+            }
+            return
+        }
+        // Where this host's composition with this serial is shown (active or not), or else into
+        // the relayed application's active field (a commit with no composition before it).
+        let target: IstessoDevInputController
+        if let shownIn = showing, let shown = shownIn.shown, shown.slot == host.slot, shown.mark.serial == commit.serial {
+            target = shownIn
+        } else {
+            guard let controller = active, controller.clientIdentifier == app else {
+                send(["op": "commit", "ok": false, "why": "relayed app not active", "comp": commit.serial], to: host, seq: seq)
+                return
+            }
+            if controller.shown != nil {
+                send(["op": "commit", "ok": false, "why": "other composition", "comp": commit.serial], to: host, seq: seq)
+                return
+            }
+            target = controller
+        }
+        guard let client = target.client() else {
+            send(["op": "commit", "ok": false, "why": "no client", "comp": commit.serial], to: host, seq: seq)
+            return
+        }
+        let at = target.shown != nil ? client.markedRange().location : client.selectedRange().location
+        client.insertText(IstessoDevInputController.japanese(commit.text), replacementRange: nowhere)
+        target.shown = nil
+        if showing === target { showing = nil }
+        host.end(commit.serial, "committed")
+        log.info("commit: \(commit.text.utf16.count) units")
+        // "inserted": the answer is made after a call that returns a value from the client
+        // (caret() asks for its ranges), which the client answers only after the insert before it.
+        // Keys the host posts after a commit wait for this (bounded), so that text and keys never
+        // change places.
+        var answer = caret(client, target)
+        answer["op"] = "commit"
+        answer["ok"] = true
+        answer["inserted"] = true
+        answer["comp"] = commit.serial
+        #if ISTESSO_TRIAL_CHECK
+        answer["at"] = at == NSNotFound ? -1 : at
+        #else
+        _ = at
+        #endif
+        send(answer, to: host, seq: seq)
+    }
+
+    /// clear: this host's composition, wherever it is shown.
+    private func clear(from host: HostConnection, seq: Any?) {
+        if let shownIn = showing, let shown = shownIn.shown, shown.slot == host.slot {
+            shownIn.client()?.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
+            shownIn.shown = nil
+            showing = nil
+            host.end(shown.mark.serial, "cleared")
+        }
+        send(["op": "clear", "ok": true], to: host, seq: seq)
     }
 
     #if ISTESSO_TRIAL_CHECK
@@ -314,7 +351,7 @@ final class Link {
         if showing === controller { showing = nil }
         controller.client()?.insertText(IstessoDevInputController.japanese(shown.mark.text), replacementRange: nowhere)
         if let host = hosts[shown.slot] {
-            host.end(shown.mark.serial)
+            host.end(shown.mark.serial, "application")
             send(["op": "ended", "by": "application", "comp": shown.mark.serial], to: host)
         }
     }
@@ -353,7 +390,7 @@ final class Link {
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         let screen = NSScreen.screens.first { $0.frame.contains(rect.origin) } ?? NSScreen.screens.first
         return [
-            "op": "caret", "ok": rect != .zero, "via": via,
+            "op": "caret", "ok": rect != .zero, "rect_ok": rect != .zero, "via": via,
             "x": rect.origin.x, "y": rect.origin.y, "w": rect.size.width, "h": rect.size.height,
             "top": primaryHeight - (rect.origin.y + rect.size.height),
             "scale": screen?.backingScaleFactor ?? 0,
