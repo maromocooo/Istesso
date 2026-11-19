@@ -46,9 +46,17 @@ pub struct Answer {
     pub why: Option<ClipboardWhy>,
 }
 
+/// What was asked: an answer must fit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    Copy,
+    Paste,
+}
+
 /// Where an answer goes, and until when.
 struct Waiting {
     id: u32,
+    asked: Asked,
     to: mpsc::Sender<Answer>,
     until: Instant,
 }
@@ -135,7 +143,7 @@ impl Hub {
     /// The mark that goes among the keys for a copy, and the note of where its answer goes.
     /// `None` when no nonce could be made: then nothing is asked, and the answer is "none".
     pub fn copy(&self, id: u32, cut: bool, to: &mpsc::Sender<Answer>) -> Option<serde_json::Value> {
-        let nonce = self.wait_for(id, to)?;
+        let nonce = self.wait_for(id, Asked::Copy, to)?;
         Some(serde_json::json!({"kind": "clipboard_copy", "nonce": nonce, "cut": cut}))
     }
 
@@ -151,7 +159,9 @@ impl Hub {
         if let Some(text) = text {
             clipboard_text_check(text.as_str())?;
         }
-        let nonce = self.wait_for(id, to).ok_or(ClipboardResult::Nothing)?;
+        let nonce = self
+            .wait_for(id, Asked::Paste, to)
+            .ok_or(ClipboardResult::Nothing)?;
         if let Some(text) = text {
             let sent = self.send(&Outgoing::PasteText {
                 nonce: &nonce,
@@ -169,7 +179,7 @@ impl Hub {
         }))
     }
 
-    fn wait_for(&self, id: u32, to: &mpsc::Sender<Answer>) -> Option<String> {
+    fn wait_for(&self, id: u32, asked: Asked, to: &mpsc::Sender<Answer>) -> Option<String> {
         let nonce = nonce()?;
         let now = Instant::now();
         let mut waiting = lock(&self.waiting);
@@ -178,6 +188,7 @@ impl Hub {
             nonce.clone(),
             Waiting {
                 id,
+                asked,
                 to: to.clone(),
                 until: now + ANSWER_WITHIN,
             },
@@ -211,17 +222,26 @@ impl Hub {
                 if waiting.until <= Instant::now() {
                     return;
                 }
-                let _ = waiting.to.send(answer(waiting.id, incoming));
+                let _ = waiting.to.send(answer(waiting.id, waiting.asked, incoming));
             }
             _ => {}
         }
     }
 }
 
-/// The answer as it may go to the device: text only with "text", and only text within the
-/// limits; a reason only with "refused".
-fn answer(id: u32, incoming: Incoming) -> Answer {
+/// The answer as it may go to the device: one that fits what was asked ("text" and "refused"
+/// only for a copy, "pasted" only for a paste; anything else is "none"), text only with "text",
+/// and only text within the limits; a reason only with "refused".
+fn answer(id: u32, asked: Asked, incoming: Incoming) -> Answer {
     let mut result = incoming.result.unwrap_or(ClipboardResult::Nothing);
+    let fits = match result {
+        ClipboardResult::Text | ClipboardResult::Refused => asked == Asked::Copy,
+        ClipboardResult::Pasted => asked == Asked::Paste,
+        _ => true,
+    };
+    if !fits {
+        result = ClipboardResult::Nothing;
+    }
     let mut text = None;
     if result == ClipboardResult::Text {
         match incoming.text {
@@ -405,17 +425,34 @@ mod tests {
             }))
             .unwrap()
         };
-        let pasted = answer(1, incoming("pasted", Some("leak"), Some("secure_input")));
+        let pasted = answer(
+            1,
+            Asked::Paste,
+            incoming("pasted", Some("leak"), Some("secure_input")),
+        );
         assert_eq!(
             (pasted.result, pasted.text, pasted.why),
             (ClipboardResult::Pasted, None, None)
         );
-        let refused = answer(2, incoming("refused", Some("leak"), Some("password_field")));
+        let refused = answer(
+            2,
+            Asked::Copy,
+            incoming("refused", Some("leak"), Some("password_field")),
+        );
         assert_eq!(refused.text, None);
         assert_eq!(refused.why, Some(ClipboardWhy::PasswordField));
-        let bad = answer(3, incoming("text", Some("a\u{7}"), None));
+        let bad = answer(3, Asked::Copy, incoming("text", Some("a\u{7}"), None));
         assert_eq!((bad.result, bad.text), (ClipboardResult::NotText, None));
-        let empty = answer(4, incoming("text", None, None));
+        let empty = answer(4, Asked::Copy, incoming("text", None, None));
         assert_eq!(empty.result, ClipboardResult::Nothing);
+        // An answer that does not fit what was asked is "none": no text for a paste, no
+        // "pasted" for a copy.
+        let text_for_a_paste = answer(5, Asked::Paste, incoming("text", Some("leak"), None));
+        assert_eq!(
+            (text_for_a_paste.result, text_for_a_paste.text),
+            (ClipboardResult::Nothing, None)
+        );
+        let pasted_for_a_copy = answer(6, Asked::Copy, incoming("pasted", None, None));
+        assert_eq!(pasted_for_a_copy.result, ClipboardResult::Nothing);
     }
 }

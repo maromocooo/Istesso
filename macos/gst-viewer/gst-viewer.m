@@ -1950,7 +1950,9 @@ static NSCursor *empty_cursor(void) {
 
 // Keys with Command come here first; they all go to the other side.
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
-    if (self.window.firstResponder != self) {
+    // Only for the window that is typed into: a key equivalent can reach a window that is not
+    // (review of ADR 0022's code), and Command-C there must not copy from the host.
+    if (self.window.firstResponder != self || !self.window.isKeyWindow) {
         return NO;
     }
     [self keyDown:event];
