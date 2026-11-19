@@ -1,0 +1,710 @@
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 788fe16..de5d50c 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -25,8 +25,8 @@ use waylanddisplaycore::utils::allocator::{
+ #[cfg(feature = "cuda")]
+ use waylanddisplaycore::utils::video_info::CUDAParams;
+ use waylanddisplaycore::{
+-    ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, Sender,
+-    WaylandDisplay, channel, utils::device::PCIVendor,
++    ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, ScrollFrom,
++    ScrollInput, ScrollStage, Sender, WaylandDisplay, channel, utils::device::PCIVendor,
+ };
+ 
+ pub struct WaylandDisplaySrc {
+@@ -235,6 +235,42 @@ impl EventHandler for WaylandDisplaySrc {
+ 
+                     let _ = self.command_tx.send(Command::PointerAxis(x, y));
+ 
++                    return true;
++                } else if structure.has_name("PointerScroll") {
++                    // Trial only: a scroll that says what scrolled and where the gesture is.
++                    // One that is not whole is dropped.
++                    let stage = |name: &str| {
++                        structure
++                            .get::<&str>(name)
++                            .map(ScrollStage::named)
++                            .unwrap_or(ScrollStage::None)
++                    };
++                    let from = match structure.get::<&str>("source") {
++                        Ok("wheel") => Some(ScrollFrom::Wheel),
++                        Ok("finger") => Some(ScrollFrom::Finger),
++                        _ => None,
++                    };
++                    if let (Some(from), Ok(x), Ok(y), Ok(h), Ok(v)) = (
++                        from,
++                        structure.get::<f64>("x"),
++                        structure.get::<f64>("y"),
++                        structure.get::<i32>("v120-x"),
++                        structure.get::<i32>("v120-y"),
++                    ) {
++                        if x.is_finite() && y.is_finite() {
++                            let _ = self.command_tx.send(Command::PointerScroll(ScrollInput {
++                                from,
++                                x,
++                                y,
++                                v120: (h, v),
++                                phase: stage("phase"),
++                                momentum: stage("momentum"),
++                                momentum_follows: structure
++                                    .get::<bool>("momentum-follows")
++                                    .unwrap_or(false),
++                            }));
++                        }
++                    }
+                     return true;
+                 } else if structure.has_name("KeyboardKey") {
+                     let key = structure.get::<u32>("key").expect("Should contain key");
+diff --git a/wayland-display-core/src/comp/clipboard.rs b/wayland-display-core/src/comp/clipboard.rs
+index 2a80da1..a6f99b0 100644
+--- a/wayland-display-core/src/comp/clipboard.rs
++++ b/wayland-display-core/src/comp/clipboard.rs
+@@ -144,6 +144,7 @@ pub(crate) fn is_input(command: &Command) -> bool {
+             | Command::PointerMotionAbsolute(_)
+             | Command::PointerButton(..)
+             | Command::PointerAxis(..)
++            | Command::PointerScroll(_)
+             | Command::TextCommit(_)
+             | Command::TextPreedit(..)
+             | Command::ClipboardCopy { .. }
+@@ -352,6 +353,7 @@ impl State {
+                     Some(vertical_amount),
+                 );
+             }
++            Command::PointerScroll(input) => self.pointer_scroll(time.as_millis() as u32, input),
+             Command::TextCommit(text) => self.commit_text(&text),
+             Command::TextPreedit(text, begin, end) => self.preedit_text(&text, begin, end),
+             Command::ClipboardCopy { nonce, cut } => self.clipboard_copy(nonce, cut),
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 8338561..c075c39 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -75,6 +75,7 @@ mod focus;
+ mod input;
+ pub(crate) mod pacing;
+ mod rendering;
++pub(crate) mod scroll;
+ pub(crate) mod windows;
+ 
+ pub use self::focus::*;
+@@ -201,6 +202,8 @@ pub struct State {
+     )>,
+     cursor_event_count: i32,
+     pub single_pixel_buffer_state: SinglePixelBufferState,
++    /// Trial only: the finger scroll that is going on (`PointerScroll`).
++    pub(crate) scrolling: scroll::Scrolling,
+ }
+ 
+ impl State {
+@@ -336,6 +339,7 @@ impl State {
+             grabbing_popups: Vec::new(),
+             app_sessions: Default::default(),
+             single_pixel_buffer_state,
++            scrolling: Default::default(),
+         }
+     }
+ }
+@@ -1411,6 +1415,7 @@ pub(crate) fn init(
+                     | Command::PointerMotionAbsolute(_)
+                     | Command::PointerButton(..)
+                     | Command::PointerAxis(..)
++                    | Command::PointerScroll(_)
+                     | Command::TextCommit(_)
+                     | Command::TextPreedit(..)
+                     | Command::ClipboardCopy { .. }
+diff --git a/wayland-display-core/src/comp/scroll.rs b/wayland-display-core/src/comp/scroll.rs
+new file mode 100644
+index 0000000..25120e6
+--- /dev/null
++++ b/wayland-display-core/src/comp/scroll.rs
+@@ -0,0 +1,250 @@
++//! Trial only (the patch gst-wayland-display-trial-y-scroll): scrolls that say what scrolled and
++//! where the gesture is, from the custom upstream event `PointerScroll` (Istesso's ADR 0007,
++//! "スクロールの種類と段階").
++//!
++//! - A wheel is told as a wheel: `axis_value120` with the notches as they came (120 to a
++//!   notch), and an axis value of [`WHEEL_STEP`] to a notch, as GNOME's own compositor tells a
++//!   wheel of the desk.
++//! - Fingers are told as fingers (`axis_source.finger`), the pixels (the picture's, divided by
++//!   the output's scale: the application's logical pixels) as the axis value, and an
++//!   `axis_stop` when the gesture is over, which is when an application may go on scrolling by
++//!   itself (inertia).
++//! - The inertia the sender's own system adds after the fingers have left (macOS does) is passed
++//!   on as more of the same finger scroll, and the stop comes when it ends. Whether inertia
++//!   follows is said by the sender with the end of the gesture (`momentum-follows`): the sender
++//!   waits for its system's inertia itself, so that no jitter of the network decides it. With
++//!   `ISTESSO_SCROLL_MOMENTUM=app` the sender's inertia is dropped and the stop comes as the
++//!   fingers leave: the application makes its own, as with a touchpad of the desk.
++//! - Fingers whose sender gives no stages: the stop comes when nothing has come for
++//!   [`IDLE_STOP`].
++//! - Whatever the stages, a finger scroll whose end never comes (lost on the way: the sender's
++//!   picture was being reconnected, its input was) stops [`LOST_STOP`] after its last value.
++//!
++//! The old `MouseAxis` is not changed.
++
++use crate::comp::State;
++use smithay::backend::input::{Axis, AxisSource};
++use smithay::input::pointer::AxisFrame;
++use smithay::reexports::calloop::RegistrationToken;
++use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++use std::time::Duration;
++
++/// The axis value of one notch of a wheel.
++pub const WHEEL_STEP: f64 = 10.0;
++/// How long after the last value of a finger scroll its end may take to come, before the stop is
++/// told anyway.
++pub const LOST_STOP: Duration = Duration::from_millis(400);
++/// How long after the last scroll of fingers without stages the gesture counts as over.
++pub const IDLE_STOP: Duration = Duration::from_millis(100);
++
++/// What scrolled.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ScrollFrom {
++    Wheel,
++    Finger,
++}
++
++/// Where a gesture, or the inertia after it, is.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ScrollStage {
++    None,
++    Began,
++    Changed,
++    Ended,
++    Cancelled,
++}
++
++impl ScrollStage {
++    /// The stage a `PointerScroll` names; one this does not know moves and ends nothing.
++    pub fn named(name: &str) -> ScrollStage {
++        match name {
++            "none" | "" => ScrollStage::None,
++            "began" => ScrollStage::Began,
++            "ended" => ScrollStage::Ended,
++            "cancelled" => ScrollStage::Cancelled,
++            _ => ScrollStage::Changed,
++        }
++    }
++}
++
++/// One scroll of the `PointerScroll` event.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct ScrollInput {
++    pub from: ScrollFrom,
++    /// Fingers: pixels to the right and down.
++    pub x: f64,
++    pub y: f64,
++    /// A wheel: 120ths of a notch to the right and down.
++    pub v120: (i32, i32),
++    pub phase: ScrollStage,
++    pub momentum: ScrollStage,
++    /// With the end of the gesture: the sender's inertia follows.
++    pub momentum_follows: bool,
++}
++
++/// What is done with the inertia of the sender.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Momentum {
++    /// Passed on, as more of the finger scroll (the default).
++    Sender,
++    /// Dropped: the application makes its own.
++    App,
++}
++
++impl Momentum {
++    fn from_environment() -> Momentum {
++        match std::env::var("ISTESSO_SCROLL_MOMENTUM").as_deref() {
++            Ok("app") => Momentum::App,
++            _ => Momentum::Sender,
++        }
++    }
++}
++
++/// The compositor's part of the finger scroll that is going on.
++#[derive(Debug, Default)]
++pub struct Scrolling {
++    /// Values of fingers have been told that no stop has followed yet.
++    open: bool,
++    /// The timer that will tell the stop.
++    stop_timer: Option<RegistrationToken>,
++    /// Read from the environment at the first scroll; tests set it.
++    pub(crate) momentum: Option<Momentum>,
++}
++
++impl State {
++    /// One scroll of the `PointerScroll` event.
++    pub fn pointer_scroll(&mut self, time: u32, input: ScrollInput) {
++        let momentum = *self.scrolling.momentum.get_or_insert_with(|| {
++            let momentum = Momentum::from_environment();
++            tracing::info!(
++                ?momentum,
++                "trial scroll: wheels as wheels, fingers as fingers"
++            );
++            momentum
++        });
++        match input.from {
++            ScrollFrom::Wheel => {
++                // A wheel ends a finger scroll that is still open.
++                self.finish_finger_scroll(time);
++                let (h, v) = input.v120;
++                if h == 0 && v == 0 {
++                    return;
++                }
++                let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
++                for (axis, notches) in [(Axis::Horizontal, h), (Axis::Vertical, v)] {
++                    if notches != 0 {
++                        frame = frame
++                            .value(axis, notches as f64 / 120.0 * WHEEL_STEP)
++                            .v120(axis, notches);
++                    }
++                }
++                self.tell_axis(frame);
++            }
++            ScrollFrom::Finger if input.momentum != ScrollStage::None => {
++                if momentum == Momentum::App {
++                    return;
++                }
++                self.finger_values(time, input.x, input.y);
++                if matches!(input.momentum, ScrollStage::Ended | ScrollStage::Cancelled) {
++                    self.finish_finger_scroll(time);
++                } else {
++                    self.stop_scroll_in(LOST_STOP);
++                }
++            }
++            ScrollFrom::Finger => match input.phase {
++                ScrollStage::Began => {
++                    // A new gesture: the one before is over.
++                    self.finish_finger_scroll(time);
++                    self.finger_values(time, input.x, input.y);
++                    self.stop_scroll_in(LOST_STOP);
++                }
++                ScrollStage::Changed => {
++                    self.finger_values(time, input.x, input.y);
++                    self.stop_scroll_in(LOST_STOP);
++                }
++                ScrollStage::Ended => {
++                    self.finger_values(time, input.x, input.y);
++                    // The sender says whether its inertia follows (it waits for it itself,
++                    // where there is no jitter of the network).
++                    if input.momentum_follows && momentum == Momentum::Sender {
++                        self.stop_scroll_in(LOST_STOP);
++                    } else {
++                        self.finish_finger_scroll(time);
++                    }
++                }
++                ScrollStage::Cancelled => {
++                    self.finger_values(time, input.x, input.y);
++                    self.finish_finger_scroll(time);
++                }
++                ScrollStage::None => {
++                    self.finger_values(time, input.x, input.y);
++                    self.stop_scroll_in(IDLE_STOP);
++                }
++            },
++        }
++    }
++
++    fn finger_values(&mut self, time: u32, x: f64, y: f64) {
++        if x == 0.0 && y == 0.0 {
++            return;
++        }
++        // The sender's pixels are the picture's; an application counts in the output's logical
++        // pixels, of which there are fewer when the output is scaled up.
++        let scale = self
++            .output
++            .as_ref()
++            .map(|output| output.current_scale().fractional_scale())
++            .filter(|scale| *scale > 0.0)
++            .unwrap_or(1.0);
++        let (x, y) = (x / scale, y / scale);
++        let mut frame = AxisFrame::new(time).source(AxisSource::Finger);
++        for (axis, value) in [(Axis::Horizontal, x), (Axis::Vertical, y)] {
++            if value != 0.0 {
++                frame = frame.value(axis, value);
++            }
++        }
++        self.tell_axis(frame);
++        self.scrolling.open = true;
++    }
++
++    /// Tells the stop of the finger scroll that is open, if one is.
++    pub(crate) fn finish_finger_scroll(&mut self, time: u32) {
++        self.cancel_scroll_stop();
++        if !std::mem::take(&mut self.scrolling.open) {
++            return;
++        }
++        let frame = AxisFrame::new(time)
++            .source(AxisSource::Finger)
++            .stop(Axis::Horizontal)
++            .stop(Axis::Vertical);
++        self.tell_axis(frame);
++    }
++
++    fn stop_scroll_in(&mut self, wait: Duration) {
++        self.cancel_scroll_stop();
++        if !self.scrolling.open {
++            return;
++        }
++        self.scrolling.stop_timer = self
++            .handle
++            .insert_source(Timer::from_duration(wait), |_, _, state| {
++                state.scrolling.stop_timer = None;
++                let time: Duration = state.clock.now().into();
++                state.finish_finger_scroll(time.as_millis() as u32);
++                TimeoutAction::Drop
++            })
++            .ok();
++    }
++
++    fn cancel_scroll_stop(&mut self) {
++        if let Some(token) = self.scrolling.stop_timer.take() {
++            self.handle.remove(token);
++        }
++    }
++
++    fn tell_axis(&mut self, frame: AxisFrame) {
++        let pointer = self.seat.get_pointer().unwrap();
++        pointer.axis(self, frame);
++        pointer.frame(self);
++    }
++}
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index 886c10d..bcf3b65 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod utils;
+ pub(crate) mod wayland;
+ 
+ pub use crate::comp::cursor::{Cursor, CursorImage, CursorSink};
++pub use crate::comp::scroll::{ScrollFrom, ScrollInput, ScrollStage};
+ pub use crate::comp::windows::WindowSink;
+ pub use crate::wayland::handlers::text_input::TextInputSink;
+ pub use crate::utils::video_info::GstVideoInfo;
+@@ -42,6 +43,8 @@ pub enum Command {
+     PointerMotionAbsolute(Point<f64, Logical>),
+     PointerButton(u32, ButtonState),
+     PointerAxis(f64, f64),
++    /// Trial only: a scroll that says what scrolled and where the gesture is (`PointerScroll`).
++    PointerScroll(ScrollInput),
+     GetSupportedDmaFormats(SyncSender<FormatSet>),
+     GetRenderDevice(SyncSender<Option<GPUDevice>>),
+     TouchDown(u32, Point<f64, Logical>),
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index cea3dd4..ee1c00d 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -7,5 +7,6 @@ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
+ mod test_trial_clipboard;
++mod test_trial_scroll;
+ mod test_trial_windows;
+ mod test_windows;
+diff --git a/wayland-display-core/src/tests/test_trial_scroll.rs b/wayland-display-core/src/tests/test_trial_scroll.rs
+new file mode 100644
+index 0000000..74def00
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_trial_scroll.rs
+@@ -0,0 +1,301 @@
++//! Integration tests for the trial's scrolls (`PointerScroll`): a wheel is told as a wheel with
++//! its notches, fingers as fingers with their pixels and a stop when the gesture is over, and
++//! the sender's inertia as more of the same scroll. A real Wayland client is told.
++
++use crate::comp::scroll::{IDLE_STOP, LOST_STOP, Momentum, ScrollFrom, ScrollInput, ScrollStage};
++use crate::tests::client::MouseEvents;
++use crate::tests::fixture::Fixture;
++use smithay::utils::Point;
++use test_log::test;
++use wayland_client::WEnum;
++use wayland_client::protocol::wl_pointer;
++
++/// A window that fills the output, with the pointer in its middle, and nothing told yet.
++fn fixture() -> Fixture {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.round_trip();
++    f.client.get_client_events().clear();
++    f
++}
++
++fn axis_name(axis: &WEnum<wl_pointer::Axis>) -> &'static str {
++    match axis {
++        WEnum::Value(wl_pointer::Axis::HorizontalScroll) => "h",
++        WEnum::Value(wl_pointer::Axis::VerticalScroll) => "v",
++        _ => "?",
++    }
++}
++
++/// What the client was told about scrolling since the last time, in words, and forgets it.
++fn told(f: &mut Fixture) -> Vec<String> {
++    f.round_trip();
++    let said = f
++        .client
++        .get_client_events()
++        .drain(..)
++        .filter_map(|event| match event {
++            MouseEvents::Pointer(wl_pointer::Event::AxisSource { axis_source }) => {
++                Some(match axis_source {
++                    WEnum::Value(wl_pointer::AxisSource::Wheel) => "wheel".to_string(),
++                    WEnum::Value(wl_pointer::AxisSource::Finger) => "finger".to_string(),
++                    other => format!("source {other:?}"),
++                })
++            }
++            MouseEvents::Pointer(wl_pointer::Event::Axis { axis, value, .. }) => {
++                Some(format!("{} {value}", axis_name(&axis)))
++            }
++            MouseEvents::Pointer(wl_pointer::Event::AxisValue120 { axis, value120 }) => {
++                Some(format!("{} notches {value120}", axis_name(&axis)))
++            }
++            MouseEvents::Pointer(wl_pointer::Event::AxisStop { axis, .. }) => {
++                Some(format!("stop {}", axis_name(&axis)))
++            }
++            MouseEvents::Pointer(wl_pointer::Event::Frame) => Some("frame".to_string()),
++            _ => None,
++        })
++        .collect();
++    said
++}
++
++fn wheel(h: i32, v: i32) -> ScrollInput {
++    ScrollInput {
++        from: ScrollFrom::Wheel,
++        x: 0.0,
++        y: 0.0,
++        v120: (h, v),
++        phase: ScrollStage::None,
++        momentum: ScrollStage::None,
++        momentum_follows: false,
++    }
++}
++
++fn fingers(x: f64, y: f64, phase: ScrollStage) -> ScrollInput {
++    ScrollInput {
++        from: ScrollFrom::Finger,
++        x,
++        y,
++        v120: (0, 0),
++        phase,
++        momentum: ScrollStage::None,
++        momentum_follows: false,
++    }
++}
++
++/// The fingers have left; `follows`: the sender says its inertia follows.
++fn ended(follows: bool) -> ScrollInput {
++    ScrollInput {
++        momentum_follows: follows,
++        ..fingers(0.0, 0.0, ScrollStage::Ended)
++    }
++}
++
++fn inertia(y: f64, momentum: ScrollStage) -> ScrollInput {
++    ScrollInput {
++        momentum,
++        ..fingers(0.0, y, ScrollStage::None)
++    }
++}
++
++#[test]
++fn a_wheel_is_told_as_a_wheel_with_its_notches() {
++    let mut f = fixture();
++    f.server.pointer_scroll(1, wheel(0, 120));
++    assert_eq!(told(&mut f), ["wheel", "v notches 120", "v 10", "frame"]);
++    // Parts of a notch, and to the left.
++    f.server.pointer_scroll(2, wheel(-60, 0));
++    assert_eq!(told(&mut f), ["wheel", "h notches -60", "h -5", "frame"]);
++    // No notch: nothing.
++    f.server.pointer_scroll(3, wheel(0, 0));
++    assert!(told(&mut f).is_empty());
++}
++
++#[test]
++fn fingers_are_told_as_fingers_and_the_inertia_of_the_sender_as_more_of_them() {
++    let mut f = fixture();
++    f.server
++        .pointer_scroll(1, fingers(0.0, 0.0, ScrollStage::Began));
++    assert!(told(&mut f).is_empty());
++    f.server
++        .pointer_scroll(2, fingers(0.0, 5.5, ScrollStage::Changed));
++    f.server
++        .pointer_scroll(3, fingers(-1.25, 3.0, ScrollStage::Changed));
++    assert_eq!(
++        told(&mut f),
++        [
++            "finger", "v 5.5", "frame", "finger", "h -1.25", "v 3", "frame"
++        ]
++    );
++    // The fingers leave, and the sender says that its inertia follows: no stop in between,
++    // however long the inertia takes to come (within the wait for a lost end).
++    f.server.pointer_scroll(4, ended(true));
++    std::thread::sleep(LOST_STOP / 2);
++    assert!(told(&mut f).is_empty());
++    f.server
++        .pointer_scroll(5, inertia(24.0, ScrollStage::Began));
++    f.server
++        .pointer_scroll(6, inertia(6.0, ScrollStage::Changed));
++    assert_eq!(
++        told(&mut f),
++        ["finger", "v 24", "frame", "finger", "v 6", "frame"]
++    );
++    f.server.pointer_scroll(7, inertia(0.0, ScrollStage::Ended));
++    assert_eq!(told(&mut f), ["finger", "stop h", "stop v", "frame"]);
++    // Nothing more after it.
++    std::thread::sleep(LOST_STOP + LOST_STOP / 4);
++    assert!(told(&mut f).is_empty());
++}
++
++#[test]
++fn without_inertia_the_stop_comes_as_the_fingers_leave() {
++    let mut f = fixture();
++    f.server
++        .pointer_scroll(1, fingers(0.0, 0.0, ScrollStage::Began));
++    f.server
++        .pointer_scroll(2, fingers(0.0, 8.0, ScrollStage::Changed));
++    f.server.pointer_scroll(3, ended(false));
++    assert_eq!(
++        told(&mut f),
++        [
++            "finger", "v 8", "frame", "finger", "stop h", "stop v", "frame"
++        ]
++    );
++    // A gesture cancelled by the system stops at once.
++    f.server
++        .pointer_scroll(4, fingers(0.0, 2.0, ScrollStage::Began));
++    f.server
++        .pointer_scroll(5, fingers(0.0, 0.0, ScrollStage::Cancelled));
++    assert_eq!(
++        told(&mut f),
++        [
++            "finger", "v 2", "frame", "finger", "stop h", "stop v", "frame"
++        ]
++    );
++}
++
++#[test]
++fn a_finger_scroll_whose_end_is_lost_stops_a_moment_after_its_last_value() {
++    let mut f = fixture();
++    // The end never comes (the viewer's picture was being reconnected, say).
++    f.server
++        .pointer_scroll(1, fingers(0.0, 8.0, ScrollStage::Changed));
++    std::thread::sleep(LOST_STOP / 2);
++    f.server
++        .pointer_scroll(2, fingers(0.0, 4.0, ScrollStage::Changed));
++    std::thread::sleep(LOST_STOP / 2);
++    assert_eq!(
++        told(&mut f),
++        ["finger", "v 8", "frame", "finger", "v 4", "frame"]
++    );
++    std::thread::sleep(LOST_STOP / 2 + LOST_STOP / 4);
++    assert_eq!(told(&mut f), ["finger", "stop h", "stop v", "frame"]);
++    // Nor when the inertia was said to follow and never came, or stopped coming.
++    f.server
++        .pointer_scroll(3, fingers(0.0, 8.0, ScrollStage::Changed));
++    f.server.pointer_scroll(4, ended(true));
++    f.server
++        .pointer_scroll(5, inertia(6.0, ScrollStage::Changed));
++    assert_eq!(
++        told(&mut f),
++        ["finger", "v 8", "frame", "finger", "v 6", "frame"]
++    );
++    std::thread::sleep(LOST_STOP + LOST_STOP / 4);
++    assert_eq!(told(&mut f), ["finger", "stop h", "stop v", "frame"]);
++}
++
++#[test]
++fn a_new_gesture_or_a_wheel_ends_the_finger_scroll_that_is_open() {
++    let mut f = fixture();
++    f.server
++        .pointer_scroll(1, fingers(0.0, 8.0, ScrollStage::Changed));
++    f.server.pointer_scroll(2, ended(true));
++    f.server
++        .pointer_scroll(3, fingers(0.0, 4.0, ScrollStage::Began));
++    assert_eq!(
++        told(&mut f),
++        [
++            "finger", "v 8", "frame", "finger", "stop h", "stop v", "frame", "finger", "v 4",
++            "frame"
++        ]
++    );
++    f.server.pointer_scroll(4, wheel(0, 120));
++    assert_eq!(
++        told(&mut f),
++        [
++            "finger",
++            "stop h",
++            "stop v",
++            "frame",
++            "wheel",
++            "v notches 120",
++            "v 10",
++            "frame"
++        ]
++    );
++    // The stop that was waiting does not come again.
++    std::thread::sleep(LOST_STOP + LOST_STOP / 4);
++    assert!(told(&mut f).is_empty());
++}
++
++#[test]
++fn when_the_application_makes_its_own_inertia_the_senders_is_dropped() {
++    let mut f = fixture();
++    f.server.scrolling.momentum = Some(Momentum::App);
++    f.server
++        .pointer_scroll(1, fingers(0.0, 8.0, ScrollStage::Changed));
++    f.server.pointer_scroll(2, ended(true));
++    f.server
++        .pointer_scroll(3, inertia(24.0, ScrollStage::Began));
++    f.server.pointer_scroll(4, inertia(0.0, ScrollStage::Ended));
++    assert_eq!(
++        told(&mut f),
++        [
++            "finger", "v 8", "frame", "finger", "stop h", "stop v", "frame"
++        ]
++    );
++}
++
++#[test]
++fn fingers_move_the_same_distance_on_an_output_scaled_up() {
++    let mut f = fixture();
++    let output = f.server.output.clone().unwrap();
++    output.change_current_state(None, None, Some(smithay::output::Scale::Integer(2)), None);
++    f.server
++        .pointer_scroll(1, fingers(0.0, 8.0, ScrollStage::Changed));
++    // Eight pixels of the picture are four logical pixels of the application.
++    assert_eq!(told(&mut f), ["finger", "v 4", "frame"]);
++    // A wheel's notches are not scaled.
++    f.server.pointer_scroll(2, wheel(0, 120));
++    assert_eq!(
++        told(&mut f),
++        [
++            "finger",
++            "stop h",
++            "stop v",
++            "frame",
++            "wheel",
++            "v notches 120",
++            "v 10",
++            "frame"
++        ]
++    );
++}
++
++#[test]
++fn fingers_without_stages_stop_when_nothing_more_comes() {
++    let mut f = fixture();
++    f.server
++        .pointer_scroll(1, fingers(0.0, 3.0, ScrollStage::None));
++    std::thread::sleep(IDLE_STOP / 2);
++    f.server
++        .pointer_scroll(2, fingers(0.0, 3.0, ScrollStage::None));
++    std::thread::sleep(IDLE_STOP / 2);
++    assert_eq!(
++        told(&mut f),
++        ["finger", "v 3", "frame", "finger", "v 3", "frame"]
++    );
++    std::thread::sleep(IDLE_STOP);
++    assert_eq!(told(&mut f), ["finger", "stop h", "stop v", "frame"]);
++}

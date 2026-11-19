@@ -1,37 +1,8 @@
-Copy and paste of text with the device a person types on (Istesso's ADR 0022; trial only). Off
-unless the environment names ISTESSO_CLIPBOARD_DIR, the folder of the session's local sockets
-(the one that holds input.sock, open to its owner only). There the compositor binds the datagram
-socket clipboard.sock: the agent sends "hello" (answered with the same nonce, so that the agent
-knows copy and paste are taken) and the text of a paste ("paste_text"), before the mark that
-orders it. The marks come on the path of the keys as the custom upstream events ClipboardCopy
-(nonce, cut) and ClipboardPaste (nonce, with-text), and carry no text. Answers go as datagrams to
-clipboard-answer.sock (bound by the agent): text, pasted, none, refused (password_field,
-secret_marker), too_large, not_text.
-
-A copy presses Control-C (Control-X to cut; Control only when it is not held already) for the
-client that has the keyboard, unless that client's enabled text input says its field is for a
-password or a PIN (then nothing is pressed); it takes the clipboard selection that the same
-client sets next, refuses one offered with x-kde-passwordManagerHint unread, and reads it in a
-loop source with a deadline of 0.5 s from the key and at most 64 KiB and a byte, so that a slow
-client never stops the compositor. A paste holds the input that follows its mark (keys, pointer,
-committed text, further marks) until its text is there, at most 0.2 s, then makes the
-compositor the owner of the selection with it and presses Control-V; a paste without text first
-withdraws the compositor's own earlier selection. The primary selection is never read or set.
-The text, its size and the nonces are never logged (the element's debug line of an event no
-longer prints TextCommit and the clipboard's marks), only how many of each answer there were.
-
-A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
-MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
-gst-wayland-display-cursor-messages.patch, gst-wayland-display-windows.patch,
-gst-wayland-display-dialogs.patch, gst-wayland-display-trial-windows.patch and
-gst-wayland-display-trial-x-text-input.patch in this directory, in that order (its name sorts
-after them on purpose). The lines of context are from that project and from those patches.
-
 diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
-index 8d36da5..a8fd314 100644
+index 35552ba..788fe16 100644
 --- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
 +++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
-@@ -140,7 +140,17 @@ trait EventHandler {
+@@ -161,7 +161,17 @@ trait EventHandler {
  
  impl EventHandler for WaylandDisplaySrc {
      fn handle_event(&self, event: &Event) -> bool {
@@ -50,7 +21,7 @@ index 8d36da5..a8fd314 100644
  
          match event.view() {
              gst::EventView::CustomUpstream(e) => {
-@@ -220,6 +230,21 @@ impl EventHandler for WaylandDisplaySrc {
+@@ -241,6 +251,21 @@ impl EventHandler for WaylandDisplaySrc {
                          },
                      ));
  
@@ -74,10 +45,10 @@ index 8d36da5..a8fd314 100644
                      // Trial only: committed text (never logged).
 diff --git a/wayland-display-core/src/comp/clipboard.rs b/wayland-display-core/src/comp/clipboard.rs
 new file mode 100644
-index 0000000..5011f04
+index 0000000..2a80da1
 --- /dev/null
 +++ b/wayland-display-core/src/comp/clipboard.rs
-@@ -0,0 +1,832 @@
+@@ -0,0 +1,834 @@
 +//! Trial only: copy and paste of text between the device a person types on and the client that
 +//! has the keyboard (Istesso's ADR 0022). Off unless `ISTESSO_CLIPBOARD_DIR` names the folder of
 +//! the session's local sockets (the one that holds `input.sock`, open to its owner only).
@@ -225,6 +196,7 @@ index 0000000..5011f04
 +            | Command::PointerButton(..)
 +            | Command::PointerAxis(..)
 +            | Command::TextCommit(_)
++            | Command::TextPreedit(..)
 +            | Command::ClipboardCopy { .. }
 +            | Command::ClipboardPaste { .. }
 +    )
@@ -432,6 +404,7 @@ index 0000000..5011f04
 +                );
 +            }
 +            Command::TextCommit(text) => self.commit_text(&text),
++            Command::TextPreedit(text, begin, end) => self.preedit_text(&text, begin, end),
 +            Command::ClipboardCopy { nonce, cut } => self.clipboard_copy(nonce, cut),
 +            Command::ClipboardPaste { nonce, with_text } => self.clipboard_paste(nonce, with_text),
 +            _ => {}
@@ -911,7 +884,7 @@ index 0000000..5011f04
 +    }
 +}
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 6a3c352..d7eb3ca 100644
+index 939ee92..8338561 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
 @@ -1,7 +1,6 @@
@@ -930,24 +903,24 @@ index 6a3c352..d7eb3ca 100644
  pub(crate) mod cursor;
  mod focus;
  mod input;
-@@ -177,6 +177,8 @@ pub struct State {
-     pub(crate) activation_state: XdgActivationState,
+@@ -178,6 +178,8 @@ pub struct State {
      /// Trial only: the clients' text inputs, for committed text.
      pub(crate) text_inputs: crate::wayland::handlers::text_input::TextInputs,
+     pub(crate) text_input_report: crate::wayland::handlers::text_input::TextInputReport,
 +    /// Trial only: copy and paste with the device a person types on (off unless asked for).
 +    pub(crate) clipboard: clipboard::Clipboard,
      _text_input_global: smithay::reexports::wayland_server::backend::GlobalId,
      /// The last key presses and button presses, for telling an activation token that comes
      /// of one from one made at will.
-@@ -324,6 +326,7 @@ impl State {
-             viewporter_state,
+@@ -326,6 +328,7 @@ impl State {
              activation_state,
              text_inputs: Default::default(),
+             text_input_report: Default::default(),
 +            clipboard: Default::default(),
              _text_input_global: text_input_global,
              input_serials: windows::InputSerials::default(),
              pointer_window_at: None,
-@@ -1093,6 +1096,12 @@ pub(crate) fn init(
+@@ -1095,6 +1098,12 @@ pub(crate) fn init(
          &input_context,
          event_loop.handle(),
      );
@@ -960,7 +933,7 @@ index 6a3c352..d7eb3ca 100644
  
      // init event loop
      state
-@@ -1105,6 +1114,15 @@ pub(crate) fn init(
+@@ -1107,6 +1116,15 @@ pub(crate) fn init(
      state
          .handle
          .insert_source(command_src, move |event, _, state| {
@@ -976,17 +949,20 @@ index 6a3c352..d7eb3ca 100644
              match event {
                  Event::Msg(Command::VideoInfo(video_info)) => {
                      apply_video_info(state, video_info, &render_target, render_node.clone());
-@@ -1248,9 +1266,6 @@ pub(crate) fn init(
+@@ -1250,12 +1268,6 @@ pub(crate) fn init(
                          };
                      }
                  }
 -                Event::Msg(Command::TextCommit(text)) => {
 -                    state.commit_text(&text);
 -                }
-                 Event::Msg(Command::CloseWindows) => {
-                     let asked = state.close_windows();
-                     tracing::info!(asked, "Asked the windows to close.");
-@@ -1286,41 +1301,6 @@ pub(crate) fn init(
+-                Event::Msg(Command::TextPreedit(text, begin, end)) => {
+-                    state.preedit_text(&text, begin, end);
+-                }
+                 Event::Msg(Command::TextInputSink(sink)) => {
+                     state.text_input_report.set_sink(sink);
+                     state.tell_text_input();
+@@ -1295,41 +1307,6 @@ pub(crate) fn init(
                      state.pacing.report();
                      state.should_quit = true;
                  }
@@ -1028,7 +1004,7 @@ index 6a3c352..d7eb3ca 100644
                  Event::Msg(Command::GetSupportedDmaFormats(sender)) => {
                      let formats = Bind::<Dmabuf>::supported_formats(&state.renderer);
                      let supported_formats = match &state.output_buffer {
-@@ -1418,6 +1398,17 @@ pub(crate) fn init(
+@@ -1427,6 +1404,18 @@ pub(crate) fn init(
                  Event::Msg(Command::TouchFrame) => {
                      state.touch_frame();
                  }
@@ -1040,6 +1016,7 @@ index 6a3c352..d7eb3ca 100644
 +                    | Command::PointerButton(..)
 +                    | Command::PointerAxis(..)
 +                    | Command::TextCommit(_)
++                    | Command::TextPreedit(..)
 +                    | Command::ClipboardCopy { .. }
 +                    | Command::ClipboardPaste { .. },
 +                ) => {}
@@ -1047,13 +1024,13 @@ index 6a3c352..d7eb3ca 100644
          })
          .unwrap();
 diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
-index 442eb42..4f0837b 100644
+index 215c4db..886c10d 100644
 --- a/wayland-display-core/src/lib.rs
 +++ b/wayland-display-core/src/lib.rs
-@@ -63,6 +63,12 @@ pub enum Command {
-     /// Trial only: committed text for the client that has the keyboard (its text input, or
-     /// printable ASCII as keys).
-     TextCommit(String),
+@@ -69,6 +69,12 @@ pub enum Command {
+     TextPreedit(String, u32, u32),
+     /// Trial only: who is told about the field with the keyboard; `None`, nobody.
+     TextInputSink(Option<crate::wayland::handlers::text_input::TextInputSink>),
 +    /// Trial only (ADR 0022): press Control-C (Control-X with `cut`) for the client that has
 +    /// the keyboard and answer with the selection it sets. The nonce names the answer.
 +    ClipboardCopy { nonce: String, cut: bool },
@@ -1675,10 +1652,10 @@ index a51dbf4..6e207fd 100644
  
  impl DataDeviceHandler for State {
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
-index a5d91e4..c0a032e 100644
+index b878c84..75876c8 100644
 --- a/wayland-display-core/src/wayland/handlers/text_input.rs
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -104,6 +104,11 @@ struct Instance {
+@@ -104,14 +104,18 @@ struct Instance {
      /// What the client asked for since its last `commit`.
      pending: Option<bool>,
      enabled: bool,
@@ -1689,17 +1666,33 @@ index a5d91e4..c0a032e 100644
 +    pending_secret: Option<bool>,
      /// The surface it was told it entered, if any.
      entered: Option<WlSurface>,
+-    /// Where the text cursor is, in the surface (as the client last committed), and
+-    /// whether the field is for a password or other secret; and what is pending.
++    /// Where the text cursor is, in the surface (as the client last committed), and what is
++    /// pending. (Whether the field is for a password or other secret is `secret` above: the
++    /// preedit's report and the clipboard's refusal both go by it.)
+     rect: Option<(i32, i32, i32, i32)>,
+-    secret: bool,
+     pending_rect: Option<(i32, i32, i32, i32)>,
+-    pending_secret: Option<bool>,
  }
-@@ -123,6 +128,8 @@ impl TextInputs {
+ 
+ /// Told whenever the field with the keyboard changes: 0 none, 1 a field, 2 a password field;
+@@ -157,11 +161,11 @@ impl TextInputs {
              commits: 0,
              pending: None,
              enabled: false,
 +            secret: false,
 +            pending_secret: None,
              entered: None,
+             rect: None,
+-            secret: false,
+             pending_rect: None,
+-            pending_secret: None,
          };
          if let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) {
-@@ -158,6 +165,8 @@ impl TextInputs {
+             if same_client(&instance.object.id(), &focus.id()) {
+@@ -196,6 +200,8 @@ impl TextInputs {
              // Until the client enables it again for the new surface.
              instance.enabled = false;
              instance.pending = None;
@@ -1708,8 +1701,8 @@ index a5d91e4..c0a032e 100644
          }
          self.focus = surface;
          if let Some(focus) = &self.focus {
-@@ -184,6 +193,17 @@ impl TextInputs {
-             .then_some(focus)
+@@ -257,6 +263,17 @@ impl TextInputs {
+         true
      }
  
 +    /// Whether the client that has the keyboard has an enabled text input there that it said is
@@ -1726,7 +1719,7 @@ index a5d91e4..c0a032e 100644
      /// Hands `text` to the enabled text input of the client that has the keyboard. False when
      /// there is none.
      pub fn commit(&mut self, text: &str) -> bool {
-@@ -349,6 +369,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -467,6 +484,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
              zwp_text_input_v3::Request::Enable => {
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.pending = Some(true);
@@ -1735,24 +1728,19 @@ index a5d91e4..c0a032e 100644
                  }
              }
              zwp_text_input_v3::Request::Disable => {
-@@ -363,12 +385,25 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
-                         // Only a text input that was told it entered a surface may be enabled.
-                         instance.enabled = enable && instance.entered.is_some();
+@@ -493,7 +512,6 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                         instance.secret = secret;
                      }
-+                    if let Some(secret) = instance.pending_secret.take() {
-+                        instance.secret = secret;
-+                    }
-+                }
-+            }
-+            zwp_text_input_v3::Request::SetContentType { purpose, .. } => {
-+                use smithay::reexports::wayland_server::WEnum;
-+                use zwp_text_input_v3::ContentPurpose;
-+                if let Some(instance) = state.text_inputs.instance(resource) {
-+                    instance.pending_secret = Some(matches!(
-+                        purpose,
-+                        WEnum::Value(ContentPurpose::Password | ContentPurpose::Pin)
-+                    ));
                  }
+-                state.tell_text_input();
+             }
+             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
+                 if let Some(instance) = state.text_inputs.instance(resource) {
+@@ -517,11 +535,12 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                 if let Some(instance) = state.text_inputs.instance(resource) {
+                     instance.pending_secret = Some(secret_purpose || secret_hint);
+                 }
++                state.tell_text_input();
              }
              zwp_text_input_v3::Request::Destroy => {
                  state.text_inputs.remove(&resource.id());
