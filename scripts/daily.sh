@@ -1006,7 +1006,8 @@ SCRIPT
     if [ -n "$KEY_RECORD" ]; then
         # For checks with synthetic keys only: the keyboard's lines of Wayland's debug output, nothing else.
         : > "$run/key-events.log"; chmod 600 "$run/key-events.log"
-        record="2> >(grep --line-buffered -oE 'wl_keyboard[@#][0-9]+\\.(enter|leave|key)\\([^)]*\\)' > $run/key-events.log)"
+        # And the names (never the arguments) of the text-input requests and events.
+        record="2> >(grep --line-buffered -oE 'wl_keyboard[@#][0-9]+\\.(enter|leave|key)\\([^)]*\\)|zwp_text_input_(manager_)?v3[@#][0-9]+\\.[a-z_]+' > $run/key-events.log)"
     fi
     # A session bus of the application's own (the owner's decision, 2026-11-18): a question of a
     # portal or a keyring is shown inside the trial's window, or not at all, never on the desk,
@@ -1045,7 +1046,7 @@ CONF
 # instead, and on a session bus of its own, so that no dialog of the desk (a portal, a keyring)
 # opens there for it.
 unset DISPLAY DBUS_SESSION_BUS_ADDRESS
-export WAYLAND_DISPLAY=$sock XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland MOZ_ENABLE_WAYLAND=1 XDG_SESSION_TYPE=wayland GTK_USE_PORTAL=0 NO_AT_BRIDGE=1
+export WAYLAND_DISPLAY=$sock XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR GDK_BACKEND=wayland GTK_IM_MODULE=wayland QT_QPA_PLATFORM=wayland MOZ_ENABLE_WAYLAND=1 XDG_SESSION_TYPE=wayland GTK_USE_PORTAL=0 NO_AT_BRIDGE=1
 # The language and the desktop of the owner's desk session, and nothing of the trial's LC_ALL=C.
 unset LC_ALL LANG LANGUAGE \$(compgen -e | grep '^LC_') XDG_CURRENT_DESKTOP
 ${desk:+export $desk}
