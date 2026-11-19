@@ -440,5 +440,6 @@ Istesso の ADR 0022（`trial-daily-clipboard` ブランチ）の、Ubuntu の�
   - text-input の限った入り直し（`gwd-trial27`）は、変えていない。
 - trial-y-scroll は、その上で、そのまま当たった（`PointerScroll` も `take_input` を通る）。
 - ホストのビルド `~/.cache/istesso-scroll-wip/gwd-trial31`（`--trial --test`）：コンポジターの試験 137 本（text-input と前の修正の 112 本、clipboard の 17 本、scroll の 8 本）が全部通った（14:56 に終わった）。`check-plugin.sh` は試用と言う（1）。関門の `gwd-cursor` は 0。
+- `aa39292`（パスワードの欄には変換中の文字を渡さない。消すのは通す）をマージして、`~/.cache/istesso-scroll-wip/gwd-trial32`（`--trial --test`、15:00 に終わった）：修正はそのまま当たり、試験 137 本が全部通った。`check-plugin.sh` は 1、関門の `gwd-cursor` は 0。**試用の既定はこれ**（`gwd-trial31` は、その前の版）。
 - この流れの前の `~/.cache/istesso-scroll-wip/gwd-trial29`（`0f37c3c` より前の text-input）は、使わない。clipboard の流れの `~/.cache/istesso-compositor-wip/gwd-trial29` とは別のもの。
 
