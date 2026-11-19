@@ -421,6 +421,17 @@ impl Host {
         watchers.list.iter().filter(open).count()
     }
 
+    /// Paired display names of the devices currently watching. No connection identifiers.
+    pub fn viewer_names(&self) -> Vec<String> {
+        self.shared
+            .watchers()
+            .list
+            .iter()
+            .filter(|watcher| !watcher.closed.load(Ordering::SeqCst))
+            .map(|watcher| watcher.peer.name.clone())
+            .collect()
+    }
+
     /// Sends one encoded frame to every viewer that can decode it. Never
     /// waits for a viewer: what a connection does not take at once is
     /// finished by that viewer's own thread ([`Sent::queued`]).

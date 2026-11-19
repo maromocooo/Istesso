@@ -25,10 +25,11 @@ output=${1:-"$here/build"}
 bundle="$output/Istesso Dev Daily Host.app"
 
 (cd "$repo" && cargo build --release -p istesso-media >&2)
-mkdir -p "$bundle/Contents/MacOS"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+cp "$here/stop-slots.sh" "$bundle/Contents/Resources/"
 swiftc -O -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.2 \
     -import-objc-header "$here/bridge.h" -I "$repo/crates/istesso-media/include" \
-    -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" "$here/clipboard.swift" "$here/inline.swift" "$here/../input-method/wire.swift" \
+    -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" "$here/clipboard.swift" "$here/inline.swift" "$here/menu-bar.swift" "$here/../input-method/wire.swift" \
     "$repo/target/release/libistesso_media.a" -liconv \
     -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
     -framework AppKit -framework ApplicationServices -framework Carbon -framework Security

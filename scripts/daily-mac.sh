@@ -62,6 +62,7 @@
 #                        through the session, the host's own pointer moves; presses and scrolls only
 #                        onto the application's own windows. 1 (default for --display): to the
 #                        process only; keys and text arrive, clicks do not (docs/m4-daily-host.md)
+#   DAILY_MENU_BAR=1    show connected viewers and Stop in the host menu bar
 #   DAILY_HOST_EXTRA     more arguments for the host program, for checks (e.g. --generated --input-dry)
 #   DAILY_HOST_DIRECT=1  for checks with a stand-in host only: start the host program's executable
 #                        itself instead of through `open` (it then has no permission of its own)
@@ -157,19 +158,9 @@ case "$DIR" in "~/"*) ;; *) echo "fail the trial's folder on the host is not a ~
 D="$HOME/${DIR#\~/}"
 mkdir -p "$D/run"
 write_down() { echo "$2 $(LC_ALL=C ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
-still_runs() {
-    [ -s "$1" ] || return 1
-    local pid started
-    read -r pid started < "$1"
-    [ -n "$pid" ] && [ -n "$started" ] && [ "$(echo $(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null))" = "$(echo $started)" ]
-}
-number_in() { local pid _; read -r pid _ < "$1"; echo "$pid"; }
-stop_written_down() {
-    still_runs "$1" || return 0
-    kill "$(number_in "$1")" 2>/dev/null
-    local i
-    for i in $(seq 1 30); do still_runs "$1" || return 0; sleep 0.1; done
-}
+HOST
+    cat "$repo/macos/daily-host/stop-slots.sh"
+    cat <<'HOST'
 signal_busy() { [ "$(cut -d' ' -f1 ~/.local/state/istesso/measuring 2>/dev/null)" = busy ]; }
 prompt_owners() {
     local LC_ALL=C owner count=0
@@ -327,6 +318,8 @@ do_open() {
         clipboard_agent="--clipboard"; clipboard_host="--clipboard"; clipboard_on=1
     fi
     # Composing text inline (ADR 0023, trial only): only with DAILY_INLINE=1, the application form only.
+    local menu_bar_arg=""
+    if [ "${DAILY_MENU_BAR:-}" = 1 ] && [ -z "${DAILY_HOST_DIRECT:-}" ]; then menu_bar_arg="--menu-bar"; fi
     local inline_host=""
     if [ "${DAILY_INLINE:-}" = 1 ] && [ "$for_whom" != aura ] && [ -z "$display" ] && [[ "${DAILY_HOST_EXTRA:-}" != *--generated* ]]; then
         inline_host="--inline"
@@ -406,9 +399,9 @@ else
     fi
     # A new document never comes with the application's old windows (restored at its launch).
     set -- "\$@" $target_args \${document:+--document "\$document" --no-restore} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        $size_arg $virtual_arg $clipboard_host $inline_host --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg $virtual_arg $clipboard_host $inline_host $menu_bar_arg --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
-        nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
+        DAILY_HOST_DIRECT=1 nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else
         open -n -g --stdout "\$run/host.log" --stderr "\$run/host.err" "\$D/$bundle_name" --args "\$@"
     fi
@@ -697,11 +690,7 @@ HOST
 
 do_stop() {
     on_host <<'HOST'
-for run in "$D"/run/*/; do
-    [ -d "$run" ] || continue
-    stop_written_down "$run/host.pid"
-    stop_written_down "$run/agent.pid"
-done
+stop_slots "$D/run"
 echo "host: every host program and agent of the trial is stopped; the applications stay open"
 HOST
     local mine

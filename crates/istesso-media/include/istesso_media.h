@@ -210,6 +210,11 @@ void istesso_media_host_offer(const IstessoMediaHost *host, int32_t offered);
 /* Devices that are being shown the picture now. */
 uint32_t istesso_media_host_viewers(const IstessoMediaHost *host);
 
+/* Calls visit synchronously for each connected viewer's paired display name.
+ * Its UTF-8 bytes are borrowed for that visit only. */
+void istesso_media_host_viewer_names(const IstessoMediaHost *host, void *context,
+                                    void (*visit)(void *, const uint8_t *, size_t));
+
 /* Ends every stream and stops listening. No other thread may be using `host`. */
 void istesso_media_host_close(IstessoMediaHost *host);
 

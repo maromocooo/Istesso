@@ -105,6 +105,7 @@ struct Settings {
     /// Start with a new window of the application's own (Command-N to its process once it is in
     /// front), never with what it opens by itself; the new window is the one shown.
     var newWindow = false
+    var menuBar = ProcessInfo.processInfo.environment["DAILY_MENU_BAR"] == "1"
     /// Copy and paste of text with the trial agent (ADR 0022); off unless asked for.
     var clipboard = false
     /// Composing text inline in the application through Istesso Dev Input (ADR 0023, inline.swift);
@@ -121,7 +122,7 @@ func usage() -> Never {
            [--bitrate KBIT] [--keep-awake FPS] [--min-qp N] [--input-socket PATH] [--input-dry]
            [--control FIFO] [--log FILE|-] [--no-fit-window] [--click-form 1|2|3] [--generated]
            [--pid-file FILE] [--signal FILE] [--system-prompt-owner BUNDLE_ID]...
-           [--inline [--inline-local-idle SECONDS]]
+           [--menu-bar] [--inline [--inline-local-idle SECONDS]]
 
     """.utf8))
     exit(2)
@@ -186,6 +187,7 @@ func readSettings() -> Settings {
         case "--virtual-slot": s.virtualSlot = max(1, min(3, number()))
         case "--new-window": s.newWindow = true
         case "--clipboard": s.clipboard = true
+        case "--menu-bar": s.menuBar = true
         case "--inline": s.inline = true
         case "--inline-local-idle": s.inlineIdle = Double(max(1, min(60, number())))
         default: usage()
@@ -427,6 +429,19 @@ final class Transport {
     }
     var closed: Bool { guarded.isClosed }
     var viewers: Int { guarded.use { Int(istesso_media_host_viewers(native)) } ?? 0 }
+    var viewerNames: [String] {
+        guarded.use {
+            var names: [String] = []
+            withUnsafeMutablePointer(to: &names) { buffer in
+                istesso_media_host_viewer_names(native, buffer) { context, bytes, count in
+                    guard let context, let bytes else { return }
+                    context.assumingMemoryBound(to: [String].self).pointee.append(
+                        String(decoding: UnsafeBufferPointer(start: bytes, count: count), as: UTF8.self))
+                }
+            }
+            return names
+        } ?? []
+    }
     /// Ends every stream and stops listening; nothing reaches the native host afterwards.
     func close() { guarded.close { istesso_media_host_close(native) } }
     func keyFrameWanted() -> Bool { guarded.use { istesso_media_host_key_frame_wanted(native) != 0 } ?? false }
@@ -1659,6 +1674,7 @@ func selfTest() -> Never {
     func checkPanel(_ got: Bool, _ want: Bool, _ what: String) {
         if got != want { failed += 1; print("FAIL \(what)") } else { print("ok   \(what)") }
     }
+    menuBarSelfTest(checkPanel)
     do {
         let owner = "com.example.prompt" // check-private: ok synthetic bundle identifier
         let other = "com.example.other" // check-private: ok synthetic bundle identifier
@@ -2697,6 +2713,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var offered = true
     var inputSocket: Int32 = -1
     var timers: [DispatchSourceTimer] = []
+    var menuBar: HostMenuBar?
     var promptMonitor: SystemPromptMonitor?
     var mayCapture = false
     /// The inline composition (--inline only), and the kind 5 said last (told again to a new stream).
@@ -2722,9 +2739,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             self?.injector.releaseAll()
         }
         // Something held, and no input for 8 s: a release was lost on the way; let go.
+        if settings.menuBar && !settings.generated && !settings.inputDry &&
+            ProcessInfo.processInfo.environment["DAILY_HOST_DIRECT"] == nil && Bundle.main.bundleURL.pathExtension == "app" {
+            menuBar = HostMenuBar(.main, pidFile: settings.pidFile)
+            if menuBar == nil { note("cannot initialize the daily host menu") }
+            refreshMenu()
+        }
         let watchdog = DispatchSource.makeTimerSource(queue: .main)
         watchdog.schedule(deadline: .now() + 1, repeating: .seconds(1))
         watchdog.setEventHandler { [weak self] in
+            self?.refreshMenu()
             self?.keepAwakeAndTellLock()
             self?.manageVirtualDisplay()
             self?.injector.releaseStaleModifiers(olderThan: 8)
@@ -2752,8 +2776,27 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard menuBar != nil else { return .terminateNow }
+        // A standalone bundle has no launcher PID receipt. Its quit request uses the same cleanup.
+        raise(SIGTERM)
+        return .terminateLater
+    }
+
+    private func refreshMenu() {
+        guard let menuBar else { return }
+        let name: String
+        switch settings.target {
+        case .display: name = "画面全体"
+        case .app: name = app?.localizedName ?? "アプリ"
+        }
+        let showing = !stopping && picture == "running" && !detached && !heldForSignal && !restarting
+        menuBar.tick(app: name, devices: showing ? transport?.viewerNames ?? [] : [])
+    }
+
     func quit(_ code: Int32) {
         stopping = true
+        menuBar = nil
         inline?.shutdown()
         promptMonitor?.stop()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(code) }
@@ -4070,6 +4113,8 @@ for name in [SIGTERM, SIGINT] {
     signal(name, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: name, queue: .main)
     source.setEventHandler {
+        guard !daily.stopping else { return }
+        daily.menuBar = nil
         daily.injector.releaseAll()
         // Istesso's input source is let go of before anything else (the Mac's own keyboard).
         daily.stopping = true

@@ -528,6 +528,23 @@ pub unsafe extern "C" fn istesso_media_host_viewers(host: *const IstessoMediaHos
 }
 
 /// # Safety
+/// `host` as above. For the duration of this call, `visit` must accept a
+/// borrowed UTF-8 name and the caller's context. No host lock is held during visits.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_viewer_names(
+    host: *const IstessoMediaHost,
+    context: *mut std::ffi::c_void,
+    visit: extern "C" fn(*mut std::ffi::c_void, *const u8, usize),
+) {
+    // SAFETY: the caller's promise.
+    if let Some(host) = unsafe { host.as_ref() } {
+        for name in host.host.viewer_names() {
+            visit(context, name.as_ptr(), name.len());
+        }
+    }
+}
+
+/// # Safety
 /// `host` is null or came from `istesso_media_host_listen`, is not in use
 /// on another thread, and is not used again.
 #[no_mangle]
@@ -1278,6 +1295,7 @@ mod tests {
                 assert!(began.elapsed() < Duration::from_secs(5));
                 std::thread::sleep(Duration::from_millis(5));
             }
+            assert_eq!((*host).host.viewer_names(), ["device"]); // check-private: ok synthetic paired device
             assert_eq!(istesso_media_host_key_frame_wanted(host), 1);
 
             let picture: Vec<u8> = (0..140_000u32).map(|i| (i % 253) as u8).collect();
@@ -1314,6 +1332,7 @@ mod tests {
             // Not offered for a moment: nobody watches, and the port takes no caller.
             istesso_media_host_offer(host, 0);
             assert_eq!(istesso_media_host_viewers(host), 0);
+            assert!((*host).host.viewer_names().is_empty());
             assert_eq!(istesso_media_client_next(client, 5000, &mut frame), -1);
             istesso_media_client_close(client);
             let refused = istesso_media_client_connect(
