@@ -51,6 +51,11 @@ final class Settings {
         prefs.edit().putString(name(h, "host"), host.trim()).apply();
     }
 
+    /** Lets go of this section's pinned device. The pairing itself (the list of paired devices) stays. */
+    void clearPaired(Host h) {
+        prefs.edit().remove(name(h, "host_id")).remove(name(h, "host_name")).apply();
+    }
+
     void setPaired(Host h, String id, String peerName) {
         prefs.edit().putString(name(h, "host_id"), id).putString(name(h, "host_name"), peerName).apply();
     }

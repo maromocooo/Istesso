@@ -91,6 +91,11 @@ public final class MainActivity extends Activity {
         column.addView(s.status);
         showPaired(s);
 
+        Button unpin = new Button(this);
+        unpin.setText(R.string.unpin);
+        unpin.setOnClickListener(v -> unpin(s));
+        column.addView(unpin);
+
         // The host's applications, one panel each (the owner's decision, 2026-11-18). Choosing one
         // that has a panel already brings that panel to the front.
         TextView apps = new TextView(this);
@@ -147,6 +152,10 @@ public final class MainActivity extends Activity {
                 if (joined != null && joined.length == 2 && pairedElsewhere(s.host, joined[0])) {
                     // The same device for two hosts: both sections would show one host's applications.
                     s.status.setText(R.string.same_host_twice);
+                } else if (joined != null && joined.length == 2 && !s.host.expectedName.equals(joined[1])) {
+                    // A name other than the one this section's host gives itself: perhaps the other
+                    // host's code was typed here. Pinned only when the person says so.
+                    confirmPin(s, joined[0], joined[1]);
                 } else if (joined != null && joined.length == 2) {
                     // Pinned for this host only: its panels connect to this device and no other.
                     settings.setPaired(s.host, joined[0], joined[1]);
@@ -156,6 +165,37 @@ public final class MainActivity extends Activity {
                 }
             });
         }, "istesso-pair").start();
+    }
+
+    /** Asks whether a device of an unexpected name is this section's host before it is pinned. */
+    private void confirmPin(Section s, String id, String name) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(R.string.pin_check_title)
+                .setMessage(getString(R.string.pin_check, name, getString(s.host.labelRes), s.host.expectedName))
+                .setPositiveButton(R.string.pin_check_yes, (d, w) -> {
+                    settings.setPaired(s.host, id, name);
+                    showPaired(s);
+                })
+                .setNegativeButton(R.string.pin_check_no, (d, w) -> s.status.setText(getString(R.string.pin_not_used, name)))
+                .setCancelable(false)
+                .show();
+    }
+
+    /** Lets go of the section's pinned device, after asking. */
+    private void unpin(Section s) {
+        String name = settings.hostName(s.host);
+        if (name.isEmpty()) {
+            s.status.setText(R.string.not_paired);
+            return;
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setMessage(getString(R.string.unpin_check, name, getString(s.host.labelRes)))
+                .setPositiveButton(R.string.unpin_yes, (d, w) -> {
+                    settings.clearPaired(s.host);
+                    showPaired(s);
+                })
+                .setNegativeButton(R.string.pin_check_no, null)
+                .show();
     }
 
     /** Whether another host's section is paired with the device `id` already. */

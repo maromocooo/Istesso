@@ -42,6 +42,14 @@
     <string name="host_ubuntu">Ubuntu のホスト</string>
     <string name="host_mac">Mac のホスト（Mac Studio）</string>
     <string name="same_host_twice">この相手は、もう一方の節のホストとしてペアにしてあります。ホストごとに別の相手にしてください</string>
+    <string name="pin_check_title">この節のホストですか？</string>
+    <string name="pin_check">ペアになった相手は「%1$s」です。「%2$s」の節では、ふつう「%3$s」です（ホストで打つ 1 行の --name）。ほかのホストのコードを入れていませんか？この節の相手にしますか？</string>
+    <string name="pin_check_yes">この節の相手にする</string>
+    <string name="pin_check_no">やめる</string>
+    <string name="pin_not_used">「%1$s」とはペアになりましたが、この節の相手にはしていません</string>
+    <string name="unpin">この節のペアの相手を外す</string>
+    <string name="unpin_check">「%2$s」の節から、ペアの相手「%1$s」を外しますか？（ペアそのものは残ります。この節は、ペアにし直すまで使えません）</string>
+    <string name="unpin_yes">外す</string>
     <string name="app_mac_slot">枠 %1$d</string>
     <string name="apps_title_mac">Mac のホストのアプリ（Mac で `daily-mac.sh open アプリ --for aura --slot N` で開いた枠を選ぶ。同時に 3 つまで）</string>
 </resources>
