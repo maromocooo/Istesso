@@ -6,8 +6,9 @@
 //! least every second. Nothing about the folder's contents is written down:
 //! only how many questions, how many bytes were read, and how it ended.
 
-use std::net::TcpStream;
-use std::sync::mpsc;
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use istesso_link::mount::{decode_question, encode};
@@ -20,8 +21,11 @@ use super::export::Export;
 pub const SILENCE: Duration = Duration::from_secs(60);
 /// How often the device's right is looked up again.
 pub const RECHECK: Duration = Duration::from_secs(1);
-/// How long sending one answer may take.
-const SEND_WITHIN: Duration = Duration::from_secs(10);
+/// How long sending one whole answer may take. A device that does not read
+/// its answers for this long is let go. (The socket's own write timeout
+/// counts from the last progress, so it is not enough: a watchdog shuts the
+/// connection.)
+pub const SEND_WITHIN: Duration = Duration::from_secs(5);
 
 /// How a shown folder's conversation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +93,24 @@ pub fn serve(
         }
     });
 
+    // The watchdog: when one answer has been on its way for longer than
+    // SEND_WITHIN, the connection is shut and the send fails.
+    let sending: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let over = Arc::new(AtomicBool::new(false));
+    let watching = writer.stream().try_clone().ok().map(|stream| {
+        let (sending, over) = (sending.clone(), over.clone());
+        std::thread::spawn(move || {
+            while !over.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(200));
+                let since = *sending.lock().unwrap_or_else(|e| e.into_inner());
+                if since.is_some_and(|at| at.elapsed() > SEND_WITHIN) {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+        })
+    });
+
     let mut checked = Instant::now();
     loop {
         if checked.elapsed() >= RECHECK {
@@ -106,7 +128,10 @@ pub fn serve(
                 };
                 served.questions += 1;
                 let (answer, data) = export.handle(question);
-                if writer.send(&encode(&answer, &data)).is_err() {
+                *sending.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                let sent = writer.send(&encode(&answer, &data));
+                *sending.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                if sent.is_err() {
                     served.end = Ending::DeviceGone;
                     break;
                 }
@@ -118,8 +143,16 @@ pub fn serve(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+    // Let the listening thread go whatever it waits for: a send to the full
+    // queue fails once the queue's receiver is gone, and a wait for the
+    // device's next frame ends when the connection is shut in both directions.
+    drop(arrived);
     writer.shut_down();
     let _ = listening.join();
+    over.store(true, Ordering::SeqCst);
+    if let Some(watching) = watching {
+        let _ = watching.join();
+    }
     served.bytes_read = export.bytes_read;
     served.lasted = began.elapsed();
     served

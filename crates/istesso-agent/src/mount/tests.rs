@@ -893,3 +893,73 @@ fn an_entry_no_longer_stored_under_its_name_is_missing() {
     // The new spellings are reached as they are stored.
     assert!(lookup_path(&mut export, "Docs/NOTES.txt").is_ok());
 }
+
+/// A device that sends questions without reading the answers fills the
+/// connection; the host gives up sending within `SEND_WITHIN`, and the
+/// conversation (and its slot) ends although the thread that listens is
+/// waiting to hand over more questions.
+#[test]
+fn a_device_that_does_not_read_its_answers_is_let_go() {
+    use istesso_link::mount::encode;
+    let base = TempDir::new("mount-flood");
+    let (root, _) = project(base.path());
+    let pair = MountPair::new(
+        "mount-flood",
+        Setup {
+            folder: &root,
+            allow_device: true,
+            show_ignored: false,
+        },
+    );
+    let mut client = pair.connect();
+    assert!(matches!(
+        client.open_mount("proj").unwrap(),
+        MountAnswer::Open { .. }
+    ));
+    let mut channel = client.into_channel();
+    // Find the big file, then ask for it again and again without reading.
+    channel
+        .send(&encode(
+            &Question::Lookup {
+                dir: ROOT_ID,
+                name: b"big.bin".to_vec(),
+            },
+            b"",
+        ))
+        .unwrap();
+    let (answer, _) = istesso_link::mount::decode_answer(&channel.recv().unwrap()).unwrap();
+    let Answer::Found { id, .. } = answer else {
+        panic!("unexpected: {answer:?}")
+    };
+    let _ = channel
+        .stream()
+        .set_write_timeout(Some(Duration::from_millis(200)));
+    let began = Instant::now();
+    for _ in 0..200 {
+        let read = encode(
+            &Question::Read {
+                id,
+                offset: 0,
+                count: MAX_READ,
+            },
+            b"",
+        );
+        if channel.send(&read).is_err() {
+            break;
+        }
+    }
+    let bound = super::host::SEND_WITHIN + Duration::from_secs(5);
+    while !pair
+        .log()
+        .iter()
+        .any(|line| line.starts_with("stopped showing"))
+    {
+        assert!(
+            began.elapsed() < bound,
+            "the conversation did not end: {:?}",
+            pair.log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(channel);
+}
