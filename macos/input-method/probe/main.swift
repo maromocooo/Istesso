@@ -6,9 +6,9 @@
 //                                         from the script (or standard input), prints its answers
 //   istesso-ime-probe register            TISRegisterInputSource on the placed bundle (no enable,
 //                                         no select)
-//   istesso-ime-probe select              selects Istesso Dev Input (after the owner added it);
-//                                         prints the source that was selected before
-//   istesso-ime-probe restore <id>        selects that source again
+//   istesso-ime-probe select              selects Istesso Dev Input (after the owner added it),
+//                                         writing down the source selected before
+//   istesso-ime-probe restore             puts that source back ("restored: yes/no")
 //   istesso-ime-probe secure              is the focused element a password field (needs
 //                                         Accessibility; says "unknown" without it), and is secure
 //                                         event input on
@@ -18,7 +18,7 @@
 //                                         byte-to-UTF-16 selection
 //
 // Commands: `mark <sel start byte> <sel end byte> <text>`, `commit <text>`, `clear`, `caret`,
-// `wait <seconds>`, `burst <n> ack|noack`, `click <dx> <dy>`, `drop`, `post-access`,
+// `wait <seconds>`, `connected <seconds> <idle seconds>`, `burst <n> ack|noack`, `click <dx> <dy>`, `drop`, `post-access`,
 // `check at <location> <text>`, `check marked <text>` / `check before <text>` (TextEdit only: does the marked
 // text, or the text just before the caret, hash the same as <text>). Text is never printed back: the answers carry lengths and rectangles only.
 import AppKit
@@ -75,26 +75,65 @@ func register() {
 }
 
 func select() {
-    guard let source = ourSources().first(where: { property($0, kTISPropertyInputSourceIsSelectCapable) ?? false }) else {
-        fail("Istesso Dev Input is not installed or cannot be selected")
-    }
-    guard property(source, kTISPropertyInputSourceIsEnabled) ?? false else {
+    guard let source = ourSources().first(where: { property($0, kTISPropertyInputSourceIsEnabled) ?? false }) else {
         fail("Istesso Dev Input is not enabled: the owner adds it in System Settings > Keyboard > Input Sources")
     }
-    let before = currentSourceID()
-    let result = TISSelectInputSource(source)
-    print("before: \(before)")
-    print("select: \(result == noErr ? "ok" : "error \(result)")")
+    _ = source
+    print("select: \(switchToIstesso() ? "ok" : "not effective")")
 }
 
-func restore(_ id: String) {
-    let filter = [kTISPropertyInputSourceID as String: id] as CFDictionary
-    guard let source = (TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource])?.first else {
-        fail("no enabled source with that identifier")
-    }
-    let result = TISSelectInputSource(source)
-    print("restore: \(result == noErr ? "ok" : "error \(result)")")
+/// `restore`: puts back the source written down by `select` or a connection.
+func restoreCommand() { restoreOriginal("asked") }
+
+// MARK: - Switching while a viewer is connected (ADR 0023, 2.)
+
+/// Where the source selected before Istesso's is kept while Istesso's is selected, so that the
+/// next start after a crash puts it back. In the host's private socket folder (0700).
+func previousSourceFile() -> String? {
+    guard let path = Wire.defaultSocketPath() else { return nil }
+    return ((path as NSString).deletingLastPathComponent as NSString).appendingPathComponent("previous-source")
 }
+
+func source(withID id: String) -> TISInputSource? {
+    let filter = [kTISPropertyInputSourceID as String: id] as CFDictionary
+    return (TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource])?.first
+}
+
+/// Selects Istesso's source, after writing down the one selected now. True when the system says
+/// Istesso's is the current source afterwards (the menu-bar icon alone is not enough: the host goes
+/// inline only after the input source itself says "active").
+func switchToIstesso() -> Bool {
+    guard let ours = source(withID: Wire.inputMethodIdentifier), let file = previousSourceFile() else { return false }
+    let before = currentSourceID()
+    if before != Wire.inputMethodIdentifier {
+        guard (try? before.write(toFile: file, atomically: true, encoding: .utf8)) != nil else { return false }
+        chmod(file, 0o600)
+    }
+    _ = TISSelectInputSource(ours)
+    return currentSourceID() == Wire.inputMethodIdentifier
+}
+
+/// Puts back the source written down before, and forgets it. "restored" is read back from the
+/// system; the identifier itself is not printed.
+@discardableResult
+func restoreOriginal(_ why: String) -> Bool {
+    guard let file = previousSourceFile(), let id = try? String(contentsOfFile: file, encoding: .utf8) else { return true }
+    var restored = false
+    if let original = source(withID: id) {
+        _ = TISSelectInputSource(original)
+        restored = currentSourceID() == id
+    }
+    if restored { unlink(file) }
+    print("restored (\(why)): \(restored ? "yes" : "no")")
+    return restored
+}
+
+/// Seconds since this Mac's own keyboard was last pressed (the HID system's state: keys the host
+/// posts to a process do not count).
+func localKeyboardIdle() -> Double {
+    CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown)
+}
+
 
 /// The focused element's subrole, read through Accessibility: a password field must never get
 /// composing text (the client then sends plain keys without its input method).
@@ -322,6 +361,39 @@ final class Session {
             guard words.count >= 2 else { return }
             let answer = ask(["op": "commit", "text": words.dropFirst().joined(separator: " "), "comp": comp - 1])
             print("stale refused: \((answer?["why"] as? String) == "stale")")
+        case "connected":
+            // `connected <seconds> <idle seconds>`: the switching rule for one connection.
+            // Istesso's source while the viewer is connected; as soon as this Mac's own keyboard
+            // types, the original source back and the strip; Istesso's again only after the local
+            // keyboard has been idle <idle seconds>. Inline only after "active" names TextEdit.
+            guard words.count == 3, let seconds = Double(words[1]), let idle = Double(words[2]) else { print("connected: bad arguments"); return }
+            let began = Date()
+            var ours = currentSourceID() == Wire.inputMethodIdentifier
+            var inline = false
+            func say(_ text: String) { print(String(format: "%7.2f s ", Date().timeIntervalSince(began)) + text) }
+            while Date().timeIntervalSince(began) < seconds {
+                let localIdle = localKeyboardIdle()
+                if localIdle < idle {
+                    if ours {
+                        restoreOriginal("local typing")
+                        ours = false
+                        inline = false
+                        say("local typing: original source, strip")
+                    }
+                } else if !ours {
+                    ours = switchToIstesso()
+                    say("local idle \(String(format: "%.1f", localIdle)) s: Istesso's selected: \(ours); strip until active")
+                }
+                for m in read(until: nil, timeout: 0.1) {
+                    if m["op"] as? String == "active" {
+                        let was = inline
+                        inline = ours && (m["client"] as? String) == "com.apple.TextEdit" && (m["ok"] as? Bool) == true
+                        if inline != was { say(inline ? "active in TextEdit: inline" : "active elsewhere: strip") }
+                    }
+                    if m["op"] as? String == "inactive", inline { inline = false; say("inactive: strip") }
+                }
+            }
+            restoreOriginal("disconnect")
         case "drop":
             // The host goes away during a composition, and the input method comes back.
             close(fd)
@@ -366,6 +438,8 @@ func serve(script: String?) {
     guard let path = Wire.defaultSocketPath() else { fail("no temporary folder") }
     let listener = listen(at: path)
     defer { close(listener); unlink(path) }
+    // A source written down and not put back means the last run ended without restoring.
+    if let file = previousSourceFile(), access(file, F_OK) == 0 { restoreOriginal("start after a crash") }
     print("waiting for Istesso Dev Input (it connects once a second while it runs)")
     guard let fd = acceptInputMethod(listener, timeout: 60) else { fail("Istesso Dev Input did not connect in 60 s") }
     let session = Session(listener: listener, fd: fd)
@@ -381,6 +455,7 @@ func serve(script: String?) {
         session.run(line)
     }
     close(session.fd)
+    restoreOriginal("end")
 }
 
 // MARK: - Self-test
@@ -460,9 +535,9 @@ switch arguments.dropFirst().first {
 case "status": status()
 case "select": select()
 case "register": register()
-case "restore" where arguments.count == 3: restore(arguments[2])
+case "restore": restoreCommand()
 case "secure": secure()
 case "serve": serve(script: arguments.count == 3 ? arguments[2] : nil)
 case "self-test" where arguments.count == 3: selfTest(arguments[2])
-default: fail("usage: status | serve [script] | select | restore <id> | secure | self-test <input method binary>")
+default: fail("usage: status | register | serve [script] | select | restore | secure | self-test <input method binary>")
 }
