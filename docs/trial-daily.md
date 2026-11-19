@@ -16,12 +16,12 @@
 - **中継（Mac）とエージェント（ホスト）は、同じ統合版から**：新しい中継と古いエージェントでは、日本語は送られない（中継が、数だけを書いて知らせる）。古い中継と新しいエージェントは、かまわない。なので、統合のあとは `scripts/daily.sh setup` で、両方をそろえる。
 
 - 毎回のマージのあとに：`cargo fmt`、`cargo clippy --workspace --all-targets -D warnings`、触ったクレートのテスト、ビューアーのビルド（`keys-test`、`text-input-test` を含む）、3 つ目のあとは `daily_flow_test.py`（15 件）。どれも通った。
-- コンポジターの既定のプラグインは `gwd-trial31`（2026-11-19。文字入力（アプリの中の変換中の文字を含む）、コピーと貼り付け、スクロールの種類と段階を 1 つにしたビルド。スクロールの流れが作った。ホストの `~/.cache/istesso-scroll-wip/gwd-trial31`、ブランチ `m3-compositor-trial2` の `bba26db`、コンポジターの試験 137 件。修正の一覧は `base`、`features`、`render-on-commit`、`cursor-messages`、`windows`、`dialogs`、`trial-windows`、`trial-x-text-input`、`trial-y-clipboard`、`trial-y-scroll`。その前は `gwd-trial27`：日本語の流れの、文字入力の修正の版。GTK のエディターがセッションを戻したときの、限った text-input の入り直しを含む）。ホストに写すのは、持ち主のひとことのあとの `scripts/daily.sh setup`（写すまでは、前に写したプラグインのまま）。
+- コンポジターの既定のプラグインは `gwd-trial32`（2026-11-19。文字入力（アプリの中の変換中の文字と、パスワードの欄では変換中の文字を受けないこと）、コピーと貼り付け、スクロールの種類と段階を 1 つにしたビルド。スクロールの流れが作った。ホストの `~/.cache/istesso-scroll-wip/gwd-trial32`、ブランチ `m3-compositor-trial2` の `223a9df`、コンポジターの試験 137 件。`check-plugin.sh` は、試用のビルドとして断る。その前の既定は `gwd-trial31`（`bba26db`。パスワードの欄の断りがない）。修正の一覧は `base`、`features`、`render-on-commit`、`cursor-messages`、`windows`、`dialogs`、`trial-windows`、`trial-x-text-input`、`trial-y-clipboard`、`trial-y-scroll`。その前は `gwd-trial27`：日本語の流れの、文字入力の修正の版。GTK のエディターがセッションを戻したときの、限った text-input の入り直しを含む）。ホストに写すのは、持ち主のひとことのあとの `scripts/daily.sh setup`（写すまでは、前に写したプラグインのまま）。
 
 ### 文字のコピーと貼り付け（2026-11-19、[ADR 0022](adr/0022-clipboard-text.md)）
 
 - Air の窓で ⌘C、⌘X、⌘V を押したときだけ、ホストのアプリとのあいだで文字（64 KiB まで）を運ぶ。ホストのアプリがパスワードの欄なら運ばない。Air で秘密の印が付いたものは貼らない。窓の題に、短く理由が出る（2 秒）。
-- ブランチ `trial-daily-clipboard`。ビューアーは `ISTESSO_CLIPBOARD=1`、中継は相手が受けると言ったときだけ送る、試用のエージェントは `--clipboard`、パイプラインは `daily-pipeline.py --clipboard`、コンポジターは `trial-y-clipboard` の入ったもの（クリップボードの流れの `gwd-trial29`。統合した試用版の既定は、3 つを 1 つにした `gwd-trial31`）。どれかが古いと、⌘C と ⌘V は、これまでどおりのキーになる（ホストの中だけのコピー）。
+- ブランチ `trial-daily-clipboard`。ビューアーは `ISTESSO_CLIPBOARD=1`、中継は相手が受けると言ったときだけ送る、試用のエージェントは `--clipboard`、パイプラインは `daily-pipeline.py --clipboard`、コンポジターは `trial-y-clipboard` の入ったもの（クリップボードの流れの `gwd-trial29`。統合した試用版の既定は、3 つを 1 つにした `gwd-trial32`）。どれかが古いと、⌘C と ⌘V は、これまでどおりのキーになる（ホストの中だけのコピー）。
 - まだ、実機の 2 台では動かしていない（ADR 0022 の「動かして確かめること」）。Mac のホスト（Studio）は、`m4-daily-host` の流れが、同じ手元の口で作る。
 - Mac のホストの流れ（`m4-daily-host`）の `scripts/daily-mac.sh` は、ここにはマージしていない。それが使うビューアーの設定（`ISTESSO_CHANNEL`、`ISTESSO_CHANNEL_PEER`、`ISTESSO_END_WITH_WINDOW`、`ISTESSO_COMMAND_KEY`、`ISTESSO_PID_FILE`、`ISTESSO_TITLE_FILE`、`ISTESSO_NO_WINDOW`）と、中継の `--keep-trying` は、統合したものにもそのままある。つなぎ直しと文字入力は、それぞれ `ISTESSO_DAILY_RECONNECT` と `ISTESSO_TEXT_INPUT` を付けたときだけ働くので、`daily-mac.sh` から起動したときの振る舞いは前のまま（読んで確かめた。`daily-mac.sh` は動かしていない）。
 
@@ -69,7 +69,7 @@ scripts/daily.sh setup [--host mac]
 - 中継とエージェント：`InputEvent::Scroll` に、省ける項目を 6 つ足した。エージェントは、範囲の外のスクロールを捨てる（古い `dx`、`dy` も 1 万まで。Mac ホストの流れの `61bb12a` と同じ）。エージェントは `input_open` の答えに `"scroll": 1` を付ける。中継は、それを言わないエージェントには、種類のあるスクロールのうち `dx` も `dy` も 0 のものを送らず、接続ごとに 1 度だけ `note: the host's agent does not take: scroll kinds …` と出す。
 - パイプライン：`daily-pipeline.py --scroll`（`scripts/daily_scroll.py`）が、種類を言うスクロールを `PointerScroll` にしてコンポジターへ渡す。種類に見合う量（`v120`、`pixels`）のないものは、古い形として。`--scroll` なしで起動したとき（`trial-y-scroll` のないプラグイン）は、`dx` も `dy` も 0 のスクロールを捨て、1 度だけ `daily: this compositor does not take: scroll kinds …` と出す。`daily.sh` は、写したプラグインの修正の一覧に `trial-y-scroll` があるときだけ `--scroll` を付ける。
 - コンポジター：試用の 7 つ目の修正 `gst-wayland-display-trial-y-scroll.patch`（ブランチ `m3-compositor-scroll`、ビルドは `~/.cache/istesso-scroll-wip/gwd-scroll3`。`DAILY_PLUGIN_FROM` の既定をここにした）。指の画素は、出力の拡大率で割る（アプリの論理の画素にする）。終わりが届かなかった指のスクロールは、最後の値から 400 ms で止める。コンポジターの試験 120 件が通った。`check-plugin.sh` は、このビルドを試用と言う（1）。計測に使うプラグインは、これまでどおり 0。
-- **統合した試用版の既定のプラグインは、`gwd-trial31` に替えた**（2026-11-19。文字入力、スクロール、クリップボードを 1 つにしたビルド。スクロールの流れが作った）。その前の `gwd-trial27` にはスクロールの修正が入っていなかったので、`daily.sh` はスクロールを種類ごとに送らず、前の形のままだった。`gwd-trial31` を `setup` で写したときから、スクロールの種類と段階が使われる（`daily.sh` が、プラグインの修正の一覧に `trial-y-scroll` があるかで決める）。
+- **統合した試用版の既定のプラグインは、`gwd-trial32` に替えた**（2026-11-19。`gwd-trial31` を経て。文字入力、スクロール、クリップボードを 1 つにしたビルド。スクロールの流れが作った）。その前の `gwd-trial27` にはスクロールの修正が入っていなかったので、`daily.sh` はスクロールを種類ごとに送らず、前の形のままだった。`gwd-trial32` を `setup` で写したときから、スクロールの種類と段階が使われる（`daily.sh` が、プラグインの修正の一覧に `trial-y-scroll` があるかで決める）。
 - 慣性の切り替え：既定は Mac の慣性をそのまま渡す（手元の Mac のアプリ、Safari と同じ減り方を目指す）。`DAILY_SCROLL_MOMENTUM=app scripts/daily.sh open NAME` で、そのアプリのコンポジターだけ、Mac の慣性を捨ててアプリに任せる（`ISTESSO_SCROLL_MOMENTUM=app`）。比べるときは、`close` してから付けて、または外して、もう 1 度 `open`。
 
 確かめ（1 回目 13:58〜14:01、直したあと 14:22〜14:24、窓を出さずに）：中継、試用のエージェント、`daily-pipeline.py`、`m1-step3-host.py`、コンポジターは、試用版と同じ道（このブランチの写しを、流れ自身のフォルダーで、`daily.sh` と同じ引数で起動した。ポートは 47961、47962。確かめのための組）。アプリは、軸のイベントを 1 行ずつ書く試しのアプリ（`scripts/scroll-log.c`）。Mac の側は、ビューアーの `scroll.h` で作った NSEvent の形の値を、時刻どおりに中継の口へ書いた（ビューアーそのものは動かしていない）。身ぶりは作り物（下の「手元」は、手元の Mac のアプリが動かすはずの量で、NSScrollView がトラックパッドの点だけ動くこと、ホイールは行で動くことからの計算）。
@@ -420,7 +420,7 @@ ADR 0020 の「変換中の文字を、アプリの中に」、ADR 0007 の「�
 - ビューアー：窓がキーを受け、エージェントが `preedit` を受けると言い、ホストが「欄がある」（状態 1）と言っているときは、変換中の文字を `{"kind":"preedit",…}` で送り、帯は出さない。候補の窓は、ホストが返したキャレットの場所（絵のピクセルを、ポインターと同じ比で窓の点に直したもの）に出す。場所が分からないとき（全部 0）は、帯の場所。欄がないとき、`ISTESSO_PREEDIT=strip` のとき、エージェントが受けないときは、帯。
 - パスワードの欄（状態 2）：入力方式を通さず、キーだけ（入力ソースは英字だけ）。変換中の文字も帯もない。そのあいだ Secure Event Input を入れ、欄を離れる、窓がキーを受けなくなる、窓を閉じる、絵が切れる、プログラムが終わる（`atexit`）ときに切る。プログラムが落ちたときも外れる（Air で見た、2026-11-19 14:57：入れただけの小さなプログラムを `kill -9` で番号で止めると、`ioreg` の `kCGSSessionSecureInputPID` が消えた）。
 - パイプライン：`daily-pipeline.py --text` が、`preedit` を `TextPreedit` にしてコンポジターへ渡し、コンポジターの `text-input-messages` を入れ、`wayland.text-input` のメッセージを、メディアのライブラリーの `istesso_media_host_set_text_input` に渡す（ホストのスクリプトが作るライブラリーとホストを、この 1 回だけ `ctypes.CDLL` を包んで知る）。`m1-step3-host.py` は変えていない。
-- コンポジター：`gwd-trial30`（`m3-compositor-text-input`）。メディアのライブラリーは、種類 5 のパケット（`c27da47`）。
+- コンポジター：`gwd-trial30`（`m3-compositor-text-input`）。メディアのライブラリーは、種類 5 のパケット（`c27da47`）。統合した試用版の既定は、これにコピーと貼り付け、スクロールを足した `gwd-trial32`。
 - 文字は、どのログにも書かない。
 - 統合（2026-11-19、`trial-daily-text` の `5ce69ad`）：コピーと貼り付け、スクロールの種類と段階と、両方を残した。エージェントは `input_open` の答えに `text`、`scroll`、`clipboard`、`preedit` を付け、中継は、つなぐたびに 4 つとも覚え直す。中継の状態のファイルは `{"pid":…,"input":…,"text":…,"clipboard":…,"preedit":…}`（つなぎ直す種類の中継だけ `,"reconnecting":…` を足す）。ビューアーは、項目を名前で読む（古い中継の、項目の欠けた行も読める。ない項目は「受けない」）。パイプラインは、`--text` の手（確定した文字と変換中の文字）、`--clipboard` の手、`--scroll` の手を、同じ読み口で順に試す。
 
