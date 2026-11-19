@@ -99,6 +99,16 @@ scripts/daily.sh setup [--host mac]
 
 - 新しいビューアーと古いホスト（いまの `gwd-trial27`、`--scroll` なし）では、はじくとホイールが直す前と同じ数になり、空のホイールの知らせはなくなり、パイプラインの記録に「does not take」の 1 行が出た。
 - `ISTESSO_SCROLL_MOMENTUM=app`（1 回目）では、はじく身ぶりは指 120 画素と、指を離した 8 ms あとの `axis_stop` だけ（慣性はアプリが付ける）。
+- **Firefox（持ち主の手の確かめのあと、2026-11-19 17:27〜17:34）**：持ち主の「速すぎる、指を離したあとも滑って、しばらくして止まる」を、試用版と同じ Firefox（Mozilla のビルド 160.0.1、試用版のフォルダーのものをプログラムだけ読んで、この流れのプロファイルで）、試用版のプラグインの写し（読むだけ）、流れ自身のコンポジターで測った。窓は絵の 1 画素が Mac の 1 点（`daily.sh` は窓を絵と同じ点の数で作る。持ち主の窓のビューアーの記録も同じ形。考え）。ページの `scrollY` と wheel のイベントを記録した（見た）：
+
+  | Firefox の設定 | 100 点を引いて離す（慣性なし） | はじく 285 点（Mac の慣性あり） |
+  |---|---|---|
+  | いまの試用版（既定） | wheel 400、ページ 1593（離したあと 2.8 秒で 1233 進んだ） | 1140（4 倍） |
+  | 倍率 10 | 100、離したあと 2.1 秒で 304 進んだ（Firefox の慣性） | 285 |
+  | 倍率 10、Firefox の慣性なし（Mac の慣性の既定） | **100** | **285** |
+  | 倍率 10、`DAILY_SCROLL_MOMENTUM=app`（Firefox の慣性あり） | 394 | 400（指の 120 + Firefox の 281） |
+
+  原因：Firefox は GTK のタッチパッドの量に既定で 40 を掛け、指の 4 倍動く（`apz.gtk.pangesture.pixel_delta_mode_multiplier`。10 で同じになった）。さらに、止まりの知らせで自分の慣性を足す（`apz.gtk.kinetic_scroll.enabled`）。直し：`daily.sh` の Firefox の `user.js` に、倍率 10 と、既定（Mac の慣性）では Firefox の慣性を切る、`app` のときは入れる。開き直したときに効く。ほかのアプリ（Chrome、テキストエディター、Blender）の倍率は、まだ測っていない。
 - まだ見ていないこと：人の手のトラックパッドとホイール（本物の NSEvent。macOS が指を離してから慣性を始めるまでの間が、60 ms に収まるか。`kCGScrollWheelEventDeltaAxis1` の向きが `scrollingDeltaY` と同じか。速く回したときの整数の行の数）、本物のアプリ（GTK、Firefox、Chrome、Blender）での動き。
 
 ## いまの部品で、何が足りなかったか

@@ -893,7 +893,19 @@ user_pref("widget.use-xdg-desktop-portal.file-picker", 0);
 user_pref("browser.crashReports.unsubmittedCheck.autoSubmit2", false);
 user_pref("datareporting.healthreport.uploadEnabled", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
+// A trackpad's scroll (docs/trial-daily.md, "スクロール"): Firefox multiplies GTK's touchpad
+// deltas by 40 by default, so that the content moved four times as far as on the Mac (seen:
+// 100 points of the fingers moved the page 400 pixels); with 10 it moves as far as the fingers.
+user_pref("apz.gtk.pangesture.pixel_delta_mode_multiplier", "10.0");
 PREFS
+        # Whose inertia (DAILY_SCROLL_MOMENTUM): the Mac's (the default), so Firefox does not add its
+        # own fling when a scroll stops (seen: 304 pixels more over 2.1 s after a drag of 100); or,
+        # with app, the Mac's is dropped by the compositor and Firefox makes its own.
+        if [ "$SCROLL_MOMENTUM" = app ]; then
+            echo 'user_pref("apz.gtk.kinetic_scroll.enabled", true);' >> "$profile/user.js"
+        else
+            echo 'user_pref("apz.gtk.kinetic_scroll.enabled", false);' >> "$profile/user.js"
+        fi
         grep -q '"media.volume_scale", *"0.0"' "$profile/user.js" 2>/dev/null ||
             { echo "fail the trial profile of Firefox does not say that it is silent: not started"; exit 1; }
         if [ -L "$profile/lock" ]; then
