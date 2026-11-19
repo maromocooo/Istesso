@@ -27,6 +27,11 @@ ADR 0015, "文字の入力の欄"). Trial only.
   latest notice is newer than such a move (seen in the owner's hands-on: after a click on an
   empty part of a page the device kept its input method, and Space went as composed text that
   had nowhere to go).
+- While "not in a field", every key press has the field told again too (the device counts
+  Backspace, Delete and dead keys as moves); an unchanged "not in a field" is told again at once.
+- Committed text with nowhere to go: an ideographic space and full-width ASCII go as the ASCII
+  keys they stand for; anything else is still dropped, and wayland.text-input gains `dropped`,
+  the count of pieces dropped so far, so that the device keeps the text for the person.
 - "Not in a field" is told only after it has held for 100 ms: between two fields a client says
   it briefly (Tab, Control+L, a click), and the device would send the first keys after it
   without its input method. A field or a password field is told at once.
@@ -44,7 +49,7 @@ their names (its name sorts last on purpose). FOR TRIALS AND EVERYDAY USE ONLY; 
 before a review.
 
 diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
-index de5d50c..f001426 100644
+index de5d50c..5bb0b6d 100644
 --- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
 +++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
 @@ -75,7 +75,7 @@ pub struct State {
@@ -52,15 +57,16 @@ index de5d50c..f001426 100644
  /// cursor's rectangle in the picture (`x`, `y`, `width`, `height`), whenever it changes.
  fn text_input_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddisplaycore::TextInputSink {
 -    Box::new(move |state, x, y, width, height| {
-+    Box::new(move |state, x, y, width, height, serial| {
++    Box::new(move |state, x, y, width, height, serial, dropped| {
          let Some(element) = element.upgrade() else {
              return;
          };
-@@ -85,6 +85,7 @@ fn text_input_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylandd
+@@ -85,6 +85,8 @@ fn text_input_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylandd
              .field("y", y)
              .field("width", width)
              .field("height", height)
 +            .field("serial", serial)
++            .field("dropped", dropped)
              .build();
          let message = Application::builder(structure).src(&element).build();
          let _ = element.post_message(message);
@@ -162,10 +168,10 @@ index 9d884af..93f8895 100644
              let client = match surface {
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
-index 18846af..864b86f 100644
+index 18846af..08f76f5 100644
 --- a/wayland-display-core/src/wayland/handlers/text_input.rs
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -124,28 +124,49 @@ struct Instance {
+@@ -124,28 +124,66 @@ struct Instance {
  
  /// Told whenever the field with the keyboard changes: 0 none, 1 a field, 2 a password field;
  /// and the text cursor's rectangle in the output (x, y, width, height). Trial only.
@@ -173,7 +179,9 @@ index 18846af..864b86f 100644
 +/// The last number is the field's serial: one more (mod 256) whenever another field has the
 +/// keyboard, or the same one is enabled again after it was disabled (or after the keyboard was
 +/// elsewhere); the device ends its composition when it changes.
-+pub type TextInputSink = Box<dyn Fn(u32, i32, i32, u32, u32, u32) + Send>;
++/// The very last number counts the pieces of committed text that had nowhere to go (no text
++/// input enabled and not ASCII), so that the device can keep them for the person.
++pub type TextInputSink = Box<dyn Fn(u32, i32, i32, u32, u32, u32, u32) + Send>;
  
  /// Tells a sink about the field with the keyboard, only when that changed.
  #[derive(Default)]
@@ -191,6 +199,9 @@ index 18846af..864b86f 100644
 +    three_pending: bool,
 +    /// Counts the requests to tell the field again, so that only the last one does.
 +    retell_generation: u64,
++    /// Pieces of committed text dropped so far, and how many the sink was told of.
++    pub(crate) dropped: u32,
++    told_dropped: u32,
  }
  
 +/// How long "not in a field" has to hold before it is told.
@@ -203,23 +214,36 @@ index 18846af..864b86f 100644
      }
  
 -    fn tell(&mut self, now: (u32, i32, i32, u32, u32)) {
+-        if self.last == Some(now) {
 +    fn tell(&mut self, now: (u32, i32, i32, u32, u32), identity: Option<(ObjectId, Option<ObjectId>)>) {
 +        if identity != self.identity {
 +            self.identity = identity;
 +            self.serial = self.serial.wrapping_add(1);
 +        }
 +        let now = (now.0, now.1, now.2, now.3, now.4, u32::from(self.serial));
-         if self.last == Some(now) {
++        if self.last == Some(now) && self.told_dropped == self.dropped {
              return;
          }
          self.last = Some(now);
++        self.told_dropped = self.dropped;
          if let Some(sink) = &self.sink {
 -            sink(now.0, now.1, now.2, now.3, now.4);
-+            sink(now.0, now.1, now.2, now.3, now.4, now.5);
++            sink(now.0, now.1, now.2, now.3, now.4, now.5, self.dropped);
++        }
++    }
++
++    /// Tells the sink again what it was told last, with the count of dropped text now.
++    fn tell_dropped(&mut self) {
++        self.dropped = self.dropped.wrapping_add(1);
++        if let Some(last) = self.last {
++            self.told_dropped = self.dropped;
++            if let Some(sink) = &self.sink {
++                sink(last.0, last.1, last.2, last.3, last.4, last.5, self.dropped);
++            }
          }
      }
  }
-@@ -235,8 +256,40 @@ impl TextInputs {
+@@ -235,8 +273,40 @@ impl TextInputs {
              .then_some(focus)
      }
  
@@ -262,7 +286,7 @@ index 18846af..864b86f 100644
      fn field(&self) -> (u32, Option<(i32, i32, i32, i32)>) {
          let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
              return (0, None);
-@@ -247,6 +300,9 @@ impl TextInputs {
+@@ -247,6 +317,9 @@ impl TextInputs {
              .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
          {
              Some(i) => (if i.secret { 2 } else { 1 }, i.rect),
@@ -272,7 +296,7 @@ index 18846af..864b86f 100644
              None => (0, None),
          }
      }
-@@ -308,6 +364,31 @@ impl TextInputs {
+@@ -308,6 +381,38 @@ impl TextInputs {
  impl State {
      /// Tells the sink, if there is one, about the field with the keyboard: where its text
      /// cursor is in the output, for the device to put its input method's candidates there.
@@ -285,8 +309,15 @@ index 18846af..864b86f 100644
 +            Timer::from_duration(std::time::Duration::from_millis(150)),
 +            move |_, _, state| {
 +                if state.text_input_report.retell_generation == generation {
++                    let was_three = state.text_input_report.last.map(|l| l.0) == Some(3);
 +                    state.text_input_report.last = None;
-+                    state.tell_text_input();
++                    if was_three && state.text_inputs.field().0 == 3 {
++                        // Still "not in a field": told at once (it held already).
++                        let identity = state.text_inputs.field_identity();
++                        state.text_input_report.tell((3, 0, 0, 0, 0), identity);
++                    } else {
++                        state.tell_text_input();
++                    }
 +                }
 +                TimeoutAction::Drop
 +            },
@@ -304,7 +335,7 @@ index 18846af..864b86f 100644
      pub fn tell_text_input(&mut self) {
          use smithay::wayland::seat::WaylandFocus;
          let (state, rect) = self.text_inputs.field();
-@@ -329,7 +410,24 @@ impl State {
+@@ -329,7 +434,24 @@ impl State {
                  }
              }
          }
@@ -330,7 +361,42 @@ index 18846af..864b86f 100644
      }
  
      /// After the keyboard moved to a window: if a text input of its client entered it and has
-@@ -507,6 +605,9 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -406,8 +528,20 @@ impl State {
+         let keyboard = self.seat.get_keyboard().unwrap();
+         if keyboard.current_focus().is_none() {
+             tracing::info!(chars, "text dropped: nobody has the keyboard");
++            self.text_input_report.tell_dropped();
+             return;
+         }
++        // An ideographic space and full-width ASCII, as an input method commits them outside a
++        // field, go as the ASCII they stand for.
++        let narrowed: String = text
++            .chars()
++            .map(|c| match c {
++                '\u{3000}' => ' ',
++                '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
++                _ => c,
++            })
++            .collect();
++        let text = narrowed.as_str();
+         // On another layout than US (XKB_DEFAULT_LAYOUT, as the everyday trial sets it) only the
+         // keys that are the same on it: letters, digits and the space.
+         let us = std::env::var("XKB_DEFAULT_LAYOUT").map_or(true, |l| l.is_empty() || l == "us");
+@@ -420,11 +554,13 @@ impl State {
+                 chars,
+                 "text dropped: the client with the keyboard has no text input enabled, and the text is not ASCII"
+             );
++            self.text_input_report.tell_dropped();
+             return;
+         };
+         let held = keyboard.modifier_state();
+         if held.shift || held.ctrl || held.alt || held.logo {
+             tracing::info!(chars, "text dropped: a modifier key is held");
++            self.text_input_report.tell_dropped();
+             return;
+         }
+         // With Caps Lock on, a letter's case comes from Shift the other way round.
+@@ -507,6 +643,9 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                  }
              }
              zwp_text_input_v3::Request::Commit => {
@@ -340,7 +406,7 @@ index 18846af..864b86f 100644
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.commits = instance.commits.wrapping_add(1);
                      if let Some(enable) = instance.pending.take() {
-@@ -539,6 +640,19 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -539,6 +678,19 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                          );
                      }
                  }
@@ -360,7 +426,7 @@ index 18846af..864b86f 100644
              }
              zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
                  if let Some(instance) = state.text_inputs.instance(resource) {
-@@ -618,3 +732,135 @@ mod tests {
+@@ -618,3 +770,142 @@ mod tests {
          assert_eq!(us_key('\t'), None);
      }
  }
@@ -449,7 +515,14 @@ index 18846af..864b86f 100644
 +        // move (it sends plain keys outside a field only then; ADR 0007).
 +        let moves = match command {
 +            Command::PointerButton(_, ButtonState::Pressed) => true,
-+            Command::KeyboardInput(code, KeyState::Pressed) => !types(*code) || moves_focus(*code) || self.chording(),
++            // Any key while "not in a field" (the device may count it as a move: Backspace,
++            // Delete, dead keys), and keys that may move the focus anywhere.
++            Command::KeyboardInput(code, KeyState::Pressed) => {
++                self.text_input_report.last.map(|l| l.0) == Some(3)
++                    || !types(*code)
++                    || moves_focus(*code)
++                    || self.chording()
++            }
 +            _ => false,
 +        };
 +        if moves {
