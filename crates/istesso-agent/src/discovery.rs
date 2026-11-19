@@ -16,7 +16,6 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use istesso_pair::PeerStore;
 use mdns_sd::{IfKind, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::cache;
@@ -71,7 +70,7 @@ fn note(paths: &Paths, own: &str, service: &ResolvedService) {
         return;
     }
     // Only paired devices matter; everything else on the network is ignored.
-    let Ok(peers) = PeerStore::open(paths.peers()) else {
+    let Ok(peers) = paths.keeping().peers() else {
         return;
     };
     let Some(peer) = peers.peers().iter().find(|p| p.id == id) else {

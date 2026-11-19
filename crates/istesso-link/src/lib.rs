@@ -108,7 +108,7 @@ pub(crate) mod testing {
                 std::process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
-            let mut store = PeerStore::open(dir.join("peers.json")).unwrap();
+            let mut store = istesso_pair::Keeping::in_dir(&dir).peers().unwrap();
             for (name, identity) in devices {
                 store
                     .add(Peer::from_hello(&Hello {

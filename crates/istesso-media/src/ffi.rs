@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use istesso_agent::Paths;
 use istesso_link::LocalKeys;
-use istesso_pair::{Identity, PeerStore};
+use istesso_pair::Identity;
 
 use crate::rejoin::{Lasting, LastingAsker, Step};
 use crate::wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, WireError};
@@ -246,10 +246,7 @@ fn paths(config_dir: Option<String>) -> Result<Paths> {
 /// This device's identity. One is never made here: a device without one is
 /// paired with nobody, and has nobody to send to or to receive from.
 fn identity(paths: &Paths) -> Result<Identity> {
-    if !paths.identity().exists() {
-        return Err(Error::NoIdentity);
-    }
-    Ok(Identity::load_or_create(&paths.identity())?)
+    paths.keeping().identity_if_any()?.ok_or(Error::NoIdentity)
 }
 
 fn address(text: &str) -> Result<SocketAddr> {
@@ -270,7 +267,7 @@ fn listen(
     Host::listen_admitting(
         address(&bind)?,
         &identity(&paths)?,
-        paths.peers(),
+        paths.keeping(),
         info.into(),
         log,
         admit,
@@ -313,7 +310,7 @@ fn connect(
     let paths = paths(config_dir)?;
     let addr = addr.ok_or_else(|| Error::Refused("no address to connect to was given".into()))?;
     let keys = LocalKeys::new(&identity(&paths)?)?;
-    let peers = PeerStore::open(paths.peers())?;
+    let peers = paths.keeping().peers()?;
     // The device may be named, as in `istesso peers list`, or given by its id.
     let expected = match peer {
         Some(selector) => Some(
@@ -736,7 +733,7 @@ pub unsafe extern "C" fn istesso_media_watch_open(
                 // Read anew for every connection: the pairing may have changed.
                 let paths = paths(dir.clone())?;
                 let keys = LocalKeys::new(&identity(&paths)?)?;
-                let peers = PeerStore::open(paths.peers())?;
+                let peers = paths.keeping().peers()?;
                 // Later connections go to the device the first one reached; the first
                 // one to the device the caller named, if it named one.
                 let expected = match (began_with, &peer) {
@@ -955,13 +952,15 @@ mod tests {
             let root = std::env::temp_dir()
                 .join(format!("istesso-media-ffi-{tag}-{}", std::process::id()));
             let dirs = Dirs { root };
-            let host = Identity::load_or_create(&Paths::at(dirs.host()).identity()).unwrap();
-            let device = Identity::load_or_create(&Paths::at(dirs.device()).identity()).unwrap();
+            let host = Paths::at(dirs.host()).keeping().identity().unwrap();
+            let device = Paths::at(dirs.device()).keeping().identity().unwrap();
             for (dir, name, other) in [
                 (dirs.host(), "device", &device),
                 (dirs.device(), "host", &host),
             ] {
-                PeerStore::open(Paths::at(dir).peers())
+                Paths::at(dir)
+                    .keeping()
+                    .peers()
                     .unwrap()
                     .add(crate::testing::peer(name, other))
                     .unwrap();

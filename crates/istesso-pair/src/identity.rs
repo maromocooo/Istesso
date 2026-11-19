@@ -44,28 +44,44 @@ impl Identity {
     /// Loads the identity stored at `path`, creating and saving a new one
     /// when the file does not exist yet.
     ///
-    /// The seed is kept in a file readable only by its owner. Moving it into
-    /// the OS keychain is planned (see `docs/adr/0006-pairing.md`).
-    pub fn load_or_create(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let seed: [u8; 32] = from_hex(text.trim())
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .ok_or_else(|| {
-                        Error::Corrupt(format!("identity file {} is damaged", path.display()))
-                    })?;
-                Ok(Identity::from_seed(seed))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    /// The seed is kept in a file readable only by its owner. This is the
+    /// file form of [`crate::Keeping`], which is the way to the key for
+    /// everything outside this crate.
+    pub(crate) fn load_or_create(path: &Path) -> Result<Self> {
+        match Identity::read_file(path)? {
+            Some(identity) => Ok(identity),
+            None => {
                 let identity = Identity::generate();
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                write_private(path, to_hex(&identity.signing.to_bytes()).as_bytes())?;
+                write_private(path, identity.seed_hex().as_bytes())?;
                 Ok(identity)
             }
+        }
+    }
+
+    /// The identity in the file at `path`; `None` when there is no file.
+    pub(crate) fn read_file(path: &Path) -> Result<Option<Self>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Identity::from_seed_hex(&text).map(Some).ok_or_else(|| {
+                Error::Corrupt(format!("identity file {} is damaged", path.display()))
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// The seed as it is kept: 64 hexadecimal digits. Never shown, never
+    /// logged.
+    pub(crate) fn seed_hex(&self) -> String {
+        to_hex(&self.signing.to_bytes())
+    }
+
+    /// The identity kept as `text`; `None` when that is not a seed.
+    pub(crate) fn from_seed_hex(text: &str) -> Option<Self> {
+        let seed: [u8; 32] = from_hex(text.trim()).and_then(|bytes| bytes.try_into().ok())?;
+        Some(Identity::from_seed(seed))
     }
 }
 

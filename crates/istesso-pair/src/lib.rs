@@ -13,6 +13,9 @@
 //!    are authenticated against these pinned keys; removing a peer from the
 //!    store revokes it.
 //!
+//! The device's own key and the list of paired devices are reached through
+//! one door, [`Keeping`], whatever form they are kept in.
+//!
 //! The cryptographic building blocks come from the RustCrypto and dalek
 //! crates. `spake2` has not had an independent audit; this crate keeps the
 //! protocol small on purpose and should be reviewed before a public release
@@ -21,12 +24,14 @@
 pub mod code;
 pub mod handshake;
 pub mod identity;
+pub mod keeping;
 pub mod store;
 pub mod tcp;
 
 pub use code::PairCode;
 pub use handshake::{Hello, Pairing, Role, Session};
 pub use identity::{fingerprint, Identity};
+pub use keeping::{Form, Keeping};
 pub use store::{Peer, PeerStore, Permission};
 
 /// Everything that can go wrong while pairing.

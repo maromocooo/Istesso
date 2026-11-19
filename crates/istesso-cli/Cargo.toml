@@ -28,3 +28,6 @@ serde_json.workspace = true
 [features]
 # Development builds only: see crates/istesso-agent/Cargo.toml.
 dev-paths = ["istesso-agent/dev-paths"]
+# The device key and the paired devices in the macOS login keychain: see
+# crates/istesso-agent/Cargo.toml.
+login-keychain = ["istesso-agent/login-keychain"]

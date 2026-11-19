@@ -71,6 +71,38 @@ fn warn_once() {
     });
 }
 
+/// What this build does not guard the device key and the list of paired
+/// devices against, in one line for the person (`istesso doctor`, and the
+/// agent when it starts); `None` in a build that keeps them where other
+/// programs of the same user are not let in unasked.
+pub fn keeping_notice() -> Option<String> {
+    Paths::from_env()
+        .keeping()
+        .open_to_the_same_user()
+        .map(|what| format!("note: {what}"))
+}
+
+#[cfg(all(feature = "login-keychain", feature = "dev-paths"))]
+compile_error!(
+    "`login-keychain` and `dev-paths` do not go together: a development build takes its \
+     places from the environment and must never hold a real key"
+);
+
+/// The configuration directory of the account itself, as a build without
+/// any override resolves it.
+#[cfg(feature = "login-keychain")]
+fn accounts_own_config() -> &'static PathBuf {
+    static OWN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| {
+        Paths::resolve(&Environment {
+            home: account_home(),
+            macos: cfg!(target_os = "macos"),
+            ..Environment::default()
+        })
+        .config
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub config: PathBuf,
@@ -307,8 +339,24 @@ impl Paths {
         }
     }
 
+    /// The file the file form keeps the device key in. The way to the key
+    /// is [`Paths::keeping`].
     pub fn identity(&self) -> PathBuf {
         self.config.join("identity.key")
+    }
+
+    /// The one door to this device's key and its list of paired devices
+    /// (`istesso_pair::Keeping`). The account's own key and list are kept in
+    /// the form this build was made for; directories that are not the
+    /// account's own (tests, development builds) always keep theirs in
+    /// files, so that no test and no development build reaches the person's
+    /// keychain.
+    pub fn keeping(&self) -> istesso_pair::Keeping {
+        #[cfg(feature = "login-keychain")]
+        if self.config == *accounts_own_config() {
+            return istesso_pair::Keeping::of_this_build(self.identity(), self.peers());
+        }
+        istesso_pair::Keeping::in_files(self.identity(), self.peers())
     }
 
     /// Where the program that shows an application of this machine to
@@ -325,6 +373,8 @@ impl Paths {
         }
     }
 
+    /// The file the file form keeps the list of paired devices in. The way
+    /// to the list is [`Paths::keeping`].
     pub fn peers(&self) -> PathBuf {
         self.config.join("peers.json")
     }
@@ -580,6 +630,37 @@ mod tests {
             paths.host_snapshot("1a2b-3c4d-5e6f-7a8b"),
             Some(PathBuf::from("/d/cache/hosts/1a2b-3c4d-5e6f-7a8b.json"))
         );
+    }
+
+    #[test]
+    fn a_directory_that_is_not_the_accounts_own_keeps_its_key_in_files() {
+        // Whatever the build was made for: tests and development builds
+        // never reach the keychain of whoever runs them.
+        let dir = crate::testing::TempDir::new("keeping");
+        let keeping = dir.paths().keeping();
+        assert_eq!(keeping.form(), istesso_pair::Form::Files);
+        assert!(keeping.identity_if_any().unwrap().is_none());
+        let made = keeping.identity().unwrap();
+        assert!(dir.paths().identity().exists());
+        let again = dir.paths().keeping().identity_if_any().unwrap().unwrap();
+        assert_eq!(made.public_key(), again.public_key());
+    }
+
+    #[test]
+    fn a_build_that_keeps_the_key_in_files_says_what_that_does_not_guard() {
+        let note = keeping_notice();
+        if istesso_pair::Keeping::FORM_OF_THIS_BUILD == istesso_pair::Form::Files {
+            let note = note.unwrap();
+            assert!(note.starts_with("note: "), "{note}");
+            assert!(
+                note.contains("every program of the same user can read and change"),
+                "{note}"
+            );
+            // Where the files are is not said: the line goes into logs.
+            assert!(!note.contains('/'), "{note}");
+        } else {
+            assert!(note.is_none());
+        }
     }
 
     #[test]

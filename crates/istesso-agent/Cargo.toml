@@ -23,6 +23,11 @@ mdns-sd.workspace = true
 # listen anywhere. Never in a build that is given permissions or a real key:
 # a program of the same user could point it at a peers list of its own.
 dev-paths = []
+# macOS builds signed with a certificate: the device key and the list of
+# paired devices are kept in the login keychain instead of files. The switch
+# is istesso-pair's; see crates/istesso-pair/Cargo.toml. Not together with
+# `dev-paths`: a development build never holds a real key.
+login-keychain = ["istesso-pair/login-keychain"]
 
 # The account's home and runtime directories, from the system rather than from
 # the environment. Not through the workspace table yet, as in

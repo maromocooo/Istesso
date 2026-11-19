@@ -121,15 +121,16 @@ pub(crate) mod testing {
     #[cfg(unix)]
     impl InputPair {
         pub fn new(tag: &str) -> Self {
-            use istesso_pair::{Hello, Identity, Peer, PeerStore};
+            use istesso_pair::{Hello, Peer};
             let (host, device) = (TempDir::new(tag), TempDir::new(tag));
-            let identities = [&host, &device]
-                .map(|dir| Identity::load_or_create(&dir.paths().identity()).unwrap());
+            let identities = [&host, &device].map(|dir| dir.paths().keeping().identity().unwrap());
             for (dir, name, other) in [
                 (&host, "a laptop", &identities[1]),
                 (&device, "a host", &identities[0]),
             ] {
-                PeerStore::open(dir.paths().peers())
+                dir.paths()
+                    .keeping()
+                    .peers()
                     .unwrap()
                     .add(Peer::from_hello(&Hello {
                         device_name: name.to_string(),
@@ -169,10 +170,12 @@ pub(crate) mod testing {
             within: std::time::Duration,
         ) -> Result<istesso_link::Client, crate::ConnectFailure> {
             let paths = self.device.paths();
-            let identity = istesso_pair::Identity::load_or_create(&paths.identity()).unwrap();
+            let identity = paths.keeping().identity().unwrap();
             let keys = istesso_link::LocalKeys::new(&identity).unwrap();
             // Read for every conversation, as the relay does.
-            let peers = istesso_pair::PeerStore::open(paths.peers())
+            let peers = paths
+                .keeping()
+                .peers()
                 .map_err(|e| crate::ConnectFailure::Here(e.to_string()))?;
             istesso_link::Client::connect(addr, &keys, &peers, None, within)
                 .map_err(crate::ConnectFailure::Link)

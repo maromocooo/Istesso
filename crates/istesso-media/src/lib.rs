@@ -176,8 +176,13 @@ pub(crate) mod testing {
             self.dir.join("peers.json")
         }
 
+        /// The way to this list, as a program is given it.
+        pub fn keeping(&self) -> istesso_pair::Keeping {
+            istesso_pair::Keeping::in_dir(&self.dir)
+        }
+
         pub fn open(&self) -> PeerStore {
-            PeerStore::open(self.path()).unwrap()
+            self.keeping().peers().unwrap()
         }
 
         /// Gives the device called `name` exactly these rights.

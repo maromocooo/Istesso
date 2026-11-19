@@ -35,3 +35,6 @@ libc = "0.2"
 # other than istesso's (`config_dir`). The switch is istesso-agent's: turned on
 # there by any crate, it is on here too. See crates/istesso-agent/Cargo.toml.
 dev-paths = ["istesso-agent/dev-paths"]
+# The device key and the paired devices in the macOS login keychain: see
+# crates/istesso-agent/Cargo.toml.
+login-keychain = ["istesso-agent/login-keychain"]

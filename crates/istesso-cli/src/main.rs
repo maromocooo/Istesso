@@ -467,6 +467,11 @@ fn run(cli: Cli) -> Result<(), String> {
             if let Some(warning) = istesso_agent::paths::development_build() {
                 eprintln!("{warning}");
             }
+            // What this build does not guard; on standard error, so that the
+            // JSON stays what paired devices are sent.
+            if let Some(note) = istesso_agent::paths::keeping_notice() {
+                eprintln!("{note}");
+            }
             let manifest = istesso_doctor::detect();
             // Other commands and the agent reuse this inspection for a while.
             cache::remember_local_manifest(&Paths::from_env(), &manifest);
@@ -807,11 +812,17 @@ fn relay_input(
 // ---------------------------------------------------------------------------
 
 fn load_identity() -> Result<Identity, String> {
-    Identity::load_or_create(&Paths::from_env().identity()).map_err(|e| e.to_string())
+    Paths::from_env()
+        .keeping()
+        .identity()
+        .map_err(|e| e.to_string())
 }
 
 fn open_peers() -> Result<PeerStore, String> {
-    PeerStore::open(Paths::from_env().peers()).map_err(|e| e.to_string())
+    Paths::from_env()
+        .keeping()
+        .peers()
+        .map_err(|e| e.to_string())
 }
 
 fn print_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), String> {
@@ -1371,6 +1382,9 @@ fn set_permission(
 
 fn run_agent(options: AgentOptions) -> Result<(), String> {
     let paths = Paths::from_env();
+    if let Some(note) = istesso_agent::paths::keeping_notice() {
+        eprintln!("{note}");
+    }
     // Everything that takes time happens before the port is opened: from
     // that moment on callers expect a prompt reaction.
     let name = istesso_doctor::hostname();

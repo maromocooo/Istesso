@@ -29,14 +29,13 @@
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use istesso_link::{Channel, Error as LinkError, LocalKeys};
-use istesso_pair::{Identity, Peer, PeerStore, Permission};
+use istesso_pair::{Identity, Keeping, Peer, PeerStore, Permission};
 
 use crate::clock;
 use crate::timed::{wait_for, Ready, Timed, Wake};
@@ -135,7 +134,7 @@ pub struct Sent {
 
 struct Shared {
     keys: LocalKeys,
-    peers_path: PathBuf,
+    keeping: Keeping,
     info: StreamInfo,
     watchers: Mutex<Watchers>,
     /// Which paired devices are shown the picture. Taken after `watchers`
@@ -299,17 +298,17 @@ fn no_signal_on_a_closed_connection(stream: &TcpStream) {
 fn no_signal_on_a_closed_connection(_stream: &TcpStream) {}
 
 impl Host {
-    /// Starts listening on `addr`. `peers_path` is the list of paired
-    /// devices; it is read afresh for every connection and while a stream
-    /// runs. `info` is what viewers are told about the picture.
+    /// Starts listening on `addr`. `keeping` is the way to the list of
+    /// paired devices; the list is read afresh for every connection and
+    /// while a stream runs. `info` is what viewers are told about the picture.
     pub fn listen(
         addr: SocketAddr,
         identity: &Identity,
-        peers_path: PathBuf,
+        keeping: Keeping,
         info: StreamInfo,
         log: Log,
     ) -> Result<Self> {
-        Self::listen_admitting(addr, identity, peers_path, info, log, Admit::Paired)
+        Self::listen_admitting(addr, identity, keeping, info, log, Admit::Paired)
     }
 
     /// The same, with who is shown the picture said before anybody can
@@ -318,7 +317,7 @@ impl Host {
     pub fn listen_admitting(
         addr: SocketAddr,
         identity: &Identity,
-        peers_path: PathBuf,
+        keeping: Keeping,
         info: StreamInfo,
         log: Log,
         admit: Admit,
@@ -331,7 +330,7 @@ impl Host {
         let addr = listener.local_addr()?;
         let shared = Arc::new(Shared {
             keys,
-            peers_path,
+            keeping,
             info,
             watchers: Mutex::new(Watchers {
                 list: Vec::new(),
@@ -919,7 +918,7 @@ impl Shared {
         // The list of paired devices is read for every caller: a pairing
         // that was removed a moment ago must not be honoured any more. A
         // list that cannot be read lets nobody in.
-        let peers = PeerStore::open(&self.peers_path)?;
+        let peers = self.keeping.peers()?;
         let read_at = clock::now_ns();
         let mut found: Option<Peer> = None;
         let mut channel = Channel::respond(stream, &self.keys, |key| {
@@ -1233,7 +1232,7 @@ impl Shared {
             }
             // The file is read with the viewers let go: frames go out
             // meanwhile.
-            let peers = PeerStore::open(&self.peers_path);
+            let peers = self.keeping.peers();
             let read_at = clock::now_ns();
             let mut watchers = self.watchers();
             let Ok(peers) = peers else {

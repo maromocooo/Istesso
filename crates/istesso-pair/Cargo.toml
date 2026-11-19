@@ -24,3 +24,16 @@ rand_core.workspace = true
 # crates/istesso-media/Cargo.toml.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Only with `login-keychain`, only on macOS: the system's Security framework,
+# for the login keychain. MIT OR Apache-2.0, as are the crates it brings in
+# (docs/components.md).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", optional = true }
+
+[features]
+# macOS builds that are signed with a certificate: keep the device key and the
+# list of paired devices as items of the login keychain instead of files
+# (docs/adr/0006-pairing.md, "鍵とペアの一覧の置き場所"). Decided when the
+# program is built, never by an argument or the environment.
+login-keychain = ["dep:security-framework"]

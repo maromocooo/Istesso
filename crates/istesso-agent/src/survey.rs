@@ -99,7 +99,7 @@ impl HostView {
 /// Describes this machine and every paired device. The local machine comes
 /// first, the others follow in the order they were paired.
 pub fn survey(paths: &Paths, options: &SurveyOptions) -> Result<Vec<HostView>, String> {
-    let identity = Identity::load_or_create(&paths.identity()).map_err(|e| e.to_string())?;
+    let identity = paths.keeping().identity().map_err(|e| e.to_string())?;
     // The paired devices are asked in the background while this machine is
     // inspected.
     let remote = {
@@ -116,8 +116,8 @@ pub fn survey(paths: &Paths, options: &SurveyOptions) -> Result<Vec<HostView>, S
 /// Asks every paired device and updates what is remembered about each. The
 /// result lists them in the order they were paired.
 pub fn refresh_peers(paths: &Paths, options: &SurveyOptions) -> Result<Vec<HostView>, String> {
-    let identity = Identity::load_or_create(&paths.identity()).map_err(|e| e.to_string())?;
-    let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| e.to_string())?);
+    let identity = paths.keeping().identity().map_err(|e| e.to_string())?;
+    let peers = Arc::new(paths.keeping().peers().map_err(|e| e.to_string())?);
     let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| e.to_string())?);
 
     let (sender, receiver) = mpsc::channel();
@@ -200,8 +200,8 @@ pub fn connect_peer_or_say_why(
     timeout: Duration,
 ) -> Result<Client, ConnectFailure> {
     let here = |e: &dyn std::fmt::Display| ConnectFailure::Here(e.to_string());
-    let identity = Identity::load_or_create(&paths.identity()).map_err(|e| here(&e))?;
-    let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| here(&e))?);
+    let identity = paths.keeping().identity().map_err(|e| here(&e))?;
+    let peers = Arc::new(paths.keeping().peers().map_err(|e| here(&e))?);
     let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| here(&e))?);
     let peer = peers
         .find(who)
@@ -452,7 +452,7 @@ mod tests {
     impl Device {
         fn new(name: &'static str) -> Self {
             let dir = TempDir::new(name);
-            let identity = Identity::load_or_create(&dir.paths().identity()).unwrap();
+            let identity = dir.paths().keeping().identity().unwrap();
             // The device already knows what it can do, as it does after its
             // first inspection. How long that inspection takes is not what
             // these tests are about.
@@ -474,7 +474,7 @@ mod tests {
 
         /// Records `other` as paired, as `istesso pair` would.
         fn trust(&self, other: &Device) {
-            let mut store = PeerStore::open(self.paths().peers()).unwrap();
+            let mut store = self.paths().keeping().peers().unwrap();
             store
                 .add(Peer::from_hello(&Hello {
                     device_name: other.name.to_string(),
@@ -519,10 +519,10 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let (paths, name) = (self.paths(), self.name);
             std::thread::spawn(move || {
-                let identity = Identity::load_or_create(&paths.identity()).unwrap();
+                let identity = paths.keeping().identity().unwrap();
                 let keys = LocalKeys::new(&identity).unwrap();
                 let (stream, _) = listener.accept().unwrap();
-                let peers = PeerStore::open(paths.peers()).unwrap();
+                let peers = paths.keeping().peers().unwrap();
                 let Ok(mut session) =
                     Session::accept(stream, &keys, &peers, Duration::from_secs(10))
                 else {
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(before[1].state, HostState::Awake, "{:?}", before[1].problem);
 
         // The agent keeps running while the pairing is removed on its side.
-        let mut store = PeerStore::open(ubuntu.paths().peers()).unwrap();
+        let mut store = ubuntu.paths().keeping().peers().unwrap();
         assert!(store.remove(&air.id()).unwrap().is_some());
 
         let views = survey(&air.paths(), &SurveyOptions::default()).unwrap();
@@ -772,7 +772,7 @@ mod tests {
         let ubuntu = Device::new("ubuntu");
         pair(&air, &ubuntu);
         // Ubuntu keeps the pairing but takes away every permission.
-        let mut store = PeerStore::open(ubuntu.paths().peers()).unwrap();
+        let mut store = ubuntu.paths().keeping().peers().unwrap();
         let mut record = store.peers()[0].clone();
         record.permissions.retain(|p| *p != Permission::View);
         store.add(record).unwrap();

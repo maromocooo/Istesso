@@ -524,7 +524,10 @@ mod tests {
         let between = Between::new(pair.addr);
         let mut line = line_through(&pair, between.addr);
 
-        istesso_pair::PeerStore::open(pair.host.paths().peers())
+        pair.host
+            .paths()
+            .keeping()
+            .peers()
             .unwrap()
             .remove("a laptop")
             .unwrap()
@@ -549,7 +552,7 @@ mod tests {
         let between = Between::new(pair.addr);
         let mut line = line_through(&pair, between.addr);
 
-        let mut peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+        let mut peers = pair.host.paths().keeping().peers().unwrap();
         let mut laptop = peers.find("a laptop").unwrap().unwrap().clone();
         laptop.permissions = vec![istesso_pair::Permission::View];
         peers.add(laptop).unwrap();
@@ -575,10 +578,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let paths = pair.host.paths();
         std::thread::spawn(move || {
-            let identity = istesso_pair::Identity::load_or_create(&paths.identity()).unwrap();
+            let identity = paths.keeping().identity().unwrap();
             let keys = LocalKeys::new(&identity).unwrap();
             let (stream, _) = listener.accept().unwrap();
-            let peers = istesso_pair::PeerStore::open(paths.peers()).unwrap();
+            let peers = paths.keeping().peers().unwrap();
             let mut session =
                 Session::accept(stream, &keys, &peers, Duration::from_secs(5)).unwrap();
             while let Ok(Some(request)) = session.next_request() {

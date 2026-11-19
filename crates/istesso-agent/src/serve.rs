@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use istesso_link::{ErrorCode, HangUp, LocalKeys, Request, Response, Session, DEFAULT_PORT};
-use istesso_pair::{Identity, PeerStore, Permission};
+use istesso_pair::Permission;
 use istesso_proto::{AppEntry, HostManifest, InputEvent};
 
 use crate::cache;
@@ -114,7 +114,7 @@ struct InputHold {
 impl Agent {
     /// Loads (or creates) the device identity and starts listening.
     pub fn bind(paths: Paths, options: &AgentOptions, log: Log) -> Result<Self, String> {
-        let identity = Identity::load_or_create(&paths.identity()).map_err(|e| e.to_string())?;
+        let identity = paths.keeping().identity().map_err(|e| e.to_string())?;
         let keys = LocalKeys::new(&identity).map_err(|e| e.to_string())?;
         let listener = TcpListener::bind((options.bind, options.port)).map_err(|e| {
             format!(
@@ -350,7 +350,7 @@ impl InputSink {
 /// control this host: read from the list on disk, not remembered from when
 /// the conversation began.
 fn may_still_control(paths: &Paths, peer: &istesso_pair::Peer) -> bool {
-    PeerStore::open(paths.peers()).is_ok_and(|peers| {
+    paths.keeping().peers().is_ok_and(|peers| {
         peers.peers().iter().any(|known| {
             known.id == peer.id
                 && known.public_key == peer.public_key
@@ -363,7 +363,7 @@ impl Shared {
     fn handle(&self, stream: TcpStream) {
         // Read the list of paired devices for every caller: a pairing that
         // was removed a moment ago must not be honoured any more.
-        let peers = match PeerStore::open(self.paths.peers()) {
+        let peers = match self.paths.keeping().peers() {
             Ok(peers) => peers,
             Err(err) => {
                 (self.log)(format!("cannot read the list of paired devices: {err}"));
@@ -839,7 +839,7 @@ mod tests {
             client.send_input(&[key(30, true)]).unwrap();
             assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
 
-            let mut peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+            let mut peers = pair.host.paths().keeping().peers().unwrap();
             let mut laptop = peers.find("a laptop").unwrap().unwrap().clone();
             laptop.permissions = vec![istesso_pair::Permission::View];
             peers.add(laptop).unwrap();
@@ -880,7 +880,7 @@ mod tests {
         };
         // Not paired at all.
         assert!(!may_still_control(&paths, &peer));
-        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        let mut peers = paths.keeping().peers().unwrap();
         peers.add(peer.clone()).unwrap();
         assert!(may_still_control(&paths, &peer));
         // Another device that took over the name does not inherit the right.
@@ -888,12 +888,12 @@ mod tests {
         impostor.public_key = "22".repeat(32);
         assert!(!may_still_control(&paths, &impostor));
         // The pairing is removed while a conversation is open.
-        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        let mut peers = paths.keeping().peers().unwrap();
         peers.remove(&peer.id).unwrap();
         assert!(!may_still_control(&paths, &peer));
         // Paired again, but only for looking.
         peer.permissions = vec![Permission::View];
-        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        let mut peers = paths.keeping().peers().unwrap();
         peers.add(peer.clone()).unwrap();
         assert!(!may_still_control(&paths, &peer));
     }

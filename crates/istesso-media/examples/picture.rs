@@ -50,7 +50,7 @@ use istesso_agent::Paths;
 use istesso_link::LocalKeys;
 use istesso_media::wire::{self, Cursor, CursorImage, StreamInfo};
 use istesso_media::{Event, Host, Lasting, Step, Viewer};
-use istesso_pair::{Hello, Identity, Peer, PeerStore};
+use istesso_pair::{Hello, Identity, Peer};
 
 type Failure = Box<dyn std::error::Error>;
 
@@ -78,10 +78,10 @@ impl Args {
 }
 
 fn identity(paths: &Paths) -> Result<Identity, Failure> {
-    if !paths.identity().exists() {
-        return Err("this device has no identity yet; pair it first".into());
-    }
-    Ok(Identity::load_or_create(&paths.identity())?)
+    paths
+        .keeping()
+        .identity_if_any()?
+        .ok_or_else(|| "this device has no identity yet; pair it first".into())
 }
 
 fn percentile(sorted: &[u64], share: usize) -> f64 {
@@ -118,7 +118,7 @@ fn watch(mut args: Args) -> Result<(), Failure> {
     let addr = addr.to_socket_addrs()?.next().ok_or("that is no address")?;
 
     let keys = LocalKeys::new(&identity(&paths)?)?;
-    let peers = PeerStore::open(paths.peers())?;
+    let peers = paths.keeping().peers()?;
     let expected = match &peer {
         Some(name) => Some(
             peers
@@ -244,7 +244,7 @@ fn replay(mut args: Args) -> Result<(), Failure> {
 
     let log = Arc::new(|line: String| eprintln!("istesso-media: {line}"));
     let addr = bind.to_socket_addrs()?.next().ok_or("that is no address")?;
-    let host = Host::listen(addr, &identity(&paths)?, paths.peers(), info, log)?;
+    let host = Host::listen(addr, &identity(&paths)?, paths.keeping(), info, log)?;
     // A cursor that cannot be mistaken for anything on the screen: a triangle with its
     // tip at the top left, where the hot spot is.
     let mut triangle = vec![0u8; 64 * 64 * 4];
@@ -304,13 +304,13 @@ fn replay(mut args: Args) -> Result<(), Failure> {
 fn pair(args: Args) -> Result<(), Failure> {
     let root = PathBuf::from(args.0.first().ok_or("which directory?")?);
     let (host, device) = (Paths::at(root.join("host")), Paths::at(root.join("device")));
-    let host_identity = Identity::load_or_create(&host.identity())?;
-    let device_identity = Identity::load_or_create(&device.identity())?;
+    let host_identity = host.keeping().identity()?;
+    let device_identity = device.keeping().identity()?;
     for (paths, name, other) in [
         (&host, "device", &device_identity),
         (&device, "host", &host_identity),
     ] {
-        PeerStore::open(paths.peers())?.add(Peer::from_hello(&Hello {
+        paths.keeping().peers()?.add(Peer::from_hello(&Hello {
             device_name: name.into(),
             public_key: other.public_key(),
         }))?;
@@ -333,11 +333,12 @@ fn stay(mut args: Args) -> Result<(), Failure> {
         Box::new(move |began_with, within| {
             // Read anew for every connection: the pairing may have changed.
             // Never made here: a device without an identity has nothing to connect with.
-            if !paths.identity().exists() {
-                return Err(istesso_media::Error::NoIdentity);
-            }
-            let keys = LocalKeys::new(&Identity::load_or_create(&paths.identity())?)?;
-            let peers = PeerStore::open(paths.peers())?;
+            let identity = paths
+                .keeping()
+                .identity_if_any()?
+                .ok_or(istesso_media::Error::NoIdentity)?;
+            let keys = LocalKeys::new(&identity)?;
+            let peers = paths.keeping().peers()?;
             let expected = match (began_with, &peer) {
                 (Some(id), _) => Some(id.to_string()),
                 (None, Some(name)) => Some(

@@ -53,7 +53,7 @@ fn pair() -> Pair {
     let host = Host::listen(
         "127.0.0.1:0".parse().unwrap(),
         &studio,
-        studio_peers.path(),
+        studio_peers.keeping(),
         info(),
         log,
     )
@@ -441,7 +441,7 @@ fn nobody_cuts_everybody_and_lets_nobody_in() {
     let closed = Host::listen_admitting(
         "127.0.0.1:0".parse().unwrap(),
         &studio,
-        peers.path(),
+        peers.keeping(),
         info(),
         Arc::new(|_| {}),
         Admit::Nobody,
@@ -1845,12 +1845,12 @@ impl Pair {
     /// connects again when it is cut.
     fn lasting_through(&self, addr: SocketAddr) -> Lasting {
         let keys = LocalKeys::new(&self.air).unwrap();
-        let list = self.air_peers.path();
+        let list = self.air_peers.keeping();
         Lasting::new(
             Box::new(move |expected, within| {
                 // The list of paired devices is read for every connection, as a
                 // program does.
-                let peers = istesso_pair::PeerStore::open(&list)?;
+                let peers = list.peers()?;
                 Viewer::connect(addr, &keys, &peers, expected, within)
             }),
             None,
@@ -2121,7 +2121,7 @@ fn another_paired_device_at_the_same_address_is_not_the_picture() {
     let other = Host::listen(
         "127.0.0.1:0".parse().unwrap(),
         &den,
-        den_peers.path(),
+        den_peers.keeping(),
         info(),
         Arc::new(|_| {}),
     )

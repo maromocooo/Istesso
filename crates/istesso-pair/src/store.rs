@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::fingerprint;
+use crate::keeping::{Item, Vault};
 use crate::{to_hex, Error, Hello, Result};
 
 /// What a paired device is allowed to do on this machine.
@@ -97,25 +98,103 @@ struct StoreFile {
     peers: Vec<Peer>,
 }
 
-/// Trusted peers, kept in a JSON file readable only by its owner.
+/// Trusted peers, kept in a JSON file readable only by its owner, or, in a
+/// build that keeps them elsewhere, as one item of that place
+/// ([`crate::Keeping`], which is how a store is opened).
 ///
-/// Several processes use the same file at once (the agent, `istesso pair`
-/// waiting for a device, `istesso peers`). A handle's list is what the file
-/// held when it was last read. Every change therefore takes the store's lock,
-/// reads the file again, applies itself to what is there now and writes the
+/// Several processes use the same list at once (the agent, `istesso pair`
+/// waiting for a device, `istesso peers`). A handle's list is what was kept
+/// when it was last read. Every change therefore takes the store's lock,
+/// reads the list again, applies itself to what is there now and writes the
 /// result back before the lock is released, so a handle opened earlier never
 /// undoes a change another process made in between.
 pub struct PeerStore {
-    path: PathBuf,
+    place: Place,
     peers: Vec<Peer>,
 }
 
+/// Where a store keeps its list.
+pub(crate) enum Place {
+    /// The JSON file at this path.
+    File(PathBuf),
+    /// One item of `vault`. `file` is where the file form kept the list: a
+    /// list found there is moved in, and the store's lock stays next to it.
+    Vault {
+        vault: std::sync::Arc<dyn Vault>,
+        file: PathBuf,
+    },
+}
+
+impl Place {
+    /// The file the store's lock is named after.
+    fn file(&self) -> &Path {
+        match self {
+            Place::File(path) | Place::Vault { file: path, .. } => path,
+        }
+    }
+
+    /// The list as it is kept now. `locked` says that the caller holds the
+    /// store's lock.
+    fn read(&self, locked: bool) -> Result<Vec<Peer>> {
+        match self {
+            Place::File(path) => read_peers(path),
+            Place::Vault { vault, file } => {
+                if let Some(kept) = vault.get(Item::Peers)? {
+                    return parse_peers(&kept, &"the kept list of paired devices");
+                }
+                // Nothing kept yet. A list an earlier build left in its file
+                // is moved in, by one process at a time.
+                if !file.exists() {
+                    return Ok(Vec::new());
+                }
+                let _lock = if locked {
+                    None
+                } else {
+                    Some(StoreLock::take(file)?)
+                };
+                if let Some(kept) = vault.get(Item::Peers)? {
+                    return parse_peers(&kept, &"the kept list of paired devices");
+                }
+                let peers = read_peers(file)?;
+                let json = encode_peers(&peers)?;
+                vault.set(Item::Peers, &json)?;
+                // The file goes only once the list can be read back.
+                if vault.get(Item::Peers)?.as_deref() != Some(json.as_slice()) {
+                    return Err(Error::Corrupt(
+                        "the list of paired devices did not arrive where it is kept; \
+                         the file was left in place"
+                            .into(),
+                    ));
+                }
+                match std::fs::remove_file(file) {
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+                    _ => Ok(peers),
+                }
+            }
+        }
+    }
+
+    /// Keeps `peers`. Only called with the store's lock held.
+    fn write(&self, peers: &[Peer]) -> Result<()> {
+        match self {
+            Place::File(path) => save(path, peers),
+            Place::Vault { vault, .. } => vault.set(Item::Peers, &encode_peers(peers)?),
+        }
+    }
+}
+
 impl PeerStore {
-    /// Opens the store at `path`. A missing file is an empty store.
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        let peers = read_peers(&path)?;
-        Ok(PeerStore { path, peers })
+    /// Opens the store in the file at `path`. A missing file is an empty
+    /// store. For this crate's own tests: everything else opens a store
+    /// through [`crate::Keeping::peers`].
+    #[cfg(test)]
+    pub(crate) fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_in(Place::File(path.into()))
+    }
+
+    pub(crate) fn open_in(place: Place) -> Result<Self> {
+        let peers = place.read(false)?;
+        Ok(PeerStore { place, peers })
     }
 
     /// The peers as they were when the file was last read by this handle.
@@ -140,19 +219,19 @@ impl PeerStore {
         })
     }
 
-    /// One read-modify-write of the file under the store's lock. `apply`
-    /// gets the list as the file holds it now and says whether it changed
-    /// it; only then is the file written. Afterwards this handle shows the
-    /// list as it was left on disk.
+    /// One read-modify-write of the list under the store's lock. `apply`
+    /// gets the list as it is kept now and says whether it changed it; only
+    /// then is the list written. Afterwards this handle shows the list as
+    /// it was left.
     fn change<T>(&mut self, apply: impl FnOnce(&mut Vec<Peer>) -> Result<(T, bool)>) -> Result<T> {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self.place.file().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _lock = StoreLock::take(&self.path)?;
-        let mut peers = read_peers(&self.path)?;
+        let _lock = StoreLock::take(self.place.file())?;
+        let mut peers = self.place.read(true)?;
         let (result, changed) = apply(&mut peers)?;
         if changed {
-            save(&self.path, &peers)?;
+            self.place.write(&peers)?;
         }
         self.peers = peers;
         Ok(result)
@@ -226,21 +305,37 @@ fn position(peers: &[Peer], selector: &str) -> Result<Option<usize>> {
 
 fn read_peers(path: &Path) -> Result<Vec<Peer>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let file: StoreFile = serde_json::from_str(&text)
-                .map_err(|err| Error::Corrupt(format!("peer store {}: {err}", path.display())))?;
-            if file.version != STORE_VERSION {
-                return Err(Error::Corrupt(format!(
-                    "peer store {} has unsupported version {}",
-                    path.display(),
-                    file.version
-                )));
-            }
-            Ok(file.peers)
-        }
+        Ok(text) => parse_peers(
+            text.as_bytes(),
+            &format_args!("peer store {}", path.display()),
+        ),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err.into()),
     }
+}
+
+/// The list in `text`, which is the store as it is kept. `origin` names
+/// where it came from, for the error.
+fn parse_peers(text: &[u8], origin: &dyn std::fmt::Display) -> Result<Vec<Peer>> {
+    let file: StoreFile =
+        serde_json::from_slice(text).map_err(|err| Error::Corrupt(format!("{origin}: {err}")))?;
+    if file.version != STORE_VERSION {
+        return Err(Error::Corrupt(format!(
+            "{origin} has unsupported version {}",
+            file.version
+        )));
+    }
+    Ok(file.peers)
+}
+
+/// The store as it is kept, in a file or elsewhere.
+fn encode_peers(peers: &[Peer]) -> Result<Vec<u8>> {
+    let file = StoreFile {
+        version: STORE_VERSION,
+        peers: peers.to_vec(),
+    };
+    serde_json::to_vec_pretty(&file)
+        .map_err(|err| Error::Corrupt(format!("cannot encode peer store: {err}")))
 }
 
 /// `path` with `suffix` appended to its file name: `peers.json` becomes
@@ -253,12 +348,7 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 
 /// Writes the store. Only called with the store's lock held.
 fn save(path: &Path, peers: &[Peer]) -> Result<()> {
-    let file = StoreFile {
-        version: STORE_VERSION,
-        peers: peers.to_vec(),
-    };
-    let json = serde_json::to_vec_pretty(&file)
-        .map_err(|err| Error::Corrupt(format!("cannot encode peer store: {err}")))?;
+    let json = encode_peers(peers)?;
     // Write a new sibling file first and move it over the store, so a crash
     // never leaves a half-written store. The name is this process's and this
     // write's own, and the file is created new, so it is private from its
@@ -318,12 +408,12 @@ fn write_new_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// exclude each other as two processes do, and the system releases it when
 /// a process dies. The lock file is left in place; removing it would let two
 /// writers lock different files.
-struct StoreLock {
+pub(crate) struct StoreLock {
     _file: std::fs::File,
 }
 
 impl StoreLock {
-    fn take(store: &Path) -> std::io::Result<Self> {
+    pub(crate) fn take(store: &Path) -> std::io::Result<Self> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
