@@ -15,7 +15,12 @@
     <string name="need_pair">先にペアにしてください</string>
     <string name="connecting">つないでいます…</string>
     <string name="connected">絵：%1$d×%2$d、毎秒 %3$d 枚、色 %4$d</string>
-    <string name="cut">切れました。つなぎ直しています（%1$d 回目）</string>
+    <string name="cut">つなぎ直しています…（切れたのは %1$d 回目）</string>
+    <string name="again_ended">つなぎ直しています…（ホストのアプリの絵が終わりました。起動し直すのを待っています）</string>
+    <string name="again_set_aside">つなぎ直しています…（ホストが絵を止めています。計測のあいだなど）</string>
+    <string name="again_not_shown">つなぎ直しています…（ホストがほかの機器に絵を出しています）</string>
+    <string name="again_no_answer">つなぎ直しています…（ホストが答えません）</string>
+    <string name="input_again">入力：つなぎ直しています…</string>
     <string name="over">終わりました：%1$s</string>
     <string name="decoder">復号器：%1$s%2$s</string>
     <string name="low_latency">（低遅延）</string>

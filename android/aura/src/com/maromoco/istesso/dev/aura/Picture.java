@@ -33,8 +33,48 @@ final class Picture {
         void connecting();
         void connected(int width, int height, int fps, int chroma);
         void cut(long cuts);
+        /**
+         * The host said that its picture is over for now (its pipeline ended, it was put aside for
+         * a measurement, or it is shown to another device): a new connection is tried in `waitMs`.
+         * `why` is one of the OVER_* numbers.
+         */
+        void reconnecting(int why, long waitMs, int attempt);
         void decoder(String name, boolean lowLatency);
         void over(String why);
+    }
+
+    /** istesso_media.h, ISTESSO_MEDIA_OVER_*: why watchNext said that it is over. */
+    static final int OVER_ENDED = 1;
+    static final int OVER_NOT_SHOWN = 2;
+    static final int OVER_SET_ASIDE = 3;
+
+    /**
+     * How long before the next try after the host said that the picture is over, the first time
+     * and at most: doubled each time in between, and back to the first once a frame has come.
+     * (Within one connection, a cut is taken up again by the library: at once, then every
+     * quarter of a second for ten seconds, then every second.)
+     */
+    static final long AGAIN_FIRST_MS = 250;
+    static final long AGAIN_MOST_MS = 5000;
+
+    /** The time before try `attempt` (1, 2, ...): 0.25 s, 0.5 s, 1 s, 2 s, 4 s, then 5 s. */
+    static long againAfter(int attempt) {
+        long wait = AGAIN_FIRST_MS << Math.min(Math.max(attempt - 1, 0), 10);
+        return Math.min(wait, AGAIN_MOST_MS);
+    }
+
+    /**
+     * Not one of the host's reasons: no connection was made for NOT_YET_AFTER_MS (the host does
+     * not answer: its pipeline is not there, it is held still for a measurement, the network is
+     * away). The connection is let go and tried again after the wait, so that a host that stays
+     * away is knocked at every five seconds or so, not every second.
+     */
+    static final int NOT_YET = 100;
+    static final long NOT_YET_AFTER_MS = 3000;
+
+    /** Whether the reason is one that passes, so that the panel tries again. */
+    static boolean passes(int why) {
+        return why == OVER_ENDED || why == OVER_NOT_SHOWN || why == OVER_SET_ASIDE || why == NOT_YET;
     }
 
     private final String configDir;
@@ -49,6 +89,8 @@ final class Picture {
     private MediaCodec codec;
     private Thread drainer;
     private volatile boolean draining;
+    /** The decoder's input buffer this thread holds, or -1; kept from one connection to the next. */
+    private int held = -1;
 
     // ---- counters for the once-a-second log line (sizes and times only, nothing of the content) ----
     private final AtomicLong framesIn = new AtomicLong();
@@ -225,124 +267,184 @@ final class Picture {
             told.over("no-peer");
             return;
         }
-        long watch = Native.watchOpen(configDir, address, peer);
-        if (watch == 0) {
-            String why = Native.lastError(Native.ERROR_PAIRING);
-            told.over(why.isEmpty() ? Native.lastError(Native.ERROR_PICTURE) : why);
-            return;
-        }
-        told.connecting();
-        long[] meta = new long[7];
-        int held = -1;
-        boolean waitForKey = true;
+        int attempt = 0;
         try {
             while (!stop) {
-                if (codec != null && held < 0) {
-                    long askedAt = System.nanoTime();
+                long watch = Native.watchOpen(configDir, address, peer);
+                if (watch == 0) {
+                    String why = Native.lastError(Native.ERROR_PAIRING);
+                    told.over(why.isEmpty() ? Native.lastError(Native.ERROR_PICTURE) : why);
+                    return;
+                }
+                if (attempt == 0) {
+                    told.connecting();
+                }
+                int why;
+                try {
+                    why = watch(watch);
+                } finally {
+                    Native.watchClose(watch);
+                }
+                if (why == WATCH_DONE) {
+                    return; // asked to stop, or over for good (told already)
+                }
+                // After a connection that brought frames, the waits begin again at the first.
+                attempt = framesCame ? 1 : attempt + 1;
+                long wait = againAfter(attempt);
+                Log.i("IstessoAura", "picture: " + (why == NOT_YET ? "no connection for " + NOT_YET_AFTER_MS + " ms"
+                        : "the host said it is over (" + why + ")") + "; trying again in " + wait + " ms");
+                told.reconnecting(why, wait, attempt);
+                long until = System.nanoTime() + wait * 1_000_000L;
+                while (!stop && System.nanoTime() < until) {
                     try {
-                        held = codec.dequeueInputBuffer(10_000);
-                        inputWaitNs.addAndGet(System.nanoTime() - askedAt);
-                    } catch (IllegalStateException e) {
-                        Log.w(TAG, "the decoder failed; it is made again");
-                        closeCodec();
-                        held = -1;
-                        waitForKey = true;
-                        Native.watchAskKeyFrame(watch);
-                        continue;
-                    }
-                    if (held < 0) {
-                        continue;
-                    }
-                }
-                ByteBuffer into = null;
-                if (codec != null && held >= 0) {
-                    into = codec.getInputBuffer(held);
-                    if (into != null) {
-                        into.clear();
-                    }
-                }
-                if (into == null) {
-                    // No decoder yet: room enough for a frame that is dropped anyway.
-                    into = scratch();
-                }
-                int got = Native.watchNext(watch, 100, into, meta);
-                switch (got) {
-                    case Native.NEXT_FRAME: {
-                        // When the whole frame had been read: istesso_media_now_ns(), which on Android is the
-                        // monotonic clock, the one System.nanoTime() reads.
-                        long arrived = meta[5];
-                        framesIn.incrementAndGet();
-                        bytesIn.addAndGet(meta[0]);
-                        max(frameMaxBytes, meta[0]);
-                        if (lastArrivalNs != 0) {
-                            max(gapMaxNs, arrived - lastArrivalNs);
-                        }
-                        lastArrivalNs = arrived;
-                        oneWay(arrived, meta[6]);
-                        if (codec == null || held < 0) {
-                            dropped.incrementAndGet();
-                            break;
-                        }
-                        boolean key = meta[3] != 0;
-                        if (waitForKey && !key) {
-                            dropped.incrementAndGet();
-                            break; // keep the buffer for the next frame
-                        }
-                        waitForKey = false;
-                        int length = (int) meta[0];
-                        long ptsUs = meta[2] / 1000;
-                        remember(ptsUs, arrived);
-                        codec.queueInputBuffer(held, 0, length, ptsUs, key ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
-                        queuedWindow.incrementAndGet();
-                        queuedTotal.incrementAndGet();
-                        held = -1;
-                        break;
-                    }
-                    case Native.NEXT_CONNECTED: {
-                        newBaseline();
-                        int[] info = Native.watchInfo(watch);
-                        if (info == null) {
-                            break;
-                        }
-                        told.connected(info[1], info[2], info[3], info[4]);
-                        if (info[0] != CODEC_H265 || info[4] != CHROMA_420) {
-                            told.over("unsupported:" + info[4]);
-                            return;
-                        }
-                        if (codec == null || info[1] != width || info[2] != height) {
-                            closeCodec();
-                            held = -1;
-                            if (!openCodec(info[1], info[2], info[3])) {
-                                return;
-                            }
-                        }
-                        waitForKey = true;
-                        break;
-                    }
-                    case Native.NEXT_CUT:
-                        cuts.incrementAndGet();
-                        Log.i("IstessoAura", "picture: cut, connecting again");
-                        long[] state = Native.watchState(watch);
-                        told.cut(state == null ? 0 : state[0]);
-                        waitForKey = true;
-                        break;
-                    case Native.NEXT_TOO_BIG:
-                        dropped.incrementAndGet();
-                        Log.w(TAG, "a frame did not fit the decoder's buffer; a key frame is asked for");
-                        waitForKey = true;
-                        Native.watchAskKeyFrame(watch);
-                        break;
-                    case Native.NEXT_OVER:
-                        told.over(Native.lastError(Native.ERROR_PICTURE));
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
                         return;
-                    default:
-                        break; // nothing, or the cursor (not used: the host draws it)
+                    }
                 }
             }
         } finally {
             closeCodec();
-            Native.watchClose(watch);
         }
+    }
+
+    /** watch(): asked to stop, or over for good (the screen has been told). */
+    private static final int WATCH_DONE = 0;
+    /** Whether the last watch() brought any frame. Only the receiving thread uses it. */
+    private boolean framesCame;
+
+    /**
+     * Takes the frames of one lasting connection until it is over. Returns WATCH_DONE, or the
+     * host's reason (OVER_*) when it is one that passes.
+     */
+    private int watch(long watch) {
+        long[] meta = new long[7];
+        boolean waitForKey = true;
+        framesCame = false;
+        boolean connected = false;
+        long waitingSince = System.nanoTime();
+        while (!stop) {
+            if (!connected && System.nanoTime() - waitingSince > NOT_YET_AFTER_MS * 1_000_000L) {
+                cuts.incrementAndGet();
+                return NOT_YET;
+            }
+            if (codec != null && held < 0) {
+                long askedAt = System.nanoTime();
+                try {
+                    held = codec.dequeueInputBuffer(10_000);
+                    inputWaitNs.addAndGet(System.nanoTime() - askedAt);
+                } catch (IllegalStateException e) {
+                    Log.w(TAG, "the decoder failed; it is made again");
+                    closeCodec();
+                    held = -1;
+                    waitForKey = true;
+                    Native.watchAskKeyFrame(watch);
+                    continue;
+                }
+                if (held < 0) {
+                    continue;
+                }
+            }
+            ByteBuffer into = null;
+            if (codec != null && held >= 0) {
+                into = codec.getInputBuffer(held);
+                if (into != null) {
+                    into.clear();
+                }
+            }
+            if (into == null) {
+                // No decoder yet: room enough for a frame that is dropped anyway.
+                into = scratch();
+            }
+            int got = Native.watchNext(watch, 100, into, meta);
+            switch (got) {
+                case Native.NEXT_FRAME: {
+                    // When the whole frame had been read: istesso_media_now_ns(), which on Android is the
+                    // monotonic clock, the one System.nanoTime() reads.
+                    long arrived = meta[5];
+                    framesIn.incrementAndGet();
+                    bytesIn.addAndGet(meta[0]);
+                    max(frameMaxBytes, meta[0]);
+                    if (lastArrivalNs != 0) {
+                        max(gapMaxNs, arrived - lastArrivalNs);
+                    }
+                    lastArrivalNs = arrived;
+                    oneWay(arrived, meta[6]);
+                    framesCame = true;
+                    if (codec == null || held < 0) {
+                        dropped.incrementAndGet();
+                        break;
+                    }
+                    boolean key = meta[3] != 0;
+                    if (waitForKey && !key) {
+                        dropped.incrementAndGet();
+                        break; // keep the buffer for the next frame
+                    }
+                    waitForKey = false;
+                    int length = (int) meta[0];
+                    long ptsUs = meta[2] / 1000;
+                    remember(ptsUs, arrived);
+                    codec.queueInputBuffer(held, 0, length, ptsUs, key ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
+                    queuedWindow.incrementAndGet();
+                    queuedTotal.incrementAndGet();
+                    held = -1;
+                    break;
+                }
+                case Native.NEXT_CONNECTED: {
+                    connected = true;
+                    newBaseline();
+                    int[] info = Native.watchInfo(watch);
+                    if (info == null) {
+                        break;
+                    }
+                    told.connected(info[1], info[2], info[3], info[4]);
+                    if (info[0] != CODEC_H265 || info[4] != CHROMA_420) {
+                        told.over("unsupported:" + info[4]);
+                        return WATCH_DONE;
+                    }
+                    if (codec == null || info[1] != width || info[2] != height) {
+                        closeCodec();
+                        held = -1;
+                        if (!openCodec(info[1], info[2], info[3])) {
+                            return WATCH_DONE;
+                        }
+                    }
+                    // The host begins every connection with a key frame; nothing before it is decoded.
+                    waitForKey = true;
+                    break;
+                }
+                case Native.NEXT_CUT: {
+                    cuts.incrementAndGet();
+                    Log.i("IstessoAura", "picture: cut, connecting again");
+                    long[] state = Native.watchState(watch);
+                    told.cut(state == null ? 0 : state[0]);
+                    waitForKey = true;
+                    connected = false;
+                    waitingSince = System.nanoTime();
+                    break;
+                }
+                case Native.NEXT_TOO_BIG:
+                    dropped.incrementAndGet();
+                    Log.w(TAG, "a frame did not fit the decoder's buffer; a key frame is asked for");
+                    waitForKey = true;
+                    Native.watchAskKeyFrame(watch);
+                    break;
+                case Native.NEXT_OVER: {
+                    long[] state = Native.watchState(watch);
+                    int why = state == null ? 0 : (int) state[3];
+                    if (passes(why)) {
+                        cuts.incrementAndGet();
+                        return why;
+                    }
+                    told.over(Native.lastError(Native.ERROR_PICTURE));
+                    return WATCH_DONE;
+                }
+                default:
+                    break; // nothing, or the cursor (not used: the host draws it)
+            }
+        }
+        return WATCH_DONE;
     }
 
     private ByteBuffer scratch;
