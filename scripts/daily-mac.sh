@@ -35,7 +35,7 @@
 # process still is the one that was started. Nothing is stopped by name.
 #
 # Environment:
-#   ISTESSO_MAC_HOST     ssh name of the Mac host (default: istesso-mac)
+#   ISTESSO_MAC_HOST     ssh name of the Mac host (default: istesso-studio)
 #   DAILY_MAC_ADDRESS    the host's address for the picture and the input (default: what ssh uses)
 #   DAILY_MAC_DIR        the trial's folder on the host (default: ~/.cache/istesso-daily-mac)
 #   DAILY_MAC_CONFIG     identity and paired devices to use here (default: this Mac's own, read only)
@@ -57,7 +57,7 @@
 set -u
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-host_name=${ISTESSO_MAC_HOST:-istesso-mac}
+host_name=${ISTESSO_MAC_HOST:-istesso-studio}
 host_dir=${DAILY_MAC_DIR:-'~/.cache/istesso-daily-mac'}
 # A folder below the host's home, written as ~/...: nothing else is ever put into a command there.
 [[ "$host_dir" =~ ^~/[A-Za-z0-9._/-]+$ ]] && [[ "$host_dir" != *..* ]] || { echo "error: DAILY_MAC_DIR is a folder below the home, as ~/name"; exit 2; }
@@ -151,6 +151,12 @@ count_said() { said "$1" | grep -c "\"istesso\":\"$2\""; }
 HOST
 }
 on_host() { # COMMANDS on standard input
+    # The host is reached through the owner's open ssh login (its connection is shared); without
+    # it, say so plainly.
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$host_name" true 2>/dev/null; then
+        echo "Studio につながっていません（ssh studio のタブを開いてください）" >&2
+        return 255
+    fi
     { host_functions; cat; } | ssh -o BatchMode=yes -o ConnectTimeout=8 "$host_name" "DIR='$host_dir' bash -s"
 }
 
@@ -172,7 +178,7 @@ do_setup() {
         0) ;;
         3) echo "a latency measurement is running on the host: nothing is copied"; exit 3 ;;
         4) echo "error: a host program is running there; scripts/daily-mac.sh stop first"; exit 1 ;;
-        *) echo "error: the host could not be reached over ssh ($host_name)"; exit 1 ;;
+        *) echo "Studio につながっていません（ssh studio のタブを開いてください）"; exit 1 ;;
     esac
     # The bundle that was there is moved aside (into replaced/, never removed), and the new one is put
     # at the very same place: the owner's grants follow its signature there.

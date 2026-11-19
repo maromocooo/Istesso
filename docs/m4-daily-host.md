@@ -24,7 +24,7 @@ AURA ─────────────────────────
 ## 使い方（Air で、このブランチのチェックアウトから）
 
 ```sh
-export ISTESSO_MAC_HOST=<ホストの ssh の名前>
+export ISTESSO_MAC_HOST=<ホストの ssh の名前>   # 言わなければ istesso-studio
 scripts/daily-mac.sh setup                 # ここでビルドし、sign.env の証明書で署名して、ホストに写す
 scripts/daily-mac.sh pair-line             # ホストで持ち主が打つ 1 行（Air と AURA のペアリング）
 scripts/daily-mac.sh open TextEdit         # アプリを開いて、その窓だけを、ここの窓 1 枚に
