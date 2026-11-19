@@ -400,3 +400,18 @@ Istesso の ADR 0022（`trial-daily-clipboard` ブランチ）の、Ubuntu の�
 - `scripts/check-plugin.sh`：試用の修正だけが足すファイルに `wayland/handlers/text_input.rs` と `comp/clipboard.rs`、プラグインの中の文字列に `clipboard: answered` を足した。
 
 確かめたこと（ホスト、2026-11-19）：`scripts/build-compositor.sh <自分のフォルダー>/gwd-trial28 --trial --test` で、7 つの修正が当たり、テストは 127 本すべて通った（このうち 15 本が新しい。本物の Wayland クライアントで、`hello`、コピー、切り取り、前からある選択は取らない、ほかのアプリがキーボードを取ったら取らない、パスワードの欄、秘密の印、上限と制御文字、貼り付け、文字を待つあいだのキー、期限、文字のない貼り付けの取り下げ、上限を超えた貼り付け。ほかに、上限と JSON の 2 本）。クリップボードのテストだけを 3 回続けて流して、3 回とも通った。`check-plugin.sh` は 1（試用）。試用版には、まだ組み込んでいない。本物のアプリ（Firefox、Blender、Text Editor）では、まだ試していない。
+
+## スクロールの種類と段階（試用の 7 つ目の修正、2026-11-19）
+
+- 修正のファイル：`scripts/patches/gst-wayland-display-trial-y-scroll.patch`（`trial-windows`、`trial-x-text-input` の上に重ねる。名前の順で、最後に当たる）。試用のビルドにだけ入る（`--trial`）。判定で測るビルドは変わらない。
+- 中身：カスタムイベント `PointerScroll`（`source`＝`wheel` か `finger`、`x`、`y`、`v120-x`、`v120-y`、`phase`、`momentum`、`momentum-follows`）を受け、ホイールはホイールとして（`axis_value120`、1 目盛りが軸の値 10）、指は指として（絵の画素を出力の拡大率で割った、論理の画素）伝え、身ぶりが終わったら `axis_stop` を送る。送る側の慣性は、既定では指のスクロールの続きとして渡し、慣性の終わりで止める。慣性が続くかは、送る側が終わりの知らせに付ける（`momentum-follows`。待つのは送る側で、ネットワークの揺れに左右されない）。付いていない終わりでは、すぐに止める。`ISTESSO_SCROLL_MOMENTUM=app` では慣性を捨て、指が離れたときに止める。段階のない指は、最後から 100 ms で止める。終わりが届かなかった指のスクロールは、最後の値から 400 ms で止める。古い `MouseAxis` は変えていない。決めたことは ADR 0007 の「スクロールの種類と段階」（ブランチ `trial-daily-scroll`）。
+- ファイル：`comp/scroll.rs`（新しい）、`lib.rs`（`Command::PointerScroll`）、`comp/mod.rs`（状態 1 つと、コマンドの受け口）、プラグインの `waylandsrc/imp.rs`（イベントの読み取り。欠けたものと、数でない値は捨てる）。
+- テスト：`tests/test_trial_scroll.rs` の 8 本（本物の Wayland クライアントが受け取ったものを見る。拡大率 2 の出力、終わりの届かないスクロールを含む）。ホストのビルド `~/.cache/istesso-scroll-wip/gwd-scroll3`（`--trial --test`）で、コンポジターの試験 120 本が全部通った（2026-11-19、14:19 に終わった）。`check-plugin.sh` は、このビルドを試用と言う（1。trial-windows の印による）。関門の `gwd-cursor` は、これまでどおり 0。
+
+## まとめた試用のビルド（`gwd-trial29`、2026-11-19）
+
+試用の修正を、1 つのビルドにまとめた（ブランチ `m3-compositor-trial`。`m3-compositor-text-input` の `13ab83c` に、`m3-compositor-clipboard` の `ee9e0f4` と `m3-compositor-scroll` の `bd8dbbc` をマージ）。当てる順は名前の順：trial-windows、trial-x-text-input、trial-y-clipboard、trial-y-scroll。
+
+- trial-y-scroll は、trial-y-clipboard の上に作り直した。ぶつかったのは 2 か所：clipboard は、入力のコマンドを `take_input` でまとめて受け、貼り付けが文字を待つあいだ止めて順に流す。`PointerScroll` も入力として、その道に入れた（`is_input` と `apply_input`、コマンドの受け口の「上で受けた」の並び）。試験のモジュールの並びは、両方を残した。
+- ホストのビルド `~/.cache/istesso-scroll-wip/gwd-trial29`（`--trial --test`）：コンポジターの試験 135 本（clipboard の 15 本、scroll の 8 本を含む）が全部通った（2026-11-19、14:31 に終わった）。`check-plugin.sh` は試用と言う（1）。関門の `gwd-cursor` は 0。
+- 日本語の流れの、変換中の文字（preedit）の変更は、このブランチの上に足す（trial-x-text-input の修正を直す）。
