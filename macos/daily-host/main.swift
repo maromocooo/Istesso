@@ -632,6 +632,44 @@ func annexB(_ sample: CMSampleBuffer) -> ([UInt8], Bool)? {
 /// Everything between a picture and the transport, on one serial queue. The newest picture wins:
 /// while the encoder still has a frame, a new picture is kept, not queued, and goes in as soon as
 /// the encoder is free (no picture waits behind another).
+/// The picture is held back while the application's window is on its way to the virtual display.
+///
+/// Seen on the Air (2026-11-19 23:01, the owner's Dia session): the viewer fixes its points per
+/// picture pixel from the first picture it decodes. That was the picture of the window on the 1x
+/// main display (1906x1074 for a 1720-point window: 0.90); after the move onto the 2x virtual
+/// display the picture doubled (3420x2150) and the window followed at 0.90 points a pixel, so
+/// everything was shown about twice as large (sharp). So with a virtual display configured, no
+/// picture is sent until the window is on it and the stream has its size in that display's pixels;
+/// the viewer's first picture is then the 2x one. Never longer than 5 s (then the picture goes as
+/// it is), and not at all when the display could not be made lately or the screen is locked.
+func pictureHeldForVirtual(configured: Bool, onVirtual: Bool, streamMatches: Bool, restarting: Bool,
+                           failedRecently: Bool, locked: Bool, waited: Double) -> Bool {
+    guard configured, !failedRecently, !locked, waited < 5 else { return false }
+    return !onVirtual || !streamMatches || restarting
+}
+
+/// What the pump does with the newest picture: nothing (nobody watches, nobody waits for a resumed
+/// picture), hold it (the window is on its way to the virtual display: the picture is kept, and the
+/// first one after the hold goes as a key frame), or encode it. A `resume` while nobody watches is
+/// answered at once (the gate's 5 s start only with a viewer; daily-mac.sh waits for that answer).
+enum EncodeGate: Equatable { case nobody, held, encode }
+func encodeGate(heldForVirtual: Bool, viewers: Int, resumeWaiting: Bool) -> EncodeGate {
+    if viewers == 0 && !resumeWaiting { return .nobody }
+    if heldForVirtual && viewers > 0 { return .held }
+    return .encode
+}
+
+/// A flag set on the main queue and read on the pump's.
+final class SharedFlag {
+    private let lock = NSLock()
+    private var flag = false
+    var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return flag }
+        set { lock.lock(); flag = newValue; lock.unlock() }
+    }
+}
+let pictureHeld = SharedFlag()
+
 final class Pump {
     let queue = DispatchQueue(label: "istesso.daily-host.pump", qos: .userInteractive)
     let transport: Transport
@@ -721,6 +759,11 @@ final class Pump {
     func tick() {
         if transport.keyFrameWanted() { keyWanted = true }
         guard running, !inFlight, last != nil, transport.viewers > 0 || resumeAsked != nil else { return }
+        // Every path to the encoder goes through encodeLast's gate; this only saves the churn.
+        if encodeGate(heldForVirtual: pictureHeld.value, viewers: transport.viewers, resumeWaiting: resumeAsked != nil) == .held {
+            keyWanted = true
+            return
+        }
         let now = nowNs()
         let awake = settings.keepAwake > 0 ? UInt64(1_000_000_000 / settings.keepAwake) : UInt64.max
         if fresh {
@@ -733,10 +776,17 @@ final class Pump {
 
     private func encodeLast(filler: Bool) {
         guard let encoder, let buffer = last else { return }
-        // Nobody watches and nobody waits for a resumed picture: nothing is encoded.
-        if transport.viewers == 0 && resumeAsked == nil {
+        switch encodeGate(heldForVirtual: pictureHeld.value, viewers: transport.viewers, resumeWaiting: resumeAsked != nil) {
+        case .nobody:
+            // Nobody watches and nobody waits for a resumed picture: nothing is encoded.
             fresh = false
             return
+        case .held:
+            // Kept (fresh stays): it goes, as a key frame, once the window is on the virtual display.
+            keyWanted = true
+            return
+        case .encode:
+            break
         }
         let key = keyWanted
         keyWanted = false
@@ -1991,6 +2041,25 @@ func selfTest() -> Never {
     _ = guardedFlag.use { ran += 100 }
     guardedFlag.close { ran += 1000 }
     checkPanel(ran == 11, true, "a closed stream takes no more calls, and is closed once")
+    do {
+        func held(_ configured: Bool = true, on: Bool = false, matches: Bool = false, restarting: Bool = false,
+                  failed: Bool = false, locked: Bool = false, waited: Double = 0.5) -> Bool {
+            pictureHeldForVirtual(configured: configured, onVirtual: on, streamMatches: matches, restarting: restarting,
+                                  failedRecently: failed, locked: locked, waited: waited)
+        }
+        checkPanel(held(), true, "2x: no picture while the window is not on the virtual display yet")
+        checkPanel(held(on: true), true, "2x: nor while the stream still has the old size")
+        checkPanel(held(on: true, matches: true, restarting: true), true, "2x: nor while the new stream is made")
+        checkPanel(held(on: true, matches: true), false, "2x: on it, the stream of its size: the picture goes")
+        checkPanel(held(waited: 5.1), false, "2x: never held longer than 5 s")
+        checkPanel(held(failed: true) || held(locked: true) || held(false), false, "2x: not held when the display could not be made, when locked, or without a virtual display")
+        // The pump's gate (every path to the encoder: a new picture, a filler, the next after one).
+        checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: false) == .held, true, "pump: a picture while held is kept, not encoded")
+        checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: true) == .held, true, "pump: also with a resume waiting, while a viewer is there (the 5 s limit applies)")
+        checkPanel(encodeGate(heldForVirtual: true, viewers: 0, resumeWaiting: true) == .encode, true, "pump: a resume with nobody watching is answered at once")
+        checkPanel(encodeGate(heldForVirtual: false, viewers: 0, resumeWaiting: false) == .nobody, true, "pump: nobody watching, nothing waiting: nothing")
+        checkPanel(encodeGate(heldForVirtual: false, viewers: 2, resumeWaiting: false) == .encode, true, "pump: not held: encoded")
+    }
     failed += inlineSelfTest()
     failed += windowsSelfTest()
     print(failed == 0 ? "all passed" : "\(failed) failed")
@@ -2873,6 +2942,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
 
     func startApp(_ name: String) {
+        // With a virtual display, no picture before the window is on it (see pictureHeldForVirtual).
+        if settings.virtualDisplay != nil { pictureHeld.value = true }
         guard let url = applicationURL(name) else {
             say("refused", [("word", "start"), ("reason", "no application called \(name) was found")])
             return quit(1)
@@ -3176,6 +3247,32 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             self.panelShown = panelShown
             windowBounds = chosen.bounds
             place(chosen)
+        }
+        updatePictureHold(chosen)
+    }
+
+    /// Since when the picture has been held back while a viewer was there (the 5 s limit).
+    var pictureHoldSince: TimeInterval?
+    func updatePictureHold(_ window: WindowInfo) {
+        let now = ProcessInfo.processInfo.systemUptime
+        // Held also while nobody is shown (nothing goes then anyway), so that the first frame a
+        // new viewer gets is never one from before the move.
+        let configured = settings.virtualDisplay != nil
+        let onVirtual = virtualScreen?.frame.map { $0.contains(CGPoint(x: window.bounds.midX, y: window.bounds.midY)) } ?? false
+        let density = densityAt(window.bounds)
+        let wantW = max(64, min(3840, Int(window.bounds.width * density)) & ~1), wantH = max(64, min(2160, Int(window.bounds.height * density)) & ~1)
+        let matches = settings.size != nil || (wantW == width && wantH == height)
+        let waiting = configured && (!onVirtual || !matches || restarting)
+        let viewed = transport != nil && transport.viewers > 0
+        // The 5 s start is the start of THIS wait with a viewer: reset when nobody watches or the
+        // wait is over (a viewer that came and left before the move leaves no stale start).
+        if !waiting || !viewed { pictureHoldSince = nil } else if pictureHoldSince == nil { pictureHoldSince = now }
+        let held = pictureHeldForVirtual(configured: configured, onVirtual: onVirtual, streamMatches: matches, restarting: restarting,
+                                         failedRecently: now - virtualFailedAt < 30, locked: screenLocked(),
+                                         waited: pictureHoldSince.map { now - $0 } ?? 0)
+        if held != pictureHeld.value {
+            pictureHeld.value = held
+            if frameLog.on { frameLog.write("{\"kind\":\"picture_hold\",\"t_ns\":\(nowNs()),\"held\":\(held)}") }
         }
     }
 
@@ -3830,6 +3927,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// the shown window is on the virtual display; once nobody has been shown it for the time a
     /// viewer may take to come back, the window goes back and the display away.
     func manageVirtualDisplay() {
+        // The look at the application (updatePictureHold) does not run while locked or while a new
+        // stream is made: the hold's start is not carried over such a gap.
+        if screenLocked() || restarting { pictureHoldSince = nil }
         guard let spec = settings.virtualDisplay, app != nil, transport != nil, windowId != nil else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let viewed = transport.viewers > 0 || settings.virtualNow

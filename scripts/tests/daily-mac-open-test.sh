@@ -80,6 +80,15 @@ check "through open, no icon asked for: no ISTESSO_APP_ICON in its --env" '[ -s 
 run icon-set DAILY_VIEWER= DAILY_VIEWER_BUNDLE="$scratch/Viewer.app" "ISTESSO_APP_ICON=$icon" -- textedit
 check "through open, the launcher's icon is passed unchanged" 'grep -qF -- "[--env] [ISTESSO_APP_ICON=$icon]" "$scratch/icon-set/open.log"'
 
+# How many picture pixels a host point is, always said to the viewer through open.
+check "DAILY_VIRTUAL=0: density 1" 'grep -qF -- "[--env] [ISTESSO_PICTURE_DENSITY=1]" "$scratch/icon-unset/open.log"'
+run density-2 DAILY_VIEWER= DAILY_VIEWER_BUNDLE="$scratch/Viewer.app" DAILY_VIRTUAL=1 DAILY_VIRTUAL_SIZE=1710x1112 -- textedit
+check "the 2x virtual display: density 2" 'grep -qF -- "[--env] [ISTESSO_PICTURE_DENSITY=2]" "$scratch/density-2/open.log"'
+run density-size DAILY_VIEWER= DAILY_VIEWER_BUNDLE="$scratch/Viewer.app" DAILY_VIRTUAL=1 DAILY_VIRTUAL_SIZE=1710x1112 -- textedit --size 1200x800
+check "a size asked for: density 1" 'grep -qF -- "[--env] [ISTESSO_PICTURE_DENSITY=1]" "$scratch/density-size/open.log"'
+host=$(cat "$scratch/density-2"/host-*.sh 2>/dev/null)
+check "and the host was asked for the virtual display" '[[ "$host" == *"--virtual-display 1710x1112@120"* ]]'
+
 run off DAILY_CLIPBOARD=0 -- textedit
 host=$(cat "$scratch/off"/host-*.sh 2>/dev/null)
 check "DAILY_CLIPBOARD=0: no copy and paste for the host" '[[ "$host" != *"--clipboard"* ]]'
