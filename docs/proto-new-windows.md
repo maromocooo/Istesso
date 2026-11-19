@@ -36,7 +36,7 @@ ADR 0027 の【問い 窓9】のおすすめ（知らせは (a)、流れは (c)�
 | 手元 → ホスト | `resize` に `"window":N` | 言葉だけ。試作のホストは、足された窓の大きさを変えない |
 | エージェント → リレー | `input_open` の答えに `"windows":true` | 窓の番号、`close`、`windows` を、そのまま渡す。古いエージェントは言わない |
 | リレー → 手元 | 状態の行に `"windows":0/1` | 上の答え |
-| ホスト → 手元（映像の接続） | パケットの種類 6 | JSON（8 KiB まで）：`{"serial":N,"windows":[{"id":2,"port":P,"width":W,"height":H,"title":"…","modal":false,"key":false,"attention":false}]}`。最初の窓の接続で、最新の 1 つだけ。あとからつないだ手元にも届く。知らない手元は読み飛ばす |
+| ホスト → 手元（映像の接続） | パケットの種類 6 | JSON（8 KiB まで）：`{"serial":N,"windows":[{"id":2,"port":P,"width":W,"height":H,"title":"…","modal":false,"key":false,"attention":false,"points":[W,H]}]}`。`points` は、ホストの窓の大きさ（点。2026-11-20 に足した。ないときは、手元は `ISTESSO_PICTURE_DENSITY` で決める）。最初の窓の接続で、最新の 1 つだけ。あとからつないだ手元にも届く。知らない手元は読み飛ばす |
 
 **守り**：古いエージェントは、`pointer_at` の知らない欄（`window`）を、黙って捨てる（読んだ：serde の決まり）。すると、2 枚目の窓の座標が、最初の窓に当たる。これを防ぐために：
 
@@ -77,13 +77,13 @@ Studio では、この試作を動かしていない。動かすには、Istesso
 
 ### 用意したもの（Air の上。まだ Studio には写していない）
 
-このブランチの作業ツリーの `macos/daily-host/build/staged-2c27b8f/`（git の外。`STAGED.txt` に同じことを書いた）：
+このブランチの作業ツリーの `macos/daily-host/build/staged-488ffcb/`（git の外。`STAGED.txt` に同じことを書いた。前に用意した `staged-2c27b8f` は使わない）：
 
 | もの | 中身 |
 |---|---|
-| `Istesso Dev Daily Host.app` | コミット 2c27b8f（m4-host-inline 0b8e825 を取り込んだもの。Studio がいま動かしている 542ad7c を含む）から作り、`~/.config/istesso/sign.env` の開発用の証明書で署名。`daily-mac.sh setup` が前に作った束と、同じ証明書であることを確かめた。CDHash `babffe2b7c41c2e6dbc75d12fb9173b55b78a9d6` |
+| `Istesso Dev Daily Host.app` | コミット 488ffcb（m4-host-inline 0b8e825 を取り込んだもの。Studio がいま動かしている 542ad7c を含む。足された窓の一覧に、窓の大きさ（点）が入る）から作り、`~/.config/istesso/sign.env` の開発用の証明書で署名。`daily-mac.sh setup` が前に作った束と、同じ証明書であることを確かめた。CDHash `d05652b9b099bafa3050c5f26bcf8f4115d1072a` |
 | `bin/istesso` | 同じコミットのエージェントとリレー（`windows` を通す） |
-| `gst-viewer` | 同じコミットの Air のビューアー（シェルから起動する。束は作らない） |
+| `gst-viewer` | 同じコミットの Air のビューアー（シェルから起動する。束は作らない）。trial-daily-next 79d1792 の、絵の点の数の直し（2 倍に見える件）を取り込んだもの：最初の窓は、絵 1 画素を 1 / `ISTESSO_PICTURE_DENSITY` 点で出す（`daily-mac.sh` が渡す。なければ 2）。足された窓は、ホストが言う窓の大きさ（点）で出す |
 
 ### 入れ替え（調整役。Air から。持ち主が決めてから）
 
@@ -91,12 +91,12 @@ Studio では、この試作を動かしていない。動かすには、Istesso
 2. このブランチの作業ツリーで（`S` は用意したフォルダー）：
 
    ```sh
-   S=macos/daily-host/build/staged-2c27b8f
+   S=macos/daily-host/build/staged-488ffcb
    H=${ISTESSO_MAC_HOST:-istesso-studio}
    # 束とエージェントを、いつもの場所で入れ替える。前のものは replaced/ に、時刻の名前で残す（消さない）
    tar -C "$S" -cf - "Istesso Dev Daily Host.app" | ssh "$H" 'D="$HOME/.cache/istesso-daily-mac"; t=$(date +%Y%m%d-%H%M%S); mkdir -p "$D/replaced" && mv "$D/Istesso Dev Daily Host.app" "$D/replaced/$t-Istesso Dev Daily Host.app" && cp -p "$D/bin/istesso" "$D/replaced/$t-istesso" && tar -C "$D" -xf - && echo "replaced: $t"'
    ssh "$H" 'D="$HOME/.cache/istesso-daily-mac"; cat > "$D/bin/istesso.new" && chmod 755 "$D/bin/istesso.new" && mv "$D/bin/istesso.new" "$D/bin/istesso"' < "$S/bin/istesso"
-   # 写したものが、用意したものと同じか（CDHash が babffe2b… であること）
+   # 写したものが、用意したものと同じか（CDHash が d05652b9… であること）
    ssh "$H" 'codesign -dvvv "$HOME/.cache/istesso-daily-mac/Istesso Dev Daily Host.app" 2>&1 | grep ^CDHash'
    ```
 
@@ -107,12 +107,12 @@ Studio では、この試作を動かしていない。動かすには、Istesso
 Air の Terminal で、このブランチの作業ツリーにいるとする（リレーは `target/release/istesso`、このブランチのもの）。
 
 ```sh
-DAILY_WINDOWS=1 DAILY_FRAME_LOGS=1 DAILY_VIEWER="$PWD/macos/daily-host/build/staged-2c27b8f/gst-viewer" scripts/daily-mac.sh open TextEdit
+DAILY_WINDOWS=1 DAILY_FRAME_LOGS=1 DAILY_VIEWER="$PWD/macos/daily-host/build/staged-488ffcb/gst-viewer" scripts/daily-mac.sh open TextEdit
 ```
 
 | # | すること | 見るもの | ADR 0027 の確かめ |
 |---|---|---|---|
-| S1 | 上のコマンド | いまと同じに、試用の書類が 1 枚、Air に出る | — |
+| S1 | 上のコマンド | いまと同じに、試用の書類が 1 枚、Air に出る。文字の大きさが、Studio の上の TextEdit と同じに見える（2 倍に見えない） | — |
 | S2 | Air の TextEdit の窓で ⌘N | Air に、新しい窓が出て、打ち込む窓になる（題名「名称未設定」のような）。Dock のタイルは 1 つのまま。⌘\` で 2 枚を行き来できる。⌘N の直後に打った文字は、落ちて知らせが出ることがある（新しい窓が出るまでの守り） | 4 |
 | S3 | 2 枚目に「abc」と「にほんご」を打つ。1 枚目をクリックして「xyz」 | 打った文字は、前に出した窓にだけ入る | 5 |
 | S4 | 2 枚目で ⌘W（または赤いボタン） | TextEdit の「保存しますか」のシートが、2 枚目の窓の絵の中に出て、押せる。「保存しない」 | 6、7 |
@@ -125,7 +125,7 @@ DAILY_WINDOWS=1 DAILY_FRAME_LOGS=1 DAILY_VIEWER="$PWD/macos/daily-host/build/sta
 ### 記録するもの（調整役。持ち主の手は要らない）
 
 - Studio：`~/.cache/istesso-daily-mac/run/TextEdit/` の `host.log`（`windows`、`windows-listed`、`window-close`、`window-fallback` の行）と、フレームのログ `frames-*.jsonl` の `{"kind":"window",...}`（noticed、streaming、watched、gone、fallback）、`second` の行（最初の窓の `encode_median_ms`。2 枚目は `"window":2` 付き。測るもの 2）。
-- Air：`~/Library/Caches/istesso-daily-mac/TextEdit/` の `frames-*.jsonl` の `{"kind":"window",...}`（listed、connected、first_picture、over、closed）と、`stream` の行（S7 で増えないこと）、`viewer.log`。
+- Air：`~/Library/Caches/istesso-daily-mac/TextEdit/` の `frames-*.jsonl` の `{"kind":"window",...}`（listed、connected、first_picture、over、closed）と、`stream` の行（S7 で増えないこと）、`viewer.log`（最初の窓の `window: … picture pixels a point` の行と、足された窓ごとの `window N: WxH points for a picture of …` の行。仮想ディスプレイの上の窓なら、点は絵の半分）。
 - 2 台の時計は比べない。「窓が出るまで」（測るもの 1）は、ホストの中（noticed → watched）と、ビューアーの中（listed → first_picture）を、別々に。
 - 題名が、どのログにも出ないこと（`grep` で確かめる）。
 
