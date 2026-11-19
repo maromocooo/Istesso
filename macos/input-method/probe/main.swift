@@ -60,7 +60,10 @@ func status() {
         let languages: [String] = property(source, kTISPropertyInputSourceLanguages) ?? []
         let ascii: Bool = property(source, kTISPropertyInputSourceIsASCIICapable) ?? false
         let name: String = property(source, kTISPropertyLocalizedName) ?? "?"
-        print("source: \(id) name=\"\(name)\" enabled=\(enabled) selected=\(selected) select_capable=\(selectable) languages=\(languages) ascii_capable=\(ascii)")
+        let enableCapable: Bool = property(source, kTISPropertyInputSourceIsEnableCapable) ?? false
+        let category: String = property(source, kTISPropertyInputSourceCategory) ?? "?"
+        let type: String = property(source, kTISPropertyInputSourceType) ?? "?"
+        print("source: \(id) name=\"\(name)\" enabled=\(enabled) selected=\(selected) select_capable=\(selectable) languages=\(languages) ascii_capable=\(ascii) enable_capable=\(enableCapable) category=\(category) type=\(type)")
     }
     print("current: \(currentSourceID())")
     print("secure_event_input: \(IsSecureEventInputEnabled())")
@@ -355,6 +358,39 @@ final class Session {
             postClick(pid, at: CGPoint(x: x + dx, y: top + h / 2 + dy))
             print("click: posted")
             _ = read(until: nil, timeout: 0.5)
+        case "select-istesso":
+            // Istesso's source, writing down the one before; then wait for the input source's own
+            // "active" (the icon alone is not enough).
+            let effective = switchToIstesso()
+            print("select: system says current is Istesso's: \(effective)")
+            let got = read(until: { $0["op"] as? String == "active" }, timeout: 3)
+            print("active after select: \(got.contains { $0["op"] as? String == "active" })")
+        case "keymark":
+            // `keymark <n> [keycode]`: a key (default "a"; 36 is Return) and at once a mark of one
+            // kana, then its commit (waiting for "inserted"). In order, the commit lands one unit
+            // after the key's character: start + 2 i + 1.
+            guard words.count >= 2, let n = Int(words[1]), let pid = textEditPid() else { print("keymark: no TextEdit or bad arguments"); return }
+            let keyCode = CGKeyCode(words.count == 3 ? Int(words[2]) ?? 0 : 0)
+            guard let start = (ask(["op": "check"])?["selected"] as? [Int])?.first, start >= 0 else { print("keymark: no selection"); return }
+            var outOfOrder = 0, unknown = 0
+            for i in 0..<n {
+                postKey(pid, keyCode: keyCode)
+                _ = ask(["op": "mark", "text": "あ", "sel": [3, 3], "comp": comp], wait: 0.5)
+                let answer = ask(["op": "commit", "text": "あ", "comp": comp], wait: 0.5)
+                comp += 1
+                guard let at = answer?["at"] as? Int else { unknown += 1; continue }
+                if at != start + 2 * i + 1 { outOfOrder += 1 }
+            }
+            print("keymark: \(n) with key \(keyCode), out of order \(outOfOrder), unknown \(unknown)")
+        case "longmark":
+            // `longmark <n>`: a composition of n kana (a long live conversion); over the limit it is
+            // refused and the composition goes to the strip.
+            guard words.count == 2, let n = Int(words[1]) else { return }
+            let text = String(repeating: "あ", count: n)
+            let answer = ask(["op": "mark", "text": text, "sel": [text.utf8.count, text.utf8.count], "comp": comp])
+            let ok = answer?["ok"] as? Bool ?? false
+            print("longmark \(n): \(ok ? "inline" : "refused (\(answer?["why"] as? String ?? "?")) -> strip")")
+            if ok { _ = ask(["op": "clear"]); comp += 1 }
         case "recommit":
             // A commit of the composition just ended (as if it crossed "ended" on the wire): must
             // be refused as stale.
@@ -410,6 +446,16 @@ final class Session {
             if op == "commit" || op == "clear" { comp += 1 }
             print("send: \(op) (\((message["text"] as? String)?.utf8.count ?? 0) bytes)")
             let answer = ask(message)
+            if op == "commit", let answer, answer["ok"] as? Bool == false, answer["why"] as? String != "stale",
+               let text = message["text"] as? String, let pid = textEditPid() {
+                // Never dropped: a refused commit goes by today's text path (a key event carrying
+                // the text, as the Mac host's strip does).
+                postText(pid, text)
+                print("fallback: text path (\(answer["why"] as? String ?? "?"))")
+            }
+            if op == "mark", let answer, answer["ok"] as? Bool == false {
+                print("fallback: strip for this composition (\(answer["why"] as? String ?? "?"))")
+            }
             if let expected { print("match: \((answer?["sha256"] as? String) == expected)") }
         }
     }
@@ -427,6 +473,16 @@ func postKey(_ pid: pid_t, keyCode: CGKeyCode) {
     }
 }
 
+func postText(_ pid: pid_t, _ text: String) {
+    let source = CGEventSource(stateID: .privateState)
+    let units = Array(text.utf16)
+    for down in [true, false] {
+        let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down)
+        if down { event?.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units) }
+        event?.postToPid(pid)
+    }
+}
+
 func postClick(_ pid: pid_t, at point: CGPoint) {
     let source = CGEventSource(stateID: .privateState)
     for type in [CGEventType.leftMouseDown, .leftMouseUp] {
@@ -434,12 +490,16 @@ func postClick(_ pid: pid_t, at point: CGPoint) {
     }
 }
 
-func serve(script: String?) {
+func serve(script: String?, selectFirst: Bool = false) {
     guard let path = Wire.defaultSocketPath() else { fail("no temporary folder") }
     let listener = listen(at: path)
     defer { close(listener); unlink(path) }
     // A source written down and not put back means the last run ended without restoring.
     if let file = previousSourceFile(), access(file, F_OK) == 0 { restoreOriginal("start after a crash") }
+    if selectFirst {
+        // The input source's process starts only when its source is selected.
+        print("select before waiting: system says current is Istesso's: \(switchToIstesso())")
+    }
     print("waiting for Istesso Dev Input (it connects once a second while it runs)")
     guard let fd = acceptInputMethod(listener, timeout: 60) else { fail("Istesso Dev Input did not connect in 60 s") }
     let session = Session(listener: listener, fd: fd)
@@ -537,7 +597,7 @@ case "select": select()
 case "register": register()
 case "restore": restoreCommand()
 case "secure": secure()
-case "serve": serve(script: arguments.count == 3 ? arguments[2] : nil)
+case "serve": serve(script: arguments.count >= 3 ? arguments[2] : nil, selectFirst: arguments.count == 4 && arguments[3] == "--select")
 case "self-test" where arguments.count == 3: selfTest(arguments[2])
 default: fail("usage: status | register | serve [script] | select | restore | secure | self-test <input method binary>")
 }
