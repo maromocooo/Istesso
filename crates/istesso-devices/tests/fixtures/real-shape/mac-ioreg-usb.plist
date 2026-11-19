@@ -1,0 +1,2483 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>37</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000000</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80100000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 18</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000000001</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>2</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 18</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 5</string>
+		<key>USBPortType</key>
+		<integer>5</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		eYqbrL3O3/ABEiM0
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB20Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>1</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>256</integer>
+		<key>bcdUSB</key>
+		<integer>528</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65271</integer>
+		<key>idVendor</key>
+		<integer>65535</integer>
+		<key>kUSBAddress</key>
+		<integer>2</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000005</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 18</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 5</string>
+		<key>locationID</key>
+		<integer>2148532224</integer>
+		<key>sessionID</key>
+		<integer>100000000000003</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>1</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>44</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000004</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80110000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 12</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000000005</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>4</integer>
+		<key>USB Product Name</key>
+		<string>Example Café Camera</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-4</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 6</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>1</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		mKm6y9zt/g8gMUJTZHWGl6i5ytvs/Q4fMEFSYw==
+		</data>
+		<key>UsbIdlePolicy</key>
+		<integer>1000</integer>
+		<key>UsbLinkSpeed</key>
+		<integer>10000006</integer>
+		<key>bDeviceClass</key>
+		<integer>239</integer>
+		<key>bDeviceProtocol</key>
+		<integer>1</integer>
+		<key>bDeviceSubClass</key>
+		<integer>2</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>258</integer>
+		<key>bcdUSB</key>
+		<integer>513</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65278</integer>
+		<key>idVendor</key>
+		<integer>65533</integer>
+		<key>kUSBAddress</key>
+		<integer>4</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Café Camera</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-4</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 6</string>
+		<key>locationID</key>
+		<integer>2148597760</integer>
+		<key>sessionID</key>
+		<integer>100000000000007</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>37</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000008</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80140000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 18</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000000009</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>5</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 18</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 2</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		t8jZ6vsMHS4/UGFyg5Sl
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB20Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>2</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>257</integer>
+		<key>bcdUSB</key>
+		<integer>528</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65269</integer>
+		<key>idVendor</key>
+		<integer>65534</integer>
+		<key>kUSBAddress</key>
+		<integer>5</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000006</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 18</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 2</string>
+		<key>locationID</key>
+		<integer>2148794368</integer>
+		<key>sessionID</key>
+		<integer>100000000000010</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>1</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>36</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000011</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80141000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 15</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000000012</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>7</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 15</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 7</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>1</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		1uf4CRorPE1eb4CR
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB20Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>10000006</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>32</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>261</integer>
+		<key>bcdUSB</key>
+		<integer>272</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65275</integer>
+		<key>idVendor</key>
+		<integer>65530</integer>
+		<key>kUSBAddress</key>
+		<integer>7</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000007</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 15</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 7</string>
+		<key>locationID</key>
+		<integer>2148798464</integer>
+		<key>sessionID</key>
+		<integer>100000000000013</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>1</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>50</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000014</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80141100</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 13</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000000015</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>11</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 13</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 7</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>1</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		9QYXKDlKW2x9jp+w
+		</data>
+		<key>UsbLinkSpeed</key>
+		<integer>10000006</integer>
+		<key>bDeviceClass</key>
+		<integer>0</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>32</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>259</integer>
+		<key>bcdUSB</key>
+		<integer>272</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65277</integer>
+		<key>idVendor</key>
+		<integer>65532</integer>
+		<key>kUSBAddress</key>
+		<integer>11</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 13</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 7</string>
+		<key>locationID</key>
+		<integer>2148798720</integer>
+		<key>sessionID</key>
+		<integer>100000000000016</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>1</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>63</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000017</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80141200</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 14</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000000018</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>12</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 14</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-5</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 8</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>1</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		FCU2R1hpeoucrb7P4PECEyQ1RldoeYqbrL3O3/ABEiM0RVZneImaq7w=
+		</data>
+		<key>UsbLinkSpeed</key>
+		<integer>10000006</integer>
+		<key>UsbPowerSinkAllocation</key>
+		<integer>400</integer>
+		<key>bDeviceClass</key>
+		<integer>0</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>32</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>260</integer>
+		<key>bcdUSB</key>
+		<integer>272</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65276</integer>
+		<key>idVendor</key>
+		<integer>65531</integer>
+		<key>kUSBAddress</key>
+		<integer>12</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 14</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-5</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 8</string>
+		<key>locationID</key>
+		<integer>2148798976</integer>
+		<key>sessionID</key>
+		<integer>100000000000019</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>1</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>49</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000020</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80142000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 2</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000000021</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>9</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 2</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-6</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 2</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>1</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		M0RVZneImaq7zN3u/xAhMkNUZXaHmKm6y9zt/g8gMUI=
+		</data>
+		<key>UsbLinkSpeed</key>
+		<integer>10000006</integer>
+		<key>bDeviceClass</key>
+		<integer>0</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>262</integer>
+		<key>bcdUSB</key>
+		<integer>512</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65274</integer>
+		<key>idVendor</key>
+		<integer>65529</integer>
+		<key>kUSBAddress</key>
+		<integer>9</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 2</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-6</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 2</string>
+		<key>locationID</key>
+		<integer>2148802560</integer>
+		<key>sessionID</key>
+		<integer>100000000000022</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>37</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000023</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80143000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 18</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>1000000024</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>8</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 18</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 2</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		UmN0hZanuMna6/wNHi9A
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB20Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>2</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>257</integer>
+		<key>bcdUSB</key>
+		<integer>528</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65269</integer>
+		<key>idVendor</key>
+		<integer>65534</integer>
+		<key>kUSBAddress</key>
+		<integer>8</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000006</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 18</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 2</string>
+		<key>locationID</key>
+		<integer>2148806656</integer>
+		<key>sessionID</key>
+		<integer>100000000000025</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IODEXTMatchCount</key>
+		<integer>1</integer>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>60</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000026</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80143100</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 6</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>1000000027</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>18</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 6</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-9</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 11</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		cYKTpLXG1+j5ChssPU5fcIGSo7TF1uf4CRorPE1e
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>Example Value 17</string>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>bDeviceClass</key>
+		<integer>255</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>265</integer>
+		<key>bcdUSB</key>
+		<integer>512</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65270</integer>
+		<key>idVendor</key>
+		<integer>65526</integer>
+		<key>kUSBAddress</key>
+		<integer>18</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 6</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-9</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 11</string>
+		<key>locationID</key>
+		<integer>2148806912</integer>
+		<key>sessionID</key>
+		<integer>100000000000028</integer>
+	</dict>
+	<dict>
+		<key>CFBundleIdentifier</key>
+		<string>Example Value 18</string>
+		<key>CFBundleIdentifierKernel</key>
+		<string>com.apple.kpi.iokit</string>
+		<key>DKUSBUserClientProperties</key>
+		<dict>
+			<key>IOClass</key>
+			<string>IOUserUserClient</string>
+			<key>IOUserClass</key>
+			<string>Example Value 19</string>
+		</dict>
+		<key>IOClass</key>
+		<string>IOUserService</string>
+		<key>IOGeneralInterest</key>
+		<string>IOCommand is not serializable</string>
+		<key>IOMatchCategory</key>
+		<string>IODefaultMatchCategory</string>
+		<key>IOMatchedPersonality</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>Example Value 18</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.kpi.iokit</string>
+			<key>DKUSBUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>Example Value 19</string>
+			</dict>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOPersonalityPublisher</key>
+			<string>Example Value 18</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostDevice</string>
+			<key>IOUserClass</key>
+			<string>Example Value 17</string>
+			<key>IOUserServerCDHash</key>
+			<string>eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeea7</string>
+			<key>IOUserServerName</key>
+			<string>Example Value 18</string>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>idProductArray</key>
+			<array>
+				<integer>65264</integer>
+				<integer>65263</integer>
+				<integer>65262</integer>
+				<integer>65261</integer>
+				<integer>65260</integer>
+				<integer>65259</integer>
+				<integer>65258</integer>
+				<integer>65257</integer>
+				<integer>65270</integer>
+				<integer>65256</integer>
+				<integer>65255</integer>
+				<integer>65254</integer>
+				<integer>65253</integer>
+				<integer>65252</integer>
+				<integer>65251</integer>
+				<integer>65250</integer>
+				<integer>65249</integer>
+				<integer>65248</integer>
+				<integer>65247</integer>
+				<integer>65246</integer>
+				<integer>65245</integer>
+				<integer>65244</integer>
+				<integer>65243</integer>
+				<integer>65242</integer>
+				<integer>65241</integer>
+				<integer>65240</integer>
+			</array>
+			<key>idVendor</key>
+			<integer>65526</integer>
+			<key>kOSBundleDextUniqueIdentifier</key>
+			<data>
+			kKGyw9Tl9gcYKTpLXG1+j6CxwtPk9QYXKDlKW2x9jp8=
+			</data>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUserService</string>
+		<key>IOObjectRetainCount</key>
+		<integer>593</integer>
+		<key>IOPersonalityPublisher</key>
+		<string>Example Value 18</string>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>3</integer>
+			<key>MaxPowerState</key>
+			<integer>3</integer>
+		</dict>
+		<key>IOProbeScore</key>
+		<integer>90000</integer>
+		<key>IOProviderClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IORegistryEntryID</key>
+		<integer>1000000029</integer>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 24</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>1000000030</integer>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>IOUserClass</key>
+		<string>Example Value 17</string>
+		<key>IOUserClasses</key>
+		<array>
+			<string>Example Value 17</string>
+			<string>IOUSBHostDevice</string>
+			<string>IOService</string>
+			<string>Example Value 20</string>
+		</array>
+		<key>IOUserServerCDHash</key>
+		<string>eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeea7</string>
+		<key>IOUserServerName</key>
+		<string>Example Value 18</string>
+		<key>bConfigurationValue</key>
+		<integer>1</integer>
+		<key>buffer frame size</key>
+		<integer>8192</integer>
+		<key>Example Key 1</key>
+		<string>Example Value 21</string>
+		<key>idProductArray</key>
+		<array>
+			<integer>65264</integer>
+			<integer>65263</integer>
+			<integer>65262</integer>
+			<integer>65261</integer>
+			<integer>65260</integer>
+			<integer>65259</integer>
+			<integer>65258</integer>
+			<integer>65257</integer>
+			<integer>65270</integer>
+			<integer>65256</integer>
+			<integer>65255</integer>
+			<integer>65254</integer>
+			<integer>65253</integer>
+			<integer>65252</integer>
+			<integer>65251</integer>
+			<integer>65250</integer>
+			<integer>65249</integer>
+			<integer>65248</integer>
+			<integer>65247</integer>
+			<integer>65246</integer>
+			<integer>65245</integer>
+			<integer>65244</integer>
+			<integer>65243</integer>
+			<integer>65242</integer>
+			<integer>65241</integer>
+			<integer>65240</integer>
+		</array>
+		<key>idVendor</key>
+		<integer>65526</integer>
+		<key>kOSBundleDextUniqueIdentifier</key>
+		<data>
+		r8DR4vMEFSY3SFlqe4ydrr/Q4fIDFCU2R1hpeoucrb4=
+		</data>
+		<key>Example Key 2</key>
+		<integer>44100</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>36</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>0</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000031</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80143200</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 18</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000032</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>15</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 18</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 5</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		zt/wARIjNEVWZ3iJ
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB20Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>1</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>256</integer>
+		<key>bcdUSB</key>
+		<integer>528</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65271</integer>
+		<key>idVendor</key>
+		<integer>65535</integer>
+		<key>kUSBAddress</key>
+		<integer>15</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000005</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 18</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 5</string>
+		<key>locationID</key>
+		<integer>2148807168</integer>
+		<key>sessionID</key>
+		<integer>100000000000033</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>38</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000034</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80143210</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 17</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000035</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>16</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 17</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-8</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 10</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		7f4PIDFCU2R1hpeoucrb7P0OHzBBUmN0hZY=
+		</data>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>UsbPowerSinkAllocation</key>
+		<integer>500</integer>
+		<key>bDeviceClass</key>
+		<integer>0</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>264</integer>
+		<key>bcdUSB</key>
+		<integer>512</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65272</integer>
+		<key>idVendor</key>
+		<integer>65527</integer>
+		<key>kUSBAddress</key>
+		<integer>16</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 17</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-8</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 10</string>
+		<key>locationID</key>
+		<integer>2148807184</integer>
+		<key>sessionID</key>
+		<integer>100000000000036</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>27</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000037</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80143240</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 18</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000038</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>17</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 18</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 5</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		DB0uP1BhcoOUpbbH
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB20Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>UsbPowerSinkAllocation</key>
+		<integer>500</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>1</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>256</integer>
+		<key>bcdUSB</key>
+		<integer>528</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65271</integer>
+		<key>idVendor</key>
+		<integer>65535</integer>
+		<key>kUSBAddress</key>
+		<integer>17</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000005</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 18</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 5</string>
+		<key>locationID</key>
+		<integer>2148807232</integer>
+		<key>sessionID</key>
+		<integer>100000000000039</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>1</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>36</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000040</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80143400</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 16</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>1000000041</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>10</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 16</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-7</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 9</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>1</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		KzxNXm+AkaKzxNXm9wgZKjtMXW5/kKGyw9Tl9gcYKTpLXG1+j6CxwtPk9QYX
+		KDk=
+		</data>
+		<key>UsbLinkSpeed</key>
+		<integer>10000006</integer>
+		<key>bDeviceClass</key>
+		<integer>0</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>263</integer>
+		<key>bcdUSB</key>
+		<integer>512</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65273</integer>
+		<key>idVendor</key>
+		<integer>65528</integer>
+		<key>kUSBAddress</key>
+		<integer>10</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 16</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-7</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 9</string>
+		<key>locationID</key>
+		<integer>2148807680</integer>
+		<key>sessionID</key>
+		<integer>100000000000042</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>3</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>36</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000043</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80200000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 10</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>1000000044</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>1</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 10</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 5</string>
+		<key>USBPortType</key>
+		<integer>5</integer>
+		<key>USBSpeed</key>
+		<integer>4</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		SltsfY6fsMHS4/QF
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB30Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>1000000045</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>3</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>9</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>256</integer>
+		<key>bcdUSB</key>
+		<integer>800</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65280</integer>
+		<key>idVendor</key>
+		<integer>65535</integer>
+		<key>kUSBAddress</key>
+		<integer>1</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000005</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBHubIdlePolicy</key>
+		<integer>0</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 10</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 5</string>
+		<key>locationID</key>
+		<integer>2149580800</integer>
+		<key>sessionID</key>
+		<integer>100000000000046</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>3</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>35</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000047</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80240000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 11</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>1000000048</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>3</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 11</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 2</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>4</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		aXqLnK2+z+DxAhMk
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB30Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>1000000045</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>3</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>9</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>257</integer>
+		<key>bcdUSB</key>
+		<integer>800</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65279</integer>
+		<key>idVendor</key>
+		<integer>65534</integer>
+		<key>kUSBAddress</key>
+		<integer>3</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000006</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 11</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 2</string>
+		<key>locationID</key>
+		<integer>2149842944</integer>
+		<key>sessionID</key>
+		<integer>100000000000049</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>3</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>35</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000050</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80243000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 11</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000051</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>6</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 11</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 2</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>4</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		iJmqu8zd7v8QITJD
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB30Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>1000000045</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>3</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>9</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>257</integer>
+		<key>bcdUSB</key>
+		<integer>800</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65279</integer>
+		<key>idVendor</key>
+		<integer>65534</integer>
+		<key>kUSBAddress</key>
+		<integer>6</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000006</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 11</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 2</string>
+		<key>locationID</key>
+		<integer>2149855232</integer>
+		<key>sessionID</key>
+		<integer>100000000000052</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>3</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>35</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000053</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80243200</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 10</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000054</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>13</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 10</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 5</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>4</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		p7jJ2uv8DR4vQFFi
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB30Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>1000000045</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>3</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>9</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>256</integer>
+		<key>bcdUSB</key>
+		<integer>800</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65280</integer>
+		<key>idVendor</key>
+		<integer>65535</integer>
+		<key>kUSBAddress</key>
+		<integer>13</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000005</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBHubIdlePolicy</key>
+		<integer>0</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 10</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 5</string>
+		<key>locationID</key>
+		<integer>2149855744</integer>
+		<key>sessionID</key>
+		<integer>100000000000055</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>3</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>27</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000056</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>80243240</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 10</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000057</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>14</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 10</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 5</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>4</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		xtfo+QobLD1OX3CB
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB30Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>1000000045</integer>
+		<key>UsbPowerSinkAllocation</key>
+		<integer>900</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>3</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>9</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>256</integer>
+		<key>bcdUSB</key>
+		<integer>800</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>0</integer>
+		<key>idProduct</key>
+		<integer>65280</integer>
+		<key>idVendor</key>
+		<integer>65535</integer>
+		<key>kUSBAddress</key>
+		<integer>14</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000005</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBHubIdlePolicy</key>
+		<integer>0</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 10</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 5</string>
+		<key>locationID</key>
+		<integer>2149855808</integer>
+		<key>sessionID</key>
+		<integer>100000000000058</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>38</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000059</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>81100000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 23</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000000060</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>2</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 23</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-11</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 13</string>
+		<key>USBPortType</key>
+		<integer>5</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		5fYHGCk6S1xtfo+gscLT5PUGFyg5Slts
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB20Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>2</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>267</integer>
+		<key>bcdUSB</key>
+		<integer>528</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65265</integer>
+		<key>idVendor</key>
+		<integer>65524</integer>
+		<key>kUSBAddress</key>
+		<integer>2</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000008</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 23</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-11</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 13</string>
+		<key>locationID</key>
+		<integer>2165309440</integer>
+		<key>sessionID</key>
+		<integer>100000000000061</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>2</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>39</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>65536</integer>
+			<key>CurrentPowerState</key>
+			<integer>1</integer>
+			<key>DevicePowerState</key>
+			<integer>1</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000062</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>81150000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 22</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>10000000063</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>4</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 22</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-12</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 14</string>
+		<key>USBPortType</key>
+		<integer>1</integer>
+		<key>USBSpeed</key>
+		<integer>3</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		BBUmN0hZanuMna6/0OHyAxQlNkdYaXqLnK2+zw==
+		</data>
+		<key>UsbIdlePolicy</key>
+		<integer>1000</integer>
+		<key>UsbLinkSpeed</key>
+		<integer>100000002</integer>
+		<key>UsbUserClientEntitlementRequired</key>
+		<dict>
+			<key>UsbUserClientEntitlement</key>
+			<string>com.apple.developer.usb.billboard</string>
+			<key>UsbUserClientEntitlementExceptionAllowUnlocked</key>
+			<true/>
+		</dict>
+		<key>bDeviceClass</key>
+		<integer>17</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>64</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>265</integer>
+		<key>bcdUSB</key>
+		<integer>513</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65266</integer>
+		<key>idVendor</key>
+		<integer>65533</integer>
+		<key>kUSBAddress</key>
+		<integer>4</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000008</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 22</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-12</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 14</string>
+		<key>locationID</key>
+		<integer>2165637120</integer>
+		<key>sessionID</key>
+		<integer>100000000000064</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>3</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>36</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>ChildrenPowerState</key>
+			<integer>2</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000065</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>81200000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 21</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000000066</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>1</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 21</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-11</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 13</string>
+		<key>USBPortType</key>
+		<integer>5</integer>
+		<key>USBSpeed</key>
+		<integer>4</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		IzRFVmd4iZqrvM3e7wARIjNEVWZ3
+		</data>
+		<key>UsbExclusiveOwner</key>
+		<string>AppleUSB30Hub</string>
+		<key>UsbLinkSpeed</key>
+		<integer>1000000045</integer>
+		<key>bDeviceClass</key>
+		<integer>9</integer>
+		<key>bDeviceProtocol</key>
+		<integer>3</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>9</integer>
+		<key>bNumConfigurations</key>
+		<integer>1</integer>
+		<key>bcdDevice</key>
+		<integer>267</integer>
+		<key>bcdUSB</key>
+		<integer>800</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65267</integer>
+		<key>idVendor</key>
+		<integer>65524</integer>
+		<key>kUSBAddress</key>
+		<integer>1</integer>
+		<key>kUSBContainerID</key>
+		<string>00000000-0000-4000-8000-000000000008</string>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>1</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 21</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-11</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 13</string>
+		<key>locationID</key>
+		<integer>2166358016</integer>
+		<key>sessionID</key>
+		<integer>100000000000067</integer>
+	</dict>
+	<dict>
+		<key>Device Speed</key>
+		<integer>3</integer>
+		<key>IOCFPlugInTypes</key>
+		<dict>
+			<key>00000000-0000-4000-8000-000000000004</key>
+			<string>Example Value 16</string>
+		</dict>
+		<key>IOObjectClass</key>
+		<string>IOUSBHostDevice</string>
+		<key>IOObjectRetainCount</key>
+		<integer>59</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>32768</integer>
+			<key>CurrentPowerState</key>
+			<integer>2</integer>
+			<key>DevicePowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>0</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+			<key>PowerOverrideOn</key>
+			<true/>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>1000000068</integer>
+		<key>IORegistryEntryLocation</key>
+		<string>81230000</string>
+		<key>IORegistryEntryName</key>
+		<string>Example Product 20</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>100000000069</integer>
+		<key>IOServiceDEXTEntitlements</key>
+		<array>
+			<array>
+				<string>com.apple.developer.driverkit.transport.usb</string>
+			</array>
+		</array>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>USB Address</key>
+		<integer>3</integer>
+		<key>USB Product Name</key>
+		<string>Example Product 20</string>
+		<key>USB Serial Number</key>
+		<string>SERIAL-10</string>
+		<key>USB Vendor Name</key>
+		<string>Example Maker 12</string>
+		<key>USBPortType</key>
+		<integer>0</integer>
+		<key>USBSpeed</key>
+		<integer>4</integer>
+		<key>UsbDeviceSignature</key>
+		<data>
+		QlNkdYaXqLnK2+z9Dh8wQVJjdIWWp7jJ2uv8DR4vQFE=
+		</data>
+		<key>UsbLinkSpeed</key>
+		<integer>1000000045</integer>
+		<key>UsbPowerSinkAllocation</key>
+		<integer>184</integer>
+		<key>bDeviceClass</key>
+		<integer>0</integer>
+		<key>bDeviceProtocol</key>
+		<integer>0</integer>
+		<key>bDeviceSubClass</key>
+		<integer>0</integer>
+		<key>bMaxPacketSize0</key>
+		<integer>9</integer>
+		<key>bNumConfigurations</key>
+		<integer>3</integer>
+		<key>bcdDevice</key>
+		<integer>266</integer>
+		<key>bcdUSB</key>
+		<integer>800</integer>
+		<key>iManufacturer</key>
+		<integer>1</integer>
+		<key>iProduct</key>
+		<integer>2</integer>
+		<key>iSerialNumber</key>
+		<integer>3</integer>
+		<key>idProduct</key>
+		<integer>65268</integer>
+		<key>idVendor</key>
+		<integer>65525</integer>
+		<key>kUSBAddress</key>
+		<integer>3</integer>
+		<key>kUSBCurrentConfiguration</key>
+		<integer>2</integer>
+		<key>kUSBPreferredConfiguration</key>
+		<integer>2</integer>
+		<key>kUSBProductString</key>
+		<string>Example Product 20</string>
+		<key>kUSBSerialNumberString</key>
+		<string>SERIAL-10</string>
+		<key>kUSBVendorString</key>
+		<string>Example Maker 12</string>
+		<key>locationID</key>
+		<integer>2166554624</integer>
+		<key>sessionID</key>
+		<integer>100000000000070</integer>
+	</dict>
+</array>
+</plist>

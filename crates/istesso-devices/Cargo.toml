@@ -16,6 +16,9 @@ hid = ["dep:hidapi"]
 istesso-device-api.workspace = true
 istesso-device-adapters.workspace = true
 image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+plist.workspace = true
 hidapi = { workspace = true, optional = true }
 
 [dev-dependencies]

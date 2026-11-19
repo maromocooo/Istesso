@@ -36,6 +36,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect devices connected to this machine
+    Devices {
+        #[command(subcommand)]
+        action: DevicesAction,
+    },
     /// Work with the application catalogue
     Apps {
         #[command(subcommand)]
@@ -92,6 +97,16 @@ enum Command {
     Input {
         #[command(subcommand)]
         action: InputAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevicesAction {
+    /// List local devices, their ports and how they can be used
+    List {
+        /// Print the inventory as JSON with machine-readable classifications
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -454,6 +469,22 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_json(&manifest)
             } else {
                 print!("{}", render_manifest(&manifest));
+                Ok(())
+            }
+        }
+        Command::Devices {
+            action: DevicesAction::List { json },
+        } => {
+            let devices = istesso_devices::inventory::local()?;
+            if json {
+                print_json(&devices)
+            } else {
+                if devices.is_empty() {
+                    println!("No local devices found.");
+                }
+                for device in devices {
+                    println!("{device}");
+                }
                 Ok(())
             }
         }
