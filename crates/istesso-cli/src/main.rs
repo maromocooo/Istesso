@@ -649,11 +649,12 @@ fn relay_input(
     let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
     // "text": whether the device takes committed text (1) or not (0), for the window;
     // "clipboard": the same for copy and paste (trial only, ADR 0022); "preedit": the same for
-    // composing text (trial only).
+    // composing text (trial only); "windows": the same for the application's other windows
+    // (window numbers, close, windows; trial only, ADR 0027 proposal).
     let tell = |event: &str,
                 cuts: u64,
                 after: Option<Duration>,
-                (text, clipboard, preedit): (bool, bool, bool)| {
+                (text, clipboard, preedit, windows): (bool, bool, bool, bool)| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -678,11 +679,12 @@ fn relay_input(
             String::new()
         };
         let line = format!(
-            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{},\"preedit\":{}{status}}}\n",
+            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{},\"preedit\":{},\"windows\":{}{status}}}\n",
             std::process::id(),
             u8::from(text),
             u8::from(clipboard),
-            u8::from(preedit)
+            u8::from(preedit),
+            u8::from(windows)
         );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
@@ -735,6 +737,7 @@ fn relay_input(
             line.takes_text(),
             line.takes_clipboard(),
             line.takes_preedit(),
+            line.takes_windows(),
         )
     };
     let opened = |line: &InputLine| {
@@ -751,7 +754,7 @@ fn relay_input(
         }
     };
     if daily {
-        tell("waiting", 0, None, (false, false, false));
+        tell("waiting", 0, None, (false, false, false, false));
     } else {
         opened(&line);
     }
@@ -780,11 +783,17 @@ fn relay_input(
                     return;
                 }
             }
-            // Of pointer positions in a row only the last one matters.
-            match (events.last_mut(), &event) {
-                (Some(last @ InputEvent::PointerAt { .. }), InputEvent::PointerAt { .. }) => {
-                    *last = event;
-                }
+            // Of pointer positions in a row in one window only the last one matters (the last
+            // one in a window is kept when the pointer goes into another, trial only).
+            let same_window = matches!(
+                (events.last(), &event),
+                (
+                    Some(InputEvent::PointerAt { window: before, .. }),
+                    InputEvent::PointerAt { window, .. },
+                ) if before == window
+            );
+            match events.last_mut() {
+                Some(last) if same_window => *last = event,
                 _ => events.push(event),
             }
         };

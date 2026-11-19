@@ -80,6 +80,13 @@ pub enum Response {
         /// Composing text (`InputEvent::Preedit`) is taken too.
         #[serde(default, skip_serializing_if = "is_false")]
         preedit: bool,
+        /// The application's other windows are taken too (trial only, ADR 0027 proposal):
+        /// window numbers on `InputEvent::PointerAt`, `Focus` and `Resize`, `InputEvent::Close`
+        /// and `InputEvent::Windows` are passed on to what takes input here. A device that does
+        /// not say so is sent none of them; a pointer meant for another window would land on
+        /// the first one there.
+        #[serde(default, skip_serializing_if = "is_false")]
+        windows: bool,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
@@ -155,7 +162,7 @@ mod tests {
                     code: 30,
                     pressed: true,
                 },
-                InputEvent::PointerAt { x: 1, y: 2 },
+                InputEvent::pointer_at(1, 2),
             ],
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -198,7 +205,8 @@ mod tests {
                 text: false,
                 scroll: 0,
                 clipboard: false,
-                preedit: false
+                preedit: false,
+                windows: false
             })
             .unwrap(),
             plain
@@ -214,7 +222,8 @@ mod tests {
                 text: false,
                 scroll: 0,
                 clipboard: false,
-                preedit: false
+                preedit: false,
+                windows: false
             }
         );
         // Asked for, and agreed to.
@@ -230,7 +239,8 @@ mod tests {
                 text: false,
                 scroll: 0,
                 clipboard: false,
-                preedit: false
+                preedit: false,
+                windows: false
             }
         );
         assert_eq!(
@@ -241,7 +251,8 @@ mod tests {
                 text: true,
                 scroll: 0,
                 clipboard: false,
-                preedit: false
+                preedit: false,
+                windows: false
             }
         );
         assert_eq!(
@@ -252,7 +263,8 @@ mod tests {
                 text: true,
                 scroll: 1,
                 clipboard: false,
-                preedit: false
+                preedit: false,
+                windows: false
             }
         );
         // An earlier version reads both as what it knows, and its own answer says
@@ -269,13 +281,66 @@ mod tests {
                 text: false,
                 scroll: 0,
                 clipboard: false,
-                preedit: false
+                preedit: false,
+                windows: false
             }
         );
         assert_eq!(
             serde_json::to_string(&Response::InputAlive).unwrap(),
             r#"{"type":"input_alive"}"#
         );
+    }
+
+    #[test]
+    fn taking_the_other_windows_is_one_field_that_an_earlier_version_passes_over() {
+        let open = Response::InputOpen {
+            alive: true,
+            text: true,
+            scroll: 1,
+            clipboard: false,
+            preedit: true,
+            windows: true,
+        };
+        let json = serde_json::to_string(&open).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"input_open","alive":true,"text":true,"scroll":1,"preedit":true,"windows":true}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), open);
+        // An earlier version reads it as what it knows; its own answer says nothing: "no".
+        assert_eq!(
+            serde_json::from_str::<Earlier>(&json).unwrap(),
+            Earlier::InputOpen
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"type":"input_open","alive":true}"#).unwrap(),
+            Response::InputOpen {
+                alive: true,
+                text: false,
+                scroll: 0,
+                clipboard: false,
+                preedit: false,
+                windows: false
+            }
+        );
+        // Events with window numbers travel in an input message as they are.
+        let request = Request::Input {
+            events: vec![
+                InputEvent::PointerAt {
+                    x: 1,
+                    y: 2,
+                    window: Some(2),
+                },
+                InputEvent::Close { window: 2 },
+                InputEvent::Windows { version: 1 },
+            ],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"input","events":[{"kind":"pointer_at","x":1,"y":2,"window":2},{"kind":"close","window":2},{"kind":"windows","version":1}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
 
     #[test]
@@ -374,7 +439,8 @@ mod tests {
                 text: true,
                 scroll: 0,
                 clipboard: true,
-                preedit: false
+                preedit: false,
+                windows: false
             }
         );
     }

@@ -391,7 +391,14 @@ impl InputSink {
                 } => {
                     held.buttons.remove(code);
                 }
-                InputEvent::PointerAt { .. } | InputEvent::Focus => {}
+                // Window numbers, closing another window and taking the windows one by one
+                // (trial only, ADR 0027 proposal) are passed on as they are: what takes input
+                // decides what to do with them, and one that does not know them passes them
+                // over.
+                InputEvent::PointerAt { .. }
+                | InputEvent::Focus { .. }
+                | InputEvent::Close { .. }
+                | InputEvent::Windows { .. } => {}
                 // A scroll out of bounds (not a number, too far) is dropped here.
                 InputEvent::Scroll { .. } => {
                     if !istesso_proto::scroll_is_acceptable(event) {
@@ -399,7 +406,7 @@ impl InputSink {
                     }
                 }
                 // A size out of bounds is dropped here.
-                InputEvent::Resize { width, height } => {
+                InputEvent::Resize { width, height, .. } => {
                     if !istesso_proto::resize_is_acceptable(*width, *height) {
                         continue;
                     }
@@ -626,14 +633,16 @@ impl Shared {
                             asked.push("input");
                             clipboard_on = self.clipboard_is_taken();
                             // This agent takes committed and composing text
-                            // (InputEvent::Text, InputEvent::Preedit), and scrolls with
-                            // their kind and stages.
+                            // (InputEvent::Text, InputEvent::Preedit), scrolls with
+                            // their kind and stages, and window numbers, `close` and
+                            // `windows`, which it passes on as they are (trial only).
                             Response::InputOpen {
                                 alive,
                                 text: true,
                                 scroll: istesso_proto::SCROLL_LEVEL,
                                 clipboard: clipboard_on,
                                 preedit: true,
+                                windows: true,
                             }
                         }
                         Err(_) => Response::error(
@@ -927,7 +936,7 @@ mod tests {
             code: 30,
             pressed: true,
         });
-        sink.send(&InputEvent::PointerAt { x: 3, y: 4 });
+        sink.send(&InputEvent::pointer_at(3, 4));
         let mut buffer = [0u8; 256];
         let length = listener.recv(&mut buffer).unwrap();
         assert_eq!(
@@ -1055,6 +1064,7 @@ mod tests {
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: true,
                     preedit: true,
+                    windows: true,
                 }
             );
             client
@@ -1119,6 +1129,7 @@ mod tests {
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
                     preedit: true,
+                    windows: true,
                 }
             );
             // Sent anyway, they are dropped; the keys around them arrive.
@@ -1172,6 +1183,7 @@ mod tests {
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
                     preedit: true,
+                    windows: true,
                 }
             );
             asking.send_input(&[]).unwrap();
@@ -1205,7 +1217,7 @@ mod tests {
                     key(30, true),
                     key(30, false),
                     button(0x110, true),
-                    InputEvent::PointerAt { x: 5, y: 6 },
+                    InputEvent::pointer_at(5, 6),
                 ])
                 .unwrap();
             assert_eq!(pair.all_handed_over(A_MOMENT).len(), 5);
@@ -1267,6 +1279,47 @@ mod tests {
         }
 
         #[test]
+        fn window_numbers_close_and_windows_are_passed_on_as_they_are() {
+            let pair = InputPair::new("iw");
+            let mut client = pair.connect();
+            // Said at the answer, so that the device sends them (trial only).
+            assert!(matches!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Open { windows: true, .. }
+            ));
+            let events = [
+                InputEvent::Windows { version: 1 },
+                InputEvent::PointerAt {
+                    x: 3,
+                    y: 4,
+                    window: Some(2),
+                },
+                InputEvent::Focus { window: Some(2) },
+                InputEvent::Resize {
+                    width: 640,
+                    height: 480,
+                    window: Some(2),
+                },
+                InputEvent::Close { window: 2 },
+                InputEvent::Focus { window: None },
+            ];
+            client.send_input(&events).unwrap();
+            assert_eq!(pair.all_handed_over(A_MOMENT), events);
+            // A size out of bounds is dropped for another window as for the first.
+            client
+                .send_input(&[
+                    InputEvent::Resize {
+                        width: 10,
+                        height: 480,
+                        window: Some(2),
+                    },
+                    key(30, true),
+                ])
+                .unwrap();
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(30, true)]);
+        }
+
+        #[test]
         fn committed_text_is_passed_on_in_order_and_text_over_the_limits_is_not() {
             let pair = InputPair::new("it");
             let mut client = pair.connect();
@@ -1306,6 +1359,7 @@ mod tests {
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
                     preedit: true,
+                    windows: true,
                 }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
@@ -1323,6 +1377,7 @@ mod tests {
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
                     preedit: true,
+                    windows: true,
                 }
             );
             second.send_input(&[key(29, true)]).unwrap();
@@ -1367,6 +1422,7 @@ mod tests {
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
                     preedit: true,
+                    windows: true,
                 }
             );
             // What was down comes up, and the conversation carries on.

@@ -423,7 +423,16 @@ pub enum InputEvent {
     Key { code: u32, pressed: bool },
     /// The pointer is at this place of the picture, in the picture's own
     /// pixels, counted from its top left corner.
-    PointerAt { x: i32, y: i32 },
+    PointerAt {
+        x: i32,
+        y: i32,
+        /// The window of the application whose picture the place is in (trial only, ADR 0027
+        /// proposal): 1 is the first window, a larger number one of its other windows as the
+        /// host listed them. Left out: the first window, as before. Sent with a number other
+        /// than 1 only to a device that said it takes it (`windows` at `input_open`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u32>,
+    },
     /// A button of the pointer went down or came up (0x110 is the left one).
     Button { code: u32, pressed: bool },
     /// The wheel was turned or two fingers moved: how far to scroll, in
@@ -472,14 +481,24 @@ pub enum InputEvent {
     Text { text: String },
     /// The sender's window that shows this picture became the one typed into (trial only, the
     /// Mac host): the host brings the session's application and its shown window to the front,
-    /// so that the next key is taken at once.
-    Focus,
+    /// so that the next key is taken at once. `window` as for [`InputEvent::PointerAt`]: the
+    /// application's window whose picture the sender's window shows; left out, the first one.
+    /// Written as before (`{"kind":"focus"}`) without it.
+    Focus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u32>,
+    },
     /// The sender's window was resized by its user, once the resizing has ended (trial only, the
     /// Mac host): the size its picture area would like, in the picture's own pixels. The host
     /// resizes the application's shown window as near to it as the application lets it, and
     /// answers with a new stream of the size taken (the sender then takes that size and asks
-    /// nothing more). See [`resize_is_acceptable`].
-    Resize { width: u32, height: u32 },
+    /// nothing more). `window` as for [`InputEvent::PointerAt`]. See [`resize_is_acceptable`].
+    Resize {
+        width: u32,
+        height: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u32>,
+    },
     /// The person pressed Command-C (or Command-X, `cut`) in the sender's window (trial only,
     /// docs/adr/0022-clipboard-text.md): the host presses its own copy key for the client that
     /// has the keyboard and answers `id` with the text that client then put on the clipboard.
@@ -504,6 +523,17 @@ pub enum InputEvent {
     /// has the keyboard to draw. Empty text clears it. Never logged. See
     /// [`preedit_is_acceptable`].
     Preedit { text: String, cursor: [u32; 2] },
+    /// The person closed the sender's window that shows this other window of the application
+    /// (trial only, ADR 0027 proposal; `window` is 2 or more, as the host listed it): the host
+    /// asks the application to close that window only, as its own close button would. Sent
+    /// only to a device that said it takes it (`windows` at `input_open`).
+    Close { window: u32 },
+    /// The sender can show each window of the application in a window of its own (trial only,
+    /// ADR 0027 proposal; `version` 1): a host that knows it may then list the application's
+    /// windows and stream them one by one. A host that does not know it shows the first window
+    /// only, as before. Never sent to a device that did not say it takes it (`windows` at
+    /// `input_open`).
+    Windows { version: u32 },
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -520,10 +550,11 @@ impl std::fmt::Debug for InputEvent {
                 .field("code", code)
                 .field("pressed", pressed)
                 .finish(),
-            InputEvent::PointerAt { x, y } => f
+            InputEvent::PointerAt { x, y, window } => f
                 .debug_struct("PointerAt")
                 .field("x", x)
                 .field("y", y)
+                .field("window", window)
                 .finish(),
             InputEvent::Button { code, pressed } => f
                 .debug_struct("Button")
@@ -551,11 +582,18 @@ impl std::fmt::Debug for InputEvent {
                 .field("momentum_follows", momentum_follows)
                 .finish(),
             InputEvent::Text { .. } => f.write_str("Text { .. }"),
-            InputEvent::Focus => f.write_str("Focus"),
-            InputEvent::Resize { width, height } => f
+            InputEvent::Focus { window } => {
+                f.debug_struct("Focus").field("window", window).finish()
+            }
+            InputEvent::Resize {
+                width,
+                height,
+                window,
+            } => f
                 .debug_struct("Resize")
                 .field("width", width)
                 .field("height", height)
+                .field("window", window)
                 .finish(),
             InputEvent::Copy { id, cut } => f
                 .debug_struct("Copy")
@@ -569,6 +607,12 @@ impl std::fmt::Debug for InputEvent {
                 .finish(),
             // The cursor's offsets would give the text's length in bytes: not shown either.
             InputEvent::Preedit { .. } => f.write_str("Preedit { .. }"),
+            InputEvent::Close { window } => {
+                f.debug_struct("Close").field("window", window).finish()
+            }
+            InputEvent::Windows { version } => {
+                f.debug_struct("Windows").field("version", version).finish()
+            }
         }
     }
 }
@@ -647,6 +691,11 @@ pub fn clipboard_text_check(text: &str) -> Result<(), ClipboardResult> {
 impl Eq for InputEvent {}
 
 impl InputEvent {
+    /// A pointer position of the old form: in the first window.
+    pub fn pointer_at(x: i32, y: i32) -> InputEvent {
+        InputEvent::PointerAt { x, y, window: None }
+    }
+
     /// A scroll of the old form: `dx` and `dy` only.
     pub fn scroll(dx: i32, dy: i32) -> InputEvent {
         InputEvent::Scroll {
@@ -740,6 +789,24 @@ pub fn scroll_is_acceptable(event: &InputEvent) -> bool {
         })
 }
 
+/// The version of [`InputEvent::Windows`] this version sends (trial only, ADR 0027 proposal).
+pub const WINDOWS_VERSION: u32 = 1;
+
+/// Whether an event is only for a device that said it takes the application's windows one by
+/// one (`windows` at `input_open`, trial only): [`InputEvent::Windows`], [`InputEvent::Close`],
+/// and a pointer position, a focus or a resize meant for a window other than the first. A
+/// device that does not know window numbers would take such a pointer for one on the first
+/// window, so it is never sent one.
+pub fn needs_windows(event: &InputEvent) -> bool {
+    match event {
+        InputEvent::Windows { .. } | InputEvent::Close { .. } => true,
+        InputEvent::PointerAt { window, .. }
+        | InputEvent::Focus { window }
+        | InputEvent::Resize { window, .. } => window.is_some_and(|n| n != 1),
+        _ => false,
+    }
+}
+
 /// The sizes a [`InputEvent::Resize`] may ask for: 64 to 8192 pixels a side.
 pub fn resize_is_acceptable(width: u32, height: u32) -> bool {
     (64..=8192).contains(&width) && (64..=8192).contains(&height)
@@ -787,7 +854,7 @@ mod tests {
         );
         for event in [
             key,
-            InputEvent::PointerAt { x: 12, y: 700 },
+            InputEvent::pointer_at(12, 700),
             InputEvent::Button {
                 code: 0x110,
                 pressed: false,
@@ -799,19 +866,98 @@ mod tests {
         }
         assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
         assert_eq!(
-            serde_json::to_string(&InputEvent::Focus).unwrap(),
+            serde_json::to_string(&InputEvent::Focus { window: None }).unwrap(),
             r#"{"kind":"focus"}"#
         );
         assert_eq!(
             serde_json::to_string(&InputEvent::Resize {
                 width: 800,
-                height: 600
+                height: 600,
+                window: None,
             })
             .unwrap(),
             r#"{"kind":"resize","width":800,"height":600}"#
         );
         assert!(super::resize_is_acceptable(800, 600));
         assert!(!super::resize_is_acceptable(10, 600));
+    }
+
+    #[test]
+    fn window_numbers_are_left_out_for_the_first_window_and_read_as_before_without_them() {
+        use super::{needs_windows, InputEvent, WINDOWS_VERSION};
+        // Without a window: written exactly as before, and the old forms read as the first.
+        assert_eq!(
+            serde_json::to_string(&InputEvent::pointer_at(12, 700)).unwrap(),
+            r#"{"kind":"pointer_at","x":12,"y":700}"#
+        );
+        for (old, event) in [
+            (
+                r#"{"kind":"pointer_at","x":12,"y":700}"#,
+                InputEvent::pointer_at(12, 700),
+            ),
+            (r#"{"kind":"focus"}"#, InputEvent::Focus { window: None }),
+            (
+                r#"{"kind":"resize","width":800,"height":600}"#,
+                InputEvent::Resize {
+                    width: 800,
+                    height: 600,
+                    window: None,
+                },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<InputEvent>(old).unwrap(), event);
+            assert_eq!(serde_json::to_string(&event).unwrap(), old);
+            assert!(!needs_windows(&event));
+        }
+        // With one, and the two new events: each comes back as it was written.
+        for (json, event) in [
+            (
+                r#"{"kind":"pointer_at","x":3,"y":4,"window":2}"#,
+                InputEvent::PointerAt {
+                    x: 3,
+                    y: 4,
+                    window: Some(2),
+                },
+            ),
+            (
+                r#"{"kind":"focus","window":3}"#,
+                InputEvent::Focus { window: Some(3) },
+            ),
+            (
+                r#"{"kind":"resize","width":640,"height":480,"window":2}"#,
+                InputEvent::Resize {
+                    width: 640,
+                    height: 480,
+                    window: Some(2),
+                },
+            ),
+            (
+                r#"{"kind":"close","window":2}"#,
+                InputEvent::Close { window: 2 },
+            ),
+            (
+                r#"{"kind":"windows","version":1}"#,
+                InputEvent::Windows {
+                    version: WINDOWS_VERSION,
+                },
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&event).unwrap(), json);
+            assert_eq!(serde_json::from_str::<InputEvent>(json).unwrap(), event);
+            assert!(needs_windows(&event), "{event:?}");
+        }
+        // The first window named as such is the first window for anybody.
+        let first = InputEvent::PointerAt {
+            x: 1,
+            y: 1,
+            window: Some(1),
+        };
+        assert!(!needs_windows(&first));
+        assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"close"}"#).is_err());
+        assert_eq!(
+            format!("{:?}", InputEvent::Focus { window: Some(2) }),
+            "Focus { window: Some(2) }"
+        );
     }
 
     #[test]
@@ -935,7 +1081,7 @@ mod tests {
         assert!(!scroll_is_acceptable(&InputEvent::scroll(i32::MAX, 0)));
         assert!(!scroll_is_acceptable(&InputEvent::scroll(0, i32::MIN)));
         assert!(scroll_is_acceptable(&InputEvent::scroll(0, -10_000)));
-        assert!(scroll_is_acceptable(&InputEvent::Focus));
+        assert!(scroll_is_acceptable(&InputEvent::Focus { window: None }));
     }
 
     #[test]

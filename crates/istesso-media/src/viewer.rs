@@ -16,7 +16,8 @@ use istesso_pair::{Peer, PeerStore};
 use crate::clock;
 use crate::timed::{wait_for, Ready, Timed, Wake};
 use crate::wire::{
-    self, Ask, Codec, Cursor, ErrorCode, Header, Kind, Reply, StreamInfo, TextField, WireError,
+    self, Ask, Codec, Cursor, ErrorCode, Header, Kind, Reply, StreamInfo, TextField, Windows,
+    WireError,
 };
 use crate::{Error, Result};
 
@@ -48,6 +49,8 @@ pub struct Viewer {
     cursor_at: Option<std::ops::Range<usize>>,
     /// What the host last said the text field is (trial only).
     text_field: Option<TextField>,
+    /// What the host last said the application's other windows are (trial only).
+    windows: Option<Windows>,
 }
 
 /// What a host sends a viewer.
@@ -59,6 +62,8 @@ pub enum Event<'a> {
     Cursor(Cursor<'a>),
     /// The text input field of the application with the keyboard (trial only).
     TextField(TextField),
+    /// The application's other windows, all of them (trial only, ADR 0027 proposal).
+    Windows(&'a Windows),
 }
 
 /// What [`Viewer::pull`] found, without the bytes.
@@ -71,6 +76,7 @@ pub(crate) enum Pulled {
     },
     Cursor,
     TextField,
+    Windows,
 }
 
 struct Asking {
@@ -189,6 +195,7 @@ impl Viewer {
             cursor_packet: Vec::new(),
             cursor_at: None,
             text_field: None,
+            windows: None,
         })
     }
 
@@ -230,12 +237,19 @@ impl Viewer {
             } => Some(Event::Frame(self.frame(header, at, first_ns, whole_ns))),
             Pulled::Cursor => self.cursor().map(Event::Cursor),
             Pulled::TextField => self.text_field.map(Event::TextField),
+            Pulled::Windows => self.windows.as_ref().map(Event::Windows),
         }
     }
 
     /// What the host last said the text field is (trial only). `None` until it has.
     pub fn text_field(&self) -> Option<TextField> {
         self.text_field
+    }
+
+    /// What the host last said the application's other windows are (trial only). `None` until
+    /// it has: a host that does not show them one by one never does.
+    pub fn windows(&self) -> Option<&Windows> {
+        self.windows.as_ref()
     }
 
     /// What the host last said the cursor is. `None` until it has said so: a host that
@@ -264,7 +278,7 @@ impl Viewer {
                     first_ns,
                     whole_ns,
                 }) => return Ok(Some(self.frame(header, at, first_ns, whole_ns))),
-                Some(Pulled::Cursor | Pulled::TextField) => continue,
+                Some(Pulled::Cursor | Pulled::TextField | Pulled::Windows) => continue,
                 None => return Ok(None),
             }
         }
@@ -282,6 +296,7 @@ impl Viewer {
             }) => Some(Event::Frame(self.frame(header, at, first_ns, whole_ns))),
             Some(Pulled::Cursor) => self.cursor().map(Event::Cursor),
             Some(Pulled::TextField) => self.text_field.map(Event::TextField),
+            Some(Pulled::Windows) => self.windows.as_ref().map(Event::Windows),
             None => None,
         })
     }
@@ -376,6 +391,14 @@ impl Viewer {
                         if let Ok(field) = wire::decode_text_field(&self.packet[at]) {
                             self.text_field = Some(field);
                             return Ok(Some(Pulled::TextField));
+                        }
+                    }
+                    Kind::Windows => {
+                        // Nor this (trial only): a list that is not of the form or not within
+                        // the limits is passed over, and the windows stay as they were.
+                        if let Ok(windows) = wire::decode_windows(&self.packet[at]) {
+                            self.windows = Some(windows);
+                            return Ok(Some(Pulled::Windows));
                         }
                     }
                 },

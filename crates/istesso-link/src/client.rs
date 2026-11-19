@@ -24,6 +24,8 @@ pub enum InputAnswer {
         scroll: u8,
         clipboard: bool,
         preedit: bool,
+        /// Window numbers, `close` and `windows` are taken too (trial only).
+        windows: bool,
     },
     /// It is not, and this is why: callers decide by the code.
     Refused { code: ErrorCode, message: String },
@@ -192,12 +194,14 @@ impl Client {
                 scroll,
                 clipboard,
                 preedit,
+                windows,
             } => Ok(InputAnswer::Open {
                 alive,
                 text,
                 scroll,
                 clipboard,
                 preedit,
+                windows,
             }),
             Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
             _ => Err(Error::Malformed),

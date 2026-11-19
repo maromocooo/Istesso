@@ -1260,7 +1260,8 @@ fn arrow(pixels: &[u8]) -> Cursor<'_> {
     })
 }
 
-/// What a viewer was handed, in the order it came: `f` for a frame, `c` for a cursor.
+/// What a viewer was handed, in the order it came: `f` for a frame, `c` for a cursor, `t` for
+/// the text field, `w` for the other windows.
 fn events(viewer: &mut Viewer, count: usize) -> (String, Vec<Vec<u8>>) {
     let (mut order, mut cursors) = (String::new(), Vec::new());
     while order.len() < count {
@@ -1275,6 +1276,7 @@ fn events(viewer: &mut Viewer, count: usize) -> (String, Vec<Vec<u8>>) {
                 });
             }
             Event::TextField(_) => order.push('t'),
+            Event::Windows(_) => order.push('w'),
         }
     }
     (order, cursors)
@@ -1434,6 +1436,8 @@ fn a_viewer_passes_over_a_cursor_that_does_not_add_up_and_kinds_it_does_not_know
             }),
             // Cut off inside its fixed part.
             body(&|p| p.truncate(at + 7)),
+            // A list of windows that is not one (trial only).
+            body(&|p| p[1] = 6),
             // A kind of packet this version does not know.
             body(&|p| p[1] = 9),
         ];
@@ -1463,6 +1467,7 @@ fn a_viewer_passes_over_a_cursor_that_does_not_add_up_and_kinds_it_does_not_know
         other => panic!("unexpected: {other:?}"),
     }
     assert!(viewer.cursor().is_none());
+    assert!(viewer.windows().is_none());
     assert_eq!(
         viewer.next(SOON).unwrap(),
         Some(Event::Cursor(Cursor::Named("default")))
@@ -1495,6 +1500,7 @@ fn a_cursor_that_changes_all_the_time_does_not_flood_the_connection_or_hold_fram
                     }
                     Some(Event::Cursor(other)) => panic!("unexpected: {other:?}"),
                     Some(Event::TextField(other)) => panic!("unexpected: {other:?}"),
+                    Some(Event::Windows(other)) => panic!("unexpected: {other:?}"),
                     None => {}
                 }
                 if done.lock().unwrap().is_some_and(|set| set == last) {
@@ -1706,6 +1712,102 @@ fn the_text_field_reaches_a_viewer_and_a_viewer_that_comes_later_and_only_once_s
     assert!(pair.host.set_text_field(&odd).is_err());
 }
 
+// ---- The other windows (trial only) ----
+
+fn windows(serial: u64, title: &str) -> crate::wire::Windows {
+    crate::wire::Windows {
+        serial,
+        windows: vec![crate::wire::Window {
+            id: 2,
+            port: 0,
+            width: 480,
+            height: 320,
+            title: title.into(),
+            modal: true,
+            key: true,
+            attention: false,
+        }],
+    }
+}
+
+#[test]
+fn the_windows_reach_a_viewer_that_comes_later_and_only_the_latest_of_them() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    // Never said: frames only, nothing else.
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(events(&mut viewer, 1).0, "f");
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(matches!(viewer.next(Duration::from_millis(100)), Ok(None)));
+    assert_eq!(viewer.windows(), None);
+
+    pair.host.set_windows(&windows(1, "Open")).unwrap();
+    assert_eq!(events(&mut viewer, 1).0, "w");
+    assert_eq!(viewer.windows(), Some(&windows(1, "Open")));
+    // Said twice more in a row: the viewer may be told the one between, never one after the
+    // latest, and the latest last.
+    std::thread::sleep(Duration::from_millis(30));
+    pair.host.set_windows(&windows(2, "Open")).unwrap();
+    pair.host.set_windows(&windows(3, "Save")).unwrap();
+    let mut serials = Vec::new();
+    while serials.last() != Some(&3) {
+        assert_eq!(events(&mut viewer, 1).0, "w");
+        serials.push(viewer.windows().unwrap().serial);
+    }
+    assert!(serials == [3] || serials == [2, 3], "{serials:?}");
+    assert_eq!(viewer.windows(), Some(&windows(3, "Save")));
+
+    // A viewer that comes later is told the latest only, once it has connected.
+    let mut later = pair.watching();
+    assert_eq!(later.windows(), None);
+    assert_eq!(events(&mut later, 1).0, "w");
+    assert_eq!(later.windows(), Some(&windows(3, "Save")));
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(matches!(later.next(Duration::from_millis(100)), Ok(None)));
+}
+
+#[test]
+fn a_list_of_windows_that_is_not_of_the_form_or_too_long_is_refused_and_reaches_nobody() {
+    use crate::wire::{Window, Windows, MAX_WINDOWS, MAX_WINDOW_TITLE};
+    let pair = pair();
+    let mut viewer = pair.watching();
+    pair.host.set_windows(&windows(1, "Open")).unwrap();
+    assert_eq!(events(&mut viewer, 1).0, "w");
+
+    // Not JSON, not of the form, a window numbered as the first.
+    for odd in [
+        &b"{ not a list"[..],
+        br#"{"serial":2}"#,
+        br#"{"serial":2,"windows":[{"id":1,"port":0,"width":1,"height":1}]}"#,
+    ] {
+        assert!(Windows::from_json(odd).is_err());
+    }
+    // A list of 9 KiB, and one that comes to more than 8192 bytes written out.
+    let mut long = br#"{"serial":2,"windows":[],"padding":""#.to_vec();
+    long.resize(9 * 1024, b' ');
+    long.extend_from_slice(br#""}"#);
+    assert!(Windows::from_json(&long).is_err());
+    let escaped = Windows {
+        serial: 2,
+        windows: vec![
+            Window {
+                title: "\"".repeat(MAX_WINDOW_TITLE),
+                ..windows(2, "").windows[0].clone()
+            };
+            MAX_WINDOWS
+        ],
+    };
+    assert!(pair.host.set_windows(&escaped).is_err());
+    // Nothing went out: the viewer has what it had.
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(matches!(viewer.next(Duration::from_millis(100)), Ok(None)));
+    assert_eq!(viewer.windows(), Some(&windows(1, "Open")));
+    // Nor does a viewer that comes later get anything of it.
+    let mut later = pair.watching();
+    assert_eq!(events(&mut later, 1).0, "w");
+    assert_eq!(later.windows(), Some(&windows(1, "Open")));
+}
+
 #[test]
 fn a_viewer_that_lost_its_right_is_not_told_the_cursor_either() {
     let pair = pair();
@@ -1777,6 +1879,7 @@ fn nobody_is_told_the_cursor_while_the_list_of_paired_devices_cannot_be_read() {
             Ok(Some(Event::Cursor(cursor))) => assert_ne!(cursor, Cursor::Named("after")),
             Ok(Some(Event::Frame(_))) => panic!("a frame"),
             Ok(Some(Event::TextField(_))) => panic!("a text field"),
+            Ok(Some(Event::Windows(_))) => panic!("the windows"),
             Ok(None) => panic!("the viewer was left waiting"),
             Err(err) => break err,
         }
@@ -1974,7 +2077,7 @@ fn step(viewer: &mut Lasting) -> crate::Result<Stepped> {
                 key_frame: frame.key_frame,
             },
             Some(Step::Event(Event::Cursor(_))) => Stepped::Cursor,
-            Some(Step::Event(Event::TextField(_))) => continue,
+            Some(Step::Event(Event::TextField(_) | Event::Windows(_))) => continue,
             Some(Step::Cut) => Stepped::Cut,
             Some(Step::Connected { again, silent_for }) => Stepped::Connected { again, silent_for },
         });
