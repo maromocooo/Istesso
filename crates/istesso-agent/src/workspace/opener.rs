@@ -281,7 +281,7 @@ fn decide_file(
             "this shell was opened without a project folder (istesso shell --project)".into(),
         ));
     };
-    if !workspace.may_ask() {
+    if !workspace.may_ask_file() {
         return Err(refuse(
             "too many",
             "too many requests; wait a few seconds".into(),
@@ -291,7 +291,7 @@ fn decide_file(
         .map_err(|why| refuse(&format!("{why:?}"), why.to_string()))?;
     let began = std::time::Instant::now();
     let opened = editor
-        .open(&checked)
+        .open(&checked, &workspace)
         .map_err(|why| refuse("the editor did not start", why))?;
     let shown = workspace.send(&ShellFrame::OpenWindow(istesso_link::shell::WindowOpen {
         picture: opened.picture,

@@ -139,6 +139,10 @@ struct Shared {
     /// The workspaces of the shells open now, whose ports are forwarded.
     #[cfg(unix)]
     workspaces: Arc<crate::workspace::watch::Workspaces>,
+    /// The host's main editor, when one is set: ended with the shell that
+    /// asked for it.
+    #[cfg(unix)]
+    main_editor: Option<Arc<crate::workspace::editor::MainEditor>>,
     /// Forwarded connections open now, by device ([`ForwardSlots`]).
     #[cfg(unix)]
     forwards_open: ForwardSlots,
@@ -303,6 +307,8 @@ impl Agent {
                 shells: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
                 workspaces,
+                #[cfg(unix)]
+                main_editor,
                 #[cfg(unix)]
                 forwards_open: ForwardSlots::default(),
             }),
@@ -791,6 +797,15 @@ impl Shared {
             if let Some(workspace) = &workspace {
                 workspace.0.end();
                 self.workspaces.remove(&workspace.0);
+                // The main editor this shell asked for goes with it.
+                if let Some(editor) = &self.main_editor {
+                    if editor.workspace_over(&workspace.0) {
+                        (self.log)(format!(
+                            "the main editor of the shell for {} was ended with the shell",
+                            peer.name
+                        ));
+                    }
+                }
             }
             // Counts and times only: never what was typed or printed.
             (self.log)(format!(

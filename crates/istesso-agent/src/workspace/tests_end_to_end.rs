@@ -493,7 +493,7 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
     std::fs::write(
         &launcher,
         format!(
-            "#!/bin/sh\nprintf '%s|%s\\n' \"$#\" \"$1\" >> '{}'\necho 'window 26891 26892 Text Editor'\n",
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$#\" \"$1\" \"$EDITOR_WINDOW_PLACE\" >> '{}'\n[ \"$1\" = stop ] && exit 0\necho 'window 26891 26892 Text Editor'\n",
             launched.display()
         ),
     )
@@ -583,10 +583,26 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
     assert!(lines[2].contains("symbolic link"));
     assert!(lines[3].contains("without '..'"));
     assert!(lines[4].contains("does not show windows"));
-    // The editor was started once, with the place the host built: one argument.
+    // The editor was started once, with the place the host built, in its
+    // environment.
     assert_eq!(
         std::fs::read_to_string(&launched).unwrap(),
-        format!("1|{}\n", folder.join("notes.txt").display())
+        format!("1|open|{}\n", folder.join("notes.txt").display())
+    );
+    // When the shell that asked is over, its editor is ended.
+    shell.type_in("exit\n");
+    let began = Instant::now();
+    while !pair
+        .log()
+        .iter()
+        .any(|line| line.contains("was ended with the shell"))
+    {
+        assert!(began.elapsed() < SOON, "{:?}", pair.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&launched).unwrap().lines().last(),
+        Some("1|stop|")
     );
     // Nothing of the places is written down.
     let log = pair.log();

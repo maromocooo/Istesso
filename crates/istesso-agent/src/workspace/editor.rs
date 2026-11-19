@@ -27,11 +27,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use istesso_link::forward::ascii_name;
-use istesso_link::shell::MAX_TITLE;
+use istesso_link::shell::harmless_title;
+
+use super::watch::Workspace;
 
 /// The name this program answers to as the asker.
 pub const EDIT_NAME: &str = "istesso-edit";
@@ -91,12 +93,13 @@ impl std::fmt::Display for Refusal {
 }
 
 /// The folder of a shell's workspace below which files may be opened: the
-/// project folder by its real place, or none when it is the root or the
-/// home folder itself (then "inside" would be everything).
+/// project folder by its real place, or none when it is the root, the home
+/// folder itself or a folder above it, like `/home` (then "inside" would be
+/// everything of this user's).
 pub fn workspace_folder(project: &Path, home: &Path) -> Option<PathBuf> {
     let folder = project.canonicalize().ok()?;
     let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    (folder.parent().is_some() && folder != home).then_some(folder)
+    (folder.parent().is_some() && !home.starts_with(&folder)).then_some(folder)
 }
 
 /// The place to hand the editor, built from `folder` (the workspace's,
@@ -104,6 +107,10 @@ pub fn workspace_folder(project: &Path, home: &Path) -> Option<PathBuf> {
 /// the way has been looked at without following a link: folders all the
 /// way, and at the end an ordinary file with one name, or no file yet (the
 /// editor makes it when it saves).
+///
+/// Every name is looked at from the root down, the workspace's folder's own
+/// names too: a folder above the place that has been changed into a link
+/// since the shell was opened is refused like any other link.
 ///
 /// What a program that changes the folders between this look and the
 /// editor's start does is not stopped (ADR 0007, "守りの限り").
@@ -138,9 +145,9 @@ pub fn checked_place(folder: &Path, asked: &str) -> Result<PathBuf, Refusal> {
     let Some((last, on_the_way)) = below.split_last() else {
         return Err(Refusal::TheFolderItself);
     };
-    let mut at = open_folder(None, folder.as_os_str())?;
-    for name in on_the_way {
-        at = open_folder(Some(&at), name)?;
+    let mut at = open_root()?;
+    for name in base.iter().chain(on_the_way) {
+        at = open_folder(&at, name)?;
     }
     match look(&at, last) {
         Ok(found) => {
@@ -167,24 +174,34 @@ fn c_name(name: &OsStr) -> Result<CString, Refusal> {
     CString::new(name.as_bytes()).map_err(|_| Refusal::Malformed)
 }
 
-/// Opens the folder `name` in `at` (or from the root, when `at` is none),
-/// never through a symbolic link.
-fn open_folder(at: Option<&OwnedFd>, name: &OsStr) -> Result<OwnedFd, Refusal> {
-    let c = c_name(name)?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let dir = at.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
+/// The root folder.
+fn open_root() -> Result<OwnedFd, Refusal> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: a name that ends with NUL, and flags; the descriptor returned
     // is owned here.
-    let fd = unsafe { libc::openat(dir, c.as_ptr(), flags) };
+    let fd = unsafe { libc::open(c"/".as_ptr(), flags) };
+    if fd < 0 {
+        return Err(Refusal::Unreadable);
+    }
+    // SAFETY: a descriptor that was just opened and belongs to no one else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens the folder `name` in `at`, never through a symbolic link.
+fn open_folder(at: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Refusal> {
+    let c = c_name(name)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: a name that ends with NUL, and flags; the descriptor returned
+    // is owned here.
+    let fd = unsafe { libc::openat(at.as_raw_fd(), c.as_ptr(), flags) };
     if fd >= 0 {
         // SAFETY: a descriptor that was just opened and belongs to no one else.
         return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
     }
-    // Why, without following a link: a link, something else, or nothing.
-    match at.map(|at| look(at, name)) {
-        Some(Ok(found)) if found.st_mode & libc::S_IFMT == libc::S_IFLNK => Err(Refusal::Link),
-        Some(Ok(_)) | Some(Err(_)) => Err(Refusal::NotAFolder),
-        None => Err(Refusal::Unreadable),
+    // Why, without following a link: a link, or something else, or nothing.
+    match look(at, name) {
+        Ok(found) if found.st_mode & libc::S_IFMT == libc::S_IFLNK => Err(Refusal::Link),
+        _ => Err(Refusal::NotAFolder),
     }
 }
 
@@ -218,12 +235,29 @@ pub struct Opened {
 
 /// The host's main editor: the program that starts it, set by whoever
 /// runs the agent (`istesso agent --main-editor`).
+///
+/// One editor runs at a time, for one shell: the shell whose workspace
+/// asked for it. When that shell is over (it ended, its device went, or its
+/// device lost its right), the editor and what shows it are ended
+/// ([`MainEditor::workspace_over`]). A request from another shell ends the
+/// editor of the first one and starts one afresh, so that no shell sees
+/// what another one opened.
+///
+/// The launcher is told what to do by one argument (`open` or `stop`) and,
+/// for `open`, by its environment: `EDITOR_WINDOW_PLACE` (the checked
+/// place), `EDITOR_WINDOW_DEVICE_ID` and `EDITOR_WINDOW_DEVICE_KEY` (the
+/// asking shell's device, the only one its window is shown to). The place
+/// is never an argument, where any program of the machine could read it.
 pub struct MainEditor {
     launcher: PathBuf,
     within: Duration,
-    /// One start at a time: the launcher chooses the ports.
-    starting: Mutex<()>,
+    /// The workspace whose editor runs; held while one is started, so that
+    /// one start runs at a time (the launcher chooses the ports).
+    owner: Mutex<Option<Arc<Workspace>>>,
 }
+
+/// How long the launcher has to end what it started.
+const STOP_WITHIN: Duration = Duration::from_secs(15);
 
 impl MainEditor {
     /// The launcher must be an absolute place of a file that can be run.
@@ -240,7 +274,7 @@ impl MainEditor {
         Ok(MainEditor {
             launcher: launcher.to_path_buf(),
             within: LAUNCH_WITHIN,
-            starting: Mutex::new(()),
+            owner: Mutex::new(None),
         })
     }
 
@@ -250,21 +284,72 @@ impl MainEditor {
         self
     }
 
-    /// Starts the editor on `place` (one that [`checked_place`] gave), and
-    /// says where its window waits. The launcher gets `place` as its one
-    /// argument, never through a shell, and answers with one line:
+    /// Opens `place` (one that [`checked_place`] gave) in the editor of
+    /// `workspace`'s shell, started now when there is none, and says where
+    /// its window waits. The launcher answers with one line:
     /// `window <picture port> <input port> [title]`, or `fail <why>`.
-    pub fn open(&self, place: &Path) -> Result<Opened, String> {
-        let _one = self.starting.lock().unwrap_or_else(|e| e.into_inner());
-        let mut child = Command::new(&self.launcher)
-            .arg(place)
+    pub fn open(&self, place: &Path, workspace: &Arc<Workspace>) -> Result<Opened, String> {
+        let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        if workspace.is_over() {
+            return Err("the shell is over".into());
+        }
+        // The editor of another shell is ended first.
+        if owner
+            .as_ref()
+            .is_some_and(|earlier| !Arc::ptr_eq(earlier, workspace))
+        {
+            self.stop();
+            *owner = None;
+        }
+        let opened = self.launch(place, workspace);
+        if opened.is_ok() {
+            *owner = Some(workspace.clone());
+        } else {
+            // Whatever it started is ended, by the launcher's own records.
+            self.stop();
+            *owner = None;
+        }
+        opened
+    }
+
+    /// `workspace`'s shell is over: its editor, when it has one, is ended.
+    /// Returns whether it had one.
+    pub fn workspace_over(&self, workspace: &Arc<Workspace>) -> bool {
+        let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        if owner
+            .as_ref()
+            .is_some_and(|running| Arc::ptr_eq(running, workspace))
+        {
+            self.stop();
+            *owner = None;
+            return true;
+        }
+        false
+    }
+
+    fn launch(&self, place: &Path, workspace: &Workspace) -> Result<Opened, String> {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new(&self.launcher);
+        command
+            .arg("open")
+            .env("EDITOR_WINDOW_PLACE", place)
+            .env("EDITOR_WINDOW_DEVICE_ID", workspace.device_id())
+            .env("EDITOR_WINDOW_DEVICE_KEY", workspace.device_key())
+            // A process group of its own: on a time-out, the launcher and
+            // whatever it started that stayed in its group are ended together.
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = spawn(&mut command)
             .map_err(|e| format!("the main editor's launcher did not start: {e}"))?;
+        let group = child.id() as libc::pid_t;
+        let end_group = || {
+            // SAFETY: a signal to the process group this launcher leads.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        };
         let Some(out) = child.stdout.take() else {
-            let _ = child.kill();
+            end_group();
             let _ = child.wait();
             return Err("the main editor's launcher cannot be heard".into());
         };
@@ -278,7 +363,7 @@ impl MainEditor {
             }
         });
         if reading.is_err() {
-            let _ = child.kill();
+            end_group();
             let _ = child.wait();
             return Err("the main editor's launcher cannot be heard".into());
         }
@@ -291,7 +376,7 @@ impl MainEditor {
                     None => continue,
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = child.kill();
+                    end_group();
                     break Err(format!(
                         "the main editor did not start within {} seconds",
                         self.within.as_secs()
@@ -307,6 +392,49 @@ impl MainEditor {
             let _ = child.wait();
         });
         answer
+    }
+
+    /// Asks the launcher to end everything it started (by the numbers it
+    /// wrote down), and waits for it a while.
+    fn stop(&self) {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new(&self.launcher);
+        command
+            .arg("stop")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let Ok(mut child) = spawn(&mut command) else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + STOP_WITHIN;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // SAFETY: a signal to the process group this launcher leads.
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.wait();
+    }
+}
+
+/// Starts `command`, again a few times when the system says that its
+/// program is being written (Linux: a program just written while another
+/// thread of this process starts one is open for writing in that one for a
+/// moment).
+fn spawn(command: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 0;
+    loop {
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
     }
 }
 
@@ -326,7 +454,7 @@ fn read_answer(line: &str) -> Option<Result<Opened, String>> {
     };
     let title = words
         .next()
-        .map(|title| ascii_name(title.trim(), MAX_TITLE))
+        .map(|title| harmless_title(title.trim()))
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| DEFAULT_TITLE.to_string());
     Some(Ok(Opened {
@@ -534,83 +662,188 @@ mod tests {
     }
 
     #[test]
-    fn the_root_and_the_home_folder_are_no_workspace_folder() {
+    fn the_root_the_home_folder_and_folders_above_it_are_no_workspace_folder() {
         let (_dir, base) = folder("ed-ws");
         let (_home, home) = folder("ed-home");
         assert_eq!(workspace_folder(&base, &home), Some(base.clone()));
         assert_eq!(workspace_folder(&home, &home), None);
         assert_eq!(workspace_folder(Path::new("/"), &home), None);
         assert_eq!(workspace_folder(&base.join("not-there"), &home), None);
+        // A folder above the home folder, like /home.
+        std::fs::create_dir_all(base.join("someone")).unwrap();
+        assert_eq!(workspace_folder(&base, &base.join("someone")), None);
+        // A folder below it is a project.
+        assert_eq!(
+            workspace_folder(&base.join("someone"), &base),
+            Some(base.join("someone"))
+        );
     }
 
-    /// A launcher of the test's own: writes its arguments down, then runs
-    /// `then` (shell code).
+    #[test]
+    fn a_folder_of_the_workspace_that_has_become_a_link_is_refused() {
+        let (_dir, outer) = folder("ed-base");
+        let base = outer.join("project");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.txt"), "x").unwrap();
+        assert!(checked_place(&base, &at(&base, "a.txt")).is_ok());
+        // After the shell opened, the project folder is moved and a link put
+        // in its place.
+        std::fs::rename(&base, outer.join("moved")).unwrap();
+        std::os::unix::fs::symlink(outer.join("moved"), &base).unwrap();
+        assert_eq!(
+            checked_place(&base, &at(&base, "a.txt")),
+            Err(Refusal::Link)
+        );
+    }
+
+    fn workspace(name: &str) -> Arc<Workspace> {
+        let peer = istesso_pair::Peer::from_hello(&istesso_pair::Hello {
+            device_name: name.into(),
+            public_key: [7; 32],
+        });
+        Workspace::new(&peer, 1, super::super::watch::How::Session)
+    }
+
+    /// A launcher of the test's own: writes down what it is told (its
+    /// arguments and the place and device it is given), then, for `open`,
+    /// runs `then` (shell code).
     fn launcher(dir: &Path, then: &str) -> (PathBuf, PathBuf) {
         let program = dir.join("launcher.sh");
-        let args = dir.join("args.txt");
+        let told = dir.join("told.txt");
         std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > '{}'\n{then}\n",
-                args.display()
+                "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$#\" \"$1\" \"$EDITOR_WINDOW_PLACE\" \"$EDITOR_WINDOW_DEVICE_ID\" >> '{}'\n[ \"$1\" = stop ] && exit 0\n{then}\n",
+                told.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (program, args)
+        (program, told)
+    }
+
+    fn lines(file: &Path) -> Vec<String> {
+        std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
-    fn the_launcher_gets_one_argument_and_says_where_the_window_waits() {
+    fn the_launcher_gets_the_place_in_its_environment_and_says_where_the_window_waits() {
         let (_dir, base) = folder("ed-launch");
-        let (program, args) = launcher(
+        let (program, told) = launcher(
             &base,
-            "echo 'starting'\necho 'window 26891 26892 Text Editor'",
+            "echo 'starting'\necho 'window 26891 26892 --gst-plugin-path=x'",
         );
         let editor = MainEditor::new(&program).unwrap();
         let place = base.join("a file with spaces; $(no) `shell`.txt");
+        let shell = workspace("a laptop");
         assert_eq!(
-            editor.open(&place),
+            editor.open(&place, &shell),
             Ok(Opened {
                 picture: 26891,
                 input: 26892,
-                title: "Text Editor".into()
+                // Never an option for whatever it is handed to.
+                title: "?-gst-plugin-path=x".into()
             })
         );
-        let written = std::fs::read_to_string(&args).unwrap();
-        assert_eq!(written, format!("1\n{}\n", place.display()));
+        assert_eq!(
+            lines(&told),
+            [format!("1|open|{}|{}", place.display(), shell.device_id())]
+        );
     }
 
     #[test]
-    fn a_launcher_that_fails_or_says_nothing_is_a_refusal() {
+    fn the_editor_goes_with_the_shell_that_asked_and_another_shell_gets_one_afresh() {
+        let (_dir, base) = folder("ed-owner");
+        let (program, told) = launcher(&base, "echo 'window 26891 26892'");
+        let editor = MainEditor::new(&program).unwrap();
+        let (first, second) = (workspace("a laptop"), workspace("a laptop"));
+        let place = base.join("x.txt");
+        editor.open(&place, &first).unwrap();
+        // The same shell again: handed to the editor that runs.
+        editor.open(&place, &first).unwrap();
+        // Another shell: the first one's editor is ended before.
+        editor.open(&place, &second).unwrap();
+        // The first shell is over: not the owner any more, nothing is ended.
+        assert!(!editor.workspace_over(&first));
+        // The second one is over: its editor is ended.
+        assert!(editor.workspace_over(&second));
+        let words: Vec<String> = lines(&told)
+            .iter()
+            .map(|line| line.split('|').nth(1).unwrap().to_string())
+            .collect();
+        assert_eq!(words, ["open", "open", "stop", "open", "stop"]);
+        // A shell that is over may not start one.
+        first.end();
+        assert!(editor.open(&place, &first).is_err());
+    }
+
+    #[test]
+    fn a_launcher_that_fails_or_says_nothing_is_a_refusal_and_is_told_to_stop() {
         let (_dir, base) = folder("ed-fail");
         let place = base.join("x.txt");
-        let (program, _) = launcher(&base, "echo 'fail the encoder is taken'; exit 1");
+        let shell = workspace("a laptop");
+        let (program, told) = launcher(&base, "echo 'fail the encoder is taken'; exit 1");
         assert_eq!(
-            MainEditor::new(&program).unwrap().open(&place),
+            MainEditor::new(&program).unwrap().open(&place, &shell),
             Err("the main editor did not start: the encoder is taken".into())
         );
+        assert_eq!(lines(&told).last().unwrap().split('|').nth(1), Some("stop"));
         let (program, _) = launcher(&base, "echo 'window 0 1'");
-        assert!(MainEditor::new(&program).unwrap().open(&place).is_err());
-        let (program, _) = launcher(&base, "exit 0");
-        assert_eq!(
-            MainEditor::new(&program).unwrap().open(&place),
-            Err("the main editor's launcher ended without a window".into())
-        );
-        let (program, _) = launcher(&base, "exec sleep 5");
-        let began = std::time::Instant::now();
         assert!(MainEditor::new(&program)
             .unwrap()
-            .with_time_limit(Duration::from_millis(300))
-            .open(&place)
-            .unwrap_err()
-            .contains("did not start within"));
-        assert!(began.elapsed() < Duration::from_secs(3));
+            .open(&place, &shell)
+            .is_err());
+        let (program, _) = launcher(&base, "exit 0");
+        assert_eq!(
+            MainEditor::new(&program).unwrap().open(&place, &shell),
+            Err("the main editor's launcher ended without a window".into())
+        );
         // The setting must name a program.
         assert!(MainEditor::new(Path::new("relative/launcher")).is_err());
         assert!(MainEditor::new(&base).is_err());
         std::fs::write(base.join("plain"), "").unwrap();
         assert!(MainEditor::new(&base.join("plain")).is_err());
+    }
+
+    #[test]
+    fn on_a_time_out_the_launcher_and_what_it_started_in_its_group_are_ended() {
+        let (_dir, base) = folder("ed-timeout");
+        let place = base.join("x.txt");
+        let child = base.join("child.pid");
+        let (program, told) = launcher(
+            &base,
+            &format!("sleep 30 &\necho $! > '{}'\nexec sleep 30", child.display()),
+        );
+        let began = std::time::Instant::now();
+        assert!(MainEditor::new(&program)
+            .unwrap()
+            .with_time_limit(Duration::from_secs(2))
+            .open(&place, &workspace("a laptop"))
+            .unwrap_err()
+            .contains("did not start within"));
+        assert!(began.elapsed() < Duration::from_secs(8));
+        let pid: i32 = std::fs::read_to_string(&child)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The launcher's child is gone (after a moment to be collected by
+        // whoever adopted it).
+        let gone = || {
+            // SAFETY: signal 0 only asks whether the process is there.
+            unsafe { libc::kill(pid, 0) != 0 }
+        };
+        let waited = std::time::Instant::now();
+        while !gone() && waited.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone(), "the launcher's child is still there");
+        // And the launcher was asked to end what it had started elsewhere.
+        assert_eq!(lines(&told).last().unwrap().split('|').nth(1), Some("stop"));
     }
 
     #[test]

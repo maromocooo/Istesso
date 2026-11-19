@@ -81,6 +81,8 @@ pub struct Workspace {
     /// what it found.
     pokes: Mutex<Option<mpsc::Sender<mpsc::Sender<()>>>>,
     asked: Mutex<VecDeque<Instant>>,
+    /// Requests to open a file, counted apart from those for pages.
+    asked_files: Mutex<VecDeque<Instant>>,
     over: AtomicBool,
     /// Below which folder files may be opened in the host's main editor
     /// (the shell's project folder, by its real place), and whether the
@@ -116,6 +118,7 @@ impl Workspace {
             outlet: Mutex::new(None),
             pokes: Mutex::new(None),
             asked: Mutex::new(VecDeque::new()),
+            asked_files: Mutex::new(VecDeque::new()),
             over: AtomicBool::new(false),
             editing,
         })
@@ -137,6 +140,17 @@ impl Workspace {
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// The id of the shell's device, as this machine's pairing list has it.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// The public key of the shell's device, as this machine's pairing list
+    /// has it.
+    pub fn device_key(&self) -> &str {
+        &self.device_key
     }
 
     pub fn is_over(&self) -> bool {
@@ -176,7 +190,18 @@ impl Workspace {
     /// Whether a request to open a page may be passed on now: at most
     /// [`MAX_ASKS`] in [`ASKING_WINDOW`].
     pub fn may_ask(&self) -> bool {
-        let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        Workspace::count_in(&self.asked)
+    }
+
+    /// The same, for requests to open a file in the main editor, which are
+    /// counted apart: pages do not use up what files may ask, nor the other
+    /// way round.
+    pub fn may_ask_file(&self) -> bool {
+        Workspace::count_in(&self.asked_files)
+    }
+
+    fn count_in(asked: &Mutex<VecDeque<Instant>>) -> bool {
+        let mut asked = asked.lock().unwrap_or_else(|e| e.into_inner());
         while asked
             .front()
             .is_some_and(|at| at.elapsed() >= ASKING_WINDOW)
