@@ -12,6 +12,13 @@ ADR 0015, "文字の入力の欄"). Trial only.
 - wayland.text-input gains `serial`: one more (mod 256) whenever another field (the surface with
   the keyboard and its enabled text input), or the same one enabled again, has the keyboard; the
   device ends its composition when it changes.
+- wayland.text-input gains state 3, "not in a field": the client has a text input on the surface
+  with the keyboard and none is enabled (the device then sends plain keys, without its input
+  method); 0 stays "nothing known" (no text input there). Seen on the host: the Text Editor,
+  Firefox and Chrome enable and disable their text input as the focus moves by Tab, Control+L,
+  Control+F and Escape, with a short "not in a field" between.
+- The field is told again after every commit of a text input (the combined build had lost that
+  call, so the device heard of a field only when the keyboard moved).
 
 A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
 MIT License), commit 1301f86, on top of every other patch in this directory, in the order of
@@ -97,7 +104,7 @@ index c075c39..1b44aa3 100644
              clipboard: Default::default(),
              _text_input_global: text_input_global,
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
-index 18846af..c4208ae 100644
+index 18846af..749b225 100644
 --- a/wayland-display-core/src/wayland/handlers/text_input.rs
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
 @@ -124,13 +124,19 @@ struct Instance {
@@ -117,7 +124,7 @@ index 18846af..c4208ae 100644
 +    last: Option<(u32, i32, i32, u32, u32, u32)>,
 +    /// Which field it was (the surface with the keyboard and its enabled text input), and its
 +    /// serial.
-+    identity: Option<(ObjectId, ObjectId)>,
++    identity: Option<(ObjectId, Option<ObjectId>)>,
 +    serial: u8,
  }
  
@@ -127,7 +134,7 @@ index 18846af..c4208ae 100644
      }
  
 -    fn tell(&mut self, now: (u32, i32, i32, u32, u32)) {
-+    fn tell(&mut self, now: (u32, i32, i32, u32, u32), identity: Option<(ObjectId, ObjectId)>) {
++    fn tell(&mut self, now: (u32, i32, i32, u32, u32), identity: Option<(ObjectId, Option<ObjectId>)>) {
 +        if identity != self.identity {
 +            self.identity = identity;
 +            self.serial = self.serial.wrapping_add(1);
@@ -143,23 +150,41 @@ index 18846af..c4208ae 100644
          }
      }
  }
-@@ -237,6 +248,15 @@ impl TextInputs {
+@@ -237,6 +248,23 @@ impl TextInputs {
  
      /// The field with the keyboard: its state (0 none, 1 a field, 2 a secret one), and the
      /// text cursor's rectangle in the surface.
 +    /// Which field has the keyboard: the surface and its enabled text input.
-+    fn field_identity(&self) -> Option<(ObjectId, ObjectId)> {
++    /// (None in second place: the surface's client has a text input there, none enabled.)
++    fn field_identity(&self) -> Option<(ObjectId, Option<ObjectId>)> {
 +        let focus = self.focus.as_ref().filter(|s| s.is_alive())?;
-+        self.instances
++        if let Some(i) = self
++            .instances
 +            .iter()
 +            .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
-+            .map(|i| (focus.id(), i.object.id()))
++        {
++            return Some((focus.id(), Some(i.object.id())));
++        }
++        self.instances
++            .iter()
++            .any(|i| i.entered.as_ref() == Some(focus))
++            .then(|| (focus.id(), None))
 +    }
 +
      fn field(&self) -> (u32, Option<(i32, i32, i32, i32)>) {
          let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
              return (0, None);
-@@ -329,7 +349,8 @@ impl State {
+@@ -247,6 +275,9 @@ impl TextInputs {
+             .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
+         {
+             Some(i) => (if i.secret { 2 } else { 1 }, i.rect),
++            // 3: the client has a text input there and none is enabled: the keyboard is not in
++            // a text field (the device sends plain keys); 0: it has none (nothing is known).
++            None if self.instances.iter().any(|i| i.entered.as_ref() == Some(focus)) => (3, None),
+             None => (0, None),
+         }
+     }
+@@ -329,7 +360,8 @@ impl State {
                  }
              }
          }
@@ -169,7 +194,7 @@ index 18846af..c4208ae 100644
      }
  
      /// After the keyboard moved to a window: if a text input of its client entered it and has
-@@ -507,6 +528,11 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -507,6 +539,11 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                  }
              }
              zwp_text_input_v3::Request::Commit => {
@@ -181,7 +206,16 @@ index 18846af..c4208ae 100644
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.commits = instance.commits.wrapping_add(1);
                      if let Some(enable) = instance.pending.take() {
-@@ -618,3 +644,69 @@ mod tests {
+@@ -539,6 +576,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                         );
+                     }
+                 }
++                // The device is told about the field as the client has it now.
++                state.tell_text_input();
+             }
+             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
+                 if let Some(instance) = state.text_inputs.instance(resource) {
+@@ -618,3 +657,69 @@ mod tests {
          assert_eq!(us_key('\t'), None);
      }
  }
@@ -229,7 +263,7 @@ index 18846af..c4208ae 100644
 +    pub(crate) fn note_sent(&mut self, command: &crate::Command) {
 +        use crate::Command;
 +        use smithay::backend::input::KeyState;
-+        if self.text_inputs.field().0 == 0 {
++        if !matches!(self.text_inputs.field().0, 1 | 2) {
 +            self.text_order.waiting = None;
 +            return;
 +        }
