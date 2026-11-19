@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from urllib.parse import quote
 
@@ -45,6 +46,10 @@ DEFAULT_LABELS = {"ubuntu": "Ubuntu", "mac": "Studio"}
 DEFAULT_MAC_HOST = "istesso-studio"
 # The fetch has to give way to a measurement within seconds (AGENTS.md, the measuring signal).
 FETCH_SECONDS = 8
+# How long install waits for Spotlight to list the shortcuts it was asked to import.
+SPOTLIGHT_WAIT = 10
+# mds is the Spotlight server; launchd starts it again at once (KeepAlive). Not a reindex.
+SPOTLIGHT_RESTART = "sudo killall mds"
 
 
 def machine_labels(path):
@@ -278,10 +283,11 @@ def install(stage, dest, rows, host):
         check_owned(dest, title, names)
     # Prepare all icons and signatures before publishing the first app. Use the destination
     # filesystem for the renames; the checkout can live on a different volume. The copies are
-    # applications by name from the moment they exist (".app"), in a hidden folder that Spotlight
-    # does not look into: Spotlight first meets each one at its final place, as an application,
-    # and is asked to import it there (spotlight_import). A folder that became an application only
-    # by a rename was left out of Spotlight and Alfred (2026-11-19).
+    # applications by name from the moment they exist (".app"), in a hidden folder: Spotlight first
+    # meets each one at its final place, as an application, and is asked to import it there
+    # (spotlight_import). Whether Spotlight then lists them is checked at the end (spotlight_report):
+    # on 2026-11-19 the shortcuts were missing from Spotlight and Alfred not because of how they
+    # were placed, but because Spotlight on the Mac had stopped importing anything new.
     with tempfile.TemporaryDirectory(dir=dest, prefix=".pending-") as tmp:
         pending = Path(tmp)
         for title in wanted:
@@ -312,6 +318,8 @@ def install(stage, dest, rows, host):
                 subprocess.run([tool, "register", bundle], check=True)
                 spotlight_import(bundle)
         remove(dest, names, names - wanted)
+    if not REHEARSAL:
+        spotlight_report(dest, wanted)
 
 
 def spotlight_import(bundle):
@@ -322,6 +330,44 @@ def spotlight_import(bundle):
         subprocess.run(["/usr/bin/mdimport", bundle], capture_output=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         print(f"Spotlight was not asked to import {bundle.name}; it may be found later.")
+
+
+def spotlight_listed(dest):
+    """The names of the applications that Spotlight lists in dest, or None if it cannot be asked."""
+    try:
+        found = subprocess.run(["/usr/bin/mdfind", "-onlyin", dest,
+                                "kMDItemContentType == 'com.apple.application-bundle'"],
+                               capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if found.returncode:
+        return None
+    return {unicodedata.normalize("NFC", Path(line).name) for line in found.stdout.splitlines() if line}
+
+
+def spotlight_report(dest, titles, wait=SPOTLIGHT_WAIT):
+    """Says which shortcuts Spotlight, and so Alfred, does not list yet. mdimport returns at once
+    and says nothing either way: on 2026-11-19 Spotlight on the Mac had started no importer for
+    hours, so every request was dropped, and only asking Spotlight showed it."""
+    wanted = {unicodedata.normalize("NFC", title + ".app") for title in titles}
+    deadline = time.monotonic() + wait
+    while True:
+        listed = spotlight_listed(dest)
+        if listed is None:
+            print("Could not ask Spotlight whether it lists the shortcuts.")
+            return
+        missing = wanted - listed
+        if not missing or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    if missing:
+        try:
+            folder = "~/" + shlex.quote(str(dest.relative_to(Path.home())))
+        except ValueError:
+            folder = shlex.quote(str(dest))
+        print(f"Spotlight does not list {len(missing)} shortcut(s) yet: {', '.join(sorted(missing))}.")
+        print("If they are still missing in a few minutes, Spotlight has stopped importing on this Mac. "
+              f"Restart it with '{SPOTLIGHT_RESTART}', wait a minute, then run: mdimport {folder}")
 
 
 @contextmanager

@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 import zlib
 from unittest.mock import Mock, patch
@@ -558,7 +559,7 @@ class InstallsApplicationsFromTheFirstMoment(unittest.TestCase):
                 contents = stage / (title + ".staged") / "Contents"
                 contents.mkdir(parents=True)
                 sc.write_plist(contents / "Info.plist", dict(CFBundleIdentifier=sc.bundle_id(title)))
-            copied, ran, imported, fetched = [], [], [], []
+            copied, ran, imported, fetched, reported = [], [], [], [], []
             real_copytree = shutil.copytree
 
             def copytree(source, target, *args, **kwargs):
@@ -582,7 +583,8 @@ class InstallsApplicationsFromTheFirstMoment(unittest.TestCase):
                                                                    subprocess.CompletedProcess(argv, 0, "free\n", ""))[1]), \
                  patch.object(sc, "fetch_icon", fetch_icon), \
                  patch.dict(os.environ), \
-                 patch.object(sc, "spotlight_import", imported.append):
+                 patch.object(sc, "spotlight_import", imported.append), \
+                 patch.object(sc, "spotlight_report", lambda *args: reported.append(args)):
                 os.environ.pop("ISTESSO_MAC_HOST", None)
                 sc.install(stage, dest, rows, "stand-in-ubuntu")
             # Without ISTESSO_MAC_HOST (shortcuts.py run by itself), the same default as daily.sh.
@@ -598,6 +600,59 @@ class InstallsApplicationsFromTheFirstMoment(unittest.TestCase):
                 self.assertIn([str(stage / "bundle-tool"), "register", str(bundle)], ran)
             self.assertEqual(sorted(imported), sorted(dest / (title + ".app") for title in titles))
             self.assertEqual([p.name for p in dest.iterdir() if p.name.startswith(".pending-")], [])
+            # Spotlight is asked once, at the end, about every shortcut that was installed.
+            self.assertEqual(reported, [(dest, set(titles))])
+
+
+class ReportsWhatSpotlightDoesNotList(unittest.TestCase):
+    """mdimport says nothing when Spotlight drops the request (2026-11-19: no importer had run
+    for hours), so install asks Spotlight what it lists and names the shortcuts that are missing."""
+
+    def report(self, listed_each_time, wait=3):
+        clock = iter(range(100))
+        asked, slept = [], []
+
+        def listed(dest):
+            asked.append(dest)
+            return listed_each_time[min(len(asked), len(listed_each_time)) - 1]
+
+        out = io.StringIO()
+        with patch.object(sc, "spotlight_listed", listed), \
+             patch.object(sc.time, "monotonic", lambda: next(clock)), \
+             patch.object(sc.time, "sleep", slept.append), \
+             patch("sys.stdout", out):
+            sc.spotlight_report(Path.home() / "Applications/Istesso Dev", ["Chrome (Ubuntu)", sc.HANDLER], wait)
+        return out.getvalue(), len(asked)
+
+    def test_silent_when_every_shortcut_is_listed(self):
+        printed, asked = self.report([{"Chrome (Ubuntu).app", sc.HANDLER + ".app", "Istesso Dev Audio.app"}])
+        self.assertEqual((printed, asked), ("", 1))
+
+    def test_waits_for_a_late_import(self):
+        printed, asked = self.report([{"Chrome (Ubuntu).app"}, {"Chrome (Ubuntu).app", sc.HANDLER + ".app"}])
+        self.assertEqual((printed, asked), ("", 2))
+
+    def test_names_the_missing_ones_and_the_way_to_restart_spotlight(self):
+        printed, asked = self.report([{"Istesso Dev Audio.app"}], wait=3)
+        self.assertEqual(asked, 3)
+        self.assertIn("does not list 2 shortcut(s) yet: Chrome (Ubuntu).app, Istesso Dev Open.app.", printed)
+        self.assertIn("'sudo killall mds'", printed)
+        self.assertIn("mdimport ~/'Applications/Istesso Dev'", printed)
+        self.assertNotIn(str(Path.home()), printed)
+
+    def test_decomposed_names_from_spotlight_still_match(self):
+        title = "Café (Ubuntu)"
+        listed = {unicodedata.normalize("NFD", title) + ".app", sc.HANDLER + ".app"}
+        with patch.object(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+                a, 0, "".join(f"/x/{name}\n" for name in listed), "")):
+            names = sc.spotlight_listed(Path("/x"))
+        self.assertEqual(names, {title + ".app", sc.HANDLER + ".app"})
+
+    def test_spotlight_that_cannot_be_asked_is_said_once(self):
+        printed, asked = self.report([None])
+        self.assertEqual((printed, asked), ("Could not ask Spotlight whether it lists the shortcuts.\n", 1))
+        with patch.object(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "")):
+            self.assertIsNone(sc.spotlight_listed(Path("/x")))
 
 
 if __name__ == "__main__":
