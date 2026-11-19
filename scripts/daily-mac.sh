@@ -44,6 +44,8 @@
 #   DAILY_VIEWER         a viewer program to start from the shell instead (no bundle)
 #   DAILY_NO_WINDOW=1    for checks: the viewer decodes but shows no window
 #   DAILY_FRAME_LOGS=1   frame logs on both sides
+#   DAILY_VIRTUAL=0      the application's window stays on the host's own screen (default: a virtual
+#                        display of this Mac's screen's size at 2x, 120 Hz, while the window is shown)
 #   DAILY_CLICK_FORM     how pointer events are posted on the host. 4 (default for an application):
 #                        through the session, the host's own pointer moves; presses and scrolls only
 #                        onto the application's own windows. 1 (default for --display): to the
@@ -204,6 +206,14 @@ do_open() {
     # the range checks); the whole display posts to the process unless DAILY_CLICK_FORM says else.
     local click_form=${DAILY_CLICK_FORM:-4}
     [ -n "$display" ] && click_form=${DAILY_CLICK_FORM:-1}
+    # The application form on a virtual display of this Mac's screen's size at 2x, 120 Hz (the
+    # owner's plan A, trial only; DAILY_VIRTUAL=0 leaves the window where it is).
+    local virtual_arg=""
+    if [ -z "$display" ] && [ "$for_whom" != aura ] && [ "${DAILY_VIRTUAL:-1}" != 0 ]; then
+        local here_size
+        here_size=$(osascript -l JavaScript -e 'ObjC.import("AppKit"); var f=$.NSScreen.mainScreen.frame; Math.round(f.size.width)+"x"+Math.round(f.size.height)' 2>/dev/null)
+        [[ "$here_size" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] && virtual_arg="--virtual-display $here_size@120"
+    fi
     local target_args size_arg="--size $size"
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$app")"; fi
     # The whole display keeps its own shape unless a size was asked for.
@@ -260,7 +270,7 @@ else
         : > "\$document"
     fi
     set -- $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        $size_arg --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg $virtual_arg --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else
