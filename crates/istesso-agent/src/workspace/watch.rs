@@ -375,7 +375,8 @@ pub fn start(workspace: Arc<Workspace>, outlet: ShellOutlet, log: Log) {
     }
     let (poke, pokes) = mpsc::channel::<mpsc::Sender<()>>();
     *workspace.pokes.lock().unwrap_or_else(|e| e.into_inner()) = Some(poke);
-    std::thread::spawn(move || {
+    let (failed, name) = (log.clone(), workspace.device_name().to_string());
+    let started = super::spawn("istesso-ports", move || {
         if !workspace.look(true, &log) {
             return;
         }
@@ -394,6 +395,11 @@ pub fn start(workspace: Arc<Workspace>, outlet: ShellOutlet, log: Log) {
             }
         }
     });
+    if let Err(err) = started {
+        failed(format!(
+            "the ports of the workspace of the shell for {name} are not looked at: {err}"
+        ));
+    }
 }
 
 /// One forwarded port as the host keeps it: what the device is told, where

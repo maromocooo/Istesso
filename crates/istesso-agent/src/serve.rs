@@ -132,9 +132,9 @@ struct Shared {
     /// The workspaces of the shells open now, whose ports are forwarded.
     #[cfg(unix)]
     workspaces: Arc<crate::workspace::watch::Workspaces>,
-    /// Forwarded connections open now ([`MAX_FORWARDS`]).
+    /// Forwarded connections open now, by device ([`ForwardSlots`]).
     #[cfg(unix)]
-    forwards_open: AtomicUsize,
+    forwards_open: ForwardSlots,
 }
 
 /// Forwarded connections served at the same time: half of
@@ -142,6 +142,37 @@ struct Shared {
 /// device from sending input or opening a shell.
 #[cfg(unix)]
 const MAX_FORWARDS: usize = MAX_CONNECTIONS / 2;
+/// Forwarded connections one device may have at the same time: half of
+/// [`MAX_FORWARDS`], so that one page that opens many connections cannot
+/// take every place from the other devices.
+#[cfg(unix)]
+const MAX_FORWARDS_PER_DEVICE: usize = MAX_FORWARDS / 2;
+
+/// The places for forwarded connections: [`MAX_FORWARDS`] in all, at most
+/// [`MAX_FORWARDS_PER_DEVICE`] for one device.
+#[cfg(unix)]
+#[derive(Default)]
+struct ForwardSlots {
+    open: Mutex<HashMap<String, usize>>,
+}
+
+#[cfg(unix)]
+impl ForwardSlots {
+    /// A place for one more connection of `device`, when there is one.
+    fn take(&self, device: &str) -> Option<ForwardSlot<'_>> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let all: usize = open.values().sum();
+        let mine = open.get(device).copied().unwrap_or(0);
+        if all >= MAX_FORWARDS || mine >= MAX_FORWARDS_PER_DEVICE {
+            return None;
+        }
+        *open.entry(device.to_string()).or_default() += 1;
+        Some(ForwardSlot {
+            slots: self,
+            device: device.to_string(),
+        })
+    }
+}
 
 /// What is kept of a conversation that carries input, for ending it from
 /// another one.
@@ -251,7 +282,7 @@ impl Agent {
                 #[cfg(unix)]
                 workspaces,
                 #[cfg(unix)]
-                forwards_open: AtomicUsize::new(0),
+                forwards_open: ForwardSlots::default(),
             }),
         })
     }
@@ -497,14 +528,23 @@ struct Forwarded<'a> {
     _slot: ForwardSlot<'a>,
 }
 
-/// A forwarded connection counted against [`MAX_FORWARDS`] while it lives.
+/// A forwarded connection counted in [`ForwardSlots`] while it lives.
 #[cfg(unix)]
-struct ForwardSlot<'a>(&'a AtomicUsize);
+struct ForwardSlot<'a> {
+    slots: &'a ForwardSlots,
+    device: String,
+}
 
 #[cfg(unix)]
 impl Drop for ForwardSlot<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        let mut open = self.slots.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = open.get_mut(&self.device) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&self.device);
+            }
+        }
     }
 }
 
@@ -856,14 +896,12 @@ impl Shared {
         if !target.reaches_only_the_workspace() {
             return Err(moved());
         }
-        if self.forwards_open.fetch_add(1, Ordering::SeqCst) >= MAX_FORWARDS {
-            self.forwards_open.fetch_sub(1, Ordering::SeqCst);
-            return Err(Response::error(
+        let slot = self.forwards_open.take(&peer.id).ok_or_else(|| {
+            Response::error(
                 ErrorCode::Internal,
                 "too many forwarded connections are open on this host",
-            ));
-        }
-        let slot = ForwardSlot(&self.forwards_open);
+            )
+        })?;
         let stream =
             TcpStream::connect_timeout(&target.to, Duration::from_secs(2)).map_err(|_| {
                 Response::error(
@@ -1303,6 +1341,27 @@ mod tests {
         let mut peers = PeerStore::open(paths.peers()).unwrap();
         peers.add(peer.clone()).unwrap();
         assert!(!may_still_control(&paths, &peer));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_device_cannot_take_every_place_for_forwarded_connections() {
+        let slots = ForwardSlots::default();
+        let first: Vec<_> = (0..MAX_FORWARDS_PER_DEVICE)
+            .map(|_| slots.take("a laptop").unwrap())
+            .collect();
+        assert!(slots.take("a laptop").is_none());
+        // Another device still has places, up to what is left in all.
+        let second: Vec<_> = (0..MAX_FORWARDS - MAX_FORWARDS_PER_DEVICE)
+            .map(|_| slots.take("a phone").unwrap())
+            .collect();
+        assert!(slots.take("a phone").is_none());
+        assert!(slots.take("a tablet").is_none());
+        // A place that is given back can be taken again.
+        drop(first);
+        assert!(slots.take("a laptop").is_some());
+        drop(second);
+        assert!(slots.open.lock().unwrap().is_empty());
     }
 
     #[test]

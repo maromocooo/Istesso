@@ -38,8 +38,16 @@ use crate::Paths;
 
 /// How far above the host's number a free one is looked for.
 const SHIFT_AT_MOST: u16 = 100;
-/// How long a connection may take to say what it is.
-const FIRST_BYTES_WITHIN: Duration = Duration::from_secs(30);
+/// How long a connection may take, in all, to send the head of its first
+/// request (or the start of TLS): a connection that trickles is cut then.
+const HEAD_WITHIN: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
+/// Connections one forward takes at the same time; more are turned away at
+/// once. Each one is a thread here and a conversation with the host.
+const MAX_OPEN_PER_FORWARD: usize = 64;
 /// How long reaching the host for a forwarded connection may take.
 const CONNECT_WITHIN: Duration = Duration::from_secs(3);
 /// How long a program that is already there may take to answer on a port
@@ -76,6 +84,9 @@ struct Entry {
     connections: AtomicU64,
     refused: AtomicU64,
     failed: AtomicU64,
+    /// Connections turned away because [`MAX_OPEN_PER_FORWARD`] were open,
+    /// or no thread could be started for them.
+    turned_away: AtomicU64,
     last_used: Mutex<Option<SystemTime>>,
     cut: AtomicBool,
     told_refused: AtomicBool,
@@ -118,6 +129,8 @@ struct Inner {
     settings: Settings,
     notice: Notice,
     state: Mutex<State>,
+    /// The socket for `istesso forwards`.
+    control: Mutex<Option<PathBuf>>,
 }
 
 /// The forwards of one shell.
@@ -159,17 +172,24 @@ impl Forwarder {
             settings,
             notice,
             state: Mutex::new(State::default()),
+            control: Mutex::new(None),
         });
         match control_socket(paths) {
             Ok((path, listener)) => {
-                *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
-                let inner = Arc::downgrade(&inner);
-                std::thread::spawn(move || {
+                *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
+                *inner.control.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+                let weak = Arc::downgrade(&inner);
+                let started = super::spawn("istesso-forwards", move || {
                     for stream in listener.incoming().flatten() {
-                        let Some(inner) = inner.upgrade() else { return };
+                        let Some(inner) = weak.upgrade() else { return };
                         answer_control(&inner, stream);
                     }
                 });
+                if let Err(err) = started {
+                    (inner.notice)(&format!(
+                        "`istesso forwards` cannot see this shell's forwards: {err}"
+                    ));
+                }
             }
             Err(err) => (inner.notice)(&format!(
                 "`istesso forwards` cannot see this shell's forwards: {err}"
@@ -263,6 +283,7 @@ impl Forwarder {
                 connections: AtomicU64::new(0),
                 refused: AtomicU64::new(0),
                 failed: AtomicU64::new(0),
+                turned_away: AtomicU64::new(0),
                 last_used: Mutex::new(None),
                 cut: AtomicBool::new(false),
                 told_refused: AtomicBool::new(false),
@@ -283,9 +304,21 @@ impl Forwarder {
                     inner.device
                 ));
             }
+            let mut listening = 0;
             for listener in listeners {
                 let (inner, entry) = (inner.clone(), entry.clone());
-                std::thread::spawn(move || listen(&inner, &entry, listener));
+                if super::spawn("istesso-forward", move || listen(&inner, &entry, listener)).is_ok()
+                {
+                    listening += 1;
+                }
+            }
+            if listening == 0 {
+                entry.close();
+                (inner.notice)(&format!(
+                    "port {port} on {} is not forwarded: no thread could be started for it",
+                    inner.device
+                ));
+                continue;
             }
             state.entries.insert(port, entry);
         }
@@ -359,7 +392,20 @@ impl Drop for Forwarder {
             entry.close();
         }
         drop(state);
-        cleanup();
+        // This forwarder's own socket (a process has one; tests have several).
+        if let Some(path) = self
+            .inner
+            .control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = std::fs::remove_file(&path);
+            let mut last = CONTROL.lock().unwrap_or_else(|e| e.into_inner());
+            if last.as_ref() == Some(&path) {
+                last.take();
+            }
+        }
     }
 }
 
@@ -377,7 +423,11 @@ fn open_page(opener: Option<&Path>, address: &str) -> std::io::Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    std::thread::spawn(move || child.wait());
+    // Collected when it ends; when no thread can wait for it, it stays a
+    // zombie until this program ends, which is harmless.
+    let _ = super::spawn("istesso-opener", move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -422,8 +472,36 @@ fn listen(inner: &Arc<Inner>, entry: &Arc<Entry>, listener: TcpListener) {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
-        let (inner, entry) = (inner.clone(), entry.clone());
-        std::thread::spawn(move || take(&inner, &entry, stream));
+        entry.connections.fetch_add(1, Ordering::Relaxed);
+        // Counted here, before its thread starts, so that a burst of
+        // connections cannot get past the limit.
+        if entry.open.fetch_add(1, Ordering::SeqCst) >= MAX_OPEN_PER_FORWARD {
+            entry.open.fetch_sub(1, Ordering::SeqCst);
+            turn_away(inner, entry, stream, "too many connections are open");
+            continue;
+        }
+        let (inner_for, entry_for) = (inner.clone(), entry.clone());
+        let started = super::spawn("istesso-forwarded", move || {
+            let _open = Open(&entry_for.open);
+            take(&inner_for, &entry_for, stream);
+        });
+        if started.is_err() {
+            // The closure, and the connection in it, are dropped with the
+            // error; its place is given back.
+            entry.open.fetch_sub(1, Ordering::SeqCst);
+            entry.turned_away.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Closes a connection the forward cannot take, and says so once.
+fn turn_away(inner: &Inner, entry: &Entry, stream: TcpStream, why: &str) {
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    if entry.turned_away.fetch_add(1, Ordering::Relaxed) == 0 {
+        (inner.notice)(&format!(
+            "turned a connection to localhost:{} away: {why} (more are counted in `istesso forwards`)",
+            entry.here
+        ));
     }
 }
 
@@ -438,11 +516,8 @@ impl Drop for Open<'_> {
 
 /// One connection to a forward: looked at, then carried to the host.
 fn take(inner: &Inner, entry: &Entry, mut stream: TcpStream) {
-    entry.open.fetch_add(1, Ordering::SeqCst);
-    let _open = Open(&entry.open);
-    entry.connections.fetch_add(1, Ordering::Relaxed);
     *entry.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
-    let _ = stream.set_read_timeout(Some(FIRST_BYTES_WITHIN));
+    let deadline = std::time::Instant::now() + HEAD_WITHIN;
     let mut first = Vec::new();
     let mut buffer = [0u8; 4096];
     let look = loop {
@@ -450,9 +525,22 @@ fn take(inner: &Inner, entry: &Entry, mut stream: TcpStream) {
             Look::More => {}
             other => break other,
         }
+        // One deadline for the whole head, however it trickles in.
+        let Some(left) = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            turn_away(inner, entry, stream, "its request did not arrive in time");
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(left));
         match stream.read(&mut buffer) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
             Ok(n) => first.extend_from_slice(&buffer[..n]),
+            Err(_) => {
+                turn_away(inner, entry, stream, "its request did not arrive in time");
+                return;
+            }
         }
     };
     if let Look::Refused(why) = look {
@@ -520,10 +608,13 @@ pub struct Shown {
     /// Connections open now, and taken in all.
     pub open: usize,
     pub connections: u64,
-    /// Connections refused at the look ([`super::gate`]), and those the
-    /// host could not be reached for.
+    /// Connections refused at the look ([`super::gate`]), those the host
+    /// could not be reached for, and those turned away (too many at once,
+    /// or too slow to say what they want).
     pub refused: u64,
     pub failed: u64,
+    #[serde(default)]
+    pub turned_away: u64,
     /// When a connection last came, in seconds since 1970.
     pub last_used: Option<u64>,
 }
@@ -559,6 +650,7 @@ fn shown(inner: &Inner) -> ShellForwards {
                 connections: entry.connections.load(Ordering::Relaxed),
                 refused: entry.refused.load(Ordering::Relaxed),
                 failed: entry.failed.load(Ordering::Relaxed),
+                turned_away: entry.turned_away.load(Ordering::Relaxed),
                 last_used: entry
                     .last_used
                     .lock()
@@ -779,6 +871,89 @@ mod tests {
         assert!(shown.forwards[0].exposed);
         drop(forwarder);
         // The folder of the socket for `istesso forwards` is empty again.
+        std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_forward_turns_away_what_it_cannot_take_and_cuts_a_request_that_trickles() {
+        use istesso_link::forward::ForwardedPort;
+        let device = crate::testing::TempDir::new("fwd-limits");
+        let forwarder = Forwarder::new(
+            &device.paths(),
+            "a host",
+            "an id",
+            // Never reached: no request gets that far in this test.
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Settings {
+                enabled: true,
+                ..Settings::default()
+            },
+            Arc::new(|_: &str| {}),
+        )
+        .unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let there = probe.local_addr().unwrap().port();
+        drop(probe);
+        forwarder.update(PortList {
+            watching: true,
+            ports: vec![ForwardedPort {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                port: there,
+                family: 4,
+                process: String::new(),
+                exposed: false,
+            }],
+            ..PortList::default()
+        });
+        let here = shown(&forwarder.inner).forwards[0].here;
+        let open_now = || shown(&forwarder.inner).forwards[0].open;
+        let soon = |what: &dyn Fn() -> bool| {
+            let began = std::time::Instant::now();
+            while !what() {
+                assert!(began.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // As many idle connections as a forward takes...
+        let idle: Vec<TcpStream> = (0..MAX_OPEN_PER_FORWARD)
+            .map(|_| TcpStream::connect(("127.0.0.1", here)).unwrap())
+            .collect();
+        soon(&|| open_now() == MAX_OPEN_PER_FORWARD);
+        // ...and the next one is closed at once, not after the deadline.
+        let mut extra = TcpStream::connect(("127.0.0.1", here)).unwrap();
+        extra
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let began = std::time::Instant::now();
+        let _ = extra.read(&mut [0u8; 16]);
+        assert!(began.elapsed() < HEAD_WITHIN / 2, "{:?}", began.elapsed());
+        assert!(shown(&forwarder.inner).forwards[0].turned_away >= 1);
+        // The idle ones are cut at the deadline for the request's head.
+        soon(&|| open_now() == 0);
+        drop(idle);
+
+        // A request that trickles in, a byte at a time, is cut when the
+        // deadline for the whole head has passed.
+        let mut slow = TcpStream::connect(("127.0.0.1", here)).unwrap();
+        let mut writer = slow.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for byte in b"GET / HTTP/1.1\r\nHost: localhost" {
+                if writer.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        slow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let began = std::time::Instant::now();
+        let _ = slow.read(&mut [0u8; 16]);
+        let lasted = began.elapsed();
+        assert!(
+            lasted >= HEAD_WITHIN / 2 && lasted < HEAD_WITHIN * 3,
+            "{lasted:?}"
+        );
+        drop(forwarder);
         std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();
     }
 

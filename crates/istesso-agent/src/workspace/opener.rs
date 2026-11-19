@@ -73,12 +73,15 @@ pub fn start(paths: &Paths, workspaces: Arc<Workspaces>, log: Log) -> std::io::R
     remove_socket(&socket);
     let listener = UnixListener::bind(&socket)?;
     let bin = make_bin(&dir).ok().flatten();
-    std::thread::spawn(move || {
+    super::spawn("istesso-open-requests", move || {
         for stream in listener.incoming().flatten() {
             let (workspaces, log) = (workspaces.clone(), log.clone());
-            std::thread::spawn(move || answer(stream, &workspaces, &log));
+            // Without a thread, the request is dropped unanswered.
+            let _ = super::spawn("istesso-open-request", move || {
+                answer(stream, &workspaces, &log)
+            });
         }
-    });
+    })?;
     Ok(OpenServer { socket, bin })
 }
 

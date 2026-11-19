@@ -89,7 +89,7 @@ pub fn carry(
             first.to_vec(),
         );
         let mut local = local;
-        std::thread::spawn(move || {
+        super::spawn("istesso-carry", move || {
             if !first.is_empty() {
                 if writer.send(&ForwardFrame::data(&first)).is_err() {
                     let _ = events.send(Event::Broken);
@@ -130,7 +130,7 @@ pub fn carry(
     let down = {
         let (events, received) = (events_in, received.clone());
         let mut local = local_out;
-        std::thread::spawn(move || loop {
+        super::spawn("istesso-carry", move || loop {
             let event = match reader.recv().map(|m| ForwardFrame::decode(&m)) {
                 Ok(Ok(ForwardFrame::Data(bytes))) => {
                     if local.write_all(&bytes).is_err() {
@@ -152,6 +152,13 @@ pub fn carry(
         })
     };
 
+    // Without both threads, nothing is carried: both connections are closed.
+    let (Ok(up), Ok(down)) = (up, down) else {
+        quit.store(true, Ordering::SeqCst);
+        let _ = wire.shutdown(Shutdown::Both);
+        let _ = local_cut.shutdown(Shutdown::Both);
+        return done(false);
+    };
     let (mut sent_all, mut received_all) = (false, false);
     let mut checked = Instant::now();
     let mut stopped = false;

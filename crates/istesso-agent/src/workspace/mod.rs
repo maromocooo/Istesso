@@ -88,6 +88,17 @@ fn short_hash(path: &Path) -> u32 {
         })
 }
 
+/// Starts a thread, or says why it could not: never a panic (in the shell's
+/// loop, a panic would leave the person's terminal raw).
+pub(crate) fn spawn<F>(name: &str, work: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(work)
+}
+
 /// 128 bits from the system's random source, as 32 hexadecimal digits:
 /// the id of a forward, the name of a scope.
 pub(crate) fn random_id() -> io::Result<String> {
