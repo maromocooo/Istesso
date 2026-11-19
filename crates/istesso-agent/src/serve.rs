@@ -322,7 +322,13 @@ impl InputSink {
                 } => {
                     held.buttons.remove(code);
                 }
-                InputEvent::PointerAt { .. } | InputEvent::Scroll { .. } | InputEvent::Focus => {}
+                InputEvent::PointerAt { .. } | InputEvent::Focus => {}
+                // A scroll out of bounds (not a number, too far) is dropped here.
+                InputEvent::Scroll { .. } => {
+                    if !istesso_proto::scroll_is_acceptable(event) {
+                        continue;
+                    }
+                }
                 // A size out of bounds is dropped here.
                 InputEvent::Resize { width, height } => {
                     if !istesso_proto::resize_is_acceptable(*width, *height) {
@@ -709,7 +715,7 @@ mod tests {
 
         // The listener goes away: input is lost, nothing else happens.
         drop(listener);
-        sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
+        sink.send(&InputEvent::scroll(0, 1));
     }
 
     #[cfg(unix)]
@@ -794,6 +800,53 @@ mod tests {
             assert_eq!(
                 pair.all_handed_over(A_MOMENT),
                 [key(42, false), button(0x110, false)]
+            );
+        }
+
+        #[test]
+        fn scrolls_are_passed_on_with_their_kind_and_scrolls_out_of_bounds_are_not() {
+            use istesso_proto::{ScrollPhase, ScrollSource};
+            let pair = InputPair::new("is");
+            let mut client = pair.connect();
+            client.open_input().unwrap();
+            let finger = |y: f64, phase: Option<ScrollPhase>| InputEvent::Scroll {
+                dx: 0,
+                dy: y as i32,
+                source: Some(ScrollSource::Finger),
+                v120: None,
+                pixels: Some([0.0, y]),
+                phase,
+                momentum: None,
+            };
+            let wheel = |v120: i32| InputEvent::Scroll {
+                dx: 0,
+                dy: 15,
+                source: Some(ScrollSource::Wheel),
+                v120: Some([0, v120]),
+                pixels: None,
+                phase: None,
+                momentum: None,
+            };
+            client
+                .send_input(&[
+                    finger(0.0, Some(ScrollPhase::Began)),
+                    finger(12.5, Some(ScrollPhase::Changed)),
+                    finger(20_000.0, Some(ScrollPhase::Changed)),
+                    wheel(120),
+                    wheel(i32::MAX),
+                    InputEvent::scroll(0, 30),
+                    finger(0.0, Some(ScrollPhase::Ended)),
+                ])
+                .unwrap();
+            assert_eq!(
+                pair.all_handed_over(A_MOMENT),
+                [
+                    finger(0.0, Some(ScrollPhase::Began)),
+                    finger(12.5, Some(ScrollPhase::Changed)),
+                    wheel(120),
+                    InputEvent::scroll(0, 30),
+                    finger(0.0, Some(ScrollPhase::Ended)),
+                ]
             );
         }
 
