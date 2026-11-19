@@ -1571,7 +1571,10 @@ fn nothing_is_sealed_behind_a_packet_that_went_out_only_in_part_behind_a_frame()
     for seq in 0..2 {
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(
-            pair.host.send_frame(b"key", seq, seq, true).unwrap().viewers,
+            pair.host
+                .send_frame(b"key", seq, seq, true)
+                .unwrap()
+                .viewers,
             1
         );
         assert_eq!(events(&mut viewer, 1).0, "f");
@@ -1592,11 +1595,18 @@ fn nothing_is_sealed_behind_a_packet_that_went_out_only_in_part_behind_a_frame()
         height: 18,
     };
     pair.host.set_text_field(&field).unwrap();
-    assert_eq!(pair.host.send_frame(b"next", 2, 2, false).unwrap().viewers, 1);
+    assert_eq!(
+        pair.host.send_frame(b"next", 2, 2, false).unwrap().viewers,
+        1
+    );
     // All of it arrives, in order: the frame, the field (small, first), the cursor.
     let began = Instant::now();
     let (order, _) = events(&mut viewer, 3);
-    assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
     assert_eq!(order, "ftc");
     assert_eq!(viewer.text_field(), Some(field));
 }
