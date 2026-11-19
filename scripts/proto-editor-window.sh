@@ -75,15 +75,18 @@ busy() {
     [ "$(head -c 4 "$signal" 2>/dev/null)" = busy ] ||
         { [ -n "$test_signal" ] && [ "$(head -c 4 "$test_signal" 2>/dev/null)" = busy ]; }
 }
+# The start time of the process $1 as `ps` says it, without the blanks around it (macOS pads it
+# with spaces at the end, which `read` drops; the same helper is in proto-editor-viewer.sh).
+started_of() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 # The recorded process still runs. If given, the second argument is the required pid.
 still_runs() {
     local pid started
     [ -s "$1" ] || return 1
     read -r pid started < "$1"
     [ -n "$started" ] && [ "$pid" = "${2:-$pid}" ] &&
-        [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
+        [ "$(started_of "$pid")" = "$started" ]
 }
-write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
+write_down() { echo "$2 $(started_of "$2")" > "$1"; }
 # Ends the session of the process written down in FILE (each part was started as the leader of a
 # session and a process group of its own), by that number only.
 end_written_down() {
@@ -335,7 +338,7 @@ cat > "$run/guard.sh" <<SCRIPT
 #!/bin/bash
 unset EDITOR_WINDOW_PLACE
 export LC_ALL=C
-$(declare -f busy still_runs end_written_down end_all)
+$(declare -f busy started_of still_runs end_written_down end_all)
 signal=$signal test_signal=$test_signal run=$run
 while sleep 2; do
     if busy; then echo "\$(date '+%H:%M:%S') measuring: everything of the editor is ended"; end_all; exit 0; fi

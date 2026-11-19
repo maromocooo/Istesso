@@ -32,13 +32,16 @@ istesso=$src/target/release/istesso
 mkdir -p "$dir" && chmod 700 "$dir"
 log=$dir/opener.log
 
+# The start time of the process $1 as `ps` says it, without the blanks around it: macOS pads it
+# with spaces at the end, which `read` would drop, so that it would never match again.
+started_of() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 still_runs() { # FILE: the process written down there (number and start time) still runs
     local pid started
     [ -s "$1" ] || return 1
     read -r pid started < "$1"
-    [ -n "$pid" ] && [ -n "$started" ] && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]
+    [ -n "$pid" ] && [ -n "$started" ] && [ "$(started_of "$pid")" = "$started" ]
 }
-write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
+write_down() { echo "$2 $(started_of "$2")" > "$1"; }
 stop_written_down() { still_runs "$1" && kill "$(read -r pid _ < "$1"; echo "$pid")" 2>/dev/null; return 0; }
 
 if [ "${1:-}" = stop ]; then

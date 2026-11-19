@@ -32,6 +32,8 @@ jobs:
         run: |
           python3 -I scripts/tests/proto-editor-window-test.py
           python3 -I scripts/tests/proto-editor-window-mac-test.py
+      - name: Test the Mac's window opener with the system's ps (stand-ins sleep; no window)
+        run: python3 -I scripts/tests/proto-editor-viewer-test.py
       - name: Build the screen probe
         if: runner.os == 'macOS'
         run: swift build --package-path macos/screen-probe
