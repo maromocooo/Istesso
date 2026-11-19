@@ -220,6 +220,7 @@ Air の窓のタイトルに「— Studio で確認が出ています」と出�
 |---|---|---|---|
 | 管理者のパスワード（`do shell script … with administrator privileges`） | `com.apple.SecurityAgent` | 1000 | 260×418 |
 | ファイルとフォルダ（デスクトップのフォルダ。こちらの開発用のアプリから） | `com.apple.UserNotificationCenter` | 8（モーダルのパネルの高さ） | 410×358 |
+| アクセシビリティ（「デバイスの制御とデータへのアクセス」。ほかの流れの試しのアプリ） | `com.apple.accessibility.universalAccessAuthWarn` | 0 | 461×181 |
 
-- 判定の下限のレイヤーは 8（見た 2 つの低いほう）。
+- 判定の下限のレイヤーは、出すものごとに決める：SecurityAgent と UserNotificationCenter は 8 以上、universalAccessAuthWarn は 0 以上（このプロセスは、確認のほかに窓を出さないので、0 でも取り違えない）。一覧のファイルで足したものは 8 以上。
 - ほかの確認（ペーストの許可、Gatekeeper の問いなど）は、見てから足す。足すときは、Studio の `~/.config/istesso/daily-mac-system-prompts.txt` に 1 行に 1 つ書けば、次の起動から使う（128 バイト以内の正しい ID を先頭から 16 件まで。形式や上限に合わない行は、標準エラーに知らせて読み飛ばす）。

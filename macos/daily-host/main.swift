@@ -48,10 +48,18 @@ enum Target {
 // The system's confirmations, as observed on the Mac Studio on 2026-11-19 (macOS 26 line,
 // --prompt-windows while the owner held each open): the administrator password dialog is a
 // window of com.apple.SecurityAgent at layer 1000; a Files-and-Folders privacy prompt is a
-// window of com.apple.UserNotificationCenter at layer 8 (the modal panel level). Others are
-// added only once seen.
-let systemPromptOwners: Set<String> = ["com.apple.SecurityAgent", "com.apple.UserNotificationCenter"]
-let systemPromptMinLayer = Int(CGWindowLevelForKey(.modalPanelWindow)) // 8: the lower of the two observed
+// window of com.apple.UserNotificationCenter at layer 8 (the modal panel level); the
+// Accessibility prompt is one of com.apple.accessibility.universalAccessAuthWarn at layer 0
+// (461x181; that process shows nothing else, so layer 0 is safe for it). Others are added only
+// once seen.
+let systemPromptMinLayers: [String: Int] = [
+    "com.apple.SecurityAgent": 8,
+    "com.apple.UserNotificationCenter": 8,
+    "com.apple.accessibility.universalAccessAuthWarn": 0,
+]
+let systemPromptOwners: Set<String> = Set(systemPromptMinLayers.keys)
+/// The lowest layer for an owner that is listed without one of its own (the owner's file).
+let systemPromptMinLayer = Int(CGWindowLevelForKey(.modalPanelWindow)) // 8
 
 func validSystemPromptOwner(_ owner: String) -> Bool {
     guard owner.utf8.count <= 128 else { return false }
@@ -980,11 +988,13 @@ func windowList(onScreenOnly: Bool = true, desktop: Bool = false) -> [WindowInfo
 /// answered by WindowServer, which waits for no application).
 func freshWindowList() { listCache = nil }
 
-func systemPromptCount(_ windows: [NSDictionary], owners: Set<String>, bundleID: (pid_t) -> String?) -> Int {
+func systemPromptCount(_ windows: [NSDictionary], owners: Set<String>,
+                       minLayer: (String) -> Int = { systemPromptMinLayers[$0] ?? systemPromptMinLayer },
+                       bundleID: (pid_t) -> String?) -> Int {
     windows.reduce(into: 0) { count, window in
-        guard let layer = window[kCGWindowLayer as String] as? Int, layer >= systemPromptMinLayer,
+        guard let layer = window[kCGWindowLayer as String] as? Int,
               let rawPID = window[kCGWindowOwnerPID as String] as? Int, let pid = pid_t(exactly: rawPID),
-              let owner = bundleID(pid), owners.contains(owner) else { return }
+              let owner = bundleID(pid), owners.contains(owner), layer >= minLayer(owner) else { return }
         count += 1
     }
 }
@@ -1595,6 +1605,12 @@ func selfTest() -> Never {
         checkPanel(systemPromptCount(windows, owners: [owner]) { ids[$0] } == 2, true,
                    "prompt: count windows with a listed owner at or above the threshold")
         checkPanel(systemPromptCount(windows, owners: []) { ids[$0] } == 0, true, "prompt: empty owner list")
+        // Per owner: the Accessibility prompt's process counts at layer 0, the others only from 8.
+        let access = "com.apple.accessibility.universalAccessAuthWarn", agent = "com.apple.SecurityAgent"
+        let shown: [NSDictionary] = [[pid: 4, layer: 0], [pid: 5, layer: 0], [pid: 5, layer: 1000]]
+        let who: [pid_t: String] = [4: access, 5: agent]
+        checkPanel(systemPromptCount(shown, owners: systemPromptOwners) { who[$0] } == 2, true,
+                   "prompt: the Accessibility prompt at layer 0 counts; SecurityAgent only at its own layer")
         var state = SystemPromptState()
         let samples: [Bool?] = [false, true, false, true, nil, true, true, true, false, true, false, false, false]
         let expected: [Bool?] = [nil, nil, nil, nil, nil, nil, true, nil, nil, nil, nil, false, nil]
