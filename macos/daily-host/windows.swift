@@ -53,16 +53,16 @@ func samePlace(_ a: CGRect, _ b: CGRect) -> Bool {
 }
 
 /// The windows that are never another window to stream: every window the application has when its
-/// first window is first shown, and every one that comes within the next 1.5 s (windows restored
-/// at launch, an application's own windows of its start). Recorded with --windows only, in every
-/// form (a document, a new window, the application as it is). Until it is recorded, nothing is
-/// another window.
+/// first window is first shown and it has finished launching, and every one that comes within the
+/// next 1.5 s (windows restored at launch, an application's own windows of its start). Recorded
+/// with --windows only, in every form (a document, a new window, the application as it is). Until
+/// it is recorded, nothing is another window.
 struct WindowBaseline {
     private(set) var known: Set<CGWindowID>?
     private var until: TimeInterval = 0
     static let grace: TimeInterval = 1.5
     /// A look at the application: `all` its windows now, `firstShown` whether its first window is
-    /// chosen, `now` uptime.
+    /// chosen and it has finished launching, `now` uptime.
     mutating func look(all: [CGWindowID], firstShown: Bool, now: TimeInterval) {
         guard firstShown else { return }
         if known == nil {

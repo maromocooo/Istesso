@@ -3212,9 +3212,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let chosen = shown.first { $0.id == windowId } ?? shown.max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
         guard let chosen else { return }
         if settings.windows {
-            // The windows that are never another window to stream (windows.swift, WindowBaseline).
+            // The windows that are never another window to stream (windows.swift, WindowBaseline):
+            // recorded once the application has finished launching (a cold start restores its
+            // windows meanwhile), from then on with its 1.5 s of grace.
             let every = windowList(onScreenOnly: false).filter { $0.pid == app.processIdentifier }.map(\.id)
-            extras.baseline.look(all: every, firstShown: true, now: ProcessInfo.processInfo.systemUptime)
+            extras.baseline.look(all: every, firstShown: app.isFinishedLaunching, now: ProcessInfo.processInfo.systemUptime)
         }
         if transport == nil {
             let density = densityAt(chosen.bounds)
