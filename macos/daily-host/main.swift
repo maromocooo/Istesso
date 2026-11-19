@@ -2256,12 +2256,17 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// (Accessibility); the answer is a new stream of the size taken, also when nothing changed.
     func resizeAsked(width: Int, height: Int) {
         guard settings.size == nil, let pid = app?.processIdentifier, windowBounds != .zero, !restarting else { return }
-        let density = pixelsPerPoint(CGMainDisplayID())
+        // The request is in picture pixels; the window is sized in points of the display it is on
+        // (2 pixels a point on the virtual display), and kept inside that display's visible area.
         let bounds = windowBounds
-        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: bounds.midX, y: NSScreen.screens[0].frame.maxY - bounds.midY)) } ?? NSScreen.main
-        let room = screen?.visibleFrame.size ?? CGSize(width: 8192, height: 8192)
+        let density = densityAt(bounds)
+        let mainTop = NSScreen.screens.first?.frame.maxY ?? 0
+        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: bounds.midX, y: mainTop - bounds.midY)) } ?? NSScreen.main
+        let visible = screen.map { CGRect(x: $0.visibleFrame.minX, y: mainTop - $0.visibleFrame.maxY, width: $0.visibleFrame.width, height: $0.visibleFrame.height) }
+            ?? CGRect(x: 0, y: 0, width: 8192, height: 8192)
         var target = CGSize(width: Double(width) / density, height: Double(height) / density)
-        target.width = min(target.width, room.width); target.height = min(target.height, room.height)
+        target.width = min(target.width, visible.maxX - bounds.minX); target.height = min(target.height, visible.maxY - bounds.minY)
+        let restartsBefore = restarts
         lookout.act {
             let element = AXUIElementCreateApplication(pid)
             var value: CFTypeRef?
@@ -2284,8 +2289,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 // The answer: a stream of the size the window has now (the look that follows the
                 // window would also notice a change; this answers when nothing changed as well).
                 guard let self, let now = windowList(onScreenOnly: true).first(where: { $0.id == self.windowId }) else { return }
-                let w = max(64, min(3840, Int(now.bounds.width * density)) & ~1), h = max(64, min(2160, Int(now.bounds.height * density)) & ~1)
-                if !self.restarting { self.restartStream(width: w, height: h, windowSize: now.bounds.size) }
+                // The answer in pixels of the display the window is on now.
+                let taken = densityAt(now.bounds)
+                let w = max(64, min(3840, Int(now.bounds.width * taken)) & ~1), h = max(64, min(2160, Int(now.bounds.height * taken)) & ~1)
+                // One answer only: when the window's own change already made a new stream, that is it.
+                if !self.restarting && self.restarts == restartsBefore { self.restartStream(width: w, height: h, windowSize: now.bounds.size) }
             }
         }
     }
@@ -3046,8 +3054,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
 
     /// Stops the picture, gives the encoder back, ends the stream, and starts one of the new size on
     /// the same port; the picture comes back as it was (running or not).
+    var restarts = 0
     func restartStream(width w: Int, height h: Int, windowSize: CGSize) {
         restarting = true
+        restarts += 1
         let old = transport!
         let oldPump = pump!
         for timer in pumpTimers { timer.cancel() }
