@@ -1004,6 +1004,34 @@ static size_t split_access_unit(const uint8_t *data, size_t size, NalUnit *units
     return count;
 }
 
+// The everyday trial (ISTESSO_DAILY_RECONNECT): when the host starts its stream again at another
+// size (the Mac host does when the application's window is resized), the window follows: the same
+// points for each of the host's pixels as before (square pixels, as the host sends its window 1:1),
+// its top left where it was, and all of it on its screen (made smaller as a whole if needed).
+static NSWindow *picture_window = nil;
+static BOOL picture_whole_display = NO;
+
+static void window_follows_picture(int width, int height, int was_width) {
+    if (picture_window == nil || picture_whole_display || width <= 0 || height <= 0) {
+        return;
+    }
+    NSRect frame = picture_window.frame;
+    NSRect content = [picture_window contentRectForFrameRect:frame];
+    CGFloat each = was_width > 0 ? content.size.width / was_width : 1.0;
+    CGFloat bar = frame.size.height - content.size.height;
+    NSRect room = (picture_window.screen ?: NSScreen.mainScreen).visibleFrame;
+    CGFloat fit = MIN(1.0, MIN(room.size.width / (width * each), (room.size.height - bar) / (height * each)));
+    NSSize size = NSMakeSize(floor(width * each * fit), floor(height * each * fit));
+    NSPoint top_left = NSMakePoint(NSMinX(frame), NSMaxY(frame));
+    [picture_window setContentSize:size];
+    NSRect now = picture_window.frame;
+    top_left.x = MAX(NSMinX(room), MIN(top_left.x, NSMaxX(room) - now.size.width));
+    top_left.y = MIN(NSMaxY(room), MAX(top_left.y, NSMinY(room) + now.size.height));
+    [picture_window setFrameTopLeftPoint:top_left];
+    fprintf(stderr, "window: %.0fx%.0f points for a picture of %dx%d (top left %.0f,%.0f)\n", size.width, size.height, width, height,
+            top_left.x, top_left.y);
+}
+
 // Sets VideoToolbox up for a stream with these parameter sets, unless it is set up for them already.
 static gboolean channel_configure(const NalUnit *sets[3]) {
     gboolean same = vt_session != NULL;
@@ -1038,8 +1066,17 @@ static gboolean channel_configure(const NalUnit *sets[3]) {
         return FALSE;
     }
     CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(vt_format);
+    int was_width = picture_width, was_height = picture_height;
     picture_width = size.width;
     picture_height = size.height;
+    // A new decoder for the new parameter sets is made below; the window follows a new size.
+    if (daily_reconnect && was_width > 0 && (was_width != size.width || was_height != size.height)) {
+        int width = size.width, height = size.height;
+        fprintf(stderr, "note: the host's picture is %dx%d now (it was %dx%d)\n", width, height, was_width, was_height);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            window_follows_picture(width, height, was_width);
+        });
+    }
     vt_srgb = channel_info.colour == 1;
     return vt_start_session(channel_info.chroma == 444, vt_srgb ? "srgb" : "-");
 }
@@ -2099,6 +2136,8 @@ int main(int argc, char *argv[]) {
         }
         NSView *view = [[viewClass alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         window.contentView = view;
+        picture_window = window;
+        picture_whole_display = whole_display;
         if (input_socket >= 0) {
             [window makeFirstResponder:view];
         }
