@@ -102,6 +102,13 @@
 #                       high (the default) is 4791N to 4794N, inside Linux's range for the ports
 #                       of outgoing connections (32768-60999), where another program's outgoing
 #                       connection can now and then hold one; low is 2791N to 2794N, below it
+#   DAILY_TITLE_COUNTS=1  the window's title always shows how often its connections were cut (for
+#                       checks); otherwise only the application's name, and a line while a
+#                       connection is being made again
+#   DAILY_PREEDIT=strip the window shows composing text in its own strip, not inside the
+#                       application (ISTESSO_PREEDIT=strip is taken too)
+#   DAILY_OUTSIDE_FIELD=ime  keys outside a text field go through this Mac's input method, as
+#                       before 2026-11-19 (ISTESSO_OUTSIDE_FIELD=ime is taken too)
 #   DAILY_CLIPBOARD=0   the window does not take Command-C, X and V for copy and paste with this
 #                       Mac: they go to the application as Control-C, X and V (copies inside the
 #                       host only). For a window opened now; the default is copy and paste on
@@ -622,6 +629,9 @@ do_bundle() {
             echo "the bundle that was there was moved aside (into $state/bundle-build)"
         fi
         mv "$staged" "$bundle" || exit 1
+        # Spotlight, and Alfred through it, list the application at once (a folder that became an
+        # application by a rename was left out, 2026-11-19). Not for a rehearsal's own place.
+        [ -z "${DAILY_BUNDLE_PLACE:-}" ] && { /usr/bin/mdimport "$bundle" > /dev/null 2>&1 || true; }
         echo "the viewer's bundle is now an application: $bundle (not started)"
         echo "the next \`scripts/daily.sh open NAME\` starts its window through it; the first start asks whether it may use the local network"
         return 0
@@ -1224,10 +1234,27 @@ remember_settings() { # FOLDER
     # that the guard has to start again is started without them, as a person may be typing by then.
     local setting
     for setting in DAILY_NO_WINDOW DAILY_FRAME_LOGS DAILY_MAC_CONFIG DAILY_HOST_CONFIG DAILY_BLENDER_CONFIG \
-        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY DAILY_CLIPBOARD DAILY_PORTS; do
+        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY DAILY_CLIPBOARD DAILY_PORTS DAILY_TITLE_COUNTS \
+        DAILY_PREEDIT DAILY_OUTSIDE_FIELD ISTESSO_PREEDIT ISTESSO_OUTSIDE_FIELD; do
         eval "echo \"export $setting=\$(quoted \"\${$setting:-}\")\""
     done > "$1/settings"
     echo "export SIZE=$(quoted "$size") LAYOUT=$(quoted "$layout")" >> "$1/settings"
+}
+
+# The person's switches for a window, as the viewer's own settings, one a line. A window started
+# through the bundle (`open`) gets only what is given here, never this shell's environment: a
+# switch that is to reach it has to be here.
+viewer_switches() {
+    echo "ISTESSO_CLIPBOARD=$([ "${DAILY_CLIPBOARD:-1}" = 0 ] && echo 0 || echo 1)"
+    echo "ISTESSO_TITLE_COUNTS=$([ "${DAILY_TITLE_COUNTS:-}" = 1 ] && echo 1 || echo 0)"
+    [ "${DAILY_DOCK_TILE:-}" = none ] && echo "ISTESSO_DOCK_TILE=none"
+    [ -n "${ISTESSO_COMMAND_KEY:-}" ] && echo "ISTESSO_COMMAND_KEY=$ISTESSO_COMMAND_KEY"
+    [ -n "${DAILY_NO_WINDOW:-}" ] && echo "ISTESSO_NO_WINDOW=1"
+    # Composing text in the strip of the window instead of inside the application, and keys
+    # outside a field through this Mac's input method as before (the Friday script's way back).
+    [ "${DAILY_PREEDIT:-${ISTESSO_PREEDIT:-}}" = strip ] && echo "ISTESSO_PREEDIT=strip"
+    [ "${DAILY_OUTSIDE_FIELD:-${ISTESSO_OUTSIDE_FIELD:-}}" = ime ] && echo "ISTESSO_OUTSIDE_FIELD=ime"
+    return 0
 }
 
 do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
@@ -1299,12 +1326,11 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         if [ -n "${POSITION:-}" ]; then x=${POSITION%,*}; y=${POSITION#*,}; else x=$((60 + 48 * n)); y=$((60 + 36 * n)); fi
         [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="$mine/frames-$(date +%s).jsonl"
         local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((port_base + 10 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1
-            ISTESSO_CLIPBOARD="$([ "${DAILY_CLIPBOARD:-1}" = 0 ] && echo 0 || echo 1)" ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
+            ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
+        local switch
+        while IFS= read -r switch; do settings+=("$switch"); done < <(viewer_switches)
         # The title the window has; the guard changes it while a window of the application is calling.
         printf '%s\n\n' "$(app_title "$name")" > "$mine/title"
-        [ "${DAILY_DOCK_TILE:-}" = none ] && settings+=(ISTESSO_DOCK_TILE=none)
-        [ -n "${ISTESSO_COMMAND_KEY:-}" ] && settings+=(ISTESSO_COMMAND_KEY="$ISTESSO_COMMAND_KEY")
-        [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
         local arguments=("$x" "$y" "$width" "$height" "$(app_title "$name")" - "$frames" 0 "$mine/in.sock")
         : > "$mine/viewer.number"; : > "$mine/viewer.log"; : > "$mine/viewer.pid"
         if [ -d "$bundle" ] && [ -z "${DAILY_NO_WINDOW:-}" ]; then
@@ -1620,6 +1646,7 @@ case "${1:-start}" in
 -h | --help) sed -n '2,/^# Made to be typed/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
 setup) shift; split_host "$@"; my_turn "setup --host $host_choice"; if [ "$host_choice" = mac ]; then refuse_when_busy; on_mac setup; else do_setup; fi ;;
 bundle) my_turn bundle; do_bundle "${2:-}" ;;
+viewer-switches) viewer_switches ;;
 ports)
     case "${2:-}" in
     "") echo "the trial's windows use the ${port_choice:-high} ports on the host (picture and input from $((port_base + 11)) and $((port_base + 21)); for AURA from $((port_base + 31)) and $((port_base + 41)))" ;;

@@ -13,7 +13,7 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SWITCHES = ("DAILY_OWNER", "DAILY_CLIPBOARD", "DAILY_OPEN_HANDLER")
+SWITCHES = ("DAILY_OWNER", "DAILY_CLIPBOARD", "DAILY_OPEN_HANDLER", "DAILY_STREAM")
 
 
 def signal_busy():
@@ -62,12 +62,19 @@ class PassesToTheMacHost(unittest.TestCase):
         words, seen = self.run_daily("open", "dia", "--host", "mac",
                                      DAILY_OWNER="1", DAILY_CLIPBOARD="1", DAILY_OPEN_HANDLER="1")
         self.assertEqual(words, ["open", "dia"])
-        self.assertEqual(seen, {"DAILY_OWNER": "1", "DAILY_CLIPBOARD": "1", "DAILY_OPEN_HANDLER": "1", "fd9": "no"})
+        self.assertEqual(seen, {"DAILY_OWNER": "1", "DAILY_CLIPBOARD": "1", "DAILY_OPEN_HANDLER": "1",
+                                "DAILY_STREAM": "(unset)", "fd9": "no"})
+
+    def test_a_streams_test_open_says_its_name(self):
+        words, seen = self.run_daily("open", "TextEdit", "--host", "mac", DAILY_STREAM="m4-daily", DAILY_CLIPBOARD="0")
+        self.assertEqual(words, ["open", "TextEdit"])
+        self.assertEqual((seen["DAILY_STREAM"], seen["DAILY_CLIPBOARD"], seen["DAILY_OWNER"]), ("m4-daily", "0", "(unset)"))
 
     def test_switches_not_given_are_not_made_up(self):
         words, seen = self.run_daily("open", "TextEdit", "--host", "mac", "--for", "aura")
         self.assertEqual(words, ["open", "TextEdit", "--for", "aura"])
-        self.assertEqual(seen, {"DAILY_OWNER": "(unset)", "DAILY_CLIPBOARD": "(unset)", "DAILY_OPEN_HANDLER": "(unset)", "fd9": "no"})
+        self.assertEqual(seen, {"DAILY_OWNER": "(unset)", "DAILY_CLIPBOARD": "(unset)", "DAILY_OPEN_HANDLER": "(unset)",
+                                "DAILY_STREAM": "(unset)", "fd9": "no"})
 
     def test_values_go_as_they_are(self):
         _, seen = self.run_daily("open", "dia", "--host", "mac", DAILY_OWNER="0", DAILY_CLIPBOARD="0")

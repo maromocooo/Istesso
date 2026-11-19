@@ -227,21 +227,25 @@ def install(stage, dest, rows, host):
     for title in names | wanted:
         check_owned(dest, title, names)
     # Prepare all icons and signatures before publishing the first app. Use the destination
-    # filesystem for the renames; the checkout can live on a different volume.
-    with tempfile.TemporaryDirectory(dir=dest) as tmp:
+    # filesystem for the renames; the checkout can live on a different volume. The copies are
+    # applications by name from the moment they exist (".app"), in a hidden folder that Spotlight
+    # does not look into: Spotlight first meets each one at its final place, as an application,
+    # and is asked to import it there (spotlight_import). A folder that became an application only
+    # by a rename was left out of Spotlight and Alfred (2026-11-19).
+    with tempfile.TemporaryDirectory(dir=dest, prefix=".pending-") as tmp:
         pending = Path(tmp)
         for title in wanted:
-            shutil.copytree(stage / (title + ".staged"), pending / (title + ".staged"))
+            shutil.copytree(stage / (title + ".staged"), pending / (title + ".app"))
         for os_name, app, title in rows:
             check_measurement()
             if os_name == "ubuntu":
-                with tempfile.TemporaryDirectory(dir=pending) as icons:
-                    add_icon(pending / (title + ".staged"), app, host, Path(icons))
+                with tempfile.TemporaryDirectory(dir=pending, prefix=".icons-") as icons:
+                    add_icon(pending / (title + ".app"), app, host, Path(icons))
         tool = stage / "bundle-tool"
         for title in [HANDLER] + sorted(wanted - {HANDLER}):
             check_measurement()
             bundle = dest / (title + ".app")
-            new = pending / (title + ".staged")
+            new = pending / (title + ".app")
             if title not in names:
                 names.add(title)
                 save_names(dest, names)
@@ -252,7 +256,18 @@ def install(stage, dest, rows, host):
             else:
                 new.rename(bundle)
             subprocess.run([tool, "register", bundle], check=True)
+            spotlight_import(bundle)
         remove(dest, names, names - wanted)
+
+
+def spotlight_import(bundle):
+    """Asks Spotlight to import the application at its place now (mdimport, the person's own
+    index): Spotlight, and Alfred, which finds applications through it, then list it. A failure
+    only means it is found later, or by its name in Finder."""
+    try:
+        subprocess.run(["/usr/bin/mdimport", bundle], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        print(f"Spotlight was not asked to import {bundle.name}; it may be found later.")
 
 
 @contextmanager
