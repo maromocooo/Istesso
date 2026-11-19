@@ -423,7 +423,8 @@ final class Session {
                 for m in read(until: nil, timeout: 0.1) {
                     if m["op"] as? String == "active" {
                         let was = inline
-                        inline = ours && (m["client"] as? String) == "com.apple.TextEdit" && (m["ok"] as? Bool) == true
+                        // "active" comes only about the relayed application.
+                        inline = ours && (m["ok"] as? Bool) == true
                         if inline != was { say(inline ? "active in TextEdit: inline" : "active elsewhere: strip") }
                     }
                     if m["op"] as? String == "inactive", inline { inline = false; say("inactive: strip") }
@@ -437,6 +438,8 @@ final class Session {
             guard let again = acceptInputMethod(listener, timeout: 5) else { print("drop: not back in 5 s"); return }
             fd = again
             reader = Wire.LineReader()
+            let app = ProcessInfo.processInfo.environment["ISTESSO_IME_APP"] ?? "com.apple.TextEdit"
+            print("hello again: \((ask(["op": "hello", "app": app])?["ok"] as? Bool) == true)")
             _ = read(until: nil, timeout: 1.0)
         default:
             guard var message = command(line) else { print("not a command"); return }
@@ -503,7 +506,11 @@ func serve(script: String?, selectFirst: Bool = false) {
     print("waiting for Istesso Dev Input (it connects once a second while it runs)")
     guard let fd = acceptInputMethod(listener, timeout: 60) else { fail("Istesso Dev Input did not connect in 60 s") }
     let session = Session(listener: listener, fd: fd)
-    _ = session.read(until: nil, timeout: 1.5)
+    _ = session.read(until: nil, timeout: 0.5)
+    // The relayed application first: the input source acts only while its field is active.
+    let app = ProcessInfo.processInfo.environment["ISTESSO_IME_APP"] ?? "com.apple.TextEdit"
+    print("hello: \((session.ask(["op": "hello", "app": app])?["ok"] as? Bool) == true)")
+    _ = session.read(until: nil, timeout: 1.0)
     let lines: [String]
     if let script {
         guard let text = try? String(contentsOfFile: script, encoding: .utf8) else { fail("script not read") }

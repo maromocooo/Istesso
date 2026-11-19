@@ -13,8 +13,15 @@ import CryptoKit
 
 enum Wire {
     static let inputMethodIdentifier = "com.maromoco.istesso-dev.inputmethod.trial"
-    /// The programs the input method takes text from.
+    /// The programs the input method takes text from. The probe takes commands on its standard
+    /// input, so it is accepted only by a --trial-check build, never by one that is left installed.
+    #if ISTESSO_TRIAL_CHECK
     static let hostIdentifiers = ["com.maromoco.istesso-dev.ime-probe", "com.maromoco.istesso-dev.daily-host"]
+    #else
+    static let hostIdentifiers = ["com.maromoco.istesso-dev.daily-host"]
+    #endif
+    /// One socket per host slot (the Mac host's sessions 1-3), each with its own relayed app.
+    static let slots = [1, 2, 3]
     static let maxLine = 8192
     /// The same limits as committed text on the control channel (ADR 0007).
     static let maxCharacters = 256
@@ -27,9 +34,14 @@ enum Wire {
         return String(cString: buffer)
     }
 
+    static func socketPath(slot: Int) -> String? {
+        guard slots.contains(slot), let base = userTemporaryFolder() else { return nil }
+        return (base as NSString).appendingPathComponent("istesso-dev-input/slot-\(slot)")
+    }
+
+    /// The probe's slot: ISTESSO_IME_SLOT, or 1.
     static func defaultSocketPath() -> String? {
-        guard let base = userTemporaryFolder() else { return nil }
-        return (base as NSString).appendingPathComponent("istesso-dev-input/socket")
+        socketPath(slot: Int(ProcessInfo.processInfo.environment["ISTESSO_IME_SLOT"] ?? "") ?? 1)
     }
 
     /// Text that may be shown or committed: not empty unless allowed, within the limits, no

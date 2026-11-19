@@ -47,150 +47,205 @@ enum Commands {
     struct Refusal: Error { let field: String; init(_ field: String) { self.field = field } }
 }
 
-/// The connection to the host, and which controller shows which composition.
+/// A composition shown in a session, and the slot of the host it belongs to.
+struct Shown { let mark: Commands.Mark; let slot: Int }
+
+/// One host's connection: one slot (1-3), one relayed application.
 ///
-/// Each controller (one per text session of a client) keeps its own composition. A composition
-/// ends exactly once: committed by the host, committed by the application (a click elsewhere, the
-/// focus moving), or cleared (the host gone). Its serial is then remembered, so that a commit or a
-/// mark that crossed the end on the wire is dropped instead of landing a second time.
+/// The host names the application it relays ("hello") before anything else. From then on its
+/// mark, commit, clear and caret act only while THAT application's field is active, and it hears
+/// "active" / "inactive" only about that application. No other application's identifier is ever
+/// sent or logged.
+final class HostConnection {
+    let slot: Int
+    let fd: Int32
+    var source: DispatchSourceRead?
+    var reader = Wire.LineReader()
+    var app: String?
+    /// Compositions of this host that have ended (serials are the host's own).
+    var ended: [Int] = []
+    var toldActive = false
+
+    init(slot: Int, fd: Int32) { self.slot = slot; self.fd = fd }
+
+    func end(_ serial: Int) {
+        ended.append(serial)
+        if ended.count > 64 { ended.removeFirst(ended.count - 64) }
+    }
+}
+
+/// The connections to the hosts, and which controller shows which composition.
+///
+/// Each controller (one per text session of a client) keeps its own composition, owned by the slot
+/// that sent it. A composition ends exactly once: committed by the host, committed by the
+/// application (a click elsewhere, the focus moving), or cleared (the host gone). Its serial is then
+/// remembered, so that a commit or a mark that crossed the end on the wire is dropped instead of
+/// landing a second time.
 final class Link {
     static let shared = Link()
     weak var active: IstessoDevInputController?
     /// The controller showing a composition now (it may no longer be the active one).
     weak var showing: IstessoDevInputController?
-    private var ended: [Int] = []
-    private var fd: Int32 = -1
-    private var source: DispatchSourceRead?
-    private var reader = Wire.LineReader()
+    private var hosts: [Int: HostConnection] = [:]
     private var timer: Timer?
     private let nowhere = NSRange(location: NSNotFound, length: NSNotFound)
 
     func start() {
         tryConnect()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self, self.fd < 0 else { return }
-            self.tryConnect()
-        }
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.tryConnect() }
     }
 
     private func tryConnect() {
-        guard let path = Wire.defaultSocketPath(), let fd = Wire.connect(path) else { return }
-        switch Wire.checkPeer(fd, identifiers: Wire.hostIdentifiers) {
-        case .refused(let why):
-            log.error("host refused: \(why, privacy: .public)")
-            close(fd)
-            return
-        case .ok(let identifier):
-            log.info("connected to \(identifier, privacy: .public)")
+        for slot in Wire.slots where hosts[slot] == nil {
+            guard let path = Wire.socketPath(slot: slot), let fd = Wire.connect(path) else { continue }
+            switch Wire.checkPeer(fd, identifiers: Wire.hostIdentifiers) {
+            case .refused(let why):
+                log.error("slot \(slot): host refused: \(why, privacy: .public)")
+                close(fd)
+                continue
+            case .ok:
+                log.info("slot \(slot): connected")
+            }
+            let host = HostConnection(slot: slot, fd: fd)
+            let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+            source.setEventHandler { [weak self, weak host] in if let host { self?.readable(host) } }
+            source.setCancelHandler { close(fd) }
+            source.resume()
+            host.source = source
+            hosts[slot] = host
         }
-        self.fd = fd
-        reader = Wire.LineReader()
-        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
-        source.setEventHandler { [weak self] in self?.readable() }
-        source.setCancelHandler { close(fd) }
-        source.resume()
-        self.source = source
-        if let active { send(active.activeMessage()) }
     }
 
-    private func end(_ serial: Int) {
-        ended.append(serial)
-        if ended.count > 64 { ended.removeFirst(ended.count - 64) }
-    }
-
-    /// The host went away (the viewer disconnected, the host stopped): what is composing is
+    /// The host went away (the viewer disconnected, the host stopped): what it was composing is
     /// cleared, never committed and never left behind in the application.
-    private func disconnect() {
-        if let controller = showing, let shown = controller.shown {
+    private func disconnect(_ host: HostConnection) {
+        if let controller = showing, let shown = controller.shown, shown.slot == host.slot {
             controller.client()?.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
             controller.shown = nil
-            end(shown.serial)
-            log.info("host gone: composing text cleared")
+            showing = nil
+            log.info("slot \(host.slot): host gone, composing text cleared")
         }
-        showing = nil
-        source?.cancel()
-        source = nil
-        fd = -1
+        host.source?.cancel()
+        host.source = nil
+        hosts[host.slot] = nil
     }
 
-    private func readable() {
+    private func readable(_ host: HostConnection) {
         var buffer = [UInt8](repeating: 0, count: 4096)
-        let n = read(fd, &buffer, buffer.count)
-        if n <= 0 { log.info("host closed"); disconnect(); return }
-        guard let messages = reader.feed(Data(buffer[0..<n])) else { log.error("line too long"); disconnect(); return }
-        for message in messages { handle(message) }
+        let n = read(host.fd, &buffer, buffer.count)
+        if n <= 0 { log.info("slot \(host.slot): host closed"); disconnect(host); return }
+        guard let messages = host.reader.feed(Data(buffer[0..<n])) else { log.error("line too long"); disconnect(host); return }
+        for message in messages { handle(message, from: host) }
     }
 
-    func send(_ object: [String: Any], seq: Any? = nil) {
+    func send(_ object: [String: Any], to host: HostConnection, seq: Any? = nil) {
         var object = object
         if let seq = seq as? Int { object["seq"] = seq }
-        guard fd >= 0, let data = Wire.encode(object) else { return }
-        if !Wire.writeAll(fd, data) { disconnect() }
+        guard host.source != nil, let data = Wire.encode(object) else { return }
+        if !Wire.writeAll(host.fd, data) { disconnect(host) }
     }
 
-    private func handle(_ message: [String: Any]) {
+    /// Tells each host whether ITS application's field is the active one now ("active" with the
+    /// caret) or not ("inactive", once).
+    func announce() {
+        for host in hosts.values {
+            guard let app = host.app else { continue }
+            if let controller = active, controller.clientIdentifier == app, let client = controller.client() {
+                var message = caret(client, controller)
+                message["op"] = "active"
+                send(message, to: host)
+                host.toldActive = true
+            } else if host.toldActive {
+                send(["op": "inactive"], to: host)
+                host.toldActive = false
+            }
+        }
+    }
+
+    private func handle(_ message: [String: Any], from host: HostConnection) {
         let op = message["op"] as? String ?? ""
         let seq = message["seq"]
-        guard let controller = active, let client = controller.client() else {
-            send(["op": op, "ok": false, "why": "no active client"], seq: seq)
+        if op == "hello" {
+            // The relayed application, once per connection, and not one another slot relays.
+            guard host.app == nil, let app = message["app"] as? String, !app.isEmpty, app.count <= 255,
+                  !hosts.values.contains(where: { $0 !== host && $0.app == app }) else {
+                send(["op": "hello", "ok": false], to: host, seq: seq)
+                return
+            }
+            host.app = app
+            send(["op": "hello", "ok": true, "slot": host.slot], to: host, seq: seq)
+            announce()
+            return
+        }
+        guard let app = host.app else {
+            send(["op": op, "ok": false, "why": "no hello"], to: host, seq: seq)
+            return
+        }
+        guard let controller = active, controller.clientIdentifier == app, let client = controller.client() else {
+            send(["op": op, "ok": false, "why": "relayed app not active"], to: host, seq: seq)
             return
         }
         switch op {
         case "mark":
-            // A password field (secure event input on): never show composing text there. The host
-            // tells the client, which then sends plain keys without its input method.
+            // Secure event input is on (some application, not necessarily this field, holds it):
+            // no composing text; the host uses the strip. Whether the field is a password field
+            // is the host's to read through Accessibility.
             if IsSecureEventInputEnabled() {
-                send(["op": "mark", "ok": false, "why": "secure", "secure": true], seq: seq)
+                send(["op": "mark", "ok": false, "why": "secure-input"], to: host, seq: seq)
                 return
             }
             switch Commands.mark(message) {
-            case .failure(let refusal): send(["op": "mark", "ok": false, "why": refusal.field], seq: seq)
+            case .failure(let refusal): send(["op": "mark", "ok": false, "why": refusal.field], to: host, seq: seq)
             case .success(let mark):
-                if ended.contains(mark.serial) {
-                    send(["op": "mark", "ok": false, "why": "stale", "comp": mark.serial], seq: seq)
+                if host.ended.contains(mark.serial) {
+                    send(["op": "mark", "ok": false, "why": "stale", "comp": mark.serial], to: host, seq: seq)
                     return
                 }
-                // A composition still shown in another session (its deactivation not come yet)
-                // ends there first, so that it lands in its own application.
-                if let other = showing, other !== controller { applicationEnded(other) }
+                // A composition still shown in another session (its deactivation not come yet), or
+                // another host's, ends there first, so that it lands in its own application.
+                if let other = showing, other !== controller || other.shown?.slot != host.slot { applicationEnded(other) }
                 if mark.text.isEmpty {
                     client.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
                     controller.shown = nil
                     showing = nil
                 } else {
                     client.setMarkedText(controller.styled(mark), selectionRange: mark.selection, replacementRange: nowhere)
-                    controller.shown = mark
+                    controller.shown = Shown(mark: mark, slot: host.slot)
                     showing = controller
                 }
                 log.info("mark: \(mark.text.utf16.count) units")
-                send(caret(client, controller), seq: seq)
+                var answer = caret(client, controller)
+                answer["op"] = "mark"
+                answer["comp"] = mark.serial
+                send(answer, to: host, seq: seq)
             }
         case "commit":
             switch Commands.commit(message) {
-            case .failure(let refusal): send(["op": "commit", "ok": false, "why": refusal.field], seq: seq)
+            case .failure(let refusal): send(["op": "commit", "ok": false, "why": refusal.field], to: host, seq: seq)
             case .success(let commit):
                 // Ended already (committed by the application, or cleared): it landed or was
-                // dropped once; never again.
-                if ended.contains(commit.serial) {
-                    send(["op": "commit", "ok": false, "why": "stale", "comp": commit.serial], seq: seq)
+                // dropped once; never again. The host does NOT deliver a stale commit elsewhere.
+                if host.ended.contains(commit.serial) {
+                    send(["op": "commit", "ok": false, "why": "stale", "comp": commit.serial], to: host, seq: seq)
                     return
                 }
-                // Where the composition is shown (the session it was typed into), or else where the
-                // caret is now (a commit with no composition before it).
-                let target = (showing?.shown?.serial == commit.serial ? showing : nil) ?? controller
-                guard let targetClient = target.client() else {
-                    send(["op": "commit", "ok": false, "why": "no client"], seq: seq)
+                // Where this host's composition is shown, or else where the caret is now (a commit
+                // with no composition before it).
+                let mine = showing?.shown.map { $0.slot == host.slot && $0.mark.serial == commit.serial } ?? false
+                let target = mine ? showing! : controller
+                guard let targetClient = target.client(), target.clientIdentifier == app else {
+                    send(["op": "commit", "ok": false, "why": "no client"], to: host, seq: seq)
                     return
                 }
-                if let shown = target.shown, shown.serial != commit.serial {
-                    send(["op": "commit", "ok": false, "why": "other composition", "comp": commit.serial], seq: seq)
+                if let shown = target.shown, !(shown.slot == host.slot && shown.mark.serial == commit.serial) {
+                    send(["op": "commit", "ok": false, "why": "other composition", "comp": commit.serial], to: host, seq: seq)
                     return
                 }
                 let at = target.shown != nil ? targetClient.markedRange().location : targetClient.selectedRange().location
                 targetClient.insertText(IstessoDevInputController.japanese(commit.text), replacementRange: nowhere)
                 target.shown = nil
                 if showing === target { showing = nil }
-                end(commit.serial)
+                host.end(commit.serial)
                 log.info("commit: \(commit.text.utf16.count) units")
                 // "inserted": the answer is made after a call that returns a value from the client
                 // (caret() asks for its ranges), which the client answers only after the insert
@@ -205,22 +260,24 @@ final class Link {
                 #else
                 _ = at
                 #endif
-                send(answer, seq: seq)
+                send(answer, to: host, seq: seq)
             }
         case "clear":
-            if let shown = controller.shown { end(shown.serial) }
-            client.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
-            controller.shown = nil
-            if showing === controller { showing = nil }
-            send(caret(client, controller), seq: seq)
+            if let shown = controller.shown, shown.slot == host.slot {
+                host.end(shown.mark.serial)
+                client.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
+                controller.shown = nil
+                if showing === controller { showing = nil }
+            }
+            send(caret(client, controller), to: host, seq: seq)
         case "caret":
-            send(caret(client, controller), seq: seq)
+            send(caret(client, controller), to: host, seq: seq)
         #if ISTESSO_TRIAL_CHECK
         case "check":
-            send(check(client), seq: seq)
+            send(check(client), to: host, seq: seq)
         #endif
         default:
-            send(["op": op, "ok": false, "why": "unknown"], seq: seq)
+            send(["op": op, "ok": false, "why": "unknown"], to: host, seq: seq)
         }
     }
 
@@ -247,16 +304,19 @@ final class Link {
     }
     #endif
 
-    /// The application ended the composition itself (a click elsewhere, another window): what was
-    /// shown is committed once into that same session, as an input method does, and the host is
-    /// told so that the client ends its own composition without committing it again.
+    /// The application ended the composition itself (a click elsewhere, another window, the source
+    /// switched back for local typing): what was shown is committed once into that same session, as
+    /// an input method does, and its host is told so that the client ends its own composition
+    /// without committing it again.
     func applicationEnded(_ controller: IstessoDevInputController) {
         guard let shown = controller.shown else { return }
         controller.shown = nil
         if showing === controller { showing = nil }
-        end(shown.serial)
-        controller.client()?.insertText(IstessoDevInputController.japanese(shown.text), replacementRange: nowhere)
-        send(["op": "ended", "by": "application", "comp": shown.serial])
+        controller.client()?.insertText(IstessoDevInputController.japanese(shown.mark.text), replacementRange: nowhere)
+        if let host = hosts[shown.slot] {
+            host.end(shown.mark.serial)
+            send(["op": "ended", "by": "application", "comp": shown.mark.serial], to: host)
+        }
     }
 
     /// The caret's rectangle in global points, AppKit's way round (origin at the bottom left of the
@@ -267,7 +327,7 @@ final class Link {
         var rect = NSRect.zero
         var via = "none"
         let markedRange = client.markedRange()
-        let selection = controller.shown?.selection ?? NSRange(location: 0, length: 0)
+        let selection = controller.shown?.mark.selection ?? NSRange(location: 0, length: 0)
         if markedRange.location != NSNotFound {
             var actual = NSRange(location: NSNotFound, length: 0)
             rect = client.firstRect(forCharacterRange: NSRange(location: markedRange.location + selection.location, length: selection.length),
@@ -282,8 +342,11 @@ final class Link {
             }
         }
         if rect == .zero {
+            // IMKInputSession.h: "The index is relative to the inline session ... if there is no
+            // inline session the value of index should be 0" -- so the position inside the
+            // composition (0 without one), not the document position.
             var line = NSRect.zero
-            _ = client.attributes(forCharacterIndex: selection.location, lineHeightRectangle: &line)
+            _ = client.attributes(forCharacterIndex: controller.shown == nil ? 0 : selection.location, lineHeightRectangle: &line)
             rect = line
             via = "line"
         }
@@ -295,7 +358,7 @@ final class Link {
             "top": primaryHeight - (rect.origin.y + rect.size.height),
             "scale": screen?.backingScaleFactor ?? 0,
             "marked_location": markedRange.location == NSNotFound ? -1 : markedRange.location,
-            "secure": IsSecureEventInputEnabled(),
+            "secure_input": IsSecureEventInputEnabled(),
         ]
     }
 }
@@ -303,19 +366,8 @@ final class Link {
 @objc(IstessoDevInputController)
 final class IstessoDevInputController: IMKInputController {
     var clientIdentifier: String { client()?.bundleIdentifier() ?? "?" }
-    /// The composition this session shows now.
-    var shown: Commands.Mark?
-
-    /// "active" with the client's application and where its caret is: the host goes inline only
-    /// when this names the application it shows and the caret lies inside the shown window.
-    func activeMessage() -> [String: Any] {
-        var message: [String: Any] = ["client": clientIdentifier]
-        if let client = client() {
-            for (key, value) in Link.shared.caret(client, self) where key != "op" { message[key] = value }
-        }
-        message["op"] = "active"
-        return message
-    }
+    /// The composition this session shows now, and the slot of the host that sent it.
+    var shown: Shown?
 
     /// No events: this Mac's own keys never come here.
     override func recognizedEvents(_ sender: Any!) -> Int { 0 }
@@ -327,15 +379,14 @@ final class IstessoDevInputController: IMKInputController {
         // A composition another session still shows ends there before this one takes over.
         if let other = Link.shared.showing, other !== self { Link.shared.applicationEnded(other) }
         Link.shared.active = self
-        log.info("active: \(self.clientIdentifier, privacy: .public)")
-        Link.shared.send(activeMessage())
+        Link.shared.announce()
     }
 
     override func deactivateServer(_ sender: Any!) {
         Link.shared.applicationEnded(self)
         if Link.shared.active === self {
             Link.shared.active = nil
-            Link.shared.send(["op": "inactive"])
+            Link.shared.announce()
         }
         super.deactivateServer(sender)
     }
