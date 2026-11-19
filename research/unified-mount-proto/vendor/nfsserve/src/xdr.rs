@@ -120,6 +120,10 @@ impl XDR for Vec<u8> {
     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
         let mut length: u32 = 0;
         length.deserialize(src)?;
+        // Istesso patch: nothing in one record can be longer than the record.
+        if length as usize > crate::rpcwire::MAX_RECORD {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "opaque too long"));
+        }
         self.resize(length as usize, 0);
         src.read_exact(self)?;
         // read padding
@@ -152,6 +156,10 @@ impl XDR for Vec<u32> {
     fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
         let mut length: u32 = 0;
         length.deserialize(src)?;
+        // Istesso patch: nothing in one record can be longer than the record.
+        if length as usize > crate::rpcwire::MAX_RECORD / 4 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "list too long"));
+        }
         self.resize(length as usize, 0);
         for i in self {
             i.deserialize(src)?;

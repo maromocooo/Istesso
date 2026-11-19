@@ -23,7 +23,12 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
+    /// Istesso patch: bounds the connections served at once.
+    connections: Arc<tokio::sync::Semaphore>,
 }
+
+/// Istesso patch: connections served at once. The operating system's client uses one.
+pub const MAX_CONNECTIONS: usize = 8;
 
 pub fn generate_host_ip(hostnum: u16) -> String {
     format!("127.88.{}.{}", ((hostnum >> 8) & 0xFF) as u8, (hostnum & 0xFF) as u8)
@@ -52,7 +57,11 @@ async fn process_socket(mut socket: tokio::net::TcpStream, context: RPCContext) 
                         return Ok(());
                     }
                     Ok(n) => {
-                        let _ = socksend.write_all(&buf[..n]).await;
+                        // Istesso patch: once the call reader has stopped (a record too
+                        // large, a broken call), end the connection instead of holding it.
+                        if socksend.write_all(&buf[..n]).await.is_err() {
+                            return Ok(());
+                        }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         continue;
@@ -159,6 +168,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         })
     }
 
@@ -196,9 +206,15 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
     async fn handle_forever(&self) -> io::Result<()> {
         loop {
             let (socket, _) = self.listener.accept().await?;
+            // Istesso patch: a connection beyond MAX_CONNECTIONS is closed at once.
+            let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                drop(socket);
+                continue;
+            };
             let context = RPCContext {
                 local_port: self.port,
-                client_addr: socket.peer_addr().unwrap().to_string(),
+                // Istesso patch: a client that is already gone must not end the accept loop.
+                client_addr: socket.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
                 auth: crate::rpc::auth_unix::default(),
                 vfs: self.arcfs.clone(),
                 mount_signal: self.mount_signal.clone(),
@@ -208,6 +224,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);
             tokio::spawn(async move {
+                let _permit = permit;
                 let _ = process_socket(socket, context).await;
             });
         }

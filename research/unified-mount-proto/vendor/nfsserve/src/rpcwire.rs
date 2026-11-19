@@ -1,4 +1,5 @@
 use std::io::{Cursor, Read, Write};
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -91,6 +92,13 @@ async fn handle_rpc(
 /// length in bytes of the fragment's data.  The boolean value is the
 /// highest-order bit of the header; the length is the 31 low-order bits.
 /// (Note that this record specification is NOT in XDR standard form!)
+/// Istesso patch: the largest record (all fragments of one call) that is read. A read-only
+/// server is only sent small calls; a client that announces a larger record is cut off
+/// before anything is allocated for it.
+pub const MAX_RECORD: usize = 256 * 1024;
+/// Istesso patch: calls of one connection that are answered at the same time.
+const MAX_IN_FLIGHT: usize = 16;
+
 async fn read_fragment(socket: &mut DuplexStream, append_to: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
     let mut header_buf = [0_u8; 4];
     socket.read_exact(&mut header_buf).await?;
@@ -98,6 +106,10 @@ async fn read_fragment(socket: &mut DuplexStream, append_to: &mut Vec<u8>) -> Re
     let is_last = (fragment_header & (1 << 31)) > 0;
     let length = (fragment_header & ((1 << 31) - 1)) as usize;
     trace!("Reading fragment length:{}, last:{}", length, is_last);
+    // Istesso patch: refuse a record larger than MAX_RECORD before allocating it.
+    if append_to.len().saturating_add(length) > MAX_RECORD {
+        return Err(anyhow::anyhow!("record larger than {} bytes", MAX_RECORD));
+    }
     let start_offset = append_to.len();
     append_to.resize(append_to.len() + length, 0);
     socket.read_exact(&mut append_to[start_offset..]).await?;
@@ -125,6 +137,8 @@ pub type SocketMessageType = Result<Vec<u8>, anyhow::Error>;
 #[derive(Debug)]
 pub struct SocketMessageHandler {
     cur_fragment: Vec<u8>,
+    /// Istesso patch: bounds the calls of this connection being answered at once.
+    in_flight: Arc<tokio::sync::Semaphore>,
     socket_receive_channel: DuplexStream,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
@@ -138,6 +152,7 @@ impl SocketMessageHandler {
         (
             Self {
                 cur_fragment: Vec::new(),
+                in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
@@ -154,7 +169,10 @@ impl SocketMessageHandler {
             let fragment = std::mem::take(&mut self.cur_fragment);
             let context = self.context.clone();
             let send = self.reply_send_channel.clone();
+            // Istesso patch: wait for room before taking the next call of this connection.
+            let permit = self.in_flight.clone().acquire_owned().await?;
             tokio::spawn(async move {
+                let _permit = permit;
                 let mut write_buf: Vec<u8> = Vec::new();
                 let mut write_cursor = Cursor::new(&mut write_buf);
                 let maybe_reply = handle_rpc(&mut Cursor::new(fragment), &mut write_cursor, context).await;
