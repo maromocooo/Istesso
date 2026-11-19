@@ -30,13 +30,24 @@ static void the_rule(void) {
     // (0.43 s).
     assert(AWAKE_AFTER_INPUT_NS > 2 * second && AWAKE_AFTER_INPUT_NS <= 5 * second);
 
-    // What began a stretch: an input after the stretch before ended, by its kind; else the front.
-    assert(strcmp(awake_began_by(true, 0, AWAKE_BY_WINDOW, 0), "session") == 0);
-    assert(strcmp(awake_began_by(false, t, AWAKE_BY_POINTER, t - second), "pointer") == 0);
-    assert(strcmp(awake_began_by(false, t, AWAKE_BY_WINDOW, t - second), "window") == 0);
-    assert(strcmp(awake_began_by(false, t, AWAKE_BY_WAY_IN, t), "way_in") == 0);
-    assert(strcmp(awake_began_by(false, t - second, AWAKE_BY_POINTER, t), "front") == 0);
-    assert(strcmp(awake_began_by(false, 0, AWAKE_BY_WINDOW, 0), "front") == 0);
+    // What began a stretch: an input after the stretch before ended, by its kind; the front when
+    // the window came to the front after the latest input; the session for the whole session.
+    assert(strcmp(awake_began_by(true, 0, AWAKE_BY_WINDOW, 0, 0), "session") == 0);
+    assert(strcmp(awake_began_by(false, t, AWAKE_BY_POINTER, t - second, t - 2 * second), "pointer") == 0);
+    assert(strcmp(awake_began_by(false, t, AWAKE_BY_WINDOW, t - second, t - 2 * second), "window") == 0);
+    assert(strcmp(awake_began_by(false, t, AWAKE_BY_WAY_IN, t, 0), "way_in") == 0);
+    assert(strcmp(awake_began_by(false, t - second, AWAKE_BY_POINTER, t, t - 2 * second), "front") == 0);
+    assert(strcmp(awake_began_by(false, 0, AWAKE_BY_WINDOW, 0, 0), "front") == 0);
+    // An input while the window was not in front, then the window to the front within the three
+    // seconds: the front began it, not the input.
+    assert(strcmp(awake_began_by(false, t - second, AWAKE_BY_POINTER, t - 2 * second, t - second / 2), "front") == 0);
+
+    // The kind of a batch: by what the person did when the window knows it, else by the batch.
+    assert(awake_by_for(AWAKE_BY_NONE, true) == AWAKE_BY_POINTER);    // the pointer's place alone
+    assert(awake_by_for(AWAKE_BY_NONE, false) == AWAKE_BY_WINDOW);    // a key, or a mixed batch
+    assert(awake_by_for(AWAKE_BY_WINDOW, true) == AWAKE_BY_WINDOW);   // a click's first batch: its place
+    assert(awake_by_for(AWAKE_BY_WINDOW, false) == AWAKE_BY_WINDOW);  // a click's button
+    assert(awake_by_for(AWAKE_BY_POINTER, false) == AWAKE_BY_POINTER);// moving, with modifiers coming up
 }
 
 static void wait_ms(unsigned ms) {
@@ -49,6 +60,8 @@ static void begin(int form, bool whole_session) {
     awake_whole_session = whole_session;
     atomic_store(&awake_last_input_ns, 0);
     atomic_store(&awake_in_front, false);
+    atomic_store(&awake_front_ns, 0);
+    atomic_store(&awake_last_by, AWAKE_BY_WINDOW);
     assert(awake_start());
 }
 
@@ -110,43 +123,79 @@ static void the_thread(void) {
     assert(awake_cpu_ns < awake_on_ns / 2);
 }
 
-// The "on":1 line says what began each stretch: here the pointer, after a pause in which the
-// core was let go; then a key; then the window coming back to the front; then the way in.
-static void the_cause(void) {
-    awake_log = tmpfile();
-    assert(awake_log != NULL);
-    begin(AWAKE_SPIN, false);
-    awake_set_in_front(true);
-    wait_ms(10);
-    awake_input_by(AWAKE_BY_POINTER);
-    wait_ms(20);
-    // The latest input made old: the stretch ends as after a pause of three seconds.
-    atomic_store(&awake_last_input_ns, awake_clock() - AWAKE_AFTER_INPUT_NS - 1);
-    wait_ms(20);
-    assert(atomic_load(&awake_resting));
-    awake_input_by(AWAKE_BY_WINDOW);
-    wait_ms(20);
-    awake_set_in_front(false);
-    wait_ms(20);
-    awake_set_in_front(true);
-    wait_ms(20);
-    atomic_store(&awake_last_input_ns, awake_clock() - AWAKE_AFTER_INPUT_NS - 1);
-    wait_ms(20);
-    awake_input_by(AWAKE_BY_WAY_IN);
-    wait_ms(20);
-    awake_finish();
-    assert(awake_stretches == 4);
-    const char *want[] = {"\"by\":\"pointer\"", "\"by\":\"window\"", "\"by\":\"front\"", "\"by\":\"way_in\""};
+// The "on":1 line says what began each stretch. The waits are long enough (120 ms) for a loaded
+// machine: the thread has to have seen each change before the next.
+static void stretches_said(const char *const *want, int count) {
     char line[512];
     int n = 0;
     rewind(awake_log);
     while (fgets(line, sizeof line, awake_log) != NULL) {
         if (strstr(line, "\"kind\":\"awake\"") != NULL && strstr(line, "\"on\":1") != NULL) {
-            assert(n < 4 && strstr(line, want[n]) != NULL);
+            assert(n < count && strstr(line, want[n]) != NULL);
             n++;
         }
     }
-    assert(n == 4);
+    assert(n == count);
+}
+
+static void the_cause(void) {
+    const unsigned w = 120;
+    awake_log = tmpfile();
+    assert(awake_log != NULL);
+    begin(AWAKE_SPIN, false);
+    awake_set_in_front(true);
+    wait_ms(w);
+    awake_input_by(AWAKE_BY_POINTER);   // the pointer moved over the window, after a pause
+    wait_ms(w);
+    // The latest input made old: the stretch ends as after a pause of three seconds.
+    atomic_store(&awake_last_input_ns, awake_clock() - AWAKE_AFTER_INPUT_NS - 1);
+    wait_ms(w);
+    assert(atomic_load(&awake_resting));
+    awake_input_by(AWAKE_BY_WINDOW);    // a key
+    wait_ms(w);
+    awake_set_in_front(false);
+    wait_ms(w);
+    awake_set_in_front(true);           // back to the front while the key is recent
+    wait_ms(w);
+    awake_set_in_front(false);
+    wait_ms(w);
+    awake_input_by(AWAKE_BY_POINTER);   // the pointer moved while the window was not in front
+    wait_ms(w);
+    assert(atomic_load(&awake_resting));
+    awake_set_in_front(true);           // then to the front within three seconds
+    wait_ms(w);
+    atomic_store(&awake_last_input_ns, awake_clock() - AWAKE_AFTER_INPUT_NS - 1);
+    wait_ms(w);
+    awake_input_by(AWAKE_BY_WAY_IN);    // the measurement's way in
+    wait_ms(w);
+    awake_finish();
+    assert(awake_stretches == 5);
+    const char *spin[] = {"\"by\":\"pointer\"", "\"by\":\"window\"", "\"by\":\"front\"", "\"by\":\"front\"",
+                          "\"by\":\"way_in\""};
+    stretches_said(spin, 5);
+    fclose(awake_log);
+
+    // The tick form says the same.
+    awake_log = tmpfile();
+    assert(awake_log != NULL);
+    begin(AWAKE_TICK, false);
+    awake_set_in_front(true);
+    wait_ms(w);
+    awake_input_by(AWAKE_BY_POINTER);
+    wait_ms(w);
+    awake_finish();
+    const char *tick[] = {"\"by\":\"pointer\""};
+    stretches_said(tick, 1);
+    fclose(awake_log);
+
+    // The whole session.
+    awake_log = tmpfile();
+    assert(awake_log != NULL);
+    begin(AWAKE_SPIN, true);
+    wait_ms(w);
+    awake_finish();
+    const char *session[] = {"\"by\":\"session\""};
+    stretches_said(session, 1);
     fclose(awake_log);
     awake_log = NULL;
 }

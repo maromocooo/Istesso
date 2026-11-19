@@ -1379,17 +1379,21 @@ static void finish(void) {
 // The window's thread hands the events to the input's thread of the library, in memory, and goes
 // on. It never touches the connection.
 
+// What the person is doing while the window's thread hands events on: a click, the pointer moving, or
+// nothing named (AWAKE_BY_NONE). The window's thread only.
+static int input_action = AWAKE_BY_NONE;
+
 static void send_input(const IstessoInputEvent *events, size_t count) {
     if (input != NULL && count > 0) {
         istesso_input_send(input, events, count);
         if (awake_form != AWAKE_OFF) {
             // The pointer moving over the window wakes the core as a key does: the hand is
-            // usually on its way to typing. The log tells the two apart.
+            // usually on its way to typing. The log tells the two apart, by what the person did.
             bool only_pointer = true;
             for (size_t i = 0; i < count; i++) {
                 only_pointer = only_pointer && events[i].kind == ISTESSO_INPUT_POINTER_AT;
             }
-            awake_input_by(only_pointer ? AWAKE_BY_POINTER : AWAKE_BY_WINDOW);
+            awake_input_by(awake_by_for(input_action, only_pointer));
         }
     }
 }
@@ -1734,7 +1738,15 @@ static NSCursor *empty_cursor(void) {
     send_one(ISTESSO_INPUT_POINTER_AT, x, y);
 }
 
+// A click: the pointer's place and the button go over as two batches, and both are the click.
 - (void)button:(unsigned)code pressed:(BOOL)pressed event:(NSEvent *)event {
+    int was = input_action;
+    input_action = AWAKE_BY_WINDOW;
+    [self buttonNow:code pressed:pressed event:event];
+    input_action = was;
+}
+
+- (void)buttonNow:(unsigned)code pressed:(BOOL)pressed event:(NSEvent *)event {
     [self pointer:event];
     unsigned bit = 1u << (code - 0x110);
     if (pressed && input_away && !picture_stale) {
@@ -1763,8 +1775,12 @@ static NSCursor *empty_cursor(void) {
 }
 
 - (void)mouseMoved:(NSEvent *)event {
+    // The pointer moving, also when modifiers come up with it.
+    int was = input_action;
+    input_action = AWAKE_BY_POINTER;
     [self pointer:event];
     [self modifiersUp:event.modifierFlags];
+    input_action = was;
 }
 - (void)mouseDragged:(NSEvent *)event { [self pointer:event]; }
 - (void)rightMouseDragged:(NSEvent *)event { [self pointer:event]; }

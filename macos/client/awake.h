@@ -29,6 +29,18 @@
 #define AWAKE_BY_WINDOW 0   // a key, a button or scrolling in the window
 #define AWAKE_BY_POINTER 1  // only the pointer's movement over the window
 #define AWAKE_BY_WAY_IN 2   // the measurement's way in for keys (a measuring build)
+#define AWAKE_BY_NONE (-1)  // no action named: the kind follows what a batch of events holds
+
+// The kind of input of one batch handed on. `action`: what the person did, when the window knows it (a click
+// sends the pointer's place and then the button, and is a click; the pointer moving may let modifiers come up,
+// and is the pointer moving); else AWAKE_BY_NONE, and a batch of nothing but the pointer's place is the
+// pointer's movement, anything else is input in the window.
+static inline int awake_by_for(int action, bool only_pointer) {
+    if (action != AWAKE_BY_NONE) {
+        return action;
+    }
+    return only_pointer ? AWAKE_BY_POINTER : AWAKE_BY_WINDOW;
+}
 
 // How long after the latest input the core is kept awake. Between the keys of a word lie tenths
 // of a second, between words and sentences up to about two seconds; a silence longer than that
@@ -76,6 +88,8 @@ static FILE *awake_log = NULL;
 static _Atomic uint64_t awake_last_input_ns = 0;
 static _Atomic int awake_last_by = AWAKE_BY_WINDOW;
 static _Atomic bool awake_in_front = false;
+// When the window last came to the front (0: never), for the line that says what began a stretch.
+static _Atomic uint64_t awake_front_ns = 0;
 // The thread rests while the rule does not hold. Whoever changes what the rule reads wakes it,
 // if it is resting.
 static _Atomic bool awake_resting = false, awake_over = false;
@@ -120,11 +134,16 @@ static inline void awake_input(void) {
 }
 
 // What began a stretch that begins now, when the one before ended at `ended_ns` (or the thread
-// began then): the whole session; an input that came after that end (of its kind); or else the
-// window coming to the front while an input was still recent.
-static inline const char *awake_began_by(bool whole_session, uint64_t last_input_ns, int last_by, uint64_t ended_ns) {
+// began then) and the window last came to the front at `front_ns`: the whole session; the window
+// coming to the front after the latest input (that input came while it was not in front); an
+// input that came after that end (of its kind); or else the front, while an input was still recent.
+static inline const char *awake_began_by(bool whole_session, uint64_t last_input_ns, int last_by, uint64_t ended_ns,
+                                         uint64_t front_ns) {
     if (whole_session) {
         return "session";
+    }
+    if (front_ns > last_input_ns) {
+        return "front";
     }
     if (last_input_ns != 0 && last_input_ns >= ended_ns) {
         return last_by == AWAKE_BY_POINTER ? "pointer" : (last_by == AWAKE_BY_WAY_IN ? "way_in" : "window");
@@ -136,6 +155,9 @@ static inline const char *awake_began_by(bool whole_session, uint64_t last_input
 static inline bool awake_set_in_front(bool in_front) {
     if (atomic_exchange(&awake_in_front, in_front) == in_front) {
         return false;
+    }
+    if (in_front) {
+        atomic_store(&awake_front_ns, awake_clock());
     }
     awake_stir();
     return true;
@@ -174,7 +196,8 @@ static void *awake_thread(void *unused) {
         if (awake_log != NULL) {
             // What began it: "pointer" when the pointer's movement over the window did.
             fprintf(awake_log, "{\"kind\":\"awake\",\"t_ns\":%llu,\"on\":1,\"by\":\"%s\"}\n", (unsigned long long)began,
-                    awake_began_by(awake_whole_session, atomic_load(&awake_last_input_ns), atomic_load(&awake_last_by), last_ended));
+                    awake_began_by(awake_whole_session, atomic_load(&awake_last_input_ns), atomic_load(&awake_last_by), last_ended,
+                                   atomic_load(&awake_front_ns)));
         }
         if (awake_form == AWAKE_SPIN) {
             do {
