@@ -71,6 +71,10 @@ enum Command {
         /// file can be read by its owner only
         #[arg(long, value_name = "PATH")]
         input_timings: Option<PathBuf>,
+        /// Daily trial: copy and paste of text with the program behind the input socket,
+        /// when it answers (docs/adr/0022-clipboard-text.md). Never logs what was copied
+        #[arg(long)]
+        clipboard: bool,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -407,6 +411,7 @@ fn run(cli: Cli) -> Result<(), String> {
             no_discovery,
             verbose,
             input_timings,
+            clipboard,
         } => run_agent(AgentOptions {
             bind,
             port,
@@ -414,6 +419,7 @@ fn run(cli: Cli) -> Result<(), String> {
             follow_input_restarts: std::env::var_os("ISTESSO_DAILY_RECONNECT").is_some(),
             verbose,
             input_timings,
+            clipboard,
             ..AgentOptions::default()
         }),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
@@ -551,8 +557,9 @@ fn relay_input(
     // output, in the log of times if there is one, and in a small file next to the socket
     // for the program that shows the window.
     let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
-    // "text": whether the device takes committed text (1) or not (0), for the window.
-    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool| {
+    // "text": whether the device takes committed text (1) or not (0), for the window;
+    // "clipboard": the same for copy and paste (trial only, ADR 0022).
+    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool, clipboard: bool| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -577,9 +584,10 @@ fn relay_input(
             String::new()
         };
         let line = format!(
-            "{{\"pid\":{},\"input\":{cuts},\"text\":{}{status}}}\n",
+            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{}{status}}}\n",
             std::process::id(),
-            u8::from(text)
+            u8::from(text),
+            u8::from(clipboard)
         );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
@@ -614,13 +622,20 @@ fn relay_input(
     }
     let listener = UnixDatagram::bind(socket)
         .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
+    // A paste of 64 KiB is a datagram of up to 128 KiB (trial only, ADR 0022).
+    istesso_agent::clipboard::set_buffers(&listener, istesso_agent::clipboard::SOCKET_BUFFER);
+    // Answers to copy and paste go to the window's own socket next to this one.
+    let answers_to = std::path::PathBuf::from(format!("{}.answers", socket.display()));
+    let answering =
+        UnixDatagram::unbound().map_err(|e| format!("cannot open a socket for answers: {e}"))?;
+    istesso_agent::clipboard::set_buffers(&answering, istesso_agent::clipboard::SOCKET_BUFFER);
     let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
     let opened = |line: &InputLine| {
         println!(
             "Input written to {} goes to the paired device.",
             socket.display()
         );
-        tell("open", 0, None, line.takes_text());
+        tell("open", 0, None, line.takes_text(), line.takes_clipboard());
         if !line.is_answered() {
             eprintln!(
                 "note: the device is of a version that does not answer \"still here\"; a connection \
@@ -629,14 +644,16 @@ fn relay_input(
         }
     };
     if daily {
-        tell("waiting", 0, None, false);
+        tell("waiting", 0, None, false, false);
     } else {
         opened(&line);
     }
     // How many pieces of committed text were not sent so far (said when it grows).
     let mut text_dropped = 0;
+    // The same for copy and paste.
+    let mut clipboard_dropped = 0;
 
-    let mut buffer = [0u8; 2048];
+    let mut buffer = vec![0u8; 192 * 1024];
     let take = |events: &mut Vec<InputEvent>, datagram: &[u8]| {
         let Ok(event) = serde_json::from_slice::<InputEvent>(datagram) else {
             return;
@@ -663,7 +680,7 @@ fn relay_input(
         // after in between (saying "still here", hearing the answers, opening it again
         // when it was cut).
         let wait = if line.is_open() {
-            LISTEN_EVERY
+            line.listen_in().min(LISTEN_EVERY)
         } else if daily {
             line.retry_in(std::time::Instant::now())
         } else {
@@ -703,6 +720,26 @@ fn relay_input(
                 })?;
         }
         listener.set_nonblocking(false).map_err(failed)?;
+        for answer in line.take_clipboard_answers() {
+            // To the window, which takes the latest one it waits for; what it carries is
+            // never written here.
+            let value = serde_json::json!({
+                "kind": "clipboard",
+                "id": answer.id,
+                "result": answer.result,
+                "text": answer.text,
+                "why": answer.why,
+            });
+            if let Ok(bytes) = serde_json::to_vec(&value) {
+                let _ = answering.send_to(&bytes, &answers_to);
+            }
+        }
+        if line.clipboard_dropped() != clipboard_dropped {
+            clipboard_dropped = line.clipboard_dropped();
+            eprintln!(
+                "note: {clipboard_dropped} copy or paste request(s) were not sent: the device does not take them"
+            );
+        }
         if line.text_dropped() != text_dropped {
             text_dropped = line.text_dropped();
             // How many, never what.
@@ -713,7 +750,13 @@ fn relay_input(
         match happened {
             Some(Happened::Cut) => {
                 eprintln!("note: the conversation with the device was cut; opening it again");
-                tell("cut", line.cuts(), None, line.takes_text());
+                tell(
+                    "cut",
+                    line.cuts(),
+                    None,
+                    line.takes_text(),
+                    line.takes_clipboard(),
+                );
             }
             Some(Happened::Back { .. }) if daily && line.cuts() == 0 => opened(&line),
             Some(Happened::Back { after }) => {
@@ -721,7 +764,13 @@ fn relay_input(
                     "note: the conversation with the device is back after {:.2} s",
                     after.as_secs_f64()
                 );
-                tell("back", line.cuts(), Some(after), line.takes_text());
+                tell(
+                    "back",
+                    line.cuts(),
+                    Some(after),
+                    line.takes_text(),
+                    line.takes_clipboard(),
+                );
             }
             None => {}
         }

@@ -17,10 +17,10 @@
 //! modifiers that are held are pressed again, and nothing else. The daily
 //! trial first releases any keys and buttons left down on the old channel.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use istesso_link::{Client, Error as LinkError, ErrorCode, InputAnswer};
+use istesso_link::{Client, ClipboardAnswer, Error as LinkError, ErrorCode, InputAnswer};
 use istesso_proto::InputEvent;
 
 use crate::survey::ConnectFailure;
@@ -41,6 +41,11 @@ pub const SILENT_AFTER: Duration = Duration::from_secs(1);
 pub const UNANSWERED_FOR: Duration = Duration::from_millis(500);
 /// How often what the device has answered is looked at.
 pub const LISTEN_EVERY: Duration = Duration::from_millis(100);
+/// How often "still here" is said, and the answers looked at, while a copy or a paste waits for
+/// its answer (trial only): the device writes the answer when it next hears from this side.
+pub const CLIPBOARD_EVERY: Duration = Duration::from_millis(50);
+/// How long the answer to a copy or a paste is waited for.
+pub const CLIPBOARD_WITHIN: Duration = Duration::from_secs(2);
 /// How long after a failed attempt the next one is made while the cut is
 /// fresh, and once the device has been away for [`SOON_FOR`].
 pub const RETRY: Duration = Duration::from_millis(250);
@@ -166,6 +171,15 @@ pub struct InputLine {
     text: bool,
     /// Pieces of committed text not sent because the device does not take them.
     text_dropped: u64,
+    /// The device takes copy and paste (trial only); without, none is sent to it.
+    clipboard: bool,
+    /// Copies and pastes not sent because the device does not take them.
+    clipboard_dropped: u64,
+    /// The copies and pastes sent on this conversation that wait for their answer, and until
+    /// when.
+    awaiting: BTreeMap<u32, Instant>,
+    /// Answers that came and are not handed on yet.
+    answers: Vec<ClipboardAnswer>,
     /// When "still here" was last said.
     said: Instant,
     /// When it was first said without an answer having come since. Silence
@@ -194,11 +208,12 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let (alive, text) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let (alive, text, clipboard) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let mut line = Self::waiting(connect);
         line.client = Some(client);
         line.alive = alive;
         line.text = text;
+        line.clipboard = clipboard;
         Ok(line)
     }
 
@@ -218,6 +233,10 @@ impl InputLine {
             alive: false,
             text: false,
             text_dropped: 0,
+            clipboard: false,
+            clipboard_dropped: 0,
+            awaiting: BTreeMap::new(),
+            answers: Vec::new(),
             said: now,
             unanswered_since: None,
             listened: now,
@@ -260,6 +279,32 @@ impl InputLine {
         self.text_dropped
     }
 
+    /// Whether the device takes copy and paste, as it said when the conversation was last
+    /// opened (trial only).
+    pub fn takes_clipboard(&self) -> bool {
+        self.clipboard
+    }
+
+    /// How many copies and pastes were not sent because the device does not take them.
+    pub fn clipboard_dropped(&self) -> u64 {
+        self.clipboard_dropped
+    }
+
+    /// The answers to copy and paste that came since this was last asked, in their order.
+    pub fn take_clipboard_answers(&mut self) -> Vec<ClipboardAnswer> {
+        std::mem::take(&mut self.answers)
+    }
+
+    /// How long to wait for something before looking after an open conversation again:
+    /// shorter while a copy or a paste waits for its answer.
+    pub fn listen_in(&self) -> Duration {
+        if self.awaiting.is_empty() {
+            LISTEN_EVERY
+        } else {
+            CLIPBOARD_EVERY
+        }
+    }
+
     /// Whether the device answers "still here", so that silence is noticed.
     pub fn is_answered(&self) -> bool {
         self.alive
@@ -289,13 +334,20 @@ impl InputLine {
         // A device that did not say it takes committed text cannot read a message with
         // it, keys and all: none goes to it.
         let kept: Vec<InputEvent>;
-        let events = if !self.text && events.iter().any(|e| matches!(e, InputEvent::Text { .. })) {
-            kept = events
-                .iter()
-                .filter(|e| !matches!(e, InputEvent::Text { .. }))
-                .cloned()
-                .collect();
-            self.text_dropped += (events.len() - kept.len()) as u64;
+        // The same for copy and paste.
+        let not_taken = |e: &InputEvent| match e {
+            InputEvent::Text { .. } => !self.text,
+            InputEvent::Copy { .. } | InputEvent::Paste { .. } => !self.clipboard,
+            _ => false,
+        };
+        let events = if events.iter().any(not_taken) {
+            kept = events.iter().filter(|e| !not_taken(e)).cloned().collect();
+            for event in events.iter().filter(|e| not_taken(e)) {
+                match event {
+                    InputEvent::Text { .. } => self.text_dropped += 1,
+                    _ => self.clipboard_dropped += 1,
+                }
+            }
             &kept[..]
         } else {
             events
@@ -312,6 +364,15 @@ impl InputLine {
         let sent = client.send_input(events).is_ok();
         if let Some(held) = &mut self.daily_held {
             held.record(events, sent);
+        }
+        if sent {
+            for event in events {
+                if let InputEvent::Copy { id, .. } | InputEvent::Paste { id, .. } = event {
+                    self.awaiting.insert(*id, now + CLIPBOARD_WITHIN);
+                    // Said again at once, so that the device has a turn to answer soon.
+                    self.said = now.checked_sub(ALIVE_EVERY).unwrap_or(self.said);
+                }
+            }
         }
         Passed {
             sent,
@@ -334,24 +395,41 @@ impl InputLine {
         now: Instant,
         pending: impl FnOnce() -> Vec<InputEvent>,
     ) -> Result<Option<Happened>, String> {
+        self.awaiting.retain(|_, until| *until > now);
+        let waiting = !self.awaiting.is_empty();
         let Some(client) = &mut self.client else {
             return self.open_again(now, pending);
         };
         let silent = self
             .unanswered_since
             .is_some_and(|since| now.saturating_duration_since(since) >= UNANSWERED_FOR);
-        if self.alive && (silent || now.saturating_duration_since(self.listened) >= LISTEN_EVERY) {
+        let listen_every = if waiting {
+            CLIPBOARD_EVERY
+        } else {
+            LISTEN_EVERY
+        };
+        if self.alive && (silent || now.saturating_duration_since(self.listened) >= listen_every) {
             // Before silence is believed, what has arrived is looked at: an answer
-            // that came while nobody listened is an answer.
+            // that came while nobody listened is an answer, and so is an answer to a copy.
             self.listened = now;
-            match client.heard_alive() {
-                Ok(true) => self.unanswered_since = None,
-                Ok(false) if silent => return Ok(Some(self.cut(now))),
-                Ok(false) => {}
+            match client.heard() {
+                Ok(heard) => {
+                    for answer in &heard.clipboard {
+                        self.awaiting.remove(&answer.id);
+                    }
+                    self.answers.extend(heard.clipboard);
+                    if heard.alive {
+                        self.unanswered_since = None;
+                    } else if silent {
+                        return Ok(Some(self.cut(now)));
+                    }
+                }
                 Err(_) => return Ok(Some(self.cut(now))),
             }
         }
-        let every = if self.alive {
+        let every = if self.alive && !self.awaiting.is_empty() {
+            CLIPBOARD_EVERY
+        } else if self.alive {
             ALIVE_EVERY
         } else {
             ALIVE_EVERY_UNANSWERED
@@ -371,6 +449,8 @@ impl InputLine {
     fn cut(&mut self, now: Instant) -> Happened {
         self.cuts += 1;
         self.client = None;
+        // Answers to what was asked on that conversation do not come on the next one.
+        self.awaiting.clear();
         self.without_since = Some(now);
         // At once, unless the conversation had only just been opened: a device that
         // takes one and lets go of it straight away is not asked faster than any other.
@@ -427,7 +507,7 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let (alive, text) = match ask(&mut client, within) {
+        let (alive, text, clipboard) = match ask(&mut client, within) {
             Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
@@ -448,6 +528,7 @@ impl InputLine {
         self.client = Some(client);
         self.alive = alive;
         self.text = text;
+        self.clipboard = clipboard;
         self.unanswered_since = None;
         (self.said, self.listened, self.made_at) = (now_open, now_open, now_open);
         Ok(Some(Happened::Back { after }))
@@ -458,7 +539,7 @@ impl InputLine {
 /// here"; the answer has `within` this time. `Ok` says whether the device
 /// answers; `Err` what to do about its refusal, and the refusal in a
 /// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
-fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool), (Again, String)> {
+fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, bool), (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
@@ -467,7 +548,13 @@ fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool), (Again, St
     let answer = client.open_input_alive().map_err(link)?;
     client.set_timeout(AGAIN_WITHIN).map_err(link)?;
     match answer {
-        InputAnswer::Open { alive, text } => Ok((alive, text)),
+        // Copy and paste only with a device that answers "still here": their answers are heard
+        // where that is.
+        InputAnswer::Open {
+            alive,
+            text,
+            clipboard,
+        } => Ok((alive, text, clipboard && alive)),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -590,6 +677,78 @@ mod tests {
             pair.handed_over(Duration::from_secs(3)),
             Some(key(31, true))
         );
+    }
+
+    #[test]
+    fn a_copy_is_answered_soon_and_none_is_sent_to_a_device_that_does_not_take_it() {
+        use crate::clipboard::{ANSWER_SOCKET, CLIPBOARD_SOCKET};
+        use std::os::unix::net::UnixDatagram;
+        // A device without a compositor that answers: copy and paste are not sent.
+        let without = std::sync::Arc::new(InputPair::with_clipboard("rn"));
+        let mut line = line_through(&without, without.addr);
+        assert!(!line.takes_clipboard());
+        assert!(
+            line.pass(&[InputEvent::Copy { id: 1, cut: false }], Instant::now())
+                .sent
+        );
+        assert_eq!(line.clipboard_dropped(), 1);
+        assert_eq!(line.listen_in(), LISTEN_EVERY);
+
+        let pair = std::sync::Arc::new(InputPair::with_clipboard("rc"));
+        let dir = pair.host.path().to_path_buf();
+        let compositor = UnixDatagram::bind(dir.join(CLIPBOARD_SOCKET)).unwrap();
+        let answers = dir.join(ANSWER_SOCKET);
+        let hello = std::thread::spawn(move || {
+            let mut buffer = [0u8; 256];
+            let length = compositor.recv(&mut buffer).unwrap();
+            compositor.send_to(&buffer[..length], answers).unwrap();
+            compositor
+        });
+        let mut line = line_through(&pair, pair.addr);
+        let _compositor = hello.join().unwrap();
+        assert!(line.takes_clipboard());
+        assert!(
+            line.pass(&[InputEvent::Copy { id: 2, cut: true }], Instant::now())
+                .sent
+        );
+        // While the answer is waited for, the line is looked after more often.
+        assert_eq!(line.listen_in(), CLIPBOARD_EVERY);
+        pair.taken.set_read_timeout(Some(A_MOMENT)).unwrap();
+        let mut buffer = [0u8; 512];
+        let length = pair.taken.recv(&mut buffer).unwrap();
+        let mark: serde_json::Value = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert_eq!(mark["cut"], true);
+        UnixDatagram::unbound()
+            .unwrap()
+            .send_to(
+                &serde_json::to_vec(&serde_json::json!({
+                    "kind": "answer", "nonce": mark["nonce"], "result": "refused", "why": "password_field"
+                }))
+                .unwrap(),
+                dir.join(ANSWER_SOCKET),
+            )
+            .unwrap();
+        let began = Instant::now();
+        let mut answers = Vec::new();
+        while answers.is_empty() && began.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(line.listen_in());
+            assert_eq!(line.turn(Instant::now()), Ok(None));
+            answers = line.take_clipboard_answers();
+        }
+        // Within a few turns of the fast pace, not after half a second.
+        assert!(
+            began.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].id, 2);
+        assert_eq!(answers[0].result, istesso_proto::ClipboardResult::Refused);
+        assert_eq!(
+            answers[0].why,
+            Some(istesso_proto::ClipboardWhy::PasswordField)
+        );
+        assert_eq!(line.listen_in(), LISTEN_EVERY);
     }
 
     #[test]
@@ -909,6 +1068,7 @@ mod tests {
                         .respond(&Response::InputOpen {
                             alive: false,
                             text: false,
+                            clipboard: false,
                         })
                         .unwrap();
                 }

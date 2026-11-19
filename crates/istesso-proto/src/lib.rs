@@ -416,7 +416,7 @@ pub enum InputMode {
 /// (`linux/input-event-codes.h`), whatever the sender runs on: a key is its
 /// place on the keyboard, not the letter printed on it, and the device that
 /// runs the application decides what the key means there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputEvent {
     /// A key went down or came up.
@@ -444,6 +444,140 @@ pub enum InputEvent {
     /// answers with a new stream of the size taken (the sender then takes that size and asks
     /// nothing more). See [`resize_is_acceptable`].
     Resize { width: u32, height: u32 },
+    /// The person pressed Command-C (or Command-X, `cut`) in the sender's window (trial only,
+    /// docs/adr/0022-clipboard-text.md): the host presses its own copy key for the client that
+    /// has the keyboard and answers `id` with the text that client then put on the clipboard.
+    /// Sent only to a device that said it takes it (`clipboard` at `input_open`).
+    Copy {
+        id: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        cut: bool,
+    },
+    /// The person pressed Command-V in the sender's window (trial only): the host puts `text` on
+    /// the session's clipboard and presses its own paste key; without `text`, it withdraws text it
+    /// put there earlier and presses the paste key only. Never logged; see
+    /// [`clipboard_text_check`] for the limits.
+    Paste {
+        id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<SecretText>,
+    },
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+/// Written out without what was typed or copied: logs and diagnostics print events with `{:?}`
+/// now and then, and text never goes into them (AGENTS.md, 4).
+impl std::fmt::Debug for InputEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputEvent::Key { code, pressed } => f
+                .debug_struct("Key")
+                .field("code", code)
+                .field("pressed", pressed)
+                .finish(),
+            InputEvent::PointerAt { x, y } => f
+                .debug_struct("PointerAt")
+                .field("x", x)
+                .field("y", y)
+                .finish(),
+            InputEvent::Button { code, pressed } => f
+                .debug_struct("Button")
+                .field("code", code)
+                .field("pressed", pressed)
+                .finish(),
+            InputEvent::Scroll { dx, dy } => f
+                .debug_struct("Scroll")
+                .field("dx", dx)
+                .field("dy", dy)
+                .finish(),
+            InputEvent::Text { .. } => f.write_str("Text { .. }"),
+            InputEvent::Focus => f.write_str("Focus"),
+            InputEvent::Resize { width, height } => f
+                .debug_struct("Resize")
+                .field("width", width)
+                .field("height", height)
+                .finish(),
+            InputEvent::Copy { id, cut } => f
+                .debug_struct("Copy")
+                .field("id", id)
+                .field("cut", cut)
+                .finish(),
+            InputEvent::Paste { id, text } => f
+                .debug_struct("Paste")
+                .field("id", id)
+                .field("text", &text.as_ref().map(|_| ".."))
+                .finish(),
+        }
+    }
+}
+
+/// Text that was copied or is to be pasted (trial only, docs/adr/0022-clipboard-text.md). Written
+/// as a plain string; `{:?}` never shows it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretText(pub String);
+
+impl std::fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretText(..)")
+    }
+}
+
+impl SecretText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The most bytes (UTF-8) of text copied or pasted between devices.
+pub const CLIPBOARD_MOST_BYTES: usize = 65536;
+
+/// What became of a copy or a paste (trial only, docs/adr/0022-clipboard-text.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardResult {
+    /// The text that was copied comes with it (a copy only).
+    Text,
+    /// The paste key was pressed (a paste only).
+    Pasted,
+    /// From a password field, or marked secret.
+    Refused,
+    /// More than [`CLIPBOARD_MOST_BYTES`].
+    TooLarge,
+    /// Not valid UTF-8, empty, or with control characters other than tab and newlines.
+    NotText,
+    /// Nothing new was copied in time, or there was nobody to press a key for. A value this
+    /// version does not know is read as this.
+    #[serde(rename = "none", other)]
+    Nothing,
+}
+
+/// Why a copy or a paste was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardWhy {
+    PasswordField,
+    SecretMarker,
+    SecureInput,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Whether text may be copied or pasted between devices: `Ok`, or the answer that says why not
+/// ([`ClipboardResult::TooLarge`] or [`ClipboardResult::NotText`]). Tab, line feed and carriage
+/// return are taken as they are; other control characters are not.
+pub fn clipboard_text_check(text: &str) -> Result<(), ClipboardResult> {
+    if text.len() > CLIPBOARD_MOST_BYTES {
+        return Err(ClipboardResult::TooLarge);
+    }
+    let unwanted = |c: char| c.is_control() && !matches!(c, '\t' | '\n' | '\r');
+    if text.is_empty() || text.chars().any(unwanted) {
+        return Err(ClipboardResult::NotText);
+    }
+    Ok(())
 }
 
 /// The sizes a [`InputEvent::Resize`] may ask for: 64 to 8192 pixels a side.
@@ -652,5 +786,79 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(family, OsFamily::Macos);
         }
+    }
+
+    #[test]
+    fn copy_and_paste_are_small_tagged_objects_and_debug_hides_text() {
+        use super::{InputEvent, SecretText};
+        let copy = InputEvent::Copy { id: 7, cut: false };
+        assert_eq!(
+            serde_json::to_string(&copy).unwrap(),
+            r#"{"kind":"copy","id":7}"#
+        );
+        let cut: InputEvent = serde_json::from_str(r#"{"kind":"copy","id":8,"cut":true}"#).unwrap();
+        assert_eq!(cut, InputEvent::Copy { id: 8, cut: true });
+        let paste = InputEvent::Paste {
+            id: 9,
+            text: Some(SecretText("hunter2".into())),
+        };
+        assert_eq!(
+            serde_json::to_string(&paste).unwrap(),
+            r#"{"kind":"paste","id":9,"text":"hunter2"}"#
+        );
+        let bare: InputEvent = serde_json::from_str(r#"{"kind":"paste","id":10}"#).unwrap();
+        assert_eq!(bare, InputEvent::Paste { id: 10, text: None });
+        for event in [
+            paste,
+            InputEvent::Text {
+                text: "hunter2".into(),
+            },
+        ] {
+            assert!(!format!("{event:?}").contains("hunter2"));
+        }
+    }
+
+    #[test]
+    fn clipboard_text_within_the_limits_and_answers_an_older_reader_does_not_know() {
+        use super::{clipboard_text_check, ClipboardResult, ClipboardWhy, CLIPBOARD_MOST_BYTES};
+        assert_eq!(clipboard_text_check("two\nlines\tand\r\n"), Ok(()));
+        assert_eq!(clipboard_text_check("日本語"), Ok(()));
+        assert_eq!(clipboard_text_check(""), Err(ClipboardResult::NotText));
+        assert_eq!(
+            clipboard_text_check("a\u{0}b"),
+            Err(ClipboardResult::NotText)
+        );
+        assert_eq!(
+            clipboard_text_check("a\u{1b}[2J"),
+            Err(ClipboardResult::NotText)
+        );
+        assert_eq!(
+            clipboard_text_check("a\u{85}"),
+            Err(ClipboardResult::NotText)
+        );
+        assert_eq!(
+            clipboard_text_check(&"a".repeat(CLIPBOARD_MOST_BYTES)),
+            Ok(())
+        );
+        assert_eq!(
+            clipboard_text_check(&"a".repeat(CLIPBOARD_MOST_BYTES + 1)),
+            Err(ClipboardResult::TooLarge)
+        );
+        assert_eq!(
+            serde_json::from_str::<ClipboardResult>(r#""too_large""#).unwrap(),
+            ClipboardResult::TooLarge
+        );
+        assert_eq!(
+            serde_json::to_string(&ClipboardResult::Nothing).unwrap(),
+            r#""none""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClipboardResult>(r#""later""#).unwrap(),
+            ClipboardResult::Nothing
+        );
+        assert_eq!(
+            serde_json::from_str::<ClipboardWhy>(r#""later""#).unwrap(),
+            ClipboardWhy::Unknown
+        );
     }
 }

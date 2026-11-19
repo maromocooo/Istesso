@@ -5,7 +5,9 @@
 //! know is answered with [`ErrorCode::Unsupported`], and readers skip the
 //! parts of an answer they do not understand.
 
-use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
+use istesso_proto::{
+    AppEntry, ClipboardResult, ClipboardWhy, HostManifest, HostStatus, InputEvent, SecretText,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,10 +68,26 @@ pub enum Response {
         alive: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         text: bool,
+        /// Copy and paste (`InputEvent::Copy`, `InputEvent::Paste`) are taken too: what takes
+        /// input here said so just now (trial only, docs/adr/0022-clipboard-text.md). A device
+        /// that does not say so is sent neither; they would be dropped without a word.
+        #[serde(default, skip_serializing_if = "is_false")]
+        clipboard: bool,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
     InputAlive,
+    /// What became of the copy or paste `id` (trial only). Sent on the conversation that asked,
+    /// after one of its messages, at most once for each `id`. `text` only with
+    /// [`ClipboardResult::Text`], `why` only with [`ClipboardResult::Refused`]. Never logged.
+    Clipboard {
+        id: u32,
+        result: ClipboardResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<SecretText>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<ClipboardWhy>,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -166,7 +184,8 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                clipboard: false
             })
             .unwrap(),
             plain
@@ -179,7 +198,8 @@ mod tests {
             serde_json::from_str::<Response>(plain).unwrap(),
             Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                clipboard: false
             }
         );
         // Asked for, and agreed to.
@@ -192,7 +212,8 @@ mod tests {
             serde_json::from_str::<Response>(asking).unwrap(),
             Response::InputOpen {
                 alive: true,
-                text: false
+                text: false,
+                clipboard: false
             }
         );
         assert_eq!(
@@ -200,7 +221,8 @@ mod tests {
                 .unwrap(),
             Response::InputOpen {
                 alive: true,
-                text: true
+                text: true,
+                clipboard: false
             }
         );
         // An earlier version reads both as what it knows, and its own answer says
@@ -214,7 +236,8 @@ mod tests {
                 .unwrap(),
             Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                clipboard: false
             }
         );
         assert_eq!(
@@ -278,6 +301,47 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Response>(json).unwrap(),
             Response::error(ErrorCode::Other, "later")
+        );
+    }
+
+    #[test]
+    fn the_answer_to_a_copy_carries_its_text_and_shows_it_to_nobody() {
+        use istesso_proto::{ClipboardResult, ClipboardWhy, SecretText};
+        let answer = Response::Clipboard {
+            id: 3,
+            result: ClipboardResult::Text,
+            text: Some(SecretText("hunter2".into())),
+            why: None,
+        };
+        let json = serde_json::to_string(&answer).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"clipboard","id":3,"result":"text","text":"hunter2"}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), answer);
+        assert!(!format!("{answer:?}").contains("hunter2"));
+        assert_eq!(
+            serde_json::from_str::<Response>(
+                r#"{"type":"clipboard","id":4,"result":"refused","why":"secure_input"}"#
+            )
+            .unwrap(),
+            Response::Clipboard {
+                id: 4,
+                result: ClipboardResult::Refused,
+                text: None,
+                why: Some(ClipboardWhy::SecureInput)
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(
+                r#"{"type":"input_open","alive":true,"text":true,"clipboard":true}"#
+            )
+            .unwrap(),
+            Response::InputOpen {
+                alive: true,
+                text: true,
+                clipboard: true
+            }
         );
     }
 }
