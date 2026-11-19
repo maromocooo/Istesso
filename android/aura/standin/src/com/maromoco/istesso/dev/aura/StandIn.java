@@ -11,6 +11,20 @@ public final class StandIn implements Picture.Told {
     public void decoder(String name, boolean low) {}
     public void over(String why) { System.out.println(t() + " panel: over: " + why); }
     public static void main(String[] a) throws Exception {
+        if (a.length >= 4 && a[3].equals("pair")) {
+            // A test device joins the host showing a code. The code comes on standard input, from
+            // the program that read it off the host, and is never printed. The host's id goes to
+            // the file named third.
+            String code = new java.io.BufferedReader(new java.io.InputStreamReader(System.in)).readLine();
+            String[] joined = Native.pairJoin(a[0], a[1], code == null ? "" : code.trim(), "aura-standin-test");
+            if (joined == null) {
+                System.out.println(t() + " pairing failed: " + Native.lastError(Native.ERROR_PAIRING));
+                System.exit(1);
+            }
+            java.nio.file.Files.writeString(java.nio.file.Path.of(a[2]), joined[0]);
+            System.out.println(t() + " paired");
+            System.exit(0);
+        }
         if (a.length >= 4 && a[3].equals("text")) {
             text(a[0], a[1], a[2]);
             return;

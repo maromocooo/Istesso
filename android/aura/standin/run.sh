@@ -8,6 +8,9 @@
 #   android/aura/standin/run.sh CONFIG_DIR HOST:PORT PEER_ID_FILE SECONDS
 #   android/aura/standin/run.sh CONFIG_DIR HOST:INPUT_PORT PEER_ID_FILE text
 #                                    the input's connection, and made-up committed text
+#   android/aura/standin/run.sh CONFIG_DIR HOST[:PORT] PEER_ID_FILE pair < code
+#                                    a test device joins the host showing a code (read from
+#                                    standard input, never printed); the host's id goes to the file
 #
 # CONFIG_DIR: a test device's identity and paired devices (`picture pair`), never this Mac's own;
 # PEER_ID_FILE: a file that holds the paired host's id. Nothing here prints a key or an address.
@@ -22,4 +25,4 @@ rm -rf "$classes" && mkdir -p "$classes"
 "$java_home/bin/javac" -d "$classes" $(find "$here/stubs" "$here/src" -name '*.java') \
     "$repo/android/aura/src/com/maromoco/istesso/dev/aura/Picture.java" "$repo/android/aura/src/com/maromoco/istesso/dev/aura/Native.java"
 exec "$java_home/bin/java" --enable-native-access=ALL-UNNAMED -Djava.library.path="$repo/target/debug" -cp "$classes" \
-    com.maromoco.istesso.dev.aura.StandIn "$1" "$2" "$(cat "$3")" "$4"
+    com.maromoco.istesso.dev.aura.StandIn "$1" "$2" "$([ "$4" = pair ] && echo "$3" || cat "$3")" "$4"
