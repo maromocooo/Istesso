@@ -161,13 +161,13 @@ do_pair_line() {
 
 do_open() {
     [ $# -ge 1 ] || { echo "usage: scripts/daily-mac.sh open APP [--display] [--for aura] [--size WxH] [--fps N] [--slot N]"; exit 2; }
-    local app=$1 display="" for_whom="" size=${SIZE:-1720x720} fps="" slot=""
+    local app=$1 display="" for_whom="" size=${SIZE:-1720x720} fps="" slot="" size_given=${SIZE:+1}
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
             --display) display=1; shift ;;
             --for) for_whom=${2:-}; shift 2 ;;
-            --size) size=${2:-}; shift 2 ;;
+            --size) size=${2:-}; size_given=1; shift 2 ;;
             --fps) fps=${2:-}; shift 2 ;;
             --slot) slot=${2:-}; shift 2 ;;
             *) echo "error: unknown: $1"; exit 2 ;;
@@ -185,8 +185,10 @@ do_open() {
     mkdir -p "$mine"
     local frames=-
     [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="\$run/frames-\$(date +%s).jsonl"
-    local target_args
+    local target_args size_arg="--size $size"
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$app")"; fi
+    # The whole display keeps its own shape unless a size was asked for.
+    [ -n "$display" ] && [ -z "$size_given" ] && size_arg=""
     local answer
     answer=$(on_host <<HOST
 NAME=$name; SLOT=$slot; BASE_PIC=$base_pic; BASE_IN=$base_in
@@ -203,13 +205,15 @@ if still_runs "\$run/host.pid"; then
     for i in \$(seq 1 30); do [ \$(( \$(count_said \$NAME resumed) + \$(count_said \$NAME refused) )) -gt "\$before" ] && break; [ \$(count_said \$NAME paused) -eq 0 ] && break; sleep 0.1; done
     echo "host: \$NAME runs already"
 else
+    # An agent left from an earlier run of this name may listen on another slot's port: never kept.
+    stop_written_down "\$run/agent.pid"
     slot=\$SLOT
     if [ -z "\$slot" ]; then
         for n in 1 2 3; do
             taken=""
             for other in "\$D"/run/*/; do
                 o=\$(basename "\$other"); [ "\$o" = "\$NAME" ] && continue
-                still_runs "\$other/host.pid" && [ "\$(cat "\$other/slot" 2>/dev/null)" = "\$BASE_PIC:\$n" ] && taken=1
+                { still_runs "\$other/host.pid" || still_runs "\$other/agent.pid"; } && [ "\$(cat "\$other/slot" 2>/dev/null)" = "\$BASE_PIC:\$n" ] && taken=1
             done
             [ -z "\$taken" ] && { slot=\$n; break; }
         done
@@ -217,35 +221,42 @@ else
     [ -n "\$slot" ] || { echo "fail three are open already: close one first"; exit 0; }
     echo "\$BASE_PIC:\$slot" > "\$run/slot"
     port=\$((BASE_PIC + slot)); agent_port=\$((BASE_IN + slot))
-    if ! still_runs "\$run/agent.pid"; then
+    if true; then
         XDG_RUNTIME_DIR=\$run/rt ISTESSO_CACHE_DIR=\$run/agent-cache ISTESSO_CONFIG_DIR=\$config nohup "\$D/bin/istesso" agent --port \$agent_port --no-discovery > "\$run/agent.log" 2>&1 < /dev/null &
         write_down "\$run/agent.pid" \$!
     fi
     [ -p "\$run/control" ] || mkfifo "\$run/control"
-    : > "\$run/host.log"; rm -f "\$run/host.number"
+    : > "\$run/host.log"; : > "\$run/host.err"; rm -f "\$run/host.number"
     set -- $target_args --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        --size $size --fps $fps --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg --fps $fps --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
-        nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2>&1 < /dev/null &
+        nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else
-        open -n -g --stdout "\$run/host.log" --stderr "\$run/host.log" "\$D/$bundle_name" --args "\$@"
+        open -n -g --stdout "\$run/host.log" --stderr "\$run/host.err" "\$D/$bundle_name" --args "\$@"
     fi
     for i in \$(seq 1 50); do [ -s "\$run/host.number" ] && break; sleep 0.2; done
     [ -s "\$run/host.number" ] && write_down "\$run/host.pid" "\$(cat "\$run/host.number")"
     for i in \$(seq 1 75); do grep -q '"istesso":"\(ready\|refused\)"' "\$run/host.log" && break; sleep 0.2; done
     if grep -q '"istesso":"refused"' "\$run/host.log"; then
         echo "fail \$(grep '"istesso":"refused"' "\$run/host.log" | head -1)"
+        stop_written_down "\$run/host.pid"
         stop_written_down "\$run/agent.pid"
         exit 0
     fi
-    grep -q '"istesso":"ready"' "\$run/host.log" || { echo "fail the host program did not say that it is ready (see \$run/host.log)"; exit 0; }
+    if ! grep -q '"istesso":"ready"' "\$run/host.log"; then
+        echo "fail the host program did not say that it is ready (see \$run/host.log and host.err)"
+        stop_written_down "\$run/host.pid"
+        stop_written_down "\$run/agent.pid"
+        exit 0
+    fi
     echo "host: \$NAME opened in slot \$slot"
 fi
 echo "slot \$slot"
+echo "size \$(sed -n 's/.*"istesso":"ready".*"size":"\([0-9]*x[0-9]*\)".*/\1/p' "\$run/host.log" | tail -1)"
 echo "peer \$(ISTESSO_CONFIG_DIR=\$config "\$D/bin/istesso" id 2>/dev/null | awk '/^Fingerprint/ {print \$2}')"
 HOST
 )
-    printf '%s\n' "$answer" | grep -v '^\(slot\|peer\|fail\) ' | grep .
+    printf '%s\n' "$answer" | grep -v '^\(slot\|peer\|size\|fail\) ' | grep .
     if printf '%s\n' "$answer" | grep -q '^fail '; then
         printf '%s\n' "$answer" | sed -n 's/^fail //p' | head -1
         return 1
@@ -253,6 +264,13 @@ HOST
     local peer
     slot=$(printf '%s\n' "$answer" | sed -n 's/^slot //p' | tail -1)
     peer=$(printf '%s\n' "$answer" | sed -n 's/^peer //p' | tail -1)
+    local shown
+    shown=$(printf '%s\n' "$answer" | sed -n 's/^size //p' | tail -1)
+    # The window here has the picture's shape, at most 1720 points wide.
+    if [ -n "$display" ] && [ -z "$size_given" ] && [[ "$shown" =~ ^[0-9]+x[0-9]+$ ]]; then
+        local pw=${shown%x*} ph=${shown#*x}
+        if [ "$pw" -gt 1720 ]; then size="1720x$((ph * 1720 / pw))"; else size=$shown; fi
+    fi
     [ -n "$slot" ] && [ -n "$peer" ] || { echo "error: the host did not start $name"; return 1; }
     if [ "$for_whom" = aura ]; then
         echo "$name: for AURA on picture port $((base_pic + slot)), input port $((base_in + slot)) (4:2:0, $size, $fps a second)"

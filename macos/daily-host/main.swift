@@ -376,6 +376,13 @@ final class Pump {
     private var keyWanted = true
     private var inFlight = false
     private var lastEncodeNs: UInt64 = 0
+    /// One more for every encoder opened: a frame of an encoder that was given back is not taken.
+    private var generation = 0
+    /// The generation that may send now (0: none), for the encoder's own thread.
+    private let liveLock = NSLock()
+    private var live = 0
+    private func setLive(_ value: Int) { liveLock.lock(); live = value; liveLock.unlock() }
+    private func isLive(_ value: Int) -> Bool { liveLock.lock(); defer { liveLock.unlock() }; return live == value }
     private(set) var running = false
     // Counts for the line a second.
     private var captured = 0, encoded = 0, dropped = 0, sentFrames = 0, fillers = 0, failed = 0
@@ -395,11 +402,18 @@ final class Pump {
         do {
             let made = try Encoder(width: width, height: height, settings: settings)
             if !made.refused.isEmpty { note("the encoder refused: \(made.refused.joined(separator: ", "))") }
+            generation += 1
             encoder = made
             running = true
             keyWanted = true
+            inFlight = false
+            fresh = false
+            lastEncodeNs = 0
+            setLive(generation)
             return nil
         } catch {
+            running = false
+            encoder = nil
             return "\(error)"
         }
     }
@@ -407,7 +421,10 @@ final class Pump {
     /// Gives the encoder back (on the pump's queue).
     func close() {
         running = false
+        generation += 1
+        setLive(0)
         encoder = nil
+        inFlight = false
         last = nil
         fresh = false
     }
@@ -422,7 +439,8 @@ final class Pump {
         }
         if fresh { dropped += 1 }  // the one kept before was never encoded
         last = buffer
-        lastPts = displayNs
+        // Never backwards: a filler took the time it was made.
+        lastPts = max(displayNs, lastPts + 1)
         fresh = true
         if !inFlight { encodeLast(filler: false) }
     }
@@ -437,7 +455,7 @@ final class Pump {
         if fresh {
             encodeLast(filler: false)
         } else if keyWanted || now - lastEncodeNs >= awake {
-            lastPts = now
+            lastPts = max(now, lastPts + 1)
             encodeLast(filler: true)
         }
     }
@@ -455,13 +473,15 @@ final class Pump {
         inFlight = true
         if filler { fillers += 1 }
         let pts = lastPts
+        let mine = generation
         let handed = nowNs()
         lastEncodeNs = handed
         let status = encoder.encode(buffer, ptsNs: pts, key: key) { [weak self] frame, isKey, status in
             let done = nowNs()
             guard let self else { return }
             var sent: IstessoMediaSent?
-            if let frame {
+            // A frame of an encoder that has been given back since goes nowhere.
+            if let frame, self.isLive(mine) {
                 sent = self.transport.send(frame, pts: pts, encoded: done, key: isKey)
             }
             let written = nowNs()
@@ -472,8 +492,9 @@ final class Pump {
                 }
             }
             self.queue.async {
+                guard self.generation == mine, self.running else { return }
                 self.inFlight = false
-                if frame == nil {
+                if frame == nil || sent == nil {
                     self.failed += 1
                     self.keyWanted = true
                     if status == kVTInvalidSessionErr { self.reopen() }
@@ -501,8 +522,14 @@ final class Pump {
 
     /// The encoder went away underneath (after the Mac slept, for one): a new one.
     private func reopen() {
+        guard running else { return }
         note("the encoder's session became invalid; opening a new one")
-        if let why = open() { note("no new encoder: \(why)") }
+        let keep = last
+        if let why = open() {
+            note("no new encoder: \(why)")
+            say("refused", [("word", "encode"), ("reason", "no encoder could be opened again: \(why); the picture stays stopped")])
+        }
+        last = keep
     }
 
     func resumed(asked: UInt64) {
@@ -659,6 +686,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
 // MARK: - The application and its windows
 
+/// Pixels of a display's current mode for one of its points (2 on a Retina display).
+func pixelsPerPoint(_ display: CGDirectDisplayID) -> Double {
+    guard let mode = CGDisplayCopyDisplayMode(display), mode.width > 0 else { return 1 }
+    return Double(mode.pixelWidth) / Double(mode.width)
+}
+
 struct WindowInfo {
     let id: CGWindowID
     let pid: pid_t
@@ -761,10 +794,19 @@ final class Injector {
         }
         if pressed { keysDown.insert(code) } else { keysDown.remove(code) }
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: virtual, keyDown: pressed) else { return }
-        event.flags = flags
+        withHeld(event)
+        // Posted to a process, a modifier key is not turned into a change of the modifiers by
+        // anything on the way: it is made one here.
+        if modifierFlag(code) != nil { event.type = .flagsChanged }
         if pressed { log("{\"kind\":\"key_in\",\"t_ns\":\(nowNs())}") }
         event.postToPid(pid)
         count("key")
+    }
+
+    /// The modifiers held now, in place of the ones the event source set; its other flags (the
+    /// keypad's and Fn's, for arrows and function keys) stay.
+    private func withHeld(_ event: CGEvent) {
+        event.flags = event.flags.subtracting([.maskShift, .maskControl, .maskAlternate, .maskCommand, .maskAlphaShift]).union(flags)
     }
 
     private func otherHeld(_ flag: CGEventFlags, besides code: UInt32) -> Bool {
@@ -782,7 +824,7 @@ final class Injector {
         guard let window = windowAt(place) else { return count("dropped_no_window") }
         let pid = window.pid
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: place, mouseButton: button) else { return }
-        event.flags = flags
+        withHeld(event)
         aim(event, at: window)
         event.postToPid(pid)
         count("move")
@@ -833,7 +875,7 @@ final class Injector {
             if settings.clickForm == 2 { event?.location = point }
         }
         guard let event else { return count("unmade_click") }
-        event.flags = flags
+        withHeld(event)
         event.postToPid(pid)
         count("button")
     }
@@ -844,7 +886,7 @@ final class Injector {
         // The other side says how far to scroll; the Mac, how far the content moves.
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: -dy, wheel2: -dx, wheel3: 0) else { return }
         event.location = point
-        event.flags = flags
+        withHeld(event)
         aim(event, at: window)
         event.postToPid(pid)
         count("scroll")
@@ -966,7 +1008,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             let (w, h) = settings.size ?? (1280, 720)
             guard listen(width: w, height: h) else { return }
             injector.target = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
-            injector.windowAt = { _ in WindowInfo(id: 0, pid: 0, layer: 0, bounds: .zero, alpha: 1, onScreen: true) }
+            injector.windowAt = { _ in nil }  // nothing to point at: the input is only counted
             openPicture { why in self.started(why) }
             return
         }
@@ -978,13 +1020,19 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     return self.quit(1)
                 }
                 self.display = display
-                let pixelsPerPoint = Double(CGDisplayPixelsWide(display.displayID)) / Double(max(1, display.width))
-                let native = (Int(Double(display.width) * pixelsPerPoint) & ~1, Int(Double(display.height) * pixelsPerPoint) & ~1)
-                let (w, h) = settings.size ?? native
+                let density = pixelsPerPoint(display.displayID)
+                let native = (Int(Double(display.width) * density) & ~1, Int(Double(display.height) * density) & ~1)
+                // Not more than 2560 pixels wide unless asked: a 5K display would take the encoder
+                // several times as long.
+                let capped = native.0 > 2560 ? (2560, Int(Double(native.1) * 2560 / Double(native.0)) & ~1) : native
+                let (w, h) = settings.size ?? capped
                 guard self.listen(width: w, height: h) else { return }
+                // The display keeps its shape in the picture: black bars where the shapes differ.
                 let frame = display.frame
-                self.injector.origin = frame.origin
-                self.injector.scale = frame.width / Double(w)
+                let k = min(Double(w) / frame.width, Double(h) / frame.height)
+                let barX = (Double(w) - frame.width * k) / 2, barY = (Double(h) - frame.height * k) / 2
+                self.injector.origin = CGPoint(x: frame.minX - barX / k, y: frame.minY - barY / k)
+                self.injector.scale = 1 / k
                 // Keys go to the application in front; the pointer to the window under it, in its process.
                 self.injector.target = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
                 self.injector.windowAt = { [weak self] point in self?.topWindow(at: point) }
@@ -1051,6 +1099,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     func lookAtApp() {
         guard let app else { return }
         if app.isTerminated {
+            for timer in timers { timer.cancel() }
+            timers.removeAll()
+            self.app = nil
             say("empty")
             stopPicture(offered: false) {}
             return quit(0)
@@ -1118,17 +1169,30 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     func place(_ window: WindowInfo) {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
             DispatchQueue.main.async {
-                guard let content, let app = self.app else { return }
                 let center = CGPoint(x: window.bounds.midX, y: window.bounds.midY)
-                guard let display = content.displays.first(where: { $0.frame.contains(center) }) ?? content.displays.first,
-                      let scApp = content.applications.first(where: { $0.processID == app.processIdentifier }) else { return }
-                let pixelsPerPoint = Double(CGDisplayPixelsWide(display.displayID)) / Double(max(1, display.width))
-                let fit = min(pixelsPerPoint, Double(self.width) / window.bounds.width, Double(self.height) / window.bounds.height)
-                let rect = CGRect(x: window.bounds.minX - display.frame.minX, y: window.bounds.minY - display.frame.minY,
-                                  width: Double(self.width) / fit, height: Double(self.height) / fit)
-                self.injector.origin = window.bounds.origin
+                guard let content, let app = self.app,
+                      let display = content.displays.first(where: { $0.frame.contains(center) }) ?? content.displays.first,
+                      let scApp = content.applications.first(where: { $0.processID == app.processIdentifier }) else {
+                    self.windowBounds = .zero  // looked at again on the next round
+                    return
+                }
+                // The window fills the picture (its shape kept); the part of the display read is the
+                // picture's shape, from the window's top left, kept inside the display.
+                let W = Double(self.width), H = Double(self.height)
+                var fit = min(W / window.bounds.width, H / window.bounds.height)
+                var rect = CGRect(x: window.bounds.minX - display.frame.minX, y: window.bounds.minY - display.frame.minY,
+                                  width: W / fit, height: H / fit)
+                let room = CGSize(width: display.frame.width, height: display.frame.height)
+                if rect.width > room.width || rect.height > room.height {
+                    fit = max(W / room.width, H / room.height)
+                    rect.size = CGSize(width: W / fit, height: H / fit)
+                }
+                rect.origin.x = max(0, min(rect.origin.x, room.width - rect.width))
+                rect.origin.y = max(0, min(rect.origin.y, room.height - rect.height))
+                self.injector.origin = CGPoint(x: rect.minX + display.frame.minX, y: rect.minY + display.frame.minY)
                 self.injector.scale = 1 / fit
                 self.scApplication = scApp
+                self.captureRect = rect
                 let configuration = Capture.configuration(width: self.width, height: self.height, sourceRect: rect)
                 let filter = SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
                 if let capture = self.capture, self.display?.displayID == display.displayID {
@@ -1139,7 +1203,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     capture.update(configuration)
                 } else {
                     self.display = display
-                    if self.picture == "running" {
+                    if self.picture == "running" && !self.opening {
                         self.openPicture { why in self.started(why) }
                     }
                 }
@@ -1149,6 +1213,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    /// The part of the display the application's picture is read from (its points, from its top
+    /// left); set by place().
+    var captureRect: CGRect?
 
     var started = false
     func started(_ why: String?) {
@@ -1164,11 +1232,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     // ---- The picture ----
 
     /// Opens the encoder and starts capturing (on the main thread).
-    func openPicture(done: @escaping (String?) -> Void) {
+    var opening = false
+    func openPicture(resumeAsked: UInt64? = nil, done: @escaping (String?) -> Void) {
+        opening = true
+        let done: (String?) -> Void = { why in self.opening = false; done(why) }
         pump.queue.async {
             if let why = self.pump.open() {
                 return DispatchQueue.main.async { done("no encoder could be opened: \(why)") }
             }
+            if let asked = resumeAsked { self.pump.resumed(asked: asked) }
             DispatchQueue.main.async {
                 if settings.generated {
                     let source = Generated(width: self.width, height: self.height)
@@ -1183,11 +1255,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 var rect: CGRect?
                 if self.app != nil {
                     // Only the application's windows; other applications are not in the picture.
-                    guard let scApp = self.scApplication else { return done(nil) }  // placed later
+                    guard let scApp = self.scApplication, let placed = self.captureRect else { return done(nil) }  // placed later
                     filter = SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
-                    let fit = 1 / self.injector.scale
-                    rect = CGRect(x: self.windowBounds.minX - display.frame.minX, y: self.windowBounds.minY - display.frame.minY,
-                                  width: Double(self.width) / fit, height: Double(self.height) / fit)
+                    rect = placed
                 } else {
                     filter = SCContentFilter(display: display, excludingWindows: [])
                 }
@@ -1225,6 +1295,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         if let capture { capture.stop(done: finish) } else { finish() }
     }
 
+    /// A resume that came while the picture was stopping.
+    var again = false
+    func stopped() {
+        picture = "paused"
+        if again {
+            again = false
+            word("resume")
+        }
+    }
+
     // ---- Words ----
 
     func startControl() {
@@ -1254,18 +1334,22 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let words = line.split(separator: " ").map(String.init)
         switch words.first {
         case "pause":
+            again = false
+            if picture == "stopping" { return }  // answered when it has stopped
             guard picture == "running" else { return say("paused", [("offered", offered), ("took_ms", 0.0)]) }
-            picture = "paused"
-            stopPicture(offered: true) {}
+            picture = "stopping"
+            stopPicture(offered: true) { self.stopped() }
         case "detach":
             detached = true
-            guard picture == "running" else {
+            again = false
+            if picture != "running" {
                 transport.offer(false)
                 offered = false
-                return say("paused", [("offered", false), ("took_ms", 0.0)])
+                if picture == "paused" { say("paused", [("offered", false), ("took_ms", 0.0)]) }
+                return
             }
-            picture = "paused"
-            stopPicture(offered: false) {}
+            picture = "stopping"
+            stopPicture(offered: false) { self.stopped() }
         case "resume":
             guard !heldForSignal else {
                 return say("refused", [("word", "resume"), ("reason", "a latency measurement runs on this Mac; the picture comes back when it is over")])
@@ -1273,16 +1357,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             detached = false
             transport.offer(true)
             offered = true
+            if picture == "stopping" { again = true; return }  // resumed once it has stopped
             guard picture == "paused" else { return }
             picture = "running"
             let asked = nowNs()
-            openPicture { why in
+            if app != nil { windowBounds = .zero }  // looked at again: places the capture anew
+            openPicture(resumeAsked: asked) { why in
                 if let why {
                     self.picture = "paused"
                     return say("refused", [("word", "resume"), ("reason", why)])
                 }
-                self.pump.queue.async { self.pump.resumed(asked: asked) }
-                if self.app != nil { self.windowBounds = .zero }  // places the capture again
             }
         case "admit":
             if words.count == 3 {
@@ -1399,7 +1483,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.heldForSignal = true
                 note("a latency measurement runs on this Mac: the picture stops until it is over")
                 self.resumeAfterSignal = self.picture == "running"
-                if self.picture == "running" { self.word("detach") } else { self.transport.offer(false); self.detached = true }
+                self.word("detach")
             } else if !busy && self.heldForSignal {
                 self.heldForSignal = false
                 if self.resumeAfterSignal {
