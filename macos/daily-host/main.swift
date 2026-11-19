@@ -2233,8 +2233,10 @@ final class Injector {
     var onClose: ((UInt32) -> Void)?
     var onFocusWindow: ((UInt32) -> Void)?
     var windowPlace: (UInt32) -> (origin: CGPoint, scale: Double)? = { _ in nil }
-    /// The window whose picture the last pointer position was in (1: the first).
+    /// The window whose picture the last pointer position was in (1: the first), and whether that
+    /// was a window not listed (nowhere).
     private(set) var pointerWindow: UInt32 = 1
+    private var pointerNowhere = false
     func beginHold() { holdingForChord = true }
     func endHold(flush: Bool) {
         holdingForChord = false
@@ -2416,21 +2418,29 @@ final class Injector {
             key(code, pressed)
         case "pointer_at":
             guard let x = (object["x"] as? NSNumber)?.doubleValue, let y = (object["y"] as? NSNumber)?.doubleValue else { return count("unreadable") }
-            if onWindows != nil, let number = (object["window"] as? NSNumber)?.uint32Value, number > 1 {
-                // In another window's picture (windows.swift); a number not listed goes nowhere.
-                guard let place = windowPlace(number) else { return count("dropped_unknown_window") }
-                pointerWindow = number
-                return moved(to: CGPoint(x: place.origin.x + x * place.scale, y: place.origin.y + y * place.scale))
+            // In the first window's picture, or (windows.swift) in another listed window's; a number
+            // not listed is nowhere: no press and no scroll goes until the pointer is somewhere again.
+            let number = onWindows != nil ? (object["window"] as? NSNumber)?.uint32Value : nil
+            switch pointerTarget(x: x, y: y, window: number, first: (origin, scale), place: windowPlace) {
+            case let .at(place, window):
+                pointerWindow = window
+                pointerNowhere = false
+                moved(to: place)
+            case let .nowhere(window):
+                pointerWindow = window
+                pointerNowhere = true
+                count("dropped_unknown_window")
             }
-            pointerWindow = 1
-            moved(to: CGPoint(x: origin.x + x * scale, y: origin.y + y * scale))
         case "button":
             guard let code = (object["code"] as? NSNumber)?.uint32Value, let pressed = object["pressed"] as? Bool else { return count("unreadable") }
+            // Nowhere: only the release of a button that is down goes (at the last place).
+            guard !pointerNowhere || passesNowhere(pressed: pressed, held: buttonsDown.contains(code)) else { return count("dropped_nowhere") }
             button(code, pressed)
         case "scroll":
             // Bounded before anything is done with them: Int32's least value has no opposite.
             guard let rawX = (object["dx"] as? NSNumber)?.doubleValue, let rawY = (object["dy"] as? NSNumber)?.doubleValue,
                   rawX.isFinite, rawY.isFinite, abs(rawX) <= 10_000, abs(rawY) <= 10_000 else { return count("unreadable") }
+            guard !pointerNowhere else { return count("dropped_nowhere") }
             let dx = Int32(rawX), dy = Int32(rawY)
             let numbers = { (key: String) -> [Double]? in
                 guard let list = object[key] as? [NSNumber], list.count == 2 else { return nil }

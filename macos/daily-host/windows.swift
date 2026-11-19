@@ -149,6 +149,25 @@ func windowListJSON(serial: UInt32, _ windows: [ListedWindow]) -> String {
     return text
 }
 
+/// Where a pointer position in a picture goes: a place on the screen and the window it is in (1:
+/// the first), or nowhere (a window number that is not listed).
+enum PointerTarget: Equatable {
+    case at(CGPoint, window: UInt32)
+    case nowhere(UInt32)
+}
+
+/// `window` nil, 0 or 1: the first window's picture (`first`), as without --windows; 2 and up:
+/// the listed window's (`place`), or nowhere when it is not listed.
+func pointerTarget(x: Double, y: Double, window: UInt32?, first: (origin: CGPoint, scale: Double),
+                   place: (UInt32) -> (origin: CGPoint, scale: Double)?) -> PointerTarget {
+    guard let window, window > 1 else { return .at(CGPoint(x: first.origin.x + x * first.scale, y: first.origin.y + y * first.scale), window: 1) }
+    guard let p = place(window) else { return .nowhere(window) }
+    return .at(CGPoint(x: p.origin.x + x * p.scale, y: p.origin.y + y * p.scale), window: window)
+}
+
+/// While the pointer is nowhere, a button event goes only when it releases a button that is down.
+func passesNowhere(pressed: Bool, held: Bool) -> Bool { !pressed && held }
+
 /// A window's picture size: its points at the density of its display, even, 64 to 3840 x 2160.
 func extraPictureSize(_ bounds: CGRect, density: Double) -> (Int, Int) {
     (max(64, min(3840, Int(bounds.width * density)) & ~1), max(64, min(2160, Int(bounds.height * density)) & ~1))
@@ -618,6 +637,16 @@ func windowsSelfTest() -> Int {
     }
     check(extraPictureSize(CGRect(x: 0, y: 0, width: 600, height: 401), density: 2) == (1200, 802), "a window's picture at its display's density")
     check(extraPictureSize(CGRect(x: 0, y: 0, width: 20, height: 3000), density: 2) == (64, 2160), "within 64 and 3840 x 2160")
+    // Review 2: a position in a window that is not listed goes nowhere, and the next press with it.
+    let firstPlace = (origin: CGPoint(x: 100, y: 50), scale: 0.5)
+    let listed: (UInt32) -> (origin: CGPoint, scale: Double)? = { $0 == 2 ? (CGPoint(x: 400, y: 300), 0.5) : nil }
+    check(pointerTarget(x: 10, y: 20, window: nil, first: firstPlace, place: listed) == .at(CGPoint(x: 105, y: 60), window: 1),
+          "without a number: the first window, as before")
+    check(pointerTarget(x: 10, y: 20, window: 2, first: firstPlace, place: listed) == .at(CGPoint(x: 405, y: 310), window: 2),
+          "a listed window's picture")
+    check(pointerTarget(x: 10, y: 20, window: 9, first: firstPlace, place: listed) == .nowhere(9), "a number not listed is nowhere")
+    check(!passesNowhere(pressed: true, held: false) && passesNowhere(pressed: false, held: true) && !passesNowhere(pressed: false, held: false),
+          "nowhere: no press; only the release of a button that is down")
     // Review 9: without --windows Accessibility is asked nothing more than before.
     check(!axAsksTitle(windows: false) && axAsksTitle(windows: true), "a window's title is read only with --windows")
     return failed
