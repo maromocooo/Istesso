@@ -92,6 +92,26 @@ static inline PasteKind clipboard_paste_kind(NSArray<NSString *> *types, NSStrin
     return strcmp(problem, "too_large") == 0 ? PASTE_TOO_LARGE : PASTE_NOT_TEXT;
 }
 
+// What a paste takes from `board` (the general pasteboard in the window, in answer to the Edit
+// menu's Paste; a pasteboard of its own in clipboard-test): the markers are looked at before any
+// text is read, and what is marked secret is not read. `*text` is set only for PASTE_WITH_TEXT.
+static inline PasteKind clipboard_read_paste(NSPasteboard *board, NSString **text) {
+    NSMutableArray<NSString *> *types = [NSMutableArray array];
+    for (NSPasteboardItem *item in board.pasteboardItems) {
+        [types addObjectsFromArray:item.types];
+    }
+    PasteKind kind = clipboard_paste_kind(types, nil);
+    *text = nil;
+    if (kind != PASTE_SECRET) {
+        NSString *found = [board stringForType:NSPasteboardTypeString];
+        kind = clipboard_paste_kind(types, found);
+        if (kind == PASTE_WITH_TEXT) {
+            *text = found;
+        }
+    }
+    return kind;
+}
+
 // The line shown in the window's title for a while, or nil for none. `cut`: the request was a
 // cut. For a paste (`result` "paste:secret" and the like, from this side) as well as for the
 // host's answers.

@@ -1701,18 +1701,8 @@ static void clipboard_ask(char which) {
     uint32_t id = clipboard_next_id++;
     NSMutableDictionary *request = [@{@"id": @(id), @"nonce": @(clipboard_nonce)} mutableCopy];
     if (which == 'v') {
-        NSPasteboard *board = NSPasteboard.generalPasteboard;
-        // The markers are looked at before any text is read: what is marked secret is not read.
-        NSMutableArray<NSString *> *types = [NSMutableArray array];
-        for (NSPasteboardItem *item in board.pasteboardItems) {
-            [types addObjectsFromArray:item.types];
-        }
-        PasteKind kind = clipboard_paste_kind(types, nil);
         NSString *text = nil;
-        if (kind != PASTE_SECRET) {
-            text = [board stringForType:NSPasteboardTypeString];
-            kind = clipboard_paste_kind(types, text);
-        }
+        PasteKind kind = clipboard_read_paste(NSPasteboard.generalPasteboard, &text);
         switch (kind) {
         case PASTE_SECRET: clipboard_show(clipboard_note("paste:secret", NULL, NO)); return;
         case PASTE_TOO_LARGE: clipboard_show(clipboard_note("paste:too_large", NULL, NO)); return;
@@ -2090,15 +2080,53 @@ static NSCursor *empty_cursor(void) {
     [self send:changes count:keys_key_up(&_keys, event.keyCode, event.modifierFlags, changes)];
 }
 
-// Keys with Command come here first; they all go to the other side.
+// Keys with Command come here first; they all go to the other side, but for Command-V while the
+// host takes copy and paste.
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
     // Only for the window that is typed into: a key equivalent can reach a window that is not
     // (review of ADR 0022's code), and Command-C there must not copy from the host.
     if (self.window.firstResponder != self || !self.window.isKeyWindow) {
         return NO;
     }
+    if (clipboard_on && host_takes_clipboard &&
+        clipboard_key(event.keyCode, event.charactersIgnoringModifiers, event.modifierFlags) == 'v') {
+        // Not taken here: it goes on to the Edit menu's Paste (paste:, below), so that this
+        // Mac's pasteboard is read in answer to a paste-related control, as macOS's pasteboard
+        // privacy asks ("input on a UI element that the system considers paste-related"). Without
+        // the menu the key comes to keyDown:, which asks as before.
+        return NO;
+    }
     [self keyDown:event];
     return YES;
+}
+
+// The Edit menu's Paste, by Command-V (or a click on it): the paste goes to the host with what
+// this Mac's pasteboard has. The key itself does not go, nor its repeats and its release.
+- (void)paste:(id)sender {
+    (void)sender;
+    if (!(clipboard_on && host_takes_clipboard) || self.window.firstResponder != self) {
+        return;
+    }
+    NSEvent *event = NSApp.currentEvent;
+    if (event.type == NSEventTypeKeyDown) {
+        if (_taken == nil) {
+            _taken = [NSMutableIndexSet indexSet];
+        }
+        [_taken addIndex:event.keyCode];
+        if (event.isARepeat) {
+            return;
+        }
+    }
+    if (!picture_stale) {
+        clipboard_ask('v');
+    }
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.action == @selector(paste:)) {
+        return clipboard_on && host_takes_clipboard && self.window.firstResponder == self && self.window.isKeyWindow;
+    }
+    return NO;
 }
 
 - (void)flagsChanged:(NSEvent *)event {
@@ -2622,6 +2650,20 @@ static GstBusSyncReply on_message(GstBus *bus, GstMessage *message, gpointer use
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--pasteboard-access") == 0) {
+            // Says how macOS lets this application read the general pasteboard (its pasteboard
+            // privacy, macOS 15.4 and later) and ends. Reads nothing of the pasteboard: neither
+            // its contents nor its types nor its change count. No window, no menu.
+            NSPasteboard *board = NSPasteboard.generalPasteboard;
+            if (@available(macOS 15.4, *)) {
+                long behavior = (long)board.accessBehavior;
+                const char *names[] = {"default (asks at the first programmatic read)", "ask", "always allow", "always deny"};
+                printf("pasteboard access: %ld %s\n", behavior, behavior >= 0 && behavior <= 3 ? names[behavior] : "(unknown)");
+            } else {
+                printf("pasteboard access: not reported before macOS 15.4\n");
+            }
+            return 0;
+        }
         gst_init(&argc, &argv);
         if (argc < 7 || argc > 10) {
             fprintf(stderr, "usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE [FRAME_LOG [KEY_REQUEST_PORT [INPUT_SOCKET]]]\n");
@@ -2679,6 +2721,19 @@ int main(int argc, char *argv[]) {
             fclose(file);
         }
         [NSApplication sharedApplication];
+        if (getenv("ISTESSO_CLIPBOARD") != NULL) {
+            // An Edit menu with Paste on Command-V (sent to the window's view: paste:). See
+            // performKeyEquivalent: of InputView. The first item is the application's own menu.
+            NSMenu *bar = [NSMenu new];
+            NSMenuItem *own = [NSMenuItem new];
+            own.submenu = [NSMenu new];
+            [bar addItem:own];
+            NSMenuItem *edit = [NSMenuItem new];
+            edit.submenu = [[NSMenu alloc] initWithTitle:@"編集"];
+            [edit.submenu addItemWithTitle:@"ペースト" action:@selector(paste:) keyEquivalent:@"v"];
+            [bar addItem:edit];
+            NSApp.mainMenu = bar;
+        }
         if (no_window) {
             [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
         } else if (dock_tile != NULL && strcmp(dock_tile, "none") == 0) {

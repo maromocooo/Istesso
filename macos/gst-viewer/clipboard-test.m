@@ -76,6 +76,30 @@ int main(void) {
         CHECK([clipboard_note("paste:secret", NULL, NO) containsString:@"秘密の印"]);
         CHECK(![clipboard_note("paste:secret", NULL, NO) isEqual:clipboard_note("refused", "password_field", NO)]);
         CHECK(clipboard_note("later", NULL, NO) != nil);
+
+        // Reading a paste: only from a pasteboard of this test's own, never the general one
+        // (the person uses it all the time).
+        NSPasteboard *board = [NSPasteboard pasteboardWithUniqueName];
+        CHECK(![board.name isEqual:NSPasteboardNameGeneral]);
+        NSString *text = @"left over";
+        [board clearContents];
+        CHECK(clipboard_read_paste(board, &text) == PASTE_KEY_ONLY && text == nil);
+        [board clearContents];
+        [board setString:@"二行の\n文字" forType:NSPasteboardTypeString];
+        CHECK(clipboard_read_paste(board, &text) == PASTE_WITH_TEXT && [text isEqual:@"二行の\n文字"]);
+        [board clearContents];
+        NSPasteboardItem *secret = [NSPasteboardItem new];
+        [secret setString:@"hunter2" forType:NSPasteboardTypeString];
+        [secret setString:@"" forType:@"org.nspasteboard.ConcealedType"];
+        [board writeObjects:@[secret]];
+        CHECK(clipboard_read_paste(board, &text) == PASTE_SECRET && text == nil);
+        [board clearContents];
+        [board setString:[@"" stringByPaddingToLength:CLIPBOARD_MOST_BYTES + 1 withString:@"a" startingAtIndex:0] forType:NSPasteboardTypeString];
+        CHECK(clipboard_read_paste(board, &text) == PASTE_TOO_LARGE && text == nil);
+        [board clearContents];
+        [board setString:@"bell\a" forType:NSPasteboardTypeString];
+        CHECK(clipboard_read_paste(board, &text) == PASTE_NOT_TEXT && text == nil);
+        [board releaseGlobally];
     }
     if (failures == 0) {
         printf("clipboard-test: all passed\n");
