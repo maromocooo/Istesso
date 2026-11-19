@@ -208,6 +208,35 @@ enum AdmitState: Equatable {
     case nobody
 }
 
+/// The order in which a stream is started, fail closed: listen admitting nobody first (nothing is
+/// called before), then, when it is not offered, stop offering, and only then say who may look.
+/// The native calls are passed in, so that --self-test can check the order.
+func startStream(admitting: AdmitState, offered: Bool, listenClosed: () -> Bool, offerNot: () -> Void,
+                 admitPaired: () -> Void, admitOnly: (String, String) -> Void) {
+    guard listenClosed() else { return }
+    if !offered { offerNot() }
+    switch admitting {
+    case .nobody: break
+    case .paired: admitPaired()
+    case let .only(id, key): admitOnly(id, key)
+    }
+}
+
+/// The admit state and the offer after the words that came during a restart, in order.
+func stateAfter(words: [String], admit: AdmitState, offered: Bool, detached: Bool, held: Bool) -> (AdmitState, Bool, Bool) {
+    var admit = admit, offered = offered, detached = detached
+    for line in words {
+        let w = line.split(separator: " ").map(String.init)
+        switch w.first {
+        case "admit": admit = w.count == 3 ? .only(id: w[1], key: w[2]) : .nobody
+        case "detach": detached = true; offered = false
+        case "resume" where !held: detached = false; offered = true
+        default: break
+        }
+    }
+    return (admit, offered, detached)
+}
+
 /// The native calls a stream may still take: none once it is closed. A small lock-held flag, so
 /// that a frame on the encoder's thread and the close on the main thread never overlap.
 final class Guarded {
@@ -233,21 +262,22 @@ final class Transport {
     private let guarded = Guarded()
     /// Fail closed: the host always starts admitting nobody, and is then told who is shown the
     /// picture (the remembered state), before anything else is done with it.
-    init?(settings: Settings, width: Int, height: Int, admitting: AdmitState) {
+    init?(settings: Settings, width: Int, height: Int, admitting: AdmitState, offered: Bool = true) {
         var info = IstessoMediaStreamInfo(codec: 1, width: UInt32(width), height: UInt32(height),
                                           fps: UInt32(settings.fps), chroma: settings.chroma, colour: 1)
         let bind = "\(settings.bind):\(settings.port)"
-        guard let made = istesso_media_host_listen_closed(settings.configDir, bind, &info) else {
+        var made: OpaquePointer?
+        startStream(admitting: admitting, offered: offered,
+                    listenClosed: { made = istesso_media_host_listen_closed(settings.configDir, bind, &info); return made != nil },
+                    offerNot: { _ = istesso_media_host_offer(made, 0) },
+                    admitPaired: { _ = istesso_media_host_admit_paired(made) },
+                    admitOnly: { id, key in _ = istesso_media_host_admit(made, id, key) })
+        guard let made else {
             let why = istesso_media_last_error().map { String(cString: $0) } ?? "unknown"
             note("cannot listen for paired devices: \(why)")
             return nil
         }
         native = made
-        switch admitting {
-        case .nobody: break
-        case .paired: _ = istesso_media_host_admit_paired(made)
-        case let .only(id, key): _ = istesso_media_host_admit(made, id, key)
-        }
     }
     var closed: Bool { guarded.isClosed }
     var viewers: Int { guarded.use { Int(istesso_media_host_viewers(native)) } ?? 0 }
@@ -1081,6 +1111,24 @@ func selfTest() -> Never {
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["detach"]), false, "resize: a detach during the restart is kept")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: true, wordsMeanwhile: []), false, "resize: held for a measurement, it stays stopped")
     checkPanel(restartResumes(picture: "paused", detached: false, offered: true, held: false, wordsMeanwhile: []), false, "resize: a stopped picture stays stopped")
+    func steps(_ admitting: AdmitState, offered: Bool, listens: Bool = true) -> [String] {
+        var calls: [String] = []
+        startStream(admitting: admitting, offered: offered,
+                    listenClosed: { calls.append("listen-closed"); return listens },
+                    offerNot: { calls.append("offer-0") },
+                    admitPaired: { calls.append("admit-paired") },
+                    admitOnly: { id, _ in calls.append("admit-\(id)") })
+        return calls
+    }
+    checkPanel(steps(.paired, offered: true) == ["listen-closed", "admit-paired"], true, "start: paired, after listening closed")
+    checkPanel(steps(.only(id: "a", key: "k"), offered: true) == ["listen-closed", "admit-a"], true, "start: one device, after listening closed")
+    checkPanel(steps(.nobody, offered: true) == ["listen-closed"], true, "start: nobody, nothing more")
+    checkPanel(steps(.paired, offered: false) == ["listen-closed", "offer-0", "admit-paired"], true, "start: not offered before anybody is admitted")
+    checkPanel(steps(.paired, offered: true, listens: false) == ["listen-closed"], true, "start: nothing is called when listening failed")
+    let after = stateAfter(words: ["admit a k", "detach"], admit: .paired, offered: true, detached: false, held: false)
+    checkPanel(after.0 == .only(id: "a", key: "k") && after.1 == false && after.2 == true, true, "restart: words that came meanwhile decide the state first")
+    let held = stateAfter(words: ["resume"], admit: .nobody, offered: false, detached: true, held: true)
+    checkPanel(held.1 == false && held.2 == true, true, "restart: a resume while held for a measurement does not offer")
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -2358,7 +2406,13 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 // stream ended (nobody may use it afterwards) and its port taken again.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     old.close()
-                    guard let made = Transport(settings: settings, width: w, height: h, admitting: .nobody) else {
+                    // The words that came meanwhile decide who may look and whether it is offered
+                    // BEFORE the new stream listens; it is never offered to anybody it should not be.
+                    let queued = self.wordsDuringRestart
+                    let (admit, offer, gone) = stateAfter(words: queued, admit: self.admitState, offered: self.offered,
+                                                          detached: self.detached, held: self.heldForSignal)
+                    self.admitState = admit
+                    guard let made = Transport(settings: settings, width: w, height: h, admitting: admit, offered: offer && !gone) else {
                         // The old stream is closed: every call on it does nothing now; the program ends.
                         say("refused", [("word", "resize"), ("reason", "cannot listen again for paired devices")])
                         self.restarting = false
@@ -2366,8 +2420,6 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     }
                     self.width = w
                     self.height = h
-                    // Shown to nobody and not offered until the words that came meanwhile are said.
-                    made.offer(false)
                     self.transport = made
                     made.ownCursor()
                     self.pump = Pump(transport: made, width: w, height: h)
@@ -2384,13 +2436,6 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     let resumes = restartResumes(picture: self.picture, detached: self.detached, offered: self.offered,
                                                  held: self.heldForSignal, wordsMeanwhile: words)
                     for word in words { self.word(word) }
-                    // Only now who may look, and whether the picture is offered, as they stand.
-                    switch self.admitState {
-                    case .nobody: _ = made.admit(nil, nil)
-                    case .paired: made.admitPaired()
-                    case let .only(id, key): _ = made.admit(id, key)
-                    }
-                    made.offer(self.offered && !self.detached)
                     if resumes && self.picture == "running" && !self.detached && self.offered && !self.heldForSignal {
                         self.openPicture { why in if let why { note("after the resize: \(why)") } }
                     }

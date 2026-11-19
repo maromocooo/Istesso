@@ -454,6 +454,12 @@ fn nobody_cuts_everybody_and_lets_nobody_in() {
     // Told otherwise, it is as a host that was never told.
     closed.admit(Admit::Paired);
     assert!(Viewer::connect(closed.local_addr(), &keys, &trusting.open(), None, SOON).is_ok());
+    // Told one device, that one is shown the picture; told nobody again, nobody is.
+    closed.admit(only("air", &pair.air));
+    assert!(Viewer::connect(closed.local_addr(), &keys, &trusting.open(), None, SOON).is_ok());
+    closed.admit(Admit::Nobody);
+    let again = Viewer::connect(closed.local_addr(), &keys, &trusting.open(), None, SOON);
+    assert!(matches!(again, Err(Error::NotShown)));
 }
 
 #[test]
