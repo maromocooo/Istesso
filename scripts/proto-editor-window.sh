@@ -114,12 +114,19 @@ end_all() {
 # running instance (GApplication's "open"), with the place read from the environment: it is never an
 # argument of any program. It waits (10 s at most) for the editor's bus (its address is written to
 # the file $1 when the bus starts) and for the editor to own its name there, so that it is started
-# while the editor starts, and never becomes the editor's first instance itself.
+# while the editor starts, and never becomes the editor's first instance itself. It stops waiting at
+# once when the editor's session (its process number, from run/app.pid) has ended, as when its bus
+# cannot start.
 hand_to_editor() {
+    local session=""
+    [ -s "$run/app.pid" ] && read -r session _ < "$run/app.pid"
     timeout 15 python3 -I -c '
 import os, sys, time
 from gi.repository import Gio, GLib
 deadline = time.time() + 10
+session = sys.argv[2]
+def ended():
+    return session.isdigit() and not os.path.exists("/proc/" + session)
 address = ""
 while not address and time.time() < deadline:
     try:
@@ -127,6 +134,8 @@ while not address and time.time() < deadline:
     except OSError:
         pass
     if not address:
+        if ended():
+            sys.exit(4)
         time.sleep(0.02)
 if not address:
     sys.exit(4)
@@ -138,7 +147,7 @@ def owned():
                           GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, -1, None)
     return reply.unpack()[0]
 while not owned():
-    if time.time() > deadline:
+    if time.time() > deadline or ended():
         sys.exit(5)
     time.sleep(0.02)
 app = Gio.Application(application_id="org.gnome.TextEditor", flags=Gio.ApplicationFlags.HANDLES_OPEN)
@@ -146,7 +155,7 @@ if not app.register(None) or not app.get_is_remote():
     sys.exit(3)
 app.open([Gio.File.new_for_path(os.environ["EDITOR_WINDOW_PLACE"])], "")
 app.get_dbus_connection().flush_sync(None)
-' "$1" > /dev/null 2>&1
+' "$1" "${session:-}" > /dev/null 2>&1
 }
 # Why hand_to_editor failed, from its exit status, naming the log that tells more.
 not_taken() {
