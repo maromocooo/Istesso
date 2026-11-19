@@ -30,7 +30,20 @@ cat > "$scratch/bin/record" <<'EOF'
 { printf 'argv:'; printf ' %s' "$@"; echo; env | grep '^ISTESSO_' | sort; } >> "$RECORD/$(basename "$0").log"
 sleep 3
 EOF
-chmod +x "$scratch/bin/ssh" "$scratch/bin/record"
+# open: the viewer's bundle started through LaunchServices, which passes on only what --env says
+# (nothing of this environment): its arguments are written down, and a stand-in stays a while.
+cat > "$scratch/bin/open" <<'EOF'
+#!/bin/bash
+{ printf 'argv:'; printf ' [%s]' "$@"; echo; } >> "$RECORD/open.log"
+pidfile=""
+prev=""
+for a in "$@"; do [ "$prev" = --env ] && [[ "$a" == ISTESSO_PID_FILE=* ]] && pidfile=${a#ISTESSO_PID_FILE=}; prev=$a; done
+sleep 4 &
+[ -n "$pidfile" ] && echo $! > "$pidfile"
+exit 0
+EOF
+mkdir -p "$scratch/Viewer.app"
+chmod +x "$scratch/bin/ssh" "$scratch/bin/record" "$scratch/bin/open"
 ln -s record "$scratch/bin/relay"
 ln -s record "$scratch/bin/viewer"
 
@@ -58,6 +71,14 @@ check "the shortcut's environment: copy and paste on for the agent and the host"
 check "the shortcut's environment: copy and paste on for the viewer" 'grep -q "^ISTESSO_CLIPBOARD=1$" "$scratch/plain/viewer.log"'
 check "the owner's new document is owner-... in documents/owner/" '[[ "$host" == *"documents/owner/owner-textedit-"* ]]'
 check "a new document comes without the application's old windows" '[[ "$host" == *"--no-restore"* ]]'
+check "no icon asked for: none passed to the viewer" '! grep -q "^ISTESSO_APP_ICON=" "$scratch/plain/viewer.log"'
+
+# The viewer's bundle through open: the icon only as an --env of its own, unchanged.
+icon="$HOME/Applications/Istesso Dev/Icons/TextEdit (Mac host).icns"
+run icon-unset DAILY_VIEWER= DAILY_VIEWER_BUNDLE="$scratch/Viewer.app" -- textedit
+check "through open, no icon asked for: no ISTESSO_APP_ICON in its --env" '[ -s "$scratch/icon-unset/open.log" ] && ! grep -q "ISTESSO_APP_ICON" "$scratch/icon-unset/open.log"'
+run icon-set DAILY_VIEWER= DAILY_VIEWER_BUNDLE="$scratch/Viewer.app" "ISTESSO_APP_ICON=$icon" -- textedit
+check "through open, the launcher's icon is passed unchanged" 'grep -qF -- "[--env] [ISTESSO_APP_ICON=$icon]" "$scratch/icon-set/open.log"'
 
 run off DAILY_CLIPBOARD=0 -- textedit
 host=$(cat "$scratch/off"/host-*.sh 2>/dev/null)

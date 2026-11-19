@@ -496,6 +496,8 @@ open_here() {
     local settings=(${clip_env[@]+"${clip_env[@]}"} ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
+    # The badged icon the launcher asks for (the viewer takes only an .icns under ~/Applications/Istesso Dev/).
+    [ -n "${ISTESSO_APP_ICON:-}" ] && settings+=(ISTESSO_APP_ICON="$ISTESSO_APP_ICON")
     local arguments=("$x" "$y" "$width" "$height" "$title" - "$frames" 0 "$mine/in.sock")
     : > "$mine/viewer.number"; : > "$mine/viewer.log"; : > "$mine/viewer.pid"; : > "$mine/window-closed"
     if [ -z "${DAILY_VIEWER:-}" ] && [ -d "$viewer_bundle" ] && [ -z "${DAILY_NO_WINDOW:-}" ]; then
