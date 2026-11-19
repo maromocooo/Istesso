@@ -116,13 +116,15 @@ struct InputState {
     interactive: u32,
     failure: u32,
     text: u32,
+    scroll: u32,
+    reserved: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MediaStreamInfo>() == 24);
 const _: () = assert!(std::mem::size_of::<usize>() != 8 || std::mem::size_of::<MediaFrame>() == 72);
 const _: () = assert!(std::mem::size_of::<MediaWatchState>() == 32);
 const _: () = assert!(std::mem::size_of::<InputEvent>() == 12);
-const _: () = assert!(std::mem::size_of::<InputState>() == 32);
+const _: () = assert!(std::mem::size_of::<InputState>() == 40);
 
 type InputTold = Option<
     unsafe extern "C" fn(
@@ -876,7 +878,7 @@ fn events_from(flat: &[i32]) -> Vec<InputEvent> {
         .collect()
 }
 
-/// `long[] inputState(long input)`: {cuts, open, answered, over, failure, text}. From any thread.
+/// `long[] inputState(long input)`: {cuts, open, answered, over, failure, text, scroll}. From any thread.
 ///
 /// # Safety
 /// Called by the Java virtual machine; `input` came from inputOpen and is not closed.
@@ -902,6 +904,7 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputSta
                 state.over as i64,
                 state.failure as i64,
                 state.text as i64,
+                state.scroll as i64,
             ],
         )
     }

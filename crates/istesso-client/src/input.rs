@@ -75,6 +75,9 @@ pub struct State {
     /// The host said, when the conversation was last opened, that it takes
     /// committed text (trial only); committed text is sent only then.
     pub text: bool,
+    /// The level of scrolls the host said it takes (`istesso_proto::SCROLL_LEVEL`; 0: dx and dy
+    /// only, and a scroll whose dx and dy are both 0 is not sent).
+    pub scroll: u8,
 }
 
 struct Batch {
@@ -246,6 +249,7 @@ pub fn scroll_event(dx: i32, dy: i32, source: u32, v120: [i32; 2], pixels: [f64;
         pixels,
         phase: None,
         momentum: None,
+        momentum_follows: false,
     }
 }
 
@@ -467,6 +471,7 @@ fn run(
                 Ok(opened) => {
                     let answered = opened.is_answered();
                     let text = opened.takes_text();
+                    let scroll = opened.scroll_level();
                     line = Some(opened);
                     // What was handed over while the conversation was being opened was
                     // typed before there was one: it is gone like everything before it,
@@ -494,6 +499,7 @@ fn run(
                         state.answered = answered;
                         state.failure = None;
                         state.text = text;
+                        state.scroll = scroll;
                     });
                     if let Some(passing) = passing {
                         passing.reconnection("open", 0);
@@ -566,11 +572,13 @@ fn run(
             }
             Some(Happened::Back { after }) => {
                 let text = open_line.takes_text();
+                let scroll = open_line.scroll_level();
                 set(&|state| {
                     state.open = is_open;
                     state.answered = answered;
                     state.failure = None;
                     state.text = text;
+                    state.scroll = scroll;
                 });
                 if let Some(passing) = passing {
                     passing.reconnection("back", cuts);

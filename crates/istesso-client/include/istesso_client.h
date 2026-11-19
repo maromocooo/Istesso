@@ -46,6 +46,8 @@ typedef struct IstessoInputState {
                            * reach the host failed, one of ISTESSO_MEDIA_FAILURE_* (istesso_media.h);
                            * 0 otherwise */
     uint32_t text;        /* TRIAL ONLY: 1 when the host said it takes committed text; text is sent only then */
+    uint32_t scroll;      /* TRIAL ONLY: the level of scrolls the host takes; 0: dx and dy only */
+    uint32_t reserved;
 } IstessoInputState;
 
 /* What happened to the conversation: the `event` of IstessoInputTold. */

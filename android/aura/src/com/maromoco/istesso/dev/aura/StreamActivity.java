@@ -38,6 +38,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private TypingSurface view;
     /** The input's agent said, when its conversation was last opened, that it takes committed text. */
     private boolean hostTakesText;
+    /** The input's cuts when the note about scroll kinds was last written (-1: never). */
+    private long scrollNotedFor = -1;
     /** Whether that has been heard yet (an input conversation was open). */
     private boolean hostTextKnown;
     /** What the input method is composing, shown over the picture; never sent. */
@@ -488,12 +490,21 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 }
                 hostTextKnown = true;
                 showTypingToggle();
+                // Once a connection: a host that does not take the kinds of scroll gets dx and dy
+                // only, and a scroll whose dx and dy are both 0 is not sent (the input library).
+                long conversation = s[0];
+                boolean scrollKinds = s.length > 6 && s[6] != 0;
+                if (!scrollKinds && scrollNotedFor != conversation) {
+                    scrollNotedFor = conversation;
+                    Log.i("IstessoAura", "note: the host's agent does not take: scroll kinds (wheel notches, finger pixels, stages); scrolls go as dx and dy only");
+                }
             }
         }
         show();
     }
 
     private void openInput() {
+        scrollNotedFor = -1; // a new input: its first connection is told about again
         // Both connections name the paired host; without one, nothing is connected.
         String peer = settings.hostId(app.host);
         if (peer.trim().isEmpty()) {

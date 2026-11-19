@@ -44,6 +44,9 @@ pub struct IstessoInputState {
     pub failure: u32,
     /// 1 when the host said it takes committed text (trial only); text is sent only then.
     pub text: u32,
+    /// The level of scrolls the host said it takes (trial only; 0: dx and dy only).
+    pub scroll: u32,
+    pub reserved: u32,
 }
 
 /// Called on the input's thread for what happens to the conversation:
@@ -294,6 +297,7 @@ pub unsafe extern "C" fn istesso_input_state(
         interactive,
         failure,
         text,
+        scroll,
     } = input.input.state();
     // SAFETY: not null, and room for the result by the caller's promise.
     unsafe {
@@ -309,6 +313,8 @@ pub unsafe extern "C" fn istesso_input_state(
             },
             failure: failure.map_or(0, |failure| failure as u32),
             text: u32::from(text),
+            scroll: u32::from(scroll),
+            reserved: 0,
         }
     };
     0
@@ -580,7 +586,7 @@ mod tests {
     #[test]
     fn the_structures_are_laid_out_as_the_header_says() {
         assert_eq!(std::mem::size_of::<IstessoInputEvent>(), 12);
-        assert_eq!(std::mem::size_of::<IstessoInputState>(), 32);
+        assert_eq!(std::mem::size_of::<IstessoInputState>(), 40);
     }
 
     #[test]

@@ -83,7 +83,10 @@ final class Native {
     static native void inputScroll(long input, int dx, int dy, int source, int v120H, int v120V,
             double pixelsH, double pixelsV);
 
-    /** {cuts, open, answered, over, failure, text}; text 1 when the host said it takes committed text. */
+    /**
+     * {cuts, open, answered, over, failure, text, scroll}; text 1 when the host said it takes
+     * committed text, scroll the level of scrolls it takes (0: dx and dy only).
+     */
     static native long[] inputState(long input);
 
     static native void inputClose(long input);

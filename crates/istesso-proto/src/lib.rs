@@ -459,6 +459,11 @@ pub enum InputEvent {
         /// system goes on with (inertia), and where it is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         momentum: Option<ScrollPhase>,
+        /// With `phase: ended`: the sender's system goes on with inertia
+        /// (`momentum` events follow). The sender waits for its system
+        /// itself, so that the jitter of the network does not decide it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        momentum_follows: bool,
     },
     /// Text that the sender's own input method has committed (trial only,
     /// docs/adr/0007-control-channel.md, "確定した文字"): for the client that
@@ -467,8 +472,11 @@ pub enum InputEvent {
     Text { text: String },
 }
 
-// Only finite numbers are ever accepted for `pixels` (see `scroll_is_acceptable`), so equality
-// is an equivalence for every event that is passed on.
+// `Eq` with an f64 inside (`pixels`): sound for every event that is read or passed on, because
+// JSON has no NaN (serde_json cannot read one, so no event read off the wire holds one) and the
+// agent drops any scroll that is not finite (`scroll_is_acceptable`). Only an event made in code
+// with a NaN would not equal itself; nothing here hashes events or relies on that. Kept because
+// the messages that carry events (`istesso_link`'s requests) are `Eq`.
 impl Eq for InputEvent {}
 
 impl InputEvent {
@@ -482,6 +490,7 @@ impl InputEvent {
             pixels: None,
             phase: None,
             momentum: None,
+            momentum_follows: false,
         }
     }
 }
@@ -514,6 +523,23 @@ pub enum ScrollPhase {
     Unknown,
 }
 
+/// The level of scrolls an agent takes, as it says in its answer to
+/// `input_open` (`"scroll"`): 1 is the trial's `source`, `v120`, `pixels`,
+/// `phase`, `momentum` and `momentum_follows` of [`InputEvent::Scroll`]. An
+/// agent that says nothing (0) uses `dx` and `dy` only.
+pub const SCROLL_LEVEL: u8 = 1;
+
+/// Whether a scroll says more than `dx` and `dy` (the trial's fields).
+pub fn scroll_has_kind(event: &InputEvent) -> bool {
+    matches!(
+        event,
+        InputEvent::Scroll {
+            source: Some(_),
+            ..
+        }
+    )
+}
+
 /// The most pixels one scroll event may move on either axis.
 pub const SCROLL_MOST_PIXELS: f64 = 10_000.0;
 /// The most notches one scroll event may turn on either axis, in 120ths.
@@ -523,16 +549,28 @@ pub const SCROLL_MOST_V120: i32 = 120 * 1000;
 /// [`SCROLL_MOST_PIXELS`] and notches of at most [`SCROLL_MOST_V120`] on
 /// either axis. Any other event is acceptable here.
 pub fn scroll_is_acceptable(event: &InputEvent) -> bool {
-    let InputEvent::Scroll { v120, pixels, .. } = event else {
+    let InputEvent::Scroll {
+        dx,
+        dy,
+        v120,
+        pixels,
+        ..
+    } = event
+    else {
         return true;
     };
-    pixels.is_none_or(|p| {
-        p.iter()
-            .all(|v| v.is_finite() && v.abs() <= SCROLL_MOST_PIXELS)
-    }) && v120.is_none_or(|n| {
-        n.iter()
-            .all(|v| v.unsigned_abs() <= SCROLL_MOST_V120 as u32)
-    })
+    // The old fields too: a receiver turns them round, and Int32's least value has no opposite.
+    let most = SCROLL_MOST_PIXELS as i32;
+    dx.unsigned_abs() <= most as u32
+        && dy.unsigned_abs() <= most as u32
+        && pixels.is_none_or(|p| {
+            p.iter()
+                .all(|v| v.is_finite() && v.abs() <= SCROLL_MOST_PIXELS)
+        })
+        && v120.is_none_or(|n| {
+            n.iter()
+                .all(|v| v.unsigned_abs() <= SCROLL_MOST_V120 as u32)
+        })
 }
 
 /// The most characters of one piece of committed text ([`InputEvent::Text`]).
@@ -602,6 +640,7 @@ mod tests {
             pixels: Some([0.0, 24.5]),
             phase: Some(ScrollPhase::Changed),
             momentum: None,
+            momentum_follows: false,
         };
         let json = serde_json::to_string(&finger).unwrap();
         assert_eq!(
@@ -619,6 +658,18 @@ mod tests {
             InputEvent::Scroll {
                 source: Some(ScrollSource::Wheel),
                 v120: Some([0, 120]),
+                ..
+            }
+        ));
+        let end: InputEvent = serde_json::from_str(
+            r#"{"kind":"scroll","dx":0,"dy":0,"source":"finger","pixels":[0,0],"phase":"ended","momentum_follows":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            end,
+            InputEvent::Scroll {
+                phase: Some(ScrollPhase::Ended),
+                momentum_follows: true,
                 ..
             }
         ));
@@ -668,6 +719,7 @@ mod tests {
             pixels,
             phase: None,
             momentum: None,
+            momentum_follows: false,
         };
         assert!(scroll_is_acceptable(&with(
             Some([-10_000.0, 10_000.0]),
@@ -681,7 +733,10 @@ mod tests {
         )));
         assert!(scroll_is_acceptable(&with(None, Some([-120_000, 120_000]))));
         assert!(!scroll_is_acceptable(&with(None, Some([0, i32::MIN]))));
-        assert!(scroll_is_acceptable(&InputEvent::scroll(i32::MAX, 0)));
+        // The old fields are bounded too (the receiver turns them round; i32::MIN has no opposite).
+        assert!(!scroll_is_acceptable(&InputEvent::scroll(i32::MAX, 0)));
+        assert!(!scroll_is_acceptable(&InputEvent::scroll(0, i32::MIN)));
+        assert!(scroll_is_acceptable(&InputEvent::scroll(0, -10_000)));
         assert!(scroll_is_acceptable(&InputEvent::Text { text: "a".into() }));
     }
 
