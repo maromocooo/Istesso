@@ -623,6 +623,14 @@ final class InlineComposer {
         if stripComposition { return count("preedit_on_strip") }
         guard engaged else {
             // The viewer has not heard yet that the host is not inline: the strip, for this one.
+            // One that was inline until now (Accessibility unsure once, the caret out of the
+            // window) is cleared there first, so that it is never left in the application to be
+            // committed by its deactivation as well as typed by the text path.
+            if let c = comp {
+                _ = ask(["op": "clear"], comp: c)
+                comp = nil
+                count("inline_to_strip_cleared")
+            }
             stripComposition = true
             count("preedit_not_inline")
             return recompute()
@@ -817,7 +825,9 @@ final class InlineHost {
     }
 
     /// What is shown is cleared, and the answer waited for (100 ms at most), before the source is
-    /// put back: switching first would make the input source commit it into the document.
+    /// put back: switching first would make the input source commit it into the document. It
+    /// blocks the main queue for that time (rare: a disconnect, a lock, a stop); answers read
+    /// meanwhile may let held events go, through the same checks as always.
     func clearBeforeRestore() {
         guard let s = composer.clearNow() else { return }
         let deadline = ProcessInfo.processInfo.systemUptime + 0.1
@@ -1244,6 +1254,24 @@ func inlineSelfTest() -> Int {
     delivered.removeAll()
     composer.preedit("", cursor: [0, 0])
     _ = im.take()
+
+    // An inline composition whose inline conditions go away mid-way (here the caret leaves the
+    // window): cleared there before it goes on the strip, its commit typed once.
+    clock += 2
+    composer.preedit("ほ", cursor: [3, 3])
+    let midMark = im.take().first
+    im.caret("mark", seq: midMark?["seq"], x: 1010, top: 210)
+    link.poll()
+    im.say(["op": "active", "ok": true, "x": 50, "y": 0, "w": 0, "h": 20, "top": 50, "scale": 2])
+    link.poll()
+    composer.preedit("ほん", cursor: [6, 6])
+    let midClear = im.take()
+    check(midClear.count == 1 && midClear.first?["op"] as? String == "clear" && composer.comp == nil && composer.stripComposition,
+          "inline, then not: cleared there first, the rest on the strip")
+    check(!composer.commit("本") && delivered == ["本"], "and its commit typed once by the text path")
+    delivered.removeAll()
+    im.caret("active", seq: nil, x: 1010, top: 210)
+    link.poll()
 
     // The answers of input source 0.4: ok means shown / in; ok:false always with a reason.
     clock += 2
