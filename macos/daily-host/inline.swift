@@ -460,6 +460,16 @@ final class InlineComposer {
 
     func isPending(_ s: Int) -> Bool { pending[s] != nil }
 
+    /// The application ended this composition (committed once there): the viewer is told by a new
+    /// field serial and ends its own without committing; what crosses that is dropped for a while.
+    private func endedByApplication(_ c: Int) {
+        remember(ended: c)
+        comp = nil
+        endedUntil = now() + 1.0
+        serial = (serial + 1) % 256
+        count("ended_by_application")
+    }
+
     /// Before Istesso's source is let go of on a disconnect or a stop: what is shown is cleared
     /// (never committed into the document by the switch). The seq of the clear, to wait for.
     func clearNow() -> Int? {
@@ -495,10 +505,7 @@ final class InlineComposer {
             if let c = m["comp"] as? Int {
                 remember(ended: c)
                 if c == comp {
-                    comp = nil
-                    endedUntil = now() + 1.0
-                    serial = (serial + 1) % 256
-                    count("ended_by_application")
+                    endedByApplication(c)
                 } else {
                     // A composition whose commit is on its way: that commit will be refused, and
                     // must not be typed again.
@@ -520,15 +527,29 @@ final class InlineComposer {
             if !ok { note("inline: the input source refused this slot's application (another slot relays it?): strip") }
         case "mark":
             if ok { takeCaret(m); break }
-            if why == "stale" { break }
+            if why == "ended" || why == "stale" {
+                // Ended there already (the application ended it, or it was committed or cleared):
+                // never shown again; if this host still took it for the current one, it ends here.
+                if let c = asked.comp, c == comp { endedByApplication(c) }
+                break
+            }
             // Refused (too long, secure input, not active...): this composition goes on the strip.
             count("mark_refused")
             if comp != nil { _ = ask(["op": "clear"]); comp = nil }
             stripComposition = true
         case "commit":
             if ok {
-                takeCaret(m)
-                count("commit_inserted")
+                if m["inserted"] as? Bool == false {
+                    // In already (ended by the application, or a repeat): not again, not by text.
+                    count("commit_already_in")
+                } else {
+                    takeCaret(m)
+                    count("commit_inserted")
+                }
+            } else if why == "cleared", !timedOut.contains(seq) {
+                // Cleared there, never inserted: by today's text path.
+                count("commit_cleared_text_path")
+                if let text = asked.text { deliverText(text) }
             } else if why == "stale" {
                 count("commit_stale")
             } else if let c = asked.comp, endedSerials.contains(c) {
@@ -547,7 +568,9 @@ final class InlineComposer {
             timedOut.removeAll { $0 == seq }
             if awaiting?.seq == seq { awaiting = nil; releaseHold() }
         case "caret":
-            if ok, m["x"] != nil {
+            // Answered from the relayed application's active field (a rectangle or not), or
+            // refused because it is not active.
+            if why == nil {
                 if !active { count("active_by_caret") }
                 active = true
                 takeCaret(m)
@@ -563,7 +586,7 @@ final class InlineComposer {
 
     /// The input source's caret: global points, top from the main display's top.
     private func takeCaret(_ m: [String: Any]) {
-        guard m["ok"] as? Bool ?? true,
+        guard (m["rect_ok"] as? Bool) ?? (m["ok"] as? Bool) ?? true,
               let x = (m["x"] as? NSNumber)?.doubleValue, let top = (m["top"] as? NSNumber)?.doubleValue,
               let w = (m["w"] as? NSNumber)?.doubleValue, let h = (m["h"] as? NSNumber)?.doubleValue,
               x.isFinite, top.isFinite, w.isFinite, h.isFinite, w >= 0, h >= 0, w < 10_000, h < 10_000 else { return }
@@ -1219,6 +1242,44 @@ func inlineSelfTest() -> Int {
     link.poll()
     check(delivered == ["と"] && !composer.holding, "after 300 more questions the waited commit's answer is still known")
     delivered.removeAll()
+    composer.preedit("", cursor: [0, 0])
+    _ = im.take()
+
+    // The answers of input source 0.4: ok means shown / in; ok:false always with a reason.
+    clock += 2
+    _ = composer.commit("に")
+    let inAlready = im.take().first
+    im.say(["op": "commit", "ok": true, "inserted": false, "ended": "application", "comp": inAlready?["comp"] ?? 0, "seq": inAlready?["seq"] ?? 0])
+    link.poll()
+    check(delivered.isEmpty && !composer.holding && composer.counts["commit_already_in"] == 1,
+          "0.4: ok without inserted (ended there already): not again, not by the text path")
+    _ = composer.commit("ぬ")
+    let cleared = im.take().first
+    im.say(["op": "commit", "ok": false, "why": "cleared", "comp": cleared?["comp"] ?? 0, "seq": cleared?["seq"] ?? 0])
+    link.poll()
+    check(delivered == ["ぬ"] && !composer.holding, "0.4: cleared there, never inserted: by the text path, once")
+    delivered.removeAll()
+    composer.preedit("の", cursor: [3, 3])
+    let endedMark = im.take().first
+    let serialBeforeMark = composer.report.serial
+    im.say(["op": "mark", "ok": false, "why": "ended", "ended": "application", "comp": endedMark?["comp"] ?? 0, "seq": endedMark?["seq"] ?? 0])
+    link.poll()
+    check(composer.comp == nil && !composer.stripComposition && composer.report.serial == (serialBeforeMark + 1) % 256,
+          "0.4: a mark refused as ended ends the composition here too (new serial), not the strip")
+    composer.preedit("", cursor: [0, 0])
+    clock += 2
+    _ = im.take()
+    let caretBefore = composer.report
+    composer.probe()
+    let noRect = im.take().first
+    im.say(["op": "caret", "ok": false, "rect_ok": false, "x": 0, "y": 0, "w": 0, "h": 0, "top": 0, "seq": noRect?["seq"] ?? 0])
+    link.poll()
+    check(composer.active && composer.report == caretBefore, "0.4: a caret answer without a rectangle: still active, the caret kept")
+    composer.preedit("は", cursor: [3, 3])
+    let markNoRect = im.take().first
+    im.say(["op": "mark", "ok": true, "rect_ok": false, "x": 0, "y": 0, "w": 0, "h": 0, "top": 0, "comp": markNoRect?["comp"] ?? 0, "seq": markNoRect?["seq"] ?? 0])
+    link.poll()
+    check(composer.report == caretBefore && !composer.stripComposition, "0.4: a mark shown without a rectangle: inline, the caret kept")
     composer.preedit("", cursor: [0, 0])
     _ = im.take()
 
