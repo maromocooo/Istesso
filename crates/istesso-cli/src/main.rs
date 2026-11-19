@@ -120,11 +120,13 @@ enum Command {
         /// Start in this project's folder, on the machine `istesso projects`
         /// says has it. MACHINE:NAME chooses the machine when more than one
         /// has a project of that name; nothing is guessed. Remembered for
-        /// that machine, as --project is
+        /// that machine, as --project is. With --address, the machine is
+        /// reached there when it is remembered there (`istesso peers
+        /// address`), and where it answered just now otherwise
         #[arg(
             long,
             value_name = "[MACHINE:]NAME",
-            conflicts_with_all = ["device", "project", "home", "address"]
+            conflicts_with_all = ["device", "project", "home"]
         )]
         project_name: Option<String>,
         /// Start at home, and forget the folder remembered from last time
@@ -701,10 +703,16 @@ fn main() -> ExitCode {
         }
         // A project by its name: the project list says where it is.
         let (device, address, project) = match project_name {
-            Some(asked) => match projects::shell_target(asked) {
-                Ok(target) => (target.id, target.address, Some(target.name)),
-                Err(message) => return refuse(&message),
-            },
+            Some(asked) => {
+                // As `istesso peers address` remembers it.
+                let at = address
+                    .as_deref()
+                    .map(|at| with_default_port(at.trim(), istesso_link::DEFAULT_PORT));
+                match projects::shell_target(asked, at.as_deref()) {
+                    Ok(target) => (target.id, target.address, Some(target.name)),
+                    Err(message) => return refuse(&message),
+                }
+            }
             None => (
                 device.clone().unwrap_or_default(),
                 address.clone(),

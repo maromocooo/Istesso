@@ -22,6 +22,23 @@
 #   ish-forwards     list them; ish-forwards stop 8000, or stop --all
 # Leave with `exit` or Control-D, or close the window.
 # Fallback without forwarding: ish-shell-only (same options).
+usage() {
+    cat <<'USAGE'
+usage: ish                 back in the folder (or project) used last; home the first time
+       ish NAME            in the folder of the project NAME, on the machine
+                           `istesso projects` says has it
+       ish MACHINE:NAME    the same, on that machine (for a name more than one has)
+       ish DIR             in that folder on the host: work/proj, proj/, ~/proj, /srv/proj
+       ish --home          at home on the host; forgets the remembered folder
+A word with a / in it, or one that starts with ., is a folder; any other word
+is a project's name.
+USAGE
+}
+if [ $# -gt 1 ]; then
+    echo "ish: give one word at most" >&2
+    usage >&2
+    exit 2
+fi
 # ISH_DIR: another test folder (with bin/istesso and config/), and ISH_DEVICE:
 # the host's name in it, for checks.
 D=${ISH_DIR:-"$HOME/Library/Application Support/istesso-dev-shell-test"}
@@ -38,8 +55,17 @@ run() {
     ISTESSO_CONFIG_DIR="$D/config" exec "$D/bin/istesso" "$@"
 }
 case "${1:-}" in
+    -h | --help)
+        usage
+        exit 0
+        ;;
     "") set -- ;;
     --home) set -- --home ;;
+    -*)
+        echo "ish: no such option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
     # A folder below this Mac's home, as the shell here wrote `~/…`: meant on the host.
     "$HOME") set -- --project "~" ;;
     "$HOME"/*) set -- --project "~${1#"$HOME"}" ;;
@@ -47,9 +73,11 @@ case "${1:-}" in
     */* | .*) set -- --project "~/$1" ;;
     *)
         # A project's name. The project list asks every machine at the
-        # address remembered for it: the host's is remembered first.
+        # address remembered for it: the host's is remembered first. A
+        # project on the host is then reached at this address (the cable),
+        # as a folder is; one on another machine where that machine answered.
         ISTESSO_CONFIG_DIR="$D/config" "$D/bin/istesso" peers address "$device" "$addr:$port" >/dev/null || exit 255
-        run shell --project-name="$1"
+        run shell --project-name="$1" --address "$addr:$port"
         ;;
 esac
 run shell "$device" --address "$addr:$port" "$@"

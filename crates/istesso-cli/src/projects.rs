@@ -87,7 +87,12 @@ fn owners<'a>(
 }
 
 fn ambiguous(name: &str, machines: &BTreeMap<&str, &str>) -> String {
-    let names = machines.values().copied().collect::<Vec<_>>().join(", ");
+    let names = machines
+        .values()
+        .copied()
+        .map(shown)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("project {name} is ambiguous on these machines: {names}")
 }
 
@@ -127,7 +132,10 @@ fn check_remote_name(name: &str, hosts: &[HostView]) -> Result<(), String> {
             return Err(ambiguous(name, machines));
         }
         if let Some(machine) = machines.values().next() {
-            return Err(format!("project {name} is already registered on {machine}"));
+            return Err(format!(
+                "project {name} is already registered on {}",
+                shown(machine)
+            ));
         }
     }
     Ok(())
@@ -160,9 +168,27 @@ pub(super) fn check_folder(folder: &str) -> Result<(), String> {
     }
 }
 
+/// What another machine said, made fit for this terminal: its control
+/// characters (escape sequences among them) are shown as `\u{..}` and do
+/// nothing. Names and reasons from paired machines go through this.
+pub(super) fn shown(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Asks every paired machine for its projects, as `istesso projects` does,
-/// and finds where `asked` (`NAME` or `MACHINE:NAME`) is.
-pub(super) fn shell_target(asked: &str) -> Result<ShellTarget, String> {
+/// and finds where `asked` (`NAME` or `MACHINE:NAME`) is. `address`, as
+/// `istesso peers address` writes it, is where the chosen machine is
+/// reached when that machine is remembered there (a cable, say); otherwise
+/// it is reached where it answered just now.
+pub(super) fn shell_target(asked: &str, address: Option<&str>) -> Result<ShellTarget, String> {
     // A word that cannot be a name is refused before anybody is asked.
     split_asked(asked)?;
     let paths = Paths::from_env();
@@ -170,35 +196,80 @@ pub(super) fn shell_target(asked: &str) -> Result<ShellTarget, String> {
         let paths = paths.clone();
         std::thread::spawn(move || survey::refresh_peers(&paths, &SurveyOptions::default()))
     };
-    let local = local_view(&paths);
+    // This machine is not inspected for it: only its name and its projects
+    // matter here.
+    let identity = istesso_pair::Identity::load_or_create(&paths.identity())
+        .map_err(|_| "cannot read this device's identity")?;
+    let (id, name) = (identity.fingerprint(), istesso_doctor::hostname());
+    let here = projects::list(&paths)?;
     let remote = remote
         .join()
         .map_err(|_| "internal error while asking the paired devices".to_string())?
         .map_err(|_| "cannot read the paired host list")?;
-    let hosts: Vec<HostView> = std::iter::once(local?).chain(remote).collect();
-    resolve(&hosts, asked)
-}
-
-/// This machine as the project list shows it, without inspecting it again
-/// (as `istesso projects` does every ten minutes): only its name and its
-/// projects matter here.
-fn local_view(paths: &Paths) -> Result<HostView, String> {
-    let identity = istesso_pair::Identity::load_or_create(&paths.identity())
-        .map_err(|_| "cannot read this device's identity")?;
-    let mut manifest = istesso_agent::cache::local_manifest(paths, std::time::Duration::MAX);
-    manifest.projects = projects::list(paths)?;
-    Ok(HostView {
-        id: identity.fingerprint(),
-        name: manifest.name.clone(),
+    let mut machines = vec![Machine {
+        id: &id,
+        name: &name,
         local: true,
-        state: HostState::Awake,
-        manifest: Some(manifest),
-        status: None,
-        apps: Vec::new(),
-        seen_at: None,
+        awake: true,
         address: None,
         problem: None,
-    })
+        projects: Some(&here),
+    }];
+    machines.extend(remote.iter().map(Machine::of));
+    let mut target = resolve_among(&machines, asked)?;
+    let remembered = istesso_agent::cache::load(&paths, &target.id)
+        .map(|snapshot| snapshot.addresses)
+        .unwrap_or_default();
+    prefer_address(&mut target, &remembered, address);
+    Ok(target)
+}
+
+/// The chosen machine is reached at `address` when it is remembered there,
+/// and where it answered otherwise: an address given for one machine (the
+/// cable to it) does not send the shell of another machine's project there.
+fn prefer_address(target: &mut ShellTarget, remembered: &[String], address: Option<&str>) {
+    if let Some(address) = address.filter(|address| remembered.iter().any(|a| a == address)) {
+        target.address = Some(address.to_string());
+    }
+}
+
+/// One machine, as much of it as finding a project needs.
+struct Machine<'a> {
+    id: &'a str,
+    name: &'a str,
+    local: bool,
+    awake: bool,
+    address: Option<&'a str>,
+    problem: Option<&'a str>,
+    /// What it answered or what is remembered of it; `None` when it was
+    /// never seen.
+    projects: Option<&'a [Project]>,
+}
+
+impl<'a> Machine<'a> {
+    fn of(view: &'a HostView) -> Self {
+        Machine {
+            id: &view.id,
+            name: &view.name,
+            local: view.local,
+            awake: view.state == HostState::Awake,
+            address: view.address.as_deref(),
+            problem: view.problem.as_deref(),
+            projects: view
+                .manifest
+                .as_ref()
+                .map(|manifest| manifest.projects.as_slice()),
+        }
+    }
+
+    /// Its projects whose names are names: anything else a machine sends
+    /// can never be asked for, and is never shown or compared.
+    fn projects(&self) -> impl Iterator<Item = &'a Project> {
+        self.projects
+            .unwrap_or_default()
+            .iter()
+            .filter(|project| projects::validate_name(&project.name).is_ok())
+    }
 }
 
 /// `MACHINE:NAME` or `NAME`. A project's name has no `:` (nor `/`), so the
@@ -210,7 +281,8 @@ fn split_asked(asked: &str) -> Result<(Option<&str>, &str), String> {
     };
     if machine.is_some_and(str::is_empty) {
         return Err(format!(
-            "{asked}: put the machine before the colon (MACHINE:NAME), or leave the colon out"
+            "{}: put the machine before the colon (MACHINE:NAME), or leave the colon out",
+            shown(asked)
         ));
     }
     if projects::validate_name(name).is_err() {
@@ -229,40 +301,40 @@ fn split_asked(asked: &str) -> Result<(Option<&str>, &str), String> {
 
 /// The machines `selector` names: by id, the beginning of an id (four
 /// characters or more), or display name in any case.
-fn machines<'a>(views: &'a [HostView], selector: &str) -> Vec<&'a HostView> {
-    if let Some(view) = views.iter().find(|view| view.id == selector) {
-        return vec![view];
+fn machines<'m, 'a>(all: &'m [Machine<'a>], selector: &str) -> Vec<&'m Machine<'a>> {
+    if let Some(machine) = all.iter().find(|machine| machine.id == selector) {
+        return vec![machine];
     }
-    views
-        .iter()
-        .filter(|view| {
-            view.name.eq_ignore_ascii_case(selector)
-                || (selector.len() >= 4 && view.id.starts_with(selector))
+    all.iter()
+        .filter(|machine| {
+            machine.name.eq_ignore_ascii_case(selector)
+                || (selector.len() >= 4 && machine.id.starts_with(selector))
         })
         .collect()
 }
 
-fn projects_on(view: &HostView) -> impl Iterator<Item = &Project> {
-    view.manifest
-        .iter()
-        .flat_map(|manifest| manifest.projects.iter())
+/// [`resolve_among`] for the list as `istesso projects` has it.
+#[cfg(test)]
+pub(super) fn resolve(views: &[HostView], asked: &str) -> Result<ShellTarget, String> {
+    let machines: Vec<Machine> = views.iter().map(Machine::of).collect();
+    resolve_among(&machines, asked)
 }
 
-/// Finds the one machine that has the project `asked` in the list `views`
-/// (as `istesso projects` shows it). Never guesses: a name on more than one
+/// Finds the one machine that has the project `asked` (as `istesso
+/// projects` shows the list). Never guesses: a name on more than one
 /// machine, a machine that does not answer, or a name nobody has, ends with
 /// a message saying so, and what can be typed instead.
-pub(super) fn resolve(views: &[HostView], asked: &str) -> Result<ShellTarget, String> {
+fn resolve_among(all: &[Machine], asked: &str) -> Result<ShellTarget, String> {
     let (machine, name) = split_asked(asked)?;
-    let chosen: Vec<&HostView> = match machine {
-        None => views.iter().collect(),
+    let chosen: Vec<&Machine> = match machine {
+        None => all.iter().collect(),
         Some(selector) => {
-            let found = machines(views, selector);
+            let found = machines(all, selector);
             match found.as_slice() {
                 [] => {
-                    let known = views
+                    let known = all
                         .iter()
-                        .map(|view| view.name.as_str())
+                        .map(|machine| shown(machine.name))
                         .collect::<Vec<_>>()
                         .join(", ");
                     return Err(format!(
@@ -273,7 +345,9 @@ pub(super) fn resolve(views: &[HostView], asked: &str) -> Result<ShellTarget, St
                 _ => {
                     let ids = found
                         .iter()
-                        .map(|view| format!("  {}:{name}\t({})", view.id, view.name))
+                        .map(|machine| {
+                            format!("  {}:{name}\t({})", shown(machine.id), shown(machine.name))
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
                     return Err(format!(
@@ -283,56 +357,62 @@ pub(super) fn resolve(views: &[HostView], asked: &str) -> Result<ShellTarget, St
             }
         }
     };
-    let owners: Vec<(&HostView, &Project)> = chosen
+    let owners: Vec<(&Machine, &Project)> = chosen
         .iter()
-        .flat_map(|view| {
-            projects_on(view)
+        .flat_map(|machine| {
+            machine
+                .projects()
                 .filter(|project| project.name.eq_ignore_ascii_case(name))
-                .map(move |project| (*view, project))
+                .map(move |project| (*machine, project))
         })
         .collect();
     match owners.as_slice() {
-        [] => Err(unknown(views, &chosen, machine, name)),
-        [(view, project)] if view.local => Err(format!(
+        [] => Err(unknown(all, &chosen, machine, name)),
+        [(machine, project)] if machine.local => Err(format!(
             "project {} is on this machine ({}); istesso shell opens shells on other machines",
-            project.name, view.name
+            project.name,
+            shown(machine.name)
         )),
-        [(view, project)] if view.state != HostState::Awake => {
-            let why = view
+        [(machine, project)] if !machine.awake => {
+            let why = machine
                 .problem
-                .as_deref()
-                .map(|problem| format!(" ({problem})"))
+                .map(|problem| format!(" ({})", shown(problem)))
                 .unwrap_or_default();
             Err(format!(
                 "project {} is on {}, which is not answering now{why}",
-                project.name, view.name
+                project.name,
+                shown(machine.name)
             ))
         }
-        [(view, project)] => Ok(ShellTarget {
-            id: view.id.clone(),
+        [(machine, project)] => Ok(ShellTarget {
+            id: machine.id.to_string(),
             name: project.name.clone(),
-            address: view.address.clone(),
+            address: machine.address.map(str::to_string),
         }),
         several => {
             // A display name shared by two machines cannot choose between
             // them: those are given by id.
-            let shared = |view: &HostView| {
+            let shared = |machine: &Machine| {
                 several
                     .iter()
-                    .filter(|(other, _)| other.name.eq_ignore_ascii_case(&view.name))
+                    .filter(|(other, _)| other.name.eq_ignore_ascii_case(machine.name))
                     .count()
                     > 1
             };
             let lines = several
                 .iter()
-                .map(|(view, project)| {
-                    let machine = if shared(view) { &view.id } else { &view.name };
-                    let state = match (view.local, view.state) {
-                        (true, _) => "\t(this machine)",
-                        (false, HostState::Awake) => "",
-                        (false, _) => "\t(not answering now)",
+                .map(|(machine, project)| {
+                    let which = if shared(machine) {
+                        machine.id
+                    } else {
+                        machine.name
                     };
-                    format!("  {machine}:{}{state}", project.name)
+                    let state = match (machine.local, machine.awake) {
+                        (true, _) => "\t(this machine)",
+                        (false, true) => "",
+                        (false, false) => "\t(not answering now)",
+                    };
+                    format!("  {}:{}{state}", shown(which), project.name)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -345,23 +425,27 @@ pub(super) fn resolve(views: &[HostView], asked: &str) -> Result<ShellTarget, St
 
 /// The message for a name that is not in the list: the names it may have
 /// been meant for, and the machines whose projects are not known.
-fn unknown(views: &[HostView], chosen: &[&HostView], machine: Option<&str>, name: &str) -> String {
+fn unknown(all: &[Machine], chosen: &[&Machine], machine: Option<&str>, name: &str) -> String {
     let mut message = match machine {
-        Some(_) => format!("{} has no project called {name}", chosen[0].name),
+        Some(_) => format!("{} has no project called {name}", shown(chosen[0].name)),
         None => format!("no machine has a project called {name}"),
     };
-    let elsewhere = views
+    let elsewhere = all
         .iter()
-        .filter(|view| !chosen.iter().any(|c| c.id == view.id))
-        .filter(|view| projects_on(view).any(|p| p.name.eq_ignore_ascii_case(name)))
-        .map(|view| view.name.as_str())
+        .filter(|machine| !chosen.iter().any(|c| c.id == machine.id))
+        .filter(|machine| {
+            machine
+                .projects()
+                .any(|p| p.name.eq_ignore_ascii_case(name))
+        })
+        .map(|machine| shown(machine.name))
         .collect::<Vec<_>>();
     if !elsewhere.is_empty() {
         message.push_str(&format!("; it is on: {}", elsewhere.join(", ")));
     }
     let names = chosen
         .iter()
-        .flat_map(|view| projects_on(view))
+        .flat_map(|machine| machine.projects())
         .map(|p| p.name.as_str());
     let close = close_names(name, names);
     if !close.is_empty() {
@@ -369,8 +453,8 @@ fn unknown(views: &[HostView], chosen: &[&HostView], machine: Option<&str>, name
     }
     let silent = chosen
         .iter()
-        .filter(|view| !view.local && view.manifest.is_none())
-        .map(|view| view.name.as_str())
+        .filter(|machine| !machine.local && machine.projects.is_none())
+        .map(|machine| shown(machine.name))
         .collect::<Vec<_>>();
     if !silent.is_empty() {
         message.push_str(&format!(
@@ -399,11 +483,15 @@ fn close_names<'a>(asked: &str, names: impl Iterator<Item = &'a str>) -> Vec<Str
         {
             continue;
         }
-        let distance = edit_distance(&asked, &lower);
-        let within = asked.len().max(lower.len()) / 3;
+        let within = (asked.len().max(lower.len()) / 3).max(1);
         let inside = asked.len().min(lower.len()) >= 2
             && (lower.contains(asked.as_str()) || asked.contains(lower.as_str()));
-        if distance <= within.max(1) || inside {
+        // Lengths further apart than that are further apart in letters too.
+        if !inside && asked.len().abs_diff(lower.len()) > within {
+            continue;
+        }
+        let distance = edit_distance(&asked, &lower);
+        if distance <= within || inside {
             found.push((distance, name.to_string()));
         }
     }
@@ -466,8 +554,8 @@ fn render(row: &ProjectRow<'_>) -> String {
         .join(",");
     format!(
         "{mark} {}\t{}\t{}\t{gpu}\t{}",
-        row.project.name,
-        row.development_machine,
+        shown(&row.project.name),
+        shown(row.development_machine),
         kind_labels(row.project),
         if tools.is_empty() { "-" } else { &tools }
     )

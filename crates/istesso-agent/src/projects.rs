@@ -91,9 +91,13 @@ pub fn remove(paths: &Paths, name: &str) -> Result<(), String> {
 
 /// The folder registered on this machine under `name` (in any case), for
 /// a shell asked to start in a project by its name. `None` when no sound
-/// registration has that name.
+/// registration has that name. A registration that is a link is not one,
+/// as the list passes over it.
 pub fn folder(paths: &Paths, name: &str) -> Option<PathBuf> {
     let path = entry_path(paths, name).ok()?;
+    if !fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
     let data = fs::read(&path).ok()?;
     read_record(paths, &path, &data).map(|record| record.folder)
 }

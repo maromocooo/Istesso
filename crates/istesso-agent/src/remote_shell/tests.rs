@@ -418,6 +418,17 @@ fn the_shell_starts_in_a_project_named_by_the_device() {
     let log = pair.log().join("\n");
     assert!(log.contains("in a project folder"), "{log}");
     assert!(!log.contains("Demo") && !log.contains("demo"), "{log}");
+
+    // A registration that is a link is passed over, as the list does, even
+    // when what it points to is a sound record of that name.
+    let paths = pair.host.paths();
+    assert!(crate::projects::folder(&paths, "DEMO").is_some());
+    let entry = paths.config.join("projects/project-demo.json");
+    let moved = project.path().join("record.json");
+    std::fs::rename(&entry, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &entry).unwrap();
+    assert!(crate::projects::folder(&paths, "demo").is_none());
+    assert!(crate::projects::list(&paths).unwrap().is_empty());
 }
 
 #[test]

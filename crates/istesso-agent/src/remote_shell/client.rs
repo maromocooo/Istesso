@@ -39,9 +39,10 @@ pub struct Options {
     pub device: String,
     /// Where to reach it, when not where it was last seen.
     pub address: Option<String>,
-    /// The folder on the device to start in. Remembered for the device once
-    /// the shell runs there; without one, the shell starts in the folder
-    /// remembered from last time.
+    /// Where on the device to start, as [`ShellRequest::project`] takes it:
+    /// a folder there, or the name of a project registered there.
+    /// Remembered for the device once the shell runs there; without one,
+    /// the shell starts where it started last time.
     pub project: Option<String>,
     /// Whether and how the ports of the shell's workspace are forwarded to
     /// this machine, and its requests to open a page taken

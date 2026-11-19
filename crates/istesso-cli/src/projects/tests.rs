@@ -503,12 +503,88 @@ fn shell_takes_a_device_or_a_project_name() {
     assert!(parses(&["--project-name", "machine:demo", "--no-forward"]));
     assert!(!parses(&[]));
     assert!(!parses(&["dev", "--project-name", "demo"]));
-    assert!(!parses(&[
+    // The address of the machine the project is on, a cable say.
+    assert!(parses(&[
         "--project-name",
         "demo",
         "--address",
-        "192.0.2.1"
+        "192.0.2.1:26920"
     ]));
     assert!(!parses(&["--project-name", "demo", "--home"]));
     assert!(!parses(&["--project-name", "demo", "--project", "~/x"]));
+}
+
+#[test]
+fn what_another_machine_sends_is_checked_and_shown_harmless() {
+    let long = "x".repeat(256 * 1024);
+    let mut odd = answering("Odd\u{1b}[2J", &["demo\u{1b}[2Jx", &long, "demox"]);
+    odd.problem = Some("said \u{7}".into());
+    let hosts = [view(A, true, HostState::Awake), odd];
+    // Names that are not names are never compared or shown: only "demox"
+    // is close, and the long one costs nothing.
+    let began = std::time::Instant::now();
+    let unknown = resolve(&hosts, "demo").unwrap_err();
+    assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    assert!(unknown.contains("did you mean: demox\n"), "{unknown}");
+    assert!(!unknown.contains('\u{1b}') && !unknown.contains(&long));
+    // A name that is not a name cannot be asked for, so it never opens.
+    assert!(resolve(&hosts, "demo\u{1b}[2Jx").is_err());
+    // The machine's own name is shown with its control characters spelt out.
+    let there = resolve(&hosts, "nothing:demo").unwrap_err();
+    assert!(there.contains("Odd\\u{1b}[2J"), "{there}");
+    assert!(!there.contains('\u{1b}'), "{there}");
+    let mut silent = hosts[1].clone();
+    silent.state = HostState::Unknown;
+    let quiet = resolve(&[silent], "demox").unwrap_err();
+    assert!(
+        quiet.contains("(said \\u{7})") && !quiet.contains('\u{7}'),
+        "{quiet}"
+    );
+    assert_eq!(shown("Mac の机 1"), "Mac の机 1");
+    assert_eq!(shown("a\tb\u{9b}c"), "a\\u{9}b\\u{9b}c");
+}
+
+#[test]
+fn the_project_list_shows_other_machines_names_harmless() {
+    let project = Project {
+        id: "x".into(),
+        name: "demo\u{1b}[2J".into(),
+        kinds: vec![ProjectKind::Unknown],
+    };
+    let manifest = sample_manifest(A);
+    let row = ProjectRow {
+        project: &project,
+        development_machine: "Odd\u{1b}]0;title\u{7}",
+        reachable: true,
+        clash: false,
+        capabilities: Summary::for_project(&project, &manifest),
+    };
+    let line = render(&row);
+    assert!(
+        !line.chars().any(|c| c.is_control() && c != '\t'),
+        "{line:?}"
+    );
+    assert!(line.contains("demo\\u{1b}[2J"), "{line}");
+}
+
+#[test]
+fn an_address_given_is_used_only_where_the_machine_is_remembered() {
+    let answered = "198.51.100.7:47801"; // check-private: ok (documentation range)
+    let wired = "192.0.2.10:26920"; // check-private: ok (documentation range)
+    let target = || ShellTarget {
+        id: "id-x".into(),
+        name: "demo".into(),
+        address: Some(answered.into()),
+    };
+    let remembered = vec![answered.to_string(), wired.to_string()];
+    let mut chosen = target();
+    prefer_address(&mut chosen, &remembered, Some(wired));
+    assert_eq!(chosen.address.as_deref(), Some(wired));
+    // Given for another machine: this one is reached where it answered.
+    let mut other = target();
+    prefer_address(&mut other, &remembered[..1], Some(wired));
+    assert_eq!(other, target());
+    let mut none = target();
+    prefer_address(&mut none, &remembered, None);
+    assert_eq!(none, target());
 }
