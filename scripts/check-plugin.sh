@@ -29,7 +29,8 @@ core="$dir/wayland-display-core/src"
 # build script made it is still told as trial.
 trial_files=""
 if [ -d "$core" ]; then
-    for f in tests/test_trial_windows.rs wayland/handlers/xdg_activation.rs; do
+    for f in tests/test_trial_windows.rs wayland/handlers/xdg_activation.rs \
+        wayland/handlers/text_input.rs comp/clipboard.rs; do
         [ -e "$core/$f" ] && trial_files="$trial_files $f"
     done
 fi
@@ -41,7 +42,7 @@ fi
 # the mark), so a source put back afterwards, or a plugin copied in, is still told as trial.
 for so in "$dir"/target/release/*.so; do
     [ -f "$so" ] || continue
-    if grep -qa 'window attention' "$so"; then
+    if grep -qa -e 'window attention' -e 'clipboard: answered' "$so"; then
         echo "trial build: $(basename "$so") has the trial patch in it"
         exit 1
     fi
