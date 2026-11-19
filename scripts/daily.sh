@@ -116,6 +116,8 @@
 #                       and at the bit rate it started with, as before (default 1: a frame is
 #                       encoded only when the one before it has been taken, so that nothing queues
 #                       up, and the bit rate follows the link; scripts/daily_flow.py)
+#   ISTESSO_MAC_HOST    ssh name of the Mac host (default: istesso-studio, the owner's alias that
+#                       rides their open `ssh studio` tab)
 #   DAILY_MAC_SCRIPT    the Mac host stream's scripts/daily-mac.sh (default: in its worktree,
 #                       ~/link-proj-m4-daily); DAILY_DRY_RUN=1 says what would be handed to it
 #                       instead of running it (the Ubuntu host's part runs as always)
@@ -1377,12 +1379,19 @@ stop_windows() {
 # the measuring signal was read here; it reads the signal itself as well, and stops everything of
 # its own by the numbers it wrote down.
 mac_script=${DAILY_MAC_SCRIPT:-"$HOME/link-proj-m4-daily/scripts/daily-mac.sh"}
+# The Mac host's ssh name: the owner's alias that rides their open `ssh studio` tab (a shared
+# connection only), unless ISTESSO_MAC_HOST says otherwise.
+export ISTESSO_MAC_HOST=${ISTESSO_MAC_HOST:-istesso-studio}
+mac_unreachable="Studio につながっていません（ssh studio のタブを開いてください）"
+mac_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=3 "$ISTESSO_MAC_HOST" true > /dev/null 2>&1; }
 on_mac() { # COMMAND [ARGUMENTS...]
     [ -x "$mac_script" ] || { echo "error: the Mac host's script is not there: $mac_script (DAILY_MAC_SCRIPT)"; return 1; }
     if [ -n "${DAILY_DRY_RUN:-}" ]; then
-        echo "dry run: would run $(basename "$mac_script") $*"
+        echo "dry run: would run $(basename "$mac_script") $* (host $ISTESSO_MAC_HOST)"
         return 0
     fi
+    # The commands that need the host say plainly when it cannot be reached.
+    mac_reachable || { echo "$mac_unreachable"; return 1; }
     "$mac_script" "$@" 9>&-
 }
 # Takes --host ubuntu|mac out of the arguments: host_choice, and the rest in `rest`.
@@ -1422,6 +1431,7 @@ do_close_mac() { # APP [--for aura]
 list_mac() { # what is open on the Mac host, one line each, after "mac" (nothing when it is not set up)
     [ -x "$mac_script" ] || return 0
     if [ -n "${DAILY_DRY_RUN:-}" ]; then on_mac list; return 0; fi
+    mac_reachable || { printf 'mac\t%s\n' "$mac_unreachable"; return 0; }
     limited 20 "$mac_script" list 9>&- 2>&1 | awk '{print "mac\t" $0}'
 }
 
