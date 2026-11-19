@@ -55,9 +55,9 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.3</string>
+    <string>0.4</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.2</string>
     <key>LSBackgroundOnly</key>
@@ -85,3 +85,11 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
 codesign --force --options runtime --timestamp=none --identifier com.maromoco.istesso-dev.ime-probe \
     --sign "$ISTESSO_SIGN_IDENTITY" "$probe" >&2
 echo "$probe"
+
+# For the self-test only: the input method's program signed with the same certificate and the input
+# method's identifier but WITHOUT the hardened runtime; the probe must refuse it.
+standin="$output/istesso-ime-standin"
+cp "$bundle/Contents/MacOS/istesso-dev-input" "$standin"
+codesign --force --timestamp=none --identifier com.maromoco.istesso-dev.inputmethod.trial \
+    --sign "$ISTESSO_SIGN_IDENTITY" "$standin" >&2
+echo "$standin"
