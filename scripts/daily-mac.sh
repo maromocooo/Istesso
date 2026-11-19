@@ -44,10 +44,10 @@
 #   DAILY_VIEWER         a viewer program to start from the shell instead (no bundle)
 #   DAILY_NO_WINDOW=1    for checks: the viewer decodes but shows no window
 #   DAILY_FRAME_LOGS=1   frame logs on both sides
-#   DAILY_CLICK_FORM     how pointer events are posted on the host. 1 (default): to the application's
-#                        process only; keys and text arrive, clicks do not (seen on the Studio).
-#                        4: through the session, the host's own pointer moves; presses and scrolls
-#                        only onto the application's own window (docs/m4-daily-host.md)
+#   DAILY_CLICK_FORM     how pointer events are posted on the host. 4 (default for an application):
+#                        through the session, the host's own pointer moves; presses and scrolls only
+#                        onto the application's own windows. 1 (default for --display): to the
+#                        process only; keys and text arrive, clicks do not (docs/m4-daily-host.md)
 #   DAILY_HOST_EXTRA     more arguments for the host program, for checks (e.g. --generated --input-dry)
 #   DAILY_HOST_DIRECT=1  for checks with a stand-in host only: start the host program's executable
 #                        itself instead of through `open` (it then has no permission of its own)
@@ -190,6 +190,10 @@ do_open() {
     mkdir -p "$mine"
     local frames=-
     [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="\$run/frames-\$(date +%s).jsonl"
+    # Friday's choice (the owner): the application form clicks through the session (form 4, with
+    # the range checks); the whole display posts to the process unless DAILY_CLICK_FORM says else.
+    local click_form=${DAILY_CLICK_FORM:-4}
+    [ -n "$display" ] && click_form=${DAILY_CLICK_FORM:-1}
     local target_args size_arg="--size $size"
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$app")"; fi
     # The whole display keeps its own shape unless a size was asked for.
@@ -246,7 +250,7 @@ else
         : > "\$document"
     fi
     set -- $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        $size_arg --fps $fps --click-form ${DAILY_CLICK_FORM:-1} --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else
