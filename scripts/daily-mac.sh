@@ -63,6 +63,9 @@
 #                        onto the application's own windows. 1 (default for --display): to the
 #                        process only; keys and text arrive, clicks do not (docs/m4-daily-host.md)
 #   DAILY_HOST_EXTRA     more arguments for the host program, for checks (e.g. --generated --input-dry)
+#   DAILY_WINDOWS=1      PROTOTYPE (ADR 0027, a proposal): the application's other windows (Command-N,
+#                        dialogs) in windows of their own here: the host with --windows, the viewer
+#                        with ISTESSO_WINDOWS=1. Needs this branch's host, agent, relay and viewer
 #   DAILY_HOST_DIRECT=1  for checks with a stand-in host only: start the host program's executable
 #                        itself instead of through `open` (it then has no permission of its own)
 set -u
@@ -73,6 +76,7 @@ host_dir=${DAILY_MAC_DIR:-'~/.cache/istesso-daily-mac'}
 # A folder below the host's home, written as ~/...: nothing else is ever put into a command there.
 [[ "$host_dir" =~ ^~/[A-Za-z0-9._/-]+$ ]] && [[ "$host_dir" != *..* ]] || { echo "error: DAILY_MAC_DIR is a folder below the home, as ~/name"; exit 2; }
 [[ "${DAILY_HOST_EXTRA:-}" =~ ^[A-Za-z0-9\ ._/-]*$ ]] || { echo "error: DAILY_HOST_EXTRA holds only words of letters, digits, . _ / -"; exit 2; }
+[ "${DAILY_WINDOWS:-}" = 1 ] && DAILY_HOST_EXTRA="${DAILY_HOST_EXTRA:-} --windows"
 [ -z "${DAILY_CLICK_FORM:-}" ] || [[ "$DAILY_CLICK_FORM" =~ ^[1-4]$ ]] || { echo "error: DAILY_CLICK_FORM is 1, 2, 3 or 4"; exit 2; }
 state=${DAILY_MAC_STATE:-"$HOME/Library/Caches/istesso-daily-mac"}
 istesso=${DAILY_ISTESSO_BIN:-"$repo/target/release/istesso"}
@@ -496,6 +500,7 @@ open_here() {
     local settings=(${clip_env[@]+"${clip_env[@]}"} ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
+    [ "${DAILY_WINDOWS:-}" = 1 ] && settings+=(ISTESSO_WINDOWS=1)
     # The badged icon the launcher asks for (the viewer takes only an .icns under ~/Applications/Istesso Dev/).
     [ -n "${ISTESSO_APP_ICON:-}" ] && settings+=(ISTESSO_APP_ICON="$ISTESSO_APP_ICON")
     local arguments=("$x" "$y" "$width" "$height" "$title" - "$frames" 0 "$mine/in.sock")
