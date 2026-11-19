@@ -5,7 +5,7 @@
 
 [English](README.md) · [日本語](README.ja.md) · [简体中文](README.zh-Hans.md) · [한국어](README.ko.md) · **Español**
 
-Istesso muestra las aplicaciones que se ejecutan en tus otros equipos como ventanas normales en el que tienes delante. Para ello utiliza su propio canal cifrado. Tiene una sola regla: si percibes que trabajas en remoto, aunque sea un poco, la prueba ha fallado.
+Istesso muestra las aplicaciones que se ejecutan en tus otros equipos como ventanas normales en el que tienes delante. Para ello utiliza su propio canal cifrado. Tiene una sola regla: si percibes que trabajas en remoto, aunque sea un poco, ha fallado.
 
 <!-- Imagen pendiente (docs/images/): detalle de una pantalla con tres ventanas de aspecto idéntico.
      Una aplicación se ejecuta aquí, otra en un equipo Linux y otra en un Mac. Las etiquetas van fuera de la imagen.
@@ -22,7 +22,7 @@ Istesso está diseñado para que cada tarea se haga donde tenga menos latencia, 
 2. Para trabajar con texto se usa una conexión directa por terminal.
 3. Quedan las aplicaciones que necesitan una interfaz gráfica y se ejecutan en otro equipo. Solo esas se transmiten como vídeo, con una ventana por aplicación y el puntero dibujado en tu equipo.
 
-La prueba tiene un criterio de fallo concreto: si puedes distinguir qué ventana es remota, no se cumple la regla. Se mide la ventana retransmitida y se compara con la misma aplicación ejecutada localmente en la misma pantalla. Además, una persona intenta distinguir a simple vista cuál es la ventana retransmitida. La regla se aplica a equipos conectados por cable en una red doméstica. Quedan fuera las conexiones por Wi-Fi y por internet.
+La regla del principio se comprueba de una forma que puede fallar: no deberías poder distinguir qué ventana es remota. Se mide la ventana retransmitida y se compara con la misma aplicación ejecutada localmente en la misma pantalla. Además, una persona intenta distinguir a simple vista cuál es la ventana retransmitida. La regla se aplica a equipos conectados por cable en una red doméstica. Quedan fuera las conexiones por Wi-Fi y por internet.
 
 El nombre viene de *l'istesso tempo*, una indicación musical que pide mantener el mismo tempo aunque cambie el compás.
 
@@ -48,7 +48,7 @@ Cada columna indica dónde se ejecuta la aplicación y en qué dispositivo la ve
 
 El visor se conecta por Wi-Fi, por lo que queda fuera de la regla de latencia, que se aplica a una red doméstica por cable. En su columna, `Trial` indica que la función se puede usar en la versión de prueba. No dice nada sobre el cumplimiento de la regla.
 
-La latencia añadida por la retransmisión se mide respecto a la misma aplicación ejecutada localmente en la misma pantalla. Con ambos equipos conectados por cable, una pantalla de 85 Hz y una imagen de 3440×1440, no debe superar los 12 ms en la mediana, los 24 ms en el percentil 95 ni los 47 ms en el percentil 99. La retransmisión pasó esta prueba el 2026-11-17 con un prototipo del programa de visualización y un anfitrión preparado para las mediciones. La aceptación depende del resultado de la prueba final, que se hará con el cliente y el anfitrión propios de Istesso ([registro de la prueba](docs/measurements/2026-11-17-m1-gate.md) (japonés)).
+La latencia añadida por la retransmisión se mide respecto a la misma aplicación ejecutada localmente en la misma pantalla. Con ambos equipos conectados por cable, una pantalla de 85 Hz y una imagen de 3440×1440, no debe superar los 12 ms en la mediana, los 24 ms en el percentil 95 ni los 47 ms en el percentil 99. La retransmisión pasó esta prueba el 2026-11-17 con un prototipo del programa de visualización y un anfitrión preparado para las mediciones. Solo se dará por aceptada tras el veredicto final, medido con el cliente y el anfitrión propios de Istesso ([registro de la prueba](docs/measurements/2026-11-17-m1-gate.md) (japonés)).
 
 ## Qué vendrá después
 
@@ -72,7 +72,7 @@ Cada etapa y la prueba que debe superar se describen en [docs/milestones.md](doc
 - Tras reiniciar un Mac anfitrión, no se puede usar como anfitrión hasta que alguien inicie sesión una vez en ese Mac.
 - Cuando un Mac actúa como anfitrión, macOS pide confirmación en la pantalla de ese Mac cada 30 días para que la aplicación pueda seguir capturando la pantalla sin usar el selector del sistema. Es una regla de Apple para las aplicaciones que capturan la pantalla de esta manera. Istesso no la añade y la confirmación se pide también en las versiones compiladas a partir del código fuente. No se distribuyen versiones firmadas y aún no se ha decidido cómo se distribuirá Istesso.
 - No hay instalador, actualizaciones automáticas ni binarios firmados. El emparejamiento aún no se ha sometido a una revisión externa.
-- Las cifras de latencia disponibles hasta ahora proceden de un prototipo del programa de visualización. La aceptación queda pendiente de la prueba final.
+- Las cifras de latencia disponibles hasta ahora proceden de un prototipo del programa de visualización. La aceptación queda pendiente del veredicto final.
 - Esta versión no es compatible con Windows.
 
 ## En qué se diferencia de herramientas similares
@@ -129,7 +129,7 @@ Para ejecutar `cargo deny check` necesitas [cargo-deny](https://github.com/Embar
 
 El emparejamiento aún no se ha sometido a una revisión externa. Está previsto hacerla antes de publicar una versión. Istesso no está protegido frente a otros programas que se ejecuten con la misma cuenta de usuario en el mismo equipo.
 
-Para informar de una vulnerabilidad, usa el canal privado de GitHub. En la pestaña Security, selecciona «Report a vulnerability». No abras una incidencia pública para comunicarla.
+Para informar de una vulnerabilidad, usa la notificación privada de vulnerabilidades de GitHub: en la pestaña Security, selecciona «Report a vulnerability». No abras una incidencia pública para comunicarla.
 
 ## Documentación
 
