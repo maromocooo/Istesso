@@ -60,7 +60,7 @@ impl MountPair {
             refresh_peers: None,
             mount_folders: vec![format!("proj={}", setup.folder.display())],
             mount_for: if setup.allow_device {
-                vec!["a laptop".to_string()]
+                vec![identities[1].fingerprint()]
             } else {
                 Vec::new()
             },
@@ -1037,4 +1037,42 @@ fn a_frame_larger_than_a_question_ends_the_conversation() {
         assert!(began.elapsed() < SOON, "{:?}", pair.log());
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn a_device_that_may_see_folders_is_named_by_its_id_not_its_name() {
+    let (host, other) = (TempDir::new("mount-by-id"), TempDir::new("mount-by-id"));
+    let key = Identity::load_or_create(&other.paths().identity()).unwrap();
+    PeerStore::open(host.paths().peers())
+        .unwrap()
+        .add(Peer::from_hello(&Hello {
+            device_name: "a laptop".into(),
+            public_key: key.public_key(),
+        }))
+        .unwrap();
+    let peers = PeerStore::open(host.paths().peers()).unwrap();
+    let folders = [format!("proj={}", other.path().display())];
+    // A name, which whoever pairs a device chooses, is not taken; the id is
+    // shown to the person instead.
+    let refused =
+        super::MountPolicy::resolve(&peers, &folders, &["a laptop".into()], &[]).unwrap_err();
+    assert!(refused.contains("not its name"), "{refused}");
+    assert!(refused.contains(&key.fingerprint()), "{refused}");
+    // Nor the beginning of an id.
+    let short = key.fingerprint()[..4].to_string();
+    assert!(super::MountPolicy::resolve(&peers, &folders, &[short], &[]).is_err());
+    let policy = super::MountPolicy::resolve(&peers, &folders, &[key.fingerprint()], &[]).unwrap();
+    assert_eq!(
+        policy.devices(),
+        vec![format!("a laptop ({})", key.fingerprint())]
+    );
+}
+
+#[test]
+fn a_refusal_from_the_host_reaches_the_terminal_as_plain_text() {
+    use super::client::plain_text;
+    assert_eq!(plain_text("no such folder"), "no such folder");
+    assert_eq!(plain_text("a\u{1b}]0;title\u{7}b\nc"), "a?]0;title?b?c");
+    let long = "x".repeat(500);
+    assert_eq!(plain_text(&long), format!("{}…", "x".repeat(200)));
 }

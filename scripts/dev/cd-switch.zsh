@@ -41,8 +41,10 @@ typeset -gA ISTESSO_MOUNT_FOR ISTESSO_MOUNT_HOST_PATH
 if (( ! ${+ISTESSO_MOUNT_FOR[ubuntu]} && ${+commands[ish-mount]} )); then
     ISTESSO_MOUNT_FOR[ubuntu]=ish-mount
 fi
-# The mount that could not be made for the command line that runs now.
+# The mount that could not be made, and the one that was made or found, for
+# the command line that runs now.
 typeset -g _istesso_mount_failed=
+typeset -g _istesso_mount_done=
 
 autoload -Uz add-zsh-hook
 
@@ -52,6 +54,9 @@ autoload -Uz add-zsh-hook
 # folder the shell would still expand (variables, commands, patterns,
 # `~user`), which is left alone.
 _istesso_cd_target() {
+    # `=~` as ERE, whatever the shell's settings: under PCRE, `$` matches
+    # before a newline at the end.
+    setopt localoptions norematchpcre
     local -a words first
     words=(${(z)1})
     local word
@@ -67,12 +72,15 @@ _istesso_cd_target() {
         (( ${#first} == 1 )) || return 1
         arg=$first[1]
     elif (( ${#first} == 1 && ${#words} == 1 )) && [[ -o autocd ]]; then
+        # A command, an alias, a function or a builtin of that name runs as
+        # one; AUTO_CD takes only a word that is none of those.
+        whence -- $first[1] >/dev/null && return 1
         arg=$first[1]
     else
         return 1
     fi
     arg=${(Q)arg}
-    [[ -n $arg && $arg != - ]] || return 1
+    [[ -n $arg && $arg != - && $arg != *$'\n'* ]] || return 1
     [[ $arg == *[\$\`\*\?\[\]\{\}\<\>\(\)\|\;\&\\\!\#\^]* || $arg == '='* ]] && return 1
     case $arg in
         '~') arg=$HOME ;;
@@ -88,7 +96,9 @@ _istesso_cd_target() {
 # <rest>), with an empty folder id at the machine's own folder. Status 1 for
 # a folder that is not below the root, or whose second part is no folder id.
 _istesso_mount_place() {
+    setopt localoptions norematchpcre
     local root rest machine id sub
+    [[ $1 != *$'\n'* ]] || return 1
     for root in ${ISTESSO_MOUNT_ROOT:a} ${ISTESSO_MOUNT_ROOT:A}; do
         [[ $1 == "$root"/* ]] || continue
         rest=${1#"$root"/}
@@ -137,6 +147,8 @@ _istesso_mount_before() {
     if ! ISTESSO_MOUNT_ROOT=${ISTESSO_MOUNT_ROOT:a} ${=mounter} "$id" >/dev/null; then
         _istesso_mount_failed=$machine/$id
         print -u2 -r -- "istesso: $machine/$id is not shown on this Mac; the cd goes nowhere"
+    else
+        _istesso_mount_done=$machine/$id
     fi
     return 0
 }
@@ -164,6 +176,7 @@ _istesso_cd_preexec() {
     typeset -ga _istesso_cd_stack
     _istesso_cd_stack=("${dirstack[@]}")
     _istesso_mount_failed=
+    _istesso_mount_done=
     _istesso_mount_before "$1"
 }
 
@@ -215,6 +228,18 @@ _istesso_cd_chpwd() {
             # An empty folder where the mount would be: not the machine's folder.
             _istesso_cd_back
             return 0
+        fi
+        if [[ -n $id && $_istesso_mount_done != "$machine/$id" ]]; then
+            # A cd the hook before it did not read (`cd "$folder"`, say) went into
+            # the folder where the mount would be: mounted now, and gone into
+            # again, so that this shell stands in the mount, not in the folder
+            # under it.
+            if ! ISTESSO_MOUNT_ROOT=${ISTESSO_MOUNT_ROOT:a} ${=mounter} "$id" >/dev/null; then
+                print -u2 -r -- "istesso: $machine/$id is not shown on this Mac; back where this shell was"
+                _istesso_cd_back
+                return 0
+            fi
+            builtin cd -q -- "$PWD"
         fi
         _istesso_mount_host_path "$machine" "$id" "$reply[3]"
         folder=$REPLY

@@ -198,7 +198,7 @@ fn private_dir(dir: &Path) -> Result<(), String> {
 /// one (no links in it), as the mount table has it. A mount left there by an earlier run that
 /// was killed is taken off first; the mount point itself is not looked at before that (a
 /// mount whose server is gone may not answer).
-fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<PathBuf, String> {
+fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<(PathBuf, bool), String> {
     private_dir(base)?;
     let machine = base.join(machine);
     private_dir(&machine)?;
@@ -216,7 +216,8 @@ fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<PathBuf, Stri
             ));
         }
     }
-    if std::fs::symlink_metadata(&point).is_err() {
+    let made = std::fs::symlink_metadata(&point).is_err();
+    if made {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&point)
@@ -236,7 +237,64 @@ fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<PathBuf, Stri
             point.display()
         ));
     }
-    Ok(point)
+    Ok((point, made))
+}
+
+/// Takes away the mount point this run made, when nothing was mounted there: an empty folder
+/// would look like an empty project.
+fn forget_point(point: &Path, made: bool) {
+    if made && !is_mounted(point) {
+        let _ = std::fs::remove_dir(point);
+    }
+}
+
+/// A mount's identity in the kernel's table (`f_fsid`). Another mount at the same place,
+/// made later, has another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fsid(pub [i32; 2]);
+
+impl std::fmt::Display for Fsid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.0[0], self.0[1])
+    }
+}
+
+impl std::str::FromStr for Fsid {
+    type Err = ();
+    fn from_str(text: &str) -> Result<Self, ()> {
+        let mut parts = text.split(' ');
+        let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(());
+        };
+        Ok(Fsid([
+            a.parse().map_err(|_| ())?,
+            b.parse().map_err(|_| ())?,
+        ]))
+    }
+}
+
+/// The mount this process made (the mount program), or watches over (the watcher), once it
+/// is known. With it, only that mount is ever taken off: a later mount at the same place is
+/// another program's.
+static OWN: std::sync::OnceLock<Fsid> = std::sync::OnceLock::new();
+
+/// Whether this process's own mount is still in the table at `point`; without one known,
+/// whether anything is. In doubt (the table cannot be read): yes.
+fn own_is_mounted(point: &Path) -> bool {
+    match (OWN.get(), mounted_fsids(point)) {
+        (_, Err(())) => true,
+        (Some(own), Ok(found)) => found.contains(own),
+        (None, Ok(found)) => !found.is_empty(),
+    }
+}
+
+/// Whether what an unmount at `point` would take off is this process's own mount (the
+/// topmost one there). Without one known, or in doubt: yes.
+fn own_is_on_top(point: &Path) -> bool {
+    match (OWN.get(), mounted_fsids(point)) {
+        (Some(own), Ok(found)) => found.last() == Some(own),
+        _ => true,
+    }
 }
 
 /// Whether the kernel's mount table has something mounted at `point` (a real path). Read
@@ -244,12 +302,19 @@ fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<PathBuf, Stri
 /// answers every question with an error, is still seen. In doubt (the table cannot be
 /// read): mounted, so that the program does not leave a mount behind.
 pub(crate) fn is_mounted(point: &Path) -> bool {
+    !matches!(mounted_fsids(point), Ok(found) if found.is_empty())
+}
+
+/// The mounts the kernel's table has at `point` (a real path), the topmost last; read as
+/// for [`is_mounted`]. `Err` when the table cannot be read.
+pub(crate) fn mounted_fsids(point: &Path) -> Result<Vec<Fsid>, ()> {
+    const _: () = assert!(std::mem::size_of::<libc::fsid_t>() == 8);
     let want = point.as_os_str().as_bytes();
     for _ in 0..3 {
         // SAFETY: with a null buffer, getfsstat only counts.
         let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
         if count < 0 {
-            return true;
+            return Err(());
         }
         let room = count as usize + 8;
         // SAFETY: statfs is plain data; all zeroes is a valid value.
@@ -258,26 +323,39 @@ pub(crate) fn is_mounted(point: &Path) -> bool {
         // SAFETY: the buffer holds `room` entries of `bytes` bytes in all.
         let filled = unsafe { libc::getfsstat(table.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
         if filled < 0 {
-            return true;
+            return Err(());
         }
         if filled as usize >= room {
             // The table grew while it was read: read it again.
             continue;
         }
-        return table[..filled as usize].iter().any(|entry| {
-            // SAFETY: f_mntonname is a NUL-terminated string inside the entry.
-            unsafe { std::ffi::CStr::from_ptr(entry.f_mntonname.as_ptr()) }.to_bytes() == want
-        });
+        return Ok(table[..filled as usize]
+            .iter()
+            .filter(|entry| {
+                // SAFETY: f_mntonname is a NUL-terminated string inside the entry.
+                unsafe { std::ffi::CStr::from_ptr(entry.f_mntonname.as_ptr()) }.to_bytes() == want
+            })
+            .map(|entry| {
+                // SAFETY: fsid_t is two i32 (checked above); its field is private in libc.
+                Fsid(unsafe { std::ptr::read((&entry.f_fsid as *const libc::fsid_t).cast()) })
+            })
+            .collect());
     }
-    true
+    Err(())
 }
 
-/// Takes the mount at `point` off, by force when it is busy. True when nothing is mounted
-/// there any more.
+/// Takes the mount at `point` off, by force when it is busy: this process's own mount once
+/// it is known ([`OWN`]), and never one made later at the same place by another program.
+/// True when the own mount (or, before one is known, any mount) is not there any more.
 fn unmount(point: &Path) -> bool {
     for force in [false, true] {
-        if !is_mounted(point) {
+        if !own_is_mounted(point) {
             return true;
+        }
+        if !own_is_on_top(point) {
+            // Another mount lies on top of this one; taking it off would take off another
+            // program's. Tried again later.
+            return false;
         }
         let mut command = Command::new("/sbin/umount");
         if force {
@@ -285,7 +363,7 @@ fn unmount(point: &Path) -> bool {
         }
         let _ = command.arg(point).status();
     }
-    !is_mounted(point)
+    !own_is_mounted(point)
 }
 
 /// Unmounts, trying again every second for as long as it takes: the program never ends
@@ -359,8 +437,8 @@ fn run_mount(options: Options) -> ExitCode {
         .machine
         .clone()
         .unwrap_or_else(|| folder_name(&device));
-    let point = match mount_point(&base, &machine, &options.folder) {
-        Ok(point) => point,
+    let (point, made) = match mount_point(&base, &machine, &options.folder) {
+        Ok(found) => found,
         Err(why) => {
             say!("mount: {why}");
             return ExitCode::FAILURE;
@@ -379,6 +457,7 @@ fn run_mount(options: Options) -> ExitCode {
         Ok(opened) => opened,
         Err(why) => {
             say!("mount: {why}");
+            forget_point(&point, made);
             return ExitCode::FAILURE;
         }
     };
@@ -391,10 +470,13 @@ fn run_mount(options: Options) -> ExitCode {
         Ok(watcher) => watcher,
         Err(why) => {
             say!("mount: cannot start the watcher: {why}");
+            forget_point(&point, made);
             return ExitCode::FAILURE;
         }
     };
     say!("watcher: process {}", watcher.id());
+    // What the watcher is told: the own mount once it is made, or that there is none.
+    let mut to_watcher = watcher.stdin.take();
 
     // A panic must not leave the mount behind: take it off while the server still answers
     // (its threads run on while the panicking one unwinds). A panic in one question's task
@@ -412,6 +494,8 @@ fn run_mount(options: Options) -> ExitCode {
         Ok(fs) => fs,
         Err(e) => {
             say!("mount: {e}");
+            tell_watcher(&mut to_watcher, "none");
+            forget_point(&point, made);
             return ExitCode::FAILURE;
         }
     };
@@ -425,6 +509,8 @@ fn run_mount(options: Options) -> ExitCode {
             Ok(l) => l,
             Err(e) => {
                 say!("mount: cannot listen on 127.0.0.1: {e}");
+                tell_watcher(&mut to_watcher, "none");
+                forget_point(&point, made);
                 return ExitCode::FAILURE;
             }
         };
@@ -467,9 +553,19 @@ fn run_mount(options: Options) -> ExitCode {
                 );
                 if is_mounted(&point) {
                     unmount_until_gone(&point).await;
+                } else {
+                    tell_watcher(&mut to_watcher, "none");
                 }
+                forget_point(&point, made);
                 return ExitCode::FAILURE;
             }
+        }
+        // The own mount, by its identity in the table: the topmost one at the place, which
+        // mount_nfs has just made.
+        if let Some(own) = mounted_fsids(&point).ok().and_then(|found| found.last().copied()) {
+            let _ = OWN.set(own);
+            say!("fsid: {own}");
+            tell_watcher(&mut to_watcher, &format!("fsid {own}"));
         }
         gate.open();
         say!(
@@ -492,7 +588,7 @@ fn run_mount(options: Options) -> ExitCode {
                 _ = quit.recv() => break,
                 _ = every.tick() => {
                     let at = point.clone();
-                    let mounted = tokio::task::spawn_blocking(move || is_mounted(&at))
+                    let mounted = tokio::task::spawn_blocking(move || own_is_mounted(&at))
                         .await
                         .unwrap_or(true);
                     if !mounted {
@@ -500,13 +596,15 @@ fn run_mount(options: Options) -> ExitCode {
                         break;
                     }
                     // A plain unmount, which the system refuses while any program here has a
-                    // file or a folder in the mount open.
+                    // file or a folder in the mount open; only of the own mount.
                     if options.unused.is_some_and(|unused| tried.elapsed() >= unused) {
                         tried = Instant::now();
                         let at = point.clone();
-                        let gone = tokio::task::spawn_blocking(move || glue::plain_unmount(&at).is_ok())
-                            .await
-                            .unwrap_or(false);
+                        let gone = tokio::task::spawn_blocking(move || {
+                            own_is_on_top(&at) && glue::plain_unmount(&at).is_ok()
+                        })
+                        .await
+                        .unwrap_or(false);
                         if gone {
                             say!("nothing on this Mac used the folder; unmounted it");
                             break;
@@ -528,10 +626,34 @@ fn run_mount(options: Options) -> ExitCode {
         gate.refused_early.load(Ordering::Relaxed),
     );
     drop(rt);
-    // The mount is off: the watcher sees its pipe close, finds nothing mounted, and ends.
-    drop(watcher.stdin.take());
+    // The mount is off: the watcher sees its pipe close, finds the own mount gone, and ends.
+    drop(to_watcher);
     let _ = watcher.wait();
     code
+}
+
+/// One line to the watcher: `fsid A B`, the own mount, or `none`, nothing of this program's
+/// is mounted.
+fn tell_watcher(pipe: &mut Option<std::process::ChildStdin>, line: &str) {
+    use std::io::Write as _;
+    if let Some(pipe) = pipe.as_mut() {
+        let _ = writeln!(pipe, "{line}");
+    }
+}
+
+/// What the watcher was told, from all the lines it read: the own mount, `Some(None)` for
+/// "nothing of mine is mounted", `None` when it was told nothing (the program was killed
+/// before it knew).
+fn told(text: &str) -> Option<Option<Fsid>> {
+    let mut told = None;
+    for line in text.lines() {
+        if line == "none" {
+            told = Some(None);
+        } else if let Some(own) = line.strip_prefix("fsid ").and_then(|f| f.parse().ok()) {
+            told = Some(Some(own));
+        }
+    }
+    told
 }
 
 /// Starts `watch` for `point` in a session of its own (the terminal's signals do not reach
@@ -567,16 +689,28 @@ fn run_watch(point: &Path) -> ExitCode {
         unsafe { libc::signal(signal, libc::SIG_IGN) };
     }
     let mut stdin = std::io::stdin();
-    let mut byte = [0u8; 1];
+    let mut heard = Vec::new();
+    let mut buf = [0u8; 256];
     loop {
-        match stdin.read(&mut byte) {
+        match stdin.read(&mut buf) {
             Ok(0) => break,
+            // A few short lines; more is not kept.
+            Ok(n) if heard.len() < 4096 => heard.extend_from_slice(&buf[..n]),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    if !is_mounted(point) {
+    match told(&String::from_utf8_lossy(&heard)) {
+        // Nothing of the program's is mounted: a mount at the place is another's.
+        Some(None) => return ExitCode::SUCCESS,
+        Some(Some(own)) => {
+            let _ = OWN.set(own);
+        }
+        // Killed before it knew: whatever is at the place is taken off, as before.
+        None => {}
+    }
+    if !own_is_mounted(point) {
         return ExitCode::SUCCESS;
     }
     say!(

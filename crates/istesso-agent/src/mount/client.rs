@@ -90,7 +90,10 @@ impl Remote {
         let (root, max_read) = match client.open_mount(folder) {
             Ok(MountAnswer::Open { root, max_read }) => (root, max_read),
             Ok(MountAnswer::Refused { message, .. }) | Err(LinkError::Remote(message)) => {
-                return Err(format!("{name} does not show that folder: {message}"))
+                return Err(format!(
+                    "{name} does not show that folder: {}",
+                    plain_text(&message)
+                ))
             }
             Err(err) => return Err(format!("{name} did not answer: {err}")),
         };
@@ -121,9 +124,15 @@ impl Remote {
         });
         let alive = Arc::downgrade(&inner);
         std::thread::spawn(move || loop {
-            // Sleep in short steps, so that a closed connection lets this go soon.
-            for _ in 0..(ALIVE_EVERY.as_millis() / 100) {
-                std::thread::sleep(Duration::from_millis(100));
+            // Sleep in short steps, so that a closed connection lets this go
+            // soon, up to a deadline, so that the steps do not add up to more.
+            let until = std::time::Instant::now() + ALIVE_EVERY;
+            loop {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(100)));
                 match alive.upgrade() {
                     Some(inner) if !inner.stopped.load(Ordering::SeqCst) => {}
                     _ => return,
@@ -171,4 +180,18 @@ impl Drop for Remote {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// What the other device wrote, for a terminal: no control characters (an
+/// escape sequence could change what the terminal shows), and not too long.
+pub(crate) fn plain_text(text: &str) -> String {
+    let mut plain: String = text
+        .chars()
+        .take(200)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if text.chars().count() > 200 {
+        plain.push('…');
+    }
+    plain
 }

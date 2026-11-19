@@ -95,10 +95,11 @@ enum Command {
         /// once. A prototype (ADR 0007, proposal)
         #[arg(long, value_name = "ID=FOLDER")]
         mount_folder: Vec<String>,
-        /// Let this paired device (id or name) see the folders named with
-        /// `--mount-folder`. The device must also be allowed to control this
-        /// machine. May be given more than once
-        #[arg(long, value_name = "DEVICE")]
+        /// Let this paired device (its id, as `istesso peers` shows it; not
+        /// its name) see the folders named with `--mount-folder`. The device
+        /// must also be allowed to control this machine. May be given more
+        /// than once
+        #[arg(long, value_name = "DEVICE_ID")]
         allow_mount: Vec<String>,
         /// Also show what Git ignores, and `.git`, in the folder with this id
         #[arg(long, value_name = "ID")]
@@ -1635,12 +1636,11 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     for device in agent.shell_devices() {
         println!("Shells are open to {device}, as the user this agent runs as.");
     }
-    if !options.mount_folders.is_empty() && !options.mount_for.is_empty() {
-        println!(
-            "{} folder(s) are shown read-only to {} paired device(s).",
-            options.mount_folders.len(),
-            options.mount_for.len()
-        );
+    let (mount_devices, folders) = agent.mount_devices();
+    if folders > 0 {
+        for device in mount_devices {
+            println!("{folders} folder(s) are shown read-only to {device}.");
+        }
     }
     let reachable: Vec<String> = addresses
         .iter()

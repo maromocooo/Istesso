@@ -165,6 +165,48 @@ struct Shared {
     /// Folders shown now, by the id of the device they are shown to.
     #[cfg(unix)]
     mounts: Mutex<HashMap<String, usize>>,
+    /// Shells, forwarded connections and shown folders open now, together
+    /// ([`MAX_LONG_LIVED`]).
+    #[cfg(unix)]
+    long_lived: LongLived,
+}
+
+/// Shells, forwarded connections and shown folders open at the same time,
+/// together: fewer than [`MAX_CONNECTIONS`], so that they cannot take every
+/// place and keep a device from sending input or asking a question. Each of
+/// them has a limit of its own, too; those add up to all the places.
+#[cfg(unix)]
+const MAX_LONG_LIVED: usize = MAX_CONNECTIONS * 3 / 4;
+
+/// The places for conversations that stay open: [`MAX_LONG_LIVED`] in all.
+#[cfg(unix)]
+#[derive(Default)]
+struct LongLived {
+    open: AtomicUsize,
+}
+
+#[cfg(unix)]
+impl LongLived {
+    /// One more place, when there is one.
+    fn take(&self) -> Option<LongPlace<'_>> {
+        self.open
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
+                (open < MAX_LONG_LIVED).then_some(open + 1)
+            })
+            .ok()
+            .map(|_| LongPlace(self))
+    }
+}
+
+/// A place in [`LongLived`], given back when dropped.
+#[cfg(unix)]
+struct LongPlace<'a>(&'a LongLived);
+
+#[cfg(unix)]
+impl Drop for LongPlace<'_> {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Forwarded connections served at the same time: half of
@@ -188,18 +230,21 @@ struct ForwardSlots {
 
 #[cfg(unix)]
 impl ForwardSlots {
-    /// A place for one more connection of `device`, when there is one.
-    fn take(&self, device: &str) -> Option<ForwardSlot<'_>> {
+    /// A place for one more connection of `device`, when there is one, here
+    /// and in `long`.
+    fn take<'a>(&'a self, device: &str, long: &'a LongLived) -> Option<ForwardSlot<'a>> {
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         let all: usize = open.values().sum();
         let mine = open.get(device).copied().unwrap_or(0);
         if all >= MAX_FORWARDS || mine >= MAX_FORWARDS_PER_DEVICE {
             return None;
         }
+        let long = long.take()?;
         *open.entry(device.to_string()).or_default() += 1;
         Some(ForwardSlot {
             slots: self,
             device: device.to_string(),
+            _long: long,
         })
     }
 }
@@ -281,6 +326,7 @@ impl Agent {
         } else {
             (None, None)
         };
+        #[cfg(unix)]
         let mount_policy = if options.mount_folders.is_empty()
             && options.mount_for.is_empty()
             && options.mount_show_ignored.is_empty()
@@ -334,11 +380,14 @@ impl Agent {
                 forwards_open: ForwardSlots::default(),
                 #[cfg(unix)]
                 shell_silence: options.shell_silence,
+                #[cfg(unix)]
                 mount_policy,
                 #[cfg(unix)]
                 mount_global_rules: options.mount_global_rules.clone(),
                 #[cfg(unix)]
                 mounts: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                long_lived: LongLived::default(),
             }),
         })
     }
@@ -358,6 +407,18 @@ impl Agent {
         return self.shared.shell_policy.devices();
         #[cfg(not(unix))]
         Vec::new()
+    }
+
+    /// The devices that may see the shown folders, as "name (id)", and how
+    /// many folders are shown.
+    pub fn mount_devices(&self) -> (Vec<String>, usize) {
+        #[cfg(unix)]
+        return (
+            self.shared.mount_policy.devices(),
+            self.shared.mount_policy.folder_count(),
+        );
+        #[cfg(not(unix))]
+        (Vec::new(), 0)
     }
 
     /// Serves paired devices until the process ends.
@@ -565,6 +626,7 @@ fn may_have_shell(
 struct ShellSlot<'a> {
     shells: &'a Mutex<HashMap<String, usize>>,
     device: String,
+    _long: LongPlace<'a>,
 }
 
 #[cfg(unix)]
@@ -597,6 +659,7 @@ struct Forwarded<'a> {
 struct ForwardSlot<'a> {
     slots: &'a ForwardSlots,
     device: String,
+    _long: LongPlace<'a>,
 }
 
 #[cfg(unix)]
@@ -938,17 +1001,21 @@ impl Shared {
             let mut mounts = self.mounts.lock().unwrap_or_else(|e| e.into_inner());
             let on_host: usize = mounts.values().sum();
             let for_device = mounts.get(&peer.id).copied().unwrap_or(0);
-            if on_host >= MAX_ON_HOST || for_device >= MAX_PER_DEVICE {
+            let long = (on_host < MAX_ON_HOST && for_device < MAX_PER_DEVICE)
+                .then(|| self.long_lived.take())
+                .flatten();
+            let Some(long) = long else {
                 return Err(Response::error(
                     ErrorCode::Internal,
                     "too many folders are shown on this host",
                 ));
-            }
+            };
             *mounts.entry(peer.id.clone()).or_default() += 1;
             // Counted like shells, in a count of its own.
             ShellSlot {
                 shells: &self.mounts,
                 device: peer.id.clone(),
+                _long: long,
             }
         };
         let opened = Export::open(
@@ -1017,16 +1084,20 @@ impl Shared {
             let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
             let on_host: usize = shells.values().sum();
             let for_device = shells.get(&peer.id).copied().unwrap_or(0);
-            if on_host >= MAX_ON_HOST || for_device >= MAX_PER_DEVICE {
+            let long = (on_host < MAX_ON_HOST && for_device < MAX_PER_DEVICE)
+                .then(|| self.long_lived.take())
+                .flatten();
+            let Some(long) = long else {
                 return Err(Response::error(
                     ErrorCode::Internal,
                     "too many shells are open on this host",
                 ));
-            }
+            };
             *shells.entry(peer.id.clone()).or_default() += 1;
             ShellSlot {
                 shells: &self.shells,
                 device: peer.id.clone(),
+                _long: long,
             }
         };
         match Shell::start(request, &self.shell_settings) {
@@ -1093,12 +1164,15 @@ impl Shared {
         let target = self.workspaces.target(peer, forward).ok_or_else(refused)?;
         // The place is taken first: what follows reads `/proc`, and no device
         // makes the host do that more often than it has places.
-        let slot = self.forwards_open.take(&peer.id).ok_or_else(|| {
-            Response::error(
-                ErrorCode::Internal,
-                "too many forwarded connections are open on this host",
-            )
-        })?;
+        let slot = self
+            .forwards_open
+            .take(&peer.id, &self.long_lived)
+            .ok_or_else(|| {
+                Response::error(
+                    ErrorCode::Internal,
+                    "too many forwarded connections are open on this host",
+                )
+            })?;
         // The list is up to half a second old: what listens there now is
         // looked at again, before connecting and after. A connection is made
         // only when nothing but the workspace's sockets would take it.
@@ -1593,21 +1667,53 @@ mod tests {
     #[test]
     fn one_device_cannot_take_every_place_for_forwarded_connections() {
         let slots = ForwardSlots::default();
+        let long = LongLived::default();
         let first: Vec<_> = (0..MAX_FORWARDS_PER_DEVICE)
-            .map(|_| slots.take("a laptop").unwrap())
+            .map(|_| slots.take("a laptop", &long).unwrap())
             .collect();
-        assert!(slots.take("a laptop").is_none());
+        assert!(slots.take("a laptop", &long).is_none());
         // Another device still has places, up to what is left in all.
         let second: Vec<_> = (0..MAX_FORWARDS - MAX_FORWARDS_PER_DEVICE)
-            .map(|_| slots.take("a phone").unwrap())
+            .map(|_| slots.take("a phone", &long).unwrap())
             .collect();
-        assert!(slots.take("a phone").is_none());
-        assert!(slots.take("a tablet").is_none());
+        assert!(slots.take("a phone", &long).is_none());
+        assert!(slots.take("a tablet", &long).is_none());
         // A place that is given back can be taken again.
         drop(first);
-        assert!(slots.take("a laptop").is_some());
+        assert!(slots.take("a laptop", &long).is_some());
         drop(second);
         assert!(slots.open.lock().unwrap().is_empty());
+        assert_eq!(long.open.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shells_forwards_and_folders_together_leave_places_for_input() {
+        // Each limit of its own adds up to every place there is...
+        const {
+            assert!(
+                crate::remote_shell::MAX_ON_HOST + MAX_FORWARDS + crate::mount::MAX_ON_HOST
+                    >= MAX_CONNECTIONS
+            )
+        };
+        // ...and together they take fewer.
+        const { assert!(MAX_LONG_LIVED < MAX_CONNECTIONS) };
+        let long = LongLived::default();
+        let slots = ForwardSlots::default();
+        let held: Vec<_> = (0..MAX_LONG_LIVED - 1)
+            .map(|_| long.take().unwrap())
+            .collect();
+        // The last place goes to a forward; then neither a forward nor
+        // anything else gets one.
+        let last = slots.take("a laptop", &long).unwrap();
+        assert!(slots.take("a phone", &long).is_none());
+        assert!(long.take().is_none());
+        // The forward's own count did not keep the place it could not have.
+        assert_eq!(slots.open.lock().unwrap().values().sum::<usize>(), 1);
+        drop(last);
+        assert!(long.take().is_some());
+        drop(held);
+        assert_eq!(long.open.load(Ordering::SeqCst), 0);
     }
 
     #[test]

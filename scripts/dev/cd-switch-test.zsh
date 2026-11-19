@@ -70,7 +70,15 @@ setopt autocd
 check "a folder alone, AUTO_CD" "/x" "$(target 'x')"
 check "a folder and more, AUTO_CD" "-" "$(target 'x y')"
 check "a folder and a command, AUTO_CD" "-" "$(target 'x; ls')"
+# A word that is a command runs as one, also with AUTO_CD.
+check "a command alone, AUTO_CD" "-" "$(target 'ls')"
+check "a builtin alone, AUTO_CD" "-" "$(target 'pwd')"
+fake_function() { : }
+check "a function alone, AUTO_CD" "-" "$(target 'fake_function')"
+alias fake_alias=true
+check "an alias alone, AUTO_CD" "-" "$(target 'fake_alias')"
 unsetopt autocd
+check "a newline in the folder" "-" "$(target $'cd \'/x\ny\'')"
 
 place() {
     local -a reply
@@ -87,6 +95,15 @@ check "no folder id: a dash first" "-" "$(place "$r/ubuntu/-p")"
 check "no folder id: an underscore" "-" "$(place "$r/ubuntu/a_b")"
 check "no folder id: too long" "-" "$(place "$r/ubuntu/${(l:33::a:)}")"
 check "a folder id of 32" "ubuntu|${(l:32::a:)}|" "$(place "$r/ubuntu/${(l:32::a:)}")"
+check "no folder id: a newline at the end" "-" "$(place "$r/ubuntu/proj"$'\n')"
+# With PCRE for =~ (some setups turn it on), `$` would match before a
+# newline at the end; the checks do not depend on it.
+setopt rematchpcre 2>/dev/null && {
+    check "PCRE: no folder id with a newline at the end" "-" "$(place "$r/ubuntu/proj"$'\n')"
+    check "PCRE: still a folder id" "ubuntu|proj|" "$(place "$r/ubuntu/proj")"
+    check "PCRE: options" "/x" "$(target 'cd -q x')"
+    unsetopt rematchpcre
+}
 
 host_path() {
     local REPLY
@@ -115,6 +132,7 @@ fake_mount() {
 asked=()
 _istesso_cd_preexec "cd $r:q/ubuntu/proj/src"
 check "mounted before the cd" "$r|proj" "${asked[1]-}"
+check "the cd after it knows it is mounted" "ubuntu/proj" "$_istesso_mount_done"
 check "no failure" "" "$_istesso_mount_failed"
 asked=()
 _istesso_cd_preexec "cd /tmp"
@@ -127,6 +145,7 @@ answer=1
 _istesso_cd_preexec "cd $r:q/ubuntu/other" 2>/dev/null
 check "asked, and refused" "$r|other" "${asked[1]-}"
 check "the failure is kept for the cd" "ubuntu/other" "$_istesso_mount_failed"
+check "and nothing is taken as mounted" "" "$_istesso_mount_done"
 _istesso_cd_preexec "ls"
 check "the next line forgets it" "" "$_istesso_mount_failed"
 answer=0

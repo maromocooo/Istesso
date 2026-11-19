@@ -51,13 +51,15 @@ pub struct Folder {
 #[derive(Debug, Clone, Default)]
 pub struct MountPolicy {
     folders: Vec<Folder>,
-    /// Each device by its id and key, as they were when the agent started.
-    devices: Vec<(String, String)>,
+    /// Each device by its id, key and name, as they were when the agent
+    /// started.
+    devices: Vec<(String, String, String)>,
 }
 
 impl MountPolicy {
-    /// Reads `ID=FOLDER` pairs, devices by id or name (as for `istesso
-    /// peers`), and the ids of folders that show what Git ignores. A folder
+    /// Reads `ID=FOLDER` pairs, devices by their id only (as `istesso peers`
+    /// shows it; a name can be given to another device by whoever pairs
+    /// it), and the ids of folders that show what Git ignores. A folder
     /// that is not there, a device that is not paired or an id given twice
     /// is an error: the person meant something else and should hear it.
     pub fn resolve(
@@ -98,12 +100,18 @@ impl MountPolicy {
             }
         }
         let mut allowed = Vec::new();
-        for selector in devices {
-            let peer = peers
-                .find(selector)
-                .map_err(|e| format!("--allow-mount {selector}: {e}"))?
-                .ok_or_else(|| format!("--allow-mount: no paired device matches '{selector}'"))?;
-            allowed.push((peer.id.clone(), peer.public_key.clone()));
+        for id in devices {
+            let Some(peer) = peers.peers().iter().find(|peer| peer.id == *id) else {
+                let by_name = peers.find(id).ok().flatten();
+                return Err(match by_name {
+                    Some(peer) => format!(
+                        "--allow-mount takes the id of a paired device, not its name: {} has the id {}",
+                        peer.name, peer.id
+                    ),
+                    None => format!("--allow-mount: no paired device has the id '{id}'"),
+                });
+            };
+            allowed.push((peer.id.clone(), peer.public_key.clone(), peer.name.clone()));
         }
         Ok(MountPolicy {
             folders: named,
@@ -120,7 +128,16 @@ impl MountPolicy {
     pub fn names(&self, peer: &Peer) -> bool {
         self.devices
             .iter()
-            .any(|(id, key)| *id == peer.id && *key == peer.public_key)
+            .any(|(id, key, _)| *id == peer.id && *key == peer.public_key)
+    }
+
+    /// The devices that may see the folders, as "name (id)", for the person
+    /// who starts the agent to check.
+    pub fn devices(&self) -> Vec<String> {
+        self.devices
+            .iter()
+            .map(|(id, _, name)| format!("{name} ({id})"))
+            .collect()
     }
 
     /// The folder with this id, when the owner named one.

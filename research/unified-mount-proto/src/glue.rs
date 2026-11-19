@@ -26,9 +26,10 @@ pub const MACHINE_FOLDER_RULE: &str =
 /// limits for reaching the device (3 s) and for its answer (5 s), with room for `mount_nfs`.
 const WAIT: Duration = Duration::from_secs(20);
 
-/// How long `ensure` waits for the `mount` of an earlier mount at the same place to end. It
-/// looks every 2 s whether its folder was unmounted from outside.
-const EARLIER_WITHIN: Duration = Duration::from_secs(4);
+/// How long `ensure` waits for the `mount` of an earlier mount at the same place (and its
+/// watcher) to end before it says so and gives up: the `mount` looks every 2 s whether its
+/// folder was unmounted, and then waits up to 5 s for its connection to close.
+const EARLIER_WITHIN: Duration = Duration::from_secs(8);
 
 /// How often `ensure` looks whether the folder is mounted yet.
 const LOOK_EVERY: Duration = Duration::from_millis(20);
@@ -142,10 +143,21 @@ pub fn parse_release(args: &[String]) -> Option<ReleaseOptions> {
     })
 }
 
-/// The name of a mount's files in the state folder. `=` is in neither a machine folder's
-/// name nor a folder id, so two mounts never share one.
-fn state_name(machine: &str, folder: &str) -> String {
-    format!("{machine}={folder}")
+/// The name of a mount's files in the state folder: a short hash of the real path of the
+/// base (8 hex digits), `-`, the machine folder, `=`, the folder id. `=` is in neither name,
+/// so two mounts below one base never share their files; two bases share them only when
+/// their hashes are the same.
+fn state_name(root: &Path, machine: &str, folder: &str) -> String {
+    // FNV-1a, 64 bits: the same in every build, unlike the standard hasher's.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!(
+        "{:08x}-{machine}={folder}",
+        (hash >> 32) as u32 ^ hash as u32
+    )
 }
 
 /// The folder for the locks, the process numbers and the logs: the given one, or one in this
@@ -217,51 +229,63 @@ fn runs_this_program(pid: i32) -> bool {
         .is_some_and(|me| std::fs::canonicalize(theirs).is_ok_and(|them| them == me))
 }
 
-/// Waits, a short while, for the `mount` of an earlier mount at this place to end: it ends
-/// within 2 s of its folder being unmounted from outside. A new mount at the same place
-/// before that would be taken by it for its own.
-fn wait_for_earlier(pid_file: &Path) {
-    let Some(pid) = std::fs::read_to_string(pid_file)
+/// The process number in a pid file.
+fn read_pid(pid_file: &Path) -> Option<i32> {
+    std::fs::read_to_string(pid_file)
         .ok()
         .and_then(|text| text.trim().parse::<i32>().ok())
-    else {
-        return;
-    };
-    let until = Instant::now() + EARLIER_WITHIN;
-    while runs_this_program(pid) && Instant::now() < until {
+}
+
+/// Waits, a short while, for these processes (an earlier `mount` at this place and its
+/// watcher) to end. False when one of them still runs this program after that: a new mount
+/// at the same place must not start then.
+fn wait_for_earlier(pids: &[i32], within: Duration) -> bool {
+    let until = Instant::now() + within;
+    loop {
+        if !pids.iter().any(|pid| runs_this_program(*pid)) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 /// What a log of `mount` says so far.
-#[derive(Debug, PartialEq, Eq)]
-enum Logged {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Record {
     /// The folder is mounted and its contents are answered.
-    Ready,
-    /// It was mounted, and the connection to the device is lost since: every read fails.
-    Lost,
-    /// Not yet, and these are the reasons it gave for failing, if any.
-    NotYet(Vec<String>),
+    ready: bool,
+    /// After that, the connection to the device was lost: every read fails.
+    lost: bool,
+    /// The mount's identity in the kernel's table.
+    fsid: Option<crate::Fsid>,
+    /// The watcher's process number.
+    watcher: Option<i32>,
+    /// The reasons it gave for failing before it was mounted.
+    reasons: Vec<String>,
 }
 
-fn read_log(text: &str) -> Logged {
-    let mut reasons = Vec::new();
-    let mut ready = false;
+fn read_log(text: &str) -> Record {
+    let mut record = Record::default();
     for line in text.lines() {
         // `mount` says this once the gate is open, after mount_nfs succeeded.
         if line.starts_with("mounted ") {
-            ready = true;
-        } else if ready && line.starts_with("mount: lost the connection") {
-            return Logged::Lost;
+            record.ready = true;
+        } else if let Some(fsid) = line.strip_prefix("fsid: ") {
+            record.fsid = fsid.parse().ok();
+        } else if let Some(pid) = line.strip_prefix("watcher: process ") {
+            record.watcher = pid.parse().ok();
+        } else if record.ready && line.starts_with("mount: lost the connection") {
+            record.lost = true;
         } else if let Some(reason) = line.strip_prefix("mount: ") {
-            reasons.push(reason.to_string());
+            if !record.ready {
+                record.reasons.push(reason.to_string());
+            }
         }
     }
-    if ready {
-        Logged::Ready
-    } else {
-        Logged::NotYet(reasons)
-    }
+    record
 }
 
 fn log_text(path: &Path) -> String {
@@ -316,7 +340,11 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
         return Err(Refused::Usage(MACHINE_FOLDER_RULE.into()));
     }
     let state = state_dir(options.state.as_deref()).map_err(failed)?;
-    let name = state_name(&options.machine, &options.folder);
+    // The base first: the names of the state files come from its real path.
+    crate::private_dir(&options.base).map_err(failed)?;
+    let root = std::fs::canonicalize(&options.base)
+        .map_err(|e| failed(format!("{}: {e}", options.base.display())))?;
+    let name = state_name(&root, &options.machine, &options.folder);
     let _lock = lock(&state, &name).map_err(failed)?;
     let mounted_at = || {
         existing_point(&options.base, &options.machine, &options.folder)
@@ -324,23 +352,59 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
     };
     let pid_file = state.join(format!("{name}.pid"));
     let log_path = state.join(format!("{name}.log"));
-    if let Some(point) = mounted_at() {
-        if read_log(&log_text(&log_path)) != Logged::Lost {
-            return Ok(point);
-        }
-        // Mounted, but every read fails since the connection was lost: mounted again, when
-        // nothing uses it.
-        match plain_unmount(&point) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                return Err(failed(
-                    "the connection to the machine was lost, and the folder is still in use on this Mac; close what uses it and go in again",
-                ))
+
+    // The mount of this flow that is there, when its `mount` still runs: used as it is, or,
+    // when its connection is lost, taken off (when nothing uses it) and made again. Only
+    // that mount, known by its identity in the table: never another one at the same place.
+    let record = read_log(&log_text(&log_path));
+    let earlier = read_pid(&pid_file);
+    let running = earlier.filter(|pid| runs_this_program(*pid));
+    if let (Some(pid), Some(point)) = (
+        running,
+        existing_point(&options.base, &options.machine, &options.folder),
+    ) {
+        let found = crate::mounted_fsids(&point);
+        match record.fsid {
+            Some(own) if found.as_ref().map_or(true, |found| found.contains(&own)) => {
+                if !record.lost {
+                    return Ok(point);
+                }
+                if !matches!(&found, Ok(found) if found.last() == Some(&own)) {
+                    return Err(failed(
+                        "the connection to the machine was lost, and another mount lies on this one; take that off first",
+                    ));
+                }
+                match plain_unmount(&point) {
+                    Ok(()) => {
+                        // It ends at once instead of at its next look.
+                        // SAFETY: a signal to the process this flow started, by its number,
+                        // which runs this program.
+                        unsafe { libc::kill(pid, libc::SIGTERM) };
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                        return Err(failed(
+                            "the connection to the machine was lost, and the folder is still in use on this Mac; close what uses it and go in again",
+                        ))
+                    }
+                    Err(e) => {
+                        return Err(failed(format!("cannot unmount {}: {e}", point.display())))
+                    }
+                }
             }
-            Err(e) => return Err(failed(format!("cannot unmount {}: {e}", point.display()))),
+            // Mounted and answering, from a `mount` that has not said which mount is its
+            // own.
+            None if record.ready && !record.lost && crate::is_mounted(&point) => return Ok(point),
+            _ => {}
         }
     }
-    wait_for_earlier(&pid_file);
+    // No mount of this flow is there to be used. An earlier `mount` at this place, or its
+    // watcher, that still runs would take a new mount here for its own: it has to end first.
+    let pids: Vec<i32> = earlier.into_iter().chain(record.watcher).collect();
+    if !wait_for_earlier(&pids, EARLIER_WITHIN) {
+        return Err(failed(
+            "an earlier mount of this folder is still ending; try again in a moment",
+        ));
+    }
 
     // A new log for this run: an earlier `mount` that has not ended yet writes on in the old
     // one, not in this one.
@@ -398,21 +462,28 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
         .and_then(|mut file| std::io::Write::write_all(&mut file, format!("{pid}\n").as_bytes()));
 
     let until = Instant::now() + options.wait;
+    // A run that ends without a mount leaves no files but its lock.
+    let forget = || {
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(&log_path);
+    };
     loop {
         let logged = read_log(&log_text(&log_path));
-        if logged == Logged::Ready {
+        if logged.ready && !logged.lost {
             if let Some(point) = mounted_at() {
                 // The `mount` goes on by itself; it is not waited for.
                 return Ok(point);
             }
         }
-        let lost = logged == Logged::Lost;
+        let lost = logged.lost;
         match child.try_wait() {
             Ok(Some(status)) => {
-                let _ = std::fs::remove_file(&pid_file);
-                let Logged::NotYet(mut reasons) = read_log(&log_text(&log_path)) else {
+                let logged = read_log(&log_text(&log_path));
+                forget();
+                if logged.ready {
                     return Err(failed(format!("the mount ended at once ({status})")));
-                };
+                }
+                let mut reasons = logged.reasons;
                 if reasons.is_empty() {
                     reasons.push(format!("the mount ended ({status})"));
                 }
@@ -429,12 +500,18 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
             while matches!(child.try_wait(), Ok(None)) && Instant::now() < stop {
                 std::thread::sleep(Duration::from_millis(50));
             }
+            let logged = read_log(&log_text(&log_path));
+            // The pid file stays while it runs: the next `ensure` waits for it.
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                forget();
+            }
             if lost {
                 return Err(failed("the connection to the machine was lost at once"));
             }
-            let mut reasons = match read_log(&log_text(&log_path)) {
-                Logged::NotYet(reasons) => reasons,
-                Logged::Ready | Logged::Lost => Vec::new(),
+            let mut reasons = if logged.ready {
+                Vec::new()
+            } else {
+                logged.reasons
             };
             reasons.push(format!(
                 "not mounted after {:.0} s; stopped trying",
@@ -483,15 +560,35 @@ pub fn release(options: &ReleaseOptions) -> Result<Released, String> {
         return Err(MACHINE_FOLDER_RULE.into());
     }
     let state = state_dir(options.state.as_deref())?;
-    let _lock = lock(&state, &state_name(&options.machine, &options.folder))?;
+    let Ok(root) = std::fs::canonicalize(&options.base) else {
+        return Ok(Released::NotMounted);
+    };
+    let name = state_name(&root, &options.machine, &options.folder);
+    let _lock = lock(&state, &name)?;
     let Some(point) = existing_point(&options.base, &options.machine, &options.folder) else {
         return Ok(Released::NotMounted);
     };
-    if !crate::is_mounted(&point) {
-        return Ok(Released::NotMounted);
-    }
+    let on_top = match crate::mounted_fsids(&point) {
+        Ok(found) if found.is_empty() => return Ok(Released::NotMounted),
+        Ok(found) => found.last().copied(),
+        Err(()) => None,
+    };
     match plain_unmount(&point) {
-        Ok(()) => Ok(Released::Unmounted),
+        Ok(()) => {
+            // The `mount` of the mount just taken off ends at once instead of at its next
+            // look, when it is this flow's and still runs.
+            let record = read_log(&log_text(&state.join(format!("{name}.log"))));
+            if let (Some(own), Some(pid)) =
+                (record.fsid, read_pid(&state.join(format!("{name}.pid"))))
+            {
+                if on_top == Some(own) && runs_this_program(pid) {
+                    // SAFETY: a signal to the process this flow started, by its number, which
+                    // runs this program; its mount is gone, so it only ends.
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                }
+            }
+            Ok(Released::Unmounted)
+        }
         Err(e) if e.raw_os_error() == Some(libc::EBUSY) => Ok(Released::Busy),
         Err(e) => Err(format!("cannot unmount {}: {e}", point.display())),
     }
@@ -524,6 +621,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_watcher_takes_the_last_thing_it_was_told() {
+        use crate::{told, Fsid};
+        assert_eq!(told(""), None);
+        assert_eq!(told("none\n"), Some(None));
+        assert_eq!(told("fsid 12 -7\n"), Some(Some(Fsid([12, -7]))));
+        assert_eq!(told("fsid 12 -7\nnone\n"), Some(None));
+        // A line it does not know is passed over.
+        assert_eq!(told("fsid twelve\nfsid 1 2 3\n"), None);
+        assert_eq!("3 4".parse::<Fsid>(), Ok(Fsid([3, 4])));
+        assert_eq!(Fsid([3, 4]).to_string(), "3 4");
+    }
+
+    #[test]
+    fn the_mount_table_has_the_root_and_not_a_plain_folder() {
+        let dir = scratch("table");
+        assert_eq!(crate::mounted_fsids(&dir), Ok(vec![]));
+        assert_eq!(crate::mounted_fsids(Path::new("/")).map(|f| f.len()), Ok(1));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -621,9 +739,18 @@ mod tests {
 
     #[test]
     fn two_mounts_never_share_their_files() {
-        // A folder id has no `=` and no `.`; a machine folder has no `=`.
-        assert_ne!(state_name("a-b", "c"), state_name("a", "b-c"));
-        assert_eq!(state_name("ubuntu", "proj"), "ubuntu=proj");
+        let root = Path::new("/Volumes/one/Istesso");
+        // A folder id has no `=`; a machine folder has no `=`.
+        assert_ne!(state_name(root, "a-b", "c"), state_name(root, "a", "b-c"));
+        let name = state_name(root, "ubuntu", "proj");
+        assert!(name.ends_with("-ubuntu=proj"), "{name}");
+        assert_eq!(name.len(), 8 + "-ubuntu=proj".len());
+        // The same in every run, and another one for another root.
+        assert_eq!(name, state_name(root, "ubuntu", "proj"));
+        assert_ne!(
+            name,
+            state_name(Path::new("/Volumes/test/Istesso"), "ubuntu", "proj")
+        );
     }
 
     #[test]
@@ -646,28 +773,29 @@ mod tests {
 
     #[test]
     fn the_log_says_ready_only_once_the_contents_are_answered() {
-        assert_eq!(read_log(""), Logged::NotYet(vec![]));
-        assert_eq!(read_log("watcher: process 12\n"), Logged::NotYet(vec![]));
-        assert_eq!(
-            read_log("watcher: process 12\nmounted proj of host read-only at /x after 0.1 s\n"),
-            Logged::Ready
+        assert_eq!(read_log(""), Record::default());
+        let started = read_log("watcher: process 12\n");
+        assert!(!started.ready);
+        assert_eq!(started.watcher, Some(12));
+        let mounted = read_log(
+            "watcher: process 12\nfsid: 50331660 30\nmounted proj of host read-only at /x after 0.1 s\n",
         );
+        assert!(mounted.ready && !mounted.lost);
+        assert_eq!(mounted.fsid, Some(crate::Fsid([50331660, 30])));
         assert_eq!(
-            read_log("mount: cannot reach host: no answer\nrefused: 0 later\n"),
-            Logged::NotYet(vec!["cannot reach host: no answer".into()])
+            read_log("mount: cannot reach host: no answer\nrefused: 0 later\n").reasons,
+            vec!["cannot reach host: no answer".to_string()]
         );
         // A line that only contains the words is not the line.
-        assert_eq!(read_log("test: not mounted yet\n"), Logged::NotYet(vec![]));
+        assert_eq!(read_log("test: not mounted yet\n"), Record::default());
         // Lost after it was mounted: every read fails from then on.
-        assert_eq!(
-            read_log("mounted p of h read-only at /x after 0.1 s\nmount: lost the connection to h (closed); reads fail from now on, until this is stopped\n"),
-            Logged::Lost
-        );
+        let lost = read_log("mounted p of h read-only at /x after 0.1 s\nmount: lost the connection to h (closed); reads fail from now on, until this is stopped\n");
+        assert!(lost.ready && lost.lost);
+        assert!(lost.reasons.is_empty());
         // The same words before the mount are only a reason.
-        assert_eq!(
-            read_log("mount: lost the connection to h\n"),
-            Logged::NotYet(vec!["lost the connection to h".into()])
-        );
+        let before = read_log("mount: lost the connection to h\n");
+        assert!(!before.lost);
+        assert_eq!(before.reasons, vec!["lost the connection to h".to_string()]);
     }
 
     #[test]
@@ -737,9 +865,18 @@ mod tests {
         let dir = scratch("earlier");
         let pid_file = dir.join("x.pid");
         std::fs::write(&pid_file, "1\n").unwrap();
+        assert_eq!(read_pid(&pid_file), Some(1));
+        assert_eq!(read_pid(&dir.join("none.pid")), None);
         let began = Instant::now();
-        wait_for_earlier(&pid_file);
+        assert!(wait_for_earlier(&[1, 0], Duration::from_secs(5)));
         assert!(began.elapsed() < Duration::from_secs(1));
+        // One that runs this program is waited for, and then it is said so.
+        let began = Instant::now();
+        assert!(!wait_for_earlier(
+            &[std::process::id() as i32],
+            Duration::from_millis(200)
+        ));
+        assert!(began.elapsed() >= Duration::from_millis(200));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

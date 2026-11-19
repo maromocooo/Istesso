@@ -21,10 +21,16 @@
 #   2. The same, with another program on the Mac in the mount: it stays
 #      mounted when the shell there ends, and goes by itself once that
 #      program is done (ISH_MOUNT_UNUSED=2: it looks every 2 s).
-#   3. Nothing answers on the host: the cd says why and goes nowhere, no
-#      shell is opened, nothing is mounted.
-#   4. The terminal is closed while the shell there is open: the mount goes
+#   3. The terminal is closed while the shell there is open: the mount goes
 #      by itself, all the same.
+#   4. A cd the hook before it cannot read (`cd "$d"`) goes into the empty
+#      folder where the mount would be: it is mounted then, and the shell
+#      there opens all the same.
+#   5. Nothing answers on the host: the cd says why and goes nowhere, no
+#      shell is opened, nothing is mounted, and the failed run leaves no
+#      folder where the mount would have been.
+#
+# The cases run in this order; each starts a new shell on this Mac.
 #
 # Prints `ok …` and `FAIL …` lines, and `ish-mount-e2e: passed` or
 # `ish-mount-e2e: FAILED`; ends with 0 only when everything passed.
@@ -81,6 +87,17 @@ case "${1:-}" in
         fi
         echo "FAIL the mount did not say it took itself off"
         exit 1
+        ;;
+    check-no-folder)
+        if [ -e "$POINT" ]; then echo "FAIL a folder is left where the mount would have been"; exit 1; fi
+        echo "ok no folder is left where the mount would have been"
+        exit 0
+        ;;
+    forget-folder)
+        # The empty folder of earlier mounts, so that the failed run is the one that makes it.
+        if mounted; then echo "FAIL mounted"; exit 1; fi
+        rmdir "$POINT" 2>/dev/null || true
+        exit 0
         ;;
     check-gone)
         if mounted; then echo "FAIL still mounted"; exit 1; fi
@@ -228,7 +245,7 @@ run_check check-went-by-itself
 send "exit\r"
 expect eof
 
-# 4. The terminal goes away while the shell there is open.
+# 3. The terminal goes away while the shell there is open.
 start_shell $env(ISH_PORT)
 send "cd \"$env(E2E_POINT)\"\r"
 sleep 3
@@ -241,7 +258,23 @@ for {set i 0} {$i < 30 && ![catch {exec $env(E2E_SELF) check-mounted}]} {incr i}
 run_check check-gone
 run_check check-went-by-itself
 
-# 3. Nothing answers on the host.
+# 4. A cd the hook before it cannot read: the folder is given by a variable.
+start_shell $env(ISH_PORT)
+send "d=\"$env(E2E_POINT)\"; print -r -- SET\r"
+local_prompt "after setting the variable"
+send "cd \"\$d\"\r"
+sleep 3
+set there [remote_at]
+if {$there eq $env(E2E_HOST_PATH)} { ok "a cd the hook did not read: the shell on the host is in the shown folder" } else { fail "a cd the hook did not read: the shell on the host is in $there" }
+run_check check-mounted
+send "exit\r"
+local_prompt "after the shell on the host ended"
+run_check check-gone
+send "exit\r"
+expect eof
+
+# 5. Nothing answers on the host.
+run_check forget-folder
 start_shell $env(E2E_DOWN_PORT)
 foreach into [list "$env(E2E_POINT)/sub" $env(E2E_POINT)] {
     set began [clock milliseconds]
@@ -261,6 +294,7 @@ foreach into [list "$env(E2E_POINT)/sub" $env(E2E_POINT)] {
     set at [local_at]
     if {$at eq $env(E2E_START)} { ok "still where the shell on this Mac was" } else { fail "the shell on this Mac is in $at" }
     run_check check-gone
+    run_check check-no-folder
 }
 send "exit\r"
 expect eof
