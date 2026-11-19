@@ -139,6 +139,21 @@ stop_written_down() {
     for i in $(seq 1 30); do still_runs "$1" || return 0; sleep 0.1; done
 }
 signal_busy() { [ "$(cut -d' ' -f1 ~/.local/state/istesso/measuring 2>/dev/null)" = busy ]; }
+prompt_owners() {
+    local LC_ALL=C owner count=0
+    local label='[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?'
+    local bundle_id="^$label([.]$label)+$"
+    # Bash variables cannot hold NUL. Map it to an invalid character before read.
+    while IFS= read -r owner || [ -n "$owner" ]; do
+        case "$owner" in ''|'#'*) continue ;; esac
+        if [[ $count -ge 16 || ${#owner} -gt 128 || ! $owner =~ $bundle_id ]]; then
+            echo "skipped a line in daily-mac-system-prompts.txt: not a bundle id" >&2
+            continue
+        fi
+        printf '%s\n' "$owner"
+        count=$((count + 1))
+    done < <(LC_ALL=C tr '\000' '/' < "$1")
+}
 # A word for the host program of run $1; never waits more than two seconds.
 tell() {
     local run=$D/run/$1 writer i
@@ -306,6 +321,14 @@ if still_runs "\$run/host.pid"; then
     for i in \$(seq 1 30); do [ \$(( \$(count_said \$NAME resumed) + \$(count_said \$NAME refused) )) -gt "\$before" ] && break; [ \$(count_said \$NAME paused) -eq 0 ] && break; sleep 0.1; done
     echo "host: \$NAME runs already"
 else
+    set --
+    prompt_file="\$HOME/.config/istesso/daily-mac-system-prompts.txt"
+    if [ -e "\$prompt_file" ]; then
+        [ -f "\$prompt_file" ] && [ -r "\$prompt_file" ] || { echo "fail cannot read the system prompt owner list"; exit 0; }
+        while IFS= read -r owner; do
+            set -- "\$@" --system-prompt-owner "\$owner"
+        done < <(prompt_owners "\$prompt_file")
+    fi
     # An agent left from an earlier run of this name may listen on another slot's port: never kept.
     stop_written_down "\$run/agent.pid"
     slot=\$SLOT
@@ -336,7 +359,7 @@ else
         : > "\$document"
         printf '%s\n' "\$document" > "\$run/document"
     fi
-    set -- $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
+    set -- "\$@" $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
         $size_arg $virtual_arg $clipboard_host --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
@@ -496,20 +519,33 @@ do_guard() {
                 fi
             done
             [ "$open_ones" = 1 ] || { echo "$(date '+%H:%M:%S') no window is open: the guard ends"; exit 0; }
-            # Whether the host's screen is locked (its host programs say so): shown in the titles.
+            # Read the last of each status in one pass through each host log.
             local states
-            states=$(printf 'for r in "$D"/run/*/; do n=$(basename "$r"); w=$(grep -o "\"istesso\":\"\\(locked\\|unlocked\\)\"" "$r/host.log" 2>/dev/null | tail -1 | cut -d\\" -f4); k=$(grep -o "\"istesso\":\"keys-\\(dropped\\|taken\\)\"" "$r/host.log" 2>/dev/null | tail -1 | cut -d\\" -f4); echo "$n ${w:-unlocked} ${k:-keys-taken}"; done\n' | on_host 2>/dev/null)
+            states=$(on_host 2>/dev/null <<'HOST'
+for run in "$D"/run/*/; do
+    [ -r "$run/host.log" ] || continue
+    awk -F'"' -v name="$(basename "$run")" '
+        BEGIN { lock = "unlocked"; keys = "keys-taken"; prompt = "false" }
+        $2 == "istesso" && ($4 == "locked" || $4 == "unlocked") { lock = $4 }
+        $2 == "istesso" && ($4 == "keys-taken" || $4 == "keys-dropped") { keys = $4 }
+        $0 == "{\"istesso\":\"system-prompt\",\"present\":true}" { prompt = "true" }
+        $0 == "{\"istesso\":\"system-prompt\",\"present\":false}" { prompt = "false" }
+        END { print name, lock, keys, prompt }
+    ' "$run/host.log"
+done
+HOST
+)
             for mine in "$state"/*/; do
                 name=$(basename "$mine")
                 still_runs "$mine/viewer.pid" || continue
-                local lock_word keys_word base wanted
-                lock_word=$(printf '%s\n' "$states" | awk -v n="$name" '$1 == n {print $2}')
-                keys_word=$(printf '%s\n' "$states" | awk -v n="$name" '$1 == n {print $3}')
+                local lock_word keys_word prompt_word base wanted
+                read -r lock_word keys_word prompt_word <<< "$(awk -v n="$name" '$1 == n {print $2, $3, $4; exit}' <<< "$states")"
                 base="$(cat "$mine/app" 2>/dev/null) (Mac host)"
                 wanted=$base
                 # Never silently: a key that the host could not hand over is said in the title.
                 [ "$keys_word" = keys-dropped ] && wanted="$base — この窓にまだ打てません。クリックしてください"
                 [ "$lock_word" = locked ] && wanted="$base — Studio はロック中"
+                [ "$prompt_word" = true ] && wanted="$wanted — Studio で確認が出ています"
                 if [ "$(head -1 "$mine/title" 2>/dev/null)" != "$wanted" ]; then
                     printf '%s\n\n' "$wanted" > "$mine/title"
                     kill -USR1 "$(number_in "$mine/viewer.pid")" 2>/dev/null

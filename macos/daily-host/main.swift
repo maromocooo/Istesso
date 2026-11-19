@@ -45,7 +45,17 @@ enum Target {
     case app(String)
 }
 
+let systemPromptOwners: Set<String> = [] // filled from an observed prompt; do not guess
+let systemPromptMinLayer = Int(CGWindowLevelForKey(.modalPanelWindow)) // to be confirmed from an observed prompt
+
+func validSystemPromptOwner(_ owner: String) -> Bool {
+    guard owner.utf8.count <= 128 else { return false }
+    let label = "[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    return owner.range(of: "\\A\(label)(?:\\.\(label))+\\z", options: .regularExpression) != nil
+}
+
 struct Settings {
+    var promptOwners = systemPromptOwners
     var port = 47911
     var bind = "[::]"
     var configDir: String?
@@ -89,7 +99,7 @@ func usage() -> Never {
            [--display | --app NAME|BUNDLE-ID|PATH] [--size WxH] [--fps N] [--chroma 444|420]
            [--bitrate KBIT] [--keep-awake FPS] [--min-qp N] [--input-socket PATH] [--input-dry]
            [--control FIFO] [--log FILE|-] [--no-fit-window] [--click-form 1|2|3] [--generated]
-           [--pid-file FILE] [--signal FILE]
+           [--pid-file FILE] [--signal FILE] [--system-prompt-owner BUNDLE_ID]...
 
     """.utf8))
     exit(2)
@@ -97,6 +107,7 @@ func usage() -> Never {
 
 func readSettings() -> Settings {
     var s = Settings()
+    var promptOwnerCount = 0
     var args = Array(CommandLine.arguments.dropFirst())
     func value() -> String {
         guard !args.isEmpty else { usage() }
@@ -119,6 +130,11 @@ func readSettings() -> Settings {
         case "--log": let v = value(); s.log = v == "-" ? nil : v
         case "--display": s.target = .display
         case "--app": s.target = .app(value())
+        case "--system-prompt-owner":
+            let owner = value()
+            guard promptOwnerCount < 16, validSystemPromptOwner(owner) else { usage() }
+            promptOwnerCount += 1
+            s.promptOwners.insert(owner)
         case "--document": s.document = value()
         case "--size":
             let parts = value().split(separator: "x").compactMap { Int($0) }
@@ -935,6 +951,62 @@ func windowList(onScreenOnly: Bool = true, desktop: Bool = false) -> [WindowInfo
 /// answered by WindowServer, which waits for no application).
 func freshWindowList() { listCache = nil }
 
+func systemPromptCount(_ windows: [NSDictionary], owners: Set<String>, bundleID: (pid_t) -> String?) -> Int {
+    windows.reduce(into: 0) { count, window in
+        guard let layer = window[kCGWindowLayer as String] as? Int, layer >= systemPromptMinLayer,
+              let rawPID = window[kCGWindowOwnerPID as String] as? Int, let pid = pid_t(exactly: rawPID),
+              let owner = bundleID(pid), owners.contains(owner) else { return }
+        count += 1
+    }
+}
+
+struct SystemPromptState {
+    private var present = false
+    private var previous: Bool?
+
+    /// An unreadable list breaks the streak. Only a confirmed change produces a log entry.
+    mutating func observe(_ sample: Bool?) -> Bool? {
+        defer { previous = sample }
+        guard let sample, sample == previous, sample != present else { return nil }
+        present = sample
+        return present
+    }
+}
+
+final class SystemPromptMonitor {
+    private let queue = DispatchQueue(label: "istesso.daily-host.system-prompt", qos: .utility)
+    private let sample: () -> Bool?
+    private var state = SystemPromptState() // Accessed only on the timer's queue.
+    private var timer: DispatchSourceTimer? // Started and stopped on main.
+
+    init(sample: @escaping () -> Bool?) { self.sample = sample }
+
+    deinit { timer?.cancel() }
+
+    func start() {
+        guard timer == nil else { return }
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now() + 1)
+        source.setEventHandler { [weak self] in
+            guard let self, !source.isCancelled else { return }
+            let present = self.sample()
+            // A measurement can start while WindowServer is answering.
+            guard !source.isCancelled else { return }
+            if let changed = self.state.observe(present) {
+                say("system-prompt", [("present", changed)])
+            }
+            source.schedule(deadline: .now() + 1)
+        }
+        timer = source
+        source.resume()
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+}
+
 func readWindowList(onScreenOnly: Bool, desktop: Bool) -> [WindowInfo] {
     var options: CGWindowListOption = onScreenOnly ? [.optionOnScreenOnly] : [.optionAll]
     if !desktop { options.insert(.excludeDesktopElements) }
@@ -1480,6 +1552,38 @@ func selfTest() -> Never {
     let panel = CGRect(x: 400, y: 300, width: 600, height: 400)
     func checkPanel(_ got: Bool, _ want: Bool, _ what: String) {
         if got != want { failed += 1; print("FAIL \(what)") } else { print("ok   \(what)") }
+    }
+    do {
+        let owner = "com.example.prompt" // check-private: ok synthetic bundle identifier
+        let other = "com.example.other" // check-private: ok synthetic bundle identifier
+        let pid = kCGWindowOwnerPID as String, layer = kCGWindowLayer as String
+        let level = systemPromptMinLayer
+        let windows: [NSDictionary] = [
+            [pid: 1, layer: level], [pid: 1, layer: level + 1], [pid: 1, layer: level - 1],
+            [pid: 2, layer: level], [pid: 3, layer: level], [pid: 1], [layer: level]
+        ]
+        let ids: [pid_t: String] = [1: owner, 2: other]
+        checkPanel(systemPromptCount(windows, owners: [owner]) { ids[$0] } == 2, true,
+                   "prompt: count windows with a listed owner at or above the threshold")
+        checkPanel(systemPromptCount(windows, owners: []) { ids[$0] } == 0, true, "prompt: empty owner list")
+        var state = SystemPromptState()
+        let samples: [Bool?] = [false, true, false, true, nil, true, true, true, false, true, false, false, false]
+        let expected: [Bool?] = [nil, nil, nil, nil, nil, nil, true, nil, nil, nil, nil, false, nil]
+        checkPanel(samples.map { state.observe($0) } == expected, true,
+                   "prompt: two consecutive reads in either direction, one report per change")
+        let sampled = DispatchSemaphore(value: 0)
+        let monitor = SystemPromptMonitor {
+            precondition(!Thread.isMainThread)
+            sampled.signal()
+            return nil
+        }
+        monitor.start()
+        checkPanel(sampled.wait(timeout: .now() + 3) == .success, true, "prompt: timer samples off the main thread")
+        monitor.stop()
+        let limit = owner + String(repeating: "a", count: 128 - owner.utf8.count)
+        checkPanel(validSystemPromptOwner(limit) && !validSystemPromptOwner(limit + "a")
+                   && !validSystemPromptOwner(owner + "\n") && !validSystemPromptOwner("--flag"),
+                   true, "prompt: reject oversized identifiers and invalid characters")
     }
     let standard = AXWindowInfo(bounds: win, role: kAXWindowRole as String, subrole: kAXStandardWindowSubrole as String)
     let sheet = AXWindowInfo(bounds: panel, role: kAXSheetRole as String, subrole: "")
@@ -2408,6 +2512,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var offered = true
     var inputSocket: Int32 = -1
     var timers: [DispatchSourceTimer] = []
+    var promptMonitor: SystemPromptMonitor?
     var mayCapture = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2458,6 +2563,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
 
     func quit(_ code: Int32) {
+        promptMonitor?.stop()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(code) }
     }
 
@@ -3330,6 +3436,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// shown anything and no input is passed; when it is free again the picture comes back. The
     /// file is only read.
     func watchSignal() {
+        let owners = settings.promptOwners
+        if !settings.generated, !owners.isEmpty {
+            promptMonitor = SystemPromptMonitor {
+                let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [NSDictionary]
+                return windows.map {
+                    systemPromptCount($0, owners: owners) { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier } > 0
+                }
+            }
+        }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: .seconds(2))
         timer.setEventHandler { [weak self] in
@@ -3337,6 +3452,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             let first = (try? String(contentsOfFile: settings.signal, encoding: .utf8))?
                 .split(whereSeparator: { $0 == " " || $0 == "\n" }).first.map(String.init)
             let busy = first == "busy"
+            if busy {
+                self.promptMonitor?.stop()
+            } else {
+                self.promptMonitor?.start()
+            }
             if busy && !self.heldForSignal {
                 self.heldForSignal = true
                 note("a latency measurement runs on this Mac: the picture stops until it is over")
@@ -3439,6 +3559,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var awake: IOPMAssertionID = 0
     var lastViewed: TimeInterval = 0
     var wasLocked: Bool?
+
     var pausedForLock = false
     func keepAwakeAndTellLock() {
         let now = ProcessInfo.processInfo.systemUptime
