@@ -38,6 +38,20 @@ static NSString *repeat(NSString *unit, NSUInteger count) {
     return [@"" stringByPaddingToLength:unit.length * count withString:unit startingAtIndex:0];
 }
 
+// Compare the actual wire bytes without printing text, including on failure.
+static void expect_preedit(const char *name, NSString *marked, NSRange selection,
+                           NSString *escaped, NSUInteger begin, NSUInteger end) {
+    BOOL hasText = NO;
+    NSData *got = text_input_preedit(marked, selection, &hasText);
+    NSString *json = [NSString stringWithFormat:@"{\"kind\":\"preedit\",\"text\":\"%@\",\"cursor\":[%lu,%lu]}",
+                      escaped, (unsigned long)begin, (unsigned long)end];
+    if (escaped ? (![got isEqualToData:[json dataUsingEncoding:NSUTF8StringEncoding]] || hasText != (escaped.length != 0))
+                : got != nil) {
+        fprintf(stderr, "FAILED: %s\n", name);
+        failures++;
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         expect("empty commit", @"", @[]);
@@ -52,6 +66,17 @@ int main(void) {
         expect("newlines and a tab", @"一\r\n二\n三\t四", @[@"一", @"KEY:28", @"二", @"KEY:28", @"三", @"KEY:15", @"四"]);
         expect("UTF-8 and JSON escapes", @"日本\"\\/語", @[@"日本\\\"\\\\/語"]);
         NSString *full = repeat(@"😀", 256);
+        expect_preedit("clear", @"", NSMakeRange(0, 0), @"", 0, 0);
+        expect_preedit("Japanese selection", @"a日本語", NSMakeRange(1, 2), @"a日本語", 1, 7);
+        expect_preedit("surrogate pair", @"日😀本", NSMakeRange(1, 2), @"日😀本", 3, 7);
+        expect_preedit("inside a surrogate pair", @"日😀本", NSMakeRange(2, 0), @"日😀本", 3, 3);
+        expect_preedit("combining mark", @"か\u3099", NSMakeRange(1, 1), @"か\u3099", 3, 6);
+        expect_preedit("controls and escaping", [NSString stringWithFormat:@"\t日\n\"\\%C本", (unichar)0x85], NSMakeRange(2, 4), @"日\\\"\\\\本", 3, 5);
+        expect_preedit("filtered mark", @"\r\n\t", NSMakeRange(0, 3), @"", 0, 0);
+        expect_preedit("clamped selection", @"字", NSMakeRange(NSNotFound, 10), @"字", 3, 3);
+        expect_preedit("full preedit", full, NSMakeRange(0, full.length), full, 0, 1024);
+        expect_preedit("too many scalars", repeat(@"a", 257), NSMakeRange(0, 0), nil, 0, 0);
+        expect_preedit("too many bytes", [full stringByAppendingString:@"a"], NSMakeRange(0, 0), nil, 0, 0);
         expect("both limits exactly", full, @[full]);
         expect("one more scalar", [full stringByAppendingString:@"字"], @[full, @"字"]);
         expect("escaped ASCII at the scalar limit", repeat(@"\\", 257), @[repeat(@"\\\\", 256), @"\\\\"]);

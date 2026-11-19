@@ -15,6 +15,15 @@ datagrams of that kind only) and sends them itself, in order, on the same main l
 never written anywhere, only checked against the limits (256 characters, 1024 bytes, no control
 characters) and passed on.
 
+With --text also composing text ("preedit", "変換中の文字": the whole text and its selected part as
+UTF-8 byte offsets) goes to the compositor, as TextPreedit (text=string, cursor-begin=uint,
+cursor-end=uint), never written anywhere either. And the compositor is asked to say which field
+has the keyboard (its property text-input-messages, gwd-trial28 and later): each wayland.text-input
+message (state, and the text cursor's rectangle in the picture; no text) is handed to the media
+library's istesso_media_host_set_text_input, which tells the viewers that may see this picture
+(ADR 0015, "文字の入力の欄"). The library and its host are taken as the host script makes them
+(ctypes.CDLL is wrapped for this one run).
+
 A quality floor for the NVENC encoder: min-qp-i, min-qp-p and min-qp-b are all set to N (0-51), so
 that a picture that stands still is encoded in very few bytes. m1-step3-host.py and m1_encoder.py
 are not changed, here or in any copy: this program replaces m1_encoder.encoder for this one run,
@@ -24,6 +33,7 @@ get the floor. Once the pipeline exists, the values the encoder element really h
 and said on standard error, one line.
 """
 
+import ctypes
 import os
 import runpy
 import sys
@@ -52,21 +62,107 @@ def acceptable(text):
     )
 
 
-def take_text(hand_over):
-    """Wraps json.loads so that a datagram of the kind "text" goes to hand_over(text) and reads,
-    for the host script, as an object of no kind (which it skips). Nothing else changes."""
+def preedit_acceptable(text, cursor):
+    """Whether composing text may be passed on: as committed text but it may be empty, and the
+    selected part lies within it on character boundaries."""
+    if not isinstance(text, str) or not (text == "" or acceptable(text)):
+        return False
+    if not (isinstance(cursor, list) and len(cursor) == 2 and all(isinstance(c, int) for c in cursor)):
+        return False
+    data = text.encode("utf-8")
+    begin, end = cursor
+
+    def boundary(at):
+        return at == len(data) or (0 <= at < len(data) and (data[at] & 0xC0) != 0x80)
+
+    return 0 <= begin <= end <= len(data) and boundary(begin) and boundary(end)
+
+
+def take_text(hand_over, hand_over_preedit):
+    """Wraps json.loads so that a datagram of the kind "text" goes to hand_over(text), and one of
+    the kind "preedit" to hand_over_preedit(text, cursor), and reads, for the host script, as an
+    object of no kind (which it skips). Nothing else changes."""
     import json
 
     loads = json.loads
 
     def taking(document, *args, **kwargs):
         value = loads(document, *args, **kwargs)
-        if isinstance(document, (bytes, bytearray)) and isinstance(value, dict) and value.get("kind") == "text":
-            hand_over(value.get("text"))
-            return {}
+        if isinstance(document, (bytes, bytearray)) and isinstance(value, dict):
+            if value.get("kind") == "text":
+                hand_over(value.get("text"))
+                return {}
+            if value.get("kind") == "preedit":
+                hand_over_preedit(value.get("text"), value.get("cursor"))
+                return {}
         return value
 
     json.loads = taking
+
+
+class MediaTextInput(ctypes.Structure):
+    """IstessoMediaTextInput of istesso_media.h."""
+
+    _fields_ = [
+        ("state", ctypes.c_uint32), ("x", ctypes.c_int32), ("y", ctypes.c_int32),
+        ("width", ctypes.c_uint32), ("height", ctypes.c_uint32),
+    ]
+
+
+def take_media():
+    """Wraps ctypes.CDLL for this run so that the media library the host script loads, and the
+    host it makes with it, are known here. Returns tell(structure), which hands a
+    wayland.text-input message to that host (nothing before there is one)."""
+    seen = {"lib": None, "host": None}
+
+    class Recorded:
+        def __init__(self, function):
+            object.__setattr__(self, "_function", function)
+
+        def __getattr__(self, name):
+            return getattr(self._function, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._function, name, value)
+
+        def __call__(self, *args):
+            host = self._function(*args)
+            if host:
+                seen["host"] = host
+            return host
+
+    class Seeing(ctypes.CDLL):
+        def __init__(self, name, *args, **kwargs):
+            super().__init__(name, *args, **kwargs)
+            if name and "istesso_media" in os.path.basename(str(name)):
+                seen["lib"] = self
+
+        def __getattr__(self, name):
+            function = super().__getattr__(name)
+            if name in ("istesso_media_host_listen", "istesso_media_host_listen_closed"):
+                function = Recorded(function)
+                setattr(self, name, function)
+            return function
+
+    ctypes.CDLL = Seeing
+
+    def tell(structure):
+        if structure is None or structure.get_name() != "wayland.text-input":
+            return
+        lib, host = seen["lib"], seen["host"]
+        if lib is None or host is None or not hasattr(lib, "istesso_media_host_set_text_input"):
+            return
+        setter = lib.istesso_media_host_set_text_input
+        setter.restype = ctypes.c_int32
+        setter.argtypes = [ctypes.c_void_p, ctypes.POINTER(MediaTextInput)]
+        field = MediaTextInput(*(structure.get_value(k) for k in ("state", "x", "y", "width", "height")))
+        result = setter(host, ctypes.byref(field))
+        if not seen.get("said"):
+            # Once: that the viewers are told about the field (never where it is).
+            seen["said"] = True
+            print(f"daily: the field with the keyboard goes to the viewers (first: {'told' if result == 0 else 'refused'})", file=sys.stderr, flush=True)
+
+    return tell
 
 
 def main():
@@ -141,8 +237,40 @@ def main():
             structure.set_value("text", piece)
             compositor.get_static_pad("src").send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
 
-        take_text(hand_over)
-        print("daily: committed text goes to the compositor (trial only)", file=sys.stderr, flush=True)
+        def hand_over_preedit(piece, cursor):
+            compositor = None
+            for pipeline in reversed(made_pipelines):
+                compositor = pipeline.get_by_name("compositor")
+                if compositor is not None:
+                    break
+            if compositor is None or not preedit_acceptable(piece, cursor):
+                dropped["count"] += 1
+                print(f"daily: composing text dropped ({dropped['count']} so far; never shown)", file=sys.stderr, flush=True)
+                return
+            from gi.repository import GObject
+
+            structure = Gst.Structure.new_empty("TextPreedit")
+            structure.set_value("text", piece)
+            structure.set_value("cursor-begin", GObject.Value(GObject.TYPE_UINT, cursor[0]))
+            structure.set_value("cursor-end", GObject.Value(GObject.TYPE_UINT, cursor[1]))
+            compositor.get_static_pad("src").send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+
+        take_text(hand_over, hand_over_preedit)
+        tell_field = take_media()
+        made_before = Gst.parse_launch
+
+        def made_with_fields(description):
+            pipeline = made_before(description)
+            compositor = pipeline.get_by_name("compositor")
+            if compositor is not None and compositor.find_property("text-input-messages") is not None:
+                bus = pipeline.get_bus()
+                bus.add_signal_watch()
+                bus.connect("message::application", lambda _bus, message: tell_field(message.get_structure()))
+                compositor.set_property("text-input-messages", True)
+            return pipeline
+
+        Gst.parse_launch = made_with_fields
+        print("daily: committed and composing text go to the compositor (trial only)", file=sys.stderr, flush=True)
 
     script = arguments[0]
     sys.argv = [script] + arguments[1:]
