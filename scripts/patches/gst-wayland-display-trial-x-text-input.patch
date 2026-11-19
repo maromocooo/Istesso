@@ -2,10 +2,11 @@ Committed text for the client that has the keyboard (Istesso's ADR 0007, "確定
 ADR 0020, route d): the compositor offers zwp_text_input_v3 to its clients, without an input
 method, and the custom upstream event TextCommit (text=string) hands a piece of committed text to
 the enabled text input of the client that has the keyboard (commit_string, then done). The text
-inputs of a client are told they entered before its keyboard is (GTK 4.14 enables its text input
-only in that order, seen on the host). A client
+inputs of a client are told they entered before its keyboard is. GTK 4.14 (the Text Editor)
+enables its text input only after the focus moved inside its window, not at the start (seen on
+the host; neither this order nor telling the window it is active again changed that). A client
 without an enabled text input gets printable ASCII as key presses (US layout; on another layout
-only letters, digits and the space); anything else is dropped. The text is never logged, only
+only letters, digits and the space; Caps Lock is taken into account); anything else is dropped. The text is never logged, only
 how many characters went which way.
 
 A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
@@ -36,15 +37,15 @@ index 5dafbc7..8d36da5 100644
                  } else if structure.has_name("TouchDown") {
                      let x = structure.get::<f64>("x").expect("Should contain x");
 diff --git a/wayland-display-core/src/comp/focus.rs b/wayland-display-core/src/comp/focus.rs
-index f4bd241..d3151aa 100644
+index f4bd241..0245bf7 100644
 --- a/wayland-display-core/src/comp/focus.rs
 +++ b/wayland-display-core/src/comp/focus.rs
 @@ -54,6 +54,15 @@ impl KeyboardTarget<State> for FocusTarget {
          keys: Vec<KeysymHandle<'_>>,
          serial: Serial,
      ) {
-+        // Trial only: the text inputs of this client are told they entered before the keyboard
-+        // is (GTK enables its text input only then, seen on the host).
++        // Trial only: the text inputs of this client are told they entered, before the keyboard
++        // is.
 +        let surface = match self {
 +            FocusTarget::Wayland(w) => match w.underlying_surface() {
 +                WindowSurface::Wayland(w) => w.wl_surface().clone(),
@@ -140,10 +141,10 @@ index b0ef369..8583d4b 100644
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
 new file mode 100644
-index 0000000..d8c0927
+index 0000000..12c70f1
 --- /dev/null
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,354 @@
 +//! Trial only: committed text for the client that has the keyboard (Istesso's ADR 0007,
 +//! "確定した文字", and ADR 0020, route d). The device a person types on composes the text with
 +//! its own input method and sends only what was committed; here it is handed to the text input
@@ -370,7 +371,10 @@ index 0000000..d8c0927
 +            tracing::info!(chars, "text dropped: a modifier key is held");
 +            return;
 +        }
-+        for (code, shift) in keys {
++        // With Caps Lock on, a letter's case comes from Shift the other way round.
++        let caps = held.caps_lock;
++        for ((code, shift), c) in keys.into_iter().zip(text.chars()) {
++            let shift = shift != (caps && c.is_ascii_alphabetic());
 +            let time = std::time::Duration::from(self.clock.now()).as_millis() as u32;
 +            if shift {
 +                let key = self.scancode_to_keycode(KEY_LEFTSHIFT);
