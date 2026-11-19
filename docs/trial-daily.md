@@ -5,6 +5,18 @@
 - ねらい：持ち主が、毎日さわって、気づいたことを宿題にするための版。粗くてよい。ランチャー（最初は、窓 1 枚）、アプリを 2 つか 3 つ同時に、アプリごとに Mac の窓 1 枚、切り替え、ていねいな終わらせ方。
 - 持ち主の決めたこと（2026-11-18）：まず窓 2 枚の形。ランチャーの窓（PR #17 の `m3-launcher.md`）は、そのあと。Mac の窓は、署名した包みから起動する。計測の合図が `busy` になったら、終わらせずに止め、`free` で戻す。閉じるときは、まず頼み、10 秒ほどで残っていたら番号で終わらせる。
 
+## 金曜日（11 月 20 日）の統合（2026-11-19）
+
+持ち主が金曜日に、ふだんの使いみち全部に使う、1 つの試用版。`trial-daily` に、次の 3 つを、この順にマージした（どれもマージのコミット）：
+
+1. `trial-daily-text`（日本語の入力、案 d：確定した文字、エージェントの上限、ビューアーの文字入力の受け口、`daily-pipeline.py --text`）。下の「日本語の入力」。
+2. `trial-viewer-reconnect`（ビューアーと中継が、自分でつなぎ直す。`ISTESSO_DAILY_RECONNECT`）。ぶつかったのは、`daily.sh` のビューアーの設定の 1 行だけで、`ISTESSO_DAILY_RECONNECT=1` と `ISTESSO_TEXT_INPUT=1` の両方を残した。`keys.h` と `keys-test.c` は、日本語の側が触っていなかったので、つなぎ直しの側のまま（つなぎ直したときは、いま押している修飾キーだけを押し直し、次のイベントで Mac の状態に合わせる）。
+3. `trial-daily-aura-flow`（AURA の絵をためない。`--flow`）。`daily-pipeline.py` は `--min-qp`、`--text`、`--flow` を一緒に受け取る形にした。
+
+- 毎回のマージのあとに：`cargo fmt`、`cargo clippy --workspace --all-targets -D warnings`、触ったクレートのテスト、ビューアーのビルド（`keys-test`、`text-input-test` を含む）、3 つ目のあとは `daily_flow_test.py`（15 件）。どれも通った。
+- コンポジターの既定のプラグインは `gwd-trial27`（日本語の流れの、文字入力の修正の版。GTK のエディターがセッションを戻したときの、限った text-input の入り直しを含む）。
+- Mac のホストの流れ（`m4-daily-host`）の `scripts/daily-mac.sh` は、ここにはマージしていない。それが使うビューアーの設定（`ISTESSO_CHANNEL`、`ISTESSO_CHANNEL_PEER`、`ISTESSO_END_WITH_WINDOW`、`ISTESSO_COMMAND_KEY`、`ISTESSO_PID_FILE`、`ISTESSO_TITLE_FILE`、`ISTESSO_NO_WINDOW`）と、中継の `--keep-trying` は、統合したものにもそのままある。つなぎ直しと文字入力は、それぞれ `ISTESSO_DAILY_RECONNECT` と `ISTESSO_TEXT_INPUT` を付けたときだけ働くので、`daily-mac.sh` から起動したときの振る舞いは前のまま（読んで確かめた。`daily-mac.sh` は動かしていない）。
+
 ## いまの部品で、何が足りなかったか
 
 `scripts/try.sh` は、アプリを 1 つ映します。`ISTESSO_TRY_NAME` を付けると、2 つめを横で動かせますが、キーボードとマウスは届きません。ホストのエージェントが、入力を、ふだんのパイプラインの口 1 つにだけ渡すためです。
