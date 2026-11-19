@@ -793,6 +793,9 @@ final class InlineHost {
     /// next connection.
     private(set) var ownerChose = false
     private var wasConnected = false
+    /// Stopped: nothing is selected again (seen on the Studio, 2026-11-19 21:41: a tick after the
+    /// stop's restore selected Istesso's source again, and the program then ended).
+    private(set) var stopped = false
     var pid: () -> pid_t? = { nil }
 
     init?(app: String, slot: Int, idle: Double, system: InputSourceSystem = TISInputSources(), path given: String? = nil) {
@@ -861,6 +864,7 @@ final class InlineHost {
 
     /// Every 100 ms (10 ms while a commit is held): which source, whether inline, what the field is.
     func tick(connected: Bool, locked: Bool, pid: pid_t?) {
+        guard !stopped else { return }
         if connected && !wasConnected { ownerChose = false; switcher.forgetRestored() }
         wasConnected = connected
         let wanted = inlineSourceWanted(connected: connected, locked: locked, localIdle: localIdle(), idle: idle)
@@ -898,6 +902,8 @@ final class InlineHost {
 
     /// Disconnect, stop, a crash's next start: Istesso's source is let go.
     func shutdown() {
+        guard !stopped else { return }
+        stopped = true
         clearBeforeRestore()
         if switcher.holding {
             let restored = switcher.release()
@@ -1416,7 +1422,16 @@ func inlineHostSelfTest(folder: String) -> Int {
     system.current = "test.layout"
     host.tick(connected: true, locked: false, pid: nil)
     check(system.current == "test.layout" && !host.switcher.holding, "picked by hand while Istesso's was selected: let go, left as chosen")
+    // A stop puts the source back, and no later tick selects Istesso's again.
+    host.tick(connected: true, locked: false, pid: nil)
+    system.current = "test.ime#kana"
     host.tick(connected: false, locked: false, pid: nil)
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current == SourceSwitch.ours, "connected: Istesso's (before the stop)")
+    host.shutdown()
+    check(system.current != SourceSwitch.ours && !host.switcher.holding, "the stop puts the source back")
+    host.tick(connected: true, locked: false, pid: nil)
+    check(system.current != SourceSwitch.ours && !host.switcher.holding, "and a tick after the stop selects nothing")
     stop.signal()
     _ = done.wait(timeout: .now() + 2)
     pump(0.05)
