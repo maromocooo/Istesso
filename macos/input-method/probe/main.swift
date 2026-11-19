@@ -314,6 +314,7 @@ final class Session {
         case "post-access":
             print("post_event_access: \(CGPreflightPostEventAccess())")
         case "burst":
+            guard mayPost() else { print("burst: not reachable (no permission to post events; nothing asked)"); return }
             // `burst <n> ack|noack [keycode]`: n times a commit of one kana (the input-source path)
             // and at once a key (the CGEvent path, default "a") posted to TextEdit, with or without
             // holding the key until the commit's "inserted" answer (at most 50 ms; a timeout is sent
@@ -350,6 +351,7 @@ final class Session {
             let median = waits.isEmpty ? 0 : waits[waits.count / 2]
             print("burst: \(n) in \(Int(Date().timeIntervalSince(began) * 1000)) ms, places known \(places.count), out of order \(outOfOrder), ack timeouts \(timeouts), ack wait median \(String(format: "%.2f", median)) ms max \(String(format: "%.2f", waits.last ?? 0)) ms")
         case "click":
+            guard mayPost() else { print("click: not reachable (no permission to post events; nothing asked)"); return }
             // `click <dx> <dy>`: a click at the last caret position moved by dx, dy points.
             guard words.count == 3, let dx = Double(words[1]), let dy = Double(words[2]), let pid = textEditPid(),
                   let x = lastCaret["x"] as? Double, let top = lastCaret["top"] as? Double, let h = lastCaret["h"] as? Double else {
@@ -366,6 +368,7 @@ final class Session {
             let got = read(until: { $0["op"] as? String == "active" }, timeout: 3)
             print("active after select: \(got.contains { $0["op"] as? String == "active" })")
         case "keymark":
+            guard mayPost() else { print("keymark: not reachable (no permission to post events; nothing asked)"); return }
             // `keymark <n> [keycode]`: a key (default "a"; 36 is Return) and at once a mark of one
             // kana, then its commit (waiting for "inserted"). In order, the commit lands one unit
             // after the key's character: start + 2 i + 1.
@@ -454,7 +457,8 @@ final class Session {
                 // Never dropped: a refused commit goes by today's text path (a key event carrying
                 // the text, as the Mac host's strip does).
                 postText(pid, text)
-                print("fallback: text path (\(answer["why"] as? String ?? "?"))")
+                print(mayPost() ? "fallback: text path" : "fallback: text path not reachable here (no permission to post events)")
+                print("fallback reason (\(answer["why"] as? String ?? "?"))")
             }
             if op == "mark", let answer, answer["ok"] as? Bool == false {
                 print("fallback: strip for this composition (\(answer["why"] as? String ?? "?"))")
@@ -469,7 +473,13 @@ func textEditPid() -> pid_t? {
     return running.count == 1 ? running[0].processIdentifier : nil
 }
 
+/// Posting events to another process without the permission makes macOS ask the owner for
+/// Accessibility (seen on the host, 2026-11-19). The probe must never ask: it posts only when the
+/// non-prompting preflight says it may, and otherwise the test says "not reachable".
+func mayPost() -> Bool { CGPreflightPostEventAccess() }
+
 func postKey(_ pid: pid_t, keyCode: CGKeyCode) {
+    guard mayPost() else { return }
     let source = CGEventSource(stateID: .privateState)
     for down in [true, false] {
         CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: down)?.postToPid(pid)
@@ -477,6 +487,7 @@ func postKey(_ pid: pid_t, keyCode: CGKeyCode) {
 }
 
 func postText(_ pid: pid_t, _ text: String) {
+    guard mayPost() else { return }
     let source = CGEventSource(stateID: .privateState)
     let units = Array(text.utf16)
     for down in [true, false] {
@@ -487,6 +498,7 @@ func postText(_ pid: pid_t, _ text: String) {
 }
 
 func postClick(_ pid: pid_t, at point: CGPoint) {
+    guard mayPost() else { return }
     let source = CGEventSource(stateID: .privateState)
     for type in [CGEventType.leftMouseDown, .leftMouseUp] {
         CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left)?.postToPid(pid)
@@ -597,6 +609,8 @@ func selfTest(_ binary: String) {
     exit(failures == 0 ? 0 : 1)
 }
 
+// Line by line, so that a log read while a run goes on is current.
+setlinebuf(stdout)
 let arguments = CommandLine.arguments
 switch arguments.dropFirst().first {
 case "status": status()
