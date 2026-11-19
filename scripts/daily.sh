@@ -28,8 +28,10 @@
 #                                     by the owner, passed on as it is and never set here);
 #                                     ubuntu (the default) as below
 #                                     start the application on the host and show it; one that already
-#                                     runs is shown again. --document: a file of the trial's copy of
-#                                     the source (e.g. crates/istesso-agent/src/serve.rs), copied once
+#                                     runs is shown again (one whose application ended by itself, its
+#                                     own Quit or a crash, is started again). --document: a file of
+#                                     the trial's copy of the source (e.g.
+#                                     crates/istesso-agent/src/serve.rs), copied once
 #                                     into its documents folder and opened. --for aura: in the AURA
 #                                     slot of that application (editor 1, firefox 2, blender 3,
 #                                     chrome 4: picture 4793N, input 4794N; 4:2:0, 72 fps, WxH as AURA
@@ -432,6 +434,10 @@ to_hold() { # RUN PART: the members, without the first process of the session. T
     for pid in $(members "$1" "$2"); do [ "$pid" = "$sid" ] || echo "$pid"; done
 }
 running_names() { local name; for name in $NAMES; do still_runs "$D/run/$name/pipeline.pid" && echo "$name"; done; }
+app_ended() { # RUN: its pipeline runs, it is not held still, and its application has ended (no
+    # process is left in the application's session)
+    still_runs "$1/pipeline.pid" && [ ! -s "$1/held" ] && [ -s "$1/app.sid" ] && [ -z "$(members "$1" app)" ]
+}
 tell() { # NAME WORD: a word for the pipeline of that application
     local run=$D/run/$1
     [ -p "$run/control" ] && still_runs "$run/pipeline.pid" && timeout 2 bash -c 'printf "%s\n" "$1" > "$2"' _ "$2" "$run/control"
@@ -829,6 +835,16 @@ if [ "$FOR" = aura ]; then
     pipe_options="--chroma 420 --fps 72"
 fi
 run=$D/run/$NAME
+# An application that ended by itself (its own Quit, or a crash) leaves its pipeline and agent
+# running with nothing in them: they are ended, and it is started afresh below, in the first free
+# slot (which may be another one: the window on the Mac follows, do_open).
+if app_ended "$run"; then
+    echo "host: $NAME had ended by itself (its own Quit, or a crash): it is started again"
+    [ "$APP" = blender ] && [ ! -s "$run/ended-checked" ] && blender_settings_check "it ended by itself" "$NAME"
+    end_run "$NAME"
+    # Their tmux sessions end with them; the new ones below have the same names.
+    for i in $(seq 1 20); do tmux has-session -t "=daily-$NAME-pipe" 2>/dev/null || tmux has-session -t "=daily-$NAME-agent" 2>/dev/null || break; sleep 0.1; done
+fi
 if still_runs "$run/pipeline.pid"; then
     [ -n "$MIN_QP" ] && echo "host: note: $NAME runs already; its encoder keeps what it was started with (close it and open it again for --min-qp $MIN_QP)"
     let_go "$NAME"
@@ -875,7 +891,9 @@ else
     fi
     # Taken by a listener, or held by a connection of another program (an outgoing connection gets
     # a port of 32768-60999 at random): the trial's programs could not listen on it.
-    if ss -Htan "( sport = :$port or sport = :$agent_port )" 2>/dev/null | grep -q .; then
+    # A connection that has just ended (TIME-WAIT, for a minute after the trial ended an application
+    # whose window was connected) does not: the trial's programs listen with SO_REUSEADDR.
+    if ss -Htan exclude time-wait "( sport = :$port or sport = :$agent_port )" 2>/dev/null | grep -q .; then
         echo "fail port $port or $agent_port is in use on the host by another program: open it again in a minute (it is free once that connection ends); \`scripts/daily.sh ports low\` takes ports no outgoing connection is given"; exit 5
     fi
     mkdir -p "$run/rt/istesso" "$run/agent-cache"; chmod 700 "$run" "$run/rt" "$run/rt/istesso"
@@ -1169,7 +1187,7 @@ SCRIPT
     tmux new-session -d -s "daily-$NAME-agent" "bash -c '$run/agent.sh > $run/agent.log 2>&1; echo \$? > $run/agent.exit'" 9>&-
     # A port taken between the check above and the listening: said plainly, with what to do.
     for i in $(seq 1 12); do
-        if grep -q "cannot listen on port" "$run/agent.log" 2>/dev/null || said "$NAME" | grep -q "cannot listen for paired devices"; then
+        if grep -q "cannot listen on " "$run/agent.log" 2>/dev/null || said "$NAME" | grep -q "cannot listen for paired devices"; then
             echo "host: port $port or $agent_port was taken by another program just as $NAME opened: run \`scripts/daily.sh close ${NAME#aura-}${FOR:+ --for aura}\` and open it again"
             break
         fi
@@ -1302,6 +1320,26 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         echo "error: the host did not start $name" | tee "$mine/not-back"
         return 1
     fi
+    # Only a slot of the three is acted on (it names ports, and the windows below follow it).
+    case "$slot" in
+    1 | 2 | 3) ;;
+    *) echo "error: the host answered no slot of 1, 2 or 3 for $name: nothing was changed here" | tee "$mine/not-back"; return 1 ;;
+    esac
+    # A window and relay here have the ports of the slot they were started for (written down in
+    # ports). When the host has started the application afresh in another slot, this one's have
+    # the old slot's ports, and a window of another application written down for this slot has
+    # this one's: either would show and type into the wrong application. They are stopped; this
+    # one's start again below, the other's with its own `open`.
+    local each was
+    for each in $apps; do
+        was=$(cut -d' ' -f1 "$state/$each/ports" 2>/dev/null)
+        { [ "$each" = "$name" ] && [ -n "$was" ] && [ "$was" != "$slot" ]; } || { [ "$each" != "$name" ] && [ "$was" = "$slot" ]; } || continue
+        { still_runs "$state/$each/viewer.pid" || still_runs "$state/$each/relay.pid"; } || continue
+        stop_window "$each"
+        if [ "$each" = "$name" ]; then echo "$name: its window had the ports of slot $was; $name runs in slot $slot now: the window opens again"
+        else echo "$each: its window had the ports of slot $was, where $name runs now: it was closed (\`scripts/daily.sh open $each\` brings it back)"; fi
+    done
+    { still_runs "$mine/relay.pid" && still_runs "$mine/viewer.pid"; } || echo "$slot $port_base" > "$mine/ports"
     remember_settings "$mine"
     local config_env=()
     [ -n "${DAILY_MAC_CONFIG:-}" ] && config_env=(ISTESSO_CONFIG_DIR="$DAILY_MAC_CONFIG")
