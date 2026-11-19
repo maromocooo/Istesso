@@ -144,6 +144,7 @@ func readSettings() -> Settings {
 
 if CommandLine.arguments.dropFirst().first == "--self-test" { selfTest() }
 if CommandLine.arguments.dropFirst().first == "--close-document" { closeDocument(Array(CommandLine.arguments.dropFirst(2))) }
+if CommandLine.arguments.dropFirst().first == "--close-window" { closeWindowAt(Array(CommandLine.arguments.dropFirst(2))) }
 if CommandLine.arguments.dropFirst().first == "--displays" {
     // Read only: every active display, its place in the arrangement, and its mode.
     var count: UInt32 = 0
@@ -1334,6 +1335,61 @@ final class VirtualDisplayCheck: NSObject, NSApplicationDelegate, SCStreamOutput
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
         }
     }
+}
+
+/// `--close-window PID X Y W H`: closes the one window of the application PID at exactly that
+/// place and size (global points), by pressing its close button through Accessibility: for a
+/// window of the trial's own whose document cannot be named any more. Nothing else is touched.
+func closeWindowAt(_ arguments: [String]) -> Never {
+    let numbers = arguments.compactMap { Double($0) }
+    guard numbers.count == 5, let pid = pid_t(arguments[0]) else { print("{\"closed\":false,\"why\":\"usage\"}"); exit(2) }
+    let wanted = CGRect(x: numbers[1], y: numbers[2], width: numbers[3], height: numbers[4])
+    let app = AXUIElementCreateApplication(pid)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success, let windows = value as? [AXUIElement] else {
+        print("{\"closed\":false,\"why\":\"the application's windows cannot be read\"}"); exit(1)
+    }
+    for window in windows {
+        var position: CFTypeRef?, extent: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &position)
+        AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &extent)
+        var p = CGPoint.zero, s = CGSize.zero
+        if let position { AXValueGetValue(position as! AXValue, .cgPoint, &p) }
+        if let extent { AXValueGetValue(extent as! AXValue, .cgSize, &s) }
+        guard abs(p.x - wanted.minX) < 2, abs(p.y - wanted.minY) < 2, abs(s.width - wanted.width) < 2, abs(s.height - wanted.height) < 2 else { continue }
+        var button: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &button) == .success, let button,
+              AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString) == .success else {
+            print("{\"closed\":false,\"why\":\"its close button could not be pressed\"}"); exit(1)
+        }
+        Thread.sleep(forTimeInterval: 1.0)
+        var children: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &children)
+        let asking = (children as? [AXUIElement] ?? []).contains { child in
+            var role: CFTypeRef?
+            AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role)
+            return role as? String == kAXSheetRole as String
+        }
+        print(asking ? "{\"closed\":false,\"why\":\"the application asks in a sheet (left as it is)\"}" : "{\"closed\":true}")
+        exit(asking ? 1 : 0)
+    }
+    // Accessibility lists one window whose place it cannot say, and the window list has exactly one
+    // window of the application on the screen, at the place asked for: that one.
+    let shown = readWindowList(onScreenOnly: true, desktop: false).filter { $0.pid == pid && $0.layer == 0 }
+    if windows.count == 1, shown.count == 1, abs(shown[0].bounds.minX - wanted.minX) < 2, abs(shown[0].bounds.minY - wanted.minY) < 2,
+       abs(shown[0].bounds.width - wanted.width) < 2, abs(shown[0].bounds.height - wanted.height) < 2 {
+        var button: CFTypeRef?
+        if AXUIElementCopyAttributeValue(windows[0], kAXCloseButtonAttribute as CFString, &button) == .success, let button,
+           AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString) == .success {
+            Thread.sleep(forTimeInterval: 1.0)
+            let still = readWindowList(onScreenOnly: true, desktop: false).contains { $0.id == shown[0].id }
+            print(still ? "{\"closed\":false,\"why\":\"pressed, but the window stays (a question in it?)\"}" : "{\"closed\":true,\"by\":\"the only window\"}")
+            exit(still ? 1 : 0)
+        }
+    }
+    let places = axWindows(pid).map { "\"\(Int($0.bounds.minX)),\(Int($0.bounds.minY)) \(Int($0.bounds.width))x\(Int($0.bounds.height)) \($0.role)\"" }
+    print("{\"closed\":false,\"why\":\"no window at that place\",\"windows\":\(windows.count),\"places\":[\(places.joined(separator: ","))]}")
+    exit(1)
 }
 
 /// `--self-test`: the rule of the session form, without any window or permission.
