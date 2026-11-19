@@ -120,47 +120,83 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// The random tokens of the handles handed out so far.
+/// The most handles kept. The host lets its oldest ids go at 100 000; when more handles than
+/// this are out, the oldest tenth are forgotten here too (the kernel then hears `STALE` and
+/// looks the names up again).
+const MAX_HANDLES: usize = 250_000;
+
+/// Each id's random token, and the ids in the order their handles were made.
+type Tokens = (HashMap<u64, [u8; 16]>, std::collections::VecDeque<u64>);
+
+/// The random tokens of the handles handed out so far, and the order they were made in.
 pub struct Handles {
-    tokens: Mutex<HashMap<u64, [u8; 16]>>,
+    tokens: Mutex<Tokens>,
     random: Mutex<std::fs::File>,
 }
 
 impl Handles {
     pub fn new() -> std::io::Result<Handles> {
         Ok(Handles {
-            tokens: Mutex::new(HashMap::new()),
+            tokens: Mutex::new((HashMap::new(), std::collections::VecDeque::new())),
             random: Mutex::new(std::fs::File::open("/dev/urandom")?),
         })
     }
 
     /// The handle of `id`, made the first time it is asked for.
     pub fn handle(&self, id: u64) -> Vec<u8> {
-        let mut tokens = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let token = *tokens.entry(id).or_insert_with(|| {
+        self.handle_within(id, MAX_HANDLES)
+    }
+
+    fn handle_within(&self, id: u64, max: usize) -> Vec<u8> {
+        let mut guard = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let (tokens, order) = &mut *guard;
+        if !tokens.contains_key(&id) {
+            if tokens.len() >= max {
+                let mut forget = (max / 10).max(1);
+                while forget > 0 {
+                    let Some(old) = order.pop_front() else { break };
+                    // The folder's own handle is never forgotten.
+                    if old != ROOT_ID && tokens.remove(&old).is_some() {
+                        forget -= 1;
+                    } else if old == ROOT_ID {
+                        order.push_back(old);
+                    }
+                }
+            }
             let mut token = [0u8; 16];
             let mut random = self.random.lock().unwrap_or_else(|e| e.into_inner());
             // Without randomness there is no handle worth handing out.
             random
                 .read_exact(&mut token)
                 .expect("cannot read /dev/urandom");
-            token
-        });
+            tokens.insert(id, token);
+            order.push_back(id);
+        }
+        let token = tokens[&id];
         let mut handle = Vec::with_capacity(HANDLE_LEN);
         handle.extend_from_slice(&id.to_le_bytes());
         handle.extend_from_slice(&token);
         handle
     }
 
-    /// The id of a handle that was handed out; `None` for anything else.
-    pub fn id(&self, handle: &[u8]) -> Option<u64> {
+    /// The id of a handle that was handed out. Anything that is not one is `BADHANDLE`,
+    /// except a well-formed handle whose id is not known (any more): `STALE`, so that the
+    /// kernel looks the name up again.
+    pub fn id(&self, handle: &[u8]) -> Result<u64, nfsstat3> {
         if handle.len() != HANDLE_LEN {
-            return None;
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
         }
-        let id = u64::from_le_bytes(handle[..8].try_into().ok()?);
-        let tokens = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let token = tokens.get(&id)?;
-        same(token, &handle[8..]).then_some(id)
+        let id = u64::from_le_bytes(
+            handle[..8]
+                .try_into()
+                .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?,
+        );
+        let guard = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.0.get(&id) {
+            None => Err(nfsstat3::NFS3ERR_STALE),
+            Some(token) if same(token, &handle[8..]) => Ok(id),
+            Some(_) => Err(nfsstat3::NFS3ERR_BADHANDLE),
+        }
     }
 }
 
@@ -280,9 +316,8 @@ impl NFSFileSystem for RemoteFs {
     }
 
     fn fh_to_id(&self, fh: &nfs_fh3) -> Result<fileid3, nfsstat3> {
-        self.handles.id(&fh.data).ok_or_else(|| {
+        self.handles.id(&fh.data).inspect_err(|_| {
             self.gate.refused_handles.fetch_add(1, Ordering::Relaxed);
-            nfsstat3::NFS3ERR_BADHANDLE
         })
     }
 
@@ -454,7 +489,7 @@ mod tests {
         let handles = Handles::new().unwrap();
         let root = handles.handle(ROOT_ID);
         assert_eq!(root.len(), HANDLE_LEN);
-        assert_eq!(handles.id(&root), Some(ROOT_ID));
+        assert!(matches!(handles.id(&root), Ok(ROOT_ID)));
         // The same id gets the same handle while the server runs.
         assert_eq!(handles.handle(ROOT_ID), root);
         let other = handles.handle(2);
@@ -462,18 +497,30 @@ mod tests {
         // A wrong token, an id never handed out, the library's own format, a short handle.
         let mut forged = root.clone();
         forged[HANDLE_LEN - 1] ^= 1;
-        assert_eq!(handles.id(&forged), None);
+        assert!(matches!(
+            handles.id(&forged),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        ));
         let mut guessed = 3u64.to_le_bytes().to_vec();
         guessed.extend_from_slice(&root[8..]);
-        assert_eq!(handles.id(&guessed), None);
+        assert!(matches!(handles.id(&guessed), Err(nfsstat3::NFS3ERR_STALE)));
         let mut plain = 0u64.to_le_bytes().to_vec();
         plain.extend_from_slice(&ROOT_ID.to_le_bytes());
-        assert_eq!(handles.id(&plain), None);
-        assert_eq!(handles.id(&root[..8]), None);
+        assert!(matches!(
+            handles.id(&plain),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        ));
+        assert!(matches!(
+            handles.id(&root[..8]),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        ));
         // A token taken from one handle does not open another id.
         let mut swapped = 2u64.to_le_bytes().to_vec();
         swapped.extend_from_slice(&root[8..]);
-        assert_eq!(handles.id(&swapped), None);
+        assert!(matches!(
+            handles.id(&swapped),
+            Err(nfsstat3::NFS3ERR_BADHANDLE)
+        ));
     }
 
     #[test]
@@ -507,6 +554,21 @@ mod tests {
             assert!(!valid_entry(&entry(id, name), 2), "{id} {name:?}");
         }
         assert!(!valid_entry(&entry(5, &[b'a'; 256]), 2));
+    }
+
+    #[test]
+    fn the_oldest_handles_are_forgotten_but_never_the_folders_own() {
+        let handles = Handles::new().unwrap();
+        let root = handles.handle_within(ROOT_ID, 10);
+        let first = handles.handle_within(2, 10);
+        for id in 3..40 {
+            handles.handle_within(id, 10);
+        }
+        assert!(matches!(handles.id(&root), Ok(ROOT_ID)));
+        assert!(matches!(handles.id(&first), Err(nfsstat3::NFS3ERR_STALE)));
+        assert!(handles.tokens.lock().unwrap().0.len() <= 10);
+        let last = handles.handle_within(39, 10);
+        assert!(matches!(handles.id(&last), Ok(39)));
     }
 
     #[test]

@@ -1046,6 +1046,7 @@ dependencies = [
  "async-trait",
  "istesso-agent",
  "istesso-link",
+ "istesso-pair",
  "libc",
  "nfsserve",
  "tokio",

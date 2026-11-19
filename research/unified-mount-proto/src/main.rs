@@ -13,8 +13,21 @@
 //!       For tests only: --hold-before-mount-ms N waits N ms between opening the loopback port
 //!       and mounting, and prints the port, so that another process can try to mount first.
 //!
+//!   unified-mount-proto watch <mount-point>     (started by `mount`, not by hand)
+//!       Waits, in a session of its own, until the `mount` that started it is gone however
+//!       it ended (its end of a pipe closes), and then takes off a mount it left.
+//!
 //! The device's identity and its list of paired devices are those of `istesso`
 //! (`ISTESSO_CONFIG_DIR` points elsewhere).
+
+/// One line on the standard error. A standard error that is gone (the terminal was closed)
+/// does not end the program, as `eprintln!` would by panicking.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 mod nfs_side;
 
@@ -30,7 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn usage() -> ExitCode {
-    eprintln!("usage: unified-mount-proto mount <device> <folder-id> [--address ADDR[:PORT]] [--base DIR]");
+    say!("usage: unified-mount-proto mount <device> <folder-id> [--address ADDR[:PORT]] [--base DIR]");
     ExitCode::from(2)
 }
 
@@ -74,10 +87,15 @@ fn parse(args: &[String]) -> Option<Options> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let (Some("watch"), Some(point), 2) =
+        (args.first().map(String::as_str), args.get(1), args.len())
+    {
+        return run_watch(Path::new(point));
+    }
     match parse(&args) {
         Some(options) if cfg!(target_os = "macos") => run_mount(options),
         Some(_) => {
-            eprintln!("mount: this prototype mounts with the macOS NFS client only (on Linux, mounting NFS needs root; the Linux client in the research document is FUSE)");
+            say!("mount: this prototype mounts with the macOS NFS client only (on Linux, mounting NFS needs root; the Linux client in the research document is FUSE)");
             ExitCode::FAILURE
         }
         None => usage(),
@@ -126,7 +144,7 @@ fn mount_point(base: &Path, device: &str, folder: &str) -> Result<PathBuf, Strin
     let machine = std::fs::canonicalize(&machine).map_err(|e| e.to_string())?;
     let point = machine.join(folder);
     if is_mounted(&point) {
-        eprintln!(
+        say!(
             "mount: a mount was left at {}; taking it off",
             point.display()
         );
@@ -220,11 +238,11 @@ async fn unmount_until_gone(point: &Path) {
             .await
             .unwrap_or(false)
         {
-            eprintln!("unmounted {}", point.display());
+            say!("unmounted {}", point.display());
             return;
         }
         if tries.is_multiple_of(10) {
-            eprintln!(
+            say!(
                 "could not unmount {} yet; trying again every second (the program stays until it is)",
                 point.display()
             );
@@ -237,44 +255,75 @@ async fn unmount_until_gone(point: &Path) {
 fn run_mount(options: Options) -> ExitCode {
     // The id becomes a folder name here: check it before anything is asked.
     if !istesso_link::mount::valid_folder_id(&options.folder) {
-        eprintln!("mount: a folder id is 1 to 32 of a-z, 0-9 and -, not starting with -");
+        say!("mount: a folder id is 1 to 32 of a-z, 0-9 and -, not starting with -");
         return ExitCode::from(2);
     }
     let began = Instant::now();
-    let device_asked = options.device.clone();
-    let (remote, opened) = match Remote::open(
-        &Paths::from_env(),
-        &options.device,
-        options.address.as_deref(),
-        &options.folder,
-        move |why| {
-            eprintln!("mount: lost the connection to {device_asked} ({why}); reads fail from now on, until this is stopped")
-        },
-    ) {
-        Ok(opened) => opened,
+    let paths = Paths::from_env();
+    // The place first, from the list of paired devices, without asking the device: a mount
+    // left there by a run that was killed is taken off even when the device cannot be
+    // reached now.
+    let device = match istesso_pair::PeerStore::open(paths.peers())
+        .map_err(|e| e.to_string())
+        .and_then(|peers| {
+            peers
+                .find(&options.device)
+                .map_err(|e| e.to_string())?
+                .map(|peer| peer.name.clone())
+                .ok_or_else(|| format!("no paired device matches '{}'", options.device))
+        }) {
+        Ok(name) => name,
         Err(why) => {
-            eprintln!("mount: {why}");
+            say!("mount: {why}");
             return ExitCode::FAILURE;
         }
     };
-    let open_after = began.elapsed();
     let base = match options.base {
         Some(base) => base,
         None => match std::env::var_os("HOME") {
             Some(home) => PathBuf::from(home).join("Istesso"),
             None => {
-                eprintln!("mount: no home folder");
+                say!("mount: no home folder");
                 return ExitCode::FAILURE;
             }
         },
     };
-    let point = match mount_point(&base, &opened.device, &options.folder) {
+    let point = match mount_point(&base, &device, &options.folder) {
         Ok(point) => point,
         Err(why) => {
-            eprintln!("mount: {why}");
+            say!("mount: {why}");
             return ExitCode::FAILURE;
         }
     };
+    let device_asked = options.device.clone();
+    let (remote, opened) = match Remote::open(
+        &paths,
+        &options.device,
+        options.address.as_deref(),
+        &options.folder,
+        move |why| {
+            say!("mount: lost the connection to {device_asked} ({why}); reads fail from now on, until this is stopped")
+        },
+    ) {
+        Ok(opened) => opened,
+        Err(why) => {
+            say!("mount: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let open_after = began.elapsed();
+
+    // The watcher: a process of its own that takes the mount off when this one is gone,
+    // however it ends (SIGKILL included), so that the port is never free while the folder
+    // is mounted for longer than it takes to unmount.
+    let mut watcher = match start_watcher(&point) {
+        Ok(watcher) => watcher,
+        Err(why) => {
+            say!("mount: cannot start the watcher: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    say!("watcher: process {}", watcher.id());
 
     // A panic must not leave the mount behind: take it off while the server still answers
     // (its threads run on while the panicking one unwinds). A panic in one question's task
@@ -291,7 +340,7 @@ fn run_mount(options: Options) -> ExitCode {
     let fs = match nfs_side::RemoteFs::new(remote.clone(), gate.clone()) {
         Ok(fs) => fs,
         Err(e) => {
-            eprintln!("mount: {e}");
+            say!("mount: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -304,7 +353,7 @@ fn run_mount(options: Options) -> ExitCode {
         let listener = match NFSTcpListener::bind("127.0.0.1:0", fs).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("mount: cannot listen on 127.0.0.1: {e}");
+                say!("mount: cannot listen on 127.0.0.1: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -312,8 +361,18 @@ fn run_mount(options: Options) -> ExitCode {
         tokio::spawn(async move {
             let _ = listener.handle_forever().await;
         });
+        // The signals are taken from here on, before anything is mounted: one that comes
+        // while mount_nfs runs is answered once it is done, by unmounting.
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut signals = [
+            SignalKind::interrupt(),
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+            SignalKind::quit(),
+        ]
+        .map(|kind| signal(kind).expect("signal"));
         if let Some(hold) = options.hold {
-            eprintln!("test: serving on 127.0.0.1:{port}; mounting in {} ms", hold.as_millis());
+            say!("test: serving on 127.0.0.1:{port}; mounting in {} ms", hold.as_millis());
             tokio::time::sleep(hold).await;
         }
         let opts =
@@ -331,7 +390,7 @@ fn run_mount(options: Options) -> ExitCode {
             other => {
                 // Another process may have taken the only MNT. Nothing but the folder's
                 // attributes was answered to anyone; stop before anything else is.
-                eprintln!(
+                say!(
                     "mount: mount_nfs failed ({other:?}); {} later mount request(s) were refused; stopping",
                     gate.refused_mounts.load(Ordering::Relaxed)
                 );
@@ -342,7 +401,7 @@ fn run_mount(options: Options) -> ExitCode {
             }
         }
         gate.open();
-        eprintln!(
+        say!(
             "mounted {} of {} read-only at {} after {:.3} s (the folder was open after {:.3} s)",
             options.folder,
             opened.device,
@@ -351,14 +410,6 @@ fn run_mount(options: Options) -> ExitCode {
             open_after.as_secs_f64(),
         );
 
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut signals = [
-            SignalKind::interrupt(),
-            SignalKind::terminate(),
-            SignalKind::hangup(),
-            SignalKind::quit(),
-        ]
-        .map(|kind| signal(kind).expect("signal"));
         let [interrupt, terminate, hangup, quit] = &mut signals;
         let mut every = tokio::time::interval(Duration::from_secs(2));
         loop {
@@ -373,7 +424,7 @@ fn run_mount(options: Options) -> ExitCode {
                         .await
                         .unwrap_or(true);
                     if !mounted {
-                        eprintln!("the folder was unmounted from outside");
+                        say!("the folder was unmounted from outside");
                         break;
                     }
                 }
@@ -385,12 +436,75 @@ fn run_mount(options: Options) -> ExitCode {
         ExitCode::SUCCESS
     });
     remote.close();
-    eprintln!(
+    say!(
         "refused: {} later mount request(s), {} unknown handle(s), {} question(s) before the mount",
         gate.refused_mounts.load(Ordering::Relaxed),
         gate.refused_handles.load(Ordering::Relaxed),
         gate.refused_early.load(Ordering::Relaxed),
     );
     drop(rt);
+    // The mount is off: the watcher sees its pipe close, finds nothing mounted, and ends.
+    drop(watcher.stdin.take());
+    let _ = watcher.wait();
     code
+}
+
+/// Starts `watch` for `point` in a session of its own (the terminal's signals do not reach
+/// it), with a pipe whose writing end only this process holds.
+fn start_watcher(point: &Path) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("watch")
+        .arg(point)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
+    // SAFETY: setsid is safe between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+/// The watcher: waits until the pipe from the program that started it closes (it ended, was
+/// killed or crashed), then takes off a mount it left at `point`, trying for half a minute.
+fn run_watch(point: &Path) -> ExitCode {
+    use std::io::Read as _;
+    // This process only cleans up after the other one: no signal of a terminal or a script
+    // ends it early.
+    for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM, libc::SIGQUIT] {
+        // SAFETY: setting a signal to be ignored is always safe.
+        unsafe { libc::signal(signal, libc::SIG_IGN) };
+    }
+    let mut stdin = std::io::stdin();
+    let mut byte = [0u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if !is_mounted(point) {
+        return ExitCode::SUCCESS;
+    }
+    say!(
+        "watch: the mount program is gone and left {} mounted; unmounting",
+        point.display()
+    );
+    for _ in 0..30 {
+        if unmount(point) {
+            say!("watch: unmounted {}", point.display());
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    say!("watch: could not unmount {}", point.display());
+    ExitCode::FAILURE
 }
