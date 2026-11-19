@@ -30,7 +30,7 @@ export ISTESSO_MAC_HOST=<ホストの ssh の名前>   # 言わなければ iste
 scripts/daily-mac.sh setup                 # ここでビルドし、sign.env の証明書で署名して、ホストに写す
 scripts/daily-mac.sh pair-line             # ホストで持ち主が打つ 1 行（Air と AURA のペアリング）
 scripts/daily-mac.sh open TextEdit         # アプリを開いて、その窓だけを、ここの窓 1 枚に
-scripts/daily-mac.sh open x --display      # 画面全体（最初の確かめだけ）
+scripts/daily-mac.sh open x --display      # 画面全体（最初の確かめだけ。desktop と同じく持ち主だけ）
 scripts/daily-mac.sh open TextEdit --for aura --size 1920x1080   # AURA 向け（ホストの側だけ）
 scripts/daily-mac.sh list | hide APP | close APP | stop
 ```
@@ -38,6 +38,7 @@ scripts/daily-mac.sh list | hide APP | close APP | stop
 - `close` は、2 とおりです（コードで確かめた、2026-11-19）。
   - 試用版の新しい文書で開いたもの（TextEdit）：その文書の窓だけを閉じる。TextEdit は終わらせない。窓の一覧にその窓がなくなったと確かめてから、その文書だけを消す。
   - それ以外（Dia、Safari、メモなど）：ホストに `close` を送り、ホストは、そのアプリに**終了を頼む**（「終了」メニューと同じ頼み方）。保存していないものがあれば、アプリが窓の中で尋ねて、残る。**Dia を開いたままにしたいときは、`close dia` ではなく `stop`**（前に「`close` は Dia を開いたまま残す」と書いたのは誤り）。
+- **もう動いているものを、もう 1 度 `open` したとき**（2026-11-20 から）：ホストのものは、起動したときの設定のまま（コピーと貼り付け、仮想ディスプレー、入力の形など）。ホストは `host: NAME runs already: its settings stay as started; close it first to change them` と言い、Air の側も、起動したときに書いたコピーと貼り付けと絵の倍率（`clipboard`、`density`）を書き換えない。これまでは Air の側だけが新しい設定を書いたので、窓を開き直すと、ビューアーとホストが食い違うことがあった。設定を変えるときは、`close` してから開く。
 - `stop` は、試用版のプログラムだけを止めます。ホストのアプリは、開いたまま残します（持ち主のアプリなので）。窓は元の画面に戻ります。
 - **コピーと貼り付けは、アプリの窓では既定で入る**（持ち主の決め、2026-11-19。Ubuntu と同じ）。ショートカットから開いたもの（環境が決まっていて `DAILY_CLIPBOARD` を持たない）も入る。切るのは `DAILY_CLIPBOARD=0` だけ。画面全体、生成した絵、AURA では、いままでどおり入らない。**流れ（エージェント）が自分の確かめで開くときは、コピーと貼り付けを試すのでなければ、`DAILY_CLIPBOARD=0` を付ける**（Studio のペーストボードに触らないため）。
 - **新しい文書の名前と置き場所**（持ち主の決め、2026-11-19。持ち主が AURA で開いた TextEdit に、ほかの流れの古い試用の文書が出て、そこに打ったため）：`daily-mac.sh` が TextEdit を開くときは、どの形（`--for aura` も）でも、いつも新しい文書を作る。持ち主が開くと `~/.cache/istesso-daily-mac/documents/owner/owner-<アプリ>-<日付-時刻>.txt`、流れが開くと（`DAILY_STREAM=<流れの名前>` を付ける）`…/documents/streams/stream-<名前>-<アプリ>-<日付-時刻>.txt`。そのときアプリは、前の窓を戻さずに起動する（起動の引数 `-ApplePersistenceIgnoreState YES`。その起動の引数のドメインだけに効き、持ち主の TextEdit の設定には何も書かない）。もう動いている TextEdit が前から持っている窓は、映さない（開く前の窓の一覧と比べて、あとから出た窓だけを映す）。`close` が消すのは、自分が作ったその文書だけ（上の 2 つの場所と名前の形に合うものだけ）。
@@ -184,7 +185,7 @@ scripts/daily-mac.sh list | hide APP | close APP | stop
 ### アプリを入れるとき：画面全体（`open desktop`）
 
 - インストーラー、管理者のパスワードを求める画面、「インターネットからダウンロードしたアプリ」の問い、許可の問いは、そのアプリの窓ではないので、アプリの窓の形では映らない。そのために、画面全体を送る形を、名前 `desktop` で開けるようにした（`daily.sh open desktop --host mac`。試用版の流れと合わせる）。
-- Mac の全部が映るので、持ち主が自分の端末から `DAILY_OWNER=1` を付けて開く。クリックはセッションを通す（形 4。範囲は画面全体、ログインの窓を除く）。キーは前面のアプリへ。ロック中は、何も送らない。
+- Mac の全部が映るので、持ち主が自分の端末から `DAILY_OWNER=1` を付けて開く。`--display`（どの名前でも、`--for aura` でも）も同じ画面全体なので、同じく持ち主だけ（2026-11-20 から。それまでは、`--display` を付けると、開いてよいアプリの一覧も、持ち主の確かめも、通らずに開けた）。クリックはセッションを通す（形 4。範囲は画面全体、ログインの窓を除く）。キーは前面のアプリへ。ロック中は、何も送らない。
 - 見込み（確かめていない）：システムの管理者のパスワードの画面（SecurityAgent）は、取り込みから外されるか、作ったイベントを受け付けないかもしれない。そのときは、Mac Studio の前で打つことになる。持ち主が金曜日に試す。
 
 ### パスワードの欄（こちらの数える窓で確かめる）

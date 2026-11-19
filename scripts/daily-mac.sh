@@ -15,7 +15,8 @@
 #   scripts/daily-mac.sh open APP [--display] [--for aura] [--size WxH] [--fps N] [--slot N]
 #                                        open APP on the host (a name such as TextEdit, a bundle id,
 #                                        or a path) and show it here; one that is open is shown again.
-#                                        --display: the whole display instead (first checks only).
+#                                        --display: the whole display instead (first checks only;
+#                                        the owner's only, as desktop).
 #                                        --for aura: the host side only, 4:2:0, picture 4793N and
 #                                        input 4794N, for AURA to connect to
 #   scripts/daily-mac.sh open desktop    the whole display, for installing (the owner's only; clicks
@@ -261,11 +262,13 @@ do_open() {
         esac
     done
     # "desktop": the whole display, for installing (installers, password and permission prompts
-    # are not an application's windows). It shows everything on the Mac: the owner's only.
-    if [ "$app" = desktop ]; then
-        display=1
+    # are not an application's windows). The whole display, by that name or by --display with any
+    # name (with or without --for aura), shows everything on the Mac and its keys go to the
+    # application in front, and it skips the list below: the owner's only.
+    [ "$app" = desktop ] && display=1
+    if [ -n "$display" ]; then
         if [ "${DAILY_OWNER:-}" != 1 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
-            echo "error: desktop shows the whole Mac: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
+            echo "error: the whole display (desktop, --display) shows the whole Mac: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
             exit 2
         fi
     fi
@@ -364,7 +367,7 @@ if still_runs "\$run/host.pid"; then
     before=\$(( \$(count_said \$NAME resumed) + \$(count_said \$NAME refused) ))
     tell \$NAME resume
     for i in \$(seq 1 30); do [ \$(( \$(count_said \$NAME resumed) + \$(count_said \$NAME refused) )) -gt "\$before" ] && break; [ \$(count_said \$NAME paused) -eq 0 ] && break; sleep 0.1; done
-    echo "host: \$NAME runs already"
+    echo "host: \$NAME runs already: its settings stay as started; close it first to change them"
 else
     set --
     prompt_file="\$HOME/.config/istesso/daily-mac-system-prompts.txt"
@@ -466,8 +469,13 @@ HOST
     # for, the whole display). A virtual display that fails on the host is not known here.
     local density=1
     [ -n "$virtual_arg" ] && [ -z "$size_given" ] && density=2
-    echo "$density" > "$mine/density"
-    echo "$app" > "$mine/app"; echo "$clipboard_on" > "$mine/clipboard"; echo "$slot" > "$mine/slot"; echo "$size" > "$mine/size"; echo "$peer" > "$mine/peer"
+    # One that runs already keeps what it was started with on the host (copy and paste, the virtual
+    # display): what was written down then stays, so that the viewer and the host agree.
+    local running=""
+    printf '%s\n' "$answer" | grep -q "^host: $name runs already" && running=1
+    [ -n "$running" ] && [ -s "$mine/density" ] || echo "$density" > "$mine/density"
+    [ -n "$running" ] && [ -s "$mine/clipboard" ] || echo "$clipboard_on" > "$mine/clipboard"
+    echo "$app" > "$mine/app"; echo "$slot" > "$mine/slot"; echo "$size" > "$mine/size"; echo "$peer" > "$mine/peer"
     open_here "$name"
     start_guard
 }

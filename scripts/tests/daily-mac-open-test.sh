@@ -22,6 +22,8 @@ last=${!#}
 [ "$last" = true ] && exit 0
 n=$(ls "$RECORD"/host-*.sh 2>/dev/null | wc -l | tr -d ' ')
 cat > "$RECORD/host-$n.sh"
+# What the host says first, when the check gives it (e.g. that it runs already).
+[ -f "$RECORD/answer-first" ] && cat "$RECORD/answer-first"
 printf 'slot 1\nsize 640x480\npeer 0000-0000-0000-0000\n'
 EOF
 # The relay and the viewer: what they were started with, and they stay a few seconds.
@@ -102,6 +104,30 @@ run aura -- textedit --for aura --slot 2
 host=$(cat "$scratch/aura"/host-*.sh 2>/dev/null)
 check "AURA: no copy and paste" '[[ "$host" != *"--clipboard"* ]]'
 check "AURA: a new document of the owner's, without old windows" '[[ "$host" == *"documents/owner/owner-textedit-"* && "$host" == *"--no-restore"* ]]'
+
+# The whole display, by --display with any name (also for AURA): the owner's only, from the
+# owner's terminal, like desktop; nothing is asked of the host.
+run display -- textedit --display
+check "--display without DAILY_OWNER: refused" 'grep -q "only the owner opens it" "$scratch/display/out.txt"'
+check "--display without DAILY_OWNER: nothing asked of the host" '! ls "$scratch/display"/host-*.sh > /dev/null 2>&1'
+run display-unlisted -- not-a-listed-application --display --for aura
+check "--display --for aura with a name not in the list: refused" 'grep -q "only the owner opens it" "$scratch/display-unlisted/out.txt" && ! ls "$scratch/display-unlisted"/host-*.sh > /dev/null 2>&1'
+run display-no-terminal DAILY_OWNER=1 -- textedit --display
+check "--display with DAILY_OWNER=1 but not from a terminal: refused" 'grep -q "only the owner opens it" "$scratch/display-no-terminal/out.txt" && ! ls "$scratch/display-no-terminal"/host-*.sh > /dev/null 2>&1'
+run desktop DAILY_OWNER=1 -- desktop
+check "desktop not from a terminal: refused as before" 'grep -q "only the owner opens it" "$scratch/desktop/out.txt"'
+
+# A second open of a name that runs already on the host: what it was started with stays here too
+# (copy and paste, the picture's density), so that the viewer and the host agree.
+run again DAILY_VIRTUAL=1 DAILY_VIRTUAL_SIZE=1710x1112 -- textedit
+check "first open: copy and paste on, density 2" '[ "$(cat "$scratch/again/state/textedit/clipboard")" = 1 ] && [ "$(cat "$scratch/again/state/textedit/density")" = 2 ]'
+echo "host: textedit runs already: its settings stay as started; close it first to change them" > "$scratch/again/answer-first"
+run again DAILY_CLIPBOARD=0 -- textedit
+check "runs already: the host says that its settings stay" 'grep -q "runs already: its settings stay as started; close it first to change them" "$scratch/again/out.txt" && cat "$scratch/again"/host-*.sh | grep -q "echo \"host: \$NAME runs already: its settings stay as started; close it first to change them\""'
+check "runs already: copy and paste and density stay as written down" '[ "$(cat "$scratch/again/state/textedit/clipboard")" = 1 ] && [ "$(cat "$scratch/again/state/textedit/density")" = 2 ]'
+run fresh-again DAILY_VIRTUAL=1 DAILY_VIRTUAL_SIZE=1710x1112 -- textedit
+run fresh-again DAILY_CLIPBOARD=0 -- textedit
+check "started anew (not running already): the new settings are written down" '[ "$(cat "$scratch/fresh-again/state/textedit/clipboard")" = 0 ] && [ "$(cat "$scratch/fresh-again/state/textedit/density")" = 1 ]'
 
 sleep 3  # the stand-ins and the guard end by themselves
 [ "$failed" = 0 ] && echo "all passed" || { echo "$failed failed"; exit 1; }
