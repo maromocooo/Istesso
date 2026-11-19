@@ -37,6 +37,11 @@
 //                              program started through `open`, which does not say it
 //   ISTESSO_PRETEND_RESIZE=WxH for checks with ISTESSO_DAILY_RECONNECT: four seconds after the start,
 //                              as if the person had resized the window by hand to WxH points
+//   ISTESSO_PICTURE_DENSITY=D  with ISTESSO_DAILY_RECONNECT: the host's picture has D pixels for one
+//                              point of its application (Ubuntu's compositor: 1; the Mac host's
+//                              application on its 2x virtual display: 2, the default). The window
+//                              shows one picture pixel at 1/D points on any screen, and asks the host
+//                              for its points times D when resized by hand (window-size.h)
 //   ISTESSO_TITLE_FILE=PATH    the signal USR1 sets the window's title to the first line of PATH
 //   ISTESSO_CLIPBOARD=1        the everyday trial's copy and paste of text (ADR 0022): Command-C,
 //                              Command-X and Command-V in the window copy from, cut from and paste
@@ -1098,18 +1103,17 @@ static size_t split_access_unit(const uint8_t *data, size_t size, NalUnit *units
 }
 
 // The everyday trial (ISTESSO_DAILY_RECONNECT): when the host starts its stream again at another
-// size (the Mac host does when the application's window is resized), the window follows: the same
-// points for each of the host's pixels as before (square pixels, as the host sends its window 1:1),
-// its top left where it was, and all of it on its screen (made smaller as a whole if needed).
+// size (the Mac host does when the application's window is resized), the window follows: one
+// picture pixel to 1 / the host's density points (square pixels, as the host sends its window
+// 1:1), its top left where it was, and all of it on its screen (made smaller as a whole if needed).
+// The same for the first picture when the window was opened at another size. See window-size.h.
 static NSWindow *picture_window = nil;
 static BOOL picture_whole_display = NO;
-// Points of the window to one pixel of the host's picture, as the window was first made (0: not
-// known yet). Kept when the window follows another size, so that the pixels stay as they were.
-static double points_per_pixel = 0;
-// A resize was asked of the host, and its answer (the next stream's size) is awaited.
-static BOOL resize_asked = NO;
 
 #include "window-size.h"
+
+// Set in main() from ISTESSO_PICTURE_DENSITY; used on the main thread only.
+static WindowSizing sizing = {1, 0, 0, 0};
 
 static void window_follows_picture(int width, int height) {
     if (picture_window == nil || picture_whole_display || width <= 0 || height <= 0) {
@@ -1120,7 +1124,10 @@ static void window_follows_picture(int width, int height) {
     CGFloat bar = frame.size.height - content.size.height;
     NSRect room = (picture_window.screen ?: NSScreen.mainScreen).visibleFrame;
     double w, h;
-    window_size_for_picture((unsigned)width, (unsigned)height, points_per_pixel, room.size.width, room.size.height - bar, &w, &h);
+    if (!window_sizing_picture(&sizing, (unsigned)width, (unsigned)height, content.size.width, content.size.height, room.size.width,
+                               room.size.height - bar, &w, &h)) {
+        return;
+    }
     NSPoint top_left = NSMakePoint(NSMinX(frame), NSMaxY(frame));
     [picture_window setContentSize:NSMakeSize(w, h)];
     NSRect now = picture_window.frame;
@@ -1141,8 +1148,7 @@ static void ask_for_window_size(void) {
     }
     NSRect content = [picture_window contentRectForFrameRect:picture_window.frame];
     unsigned width, height;
-    picture_size_for_window(content.size.width, content.size.height, points_per_pixel, &width, &height);
-    resize_asked = YES;
+    window_sizing_hand_resized(&sizing, content.size.width, content.size.height, &width, &height);
     send_input("{\"kind\":\"resize\",\"width\":%u,\"height\":%u}", width, height);
     fprintf(stderr, "note: asked the host for a picture of %ux%u (the window was resized by hand)\n", width, height);
 }
@@ -1184,24 +1190,18 @@ static gboolean channel_configure(const NalUnit *sets[3]) {
     int was_width = picture_width, was_height = picture_height;
     picture_width = size.width;
     picture_height = size.height;
-    // A new decoder for the new parameter sets is made below; the window follows a new size, and
-    // goes to the answer of a resize that was asked for even when the size stayed the same.
+    // A new decoder for the new parameter sets is made below; the window follows a new size, goes
+    // to the answer of a resize that was asked for even when the size stayed the same, and to the
+    // first picture when it was opened at another size (window_sizing_picture decides).
     if (daily_reconnect) {
         int width = size.width, height = size.height;
-        BOOL changed = was_width > 0 && (was_width != size.width || was_height != size.height);
-        if (changed) {
+        if (was_width <= 0) {
+            fprintf(stderr, "note: the host's first picture is %dx%d\n", width, height);
+        } else if (was_width != size.width || was_height != size.height) {
             fprintf(stderr, "note: the host's picture is %dx%d now (it was %dx%d)\n", width, height, was_width, was_height);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (points_per_pixel <= 0 && picture_window != nil && !picture_whole_display) {
-                // As the window was made for the first picture.
-                NSRect content = [picture_window contentRectForFrameRect:picture_window.frame];
-                points_per_pixel = content.size.width / width;
-            }
-            if (changed || resize_asked) {
-                resize_asked = NO;
-                window_follows_picture(width, height);
-            }
+            window_follows_picture(width, height);
         });
     }
     vt_srgb = channel_info.colour == 1;
@@ -2836,6 +2836,17 @@ int main(int argc, char *argv[]) {
 
         // The everyday trial's switches (see the top of this file).
         daily_reconnect = getenv("ISTESSO_DAILY_RECONNECT") != NULL;
+        if (daily_reconnect) {
+            const char *density_said = getenv("ISTESSO_PICTURE_DENSITY");
+            double density = picture_density_from(density_said, 2);
+            sizing = window_sizing_start(density);
+            fprintf(stderr, "window: %g picture pixels a point of the host (%s); %g points of this window a picture pixel, on any screen\n",
+                    density, density_said == NULL ? "the Mac host's 2x display: ISTESSO_PICTURE_DENSITY not given" : "ISTESSO_PICTURE_DENSITY",
+                    sizing.each);
+            if (density_said != NULL && picture_density_from(density_said, 0) == 0) {
+                fprintf(stderr, "warning: ISTESSO_PICTURE_DENSITY is a number from 0.25 to 4; 2 is taken\n");
+            }
+        }
         BOOL no_window = getenv("ISTESSO_NO_WINDOW") != NULL;
         // PROTOTYPE (ADR 0027, a proposal): the application's other windows in windows of their own,
         // in the everyday form over the channel only (extra-windows.h).
@@ -2948,6 +2959,26 @@ int main(int argc, char *argv[]) {
                                                         usingBlock:^(NSNotification *note) {
                                                             (void)note;
                                                             ask_for_window_size();
+                                                        }];
+            // Dragged onto a screen of another scale (the Air's 2x screen, a 1x monitor), the
+            // window keeps its size in points and its points a picture pixel (window-size.h):
+            // nothing is asked of the host. Said in the log, for the owner's check.
+            [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidChangeBackingPropertiesNotification
+                                                            object:window
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) {
+                                                            NSWindow *moved = note.object;
+                                                            double was = [note.userInfo[NSBackingPropertyOldScaleFactorKey] doubleValue];
+                                                            double now = moved.backingScaleFactor;
+                                                            if (was == now) {
+                                                                return;  // its colour space changed
+                                                            }
+                                                            NSSize area = [moved contentRectForFrameRect:moved.frame].size;
+                                                            fprintf(stderr,
+                                                                    "window: on a screen of %g pixels a point now (it was %g); still %.0fx%.0f "
+                                                                    "points, %g points a picture pixel (%g pixels of this screen); nothing asked of the host\n",
+                                                                    now, was, area.width, area.height, sizing.each,
+                                                                    screen_pixels_per_picture_pixel(&sizing, now));
                                                         }];
             // For checks that must not touch the window: behave, once the first picture is there,
             // as if the person had resized the window by hand to WxH points.

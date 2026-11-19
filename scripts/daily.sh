@@ -1236,8 +1236,10 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         local x y frames=- n=$slot
         if [ -n "${POSITION:-}" ]; then x=${POSITION%,*}; y=${POSITION#*,}; else x=$((60 + 48 * n)); y=$((60 + 36 * n)); fi
         [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="$mine/frames-$(date +%s).jsonl"
+        # ISTESSO_PICTURE_DENSITY=1: the compositor draws at scale 1, so one picture pixel is one
+        # point of the window on any screen (the viewer's default, 2, is the Mac host's).
         local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CLIPBOARD=1
-            ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
+            ISTESSO_PICTURE_DENSITY=1 ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
         # The title the window has; the guard changes it while a window of the application is calling.
         printf '%s\n\n' "$(app_title "$name")" > "$mine/title"
         [ "${DAILY_DOCK_TILE:-}" = none ] && settings+=(ISTESSO_DOCK_TILE=none)

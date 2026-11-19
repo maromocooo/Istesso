@@ -294,10 +294,10 @@ static uint32_t key_window_number(void) {
     if (!window_address(channel_address, listed.port, _address, sizeof _address)) {
         return nil;
     }
-    // As large as its picture, at the first window's points to a pixel, made smaller as a whole to
-    // fit the screen (window-size.h).
+    // One picture pixel at 1 / the density told, as the first window (window-size.h), on any screen
+    // here, made smaller as a whole to fit the screen.
     NSScreen *screen = picture_window.screen ?: NSScreen.mainScreen;
-    double each = points_per_pixel > 0 ? points_per_pixel : 1.0 / (screen.backingScaleFactor > 0 ? screen.backingScaleFactor : 2);
+    double each = sizing.each;
     NSRect room = screen.visibleFrame;
     double w, h;
     window_size_for_picture((unsigned)listed.width, (unsigned)listed.height, each, room.size.width, room.size.height - 28, &w, &h);
