@@ -5,7 +5,7 @@ the enabled text input of the client that has the keyboard (commit_string, then 
 inputs of a client are told they entered before its keyboard is. When the text input of the
 window that got the keyboard has not enabled itself 0.3 s (and 1 s) later, that window is told
 again that it has the keyboard (wl_keyboard leave and enter to that surface only; the seat's focus
-does not change): the Text Editor (GTK 4.14), when it restores a page from its session, enables
+does not change; once per surface, only while no key is down): the Text Editor (GTK 4.14), when it restores a page from its session, enables
 its text input only after such a second focus (seen on the host). A client
 without an enabled text input gets printable ASCII as key presses (US layout; on another layout
 only letters, digits and the space; Caps Lock is taken into account); anything else is dropped. The text is never logged, only
@@ -144,10 +144,10 @@ index b0ef369..8583d4b 100644
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
 new file mode 100644
-index 0000000..d6dd56c
+index 0000000..a5d91e4
 --- /dev/null
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,410 @@
 +//! Trial only: committed text for the client that has the keyboard (Istesso's ADR 0007,
 +//! "確定した文字", and ADR 0020, route d). The device a person types on composes the text with
 +//! its own input method and sends only what was committed; here it is handed to the text input
@@ -243,6 +243,8 @@ index 0000000..d6dd56c
 +pub struct TextInputs {
 +    instances: Vec<Instance>,
 +    focus: Option<WlSurface>,
++    /// The surfaces that were told the keyboard again (below): each one once, never again.
++    retold: Vec<WlSurface>,
 +}
 +
 +struct Instance {
@@ -320,8 +322,12 @@ index 0000000..d6dd56c
 +
 +    /// The surface with the keyboard, when a text input of its client entered it and has not
 +    /// enabled itself (nor asked to).
-+    fn not_enabled_focus(&self) -> Option<WlSurface> {
++    fn not_enabled_focus(&mut self) -> Option<WlSurface> {
++        self.retold.retain(|s| s.is_alive());
 +        let focus = self.focus.clone().filter(|s| s.is_alive())?;
++        if self.retold.contains(&focus) {
++            return None;
++        }
 +        self.instances
 +            .iter()
 +            .any(|i| i.entered.as_ref() == Some(&focus) && !i.enabled && i.pending.is_none())
@@ -348,11 +354,17 @@ index 0000000..d6dd56c
 +}
 +
 +impl State {
-+    /// After the keyboard moved to a window: if its text input has not enabled itself 0.3 s
-+    /// (and again 1 s) later, the window is told once more that it has the keyboard (keyboard
-+    /// leave, then enter, to that surface only; the seat's focus does not change). Seen on the
-+    /// host: the Text Editor, when it restores a page from its session, enables its text input
-+    /// only after its focus moves again.
++    /// After the keyboard moved to a window: if a text input of its client entered it and has
++    /// not enabled itself 0.3 s (or 1 s) later, the window is told once more that it has the
++    /// keyboard (keyboard leave, then enter, to that surface only). Seen on the host: the Text
++    /// Editor, when it restores a page from its session, enables its text input only after a
++    /// second keyboard enter (its one text input was created, and told it entered, before).
++    ///
++    /// * Once per surface, never again (`retold`), and never for a client without a text input.
++    /// * Only while no key is down: the leave and the enter go out together in this one callback,
++    ///   so no key event comes between them, and none is held that the client would forget.
++    /// * The seat is not asked: its focus, the active window, the stacking, the keyboard's holder
++    ///   and the recent input serials stay as they are (docs/m3-compositor-windows.md).
 +    pub fn text_inputs_check_soon(&mut self) {
 +        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 +        for wait in [300u64, 1000] {
@@ -369,9 +381,13 @@ index 0000000..d6dd56c
 +    fn tell_keyboard_again_for_text_input(&mut self) {
 +        use smithay::input::keyboard::KeyboardTarget;
 +        use smithay::utils::SERIAL_COUNTER;
++        if !self.seat.get_keyboard().unwrap().pressed_keys().is_empty() {
++            return;
++        }
 +        let Some(surface) = self.text_inputs.not_enabled_focus() else {
 +            return;
 +        };
++        self.text_inputs.retold.push(surface.clone());
 +        let seat = self.seat.clone();
 +        KeyboardTarget::leave(&surface, &seat, self, SERIAL_COUNTER.next_serial());
 +        KeyboardTarget::enter(&surface, &seat, self, Vec::new(), SERIAL_COUNTER.next_serial());
