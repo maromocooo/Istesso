@@ -226,8 +226,6 @@ impl Drop for Input {
     }
 }
 
-/// Adds an event to those that leave together. Of pointer positions in a
-/// row only the last one matters.
 /// Linux key codes of the keys committed text stands in for (input-event-codes.h).
 const KEY_TAB: u32 = 15;
 const KEY_ENTER: u32 = 28;
@@ -288,6 +286,8 @@ pub fn text_events(text: &str) -> Vec<InputEvent> {
     events
 }
 
+/// Adds an event to those that leave together. Of pointer positions in a
+/// row only the last one matters.
 pub(crate) fn take(events: &mut Vec<InputEvent>, event: InputEvent) {
     match (events.last_mut(), &event) {
         (Some(last @ InputEvent::PointerAt { .. }), InputEvent::PointerAt { .. }) => *last = event,

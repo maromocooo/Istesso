@@ -5,7 +5,7 @@ import android.util.Log;
 public final class StandIn implements Picture.Told {
     static String t() { return Log.Stamp.now(); }
     public void connecting() { System.out.println(t() + " panel: つないでいます…"); }
-    public void connected(int w, int h, int fps, int chroma) { System.out.println(t() + " panel: connected " + w + "x" + h + " " + fps + " fps " + chroma); }
+    public void connected(Picture from, int w, int h, int fps, int chroma) { System.out.println(t() + " panel: connected " + w + "x" + h + " " + fps + " fps " + chroma); }
     public void cut(long cuts) { System.out.println(t() + " panel: つなぎ直しています…（切れたのは " + cuts + " 回目）"); }
     public void reconnecting(int why, long waitMs, int attempt) { System.out.println(t() + " panel: つなぎ直しています… why=" + why + " wait=" + waitMs + " ms attempt=" + attempt); }
     public void decoder(String name, boolean low) {}

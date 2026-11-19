@@ -162,7 +162,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         settings = new Settings(this);
         app = HostApp.of(getIntent().getData());
         if (app == null) {
-            app = HostApp.ALL[0];
+            // A panel whose host or application this version does not know: never another one in its place.
+            Log.w(TAG, "a panel for an application this version does not know: closed");
+            finish();
+            return;
         }
         setTitle(getString(R.string.panel_name, app.fullTitle(this)));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -230,7 +233,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         FrameLayout.LayoutParams typingAt = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
         typingAt.bottomMargin = (int) (48 * getResources().getDisplayMetrics().density);
-        root.addView(typingToggle, typingAt);
+        if (app.host.takesText) {
+            root.addView(typingToggle, typingAt);
+        }
         composingLine = new TextView(this);
         composingLine.setTextColor(Color.WHITE);
         composingLine.setBackgroundColor(0xC0202060);
@@ -352,13 +357,13 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     }
 
     @Override
-    public void connected(int width, int height, int fps, int chroma) {
-        pictureWidth = width;
-        pictureHeight = height;
+    public void connected(Picture from, int width, int height, int fps, int chroma) {
         runOnUiThread(() -> {
-            if (!resumed || picture == null) {
-                return; // a picture thread of a panel that has gone to the background
+            if (!resumed || picture != from) {
+                return; // an earlier picture of this panel, or a panel that has gone to the background
             }
+            pictureWidth = width;
+            pictureHeight = height;
             away = false;
             takeWifi();
             frame.setAspect(width, height);

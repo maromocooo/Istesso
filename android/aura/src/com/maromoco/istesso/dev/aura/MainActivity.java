@@ -144,7 +144,10 @@ public final class MainActivity extends Activity {
             String why = joined == null ? Native.lastError(Native.ERROR_PAIRING) : null;
             runOnUiThread(() -> {
                 s.pair.setEnabled(true);
-                if (joined != null && joined.length == 2) {
+                if (joined != null && joined.length == 2 && pairedElsewhere(s.host, joined[0])) {
+                    // The same device for two hosts: both sections would show one host's applications.
+                    s.status.setText(R.string.same_host_twice);
+                } else if (joined != null && joined.length == 2) {
                     // Pinned for this host only: its panels connect to this device and no other.
                     settings.setPaired(s.host, joined[0], joined[1]);
                     showPaired(s);
@@ -153,6 +156,16 @@ public final class MainActivity extends Activity {
                 }
             });
         }, "istesso-pair").start();
+    }
+
+    /** Whether another host's section is paired with the device `id` already. */
+    private boolean pairedElsewhere(Host host, String id) {
+        for (Host other : Host.ALL) {
+            if (other != host && id.equals(settings.hostId(other))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

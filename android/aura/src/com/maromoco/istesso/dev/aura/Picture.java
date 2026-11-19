@@ -31,7 +31,8 @@ final class Picture {
     /** What the screen is told. Called on the picture's threads. */
     interface Told {
         void connecting();
-        void connected(int width, int height, int fps, int chroma);
+        /** `from`: the picture that connected, so that an earlier one of the panel is told apart. */
+        void connected(Picture from, int width, int height, int fps, int chroma);
         void cut(long cuts);
         /**
          * The host said that its picture is over for now (its pipeline ended, it was put aside for
@@ -404,7 +405,7 @@ final class Picture {
                     if (info == null) {
                         break;
                     }
-                    told.connected(info[1], info[2], info[3], info[4]);
+                    told.connected(this, info[1], info[2], info[3], info[4]);
                     if (info[0] != CODEC_H265 || info[4] != CHROMA_420) {
                         told.over("unsupported:" + info[4]);
                         return WATCH_DONE;

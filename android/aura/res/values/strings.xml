@@ -40,6 +40,7 @@
     <string name="panel_name">%1$s（Istesso 試作）</string>
     <string name="host_ubuntu">Ubuntu のホスト</string>
     <string name="host_mac">Mac のホスト（Mac Studio）</string>
+    <string name="same_host_twice">この相手は、もう一方の節のホストとしてペアにしてあります。ホストごとに別の相手にしてください</string>
     <string name="app_mac_slot">枠 %1$d</string>
     <string name="apps_title_mac">Mac のホストのアプリ（Mac で `daily-mac.sh open アプリ --for aura --slot N` で開いた枠を選ぶ。同時に 3 つまで）</string>
 </resources>

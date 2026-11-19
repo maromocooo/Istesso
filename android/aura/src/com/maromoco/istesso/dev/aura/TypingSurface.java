@@ -73,7 +73,9 @@ final class TypingSurface extends SurfaceView {
         public boolean commitText(CharSequence text, int newCursorPosition) {
             composing = "";
             typed.composing("");
-            if (text != null && text.length() > 0) {
+            // Typing switched off (also when the panel goes to the background): the framework
+            // finishes the old connection, and what was not converted yet is not sent.
+            if (typing && text != null && text.length() > 0) {
                 typed.text(text.toString());
             }
             return true;
@@ -92,7 +94,7 @@ final class TypingSurface extends SurfaceView {
             String done = composing;
             composing = "";
             typed.composing("");
-            if (!done.isEmpty()) {
+            if (typing && !done.isEmpty()) {
                 typed.text(done);
             }
             return true;
@@ -100,6 +102,9 @@ final class TypingSurface extends SurfaceView {
 
         @Override
         public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+            if (!typing) {
+                return true;
+            }
             // The text is the host application's: deleting before the cursor is Backspace there.
             for (int i = 0; i < Math.min(beforeLength, 64); i++) {
                 press(KeyEvent.KEYCODE_DEL);
@@ -108,6 +113,11 @@ final class TypingSurface extends SurfaceView {
                 press(KeyEvent.KEYCODE_FORWARD_DEL);
             }
             return true;
+        }
+
+        @Override
+        public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+            return deleteSurroundingText(beforeLength, afterLength);
         }
 
         @Override
