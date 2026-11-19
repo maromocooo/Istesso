@@ -330,6 +330,7 @@ scripts/daily.sh note "気づいたこと"
   3. Dia の近道を使うなら：`~/.config/istesso/daily-shortcuts-owner-apps.txt` を自分で作り、`Dia` と 1 行書く。
   4. 計測が走っていないときに `scripts/daily.sh shortcuts build` → `scripts/daily.sh shortcuts install`（登録で、Air の LAN のつなぎが一時的に切れる）。最初に近道から開いたとき、「ローカルネットワーク」の問いが出たら `Istesso Dev Open` に許す。
   5. いつもどおり `open`（または近道）で開く。
+  6. Mac Studio の Dia を、試用版の起動口から開くとき（持ち主だけ）：`DAILY_OWNER=1 DAILY_CLIPBOARD=1 scripts/daily.sh open dia --host mac`。`daily.sh` は、言葉と、`DAILY_OWNER`、`DAILY_CLIPBOARD`、`DAILY_OPEN_HANDLER`（持ち主の近道が付けるもの）を、そのまま `daily-mac.sh` に渡す（付けていないものは付けない。鍵の記述子は渡さない。`scripts/daily_mac_pass_test.py` で確かめる）。`daily-mac.sh` の側の門は、M4 の流れ（`m4-daily-host`）が入れる。
 
 ## Spotlight、Alfred、Dock から開く
 
