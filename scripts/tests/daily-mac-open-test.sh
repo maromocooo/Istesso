@@ -121,9 +121,9 @@ check "desktop not from a terminal: refused as before" 'grep -q "only the owner 
 # (copy and paste, the picture's density), so that the viewer and the host agree.
 run again DAILY_VIRTUAL=1 DAILY_VIRTUAL_SIZE=1710x1112 -- textedit
 check "first open: copy and paste on, density 2" '[ "$(cat "$scratch/again/state/textedit/clipboard")" = 1 ] && [ "$(cat "$scratch/again/state/textedit/density")" = 2 ]'
-echo "host: textedit runs already: its settings stay as started; close it first to change them" > "$scratch/again/answer-first"
+echo "host: textedit runs already: its settings stay as started; stop or close it first to change them" > "$scratch/again/answer-first"
 run again DAILY_CLIPBOARD=0 -- textedit
-check "runs already: the host says that its settings stay" 'grep -q "runs already: its settings stay as started; close it first to change them" "$scratch/again/out.txt" && cat "$scratch/again"/host-*.sh | grep -q "echo \"host: \$NAME runs already: its settings stay as started; close it first to change them\""'
+check "runs already: the host says that its settings stay" 'grep -q "runs already: its settings stay as started; stop or close it first to change them" "$scratch/again/out.txt" && cat "$scratch/again"/host-*.sh | grep -q "echo \"host: \$NAME runs already: its settings stay as started; stop or close it first to change them\""'
 check "runs already: copy and paste and density stay as written down" '[ "$(cat "$scratch/again/state/textedit/clipboard")" = 1 ] && [ "$(cat "$scratch/again/state/textedit/density")" = 2 ]'
 run fresh-again DAILY_VIRTUAL=1 DAILY_VIRTUAL_SIZE=1710x1112 -- textedit
 run fresh-again DAILY_CLIPBOARD=0 -- textedit

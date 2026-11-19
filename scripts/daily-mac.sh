@@ -367,7 +367,7 @@ if still_runs "\$run/host.pid"; then
     before=\$(( \$(count_said \$NAME resumed) + \$(count_said \$NAME refused) ))
     tell \$NAME resume
     for i in \$(seq 1 30); do [ \$(( \$(count_said \$NAME resumed) + \$(count_said \$NAME refused) )) -gt "\$before" ] && break; [ \$(count_said \$NAME paused) -eq 0 ] && break; sleep 0.1; done
-    echo "host: \$NAME runs already: its settings stay as started; close it first to change them"
+    echo "host: \$NAME runs already: its settings stay as started; stop or close it first to change them"
 else
     set --
     prompt_file="\$HOME/.config/istesso/daily-mac-system-prompts.txt"
