@@ -7,7 +7,7 @@ use istesso_pair::{Peer, PeerStore};
 use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
 
 use crate::channel::{Channel, LocalKeys};
-use crate::message::{ErrorCode, Request, Response};
+use crate::message::{ErrorCode, Request, Response, ShellRequest};
 use crate::{Error, Result};
 
 /// What the other device said to a request to send it input
@@ -18,6 +18,17 @@ pub enum InputAnswer {
     /// [`Client::heard_alive`] has something to hear.
     Open { alive: bool },
     /// It is not, and this is why: callers decide by the code.
+    Refused { code: ErrorCode, message: String },
+}
+
+/// What the other device said to a request for a shell
+/// ([`Client::open_shell`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellAnswer {
+    /// The shell runs. The conversation carries the frames of
+    /// [`crate::shell`] from now on: [`Client::into_channel`].
+    Open,
+    /// It does not, and this is why.
     Refused { code: ErrorCode, message: String },
 }
 
@@ -184,6 +195,27 @@ impl Client {
             }
         }
         Ok(heard)
+    }
+
+    /// Asks the other device for a shell. After [`ShellAnswer::Open`] the
+    /// conversation is no longer one of requests and answers: take the
+    /// channel out with [`Client::into_channel`].
+    pub fn open_shell(&mut self, request: ShellRequest) -> Result<ShellAnswer> {
+        let bytes =
+            serde_json::to_vec(&Request::ShellOpen(request)).map_err(|_| Error::Malformed)?;
+        self.channel.send(&bytes)?;
+        let answer = self.channel.recv()?;
+        match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
+            Response::ShellOpen => Ok(ShellAnswer::Open),
+            Response::Error { code, message } => Ok(ShellAnswer::Refused { code, message }),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// The channel underneath, for a conversation that has become something
+    /// other than requests and answers (a shell).
+    pub fn into_channel(self) -> Channel<TcpStream> {
+        self.channel
     }
 
     fn something_has_arrived(&self) -> Result<bool> {

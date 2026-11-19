@@ -40,6 +40,31 @@ pub enum Request {
         #[serde(deserialize_with = "istesso_proto::known_only")]
         events: Vec<InputEvent>,
     },
+    /// May I have a shell on your machine? Answered with
+    /// [`Response::ShellOpen`] or an error. Once it is open, the connection
+    /// carries only the frames of [`crate::shell`] in both directions, and
+    /// no more JSON. Proposed in ADR 0007 ("文字のシェル"); off unless the
+    /// host was told to allow it for this device.
+    ShellOpen(ShellRequest),
+}
+
+/// What a device says when it asks for a shell ([`Request::ShellOpen`]).
+/// The host checks every field; none of it is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellRequest {
+    /// The size of the terminal the shell is shown in.
+    pub cols: u16,
+    pub rows: u16,
+    /// The terminal's type, for `TERM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<String>,
+    /// The language the person uses, for `LANG` (`ja_JP.UTF-8`, say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// A folder on the host to start in: absolute, or below the home folder
+    /// (`~/...`). The home folder when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +90,9 @@ pub enum Response {
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
     InputAlive,
+    /// The shell is running. From now on the connection carries the frames
+    /// of [`crate::shell`] only.
+    ShellOpen,
     Error {
         code: ErrorCode,
         message: String,
@@ -194,6 +222,40 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Response::InputAlive).unwrap(),
             r#"{"type":"input_alive"}"#
+        );
+    }
+
+    #[test]
+    fn asking_for_a_shell_is_a_small_object_with_optional_parts() {
+        let bare = Request::ShellOpen(ShellRequest {
+            cols: 80,
+            rows: 24,
+            term: None,
+            locale: None,
+            project: None,
+        });
+        let json = serde_json::to_string(&bare).unwrap();
+        assert_eq!(json, r#"{"type":"shell_open","cols":80,"rows":24}"#);
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), bare);
+
+        let full = r#"{"type":"shell_open","cols":120,"rows":40,"term":"xterm-ghostty","locale":"ja_JP.UTF-8","project":"~/src/istesso","later":"ignored"}"#;
+        match serde_json::from_str::<Request>(full).unwrap() {
+            Request::ShellOpen(request) => {
+                assert_eq!((request.cols, request.rows), (120, 40));
+                assert_eq!(request.term.as_deref(), Some("xterm-ghostty"));
+                assert_eq!(request.locale.as_deref(), Some("ja_JP.UTF-8"));
+                assert_eq!(request.project.as_deref(), Some("~/src/istesso"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // A size that does not fit is not a request at all.
+        assert!(
+            serde_json::from_str::<Request>(r#"{"type":"shell_open","cols":70000,"rows":1}"#)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::ShellOpen).unwrap(),
+            r#"{"type":"shell_open"}"#
         );
     }
 

@@ -16,3 +16,8 @@ istesso-catalog.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mdns-sd.workspace = true
+
+# Pseudo-terminals, the user database and terminal modes for the remote shell
+# (src/remote_shell). Already in the tree through istesso-pair.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -542,7 +542,9 @@ mod tests {
                         Request::Status => Response::Status {
                             status: HostStatus::default(),
                         },
-                        Request::InputOpen { .. } | Request::Input { .. } => continue,
+                        Request::InputOpen { .. }
+                        | Request::Input { .. }
+                        | Request::ShellOpen(_) => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;

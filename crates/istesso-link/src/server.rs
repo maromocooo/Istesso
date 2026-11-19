@@ -113,6 +113,12 @@ impl Session {
         let bytes = serde_json::to_vec(response).map_err(|_| Error::Malformed)?;
         self.channel.send(&bytes)
     }
+
+    /// The channel underneath, for a conversation that has become something
+    /// other than requests and answers (a shell).
+    pub fn into_channel(self) -> Channel<TcpStream> {
+        self.channel
+    }
 }
 
 #[cfg(test)]

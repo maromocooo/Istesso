@@ -8,12 +8,16 @@
 //!   network.
 //! * [`cache`] is that memory, [`status`] measures the local load and
 //!   [`paths`] says where files live.
+//! * [`remote_shell`] opens a shell on another machine over the same
+//!   channel, and answers a device that asks for one.
 
 pub mod cache;
 pub mod discovery;
 pub mod passing;
 pub mod paths;
 pub mod relay;
+#[cfg(unix)]
+pub mod remote_shell;
 pub mod serve;
 pub mod status;
 pub mod survey;

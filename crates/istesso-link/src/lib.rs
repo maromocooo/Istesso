@@ -9,6 +9,7 @@
 //!   exchanged with a device that is not on that list.
 //! * [`message`] defines what one device can ask of another.
 //! * [`client`] and [`server`] are the two ends of a conversation.
+//! * [`shell`] is what a conversation carries once it has become a shell.
 //!
 //! Addresses are never trusted. Whoever answers at an address has to pass the
 //! handshake, so a wrong or forged address (from discovery or from memory) can
@@ -21,10 +22,11 @@ pub mod client;
 mod frame;
 pub mod message;
 pub mod server;
+pub mod shell;
 
-pub use channel::{Channel, LocalKeys};
-pub use client::{Client, InputAnswer};
-pub use message::{ErrorCode, Request, Response};
+pub use channel::{Channel, ChannelReader, ChannelWriter, LocalKeys};
+pub use client::{Client, InputAnswer, ShellAnswer};
+pub use message::{ErrorCode, Request, Response, ShellRequest};
 pub use server::{HangUp, Session};
 
 /// Port the agent listens on unless told otherwise.

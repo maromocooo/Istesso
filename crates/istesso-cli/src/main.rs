@@ -76,6 +76,29 @@ enum Command {
         /// file can be read by its owner only
         #[arg(long, value_name = "PATH")]
         input_timings: Option<PathBuf>,
+        /// Let this paired device (id or name) open a shell here, as the
+        /// user this agent runs as, with `istesso shell`. Off unless given;
+        /// may be given more than once. The device must also be allowed to
+        /// control this machine. A prototype (ADR 0007, proposal)
+        #[arg(long, value_name = "DEVICE")]
+        allow_shell: Vec<String>,
+    },
+    /// Open a shell on a paired device in this terminal, over Istesso's own
+    /// encrypted channel. Any terminal application can run this instead of
+    /// a local shell. Ends with the remote shell's exit status, or 255 when
+    /// there was no shell or the connection was lost. A prototype (ADR 0007,
+    /// proposal); the device has to allow it (`istesso agent --allow-shell`)
+    Shell {
+        /// Id or name of the paired device
+        device: String,
+        /// Start in this folder on the device: an absolute path there, or
+        /// one that starts with `~/`
+        #[arg(long, value_name = "DIR")]
+        project: Option<String>,
+        /// Reach the device at this address (and port) instead of where it
+        /// was last seen
+        #[arg(long, value_name = "ADDRESS[:PORT]")]
+        address: Option<String>,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -450,7 +473,27 @@ fn permission_names(permissions: &[istesso_pair::Permission]) -> String {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    // The shell ends with the status of the shell on the other machine, not
+    // with success or failure.
+    #[cfg(unix)]
+    if let Command::Shell {
+        device,
+        project,
+        address,
+    } = &cli.command
+    {
+        let options = istesso_agent::remote_shell::client::Options {
+            device: device.clone(),
+            address: address.clone(),
+            project: project.clone(),
+        };
+        return ExitCode::from(istesso_agent::remote_shell::client::run(
+            &Paths::from_env(),
+            &options,
+        ));
+    }
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("error: {message}");
@@ -497,14 +540,17 @@ fn run(cli: Cli) -> Result<(), String> {
             no_discovery,
             verbose,
             input_timings,
+            allow_shell,
         } => run_agent(AgentOptions {
             bind,
             port,
             discovery: !no_discovery,
             verbose,
             input_timings,
+            shell_for: allow_shell,
             ..AgentOptions::default()
         }),
+        Command::Shell { .. } => Err("this machine cannot open shells on other devices".into()),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
         Command::Id => {
             let paths = Paths::from_env();
@@ -1353,10 +1399,14 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     let addresses = istesso_doctor::lan_addresses();
     let paired = open_peers()?.peers().len();
 
+    let shells = options.shell_for.len();
     let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
     println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
+    if shells > 0 {
+        println!("Shells are open to {shells} paired device(s), as the user this agent runs as.");
+    }
     let reachable: Vec<String> = addresses
         .iter()
         .map(|address| with_port(address, addr.port()))

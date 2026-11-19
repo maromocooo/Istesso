@@ -64,6 +64,12 @@ pub struct AgentOptions {
     /// For measuring: write down when input was passed on, and never what it
     /// was ([`crate::passing`]). `None`, the default, writes nothing.
     pub input_timings: Option<std::path::PathBuf>,
+    /// The paired devices that may open a shell on this machine, by id or
+    /// name ([`crate::remote_shell`]). Empty, the default: none may.
+    pub shell_for: Vec<String>,
+    /// The program to run as a shell instead of the user's login shell. For
+    /// tests only, which must not run the login files of whoever runs them.
+    pub shell_program: Option<std::path::PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -76,6 +82,8 @@ impl Default for AgentOptions {
             verbose: false,
             input_socket: None,
             input_timings: None,
+            shell_for: Vec::new(),
+            shell_program: None,
         }
     }
 }
@@ -101,6 +109,14 @@ struct Shared {
     inputs: Mutex<HashMap<String, InputHold>>,
     passing: Option<crate::PassLog>,
     log: Log,
+    /// Who may open a shell here, and how shells are started.
+    #[cfg(unix)]
+    shell_policy: crate::remote_shell::ShellPolicy,
+    #[cfg(unix)]
+    shell_settings: crate::remote_shell::host::ShellSettings,
+    /// Shells open now, by the id of the device they are open for.
+    #[cfg(unix)]
+    shells: Mutex<HashMap<String, usize>>,
 }
 
 /// What is kept of a conversation that carries input, for ending it from
@@ -130,6 +146,17 @@ impl Agent {
             None => None,
         };
         let paths_input_socket = paths.input_socket();
+        #[cfg(unix)]
+        let shell_policy = if options.shell_for.is_empty() {
+            crate::remote_shell::ShellPolicy::default()
+        } else {
+            let peers = PeerStore::open(paths.peers()).map_err(|e| e.to_string())?;
+            crate::remote_shell::ShellPolicy::resolve(&peers, &options.shell_for)?
+        };
+        #[cfg(not(unix))]
+        if !options.shell_for.is_empty() {
+            return Err("this machine cannot open shells for other devices".into());
+        }
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -145,6 +172,14 @@ impl Agent {
                 inputs: Mutex::new(HashMap::new()),
                 passing,
                 log,
+                #[cfg(unix)]
+                shell_policy,
+                #[cfg(unix)]
+                shell_settings: crate::remote_shell::host::ShellSettings {
+                    program: options.shell_program.clone(),
+                },
+                #[cfg(unix)]
+                shells: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -346,6 +381,38 @@ impl InputSink {
     }
 }
 
+/// Whether the device may, at this moment, have a shell here: the host named
+/// it, with the key it has now, and it is still paired and still allowed to
+/// control this host (read from the list on disk).
+#[cfg(unix)]
+fn may_have_shell(
+    paths: &Paths,
+    peer: &istesso_pair::Peer,
+    policy: &crate::remote_shell::ShellPolicy,
+) -> bool {
+    policy.names(peer) && may_still_control(paths, peer)
+}
+
+/// A shell counted against the limits for as long as it is open.
+#[cfg(unix)]
+struct ShellSlot<'a> {
+    shells: &'a Mutex<HashMap<String, usize>>,
+    device: String,
+}
+
+#[cfg(unix)]
+impl Drop for ShellSlot<'_> {
+    fn drop(&mut self) {
+        let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = shells.get_mut(&self.device) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                shells.remove(&self.device);
+            }
+        }
+    }
+}
+
 /// Whether the device is, at this moment, still paired and still allowed to
 /// control this host: read from the list on disk, not remembered from when
 /// the conversation began.
@@ -397,6 +464,10 @@ impl Shared {
 
         let mut asked: Vec<&'static str> = Vec::new();
         let mut input: Option<InputSink> = None;
+        // A shell that was opened on this conversation: the conversation carries
+        // it from then on, and nothing else.
+        #[cfg(unix)]
+        let mut shell: Option<(crate::remote_shell::host::Shell, ShellSlot<'_>)> = None;
         // The device asked to be answered when it says "still here".
         let mut answers_alive = false;
         let mut checked = Instant::now();
@@ -461,10 +532,22 @@ impl Shared {
                         "nothing on this host takes input at the moment",
                     ),
                 },
+                #[cfg(unix)]
+                Request::ShellOpen(request) => match self.open_shell(&session, &request) {
+                    Ok(opened) => {
+                        shell = Some(opened);
+                        Response::ShellOpen
+                    }
+                    Err(refused) => refused,
+                },
                 request if session.allows(Permission::View) => self.answer(&request, &mut asked),
                 _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
             if session.respond(&response).is_err() {
+                break;
+            }
+            #[cfg(unix)]
+            if shell.is_some() {
                 break;
             }
         }
@@ -480,6 +563,85 @@ impl Shared {
                 session.peer().name,
                 asked.join(", ")
             ));
+        }
+        #[cfg(unix)]
+        if let Some((shell, _slot)) = shell {
+            let peer = session.peer().clone();
+            let pid = shell.pid();
+            let served = shell.serve(session.into_channel(), || {
+                may_have_shell(&self.paths, &peer, &self.shell_policy)
+            });
+            // Counts and times only: never what was typed or printed.
+            (self.log)(format!(
+                "the shell for {} (process {pid}) is over after {:.1} s: {}; {} bytes in {} frames from the device, {} bytes in {} frames to it, {} new sizes",
+                peer.name,
+                served.lasted.as_secs_f64(),
+                served.end,
+                served.bytes_in,
+                served.frames_in,
+                served.bytes_out,
+                served.frames_out,
+                served.resizes,
+            ));
+        }
+    }
+
+    /// Starts a shell for the device of `session`, when it may have one, and
+    /// counts it. The refusal is the answer to send.
+    #[cfg(unix)]
+    fn open_shell(
+        &self,
+        session: &Session,
+        request: &istesso_link::ShellRequest,
+    ) -> Result<(crate::remote_shell::host::Shell, ShellSlot<'_>), Response> {
+        use crate::remote_shell::{host::Shell, MAX_ON_HOST, MAX_PER_DEVICE};
+        let peer = session.peer();
+        if !self.shell_policy.names(peer) {
+            return Err(Response::error(
+                ErrorCode::Forbidden,
+                "this host does not open shells for this device",
+            ));
+        }
+        if !may_still_control(&self.paths, peer) {
+            return Err(Response::error(
+                ErrorCode::Forbidden,
+                "this device may not control the host",
+            ));
+        }
+        let slot = {
+            let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
+            let on_host: usize = shells.values().sum();
+            let for_device = shells.get(&peer.id).copied().unwrap_or(0);
+            if on_host >= MAX_ON_HOST || for_device >= MAX_PER_DEVICE {
+                return Err(Response::error(
+                    ErrorCode::Internal,
+                    "too many shells are open on this host",
+                ));
+            }
+            *shells.entry(peer.id.clone()).or_default() += 1;
+            ShellSlot {
+                shells: &self.shells,
+                device: peer.id.clone(),
+            }
+        };
+        match Shell::start(request, &self.shell_settings) {
+            Ok(shell) => {
+                (self.log)(format!(
+                    "opened a shell for {} (process {}), {}",
+                    peer.name,
+                    shell.pid(),
+                    if request.project.is_some() {
+                        "in a project folder"
+                    } else {
+                        "at home"
+                    }
+                ));
+                Ok((shell, slot))
+            }
+            Err(why) => {
+                (self.log)(format!("could not open a shell for {}: {why}", peer.name));
+                Err(Response::error(ErrorCode::Internal, why))
+            }
         }
     }
 
@@ -542,6 +704,10 @@ impl Shared {
             Request::InputOpen { .. } | Request::Input { .. } => Response::error(
                 ErrorCode::Unsupported,
                 "input is not answered like a question",
+            ),
+            Request::ShellOpen(_) => Response::error(
+                ErrorCode::Unsupported,
+                "this machine cannot open shells for other devices",
             ),
         }
     }

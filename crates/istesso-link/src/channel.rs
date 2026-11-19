@@ -23,6 +23,7 @@
 use std::cmp::Ordering;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use istesso_pair::Identity;
@@ -342,66 +343,194 @@ impl<S: Read + Write> Channel<S> {
 
     /// Sends one message.
     pub fn send(&mut self, message: &[u8]) -> Result<()> {
-        if message.len() > MAX_MESSAGE {
-            return Err(Error::TooLarge);
-        }
-        // A message is its length followed by its bytes, cut into pieces that
-        // each fit one Noise message.
-        let mut plain = Vec::with_capacity(4 + message.len());
-        plain.extend_from_slice(&(message.len() as u32).to_be_bytes());
-        plain.extend_from_slice(message);
-
-        let frames = plain.len().div_ceil(MAX_CHUNK);
-        let mut wire = Vec::with_capacity(plain.len() + frames * (2 + TAG_LEN));
-        for chunk in plain.chunks(MAX_CHUNK) {
-            let n = self
-                .transport
-                .write_message(chunk, &mut self.scratch)
-                .map_err(Error::crypto)?;
-            encode_frame(&mut wire, &self.scratch[..n]);
-        }
+        let wire = seal(&mut self.transport, &mut self.scratch, message)?;
         write_all(&mut self.stream, &wire)
     }
 
     /// Waits for the next message. [`Error::Closed`] means the other end hung
     /// up.
     pub fn recv(&mut self) -> Result<Vec<u8>> {
-        let mut plain: Vec<u8> = Vec::new();
-        let mut expected: Option<usize> = None;
-        loop {
-            let frame = read_frame(&mut self.stream, MAX_FRAME)?;
-            let n = self
-                .transport
-                .read_message(&frame, &mut self.scratch)
-                .map_err(Error::crypto)?;
-            if n == 0 {
-                return Err(Error::Malformed);
-            }
-            plain.extend_from_slice(&self.scratch[..n]);
+        let Channel {
+            stream,
+            transport,
+            scratch,
+            ..
+        } = self;
+        receive(stream, scratch, |frame, out| {
+            transport.read_message(frame, out).map_err(Error::crypto)
+        })
+    }
+}
 
-            let total = match expected {
-                Some(total) => total,
-                None => {
-                    if plain.len() < 4 {
-                        return Err(Error::Malformed);
-                    }
-                    let len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
-                    if len > MAX_MESSAGE {
-                        return Err(Error::TooLarge);
-                    }
-                    expected = Some(4 + len);
-                    4 + len
-                }
-            };
-            match plain.len().cmp(&total) {
-                Ordering::Less => continue,
-                Ordering::Equal => {
-                    plain.drain(..4);
-                    return Ok(plain);
-                }
-                Ordering::Greater => return Err(Error::Malformed),
-            }
+/// Encrypts one message into the frames that carry it: its length followed
+/// by its bytes, cut into pieces that each fit one Noise message.
+fn seal(
+    transport: &mut snow::TransportState,
+    scratch: &mut [u8],
+    message: &[u8],
+) -> Result<Vec<u8>> {
+    if message.len() > MAX_MESSAGE {
+        return Err(Error::TooLarge);
+    }
+    let mut plain = Vec::with_capacity(4 + message.len());
+    plain.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    plain.extend_from_slice(message);
+
+    let frames = plain.len().div_ceil(MAX_CHUNK);
+    let mut wire = Vec::with_capacity(plain.len() + frames * (2 + TAG_LEN));
+    for chunk in plain.chunks(MAX_CHUNK) {
+        let n = transport
+            .write_message(chunk, scratch)
+            .map_err(Error::crypto)?;
+        encode_frame(&mut wire, &scratch[..n]);
+    }
+    Ok(wire)
+}
+
+/// Reads frames until one message is whole. `open` decrypts one frame into
+/// the buffer it is given and says how many bytes it wrote there.
+fn receive<R: Read>(
+    stream: &mut R,
+    scratch: &mut [u8],
+    mut open: impl FnMut(&[u8], &mut [u8]) -> Result<usize>,
+) -> Result<Vec<u8>> {
+    let mut plain: Vec<u8> = Vec::new();
+    let mut expected: Option<usize> = None;
+    loop {
+        let frame = read_frame(stream, MAX_FRAME)?;
+        let n = open(&frame, scratch)?;
+        if n == 0 {
+            return Err(Error::Malformed);
         }
+        plain.extend_from_slice(&scratch[..n]);
+
+        let total = match expected {
+            Some(total) => total,
+            None => {
+                if plain.len() < 4 {
+                    return Err(Error::Malformed);
+                }
+                let len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+                if len > MAX_MESSAGE {
+                    return Err(Error::TooLarge);
+                }
+                expected = Some(4 + len);
+                4 + len
+            }
+        };
+        match plain.len().cmp(&total) {
+            Ordering::Less => continue,
+            Ordering::Equal => {
+                plain.drain(..4);
+                return Ok(plain);
+            }
+            Ordering::Greater => return Err(Error::Malformed),
+        }
+    }
+}
+
+impl Channel<TcpStream> {
+    /// Cuts the channel into a half that reads and a half that writes, for a
+    /// conversation in which both ends talk whenever they like (a shell:
+    /// what the program prints and what the person types flow at the same
+    /// time). Nothing changes on the wire.
+    ///
+    /// The two halves share the channel's encryption state behind one lock,
+    /// held only while a message is sealed or opened, never while waiting
+    /// for the network. Each direction keeps its own key and counter inside
+    /// that state, as before. There is one writing half, and it sends what
+    /// it sealed before it seals the next message, so messages leave in the
+    /// order of their counters.
+    ///
+    /// The halves share one connection: its timeouts are the same for both,
+    /// and [`ChannelWriter::shut_down`] ends the waits of both. After an
+    /// error on either half, both must be dropped.
+    pub fn split(self) -> Result<(ChannelReader, ChannelWriter)> {
+        let writing = self.stream.try_clone().map_err(Error::from_io)?;
+        let transport = Arc::new(Mutex::new(self.transport));
+        Ok((
+            ChannelReader {
+                stream: self.stream,
+                transport: transport.clone(),
+                peer_key: self.peer_key,
+                scratch: self.scratch,
+            },
+            ChannelWriter {
+                stream: writing,
+                transport,
+                scratch: vec![0u8; MAX_FRAME],
+            },
+        ))
+    }
+}
+
+/// The encryption state, unless a thread panicked while it held it: then
+/// the state may be half changed, and the channel is over.
+fn locked(transport: &Mutex<snow::TransportState>) -> Result<MutexGuard<'_, snow::TransportState>> {
+    transport.lock().map_err(|_| Error::Closed)
+}
+
+/// The half of a [`Channel`] that receives ([`Channel::split`]).
+pub struct ChannelReader {
+    stream: TcpStream,
+    transport: Arc<Mutex<snow::TransportState>>,
+    peer_key: [u8; 32],
+    scratch: Vec<u8>,
+}
+
+impl ChannelReader {
+    /// As [`Channel::recv`].
+    pub fn recv(&mut self) -> Result<Vec<u8>> {
+        let ChannelReader {
+            stream,
+            transport,
+            scratch,
+            ..
+        } = self;
+        receive(stream, scratch, |frame, out| {
+            locked(transport)?
+                .read_message(frame, out)
+                .map_err(Error::crypto)
+        })
+    }
+
+    /// The identity key of the device at the other end.
+    pub fn peer_key(&self) -> &[u8; 32] {
+        &self.peer_key
+    }
+
+    /// The underlying connection, for adjusting timeouts.
+    pub fn stream(&self) -> &TcpStream {
+        &self.stream
+    }
+}
+
+/// The half of a [`Channel`] that sends ([`Channel::split`]).
+pub struct ChannelWriter {
+    stream: TcpStream,
+    transport: Arc<Mutex<snow::TransportState>>,
+    scratch: Vec<u8>,
+}
+
+impl ChannelWriter {
+    /// As [`Channel::send`].
+    pub fn send(&mut self, message: &[u8]) -> Result<()> {
+        let wire = {
+            let mut transport = locked(&self.transport)?;
+            seal(&mut transport, &mut self.scratch, message)?
+        };
+        write_all(&mut self.stream, &wire)
+    }
+
+    /// Ends the connection in both directions: whoever waits on either half
+    /// is told that it is closed.
+    pub fn shut_down(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// The underlying connection, for adjusting timeouts.
+    pub fn stream(&self) -> &TcpStream {
+        &self.stream
     }
 }
 
@@ -622,6 +751,68 @@ mod tests {
             .write_all(&(MAX_HANDSHAKE_FRAME as u16 + 1).to_be_bytes())
             .unwrap();
         assert!(matches!(server.join().unwrap(), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn split_halves_talk_both_ways_at_once_and_the_other_end_sees_no_difference() {
+        let (client, mut server, _, studio) = pair();
+        let (mut reader, mut writer) = client.split().unwrap();
+        assert_eq!(reader.peer_key(), &studio.public_key());
+
+        // The far end answers every message, while this end goes on sending
+        // without reading: both directions are busy at the same time.
+        const COUNT: u32 = 2_000;
+        let echo = thread::spawn(move || {
+            for _ in 0..COUNT {
+                let message = server.recv().unwrap();
+                server.send(&message).unwrap();
+            }
+            server
+        });
+        let sending = thread::spawn(move || {
+            for i in 0..COUNT {
+                // Some messages span several Noise messages.
+                let size = if i % 97 == 0 {
+                    70_000
+                } else {
+                    1 + (i as usize % 300)
+                };
+                let mut message = i.to_be_bytes().to_vec();
+                message.resize(4 + size, (i % 251) as u8);
+                writer.send(&message).unwrap();
+            }
+            writer
+        });
+        for i in 0..COUNT {
+            let message = reader.recv().unwrap();
+            assert_eq!(&message[..4], &i.to_be_bytes(), "out of order");
+            assert!(message[4..].iter().all(|b| *b == (i % 251) as u8));
+        }
+        let mut writer = sending.join().unwrap();
+        let mut server = echo.join().unwrap();
+
+        // Shutting down through the writing half ends the wait of the reading one,
+        // and the other end is told that the conversation is over.
+        writer.send(b"last").unwrap();
+        assert_eq!(server.recv().unwrap(), b"last");
+        writer.shut_down();
+        assert!(matches!(reader.recv(), Err(Error::Closed)));
+        assert!(matches!(server.recv(), Err(Error::Closed)));
+    }
+
+    #[test]
+    fn a_split_half_refuses_what_a_whole_channel_refuses() {
+        let (mut client, server, _, _) = pair();
+        let (mut reader, mut writer) = server.split().unwrap();
+        assert!(matches!(
+            writer.send(&vec![0u8; MAX_MESSAGE + 1]),
+            Err(Error::TooLarge)
+        ));
+        client.send(b"fine").unwrap();
+        assert_eq!(reader.recv().unwrap(), b"fine");
+        // Bytes that were not produced by the other end's encryption.
+        write_frame(&mut client.stream, &[0x5a; 40]).unwrap();
+        assert!(matches!(reader.recv(), Err(Error::Crypto(_))));
     }
 
     #[test]
