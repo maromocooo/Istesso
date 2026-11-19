@@ -239,6 +239,19 @@ impl Plan {
         }
     }
 
+    /// Adds a rule after the plan was made (a grant kept by the owner's answer). An existing rule
+    /// for the same path keeps the wider access.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn add_rule(&mut self, path: PathBuf, access: Access) {
+        if let Some(existing) = self.paths.iter_mut().find(|r| r.path == path) {
+            if access > existing.access {
+                existing.access = access;
+            }
+        } else {
+            self.paths.push(PathRule { path, access });
+        }
+    }
+
     pub fn confined(&self) -> bool {
         self.level != Level::Owner
     }

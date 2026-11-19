@@ -6,6 +6,7 @@
 //! user, the same-user ways out (the Docker socket, the user's service manager) stay open; the
 //! launcher says so when it starts.
 
+mod ask;
 mod policy;
 
 #[cfg(target_os = "linux")]
@@ -43,15 +44,8 @@ enum Cmd {
     Run {
         #[command(flatten)]
         scope: ScopeArgs,
-        /// Hold opens of files outside the rules and ask before the kernel answers
-        /// (seccomp user notification; x86-64 only).
-        #[arg(long)]
-        hold_files: bool,
-        /// Stand-in for the owner's dialog: a shell command run for each held open, with
-        /// ISTESSO_ASK_PATH and ISTESSO_ASK_ACCESS set. Exit 0 = allow once, else refuse.
-        /// Without it, held opens are refused.
-        #[arg(long, requires = "hold_files")]
-        ask_cmd: Option<String>,
+        #[command(flatten)]
+        hold: HoldArgs,
         /// Let levels 1 to 3 listen on every address. Without it, a bind or listen on an address
         /// that is not loopback is moved to loopback (seccomp user notification; x86-64 only).
         #[arg(long)]
@@ -59,6 +53,38 @@ enum Cmd {
         /// The command and its arguments.
         #[arg(required = true, last = true)]
         command: Vec<String>,
+    },
+    /// The answering device's end (a test form in a terminal, not the owner's dialog): connect
+    /// to a launcher started with --ask-listen and answer its questions.
+    Answer {
+        /// Where the launcher listens (address:port).
+        #[arg(long)]
+        connect: std::net::SocketAddr,
+        /// Folder with this device's test identity and the launcher's trusted key.
+        #[arg(long)]
+        keys: PathBuf,
+        /// Answer from this list, in order, instead of asking at the prompt: once, widen-run,
+        /// widen-keep, refuse (comma-separated). When it runs out: refuse.
+        #[arg(long, value_delimiter = ',')]
+        script: Option<Vec<String>>,
+        /// Keep trying to connect for this many seconds.
+        #[arg(long, default_value_t = 30)]
+        retry: u64,
+    },
+    /// Create a test identity for the link in a folder of its own and write its public key to
+    /// <dir>/public-key (never the device's real key).
+    LinkKeys {
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Trust the device whose public key file (from link-keys) is given, in a test folder.
+    LinkTrust {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        public_key_file: PathBuf,
     },
     /// One operation with one line of result (for tests).
     #[command(hide = true)]
@@ -98,6 +124,45 @@ struct ScopeArgs {
     /// Do not print what is enforced and the warnings (errors are still printed).
     #[arg(long, short)]
     quiet: bool,
+}
+
+/// Holding operations at the edge and asking the owner.
+#[derive(Args, Clone)]
+struct HoldArgs {
+    /// Hold opens of files outside the rules and ask before the kernel answers
+    /// (seccomp user notification; x86-64 only).
+    #[arg(long)]
+    hold_files: bool,
+    /// Hold TCP connections to ports outside the rules and ask.
+    #[arg(long)]
+    hold_connect: bool,
+    /// Stand-in for the owner's dialog: a shell command run for each question, with
+    /// ISTESSO_ASK_KIND, ISTESSO_ASK_PATH, ISTESSO_ASK_ACCESS or ISTESSO_ASK_ADDRESS set.
+    /// Exit 0 = allow once, 10 = widen for this run, 11 = widen and keep, else refuse.
+    #[arg(long, conflicts_with = "ask_listen")]
+    ask_cmd: Option<String>,
+    /// Ask the owner's device over the Istesso link: listen here (address:port) for it before
+    /// the command starts. Use loopback or a wired address, never every address.
+    #[arg(long, requires = "link_keys")]
+    ask_listen: Option<std::net::SocketAddr>,
+    /// Folder with the launcher's test identity and the device's trusted key (link-keys,
+    /// link-trust). The confined command must not be able to read it.
+    #[arg(long)]
+    link_keys: Option<PathBuf>,
+    /// The one device (name or id in the trusted list) that may answer for this run: the device
+    /// that asked for it. Without it, the first trusted device that connects.
+    #[arg(long, requires = "ask_listen")]
+    ask_device: Option<String>,
+    /// Seconds to wait for the answering device before refusing to start.
+    #[arg(long, default_value_t = 120)]
+    ask_wait: u64,
+    /// Seconds a question waits for its answer; then it is refused.
+    #[arg(long, default_value_t = 60)]
+    ask_timeout: u64,
+    /// The project's grants file: "widen and keep" writes to it, and every start reads it. The
+    /// confined command must not be able to write it.
+    #[arg(long)]
+    grants: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -164,14 +229,82 @@ fn main() {
         },
         Cmd::Run {
             scope,
-            hold_files,
-            ask_cmd,
+            hold,
             listen_anywhere,
             command,
-        } => run(&scope, hold_files, ask_cmd, listen_anywhere, &command),
+        } => run(&scope, hold, listen_anywhere, &command),
+        Cmd::Answer {
+            connect,
+            keys,
+            script,
+            retry,
+        } => answer(connect, &keys, script, retry),
+        Cmd::LinkKeys { dir } => match ask::make_keys(&dir) {
+            Ok(id) => {
+                println!("identity: {id}");
+                println!("public-key-file: {}", dir.join("public-key").display());
+                0
+            }
+            Err(e) => {
+                eprintln!("istesso-scope: {e}");
+                1
+            }
+        },
+        Cmd::LinkTrust {
+            dir,
+            name,
+            public_key_file,
+        } => match ask::trust(&dir, &name, &public_key_file) {
+            Ok(id) => {
+                println!("trusted: {name} ({id})");
+                0
+            }
+            Err(e) => {
+                eprintln!("istesso-scope: {e}");
+                1
+            }
+        },
         Cmd::Probe { what } => probe(what),
     };
     std::process::exit(code);
+}
+
+fn answer(
+    connect: std::net::SocketAddr,
+    keys: &Path,
+    script: Option<Vec<String>>,
+    retry: u64,
+) -> i32 {
+    let answers = match script {
+        Some(list) => {
+            let mut choices = Vec::new();
+            for item in list {
+                match ask::Choice::parse(&item) {
+                    Some(c) => choices.push(c),
+                    None => {
+                        eprintln!("istesso-scope: not an answer: {item:?}");
+                        return 2;
+                    }
+                }
+            }
+            ask::Answers::Script(choices)
+        }
+        None => ask::Answers::Prompt(std::io::stdin().lock()),
+    };
+    let mut out = std::io::stdout();
+    match ask::answer(
+        connect,
+        keys,
+        std::time::Duration::from_secs(retry),
+        answers,
+        &mut out,
+    ) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("istesso-scope: {e}");
+            125
+        }
+    }
 }
 
 fn absolute(p: &Path) -> Result<PathBuf, String> {
@@ -321,28 +454,33 @@ fn check(probe_network: bool) -> i32 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(_: &ScopeArgs, _: bool, _: Option<String>, _: bool, _: &[String]) -> i32 {
+fn run(_: &ScopeArgs, _: HoldArgs, _: bool, _: &[String]) -> i32 {
     eprintln!("istesso-scope: this prototype confines on Linux only");
     125
 }
 
 #[cfg(target_os = "linux")]
-fn run(
-    args: &ScopeArgs,
-    hold_files: bool,
-    ask_cmd: Option<String>,
-    listen_anywhere: bool,
-    command: &[String],
-) -> i32 {
+fn run(args: &ScopeArgs, hold: HoldArgs, listen_anywhere: bool, command: &[String]) -> i32 {
     use std::os::unix::process::CommandExt;
 
-    let (plan, machine) = match make_plan(args, true) {
+    let (mut plan, machine) = match make_plan(args, true) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("istesso-scope: {e}");
             return 125;
         }
     };
+    let kept_connects = match apply_grants(&mut plan, &hold, !args.quiet) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("istesso-scope: {e}");
+            return 125;
+        }
+    };
+    if let Err(e) = check_private_places(&plan, &hold) {
+        eprintln!("istesso-scope: {e}");
+        return 125;
+    }
     let outside: Vec<(String, String)> = std::env::vars().collect();
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
@@ -404,11 +542,14 @@ fn run(
     }
 
     let loopback = !listen_anywhere;
-    if hold_files || loopback {
+    // Kept addresses are connected by the supervisor, so connections are held whenever there are
+    // any.
+    let hold_connect = hold.hold_connect || !kept_connects.is_empty();
+    if hold.hold_files || hold_connect || loopback {
         if !cfg!(target_arch = "x86_64") {
             eprintln!(
-                "istesso-scope: the supervisor (--hold-files, loopback-only listening) is \
-                 written for x86-64 only; use --listen-anywhere elsewhere"
+                "istesso-scope: the supervisor (--hold-files, --hold-connect, loopback-only \
+                 listening) is written for x86-64 only; use --listen-anywhere elsewhere"
             );
             return 125;
         }
@@ -416,10 +557,39 @@ fn run(
             eprintln!("istesso-scope: this kernel has no seccomp user notification");
             return 125;
         }
+        let link = match (&hold.ask_listen, &hold.link_keys) {
+            (Some(addr), Some(keys)) => {
+                match ask::Asker::wait_for_device(
+                    *addr,
+                    keys,
+                    hold.ask_device.as_deref(),
+                    std::time::Duration::from_secs(hold.ask_wait),
+                ) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        eprintln!("istesso-scope: {e}; not starting");
+                        return 125;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let run_info = link.as_ref().map(|_| ask::HostSays::Run {
+            project: plan.project.display().to_string(),
+            level: plan.level.number(),
+            command: command.to_vec(),
+            ask_timeout_secs: hold.ask_timeout,
+        });
         let opts = linux::hold::Options {
-            hold_files,
-            ask: ask_cmd,
+            hold_files: hold.hold_files,
+            hold_connect,
+            ask_cmd: hold.ask_cmd,
+            link,
+            ask_timeout: std::time::Duration::from_secs(hold.ask_timeout),
+            grants: hold.grants,
+            kept_connects,
             loopback,
+            run_info,
         };
         return linux::hold::run(&plan, built.ruleset, cmd, opts);
     }
@@ -428,6 +598,17 @@ fn run(
         eprintln!("istesso-scope: {e}");
         return 125;
     }
+    if cfg!(target_arch = "x86_64") {
+        if let Err(e) = linux::hold::install_plain() {
+            eprintln!("istesso-scope: seccomp: {e}");
+            return 125;
+        }
+    } else if say {
+        eprintln!(
+            "istesso-scope: NOT enforced on this machine: TCP Fast Open (sendto with \
+             MSG_FASTOPEN) is not seen by Landlock's connect rule"
+        );
+    }
     let e = cmd.exec();
     eprintln!("istesso-scope: could not start {}: {e}", command[0]);
     if e.kind() == std::io::ErrorKind::NotFound {
@@ -435,6 +616,81 @@ fn run(
     } else {
         126
     }
+}
+
+/// Reads the grants file (when given): kept files and folders become rules of the plan (the
+/// kernel enforces them from this start on); kept addresses are returned for the supervisor.
+#[cfg(target_os = "linux")]
+fn apply_grants(
+    plan: &mut Plan,
+    hold: &HoldArgs,
+    say: bool,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let Some(file) = &hold.grants else {
+        return Ok(Vec::new());
+    };
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", file.display())),
+    };
+    let mut connects = Vec::new();
+    for g in ask::parse_grants(&text)? {
+        match g {
+            ask::Grant::Read(p) | ask::Grant::Write(p) if !p.exists() => {
+                if say {
+                    eprintln!("istesso-scope: kept grant for missing path {}", p.display());
+                }
+            }
+            // The rule would be put on whatever the path leads to now: a link put in its place
+            // since (or in a folder above) would move the grant elsewhere.
+            ask::Grant::Read(p) | ask::Grant::Write(p)
+                if std::fs::canonicalize(&p).ok().as_deref() != Some(p.as_path()) =>
+            {
+                eprintln!(
+                    "istesso-scope: kept grant for {} skipped: the path leads elsewhere now",
+                    p.display()
+                );
+            }
+            ask::Grant::Read(p) => plan.add_rule(p, policy::Access::Read),
+            ask::Grant::Write(p) => plan.add_rule(p, policy::Access::Write),
+            ask::Grant::Connect(a) => connects.push(a),
+        }
+    }
+    if say && !text.is_empty() {
+        eprintln!("istesso-scope: read the kept grants in {}", file.display());
+    }
+    Ok(connects)
+}
+
+/// The link keys must stay unreadable and the grants file unwritable for the confined command,
+/// or it could answer its own questions or widen its own scope.
+#[cfg(target_os = "linux")]
+fn check_private_places(plan: &Plan, hold: &HoldArgs) -> Result<(), String> {
+    if let Some(keys) = &hold.link_keys {
+        let keys = absolute(keys)?;
+        if plan.covers(&keys, false) || plan.covers(&keys.join("identity"), false) {
+            return Err(format!(
+                "the confined command could read the link keys in {}; keep them outside its rules",
+                keys.display()
+            ));
+        }
+    }
+    if let Some(file) = &hold.grants {
+        let parent = file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent = absolute(parent)?;
+        let name = file.file_name().ok_or("the grants file needs a name")?;
+        if plan.covers(&parent, true) || plan.covers(&parent.join(name), true) {
+            return Err(format!(
+                "the confined command could write the grants file in {}; keep it outside its rules",
+                parent.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]

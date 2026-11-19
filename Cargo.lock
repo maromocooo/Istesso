@@ -1061,8 +1061,12 @@ name = "istesso-scope"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "istesso-link",
+ "istesso-pair",
  "landlock",
  "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

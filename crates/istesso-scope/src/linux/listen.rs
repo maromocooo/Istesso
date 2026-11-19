@@ -25,7 +25,7 @@ pub enum Outcome {
     Done(i32),
 }
 
-fn tgid(tid: u32) -> Option<i32> {
+pub(crate) fn tgid(tid: u32) -> Option<i32> {
     let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
     status
         .lines()
@@ -34,7 +34,7 @@ fn tgid(tid: u32) -> Option<i32> {
 }
 
 /// A copy of descriptor `fd` of thread `tid` (same socket).
-fn take_fd(tid: u32, fd: i32) -> io::Result<OwnedFd> {
+pub(crate) fn take_fd(tid: u32, fd: i32) -> io::Result<OwnedFd> {
     let pid = tgid(tid).ok_or_else(|| io::Error::other("no such process"))?;
     // SAFETY: plain system calls; the results are owned below.
     unsafe {
@@ -126,7 +126,7 @@ pub fn loopback_address(domain: i32, addr: &[u8]) -> Option<(Vec<u8>, bool)> {
     }
 }
 
-fn describe(addr: &[u8]) -> String {
+pub(crate) fn describe(addr: &[u8]) -> String {
     let family = u16::from_ne_bytes([addr[0], addr[1]]) as i32;
     let port = u16::from_be_bytes([addr[2], addr[3]]);
     if family == libc::AF_INET && addr.len() >= 8 {

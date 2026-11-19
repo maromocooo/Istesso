@@ -86,7 +86,10 @@ impl Drop for Fixture {
         for f in [
             "project/inside.txt",
             "project/written.txt",
+            "project/link",
             "outside/secret.txt",
+            "outside/grants",
+            "outside/x.txt",
         ] {
             let _ = std::fs::remove_file(self.p(f));
         }
@@ -184,18 +187,179 @@ fn held_open_is_allowed_once_or_refused() {
         &["read", &outside],
     );
     assert!(ok, "{text}");
-    assert!(text.contains("allow once"), "{text}");
+    assert!(text.contains(": once"), "{text}");
     let (ok, text) = f.probe(
         "1",
         &["--hold-files", "--ask-cmd", "exit 1"],
         &["read", &outside],
     );
     assert!(!ok, "{text}");
-    assert!(text.contains("refuse"), "{text}");
+    assert!(text.contains(": refuse"), "{text}");
+    assert!(text.contains("Permission denied"), "{text}");
     // Inside the rules nothing is asked.
     let (ok, text) = f.probe("1", &["--hold-files"], &["read", &inside]);
     assert!(ok, "{text}");
     assert!(text.contains(" 0 asked"), "{text}");
+}
+
+/// Two reads of the same file in one run (two processes): asked once, then done by the
+/// widening.
+#[test]
+fn widening_for_the_run_is_not_asked_again() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let outside = f.p("outside/secret.txt").display().to_string();
+    let script = format!("{EXE} probe read {outside} && {EXE} probe read {outside}");
+    let out = f.run(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 10"],
+        &["/bin/sh", "-c", &script],
+    );
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 asked"), "{text}");
+    assert!(text.contains("1 done by an earlier widening"), "{text}");
+}
+
+/// "Widen and keep" writes the grant; the next start reads it and the kernel allows the file
+/// without a question (and without anyone to ask).
+#[test]
+fn a_kept_widening_is_a_kernel_rule_at_the_next_start() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let outside = f.p("outside/secret.txt").display().to_string();
+    let grants = f.p("outside/grants").display().to_string();
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 11", "--grants", &grants],
+        &["read", &outside],
+    );
+    assert!(ok, "{text}");
+    let kept = std::fs::read_to_string(&grants).unwrap();
+    assert!(kept.contains(&format!("read {outside}")), "{kept}");
+    // Next start: no stand-in (it would refuse), and nothing is asked.
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--grants", &grants],
+        &["read", &outside],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains(" 0 asked"), "{text}");
+    // Without the supervisor at all, the kernel rule alone allows it.
+    let (ok, text) = f.probe(
+        "1",
+        &["--listen-anywhere", "--grants", &grants],
+        &["read", &outside],
+    );
+    assert!(ok, "{text}");
+    // A link put in place of the kept file since: the grant is not applied to its target.
+    std::fs::rename(&outside, f.p("outside/x.txt")).unwrap();
+    std::os::unix::fs::symlink(f.p("outside/x.txt"), &outside).unwrap();
+    let (ok, text) = f.probe(
+        "1",
+        &["--listen-anywhere", "--grants", &grants],
+        &["read", &outside],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("leads elsewhere now"), "{text}");
+    std::fs::remove_file(&outside).unwrap();
+    std::fs::rename(f.p("outside/x.txt"), &outside).unwrap();
+    // A grants file the command could write is refused.
+    let inside_grants = f.p("project/grants").display().to_string();
+    let (ok, text) = f.probe("1", &["--grants", &inside_grants], &["read", &outside]);
+    assert!(!ok, "{text}");
+    assert!(text.contains("could write the grants file"), "{text}");
+}
+
+#[test]
+fn held_connect_is_made_by_the_supervisor_or_refused() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = format!("127.0.0.1:{}", other.local_addr().unwrap().port());
+    let (ok, text) = f.probe(
+        "1",
+        &[
+            "--hold-connect",
+            "--ask-cmd",
+            "test \"$ISTESSO_ASK_ADDRESS\" = 127.0.0.1:${ISTESSO_ASK_ADDRESS##*:}",
+        ],
+        &["connect", &target],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains(&format!("connects to {target}")), "{text}");
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-connect", "--ask-cmd", "exit 1"],
+        &["connect", &target],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("Permission denied"), "{text}");
+}
+
+/// A link in the project to a file outside, and `..` out of the project: the question names the
+/// real file, and that is the file opened.
+#[test]
+fn links_and_dot_dot_are_asked_about_the_real_file() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let outside = f.p("outside/secret.txt").display().to_string();
+    let link = f.p("project/link");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let ask = format!("test \"$ISTESSO_ASK_PATH\" = {outside}");
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", &ask],
+        &["read", &link.display().to_string()],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("asked as"), "{text}");
+    let climbing = f.p("project/../outside/secret.txt").display().to_string();
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", &ask],
+        &["read", &climbing],
+    );
+    assert!(ok, "{text}");
+    // Without the hold, the kernel refuses both.
+    let (ok, _) = f.probe("1", &[], &["read", &link.display().to_string()]);
+    assert!(!ok);
+}
+
+/// The stand-in answers "once" after putting a link to another file in place of the file the
+/// question named. The supervisor opens without following links, so the open fails instead of
+/// handing over the other file.
+#[test]
+fn a_link_put_in_place_after_the_question_is_not_followed() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let named = f.p("outside/x.txt");
+    std::fs::write(&named, "x").unwrap();
+    let secret = f.p("outside/secret.txt");
+    let ask = format!(
+        "rm {named} && ln -s {secret} {named} && exit 0",
+        named = named.display(),
+        secret = secret.display()
+    );
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", &ask],
+        &["read", &named.display().to_string()],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains(": once"), "{text}");
+    assert!(text.contains("symbolic links"), "{text}");
+    assert!(!text.contains("outside\n"), "{text}");
 }
 
 #[test]
