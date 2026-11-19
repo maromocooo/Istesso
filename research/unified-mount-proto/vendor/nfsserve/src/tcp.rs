@@ -29,6 +29,9 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
 
 /// Istesso patch: connections served at once. The operating system's client uses one.
 pub const MAX_CONNECTIONS: usize = 8;
+/// Istesso patch: a connection that has not sent one call that could be handled by then is
+/// closed, so that idle connections cannot hold the places of MAX_CONNECTIONS.
+pub const FIRST_CALL_WITHIN: Duration = Duration::from_secs(5);
 
 pub fn generate_host_ip(hostnum: u16) -> String {
     format!("127.88.{}.{}", ((hostnum >> 8) & 0xFF) as u8, (hostnum & 0xFF) as u8)
@@ -38,6 +41,9 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 async fn process_socket(mut socket: tokio::net::TcpStream, context: RPCContext) -> Result<(), anyhow::Error> {
     let (mut message_handler, mut socksend, mut msgrecvchan) = SocketMessageHandler::new(&context);
     let _ = socket.set_nodelay(true);
+    // Istesso patch: see FIRST_CALL_WITHIN.
+    let valid_call = message_handler.valid_call.clone();
+    let first_call_by = tokio::time::Instant::now() + FIRST_CALL_WITHIN;
 
     tokio::spawn(async move {
         loop {
@@ -49,6 +55,10 @@ async fn process_socket(mut socket: tokio::net::TcpStream, context: RPCContext) 
     });
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(first_call_by), if !valid_call.load(std::sync::atomic::Ordering::SeqCst) => {
+                debug!("No call within {:?}; closing", FIRST_CALL_WITHIN);
+                return Ok(());
+            }
             _ = socket.readable() => {
                 let mut buf = [0; 128000];
 

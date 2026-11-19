@@ -139,6 +139,8 @@ pub struct SocketMessageHandler {
     cur_fragment: Vec<u8>,
     /// Istesso patch: bounds the calls of this connection being answered at once.
     in_flight: Arc<tokio::sync::Semaphore>,
+    /// Istesso patch: set once a call of this connection was read and handled.
+    pub(crate) valid_call: Arc<std::sync::atomic::AtomicBool>,
     socket_receive_channel: DuplexStream,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext,
@@ -153,6 +155,7 @@ impl SocketMessageHandler {
             Self {
                 cur_fragment: Vec::new(),
                 in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+                valid_call: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context: context.clone(),
@@ -171,6 +174,7 @@ impl SocketMessageHandler {
             let send = self.reply_send_channel.clone();
             // Istesso patch: wait for room before taking the next call of this connection.
             let permit = self.in_flight.clone().acquire_owned().await?;
+            let valid_call = self.valid_call.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let mut write_buf: Vec<u8> = Vec::new();
@@ -182,10 +186,12 @@ impl SocketMessageHandler {
                         let _ = send.send(Err(e));
                     },
                     Ok(true) => {
+                        valid_call.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = std::io::Write::flush(&mut write_cursor);
                         let _ = send.send(Ok(write_buf));
                     },
                     Ok(false) => {
+                        valid_call.store(true, std::sync::atomic::Ordering::SeqCst);
                         // do not reply
                     },
                 }

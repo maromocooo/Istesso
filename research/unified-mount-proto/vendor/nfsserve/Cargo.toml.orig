@@ -9,7 +9,7 @@ readme = "README.md"
 keywords = ["nfs"]
 license = "BSD-3-Clause"
 categories = ["network-programming", "filesystem"]
-publish = true
+publish = false
 include = ["src/**/*", "src/*", "Cargo.toml", "LICENSE", "README.md"]
 
 

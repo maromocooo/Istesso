@@ -21,7 +21,7 @@ include = [
     "LICENSE",
     "README.md",
 ]
-publish = true
+publish = false
 autolib = false
 autobins = false
 autoexamples = false
@@ -82,6 +82,7 @@ features = [
     "fs",
     "rt",
     "macros",
+    "time",
 ]
 default-features = false
 
