@@ -23,6 +23,12 @@ const TICK: Duration = Duration::from_millis(250);
 const RECHECK: Duration = Duration::from_secs(1);
 /// How long a write may take before the other end is taken for gone.
 const WRITE_WITHIN: Duration = Duration::from_secs(30);
+/// How long a forwarded connection may carry nothing, either way, before it
+/// is closed. A browser keeps connections open for later requests; without
+/// this, the places for forwarded connections on the host would fill with
+/// idle ones. A page that keeps a quiet connection (a development server's
+/// channel for reloading, say) opens it again.
+pub const IDLE: Duration = Duration::from_secs(120);
 
 /// What a forwarded connection came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +40,8 @@ pub struct Carried {
     pub lasted: Duration,
     /// Whether it ended because `go_on` said no.
     pub stopped: bool,
+    /// Whether it ended because nothing passed for the idle time.
+    pub idled: bool,
 }
 
 enum Event {
@@ -53,16 +61,18 @@ pub fn carry(
     local: TcpStream,
     channel: Channel<TcpStream>,
     first: &[u8],
+    idle: Duration,
     mut go_on: impl FnMut() -> bool,
 ) -> Carried {
     let started = Instant::now();
     let sent = Arc::new(AtomicU64::new(0));
     let received = Arc::new(AtomicU64::new(0));
-    let done = |stopped| Carried {
+    let done = |stopped, idled| Carried {
         sent: sent.load(Ordering::Relaxed),
         received: received.load(Ordering::Relaxed),
         lasted: started.elapsed(),
         stopped,
+        idled,
     };
     let _ = channel.stream().set_read_timeout(None);
     let _ = channel.stream().set_write_timeout(Some(WRITE_WITHIN));
@@ -76,7 +86,7 @@ pub fn carry(
         channel.split(),
     ) else {
         let _ = local.shutdown(Shutdown::Both);
-        return done(false);
+        return done(false, false);
     };
     let (events_in, events) = mpsc::channel::<Event>();
     let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -157,11 +167,12 @@ pub fn carry(
         quit.store(true, Ordering::SeqCst);
         let _ = wire.shutdown(Shutdown::Both);
         let _ = local_cut.shutdown(Shutdown::Both);
-        return done(false);
+        return done(false, false);
     };
     let (mut sent_all, mut received_all) = (false, false);
     let mut checked = Instant::now();
-    let mut stopped = false;
+    let (mut stopped, mut idled) = (false, false);
+    let (mut carried_before, mut active) = (u64::MAX, Instant::now());
     loop {
         match events.recv_timeout(TICK) {
             Ok(Event::SentAll) => sent_all = true,
@@ -178,6 +189,13 @@ pub fn carry(
                 stopped = true;
                 break;
             }
+            let carried = sent.load(Ordering::Relaxed) + received.load(Ordering::Relaxed);
+            if carried != carried_before {
+                (carried_before, active) = (carried, Instant::now());
+            } else if active.elapsed() >= idle {
+                idled = true;
+                break;
+            }
         }
     }
     // Both connections end here, also for a thread that waits on either.
@@ -186,7 +204,7 @@ pub fn carry(
     let _ = local_cut.shutdown(Shutdown::Both);
     let _ = up.join();
     let _ = down.join();
-    done(stopped)
+    done(stopped, idled)
 }
 
 #[cfg(test)]
@@ -247,8 +265,9 @@ mod tests {
         let (browser_side, mut browser) = local_pair();
         let (server_side, mut server) = local_pair();
         let (first, rest) = (b"GET / HTTP/1.1\r\n", b"Host: localhost:1\r\n\r\n");
-        let device_end = std::thread::spawn(move || carry(browser_side, device, first, || true));
-        let host_end = std::thread::spawn(move || carry(server_side, host, b"", || true));
+        let device_end =
+            std::thread::spawn(move || carry(browser_side, device, first, IDLE, || true));
+        let host_end = std::thread::spawn(move || carry(server_side, host, b"", IDLE, || true));
 
         browser.write_all(rest).unwrap();
         // The browser is done sending; the answer must still come back.
@@ -273,13 +292,41 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_that_carries_nothing_for_the_idle_time_is_closed() {
+        let (device, host, _dir) = conversation();
+        let (browser_side, mut browser) = local_pair();
+        let (server_side, mut server) = local_pair();
+        let idle = Duration::from_secs(2);
+        let device_end =
+            std::thread::spawn(move || carry(browser_side, device, b"", idle, || true));
+        let _host_end = std::thread::spawn(move || carry(server_side, host, b"", IDLE, || true));
+        // Something passes: the clock starts again.
+        std::thread::sleep(Duration::from_millis(1500));
+        browser.write_all(b"ping").unwrap();
+        let mut heard = [0u8; 4];
+        server.read_exact(&mut heard).unwrap();
+        let began = Instant::now();
+        let carried = device_end.join().unwrap();
+        assert!(carried.idled && !carried.stopped);
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1500) && waited < Duration::from_secs(4),
+            "{waited:?}"
+        );
+        let mut rest = Vec::new();
+        let _ = browser.set_read_timeout(Some(Duration::from_secs(3)));
+        assert!(matches!(browser.read_to_end(&mut rest), Ok(0) | Err(_)));
+    }
+
+    #[test]
     fn a_forward_that_may_not_go_on_is_cut_within_a_second_or_two() {
         let (device, host, _dir) = conversation();
         let (browser_side, mut browser) = local_pair();
         let (server_side, _server) = local_pair();
         let began = Instant::now();
-        let device_end = std::thread::spawn(move || carry(browser_side, device, b"", || false));
-        let _host_end = std::thread::spawn(move || carry(server_side, host, b"", || true));
+        let device_end =
+            std::thread::spawn(move || carry(browser_side, device, b"", IDLE, || false));
+        let _host_end = std::thread::spawn(move || carry(server_side, host, b"", IDLE, || true));
         let carried = device_end.join().unwrap();
         assert!(carried.stopped);
         assert!(began.elapsed() < Duration::from_secs(3));

@@ -94,8 +94,9 @@ fn head_names_this_forward(head: &[u8], port: u16) -> Result<(), Why> {
     let mut lines = split_lines(head);
     let request = lines.next().ok_or(Why::Malformed)?;
     // A carriage return, line feed or NUL inside a line could end it for one
-    // program and not for another.
-    if request.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+    // program and not for another; a tab or another control character in the
+    // request line could split it differently.
+    if request.iter().any(|b| b.is_ascii_control()) {
         return Err(Why::Malformed);
     }
     let request = std::str::from_utf8(request)
@@ -277,6 +278,8 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: localhost:80\nHost: evil.example\r\n\r\n",
             b"GET / HTTP/1.1\r\nX: a\x00b\r\nHost: localhost:80\r\n\r\n",
             b"GET /\x00 HTTP/1.1\r\nHost: localhost:80\r\n\r\n",
+            b"GET /a\tb HTTP/1.1\r\nHost: localhost:80\r\n\r\n",
+            b"GET /\tHTTP/1.1 HTTP/1.1\r\nHost: localhost:80\r\n\r\n",
             b"GET / HTTP/1.1\r\nX\x00: a\r\nHost: localhost:80\r\n\r\n",
         ] {
             assert_eq!(

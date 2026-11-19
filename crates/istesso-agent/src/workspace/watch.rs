@@ -75,7 +75,7 @@ pub struct Workspace {
     elsewhere: Mutex<Vec<u16>>,
     /// The id each port has had in this workspace.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    ids: Mutex<HashMap<(u16, u64), String>>,
+    ids: Mutex<HashMap<u16, String>>,
     outlet: Mutex<Option<ShellOutlet>>,
     /// Asks the watching thread to look now; it answers when it has sent
     /// what it found.
@@ -228,44 +228,39 @@ impl Workspace {
         }
     }
 
-    /// Whether a connection to `to` now reaches the socket `inode`, and
-    /// nothing but sockets of this workspace.
+    /// Whether a connection to `to` now reaches a socket, and nothing but
+    /// sockets of this workspace.
     #[cfg(target_os = "linux")]
-    fn reaches_only_itself(&self, to: SocketAddr, inode: u64) -> bool {
+    fn reaches_only_itself(&self, to: SocketAddr) -> bool {
         let sockets = super::procfs::listening_on(to.port());
         let held = super::procfs::held_by(&self.members());
-        super::procfs::reaches_only(&sockets, to, inode, &held)
+        super::procfs::reaches_only(&sockets, to, &held)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn reaches_only_itself(&self, _to: SocketAddr, _inode: u64) -> bool {
+    fn reaches_only_itself(&self, _to: SocketAddr) -> bool {
         false
     }
 
     /// The ports of the workspace now, with their ids, and those it
-    /// listens on only where they cannot be forwarded. A socket keeps its
-    /// id while it listens; another socket on the same port gets a new one.
+    /// listens on only where they cannot be forwarded. A port keeps its id
+    /// while any socket of the workspace listens on it (a server may add,
+    /// drop or replace sockets on it); once none does, the id is retired.
     #[cfg(target_os = "linux")]
     fn find_ports(&self) -> (Vec<Forward>, Vec<u16>) {
         let found = super::procfs::listening(&self.members());
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
-        ids.retain(|(port, inode), _| {
-            found
-                .ports
-                .iter()
-                .any(|f| f.port == *port && f.inode == *inode)
-        });
+        ids.retain(|port, _| found.ports.iter().any(|f| f.port == *port));
         let ports = found
             .ports
             .into_iter()
             .take(MAX_PORTS)
             .filter_map(|listening| {
-                let key = (listening.port, listening.inode);
-                let id = match ids.get(&key) {
+                let id = match ids.get(&listening.port) {
                     Some(id) => id.clone(),
                     None => {
                         let id = super::random_id().ok()?;
-                        ids.insert(key, id.clone());
+                        ids.insert(listening.port, id.clone());
                         id
                     }
                 };
@@ -281,7 +276,7 @@ impl Workspace {
                         exposed: listening.exposed,
                     },
                     to: listening.to,
-                    inode: listening.inode,
+                    fallback: listening.fallback,
                 })
             })
             .collect();
@@ -402,13 +397,13 @@ pub fn start(workspace: Arc<Workspace>, outlet: ShellOutlet, log: Log) {
     }
 }
 
-/// One forwarded port as the host keeps it: what the device is told, where
-/// the host connects, and the socket that must be there.
+/// One forwarded port as the host keeps it: what the device is told, and
+/// where the host connects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Forward {
     wire: ForwardedPort,
     to: SocketAddr,
-    inode: u64,
+    fallback: Option<SocketAddr>,
 }
 
 /// Where a forwarded connection goes.
@@ -418,17 +413,24 @@ pub struct Target {
     /// The address the host connects to: the one the socket is bound to
     /// (127.0.0.1 or ::1 for every address).
     pub to: SocketAddr,
+    /// Where else, when `to` cannot be reached (127.0.0.1 for a socket on
+    /// every IPv6 address, on a machine whose IPv6 is off).
+    pub fallback: Option<SocketAddr>,
     pub port: u16,
-    inode: u64,
 }
 
 impl Target {
-    /// Whether a connection to [`Target::to`] reaches the forwarded socket
-    /// now, and nothing but the workspace's sockets: no other program (of
-    /// this user or another) holds that address and port, or a more exact
-    /// one. Asked before and after connecting.
-    pub fn reaches_only_the_workspace(&self) -> bool {
-        self.workspace.reaches_only_itself(self.to, self.inode)
+    /// The addresses to try, in order.
+    pub fn addresses(&self) -> impl Iterator<Item = SocketAddr> {
+        std::iter::once(self.to).chain(self.fallback)
+    }
+
+    /// Whether a connection to `to` reaches a socket of the workspace now,
+    /// and nothing but the workspace's sockets: no other program (of this
+    /// user or another) holds that address and port, or a more exact one.
+    /// Asked before and after connecting.
+    pub fn reaches_only_the_workspace(&self, to: SocketAddr) -> bool {
+        self.workspace.reaches_only_itself(to)
     }
 
     /// Whether the forward is still listed (the socket listens, the shell
@@ -472,8 +474,8 @@ impl Workspaces {
                     workspace: workspace.clone(),
                     id: id.to_string(),
                     to: forward.to,
+                    fallback: forward.fallback,
                     port: forward.wire.port,
-                    inode: forward.inode,
                 })
             })
     }
@@ -542,7 +544,7 @@ mod tests {
                 exposed: false,
             },
             to: to.parse().unwrap(),
-            inode: u64::from(port),
+            fallback: None,
         };
         *workspace.forwards.lock().unwrap() = vec![
             forward(id, 26861, "127.0.0.2:26861"),
@@ -616,8 +618,20 @@ mod tests {
         // Nothing else listens there: a connection would reach this socket.
         let forward = found.iter().find(|f| f.wire.port == port).unwrap();
         assert_eq!(forward.to, listener.local_addr().unwrap());
-        assert!(workspace.reaches_only_itself(forward.to, forward.inode));
-        assert!(!workspace.reaches_only_itself(forward.to, forward.inode + 1));
+        assert!(workspace.reaches_only_itself(forward.to));
+        // Somewhere nothing listens: not reached.
+        let elsewhere = SocketAddr::from(([127, 0, 0, 3], port));
+        assert!(!workspace.reaches_only_itself(elsewhere));
+        // A second socket of the workspace on the same port, on another
+        // address: the port keeps its id.
+        let id = forward.wire.id.clone();
+        let second = std::net::TcpListener::bind(("127.0.0.2", port)).unwrap();
+        let (again, _) = workspace.find_ports();
+        assert_eq!(
+            again.iter().find(|f| f.wire.port == port).unwrap().wire.id,
+            id
+        );
+        drop(second);
         // The same port keeps its id.
         assert_eq!(
             workspace

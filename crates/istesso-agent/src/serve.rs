@@ -727,10 +727,13 @@ impl Shared {
             // It ends when the shell is over, when the socket it was made to
             // stops listening (its id is no longer listed), or when the
             // device loses its right.
-            let carried =
-                crate::workspace::pump::carry(stream, session.into_channel(), b"", || {
-                    target.still_listed() && may_have_shell(&self.paths, &peer, &self.shell_policy)
-                });
+            let carried = crate::workspace::pump::carry(
+                stream,
+                session.into_channel(),
+                b"",
+                crate::workspace::pump::IDLE,
+                || target.still_listed() && may_have_shell(&self.paths, &peer, &self.shell_policy),
+            );
             // Port numbers, counts and times only.
             (self.log)(format!(
                 "a forwarded connection to port {port} for {} is over after {:.1} s{}: {} bytes from the device, {} bytes to it",
@@ -738,6 +741,8 @@ impl Shared {
                 carried.lasted.as_secs_f64(),
                 if carried.stopped {
                     " (the shell or the port is gone, or the device lost its right)"
+                } else if carried.idled {
+                    " (nothing passed for a while)"
                 } else {
                     ""
                 },
@@ -884,40 +889,43 @@ impl Shared {
             return Err(refused());
         }
         let target = self.workspaces.target(peer, forward).ok_or_else(refused)?;
-        // The list is up to half a second old: what listens there now is
-        // looked at again, before connecting and after. A connection is made
-        // only when nothing but the workspace's socket would take it.
-        let moved = || {
-            Response::error(
-                ErrorCode::Internal,
-                "that port of the host is no longer the workspace's alone",
-            )
-        };
-        if !target.reaches_only_the_workspace() {
-            return Err(moved());
-        }
+        // The place is taken first: what follows reads `/proc`, and no device
+        // makes the host do that more often than it has places.
         let slot = self.forwards_open.take(&peer.id).ok_or_else(|| {
             Response::error(
                 ErrorCode::Internal,
                 "too many forwarded connections are open on this host",
             )
         })?;
-        let stream =
-            TcpStream::connect_timeout(&target.to, Duration::from_secs(2)).map_err(|_| {
-                Response::error(
+        // The list is up to half a second old: what listens there now is
+        // looked at again, before connecting and after. A connection is made
+        // only when nothing but the workspace's sockets would take it.
+        let mut why = Response::error(
+            ErrorCode::Internal,
+            "that port of the host is no longer the workspace's alone",
+        );
+        for to in target.addresses() {
+            if !target.reaches_only_the_workspace(to) {
+                continue;
+            }
+            let Ok(stream) = TcpStream::connect_timeout(&to, Duration::from_secs(2)) else {
+                // ::1 on a machine whose IPv6 is off: the next address, if any.
+                why = Response::error(
                     ErrorCode::Internal,
                     "nothing answers on that port of the host any more",
-                )
-            })?;
-        if !target.reaches_only_the_workspace() {
+                );
+                continue;
+            };
+            if target.reaches_only_the_workspace(to) {
+                return Ok(Forwarded {
+                    stream,
+                    target,
+                    _slot: slot,
+                });
+            }
             let _ = stream.shutdown(std::net::Shutdown::Both);
-            return Err(moved());
         }
-        Ok(Forwarded {
-            stream,
-            target,
-            _slot: slot,
-        })
+        Err(why)
     }
 
     /// Notes that `session` carries its device's input from now on, and ends

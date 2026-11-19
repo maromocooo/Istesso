@@ -23,9 +23,10 @@ pub struct Listening {
     /// is a loopback address; 127.0.0.1 for every IPv4 address, ::1 for
     /// every IPv6 address. Never another address than the socket's own.
     pub to: SocketAddr,
-    /// The socket that is forwarded, by inode: the one that must still be
-    /// there, and the workspace's, when a connection is made.
-    pub inode: u64,
+    /// Where else, when [`Listening::to`] cannot be reached: 127.0.0.1 for
+    /// a socket on every IPv6 address (which takes IPv4 too), on a machine
+    /// whose IPv6 is turned off.
+    pub fallback: Option<SocketAddr>,
     /// One of the processes that hold the socket.
     pub pid: i32,
     /// It listens on every address, or on one of a network, as well: other
@@ -71,6 +72,17 @@ impl Socket {
             _ => return None,
         };
         Some(SocketAddr::new(to, self.port))
+    }
+
+    /// Where else the host may connect for this socket: 127.0.0.1 for one on
+    /// every IPv6 address, when ::1 cannot be reached.
+    fn fallback(&self) -> Option<SocketAddr> {
+        match self.address {
+            IpAddr::V6(v6) if v6.is_unspecified() => {
+                Some(SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)))
+            }
+            _ => None,
+        }
     }
 
     /// Whether other machines reach it: bound to every address or to one of
@@ -348,7 +360,7 @@ pub(crate) fn combine(held: Vec<(i32, Socket)>) -> Found {
                 to: socket
                     .to()
                     .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
-                inode: socket.inode,
+                fallback: socket.fallback(),
                 pid: *pid,
                 exposed,
             }),
@@ -389,17 +401,14 @@ pub(crate) fn winners(sockets: &[Socket], to: SocketAddr) -> Vec<u64> {
         .collect()
 }
 
-/// Whether a connection to `to` now reaches the socket `inode`, and only
-/// sockets that `held` (the workspace's) holds: nothing else on this
-/// machine, of this user or another, would take it instead.
-pub(crate) fn reaches_only(
-    sockets: &[Socket],
-    to: SocketAddr,
-    inode: u64,
-    held: &HashSet<u64>,
-) -> bool {
+/// Whether a connection to `to` now reaches a socket, and only sockets
+/// that `held` (the workspace's) holds: nothing else on this machine, of
+/// this user or another, would take it instead. Any of the workspace's
+/// sockets on the port will do (a server may hold several, and replace
+/// one while the others go on).
+pub(crate) fn reaches_only(sockets: &[Socket], to: SocketAddr, held: &HashSet<u64>) -> bool {
     let winners = winners(sockets, to);
-    winners.contains(&inode) && winners.iter().all(|inode| held.contains(inode))
+    !winners.is_empty() && winners.iter().all(|inode| held.contains(inode))
 }
 
 #[cfg(test)]
@@ -498,22 +507,22 @@ mod tests {
             // On one network's address alone.
             (600, socket(61, v4("192.0.2.7"), 9000)),
         ]);
-        let listening = |port, to: &str, inode, pid, exposed| Listening {
+        let listening = |port, to: &str, fallback: Option<&str>, pid, exposed| Listening {
             port,
             to: to.parse().unwrap(),
-            inode,
+            fallback: fallback.map(|f| f.parse().unwrap()),
             pid,
             exposed,
         };
         assert_eq!(
             found.ports,
             vec![
-                listening(3000, "127.0.0.1:3000", 51, 500, true),
-                listening(4000, "[::1]:4000", 41, 400, false),
-                listening(4500, "127.0.0.2:4500", 45, 450, false),
-                listening(4600, "[::1]:4600", 46, 460, true),
-                listening(5173, "127.0.0.1:5173", 21, 200, false),
-                listening(8000, "127.0.0.1:8000", 31, 300, true),
+                listening(3000, "127.0.0.1:3000", None, 500, true),
+                listening(4000, "[::1]:4000", None, 400, false),
+                listening(4500, "127.0.0.2:4500", None, 450, false),
+                listening(4600, "[::1]:4600", Some("127.0.0.1:4600"), 460, true),
+                listening(5173, "127.0.0.1:5173", None, 200, false),
+                listening(8000, "127.0.0.1:8000", None, 300, true),
             ]
         );
         assert_eq!(found.elsewhere, vec![9000]);
@@ -525,10 +534,10 @@ mod tests {
         let to = |text: &str| text.parse::<SocketAddr>().unwrap();
         // The workspace on every IPv4 address; nobody else on the port.
         let alone = [socket(1, v4("0.0.0.0"), 80)];
-        assert!(reaches_only(&alone, to("127.0.0.1:80"), 1, &ours));
+        assert!(reaches_only(&alone, to("127.0.0.1:80"), &ours));
         // Someone else on 127.0.0.1 itself would take the connection.
         let taken = [socket(1, v4("0.0.0.0"), 80), socket(9, v4("127.0.0.1"), 80)];
-        assert!(!reaches_only(&taken, to("127.0.0.1:80"), 1, &ours));
+        assert!(!reaches_only(&taken, to("127.0.0.1:80"), &ours));
         assert_eq!(winners(&taken, to("127.0.0.1:80")), vec![9]);
         // The workspace on 127.0.0.2, someone else on 127.0.0.1: the
         // connection goes to 127.0.0.2, and only there.
@@ -536,35 +545,45 @@ mod tests {
             socket(1, v4("127.0.0.2"), 80),
             socket(9, v4("127.0.0.1"), 80),
         ];
-        assert!(reaches_only(&side, to("127.0.0.2:80"), 1, &ours));
+        assert!(reaches_only(&side, to("127.0.0.2:80"), &ours));
         // Every IPv6 address, someone else on ::1.
         let v6_taken = [socket(1, v6("::"), 80), socket(9, v6("::1"), 80)];
-        assert!(!reaches_only(&v6_taken, to("[::1]:80"), 1, &ours));
+        assert!(!reaches_only(&v6_taken, to("[::1]:80"), &ours));
         // Another socket of the workspace on the same address (a group of
         // sockets sharing the port) is fine; someone else's is not.
         let shared = [
             socket(1, v4("127.0.0.1"), 80),
             socket(2, v4("127.0.0.1"), 80),
         ];
-        assert!(reaches_only(&shared, to("127.0.0.1:80"), 1, &ours));
+        assert!(reaches_only(&shared, to("127.0.0.1:80"), &ours));
         let mixed = [
             socket(1, v4("127.0.0.1"), 80),
             socket(9, v4("127.0.0.1"), 80),
         ];
-        assert!(!reaches_only(&mixed, to("127.0.0.1:80"), 1, &ours));
+        assert!(!reaches_only(&mixed, to("127.0.0.1:80"), &ours));
         // An IPv6 socket on every address may take IPv4 connections: when it
         // is someone else's, the workspace's 0.0.0.0 is not trusted alone.
         let dual = [socket(1, v4("0.0.0.0"), 80), socket(9, v6("::"), 80)];
-        assert!(!reaches_only(&dual, to("127.0.0.1:80"), 1, &ours));
-        // The socket is gone, or another took its place.
-        assert!(!reaches_only(&[], to("127.0.0.1:80"), 1, &ours));
+        assert!(!reaches_only(&dual, to("127.0.0.1:80"), &ours));
+        // Nothing listens there any more.
+        assert!(!reaches_only(&[], to("127.0.0.1:80"), &ours));
+        // Another program took its place.
         let replaced = [socket(7, v4("0.0.0.0"), 80)];
-        assert!(!reaches_only(
+        assert!(!reaches_only(&replaced, to("127.0.0.1:80"), &ours));
+        // The workspace replaced one of its sockets (a worker restarted): any
+        // socket of the workspace will do.
+        assert!(reaches_only(
             &replaced,
             to("127.0.0.1:80"),
-            1,
             &HashSet::from([1, 7])
         ));
+        // Every IPv6 address, on a machine whose IPv6 is off: 127.0.0.1
+        // reaches it, and nobody else holds 127.0.0.1 or 0.0.0.0 there.
+        let dual_only = [socket(1, v6("::"), 80)];
+        assert!(reaches_only(&dual_only, to("127.0.0.1:80"), &ours));
+        assert_eq!(socket(1, v6("::"), 80).fallback(), Some(to("127.0.0.1:80")));
+        assert_eq!(socket(1, v6("::1"), 80).fallback(), None);
+        assert_eq!(socket(1, v4("0.0.0.0"), 80).fallback(), None);
     }
 
     #[test]

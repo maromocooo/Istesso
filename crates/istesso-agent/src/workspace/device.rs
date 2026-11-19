@@ -631,7 +631,7 @@ fn take(inner: &Inner, entry: &Entry, mut stream: TcpStream) {
             return;
         }
     };
-    super::pump::carry(stream, channel, &first, || {
+    super::pump::carry(stream, channel, &first, super::pump::IDLE, || {
         !entry.cut.load(Ordering::SeqCst)
     });
 }
