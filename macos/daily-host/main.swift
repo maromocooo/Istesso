@@ -203,16 +203,33 @@ if CommandLine.arguments.dropFirst().first == "--access-behavior" {
     exit(0)
 }
 if CommandLine.arguments.dropFirst().first == "--prompt-windows" {
-    // Read only, for collecting what the system's confirmations look like: every on-screen window
-    // above the normal layer, with its layer and the owner's bundle id when it is Apple's own,
-    // else "another application". Never a title.
-    let windows = readWindowList(onScreenOnly: true, desktop: false).filter { $0.layer > 0 }
-    for window in windows {
-        let id = NSRunningApplication(processIdentifier: window.pid)?.bundleIdentifier ?? ""
-        let owner = id.hasPrefix("com.apple.") ? id : "another application"
-        print("layer \(window.layer) \(owner) \(Int(window.bounds.width))x\(Int(window.bounds.height))")
+    // Read only, for collecting what the system's confirmations look like. Every on-screen window
+    // above the normal layer, and the normal-layer windows of Apple's own processes: layer, size,
+    // whether on screen, and the owner - Apple's bundle id; or, with no bundle id, the
+    // executable's name when it lives below /System/ or /usr/ (the system's agents); else
+    // "another application" (only counted). Never a title.
+    func owner(_ pid: pid_t) -> (String, apple: Bool) {
+        if let id = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier, !id.isEmpty {
+            return id.hasPrefix("com.apple.") ? (id, true) : ("another application", false)
+        }
+        var buffer = [CChar](repeating: 0, count: 4096)
+        if proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 {
+            let path = String(cString: buffer)
+            if path.hasPrefix("/System/") || path.hasPrefix("/usr/") {
+                return ("no bundle id: " + (path as NSString).lastPathComponent, true)
+            }
+        }
+        return ("another application", false)
     }
-    print("windows above the normal layer: \(windows.count)")
+    var others = 0, listed = 0
+    for window in readWindowList(onScreenOnly: false, desktop: false) {
+        let (name, apple) = owner(window.pid)
+        guard window.onScreen, window.layer >= 0 else { continue }
+        if !apple { others += 1; continue }
+        listed += 1
+        print("layer \(window.layer) \(name) \(Int(window.bounds.width))x\(Int(window.bounds.height)) on_screen=\(window.onScreen)")
+    }
+    print("listed: \(listed); windows of other applications (only counted): \(others)")
     exit(0)
 }
 if CommandLine.arguments.dropFirst().first == "--ask-desktop" {
