@@ -824,6 +824,13 @@ func panelAllowed(serviceWindow: CGRect, appWindows: [AXWindowInfo], appInFront:
     }
 }
 
+/// The windows the capture names while the application's panel shows: all of the application's
+/// own, and of the panel service only those allowed. Any other window of the service is left out,
+/// also one that came after the allowed ones were found.
+func capturedWindows(appWindows: [CGWindowID], serviceWindows: [CGWindowID], allowed: Set<CGWindowID>) -> [CGWindowID] {
+    appWindows + serviceWindows.filter { allowed.contains($0) }
+}
+
 /// What to do with one pointer event of the session form (form 4).
 enum SessionStep: Equatable {
     enum Remember: Equatable { case press(CGRect), release, nothing }
@@ -893,6 +900,9 @@ func selfTest() -> Never {
     checkPanel(panelAllowed(serviceWindow: panel, appWindows: [standard], appInFront: true), false, "a panel the application does not show (another application's)")
     checkPanel(panelAllowed(serviceWindow: panel, appWindows: [standard, fake], appInFront: true), false, "a standard window of the same place and size does not count")
     checkPanel(panelAllowed(serviceWindow: panel, appWindows: [standard, sheet], appInFront: false), false, "no panel while the application is not in front")
+    checkPanel(capturedWindows(appWindows: [1, 2], serviceWindows: [10, 11], allowed: [10]) == [1, 2, 10], true,
+               "a new window of the panel service (another application's) is not captured")
+    checkPanel(capturedWindows(appWindows: [1], serviceWindows: [10], allowed: []) == [1], true, "nothing of the service by default")
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
 }
@@ -1453,7 +1463,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             if settings.fitWindow { fit(chosen) }
         }
         // A panel of the system's for the application came or went: placed again, with it.
-        let panelShown = appPanels().map { Int($0.id) }.sorted()
+        // Every window of the service on the screen, and which are allowed: any change places the
+        // capture again.
+        let services = windowList().filter { isPanelService($0.pid) }.map { Int($0.id) }.sorted()
+        let panelShown = services + [-1] + appPanels().map { Int($0.id) }.sorted()
         if chosen.bounds != windowBounds || panelShown != self.panelShown {
             self.panelShown = panelShown
             windowBounds = chosen.bounds
@@ -1536,15 +1549,24 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 let allowedIds = Set(allowed.map(\.id))
                 let panels = content.applications.filter { shownPanels.contains($0.processID) }
                 let included = [scApp] + panels
-                // Of the service, every window but the application's panel is left out.
-                let excepted = content.windows.filter {
-                    guard let owner = $0.owningApplication else { return false }
-                    return shownPanels.contains(owner.processID) && !allowedIds.contains($0.windowID)
+                _ = included
+                // Nothing of the service by default. While the application's panel shows, the
+                // filter names windows one by one: the application's own and exactly the allowed
+                // panel windows; a new window of the service is never in it.
+                let filter: SCContentFilter
+                if allowedIds.isEmpty {
+                    filter = SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
+                    self.panelWindows = []
+                } else {
+                    let own = content.windows.filter { $0.owningApplication?.processID == scApp.processID }.map(\.windowID)
+                    let service = content.windows.filter { $0.owningApplication.map { shownPanels.contains($0.processID) } ?? false }.map(\.windowID)
+                    let named = Set(capturedWindows(appWindows: own, serviceWindows: service, allowed: allowedIds))
+                    let windows = content.windows.filter { named.contains($0.windowID) }
+                    filter = SCContentFilter(display: display, including: windows)
+                    self.panelWindows = windows
                 }
-                let filter = SCContentFilter(display: display, including: included, exceptingWindows: excepted)
-                let names = included.map { Int($0.processID) } + allowedIds.map { Int($0) }.sorted()
+                let names = [Int(scApp.processID)] + allowedIds.map { Int($0) }.sorted()
                 self.panelApplications = panels
-                self.panelExcepted = excepted
                 if let capture = self.capture, self.display?.displayID == display.displayID {
                     if names != self.includedPids { capture.update(filter) }
                     capture.update(configuration)
@@ -1573,7 +1595,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var includedPids: [Int] = []
     var panelShown: [Int] = []
     var panelApplications: [SCRunningApplication] = []
-    var panelExcepted: [SCWindow] = []
+    /// While the application's panel shows: the windows the capture names, one by one.
+    var panelWindows: [SCWindow] = []
 
     var started = false
     func started(_ why: String?) {
@@ -1613,7 +1636,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 if self.app != nil {
                     // Only the application's windows; other applications are not in the picture.
                     guard let scApp = self.scApplication, let placed = self.captureRect else { return done(nil) }  // placed later
-                    filter = SCContentFilter(display: display, including: [scApp] + self.panelApplications, exceptingWindows: self.panelExcepted)
+                    filter = self.panelWindows.isEmpty
+                        ? SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
+                        : SCContentFilter(display: display, including: self.panelWindows)
                     rect = placed
                 } else {
                     filter = SCContentFilter(display: display, excludingWindows: [])
