@@ -75,6 +75,8 @@ pub struct Shell {
     master: Option<OwnedFd>,
     pid: u32,
     started: Instant,
+    /// How long the device may say nothing ([`SILENCE`]).
+    silence: Duration,
 }
 
 /// What a shell's conversation came to, for the one line about it.
@@ -292,7 +294,14 @@ impl Shell {
             child: Some(child),
             master: Some(master),
             started,
+            silence: SILENCE,
         })
+    }
+
+    /// Changes how long the device may say nothing, from [`SILENCE`]. For
+    /// tests, which cannot wait a minute.
+    pub fn set_silence(&mut self, silence: Duration) {
+        self.silence = silence;
     }
 
     /// The shell's process number.
@@ -328,8 +337,8 @@ impl Shell {
 
         let stream = channel.stream();
         let _ = stream
-            .set_read_timeout(Some(SILENCE))
-            .and_then(|_| stream.set_write_timeout(Some(SILENCE)));
+            .set_read_timeout(Some(self.silence))
+            .and_then(|_| stream.set_write_timeout(Some(self.silence)));
         let (events_in, events) = mpsc::channel::<Event>();
         // A handle on the connection that ends it from here, whatever the other
         // threads are waiting for.
@@ -361,7 +370,10 @@ impl Shell {
                 counts.clone(),
                 events_in.clone(),
             );
-            std::thread::spawn(move || pass_input(reader, fd, writer, stop, counts, events))
+            let silence = self.silence;
+            std::thread::spawn(move || {
+                pass_input(reader, fd, writer, stop, counts, events, silence)
+            })
         });
         child_exit_watch(child, events_in);
 
@@ -599,24 +611,18 @@ fn pass_input(
     stop: Arc<AtomicBool>,
     counts: Arc<Counts>,
     events: mpsc::Sender<Event>,
+    silence: Duration,
 ) {
     let socket = reader.stream().as_raw_fd();
     let terminal = master.as_raw_fd();
     let mut pending: Vec<u8> = Vec::new();
-    let mut heard = Instant::now();
-    let mut taken = Instant::now();
+    let mut patience = Patience::new(silence, Instant::now());
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
         let full = pending.len() >= MAX_PENDING;
-        if full && taken.elapsed() >= SILENCE {
-            // The shell has taken nothing for a minute, and the device has more
-            // to give it than is kept: the device is not read, and so cannot be
-            // heard to go. The shell is ended rather than kept without end.
-            break;
-        }
-        if !full && heard.elapsed() >= SILENCE {
+        if patience.run_out(full, Instant::now()) {
             break;
         }
         let (readable, writable) = match sys::wait(
@@ -628,7 +634,7 @@ fn pass_input(
             Err(_) => break,
         };
         if writable {
-            to_terminal(terminal, &mut pending, &mut taken);
+            to_terminal(terminal, &mut pending, &mut patience);
         }
         if !readable {
             continue;
@@ -636,7 +642,7 @@ fn pass_input(
         // A frame that has begun to arrive is whole within the connection's
         // timeout, or the connection is over.
         let Ok(message) = reader.recv() else { break };
-        heard = Instant::now();
+        patience.heard(Instant::now());
         let Ok(frame) = ShellFrame::decode(&message) else {
             break;
         };
@@ -647,11 +653,11 @@ fn pass_input(
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 counts.frames_in.fetch_add(1, Ordering::Relaxed);
                 if pending.is_empty() {
-                    taken = Instant::now();
+                    patience.taken(Instant::now());
                 }
                 pending.extend_from_slice(&bytes);
                 // At once, not after the next wait: what is typed is not held up.
-                to_terminal(terminal, &mut pending, &mut taken);
+                to_terminal(terminal, &mut pending, &mut patience);
             }
             ShellFrame::Resize { cols, rows } => {
                 counts.resizes.fetch_add(1, Ordering::Relaxed);
@@ -673,15 +679,62 @@ fn pass_input(
     let _ = events.send(Event::DeviceGone);
 }
 
+/// When the host stops waiting for a device whose typing waits for the shell.
+///
+/// While less than [`MAX_PENDING`] waits, the device is read, and it is gone
+/// when it has said nothing for the silence. While more waits, it is not read
+/// and cannot be heard: then the shell is given the silence to take
+/// something, and when it does not, the conversation ends. Leaving that
+/// state starts the device's silence afresh: it could not be heard while it
+/// was not read.
+struct Patience {
+    silence: Duration,
+    heard: Instant,
+    taken: Instant,
+    was_full: bool,
+}
+
+impl Patience {
+    fn new(silence: Duration, now: Instant) -> Self {
+        Patience {
+            silence,
+            heard: now,
+            taken: now,
+            was_full: false,
+        }
+    }
+
+    /// The device said something.
+    fn heard(&mut self, now: Instant) {
+        self.heard = now;
+    }
+
+    /// The shell took some of what waits (or nothing waited until now).
+    fn taken(&mut self, now: Instant) {
+        self.taken = now;
+    }
+
+    /// Whether to stop waiting, with `full` saying whether more than
+    /// [`MAX_PENDING`] waits now.
+    fn run_out(&mut self, full: bool, now: Instant) -> bool {
+        if self.was_full && !full {
+            self.heard = now;
+        }
+        self.was_full = full;
+        let since = if full { self.taken } else { self.heard };
+        now.saturating_duration_since(since) >= self.silence
+    }
+}
+
 /// Gives the terminal as much of `pending` as it takes now, without waiting.
 /// A terminal that is gone takes nothing more, and what waits is dropped.
-fn to_terminal(terminal: std::os::fd::RawFd, pending: &mut Vec<u8>, taken: &mut Instant) {
+fn to_terminal(terminal: std::os::fd::RawFd, pending: &mut Vec<u8>, patience: &mut Patience) {
     while !pending.is_empty() {
         match sys::write(terminal, pending) {
             Ok(0) => return,
             Ok(n) => {
                 pending.drain(..n);
-                *taken = Instant::now();
+                patience.taken(Instant::now());
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
@@ -696,6 +749,45 @@ fn to_terminal(terminal: std::os::fd::RawFd, pending: &mut Vec<u8>, taken: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The second review's case: more than is kept waits for a program that
+    /// reads slowly, for longer than the silence, while the device is there.
+    #[test]
+    fn a_device_that_could_not_be_heard_while_much_waited_is_not_taken_for_gone() {
+        let silence = Duration::from_secs(60);
+        let t = Instant::now();
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        let mut patience = Patience::new(silence, t);
+        patience.heard(at(1));
+        // Full from 2 s on; the program takes a little every 10 s.
+        for second in (2..=130).step_by(10) {
+            patience.taken(at(second));
+            assert!(!patience.run_out(true, at(second)), "{second}");
+        }
+        // Below the limit again after 130 s: the device is read again, and its
+        // silence counts from now.
+        assert!(!patience.run_out(false, at(131)));
+        assert!(!patience.run_out(false, at(190)));
+        // It says nothing for the whole silence after that: gone.
+        assert!(patience.run_out(false, at(191)));
+    }
+
+    #[test]
+    fn a_shell_that_takes_nothing_while_much_waits_is_given_up_after_the_silence() {
+        let silence = Duration::from_secs(60);
+        let t = Instant::now();
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        let mut patience = Patience::new(silence, t);
+        patience.taken(at(1));
+        assert!(!patience.run_out(true, at(60)));
+        assert!(patience.run_out(true, at(61)));
+        // A device that is read and heard keeps the conversation.
+        let mut patience = Patience::new(silence, t);
+        for second in (0..200).step_by(10) {
+            patience.heard(at(second));
+            assert!(!patience.run_out(false, at(second + 5)));
+        }
+    }
 
     #[test]
     fn the_terminal_type_is_a_plain_name_or_the_default() {

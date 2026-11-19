@@ -39,8 +39,55 @@ pub struct Options {
     pub device: String,
     /// Where to reach it, when not where it was last seen.
     pub address: Option<String>,
-    /// The folder on the device to start in.
+    /// The folder on the device to start in. Remembered for the device once
+    /// the shell runs there; without one, the shell starts in the folder
+    /// remembered from last time.
     pub project: Option<String>,
+    /// Start at home, and forget the remembered folder.
+    pub home: bool,
+}
+
+/// The folder a shell on the device `id` was last opened in, if one is
+/// remembered.
+pub fn remembered_project(paths: &Paths, id: &str) -> Option<String> {
+    let file = paths.last_project(id)?;
+    let text = std::fs::read_to_string(file).ok()?;
+    let project = text.trim_end_matches('\n');
+    (!project.is_empty() && !project.contains('\n')).then(|| project.to_string())
+}
+
+/// Remembers `project` as the folder for the device `id`, or forgets the
+/// folder (`None`). Readable by its owner only; a failure to remember is not
+/// worth a word.
+pub fn remember_project(paths: &Paths, id: &str, project: Option<&str>) {
+    let Some(file) = paths.last_project(id) else {
+        return;
+    };
+    match project {
+        None => {
+            let _ = std::fs::remove_file(file);
+        }
+        Some(project) => {
+            use std::io::Write as _;
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir);
+            }
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file)
+                .and_then(|mut out| out.write_all(format!("{project}\n").as_bytes()));
+            if written.is_err() {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
 }
 
 /// Opens a shell on another device in this terminal and returns when it is
@@ -64,7 +111,17 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
         }
     };
     let device = client.peer().name.clone();
+    let device_id = client.peer().id.clone();
     let _ = client.set_timeout(ANSWER_WITHIN);
+    let (project, remembered) = match (&options.project, options.home) {
+        (_, true) => (None, false),
+        (Some(project), false) => (Some(project.clone()), false),
+        (None, false) => {
+            let project = remembered_project(paths, &device_id);
+            let remembered = project.is_some();
+            (project, remembered)
+        }
+    };
 
     let terminal = sys::is_terminal(STDIN);
     let (cols, rows) = sys::size(STDIN)
@@ -78,12 +135,16 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
         locale: variable("LC_ALL")
             .or_else(|| variable("LC_CTYPE"))
             .or_else(|| variable("LANG")),
-        project: options.project.clone(),
+        project: project.clone(),
     };
     match client.open_shell(request) {
-        Ok(ShellAnswer::Open) => {}
+        // The device took the folder: the next shell without one opens there.
+        Ok(ShellAnswer::Open) => remember_project(paths, &device_id, project.as_deref()),
         Ok(ShellAnswer::Refused { message, .. }) => {
             say(&format!("{device} did not open a shell: {message}"));
+            if remembered {
+                say("(that folder was remembered from last time; --home starts at home and forgets it)");
+            }
             return 255;
         }
         Err(LinkError::Remote(message)) => {
@@ -282,5 +343,45 @@ fn watch_signals(signals: libc::sigset_t, writer: Arc<Mutex<ChannelWriter>>) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_folder_is_remembered_for_each_device_and_can_be_forgotten() {
+        let dir = crate::testing::TempDir::new("projects");
+        let paths = dir.paths();
+        let (one, other) = ("1a2b-3c4d", "5e6f-7a8b");
+        assert_eq!(remembered_project(&paths, one), None);
+        remember_project(&paths, one, Some("~/src/istesso"));
+        remember_project(&paths, other, Some("/srv/other"));
+        assert_eq!(
+            remembered_project(&paths, one).as_deref(),
+            Some("~/src/istesso")
+        );
+        assert_eq!(
+            remembered_project(&paths, other).as_deref(),
+            Some("/srv/other")
+        );
+        // Only its owner can read it.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(paths.last_project(one).unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+        // Home forgets it; the other device keeps its own.
+        remember_project(&paths, one, None);
+        assert_eq!(remembered_project(&paths, one), None);
+        assert_eq!(
+            remembered_project(&paths, other).as_deref(),
+            Some("/srv/other")
+        );
+        // An id that is no fingerprint gets no file at all.
+        remember_project(&paths, "../x", Some("/"));
+        assert_eq!(remembered_project(&paths, "../x"), None);
     }
 }

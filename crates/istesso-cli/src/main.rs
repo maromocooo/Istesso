@@ -98,9 +98,13 @@ enum Command {
         /// Id or name of the paired device
         device: String,
         /// Start in this folder on the device: an absolute path there, or
-        /// one that starts with `~/`
-        #[arg(long, value_name = "DIR")]
+        /// one that starts with `~/`. Remembered for the device: without
+        /// this, the shell starts in the folder used last time
+        #[arg(long, value_name = "DIR", conflicts_with = "home")]
         project: Option<String>,
+        /// Start at home, and forget the folder remembered from last time
+        #[arg(long)]
+        home: bool,
         /// Reach the device at this address (and port) instead of where it
         /// was last seen
         #[arg(long, value_name = "ADDRESS[:PORT]")]
@@ -486,6 +490,7 @@ fn main() -> ExitCode {
     if let Command::Shell {
         device,
         project,
+        home,
         address,
     } = &cli.command
     {
@@ -493,6 +498,7 @@ fn main() -> ExitCode {
             device: device.clone(),
             address: address.clone(),
             project: project.clone(),
+            home: *home,
         };
         return ExitCode::from(istesso_agent::remote_shell::client::run(
             &Paths::from_env(),

@@ -116,6 +116,14 @@ impl Paths {
         plausible.then(|| self.cache.join("hosts").join(format!("{id}.json")))
     }
 
+    /// The folder a shell on the paired device `id` was last opened in
+    /// (`istesso shell --project`), so that the next one opens there too.
+    /// `None` when `id` does not look like a key fingerprint.
+    pub fn last_project(&self, id: &str) -> Option<PathBuf> {
+        self.host_snapshot(id)?;
+        Some(self.cache.join("shell").join(format!("{id}.project")))
+    }
+
     /// The result of the last full inspection of this machine.
     pub fn local_manifest(&self) -> PathBuf {
         self.cache.join("local-manifest.json")
@@ -196,6 +204,11 @@ mod tests {
     #[test]
     fn ids_that_are_not_fingerprints_get_no_file() {
         let paths = Paths::at("/d");
+        assert_eq!(paths.last_project("../x"), None);
+        assert_eq!(
+            paths.last_project("1a2b-3c4d"),
+            Some(PathBuf::from("/d/cache/shell/1a2b-3c4d.project"))
+        );
         assert_eq!(paths.host_snapshot("../../etc/passwd"), None);
         assert_eq!(paths.host_snapshot("a/b"), None);
         assert_eq!(paths.host_snapshot(""), None);

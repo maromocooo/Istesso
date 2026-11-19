@@ -579,3 +579,55 @@ fn the_shell_gets_none_of_the_agents_other_descriptors() {
     terminal.type_in("exit\n");
     assert_eq!(terminal.ended(), Some(ShellEnd::Code(0)));
 }
+
+/// The review's case for a shell whose "it runs" answer cannot be sent: the
+/// device asks and resets the connection at once. The host must hang the
+/// shell up, and must not serve it on the broken connection.
+#[test]
+fn a_shell_whose_answer_cannot_be_sent_is_hung_up_and_not_served() {
+    use std::os::fd::AsRawFd;
+    let pair = ShellPair::new("sh-no-answer", true);
+    let mut channel = pair.connect().into_channel();
+    let asking = istesso_link::Request::ShellOpen(request(80, 24));
+    channel.send(&serde_json::to_vec(&asking).unwrap()).unwrap();
+    // Closing now resets the connection (no lingering): the host reads the
+    // request, starts the shell, and finds the connection gone when it answers.
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: sets one option on a socket this test owns, from a local value.
+    let set = unsafe {
+        libc::setsockopt(
+            channel.stream().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0);
+    drop(channel);
+    let began = Instant::now();
+    while !pair
+        .log()
+        .iter()
+        .any(|line| line.starts_with("opened a shell"))
+    {
+        assert!(
+            began.elapsed() < SOON,
+            "no shell was started: {:?}",
+            pair.log()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = pair.shell_pid();
+    assert!(process_is_gone(pid), "the shell is still running");
+    // Never served: a served shell would have been reported as over.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !pair.log().iter().any(|line| line.contains("is over")),
+        "{:?}",
+        pair.log()
+    );
+}

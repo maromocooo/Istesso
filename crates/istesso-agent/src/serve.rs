@@ -70,6 +70,9 @@ pub struct AgentOptions {
     /// The program to run as a shell instead of the user's login shell. For
     /// tests only, which must not run the login files of whoever runs them.
     pub shell_program: Option<std::path::PathBuf>,
+    /// How long a device with a shell may say nothing, instead of a minute.
+    /// For tests only, which cannot wait that long.
+    pub shell_silence: Option<Duration>,
 }
 
 impl Default for AgentOptions {
@@ -84,6 +87,7 @@ impl Default for AgentOptions {
             input_timings: None,
             shell_for: Vec::new(),
             shell_program: None,
+            shell_silence: None,
         }
     }
 }
@@ -117,6 +121,8 @@ struct Shared {
     /// Shells open now, by the id of the device they are open for.
     #[cfg(unix)]
     shells: Mutex<HashMap<String, usize>>,
+    #[cfg(unix)]
+    shell_silence: Option<Duration>,
 }
 
 /// What is kept of a conversation that carries input, for ending it from
@@ -181,6 +187,8 @@ impl Agent {
                 },
                 #[cfg(unix)]
                 shells: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                shell_silence: options.shell_silence,
             }),
         })
     }
@@ -640,7 +648,10 @@ impl Shared {
             }
         };
         match Shell::start(request, &self.shell_settings) {
-            Ok(shell) => {
+            Ok(mut shell) => {
+                if let Some(silence) = self.shell_silence {
+                    shell.set_silence(silence);
+                }
                 (self.log)(format!(
                     "opened a shell for {} (process {}), {}",
                     peer.name,
