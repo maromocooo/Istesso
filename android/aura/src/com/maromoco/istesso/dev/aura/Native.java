@@ -71,6 +71,18 @@ final class Native {
      */
     static native void inputText(long input, String text);
 
+    /** inputScroll's source: a wheel of notches, or fingers on a touchpad. */
+    static final int SCROLL_WHEEL = 1;
+    static final int SCROLL_FINGER = 2;
+
+    /**
+     * TRIAL ONLY: a scroll that says what scrolled (ADR 0007, スクロールの種類と段階). dx, dy as for
+     * INPUT_SCROLL; a wheel: v120 (120 to a notch, right and down); fingers: pixels of the picture
+     * (right and down, not rounded). No phase: the host stops after 100 ms of nothing.
+     */
+    static native void inputScroll(long input, int dx, int dy, int source, int v120H, int v120V,
+            double pixelsH, double pixelsV);
+
     /** {cuts, open, answered, over, failure, text}; text 1 when the host said it takes committed text. */
     static native long[] inputState(long input);
 

@@ -182,6 +182,38 @@ pub unsafe extern "C" fn istesso_input_open(
     }
 }
 
+/// A scroll that says what scrolled (trial only, ADR 0007 "スクロールの種類と段階"), handed over
+/// in order with the events. `dx` and `dy` as for an event of kind 4. `source`: 0 not said,
+/// 1 a wheel (`v120` to the right and down, 120 to a notch), 2 fingers (`pixels` to the right and
+/// down, in the picture's pixels, not rounded). No phase: the receiver decides when fingers have
+/// stopped. A scroll out of bounds is dropped by the receiver.
+///
+/// # Safety
+/// `input` came from `istesso_input_open` and has not been closed.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_input_send_scroll(
+    input: *const IstessoInput,
+    dx: i32,
+    dy: i32,
+    source: u32,
+    v120_h: i32,
+    v120_v: i32,
+    pixels_h: f64,
+    pixels_v: f64,
+) {
+    // SAFETY: the caller's promise.
+    let Some(input) = (unsafe { input.as_ref() }) else {
+        return;
+    };
+    input.input.send(vec![crate::input::scroll_event(
+        dx,
+        dy,
+        source,
+        [v120_h, v120_v],
+        [pixels_h, pixels_v],
+    )]);
+}
+
 /// Committed text from the device's input method (trial only): handed over, in order with
 /// the events, as `crate::input::text_events` cuts it. `text` is UTF-8 of `len` bytes; text
 /// that is not UTF-8 is left out whole. Never logged.
@@ -235,10 +267,7 @@ pub unsafe extern "C" fn istesso_input_send(
                 code: u32::try_from(event.a).ok()?,
                 pressed: event.b != 0,
             }),
-            4 => Some(InputEvent::Scroll {
-                dx: event.a,
-                dy: event.b,
-            }),
+            4 => Some(InputEvent::scroll(event.a, event.b)),
             // A kind this version does not know: passed over.
             _ => None,
         })

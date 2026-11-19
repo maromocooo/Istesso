@@ -235,3 +235,13 @@ ADR 0007（m3-ime-route-d）の「確定した文字」の形。AURA の入力�
 - 試しの身元（この Mac の流れのフォルダー）を、Studio の**試用の**身元（`~/.cache/istesso-daily-mac/config`。Studio のふだんの身元でも、この Mac の鍵でもない）とペアにした。コードは、プログラムの間で渡しただけで、どこにも出していない（`android/aura/standin/run.sh … pair` が標準入力から読む）。
 - Studio で `daily-mac.sh open TextEdit --for aura --slot 2 --size 1920x1080 --new-document txt`（m4-daily-host）。代わりの見る側（アプリの `Picture.java` と `Native.java`）でつないだ：1920x1080、毎秒 60 拍の知らせ、20 秒で 444 枚（止まった文書なので、変わるときに出る）、キーフレームは最初の 1 枚だけ、切れ目 0。入力：エージェントは `text=1`（文字を受ける）と答え、パネルの「文字」は使える側。
 - 後片付け：試しの文書の窓を閉じ、窓の一覧からなくなったのを確かめてから、文書を消した（`daily-mac.sh close`。TextEdit そのものは終わらせていない）。Studio の画面の並び（主な画面 1 枚、3440x1440）は前と同じ。試しの機器を Studio の試用の身元のペアの一覧から外し、読み返して、いないのを確かめた（1 つ残る：前からの Air）。試しの身元と、Studio の上の流れのフォルダーを消した。
+
+### 7.10 スクロールの種類と量（試用の道だけ。2026-11-19。ADR 0007 の trial-daily-scroll 74f5835）
+
+持ち主が感じたこと：2 本指のスクロールが重い。前は、システムのスクロールの量を、1 目盛り 15 画素の整数にまとめて送っていた。
+
+- `scroll` に、何が回したか（`source`）と、丸めない量を付けて送る。`dx`、`dy` は前と同じ値（古いホストは、それだけを使う）。
+  - **指（タッチパッド）**：`source` は `finger`、`pixels` は、システムの量 × `ViewConfiguration` の画面のスクロールの倍率 × 絵の画素とビューの画素の比（縦は符号を反転、`dy` と同じ向き）。段階（`phase`）は付けない（ホストのコンポジターは、100 ms 何も来なければ止まったとする）。パックのタッチパッドはマウスとして来るので、機器がタッチパッドと言うとき、または量が目盛りの整数でないときを、指とみなす。2 本指の身ぶり（`CLASSIFICATION_TWO_FINGER_SWIPE`）は、その距離（ビューの画素）を絵の画素に直して送る。
+  - **ホイール**：`source` は `wheel`、`v120` = round(−量 × 120)（縦。横は round(量 × 120)）。
+- 共通の部品：`istesso-proto` の `InputEvent::Scroll` の 5 つの欄、`scroll_is_acceptable`、エージェントの受け取りは trial-daily-scroll と同じ中身（窓の前出しと大きさの知らせは、ここには入れていない）。`istesso-client` に `scroll_event` と C の `istesso_input_send_scroll`、JNI に `inputScroll`。
+- 確かめたこと：`istesso-client` の試し（ホイールと指の JSON、古い形）。ホストのコンポジターまでの確かめは、まとめ役の合図を待っている。

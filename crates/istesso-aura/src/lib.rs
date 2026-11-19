@@ -160,6 +160,17 @@ extern "C" {
     ) -> *mut c_void;
     fn istesso_input_send(input: *const c_void, events: *const InputEvent, count: usize);
     fn istesso_input_send_text(input: *const c_void, text: *const u8, len: usize);
+    #[allow(clippy::too_many_arguments)]
+    fn istesso_input_send_scroll(
+        input: *const c_void,
+        dx: i32,
+        dy: i32,
+        source: u32,
+        v120_h: i32,
+        v120_v: i32,
+        pixels_h: f64,
+        pixels_v: f64,
+    );
     fn istesso_input_state(input: *const c_void, state: *mut InputState) -> i32;
     fn istesso_input_close(input: *mut c_void);
     fn istesso_client_last_error() -> *const c_char;
@@ -813,6 +824,45 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputTex
         region(env, text, 0, n as jsize, units.as_mut_ptr());
         let text = String::from_utf16_lossy(&units);
         istesso_input_send_text(input as *const c_void, text.as_ptr(), text.len());
+    }
+}
+
+/// `void inputScroll(long input, int dx, int dy, int source, int v120H, int v120V, double
+/// pixelsH, double pixelsV)`: a scroll that says what scrolled (TRIAL ONLY, ADR 0007 "スクロールの
+/// 種類と段階"): source 1 a wheel (v120), 2 fingers (pixels of the picture); dx and dy as before.
+///
+/// # Safety
+/// Called by the Java virtual machine; `input` came from inputOpen and is not closed.
+#[cfg(unix)]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputScroll(
+    _env: *mut JNIEnv,
+    _class: jclass,
+    input: jlong,
+    dx: jint,
+    dy: jint,
+    source: jint,
+    v120_h: jint,
+    v120_v: jint,
+    pixels_h: f64,
+    pixels_v: f64,
+) {
+    if input == 0 {
+        return;
+    }
+    // SAFETY: the caller's promise about `input`.
+    unsafe {
+        istesso_input_send_scroll(
+            input as *const c_void,
+            dx,
+            dy,
+            source.max(0) as u32,
+            v120_h,
+            v120_v,
+            pixels_h,
+            pixels_v,
+        )
     }
 }
 

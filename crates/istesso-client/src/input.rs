@@ -229,6 +229,26 @@ impl Drop for Input {
     }
 }
 
+/// A scroll as `istesso_input_send_scroll` says it: `source` 1 a wheel (its `v120` kept),
+/// 2 fingers (its `pixels` kept), anything else the old form (`dx` and `dy` only).
+pub fn scroll_event(dx: i32, dy: i32, source: u32, v120: [i32; 2], pixels: [f64; 2]) -> InputEvent {
+    use istesso_proto::ScrollSource;
+    let (source, v120, pixels) = match source {
+        1 => (Some(ScrollSource::Wheel), Some(v120), None),
+        2 => (Some(ScrollSource::Finger), None, Some(pixels)),
+        _ => (None, None, None),
+    };
+    InputEvent::Scroll {
+        dx,
+        dy,
+        source,
+        v120,
+        pixels,
+        phase: None,
+        momentum: None,
+    }
+}
+
 /// Linux key codes of the keys committed text stands in for (input-event-codes.h).
 const KEY_TAB: u32 = 15;
 const KEY_ENTER: u32 = 28;
@@ -632,5 +652,29 @@ mod text_tests {
             text_events("\n"),
             [key(KEY_ENTER, true), key(KEY_ENTER, false)]
         );
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn a_scroll_says_what_scrolled_and_keeps_dx_and_dy() {
+        let wheel = scroll_event(0, -15, 1, [0, -120], [9.0, 9.0]);
+        assert_eq!(
+            serde_json::to_string(&wheel).unwrap(),
+            r#"{"kind":"scroll","dx":0,"dy":-15,"source":"wheel","v120":[0,-120]}"#
+        );
+        let fingers = scroll_event(0, 3, 2, [7, 7], [0.25, 3.5]);
+        assert_eq!(
+            serde_json::to_string(&fingers).unwrap(),
+            r#"{"kind":"scroll","dx":0,"dy":3,"source":"finger","pixels":[0.25,3.5]}"#
+        );
+        assert_eq!(
+            scroll_event(1, 2, 0, [1, 1], [1.0, 1.0]),
+            InputEvent::scroll(1, 2)
+        );
+        assert!(istesso_proto::scroll_is_acceptable(&fingers));
     }
 }

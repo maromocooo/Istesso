@@ -101,6 +101,14 @@ void istesso_input_send(const IstessoInput *input, const IstessoInputEvent *even
  */
 void istesso_input_send_text(const IstessoInput *input, const uint8_t *text, size_t len);
 
+/*
+ * TRIAL ONLY: a scroll that says what scrolled, in order with the events. dx, dy as for a scroll
+ * event; source 0 not said, 1 a wheel (v120_h, v120_v: 120 to a notch, right and down), 2 fingers
+ * (pixels_h, pixels_v: picture pixels, right and down, not rounded). No phase.
+ */
+void istesso_input_send_scroll(const IstessoInput *input, int32_t dx, int32_t dy, uint32_t source,
+                               int32_t v120_h, int32_t v120_v, double pixels_h, double pixels_v);
+
 /* How it stands. From any thread. 0, or -1. */
 int32_t istesso_input_state(const IstessoInput *input, IstessoInputState *state);
 

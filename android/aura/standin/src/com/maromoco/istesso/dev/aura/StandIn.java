@@ -25,6 +25,28 @@ public final class StandIn implements Picture.Told {
             System.out.println(t() + " paired");
             System.exit(0);
         }
+        if (a.length >= 4 && a[3].equals("scroll")) {
+            // The input's connection, and scrolls as the panel sends them: a wheel's notch down,
+            // and fingers moving a little at a time (made-up amounts).
+            long input = Native.inputOpen(a[0], a[2], a[1]);
+            for (int i = 0; i < 50 && input != 0; i++) {
+                long[] s = Native.inputState(input);
+                if (s != null && s[1] != 0) {
+                    break;
+                }
+                Thread.sleep(100);
+            }
+            Native.inputSend(input, new int[] {Native.INPUT_POINTER_AT, 400, 300}, 1);
+            Native.inputScroll(input, 0, 15, Native.SCROLL_WHEEL, 0, 120, 0, 0);
+            for (int i = 0; i < 20; i++) {
+                Native.inputScroll(input, 0, 0, Native.SCROLL_FINGER, 0, 0, 0.0, 2.75);
+                Thread.sleep(8);
+            }
+            Thread.sleep(1000);
+            Native.inputClose(input);
+            System.out.println(t() + " scrolls sent");
+            System.exit(0);
+        }
         if (a.length >= 4 && a[3].equals("text")) {
             text(a[0], a[1], a[2]);
             return;

@@ -416,7 +416,7 @@ pub enum InputMode {
 /// (`linux/input-event-codes.h`), whatever the sender runs on: a key is its
 /// place on the keyboard, not the letter printed on it, and the device that
 /// runs the application decides what the key means there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputEvent {
     /// A key went down or came up.
@@ -426,14 +426,113 @@ pub enum InputEvent {
     PointerAt { x: i32, y: i32 },
     /// A button of the pointer went down or came up (0x110 is the left one).
     Button { code: u32, pressed: bool },
-    /// The wheel was turned or two fingers moved: how far the content
-    /// should move, in pixels, to the right and down.
-    Scroll { dx: i32, dy: i32 },
+    /// The wheel was turned or two fingers moved: how far to scroll, in
+    /// pixels, to the right and down (positive: the view goes towards the
+    /// end of the document and the content moves up, as Wayland's axis
+    /// values count).
+    ///
+    /// The fields after `dx` and `dy` are of the trial (ADR 0007, "スクロールの
+    /// 種類と段階"), and every one of them may be left out: a receiver that
+    /// does not know them uses `dx` and `dy` as before, and a sender that
+    /// fills them in still gives `dx` and `dy` the values it gave before.
+    /// See [`scroll_is_acceptable`] for the limits.
+    Scroll {
+        dx: i32,
+        dy: i32,
+        /// What scrolled: a wheel of notches, or fingers on a touchpad.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ScrollSource>,
+        /// A wheel: notches to the right and down, 120 to a notch (as
+        /// Wayland's `axis_value120`). Parts of a notch are allowed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        v120: Option<[i32; 2]>,
+        /// Fingers: how far, in the picture's own pixels, to the right and
+        /// down, not rounded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pixels: Option<[f64; 2]>,
+        /// Fingers on the touchpad: where the gesture is. Left out by a
+        /// sender whose system does not say (then the receiver decides when
+        /// the gesture is over), and on the events of `momentum`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<ScrollPhase>,
+        /// After the fingers have left: the scrolling that the sender's own
+        /// system goes on with (inertia), and where it is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        momentum: Option<ScrollPhase>,
+    },
     /// Text that the sender's own input method has committed (trial only,
     /// docs/adr/0007-control-channel.md, "確定した文字"): for the client that
     /// has the keyboard. Never logged. See [`text_is_acceptable`] for the
     /// limits; a receiver drops a piece that is not within them.
     Text { text: String },
+}
+
+// Only finite numbers are ever accepted for `pixels` (see `scroll_is_acceptable`), so equality
+// is an equivalence for every event that is passed on.
+impl Eq for InputEvent {}
+
+impl InputEvent {
+    /// A scroll of the old form: `dx` and `dy` only.
+    pub fn scroll(dx: i32, dy: i32) -> InputEvent {
+        InputEvent::Scroll {
+            dx,
+            dy,
+            source: None,
+            v120: None,
+            pixels: None,
+            phase: None,
+            momentum: None,
+        }
+    }
+}
+
+/// What scrolled ([`InputEvent::Scroll`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollSource {
+    /// A wheel that turns in notches (`v120`).
+    Wheel,
+    /// Fingers on a touchpad, or anything else that scrolls by pixels
+    /// (`pixels`).
+    Finger,
+    /// A source of a newer version.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Where a scroll gesture is ([`InputEvent::Scroll`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollPhase {
+    Began,
+    Changed,
+    Ended,
+    /// The system took the gesture back (only for `phase`).
+    Cancelled,
+    /// A stage of a newer version.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The most pixels one scroll event may move on either axis.
+pub const SCROLL_MOST_PIXELS: f64 = 10_000.0;
+/// The most notches one scroll event may turn on either axis, in 120ths.
+pub const SCROLL_MOST_V120: i32 = 120 * 1000;
+
+/// Whether a scroll event is within the limits: finite pixels of at most
+/// [`SCROLL_MOST_PIXELS`] and notches of at most [`SCROLL_MOST_V120`] on
+/// either axis. Any other event is acceptable here.
+pub fn scroll_is_acceptable(event: &InputEvent) -> bool {
+    let InputEvent::Scroll { v120, pixels, .. } = event else {
+        return true;
+    };
+    pixels.is_none_or(|p| {
+        p.iter()
+            .all(|v| v.is_finite() && v.abs() <= SCROLL_MOST_PIXELS)
+    }) && v120.is_none_or(|n| {
+        n.iter()
+            .all(|v| v.unsigned_abs() <= SCROLL_MOST_V120 as u32)
+    })
 }
 
 /// The most characters of one piece of committed text ([`InputEvent::Text`]).
@@ -471,12 +570,119 @@ mod tests {
                 code: 0x110,
                 pressed: false,
             },
-            InputEvent::Scroll { dx: 0, dy: -15 },
+            InputEvent::scroll(0, -15),
         ] {
             let json = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), event);
         }
         assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
+    }
+
+    #[test]
+    fn scrolls_of_the_old_form_read_and_write_as_before() {
+        use super::InputEvent;
+        assert_eq!(
+            serde_json::to_string(&InputEvent::scroll(0, -15)).unwrap(),
+            r#"{"kind":"scroll","dx":0,"dy":-15}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<InputEvent>(r#"{"kind":"scroll","dx":3,"dy":4}"#).unwrap(),
+            InputEvent::scroll(3, 4)
+        );
+    }
+
+    #[test]
+    fn scrolls_carry_their_source_and_stage() {
+        use super::{scroll_is_acceptable, InputEvent, ScrollPhase, ScrollSource};
+        let finger = InputEvent::Scroll {
+            dx: 0,
+            dy: 12,
+            source: Some(ScrollSource::Finger),
+            v120: None,
+            pixels: Some([0.0, 24.5]),
+            phase: Some(ScrollPhase::Changed),
+            momentum: None,
+        };
+        let json = serde_json::to_string(&finger).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"scroll","dx":0,"dy":12,"source":"finger","pixels":[0.0,24.5],"phase":"changed"}"#
+        );
+        assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), finger);
+        assert!(scroll_is_acceptable(&finger));
+        let wheel: InputEvent = serde_json::from_str(
+            r#"{"kind":"scroll","dx":0,"dy":15,"source":"wheel","v120":[0,120]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            wheel,
+            InputEvent::Scroll {
+                source: Some(ScrollSource::Wheel),
+                v120: Some([0, 120]),
+                ..
+            }
+        ));
+        let momentum: InputEvent = serde_json::from_str(
+            r#"{"kind":"scroll","dx":0,"dy":0,"source":"finger","pixels":[0,0],"momentum":"ended"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            momentum,
+            InputEvent::Scroll {
+                phase: None,
+                momentum: Some(ScrollPhase::Ended),
+                ..
+            }
+        ));
+        // What a newer version may say is read, not refused.
+        let newer: InputEvent = serde_json::from_str(
+            r#"{"kind":"scroll","dx":0,"dy":1,"source":"tilt","phase":"may_begin","later":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            newer,
+            InputEvent::Scroll {
+                source: Some(ScrollSource::Unknown),
+                phase: Some(ScrollPhase::Unknown),
+                ..
+            }
+        ));
+        // An older reader sees `dx` and `dy` (this reader ignores what it does not know too).
+        #[derive(serde::Deserialize)]
+        struct Old {
+            dx: i32,
+            dy: i32,
+        }
+        let old: Old = serde_json::from_str(&json).unwrap();
+        assert_eq!((old.dx, old.dy), (0, 12));
+    }
+
+    #[test]
+    fn scrolls_out_of_bounds_are_not_acceptable() {
+        use super::{scroll_is_acceptable, InputEvent, ScrollSource};
+        let with = |pixels: Option<[f64; 2]>, v120: Option<[i32; 2]>| InputEvent::Scroll {
+            dx: 0,
+            dy: 0,
+            source: Some(ScrollSource::Finger),
+            v120,
+            pixels,
+            phase: None,
+            momentum: None,
+        };
+        assert!(scroll_is_acceptable(&with(
+            Some([-10_000.0, 10_000.0]),
+            None
+        )));
+        assert!(!scroll_is_acceptable(&with(Some([0.0, 10_000.5]), None)));
+        assert!(!scroll_is_acceptable(&with(Some([f64::NAN, 0.0]), None)));
+        assert!(!scroll_is_acceptable(&with(
+            Some([0.0, f64::INFINITY]),
+            None
+        )));
+        assert!(scroll_is_acceptable(&with(None, Some([-120_000, 120_000]))));
+        assert!(!scroll_is_acceptable(&with(None, Some([0, i32::MIN]))));
+        assert!(scroll_is_acceptable(&InputEvent::scroll(i32::MAX, 0)));
+        assert!(scroll_is_acceptable(&InputEvent::Text { text: "a".into() }));
     }
 
     #[test]

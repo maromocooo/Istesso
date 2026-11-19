@@ -577,6 +577,30 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         return true;
     }
 
+    /**
+     * Whether a scroll came from fingers on a touchpad rather than a wheel: the device says it is a
+     * touchpad, or the amounts are not whole notches (the puck's touchpad comes as a mouse, with
+     * parts of a notch; a wheel turns in whole ones).
+     */
+    private static boolean fingers(MotionEvent e, float h, float v) {
+        InputDevice d = e.getDevice();
+        if (d != null && d.supportsSource(InputDevice.SOURCE_TOUCHPAD)) {
+            return true;
+        }
+        return h != Math.rint(h) || v != Math.rint(v);
+    }
+
+    /** Picture pixels per view pixel, across and down (1 before there is a picture). */
+    private float pictureScaleX() {
+        int vw = view.getWidth();
+        return pictureWidth > 0 && vw > 0 ? (float) pictureWidth / vw : 1f;
+    }
+
+    private float pictureScaleY() {
+        int vh = view.getHeight();
+        return pictureHeight > 0 && vh > 0 ? (float) pictureHeight / vh : 1f;
+    }
+
     /** Where the pointer is, in the picture's pixels; false when there is no picture yet. */
     private boolean place(MotionEvent e) {
         int w = pictureWidth;
@@ -670,7 +694,19 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 if (dx != 0 || dy != 0) {
                     scrollX -= dx;
                     scrollY -= dy;
-                    send(Native.INPUT_SCROLL, dx, dy);
+                }
+                // What scrolled, and by how much, not rounded (the owner, 2026-11-19: two fingers
+                // felt heavy). dx and dy stay as they were, for a host that knows only those.
+                if (input != 0 && (h != 0 || v != 0)) {
+                    if (fingers(e, h, v)) {
+                        float factorH = android.view.ViewConfiguration.get(this).getScaledHorizontalScrollFactor();
+                        float factorV = android.view.ViewConfiguration.get(this).getScaledVerticalScrollFactor();
+                        Native.inputScroll(input, dx, dy, Native.SCROLL_FINGER, 0, 0,
+                                h * factorH * pictureScaleX(), -v * factorV * pictureScaleY());
+                    } else {
+                        Native.inputScroll(input, dx, dy, Native.SCROLL_WHEEL,
+                                Math.round(h * 120), Math.round(-v * 120), 0, 0);
+                    }
                 }
                 noteScroll(e, h, v, dx, dy);
                 return true;
@@ -686,14 +722,19 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         // The puck's touchpad: a two-finger swipe is a scroll; a three-or-more-finger swipe is left to the system.
         int c = e.getClassification();
         if (c == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE) {
-            scrollX += e.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_X_DISTANCE);
-            scrollY += e.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE);
+            float gx = e.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_X_DISTANCE);
+            float gy = e.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE);
+            scrollX += gx;
+            scrollY += gy;
             int dx = (int) scrollX;
             int dy = (int) scrollY;
             if (dx != 0 || dy != 0) {
                 scrollX -= dx;
                 scrollY -= dy;
-                send(Native.INPUT_SCROLL, dx, dy);
+            }
+            if (input != 0 && (gx != 0 || gy != 0)) {
+                // The distances are the view's pixels: in the picture's, not rounded.
+                Native.inputScroll(input, dx, dy, Native.SCROLL_FINGER, 0, 0, gx * pictureScaleX(), gy * pictureScaleY());
             }
             return true;
         }
