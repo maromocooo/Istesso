@@ -199,9 +199,17 @@ do_open() {
         # Only what the allow-list names (scripts/daily-mac-apps.txt and the owner's own list).
         local entry
         entry=$(cat "$repo/scripts/daily-mac-apps.txt" "$HOME/.config/istesso/daily-mac-apps.txt" 2>/dev/null | grep -v '^#' |
-            awk -v n="$(printf '%s' "$app" | tr 'A-Z' 'a-z')" 'tolower($1) == n {print $2, $3; exit}')
+            awk -v n="$(printf '%s' "$app" | tr 'A-Z' 'a-z')" 'tolower($1) == n {print $2, $3, $4; exit}')
         [ -n "$entry" ] || { echo "error: $app is not in the list of applications that may be opened (scripts/daily-mac-apps.txt, ~/.config/istesso/daily-mac-apps.txt)"; exit 2; }
-        what=${entry% *}; start=${entry#* }
+        local who
+        read -r what start who <<< "$entry"
+        # Applications that show the owner's own content: only the owner opens them (the owner's
+        # rule). The owner says so with DAILY_OWNER=1, from a terminal; an agent never sets it,
+        # and an agent's command has no terminal.
+        if [ "$who" = owner ] && { [ "${DAILY_OWNER:-}" != 1 ] || [ ! -t 0 ] || [ ! -t 1 ]; }; then
+            echo "error: $app shows the owner's own content: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
+            exit 2
+        fi
         [[ "$what" =~ ^[A-Za-z0-9._~/-]+$ ]] || { echo "error: the list's entry for $app is not a bundle id or a ~/ path"; exit 2; }
         # A path written with _ for spaces (the list is split at spaces).
         what=${what//_/ }

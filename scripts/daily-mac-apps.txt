@@ -1,14 +1,16 @@
 # The applications of the Mac host that scripts/daily-mac.sh may open (trial only). One a line:
-#   NAME  WHAT                                   START
+#   NAME  WHAT                                   START  [owner]
 # WHAT is a bundle id, or a path below the host's home (~/...). START is how it begins, so that it
 # never opens one of the owner's documents by itself:
 #   document:KIND  a new empty document of the trial's own (KIND: txt or rtf)
 #   new-window     a new window of its own (Command-N to it once it is in front); only that is shown
 #   as-is          as it opens (it may show what it shows by itself, such as its last notes)
+# "owner": the application shows the owner's own content; it is opened only by the owner, from a
+# terminal of the owner's own, with DAILY_OWNER=1 (an agent never sets it, and has no terminal).
 # The owner adds more in ~/.config/istesso/daily-mac-apps.txt on this Mac (the same form).
 textedit      com.apple.TextEdit                                        document:txt
-safari        com.apple.Safari                                          new-window
-notes         com.apple.Notes                                           as-is
-preview       com.apple.Preview                                         as-is
-finder        com.apple.finder                                          new-window
+safari        com.apple.Safari                                          new-window  owner
+notes         com.apple.Notes                                           as-is  owner
+preview       com.apple.Preview                                         as-is  owner
+finder        com.apple.finder                                          new-window  owner
 input-target  ~/.cache/istesso-daily-mac/Istesso_Dev_Input_Target.app  as-is
