@@ -115,7 +115,6 @@ fake_mount() {
 asked=()
 _istesso_cd_preexec "cd $r:q/ubuntu/proj/src"
 check "mounted before the cd" "$r|proj" "${asked[1]-}"
-check "remembered for taking it off" "1" "${_istesso_mount_used[ubuntu/proj]-}"
 check "no failure" "" "$_istesso_mount_failed"
 asked=()
 _istesso_cd_preexec "cd /tmp"
@@ -128,7 +127,6 @@ answer=1
 _istesso_cd_preexec "cd $r:q/ubuntu/other" 2>/dev/null
 check "asked, and refused" "$r|other" "${asked[1]-}"
 check "the failure is kept for the cd" "ubuntu/other" "$_istesso_mount_failed"
-check "not remembered" "" "${_istesso_mount_used[ubuntu/other]-}"
 _istesso_cd_preexec "ls"
 check "the next line forgets it" "" "$_istesso_mount_failed"
 answer=0
@@ -137,40 +135,32 @@ answer=0
 asked=()
 builtin cd -q /
 answer=3
-_istesso_mount_release -q ubuntu proj
+_istesso_mount_release ubuntu proj
 check "busy: status 3" "3" "$?"
 check "busy: asked to release" "$r|--release proj" "${asked[1]-}"
-check "busy: still remembered" "1" "${_istesso_mount_used[ubuntu/proj]-}"
 answer=0
-_istesso_mount_release -q ubuntu proj
+asked=()
+_istesso_mount_release ubuntu proj
 check "released: status 0" "0" "$?"
-check "released: forgotten" "" "${_istesso_mount_used[ubuntu/proj]-}"
+check "released: asked once" "1" "${#asked}"
+asked=()
+_istesso_mount_release studio proj
+check "no mount program: nothing to do" "0:0" "$?:${#asked}"
 
-# Never while this shell stands in it (the folder is made for this check only
-# when it can be: the root above does not exist).
-_istesso_mount_used[ubuntu/proj]=1
+# Never while this shell stands in it (PWD is only set: the root above does
+# not exist).
 asked=()
 PWD_SAVED=$PWD
 PWD=$r/ubuntu/proj/src
-_istesso_mount_release -q ubuntu proj
+_istesso_mount_release ubuntu proj
 check "standing in it: status 3" "3" "$?"
 check "standing in it: not asked" "0" "${#asked}"
 PWD=$PWD_SAVED
 
-# The prompts try again, but not more often than told.
-ISTESSO_MOUNT_RETRY=30
-_istesso_mount_tried=$EPOCHSECONDS
+# The prompt does nothing with mounts.
 asked=()
 _istesso_cd_precmd
-check "not again so soon" "0" "${#asked}"
-_istesso_mount_tried=0
-_istesso_cd_precmd
-check "again after a while" "$r|--release proj" "${asked[1]-}"
-check "and then forgotten" "0" "${#_istesso_mount_used}"
-asked=()
-_istesso_mount_tried=0
-_istesso_cd_precmd
-check "nothing to try" "0" "${#asked}"
+check "nothing at the prompt" "0" "${#asked}"
 
 print -r -- "cd-switch-test: $passed passed, $failed failed"
 (( failed == 0 ))

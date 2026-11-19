@@ -19,10 +19,12 @@
 #      writing is refused. `exit`: back where the shell was, and the mount is
 #      gone.
 #   2. The same, with another program on the Mac in the mount: it stays
-#      mounted when the shell there ends, and goes at the next prompt once
-#      that program is done.
+#      mounted when the shell there ends, and goes by itself once that
+#      program is done (ISH_MOUNT_UNUSED=2: it looks every 2 s).
 #   3. Nothing answers on the host: the cd says why and goes nowhere, no
 #      shell is opened, nothing is mounted.
+#   4. The terminal is closed while the shell there is open: the mount goes
+#      by itself, all the same.
 #
 # Prints `ok …` and `FAIL …` lines, and `ish-mount-e2e: passed` or
 # `ish-mount-e2e: FAILED`; ends with 0 only when everything passed.
@@ -72,6 +74,14 @@ case "${1:-}" in
         echo "FAIL not mounted"
         exit 1
         ;;
+    check-went-by-itself)
+        if grep -q "nothing on this Mac used the folder; unmounted it" "$ISH_MOUNT_STATE/ubuntu=$FOLDER.log"; then
+            echo "ok the mount took itself off"
+            exit 0
+        fi
+        echo "FAIL the mount did not say it took itself off"
+        exit 1
+        ;;
     check-gone)
         if mounted; then echo "FAIL still mounted"; exit 1; fi
         echo "ok not mounted"
@@ -117,13 +127,13 @@ typeset -gA ISTESSO_SHELL_FOR ISTESSO_MOUNT_FOR ISTESSO_MOUNT_HOST_PATH
 ISTESSO_SHELL_FOR[ubuntu]=$E2E_BIN/ish
 ISTESSO_MOUNT_FOR[ubuntu]=$E2E_BIN/ish-mount
 ISTESSO_MOUNT_HOST_PATH[ubuntu/$FOLDER]='$E2E_HOST_PATH'
-ISTESSO_MOUNT_RETRY=1
 source '$(dirname "$self")/cd-switch.zsh'
 builtin cd -q '$E2E_WORK/start'
 EOF
 
 export E2E_SELF=$self E2E_RC=$rc E2E_POINT=$POINT E2E_START=$E2E_WORK/start
 export E2E_LOG=$E2E_WORK/expect.log E2E_FOLDER=$FOLDER
+export ISH_MOUNT_UNUSED=2
 cat > "$E2E_WORK/e2e.exp" <<'EXPECT'
 set timeout 20
 log_file -a -noappend $env(E2E_LOG)
@@ -211,12 +221,25 @@ local_prompt "after the shell on the host ended"
 run_check check-mounted
 # Each exec lets Tcl collect the ended holder, so that kill -0 fails then.
 for {set i 0} {$i < 50 && ![catch {exec kill -0 $holder}]} {incr i} { after 200 }
-after 1200
-send ":\r"
-local_prompt "after the next command"
+# The mount looks every 2 s whether anything uses it.
+for {set i 0} {$i < 30 && ![catch {exec $env(E2E_SELF) check-mounted}]} {incr i} { after 200 }
 run_check check-gone
+run_check check-went-by-itself
 send "exit\r"
 expect eof
+
+# 4. The terminal goes away while the shell there is open.
+start_shell $env(ISH_PORT)
+send "cd \"$env(E2E_POINT)\"\r"
+sleep 3
+set there [remote_at]
+if {$there eq $env(E2E_HOST_PATH)} { ok "the shell on the host is in the shown folder" } else { fail "the shell on the host is in $there" }
+run_check check-mounted
+close
+wait
+for {set i 0} {$i < 30 && ![catch {exec $env(E2E_SELF) check-mounted}]} {incr i} { after 200 }
+run_check check-gone
+run_check check-went-by-itself
 
 # 3. Nothing answers on the host.
 start_shell $env(E2E_DOWN_PORT)

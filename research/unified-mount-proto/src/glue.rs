@@ -33,6 +33,11 @@ const EARLIER_WITHIN: Duration = Duration::from_secs(4);
 /// How often `ensure` looks whether the folder is mounted yet.
 const LOOK_EVERY: Duration = Duration::from_millis(20);
 
+/// How often the `mount` that `ensure` starts tries to take the folder off, unless told
+/// otherwise: a mount that nothing uses goes within this time, also when the shell that
+/// went into it is gone (its window was closed, say).
+const UNUSED: Duration = Duration::from_secs(30);
+
 /// Whether `name` may be the folder below the base that a machine's folders are mounted in:
 /// one plain folder name, with nothing that a shell, `mount_nfs` or a path would read as
 /// something else.
@@ -56,6 +61,7 @@ pub struct EnsureOptions {
     pub address: Option<String>,
     pub state: Option<PathBuf>,
     pub wait: Duration,
+    pub unused: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +105,7 @@ pub fn parse_ensure(args: &[String]) -> Option<EnsureOptions> {
             "--address",
             "--state",
             "--wait-ms",
+            "--unmount-when-unused",
         ],
     )?;
     Some(EnsureOptions {
@@ -111,6 +118,10 @@ pub fn parse_ensure(args: &[String]) -> Option<EnsureOptions> {
         wait: match flag(&given, "--wait-ms") {
             Some(ms) => Duration::from_millis(ms.parse().ok().filter(|ms| *ms > 0)?),
             None => WAIT,
+        },
+        unused: match flag(&given, "--unmount-when-unused") {
+            Some(secs) => Duration::from_secs(secs.parse().ok().filter(|secs| *secs > 0)?),
+            None => UNUSED,
         },
     })
 }
@@ -348,7 +359,9 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
         .arg("--base")
         .arg(&options.base)
         .arg("--machine-folder")
-        .arg(&options.machine);
+        .arg(&options.machine)
+        .arg("--unmount-when-unused")
+        .arg(options.unused.as_secs().to_string());
     if let Some(address) = &options.address {
         command.arg("--address").arg(address);
     }
@@ -482,7 +495,7 @@ pub fn release(options: &ReleaseOptions) -> Result<Released, String> {
 }
 
 /// unmount(2) without force: refused (EBUSY) while anything in the mount is open.
-fn plain_unmount(point: &Path) -> std::io::Result<()> {
+pub(crate) fn plain_unmount(point: &Path) -> std::io::Result<()> {
     let path = std::ffi::CString::new(point.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     // SAFETY: a NUL-terminated path; flags 0 is a plain unmount.
@@ -551,8 +564,14 @@ mod tests {
                 address: Some("192.0.2.1:26910".into()), // check-private: ok (a documentation address, RFC 5737)
                 state: Some("/s".into()),
                 wait: Duration::from_millis(1500),
+                unused: UNUSED,
             }
         );
+        let often = parse_ensure(&words(
+            "d f --base b --machine-folder m --unmount-when-unused 2",
+        ))
+        .unwrap();
+        assert_eq!(often.unused, Duration::from_secs(2));
         let plain = parse_ensure(&words("d f --machine-folder m --base b")).unwrap();
         assert_eq!(plain.wait, WAIT);
         assert_eq!(plain.address, None);
@@ -567,6 +586,8 @@ mod tests {
             "d f --base b --machine-folder m --wait-ms",
             "d f --base b --machine-folder m --wait-ms 0",
             "d f --base b --machine-folder m --wait-ms soon",
+            "d f --base b --machine-folder m --unmount-when-unused 0",
+            "d f --base b --machine-folder m --unmount-when-unused",
             "--base b f --machine-folder m",
         ] {
             assert_eq!(parse_ensure(&words(bad)), None, "{bad}");

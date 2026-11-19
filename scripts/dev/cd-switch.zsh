@@ -24,17 +24,15 @@
 # <folder-id>`), and the cd goes nowhere when it cannot be mounted. The shell
 # on that machine opens in the folder the mount shows:
 # ISTESSO_MOUNT_HOST_PATH[<machine>/<folder-id>], or ~/<folder-id> there. When
-# that shell ends, and at this shell's prompts after that (every
-# $ISTESSO_MOUNT_RETRY seconds at most, 30 unless set), the mount is taken off
-# unless something on this Mac still uses it (`<program> --release
-# <folder-id>`, a plain unmount, which the system refuses while any program
-# has a file or a folder in it open).
+# that shell ends, the mount is taken off unless something on this Mac still
+# uses it (`<program> --release <folder-id>`, a plain unmount, which the
+# system refuses while any program has a file or a folder in it open). One
+# that stays is taken off by its own program once nothing uses it any more
+# (it tries every 30 s), also when this shell is gone.
 #
 # Remove it from a shell with `istesso_cd_switch_off`.
 
 [[ -o interactive ]] || return 0
-
-zmodload -F zsh/datetime p:EPOCHSECONDS
 
 typeset -g ISTESSO_MOUNT_ROOT=${ISTESSO_MOUNT_ROOT:-$HOME/Istesso}
 typeset -gA ISTESSO_SHELL_FOR
@@ -43,11 +41,6 @@ typeset -gA ISTESSO_MOUNT_FOR ISTESSO_MOUNT_HOST_PATH
 if (( ! ${+ISTESSO_MOUNT_FOR[ubuntu]} && ${+commands[ish-mount]} )); then
     ISTESSO_MOUNT_FOR[ubuntu]=ish-mount
 fi
-typeset -g ISTESSO_MOUNT_RETRY=${ISTESSO_MOUNT_RETRY:-30}
-# The mounts this shell went into, as <machine>/<folder-id>: taken off when
-# nothing uses them any more.
-typeset -gA _istesso_mount_used
-typeset -g _istesso_mount_tried=0
 # The mount that could not be made for the command line that runs now.
 typeset -g _istesso_mount_failed=
 
@@ -144,48 +137,21 @@ _istesso_mount_before() {
     if ! ISTESSO_MOUNT_ROOT=${ISTESSO_MOUNT_ROOT:a} ${=mounter} "$id" >/dev/null; then
         _istesso_mount_failed=$machine/$id
         print -u2 -r -- "istesso: $machine/$id is not shown on this Mac; the cd goes nowhere"
-        return 0
     fi
-    _istesso_mount_used[$machine/$id]=1
+    return 0
 }
 
 # Takes off the mount of <machine> <folder-id> unless something uses it.
 # Status 0 when it is not mounted any more, 3 while it is used (by this shell,
-# too, when it stands in it). With -q, says nothing.
+# too, when it stands in it).
 _istesso_mount_release() {
-    local quiet=
-    [[ $1 == -q ]] && { quiet=1; shift }
     local mounter=${ISTESSO_MOUNT_FOR[$1]}
-    if [[ -z $mounter ]]; then
-        unset "_istesso_mount_used[$1/$2]"
-        return 0
-    fi
+    [[ -n $mounter ]] || return 0
     local root
     for root in ${ISTESSO_MOUNT_ROOT:a} ${ISTESSO_MOUNT_ROOT:A}; do
         [[ $PWD == "$root/$1/$2" || $PWD == "$root/$1/$2"/* ]] && return 3
     done
-    local released
-    if [[ -n $quiet ]]; then
-        ISTESSO_MOUNT_ROOT=${ISTESSO_MOUNT_ROOT:a} ${=mounter} --release "$2" 2>/dev/null
-    else
-        ISTESSO_MOUNT_ROOT=${ISTESSO_MOUNT_ROOT:a} ${=mounter} --release "$2"
-    fi
-    released=$?
-    (( released == 0 )) && unset "_istesso_mount_used[$1/$2]"
-    return $released
-}
-
-# Tries the mounts this shell went into, every ISTESSO_MOUNT_RETRY seconds at
-# most.
-_istesso_mount_retry() {
-    (( ${#_istesso_mount_used} )) || return 0
-    (( EPOCHSECONDS - _istesso_mount_tried >= ISTESSO_MOUNT_RETRY )) || return 0
-    _istesso_mount_tried=$EPOCHSECONDS
-    local key
-    for key in ${(k)_istesso_mount_used}; do
-        _istesso_mount_release -q "${key%%/*}" "${key#*/}"
-    done
-    return 0
+    ISTESSO_MOUNT_ROOT=${ISTESSO_MOUNT_ROOT:a} ${=mounter} --release "$2"
 }
 
 # What the command line was, and where this shell stood, before the command
@@ -202,10 +168,9 @@ _istesso_cd_preexec() {
 }
 
 # A command line is over: a cd that comes later without one (from a key
-# binding, say) is not taken for it. Mounts nothing uses any more go.
+# binding, say) is not taken for it.
 _istesso_cd_precmd() {
     typeset -g _istesso_cd_line=
-    _istesso_mount_retry
 }
 
 # Back where this shell was before the cd, as if it had not happened.
@@ -269,27 +234,16 @@ _istesso_cd_chpwd() {
     if [[ -n $id ]]; then
         # The shell there is over: the mount goes unless something here uses it.
         _istesso_mount_release "$machine" "$id"
-        _istesso_mount_tried=$EPOCHSECONDS
     fi
     return 0
-}
-
-# Before this shell ends: mounts nothing uses any more go.
-_istesso_mount_zshexit() {
-    local key
-    for key in ${(k)_istesso_mount_used}; do
-        _istesso_mount_release -q "${key%%/*}" "${key#*/}"
-    done
 }
 
 istesso_cd_switch_off() {
     add-zsh-hook -d preexec _istesso_cd_preexec
     add-zsh-hook -d precmd _istesso_cd_precmd
     add-zsh-hook -d chpwd _istesso_cd_chpwd
-    add-zsh-hook -d zshexit _istesso_mount_zshexit
 }
 
 add-zsh-hook preexec _istesso_cd_preexec
 add-zsh-hook precmd _istesso_cd_precmd
 add-zsh-hook chpwd _istesso_cd_chpwd
-add-zsh-hook zshexit _istesso_mount_zshexit

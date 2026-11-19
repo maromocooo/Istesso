@@ -11,7 +11,9 @@
 #                                    uses it (status 3 then: it stays mounted)
 # Like `ish`, it uses a test identity of its own (ISH_DIR), and the host's
 # agent on 26850 (ISH_PORT). The locks, process numbers and logs of the
-# mounts are in this user's temporary folder, or in ISH_MOUNT_STATE.
+# mounts are in this user's temporary folder, or in ISH_MOUNT_STATE. A mount
+# goes by itself once nothing uses it; it looks every 30 s, or every
+# ISH_MOUNT_UNUSED seconds.
 D=${ISH_DIR:-"$HOME/Library/Application Support/istesso-dev-shell-test"}
 root=${ISTESSO_MOUNT_ROOT:-"$HOME/Istesso"}
 prog="$D/bin/unified-mount-proto"
@@ -37,4 +39,5 @@ fi
 port=${ISH_PORT:-26850}
 set -- ensure proto-host "$1" --base "$root" --machine-folder ubuntu --address "$addr:$port"
 if [ -n "${ISH_MOUNT_STATE:-}" ]; then set -- "$@" --state "$ISH_MOUNT_STATE"; fi
+if [ -n "${ISH_MOUNT_UNUSED:-}" ]; then set -- "$@" --unmount-when-unused "$ISH_MOUNT_UNUSED"; fi
 ISTESSO_CONFIG_DIR="$D/config" exec "$prog" "$@"

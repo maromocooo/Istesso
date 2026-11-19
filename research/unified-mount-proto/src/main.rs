@@ -3,7 +3,7 @@
 //! docs/research/unified-mount.md and ADR 0007 (proposal "フォルダーを読むだけで見せる").
 //!
 //!   unified-mount-proto mount <device> <folder-id> [--address ADDR[:PORT]] [--base DIR]
-//!                             [--machine-folder NAME]
+//!                             [--machine-folder NAME] [--unmount-when-unused SECS]
 //!       Asks the paired <device> (its name or the beginning of its id, as for `istesso
 //!       peers`) for its folder <folder-id> over Istesso's control channel, serves it as a
 //!       read-only NFSv3 server on 127.0.0.1, and mounts that with the built-in NFS client at
@@ -11,15 +11,19 @@
 //!       folder are made private (0700), and are refused when they are not. Unmounts on Ctrl-C
 //!       or SIGTERM, and stops when the folder is unmounted from outside. --machine-folder
 //!       names the folder below <base> instead of the device's name (`ubuntu`, say, for the
-//!       name the shell's cd switch knows the machine by).
+//!       name the shell's cd switch knows the machine by). --unmount-when-unused tries a plain
+//!       unmount every SECS seconds (refused while any program here has a file or a folder in
+//!       the mount open), and ends once it went through.
 //!
 //!   unified-mount-proto ensure <device> <folder-id> --base DIR --machine-folder NAME
 //!                              [--address ADDR[:PORT]] [--state DIR] [--wait-ms N]
+//!                              [--unmount-when-unused SECS]
 //!       The mount on first use, for the cd switch: when nothing is mounted at
 //!       <base>/<NAME>/<folder-id>, starts `mount` for it on its own (a session of its own,
 //!       its messages in a log in <state>), and waits until the folder is mounted, the
 //!       `mount` ends, or N ms (20 s) have gone by. Prints the mount point when it is
-//!       mounted; says why not, and ends with 1, when it is not.
+//!       mounted; says why not, and ends with 1, when it is not. The `mount` it starts takes
+//!       the folder off once nothing uses it (--unmount-when-unused SECS, 30 unless given).
 //!
 //!   unified-mount-proto release <folder-id> --base DIR --machine-folder NAME [--state DIR]
 //!       Unmounts <base>/<NAME>/<folder-id> when nothing on this Mac uses it: a plain
@@ -73,6 +77,8 @@ struct Options {
     base: Option<PathBuf>,
     /// The folder below the base, instead of one named after the device.
     machine: Option<String>,
+    /// Every so often, a plain unmount: the mount goes once nothing on this Mac uses it.
+    unused: Option<Duration>,
     hold: Option<Duration>,
 }
 
@@ -90,6 +96,7 @@ fn parse(args: &[String]) -> Option<Options> {
         address: None,
         base: None,
         machine: None,
+        unused: None,
         hold: None,
     };
     let mut rest = args[3..].iter();
@@ -99,6 +106,11 @@ fn parse(args: &[String]) -> Option<Options> {
             "--address" => options.address = Some(value.clone()),
             "--base" => options.base = Some(PathBuf::from(value)),
             "--machine-folder" => options.machine = Some(value.clone()),
+            "--unmount-when-unused" => {
+                options.unused = Some(Duration::from_secs(
+                    value.parse().ok().filter(|secs| *secs > 0)?,
+                ))
+            }
             "--hold-before-mount-ms" => {
                 options.hold = Some(Duration::from_millis(value.parse().ok()?))
             }
@@ -471,6 +483,7 @@ fn run_mount(options: Options) -> ExitCode {
 
         let [interrupt, terminate, hangup, quit] = &mut signals;
         let mut every = tokio::time::interval(Duration::from_secs(2));
+        let mut tried = Instant::now();
         loop {
             tokio::select! {
                 _ = interrupt.recv() => break,
@@ -485,6 +498,19 @@ fn run_mount(options: Options) -> ExitCode {
                     if !mounted {
                         say!("the folder was unmounted from outside");
                         break;
+                    }
+                    // A plain unmount, which the system refuses while any program here has a
+                    // file or a folder in the mount open.
+                    if options.unused.is_some_and(|unused| tried.elapsed() >= unused) {
+                        tried = Instant::now();
+                        let at = point.clone();
+                        let gone = tokio::task::spawn_blocking(move || glue::plain_unmount(&at).is_ok())
+                            .await
+                            .unwrap_or(false);
+                        if gone {
+                            say!("nothing on this Mac used the folder; unmounted it");
+                            break;
+                        }
                     }
                 }
             }
