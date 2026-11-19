@@ -130,6 +130,7 @@ fn request(cols: u16, rows: u16) -> ShellRequest {
         locale: None,
         project: None,
         forward: false,
+        windows: false,
     }
 }
 

@@ -198,6 +198,17 @@ fn start_folder(project: Option<&str>, home: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// The folder below which the host's main editor may open files of the
+/// shell's workspace (ADR 0007, "メインのエディターで開く頼み"): the project
+/// the device named, by its real place. None without a project, and none
+/// when it is the root or the home folder itself.
+pub(crate) fn project_folder(project: Option<&str>) -> Option<PathBuf> {
+    let project = project?;
+    let account = sys::account().ok()?;
+    let folder = start_folder(Some(project), &account.home).ok()?;
+    crate::workspace::editor::workspace_folder(&folder, &account.home)
+}
+
 /// The environment of a new shell: made afresh, as a login does, and not
 /// taken over from the agent.
 fn environment(
@@ -646,11 +657,12 @@ fn pass_input(
                     break;
                 }
             }
-            // Only the host ends a shell, lists ports and asks to open pages; frames
-            // of a later version are skipped.
+            // Only the host ends a shell, lists ports, asks to open pages and opens
+            // windows; frames of a later version are skipped.
             ShellFrame::Exit(_)
             | ShellFrame::Ports(_)
             | ShellFrame::OpenUrl(_)
+            | ShellFrame::OpenWindow(_)
             | ShellFrame::Unknown(_) => {}
         }
         if stop.load(Ordering::SeqCst) {
@@ -736,6 +748,7 @@ mod tests {
             locale: None,
             project: None,
             forward: false,
+            windows: false,
         };
         let inherited = |name: &str| match name {
             "TMPDIR" | "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),

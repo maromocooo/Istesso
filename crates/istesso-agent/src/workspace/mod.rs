@@ -7,7 +7,10 @@
 //! * [`watch`] tells which processes belong to the workspace and which
 //!   ports they listen on, and lists them on the shell's conversation;
 //! * [`opener`] takes the requests to open a page from inside the
-//!   workspace (`BROWSER`, `xdg-open`) and passes them on.
+//!   workspace (`BROWSER`, `xdg-open`) and passes them on;
+//! * [`editor`] checks a request to open a file in the host's main editor
+//!   (`istesso-edit`) and starts the editor, whose window the device is
+//!   told about.
 //!
 //! On the device (the machine with the browser):
 //!
@@ -16,7 +19,9 @@
 //! * [`gate`] lets only requests for `localhost` through, against DNS
 //!   rebinding;
 //! * [`url`] reads the addresses of pages strictly and points those on the
-//!   host at the forwarded ports.
+//!   host at the forwarded ports;
+//! * [`windows`] shows the windows the host opened for the shell, with a
+//!   program of the device's own.
 //!
 //! [`pump`] carries the bytes of one forwarded connection, on both ends.
 //!
@@ -24,11 +29,13 @@
 //! query of a page's address, and never a byte that was carried.
 
 pub mod device;
+pub mod editor;
 pub mod gate;
 pub mod opener;
 pub mod pump;
 pub mod url;
 pub mod watch;
+pub mod windows;
 
 #[cfg(test)]
 mod tests_end_to_end;

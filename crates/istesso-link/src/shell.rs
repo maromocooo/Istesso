@@ -10,7 +10,9 @@
 //! A frame of a kind this version does not know is read as
 //! [`ShellFrame::Unknown`] and skipped by the receiver.
 
-use crate::forward::{PortList, MAX_URL};
+use serde::{Deserialize, Serialize};
+
+use crate::forward::{ascii_name, PortList, MAX_URL};
 use crate::{Error, Result};
 
 /// The most terminal bytes a sender puts into one frame.
@@ -26,6 +28,12 @@ const EXIT: u8 = 0x03;
 const ALIVE: u8 = 0x04;
 const PORTS: u8 = 0x05;
 const OPEN_URL: u8 = 0x06;
+const OPEN_WINDOW: u8 = 0x07;
+
+/// The most bytes of a [`ShellFrame::OpenWindow`] frame's JSON.
+pub const MAX_WINDOW: usize = 1024;
+/// The most characters of a window's title that are shown.
+pub const MAX_TITLE: usize = 64;
 
 const END_CODE: u8 = 0;
 const END_SIGNAL: u8 = 1;
@@ -54,8 +62,31 @@ pub enum ShellFrame {
     /// host, when the device asked with `forward`). The device decides
     /// whether it does.
     OpenUrl(String),
+    /// The workspace opened a window on the host (a file in the host's main
+    /// editor), whose picture and input wait on these ports of the host
+    /// (from the host, when the device asked with `windows`). The device
+    /// decides whether it shows it, and connects to the host it opened the
+    /// shell on: the frame names no address and no key. Proposed in ADR
+    /// 0007 ("メインのエディターで開く頼み").
+    OpenWindow(WindowOpen),
     /// A kind this version does not know.
     Unknown(u8),
+}
+
+/// A window that the host opened for the shell's workspace: where its
+/// picture and its input wait, and what to call it. Never a path, a file's
+/// name, an address or a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowOpen {
+    /// The host's port of the window's picture (ADR 0015).
+    pub picture: u16,
+    /// The host's port of the agent that takes the window's input.
+    pub input: u16,
+    /// What to call the window, for showing only: ASCII that can be seen
+    /// and spaces, [`MAX_TITLE`] characters at most (anything else is
+    /// replaced when the frame is read).
+    #[serde(default)]
+    pub title: String,
 }
 
 /// How a shell ended.
@@ -127,6 +158,11 @@ impl ShellFrame {
                 frame.extend_from_slice(url.as_bytes());
                 frame
             }
+            ShellFrame::OpenWindow(window) => {
+                let mut frame = vec![OPEN_WINDOW];
+                frame.extend_from_slice(&serde_json::to_vec(window).unwrap_or_default());
+                frame
+            }
             ShellFrame::Unknown(kind) => vec![*kind],
         }
     }
@@ -165,6 +201,17 @@ impl ShellFrame {
             OPEN_URL => String::from_utf8(rest.to_vec())
                 .map(ShellFrame::OpenUrl)
                 .map_err(|_| Error::Malformed),
+            OPEN_WINDOW if rest.len() > MAX_WINDOW => Err(Error::TooLarge),
+            OPEN_WINDOW => {
+                let mut window: WindowOpen =
+                    serde_json::from_slice(rest).map_err(|_| Error::Malformed)?;
+                if window.picture == 0 || window.input == 0 {
+                    return Err(Error::Malformed);
+                }
+                // Nothing in it that a terminal or a title bar would act on.
+                window.title = ascii_name(&window.title, MAX_TITLE);
+                Ok(ShellFrame::OpenWindow(window))
+            }
             other => Ok(ShellFrame::Unknown(other)),
         }
     }
@@ -199,6 +246,11 @@ mod tests {
                 elsewhere: Vec::new(),
             }),
             ShellFrame::OpenUrl("http://localhost:5173/".into()),
+            ShellFrame::OpenWindow(WindowOpen {
+                picture: 26891,
+                input: 26892,
+                title: "Text Editor".into(),
+            }),
         ];
         for frame in frames {
             assert_eq!(ShellFrame::decode(&frame.encode()).unwrap(), frame);
@@ -264,6 +316,62 @@ mod tests {
         assert!(matches!(ShellFrame::decode(&huge), Err(Error::TooLarge)));
         huge.pop();
         assert!(ShellFrame::decode(&huge).is_ok());
+    }
+
+    #[test]
+    fn a_window_names_ports_and_a_title_only_and_the_title_is_made_harmless() {
+        let frame = ShellFrame::OpenWindow(WindowOpen {
+            picture: 1,
+            input: 2,
+            title: "x".into(),
+        })
+        .encode();
+        assert_eq!(frame[0], 0x07);
+        assert_eq!(&frame[1..], br#"{"picture":1,"input":2,"title":"x"}"#);
+        // Escape sequences and long titles are not shown as they are.
+        let mut raw = vec![0x07];
+        raw.extend_from_slice(
+            format!(
+                r#"{{"picture":5,"input":6,"title":"\u001b]0;evil\u0007{}"}}"#,
+                "a".repeat(100)
+            )
+            .as_bytes(),
+        );
+        let ShellFrame::OpenWindow(window) = ShellFrame::decode(&raw).unwrap() else {
+            panic!("not a window");
+        };
+        assert_eq!(window.title.chars().count(), MAX_TITLE);
+        assert!(window.title.starts_with("?]0;evil?"));
+        // A title may be left out; fields of a later version are passed over.
+        let with = |json: &[u8]| {
+            let mut raw = vec![0x07];
+            raw.extend_from_slice(json);
+            ShellFrame::decode(&raw)
+        };
+        assert!(matches!(
+            with(br#"{"picture":5,"input":6}"#),
+            Ok(ShellFrame::OpenWindow(WindowOpen { title, .. })) if title.is_empty()
+        ));
+        assert!(matches!(
+            with(br#"{"picture":5,"input":6,"size":[1,2]}"#),
+            Ok(ShellFrame::OpenWindow(WindowOpen {
+                picture: 5,
+                input: 6,
+                ..
+            }))
+        ));
+        // Ports may not be 0 or missing or larger than a port.
+        for bad in [
+            &br#"{"picture":0,"input":6}"#[..],
+            br#"{"picture":5}"#,
+            br#"{"picture":70000,"input":6}"#,
+            b"not json",
+        ] {
+            assert!(matches!(with(bad), Err(Error::Malformed)));
+        }
+        let mut huge = vec![0x07];
+        huge.resize(2 + MAX_WINDOW, b' ');
+        assert!(matches!(ShellFrame::decode(&huge), Err(Error::TooLarge)));
     }
 
     #[test]

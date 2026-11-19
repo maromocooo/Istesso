@@ -10,9 +10,13 @@
 //!   (`SO_PEERCRED`), and passes the address on only when that process
 //!   belongs to the workspace of an open shell, to that shell's device.
 //! * The device decides what is opened ([`super::device`]).
+//! * The same socket takes requests to open a file in the host's main
+//!   editor (`istesso-edit`, [`super::editor`]): a line that begins with
+//!   `file `.
 //!
 //! Written down: that a request was passed on or refused, and why in a
-//! word; the port when it is one on the host. Never the address.
+//! word; the port when it is one on the host. Never the address, and never
+//! a file's place or name.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,6 +28,7 @@ use std::time::Duration;
 use istesso_link::forward::MAX_URL;
 use istesso_link::shell::ShellFrame;
 
+use super::editor::{self, MainEditor};
 use super::url;
 use super::watch::Workspaces;
 use crate::serve::Log;
@@ -66,8 +71,14 @@ impl OpenServer {
     }
 }
 
-/// Starts taking requests.
-pub fn start(paths: &Paths, workspaces: Arc<Workspaces>, log: Log) -> std::io::Result<OpenServer> {
+/// Starts taking requests: to open pages, and, with `editor`, files in the
+/// host's main editor.
+pub fn start(
+    paths: &Paths,
+    workspaces: Arc<Workspaces>,
+    editor: Option<Arc<MainEditor>>,
+    log: Log,
+) -> std::io::Result<OpenServer> {
     let dir = super::private_dir(paths)?;
     let socket = dir.join("open.sock");
     remove_socket(&socket);
@@ -75,10 +86,10 @@ pub fn start(paths: &Paths, workspaces: Arc<Workspaces>, log: Log) -> std::io::R
     let bin = make_bin(&dir).ok().flatten();
     super::spawn("istesso-open-requests", move || {
         for stream in listener.incoming().flatten() {
-            let (workspaces, log) = (workspaces.clone(), log.clone());
+            let (workspaces, editor, log) = (workspaces.clone(), editor.clone(), log.clone());
             // Without a thread, the request is dropped unanswered.
             let _ = super::spawn("istesso-open-request", move || {
-                answer(stream, &workspaces, &log)
+                answer(stream, &workspaces, editor.as_deref(), &log)
             });
         }
     })?;
@@ -93,8 +104,8 @@ fn remove_socket(path: &Path) {
     }
 }
 
-/// `bin/istesso-open` and `bin/xdg-open`, links to this program, when it is
-/// `istesso` (in tests it is not, and none are made).
+/// `bin/istesso-open`, `bin/istesso-edit` and `bin/xdg-open`, links to this
+/// program, when it is `istesso` (in tests it is not, and none are made).
 fn make_bin(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     use std::os::unix::fs::DirBuilderExt;
     let program = std::env::current_exe()?;
@@ -108,9 +119,9 @@ fn make_bin(dir: &Path) -> std::io::Result<Option<PathBuf>> {
         Err(e) => return Err(e),
     }
     let names: &[&str] = if cfg!(target_os = "linux") {
-        &[OPEN_NAME, XDG_OPEN_NAME]
+        &[OPEN_NAME, editor::EDIT_NAME, XDG_OPEN_NAME]
     } else {
-        &[OPEN_NAME]
+        &[OPEN_NAME, editor::EDIT_NAME]
     };
     for name in names {
         let link = bin.join(name);
@@ -156,10 +167,10 @@ pub(crate) fn peer_of(stream: &UnixStream) -> Option<(u32, i32)> {
 }
 
 /// Takes one request and answers it with `ok` or `refused: <why>`.
-fn answer(stream: UnixStream, workspaces: &Workspaces, log: &Log) {
+fn answer(stream: UnixStream, workspaces: &Workspaces, editor: Option<&MainEditor>, log: &Log) {
     let _ = stream.set_read_timeout(Some(WAIT));
     let _ = stream.set_write_timeout(Some(WAIT));
-    let verdict = decide(&stream, workspaces, log);
+    let verdict = decide(&stream, workspaces, editor, log);
     let line = match verdict {
         Ok(()) => "ok\n".to_string(),
         Err(why) => format!("refused: {why}\n"),
@@ -167,18 +178,32 @@ fn answer(stream: UnixStream, workspaces: &Workspaces, log: &Log) {
     let _ = (&stream).write_all(line.as_bytes());
 }
 
-fn decide(stream: &UnixStream, workspaces: &Workspaces, log: &Log) -> Result<(), String> {
+fn decide(
+    stream: &UnixStream,
+    workspaces: &Workspaces,
+    editor: Option<&MainEditor>,
+    log: &Log,
+) -> Result<(), String> {
     // SAFETY: getuid cannot fail.
     let me = unsafe { libc::getuid() };
     let (uid, pid) = peer_of(stream).ok_or("cannot tell who asks")?;
     if uid != me {
         return Err("only programs of this user may ask".into());
     }
+    let longest = MAX_URL.max(editor::FILE_REQUEST.len() + editor::MAX_PLACE);
     let mut line = Vec::new();
-    BufReader::new(stream.take(MAX_URL as u64 + 1))
+    BufReader::new(stream.take(longest as u64 + 1))
         .read_until(b'\n', &mut line)
         .map_err(|_| "the request did not arrive")?;
     if line.pop() != Some(b'\n') {
+        return Err("the request did not arrive whole".into());
+    }
+    if let Some(place) = line.strip_prefix(editor::FILE_REQUEST.as_bytes()) {
+        let place =
+            std::str::from_utf8(place).map_err(|_| editor::Refusal::Malformed.to_string())?;
+        return decide_file(pid, place, workspaces, editor, log);
+    }
+    if line.len() > MAX_URL {
         return Err("the request did not arrive whole".into());
     }
     let text = String::from_utf8(line).map_err(|_| url::Refusal::Malformed.to_string())?;
@@ -211,6 +236,76 @@ fn decide(stream: &UnixStream, workspaces: &Workspaces, log: &Log) -> Result<(),
     log(format!(
         "passed on a request to open a page {what} from the workspace of the shell for {}",
         workspace.device_name()
+    ));
+    Ok(())
+}
+
+/// A request to open the file at `place` in the main editor, from the
+/// process `pid`. Never writes `place` down, nor any part of it.
+fn decide_file(
+    pid: i32,
+    place: &str,
+    workspaces: &Workspaces,
+    editor: Option<&MainEditor>,
+    log: &Log,
+) -> Result<(), String> {
+    let workspace = workspaces.holding(pid).ok_or_else(|| {
+        log(
+            "refused a request to open a file: it does not come from the workspace of a shell"
+                .into(),
+        );
+        "only programs started in a shell of another device may ask".to_string()
+    })?;
+    let name = workspace.device_name().to_string();
+    let refuse = |word: &str, why: String| {
+        log(format!(
+            "refused a request to open a file from the workspace of the shell for {name}: {word}"
+        ));
+        why
+    };
+    if !workspace.shows_windows() {
+        return Err(refuse(
+            "its device does not show windows",
+            "the device of this shell does not show windows of this machine".into(),
+        ));
+    }
+    let Some(editor) = editor else {
+        return Err(refuse(
+            "no main editor is set",
+            "this machine has no main editor (istesso agent --main-editor)".into(),
+        ));
+    };
+    let Some(folder) = workspace.folder() else {
+        return Err(refuse(
+            "no project folder",
+            "this shell was opened without a project folder (istesso shell --project)".into(),
+        ));
+    };
+    if !workspace.may_ask() {
+        return Err(refuse(
+            "too many",
+            "too many requests; wait a few seconds".into(),
+        ));
+    }
+    let checked = editor::checked_place(folder, place)
+        .map_err(|why| refuse(&format!("{why:?}"), why.to_string()))?;
+    let began = std::time::Instant::now();
+    let opened = editor
+        .open(&checked)
+        .map_err(|why| refuse("the editor did not start", why))?;
+    let shown = workspace.send(&ShellFrame::OpenWindow(istesso_link::shell::WindowOpen {
+        picture: opened.picture,
+        input: opened.input,
+        title: opened.title,
+    }));
+    if !shown {
+        return Err(refuse("the shell is over", "the shell is over".into()));
+    }
+    log(format!(
+        "opened a file of the workspace of the shell for {name} in the main editor in {} ms: its window waits on port {} (picture) and {} (input)",
+        began.elapsed().as_millis(),
+        opened.picture,
+        opened.input
     ));
     Ok(())
 }

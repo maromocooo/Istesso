@@ -80,6 +80,12 @@ pub struct AgentOptions {
     /// ([`crate::workspace::opener`]), on a socket in a folder of this
     /// user's. Off in tests that do not need it.
     pub open_requests: bool,
+    /// The program that starts the host's main editor on a file of a
+    /// shell's project folder, and says where its window waits
+    /// ([`crate::workspace::editor`]). The host's own setting: a request
+    /// names a file and nothing else. `None`, the default: no file is
+    /// opened.
+    pub main_editor: Option<std::path::PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -96,6 +102,7 @@ impl Default for AgentOptions {
             shell_program: None,
             workspace_scopes: true,
             open_requests: true,
+            main_editor: None,
         }
     }
 }
@@ -213,14 +220,29 @@ impl Agent {
             return Err("this machine cannot open shells for other devices".into());
         }
         #[cfg(unix)]
+        let main_editor = match &options.main_editor {
+            Some(launcher) => Some(Arc::new(crate::workspace::editor::MainEditor::new(
+                launcher,
+            )?)),
+            None => None,
+        };
+        #[cfg(not(unix))]
+        if options.main_editor.is_some() {
+            return Err("this machine cannot open files for other devices".into());
+        }
+        #[cfg(unix)]
         let workspaces = Arc::new(crate::workspace::watch::Workspaces::default());
         // What a shell whose device asked for forwards is started with.
         #[cfg(unix)]
         let (opener, scope_tool) = if shell_policy.is_on() {
-            let opener = match options
-                .open_requests
-                .then(|| crate::workspace::opener::start(&paths, workspaces.clone(), log.clone()))
-            {
+            let opener = match options.open_requests.then(|| {
+                crate::workspace::opener::start(
+                    &paths,
+                    workspaces.clone(),
+                    main_editor.clone(),
+                    log.clone(),
+                )
+            }) {
                 None => None,
                 Some(Ok(opener)) => Some(opener),
                 Some(Err(err)) => {
@@ -832,7 +854,7 @@ impl Shared {
         };
         match Shell::start(request, &self.shell_settings) {
             Ok(shell) => {
-                use crate::workspace::watch::{How, Workspace as Watched};
+                use crate::workspace::watch::{Editing, How, Workspace as Watched};
                 let workspace = request.forward.then(|| {
                     let how = if !cfg!(target_os = "linux") {
                         How::Not("this host does not look for ports yet".into())
@@ -841,7 +863,15 @@ impl Shared {
                     } else {
                         How::Session
                     };
-                    let workspace = Watched::new(peer, shell.pid(), how);
+                    // Files below the project folder may be opened in the main
+                    // editor, when the device shows windows.
+                    let editing = Editing {
+                        folder: crate::remote_shell::host::project_folder(
+                            request.project.as_deref(),
+                        ),
+                        windows: request.windows,
+                    };
+                    let workspace = Watched::new_editing(peer, shell.pid(), how, editing);
                     self.workspaces.add(workspace.clone());
                     Workspace(workspace)
                 });
@@ -859,8 +889,21 @@ impl Shared {
                         Some(How::Session) => ", its ports forwarded (by its session)",
                         Some(How::Not(_)) => ", its ports not looked for",
                         None => "",
-                    }
+                    },
                 ));
+                if let Some(workspace) = &workspace {
+                    if workspace.0.shows_windows() {
+                        (self.log)(format!(
+                            "the shell for {} may open files {} in the main editor, shown on its device",
+                            peer.name,
+                            if workspace.0.folder().is_some() {
+                                "of its project folder"
+                            } else {
+                                "of no folder (it has no project folder)"
+                            }
+                        ));
+                    }
+                }
                 Ok((shell, slot, workspace))
             }
             Err(why) => {

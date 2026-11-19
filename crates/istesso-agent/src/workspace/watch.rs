@@ -82,10 +82,27 @@ pub struct Workspace {
     pokes: Mutex<Option<mpsc::Sender<mpsc::Sender<()>>>>,
     asked: Mutex<VecDeque<Instant>>,
     over: AtomicBool,
+    /// Below which folder files may be opened in the host's main editor
+    /// (the shell's project folder, by its real place), and whether the
+    /// device shows the windows ([`super::editor`]).
+    editing: Editing,
+}
+
+/// What a workspace may open in the host's main editor, and whether its
+/// device shows windows.
+#[derive(Debug, Clone, Default)]
+pub struct Editing {
+    pub folder: Option<PathBuf>,
+    pub windows: bool,
 }
 
 impl Workspace {
     pub fn new(device: &Peer, shell: u32, how: How) -> Arc<Workspace> {
+        Workspace::new_editing(device, shell, how, Editing::default())
+    }
+
+    /// As [`Workspace::new`], with what it may open in the main editor.
+    pub fn new_editing(device: &Peer, shell: u32, how: How, editing: Editing) -> Arc<Workspace> {
         Arc::new(Workspace {
             device_id: device.id.clone(),
             device_key: device.public_key.clone(),
@@ -100,7 +117,18 @@ impl Workspace {
             pokes: Mutex::new(None),
             asked: Mutex::new(VecDeque::new()),
             over: AtomicBool::new(false),
+            editing,
         })
+    }
+
+    /// The folder below which files may be opened in the main editor.
+    pub fn folder(&self) -> Option<&std::path::Path> {
+        self.editing.folder.as_deref()
+    }
+
+    /// Whether the shell's device shows windows opened for it.
+    pub fn shows_windows(&self) -> bool {
+        self.editing.windows
     }
 
     pub fn how(&self) -> &How {

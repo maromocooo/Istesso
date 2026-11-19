@@ -87,6 +87,13 @@ enum Command {
         /// control this machine. A prototype (ADR 0007, proposal)
         #[arg(long, value_name = "DEVICE")]
         allow_shell: Vec<String>,
+        /// The program that starts this machine's main editor on a file of
+        /// a shell's project folder (`istesso-edit <file>` in a shell of
+        /// another device), and says on which ports its window's picture
+        /// and input wait. The request names a file and nothing else. A
+        /// prototype (ADR 0007, proposal)
+        #[arg(long, value_name = "PROGRAM")]
+        main_editor: Option<PathBuf>,
     },
     /// Open a shell on a paired device in this terminal, over Istesso's own
     /// encrypted channel. Any terminal application can run this instead of
@@ -122,6 +129,13 @@ enum Command {
         /// system's, or ISTESSO_URL_OPENER
         #[arg(long, value_name = "WHICH", default_value = "forwarded")]
         open_urls: OpenUrls,
+        /// Do not show here the windows that the shell's workspace opens on
+        /// the device (`istesso-edit <file>`: a file in the device's main
+        /// editor). They are shown by default, with the program
+        /// ISTESSO_WINDOW_OPENER names, and only with forwards (a
+        /// prototype, ADR 0007, proposal)
+        #[arg(long)]
+        no_windows: bool,
     },
     /// Show the ports forwarded to this machine from the shells open here
     /// (`istesso shell`), or stop forwarding them
@@ -628,10 +642,14 @@ fn main() -> ExitCode {
             [
                 istesso_agent::workspace::opener::OPEN_NAME,
                 istesso_agent::workspace::opener::XDG_OPEN_NAME,
+                istesso_agent::workspace::editor::EDIT_NAME,
             ]
             .contains(&name.as_str())
         }) {
             let rest: Vec<std::ffi::OsString> = args.collect();
+            if name == istesso_agent::workspace::editor::EDIT_NAME {
+                return ExitCode::from(istesso_agent::workspace::editor::run_as_edit(&rest));
+            }
             return ExitCode::from(istesso_agent::workspace::opener::run_as(&name, &rest));
         }
     }
@@ -646,6 +664,7 @@ fn main() -> ExitCode {
         no_forward,
         forward_pin,
         open_urls,
+        no_windows,
     } = &cli.command
     {
         let mut pins = Vec::new();
@@ -675,6 +694,10 @@ fn main() -> ExitCode {
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from),
             },
+            windows: !no_windows,
+            window_opener: std::env::var_os(istesso_agent::workspace::windows::OPENER_VARIABLE)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         };
         return ExitCode::from(istesso_agent::remote_shell::client::run(
             &Paths::from_env(),
@@ -730,6 +753,7 @@ fn run(cli: Cli) -> Result<(), String> {
             verbose,
             input_timings,
             allow_shell,
+            main_editor,
         } => run_agent(AgentOptions {
             bind,
             port,
@@ -742,6 +766,7 @@ fn run(cli: Cli) -> Result<(), String> {
             verbose,
             input_timings,
             shell_for: allow_shell,
+            main_editor,
             ..AgentOptions::default()
         }),
         Command::Shell { .. } => Err("this machine cannot open shells on other devices".into()),
@@ -1595,12 +1620,16 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     let paired = open_peers()?.peers().len();
 
     let shells = options.shell_for.len();
+    let main_editor = options.main_editor.is_some();
     let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
     println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
     if shells > 0 {
         println!("Shells are open to {shells} paired device(s), as the user this agent runs as.");
+        if main_editor {
+            println!("Files of a shell's project folder open in the main editor (istesso-edit), its window shown on the shell's device.");
+        }
     }
     let reachable: Vec<String> = addresses
         .iter()
