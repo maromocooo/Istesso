@@ -77,15 +77,23 @@ struct WindowBaseline {
 /// The application's other windows, front to back: see the top of this file. `all` is the
 /// application's windows in the window list, `first` the window that is shown, `before` the
 /// windows that are never another window (WindowBaseline; nil: not recorded yet, so none is),
-/// `ax` what Accessibility listed last.
-func extraCandidates(all: [WindowInfo], first: CGWindowID?, before: Set<CGWindowID>?, ax: [AXWindowInfo]) -> [ExtraCandidate] {
+/// `ax` what Accessibility listed last, `known` the windows taken before (by their number in the
+/// window list): Accessibility's list lags the window list by a look, so a window that moves is
+/// not found there at its new place for a moment; one taken before stays taken while it is in the
+/// window list, with its title and kind as last seen.
+func extraCandidates(all: [WindowInfo], first: CGWindowID?, before: Set<CGWindowID>?, ax: [AXWindowInfo],
+                     known: [CGWindowID: ExtraCandidate] = [:]) -> [ExtraCandidate] {
     guard let first, let before else { return [] }
     let dialogs = [kAXDialogSubrole, kAXSystemDialogSubrole, kAXFloatingWindowSubrole].map { $0 as String }
     return all.compactMap { w in
         guard w.id != first, w.layer == 0, w.onScreen, w.alpha > 0.05, w.bounds.width > 40, w.bounds.height > 40,
-              !before.contains(w.id),
-              let match = ax.first(where: { samePlace($0.bounds, w.bounds) }), match.role == kAXWindowRole as String else { return nil }
-        return ExtraCandidate(id: w.id, bounds: w.bounds, title: match.title, modal: dialogs.contains(match.subrole))
+              !before.contains(w.id) else { return nil }
+        let match = ax.first(where: { samePlace($0.bounds, w.bounds) && $0.role == kAXWindowRole as String })
+        if let match {
+            return ExtraCandidate(id: w.id, bounds: w.bounds, title: match.title, modal: dialogs.contains(match.subrole))
+        }
+        guard let taken = known[w.id] else { return nil }
+        return ExtraCandidate(id: w.id, bounds: w.bounds, title: taken.title, modal: taken.modal)
     }
 }
 
@@ -337,6 +345,8 @@ final class ExtraWindows {
     var viewerAwaySince: TimeInterval?
     /// The windows that are never another window (--windows; recorded by lookAtApp).
     var baseline = WindowBaseline()
+    /// The other windows taken on the last look (extraCandidates' `known`).
+    var taken: [CGWindowID: ExtraCandidate] = [:]
     /// The stand-in's windows (--generated), there from `pretendFrom` (uptime) on: three seconds
     /// after the viewer said it, so that they open while the first window's stream runs steadily.
     var pretend: [ExtraCandidate] = []
@@ -395,7 +405,9 @@ extension DailyHost {
             lookout.refresh(pid)
             let all = windowList(onScreenOnly: false).filter { $0.pid == pid }
             let before = extras.baseline.known.map { $0.union(windowsAtOpen ?? []) }
-            candidates = extraCandidates(all: all, first: windowId, before: before, ax: lookout.windows)
+            candidates = extraCandidates(all: all, first: windowId, before: before, ax: lookout.windows, known: extras.taken)
+            // Taken while they are in the window list (a moved window is not dropped for a look).
+            extras.taken = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         }
         candidates.sort { extras.numbers.number(for: $0.id) < extras.numbers.number(for: $1.id) }
         let streaming = Set(extras.streams.values.map(\.windowId))
@@ -510,6 +522,7 @@ extension DailyHost {
         let had = !extras.streams.isEmpty
         extras.streams.removeAll()
         extras.fallback.removeAll()
+        extras.taken = [:]
         extras.focus = .first
         extras.declared = false
         extras.pretend = []
@@ -739,6 +752,15 @@ func windowsSelfTest() -> Int {
     // Reviews 5 and 6: a new admit, a pause or detach, a new size of the first stream end them all.
     check(["admit", "pause", "detach", "resize"].allSatisfy(windowsEnd(after:)) && !windowsEnd(after: "resume") && !windowsEnd(after: "click-form"),
           "who may look, a stop or a new first stream ends the other windows' streams")
+    // Review 8: a window that moves stays another window although Accessibility still has its old place.
+    let moved2 = WindowInfo(id: 11, pid: 100, layer: 0, bounds: second.bounds.offsetBy(dx: 120, dy: 0), alpha: 1, onScreen: true)
+    let takenBefore = Dictionary(uniqueKeysWithValues: found.map { ($0.id, $0) })
+    let afterMove = extraCandidates(all: [first, moved2], first: 10, before: [14], ax: ax, known: takenBefore)
+    check(afterMove.map(\.id) == [11] && afterMove.first?.bounds == moved2.bounds && afterMove.first?.title == "Untitled 2",
+          "a window taken before is kept at its new place, with its title")
+    check(extraCandidates(all: [first, moved2], first: 10, before: [14], ax: ax).isEmpty, "a window never taken needs Accessibility's word")
+    let gone = WindowInfo(id: 11, pid: 100, layer: 0, bounds: moved2.bounds, alpha: 1, onScreen: false)
+    check(extraCandidates(all: [first, gone], first: 10, before: [14], ax: ax, known: takenBefore).isEmpty, "a window taken before that is hidden goes")
     // Review 9: without --windows Accessibility is asked nothing more than before.
     check(!axAsksTitle(windows: false) && axAsksTitle(windows: true), "a window's title is read only with --windows")
     return failed
