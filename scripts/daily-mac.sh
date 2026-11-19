@@ -71,6 +71,21 @@ mkdir -p "$state"
 
 # ---- Small things ----
 
+# Whether this command was started by "Istesso Dev Open" (the handler the owner's own click on a
+# Spotlight or launcher entry starts; it sets DAILY_OPEN_HANDLER=1): that application's program is
+# among this process's ancestors. A discipline guard for agents, not a security boundary.
+started_by_open_handler() {
+    [ "${DAILY_OPEN_HANDLER:-}" = 1 ] || return 1
+    local pid=$$ i command
+    for i in 1 2 3 4 5 6 7 8; do
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != 1 ] || return 1
+        command=$(ps -o comm= -p "$pid" 2>/dev/null)
+        case "$command" in */"Istesso Dev Open.app"/Contents/MacOS/*) return 0 ;; esac
+    done
+    return 1
+}
+
 signal_free() { "$repo/scripts/measuring.sh" status >/dev/null 2>&1; }
 refuse_when_busy() {
     signal_free && return 0
@@ -206,7 +221,7 @@ do_open() {
         # Applications that show the owner's own content: only the owner opens them (the owner's
         # rule). The owner says so with DAILY_OWNER=1, from a terminal; an agent never sets it,
         # and an agent's command has no terminal.
-        if [ "$who" = owner ] && { [ "${DAILY_OWNER:-}" != 1 ] || [ ! -t 0 ] || [ ! -t 1 ]; }; then
+        if [ "$who" = owner ] && { [ "${DAILY_OWNER:-}" != 1 ] || { { [ ! -t 0 ] || [ ! -t 1 ]; } && ! started_by_open_handler; }; }; then
             echo "error: $app shows the owner's own content: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
             exit 2
         fi

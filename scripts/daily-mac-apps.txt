@@ -6,7 +6,8 @@
 #   new-window     a new window of its own (Command-N to it once it is in front); only that is shown
 #   as-is          as it opens (it may show what it shows by itself, such as its last notes)
 # "owner": the application shows the owner's own content; it is opened only by the owner, from a
-# terminal of the owner's own, with DAILY_OWNER=1 (an agent never sets it, and has no terminal).
+# terminal of the owner's own, or through "Istesso Dev Open" (the owner's click), with
+# DAILY_OWNER=1. An agent never sets it. This is a rule for agents, not a security boundary.
 # The owner adds more in ~/.config/istesso/daily-mac-apps.txt on this Mac (the same form).
 textedit      com.apple.TextEdit                                        document:txt
 safari        com.apple.Safari                                          new-window  owner
