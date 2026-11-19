@@ -1,0 +1,47 @@
+PROPOSAL ONLY (the late frame, docs/measurements/2026-11-20-late-frame.md). Not in a build that
+a trial, the gate or a verdict uses: scripts/build-compositor.sh does not know it (it is in a
+folder of its own, and it is not a trial-*.patch). Whether it goes into the measured build is
+for the owner to decide: it changes the path that is measured.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of the four measured patches in scripts/patches
+(render-on-commit, cursor-messages, windows, dialogs, in that order). The lines of context are
+from that project and from those patches.
+
+What it changes: `State::create_frame` waits for the renderer to have drawn the frame before it
+asks for the copy into the element's buffer.
+
+Why: with `memory:CUDAMemory` frames the copy is `CuMemcpy2DAsync` on a CUDA stream, out of the
+buffer the renderer draws into. The renderer has only been told to start by then (`glFlush` and
+a fence), and nothing orders the CUDA copy after its work. Now and then the copy runs first and
+takes what the buffer held before: the picture of the frame before. The frame that was drawn
+for a commit then goes out without what was committed. Where the picture stands still, the
+"render on commit" mode sends the next frame only two frame intervals later, and that one
+shows it: about 24 ms late at 85 frames a second. Whoever asked for the frame already waits
+for the same fence (comp/mod.rs, "we need to wait before giving a hardware buffer to
+gstreamer"), but only after the copy has been asked for; with this patch that later wait
+comes back at once. The frames in system memory and as DMABuf are not changed in what they
+show (the first is read back through the renderer, the second was waited for already).
+
+diff --git a/wayland-display-core/src/comp/rendering.rs b/wayland-display-core/src/comp/rendering.rs
+index 22619ab..81c7286 100644
+--- a/wayland-display-core/src/comp/rendering.rs
++++ b/wayland-display-core/src/comp/rendering.rs
+@@ -86,6 +86,17 @@ impl State {
+             [0.0, 0.0, 0.0, 1.0],
+         )?;
+ 
++        // Nothing orders the copy into the element's buffer after the renderer's work: with
++        // CUDA it is a copy on a CUDA stream of what the renderer draws into, and the
++        // renderer has only been told to start. A copy that runs first takes the picture of
++        // the frame before. So the drawing is waited for here, before the copy is asked for.
++        // (Whoever asked for the frame waits for the same point before handing the buffer
++        // on; that wait then comes back at once.)
++        render_output_result
++            .sync
++            .wait()
++            .map_err(|_| OutputDamageTrackerError::Rendering(GlesError::SyncInterrupted))?;
++
+         match self
+             .output_buffer
+             .clone()

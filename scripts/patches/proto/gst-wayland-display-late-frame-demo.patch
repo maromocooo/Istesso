@@ -1,0 +1,89 @@
+DEMONSTRATION ONLY (the late frame, docs/measurements/2026-11-20-late-frame.md). Never in a
+build that a trial, the gate or a verdict uses; scripts/build-compositor.sh does not know it.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of the four measured patches in scripts/patches, with or
+without gst-wayland-display-proposal-draw-before-copy.patch in this folder.
+
+With `ISTESSO_LATE_FRAME_DEMO=N` in the environment the renderer gets extra work before every
+frame: N times it fills a buffer of its own that nothing shows. The picture is drawn after that
+work. Without the proposal patch the copy into the element's buffer is then asked for while
+the renderer is still busy, and takes the picture of the frame before; with the proposal patch
+it waits. Without the variable nothing changes.
+
+diff --git a/wayland-display-core/src/comp/rendering.rs b/wayland-display-core/src/comp/rendering.rs
+index 22619ab..5e8a7d0 100644
+--- a/wayland-display-core/src/comp/rendering.rs
++++ b/wayland-display-core/src/comp/rendering.rs
+@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
+ 
+ use super::State;
+ use crate::utils::allocator::GsBuffer;
+-use smithay::backend::renderer::gles::GlesError;
++use smithay::backend::renderer::gles::{GlesError, GlesRenderer};
+ use smithay::{
+     backend::renderer::{
+         ImportAll, ImportMem, Renderer,
+@@ -24,6 +24,53 @@ render_elements! {
+     Memory=MemoryRenderBufferRenderElement<R>
+ }
+ 
++/// Demonstration only (the late frame): with `ISTESSO_LATE_FRAME_DEMO=N` in the environment
++/// the renderer gets extra work before every frame, N times filling a buffer of its own that
++/// nothing shows. The picture is drawn after that work. What is copied out of the output
++/// buffer before the renderer has come that far is the picture of the frame before.
++fn demo_renderer_load(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
++    use smithay::backend::allocator::Fourcc;
++    use smithay::backend::renderer::gles::GlesRenderbuffer;
++    use smithay::backend::renderer::{Bind, Frame, Offscreen};
++    use smithay::utils::{Rectangle, Transform};
++    use std::cell::RefCell;
++    use std::sync::OnceLock;
++
++    const SIDE: i32 = 4096;
++    static FILLS: OnceLock<u32> = OnceLock::new();
++    thread_local! {
++        static SCRATCH: RefCell<Option<GlesRenderbuffer>> = const { RefCell::new(None) };
++    }
++    let fills = *FILLS.get_or_init(|| {
++        std::env::var("ISTESSO_LATE_FRAME_DEMO")
++            .ok()
++            .and_then(|fills| fills.parse().ok())
++            .unwrap_or(0)
++    });
++    if fills == 0 {
++        return Ok(());
++    }
++    SCRATCH.with(|scratch| {
++        let mut scratch = scratch.borrow_mut();
++        if scratch.is_none() {
++            let buffer: GlesRenderbuffer =
++                renderer.create_buffer(Fourcc::Abgr8888, (SIDE, SIDE).into())?;
++            *scratch = Some(buffer);
++        }
++        let mut target = renderer.bind(scratch.as_mut().unwrap())?;
++        let mut frame = renderer.render(&mut target, (SIDE, SIDE).into(), Transform::Normal)?;
++        for fill in 0..fills {
++            let shade = (fill % 2) as f32;
++            frame.clear(
++                [shade, shade, shade, 1.0].into(),
++                &[Rectangle::from_size((SIDE, SIDE).into())],
++            )?;
++        }
++        // Not waited for: the work is to be in the renderer's queue when the picture is drawn.
++        frame.finish().map(|_| ())
++    })
++}
++
+ impl State {
+     pub fn create_frame(
+         &mut self,
+@@ -68,6 +115,8 @@ impl State {
+             vec![]
+         };
+ 
++        demo_renderer_load(&mut self.renderer).map_err(OutputDamageTrackerError::Rendering)?;
++
+         let mut output_buffer = self.output_buffer.clone().expect("Output buffer not set");
+ 
+         let mut target = output_buffer
