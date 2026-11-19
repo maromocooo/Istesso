@@ -164,7 +164,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-scroll-wip/gwd-trial34/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/istesso-scratch/holes/gwd-trial35/target/release'}
 # The trial's ports on the host (picture 4791N, input 4792N; for AURA 4793N and 4794N), or with
 # `scripts/daily.sh ports low` 2791N to 2794N: below Linux's range for the ports of outgoing
 # connections, so that no outgoing connection of another program (a browser's, say) can hold one
