@@ -772,9 +772,37 @@ func applicationURL(_ name: String) -> URL? {
 
 // MARK: - Input
 
+/// The places of the windows Accessibility lists for an application (global points, top left).
+func axWindowBounds(_ pid: pid_t) -> [CGRect] {
+    let app = AXUIElementCreateApplication(pid)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+          let windows = value as? [AXUIElement] else { return [] }
+    return windows.compactMap { window in
+        var position: CFTypeRef?, extent: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &position) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &extent) == .success,
+              let position, let extent else { return nil }
+        var p = CGPoint.zero, s = CGSize.zero
+        AXValueGetValue(position as! AXValue, .cgPoint, &p)
+        AXValueGetValue(extent as! AXValue, .cgSize, &s)
+        return CGRect(origin: p, size: s)
+    }
+}
+
 /// The system's process that shows an application's open and save panel.
 func isPanelService(_ pid: pid_t) -> Bool {
     NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.appkit.xpc.openAndSavePanelService"
+}
+
+/// Whether a window of the system's open and save panel service is the application's own panel:
+/// only while the application is in front, and only when the application itself shows a window
+/// with the very same place and size (Accessibility lists the panel among the application's
+/// windows). A panel the service shows for another application has no such twin.
+func panelAllowed(serviceWindow: CGRect, appWindows: [CGRect], appInFront: Bool) -> Bool {
+    guard appInFront else { return false }
+    return appWindows.contains { abs($0.minX - serviceWindow.minX) < 2 && abs($0.minY - serviceWindow.minY) < 2
+        && abs($0.width - serviceWindow.width) < 2 && abs($0.height - serviceWindow.height) < 2 }
 }
 
 /// What to do with one pointer event of the session form (form 4).
@@ -833,6 +861,13 @@ func selfTest() -> Never {
     check(sessionStep(type: .mouseMoved, at: inside, onTarget: true, pressWindow: nil, window: win), .post(inside, .nothing), "move over the app")
     check(sessionStep(type: .scrollWheel, at: outside, onTarget: false, pressWindow: nil, window: win), .drop, "scroll over another window is dropped")
     check(sessionStep(type: .leftMouseDown, at: inside, onTarget: true, pressWindow: win, window: win), .drop, "a second press of a held button is dropped")
+    let panel = CGRect(x: 400, y: 300, width: 600, height: 400)
+    func checkPanel(_ got: Bool, _ want: Bool, _ what: String) {
+        if got != want { failed += 1; print("FAIL \(what)") } else { print("ok   \(what)") }
+    }
+    checkPanel(panelAllowed(serviceWindow: panel, appWindows: [win, panel], appInFront: true), true, "the application's own panel")
+    checkPanel(panelAllowed(serviceWindow: panel, appWindows: [win], appInFront: true), false, "a panel the application does not show (another application's)")
+    checkPanel(panelAllowed(serviceWindow: panel, appWindows: [win, panel], appInFront: false), false, "no panel while the application is not in front")
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
 }
@@ -1313,7 +1348,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 // while the application is in front. Keys only while it is in front.
                 self.injector.inRange = { [weak self] _, top in
                     guard let self, let pid = self.app?.processIdentifier, let top else { return false }
-                    return top == pid || (self.appInFront() && isPanelService(top))
+                    return top == pid || self.appPanels().contains { $0.pid == top }
                 }
                 self.injector.keysAllowed = { [weak self] in self?.appInFront() ?? false }
                 self.injector.windowAt = { [weak self] point in self?.appWindow(at: point) }
@@ -1330,6 +1365,17 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The windows of the system's open and save panel that are the application's own (see
+    /// panelAllowed), on the screen now.
+    func appPanels() -> [WindowInfo] {
+        guard let pid = app?.processIdentifier else { return [] }
+        let services = windowList().filter { isPanelService($0.pid) && $0.layer >= 0 && $0.alpha > 0.05 }
+        guard !services.isEmpty else { return [] }
+        let own = axWindowBounds(pid)
+        let front = appInFront()
+        return services.filter { panelAllowed(serviceWindow: $0.bounds, appWindows: own, appInFront: front) }
+    }
+
     func appInFront() -> Bool {
         guard let pid = app?.processIdentifier, let front = NSWorkspace.shared.frontmostApplication else { return false }
         return front.processIdentifier == pid
@@ -1339,6 +1385,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// process too); the window that is shown when there is none there. Never another process's.
     func appWindow(at point: CGPoint) -> WindowInfo? {
         guard let pid = app?.processIdentifier else { return nil }
+        // The application's own panel first: it lies over its windows. A press on it keeps its
+        // drag and release inside it.
+        if let panel = appPanels().first(where: { $0.bounds.contains(point) }) { return panel }
         let mine = windowList().filter { $0.pid == pid && $0.alpha > 0.05 }
         return mine.first { $0.bounds.contains(point) } ?? mine.first { $0.id == windowId }
     }
@@ -1376,7 +1425,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             windowBounds = .zero
             if settings.fitWindow { fit(chosen) }
         }
-        if chosen.bounds != windowBounds {
+        // A panel of the system's for the application came or went: placed again, with it.
+        let panelShown = !appPanels().isEmpty
+        if chosen.bounds != windowBounds || panelShown != self.panelShown {
+            self.panelShown = panelShown
             windowBounds = chosen.bounds
             place(chosen)
         }
@@ -1450,8 +1502,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.scApplication = scApp
                 self.captureRect = rect
                 let configuration = Capture.configuration(width: self.width, height: self.height, sourceRect: rect)
-                let filter = SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
+                // The system's open and save panel is another process's: in the picture while the
+                // application is in front (the same range as the input).
+                let shownPanels = Set(self.appPanels().map(\.pid))
+                let panels = content.applications.filter { shownPanels.contains($0.processID) }
+                let included = [scApp] + panels
+                let filter = SCContentFilter(display: display, including: included, exceptingWindows: [])
+                let names = included.map { Int($0.processID) }
+                self.panelApplications = panels
                 if let capture = self.capture, self.display?.displayID == display.displayID {
+                    if names != self.includedPids { capture.update(filter) }
                     capture.update(configuration)
                 } else if let capture = self.capture {
                     self.display = display
@@ -1463,6 +1523,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                         self.openPicture { why in self.started(why) }
                     }
                 }
+                self.includedPids = names
                 if frameLog.on {
                     frameLog.write("{\"kind\":\"window\",\"t_ns\":\(nowNs()),\"points\":\"\(Int(window.bounds.width))x\(Int(window.bounds.height))\",\"scale\":\(String(format: "%.3f", fit))}")
                 }
@@ -1473,6 +1534,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// The part of the display the application's picture is read from (its points, from its top
     /// left); set by place().
     var captureRect: CGRect?
+    /// The processes the capture includes now, and the panel processes among them.
+    var includedPids: [Int] = []
+    var panelShown = false
+    var panelApplications: [SCRunningApplication] = []
 
     var started = false
     func started(_ why: String?) {
@@ -1512,7 +1577,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 if self.app != nil {
                     // Only the application's windows; other applications are not in the picture.
                     guard let scApp = self.scApplication, let placed = self.captureRect else { return done(nil) }  // placed later
-                    filter = SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
+                    filter = SCContentFilter(display: display, including: [scApp] + self.panelApplications, exceptingWindows: [])
                     rect = placed
                 } else {
                     filter = SCContentFilter(display: display, excludingWindows: [])
