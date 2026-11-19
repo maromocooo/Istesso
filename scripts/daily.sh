@@ -1370,9 +1370,10 @@ stop_windows() {
 # ---- The Mac host (the Mac Studio) ----
 #
 # One launcher for both hosts: `--host mac` hands the command to the Mac host stream's
-# scripts/daily-mac.sh (branch m4-daily-host; that stream edits it and its host program, this script
-# only calls it), with the same words: open APP [--for aura] [--size WxH], list, close APP, stop,
-# setup. It is run without this script's lock descriptor (its guard must not hold the lock), after
+# scripts/daily-mac.sh (branch m4-daily-host; that stream edits it, its list of applications that may
+# be opened (scripts/daily-mac-apps.txt and the owner's ~/.config/istesso/daily-mac-apps.txt) and its
+# host program; this script only calls it), with the same words: open APP [--for aura] [--slot N]
+# [--size WxH], list, close APP, stop, setup. It is run without this script's lock descriptor (its guard must not hold the lock), after
 # the measuring signal was read here; it reads the signal itself as well, and stops everything of
 # its own by the numbers it wrote down.
 mac_script=${DAILY_MAC_SCRIPT:-"$HOME/link-proj-m4-daily/scripts/daily-mac.sh"}
@@ -1396,15 +1397,15 @@ split_host() {
     done
     case "$host_choice" in ubuntu | mac) ;; *) echo "error: --host is ubuntu (the default) or mac"; exit 2 ;; esac
 }
-do_open_mac() { # APP [--for aura] [--size WxH]
-    [ $# -ge 1 ] || { echo "usage: scripts/daily.sh open APP --host mac [--for aura] [--size WxH]"; exit 2; }
+do_open_mac() { # APP [--for aura] [--slot N] [--size WxH]
+    [ $# -ge 1 ] || { echo "usage: scripts/daily.sh open APP --host mac [--for aura] [--slot N]"; exit 2; }
     local app=$1 passed=()
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
-        --for | --size) passed+=("$1" "${2:-}"); shift 2 ;;
+        --for | --slot | --size) passed+=("$1" "${2:-}"); shift 2 ;;
         --document | --min-qp) echo "error: $1 is for the Ubuntu host only"; exit 2 ;;
-        *) echo "error: open APP --host mac [--for aura] [--size WxH]"; exit 2 ;;
+        *) echo "error: open APP --host mac [--for aura] [--slot N]"; exit 2 ;;
         esac
     done
     refuse_when_busy
