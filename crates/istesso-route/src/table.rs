@@ -135,7 +135,9 @@ mod tests {
             for entry in entries {
                 let manifest: HostManifest = serde_json::from_value(entry["manifest"].clone())
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
-                assert_eq!(manifest.schema, istesso_proto::MANIFEST_SCHEMA, "{name}");
+                // These captures predate the capabilities field.
+                assert_eq!(manifest.schema, 2, "{name}");
+                assert_eq!(manifest.capabilities, Default::default(), "{name}");
                 assert_eq!(manifest.name, entry["name"].as_str().unwrap(), "{name}");
                 let _: HostState = serde_json::from_value(entry["state"].clone()).expect(name);
                 if !entry["status"].is_null() {

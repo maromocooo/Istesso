@@ -129,7 +129,11 @@ pub fn local_manifest(paths: &Paths, max_age: Duration) -> HostManifest {
 
 /// Inspects this machine now and remembers the result.
 pub fn refresh_local_manifest(paths: &Paths) -> HostManifest {
+    #[cfg(not(test))]
     let manifest = istesso_doctor::detect();
+    // Cache and survey tests exercise refresh without invoking installed tools.
+    #[cfg(test)]
+    let manifest = crate::testing::manifest("");
     remember_local_manifest(paths, &manifest);
     manifest
 }
@@ -148,7 +152,7 @@ pub fn remember_local_manifest(paths: &Paths, manifest: &HostManifest) {
 
 /// Writes a file only its owner can read, replacing any earlier version in
 /// one step.
-fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
     if let Some(parent) = path.parent() {

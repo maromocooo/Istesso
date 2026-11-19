@@ -1,0 +1,2048 @@
+{
+  "info": {
+    "arguments": [
+      "Example Value 1",
+      "Example Value 2",
+      "Example Value 3",
+      "Example Value 4",
+      "Example Value 5",
+      "Example Value 6",
+      "Example Value 7",
+      "Example Value 8"
+    ],
+    "commandType": "devicectl.list.devices",
+    "environment": {
+      "TERM": "Example Value 9"
+    },
+    "jsonVersion": 5,
+    "outcome": "success",
+    "version": "642.0.1"
+  },
+  "result": {
+    "devices": [
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 1",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "realityDevice",
+          "hardwareModel": "X1AP",
+          "marketingName": "Example Model 1",
+          "platform": "visionOS",
+          "productType": "Example1,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000001"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000001",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "realityDevice",
+            "hasActionButton": false,
+            "marketingName": "Example Model 1",
+            "platform": "xrOS",
+            "productType": "Example1,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000001"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 1",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 2",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "appleWatch",
+          "hardwareModel": "X2AP",
+          "marketingName": "Example Model 2",
+          "platform": "watchOS",
+          "productType": "Example2,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000002"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000002",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "appleWatch",
+            "hasActionButton": false,
+            "marketingName": "Example Model 2",
+            "platform": "watchOS",
+            "productType": "Example2,1",
+            "reality": "simulated",
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000002"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 2",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 3",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "appleWatch",
+          "hardwareModel": "X3AP",
+          "marketingName": "Example Model 3",
+          "platform": "watchOS",
+          "productType": "Example3,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000003"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000003",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "appleWatch",
+            "hasActionButton": false,
+            "marketingName": "Example Model 3",
+            "platform": "watchOS",
+            "productType": "Example3,1",
+            "reality": "simulated",
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000003"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 3",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 4",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "appleWatch",
+          "hardwareModel": "X4AP",
+          "marketingName": "Example Model 4",
+          "platform": "watchOS",
+          "productType": "Example4,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000004"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000004",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "appleWatch",
+            "hasActionButton": false,
+            "marketingName": "Example Model 4",
+            "platform": "watchOS",
+            "productType": "Example4,1",
+            "reality": "simulated",
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000004"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 4",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 5",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPad",
+          "hardwareModel": "X5AP",
+          "marketingName": "Example Model 5",
+          "platform": "iOS",
+          "productType": "Example5,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000005"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000005",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPad",
+            "hasActionButton": false,
+            "marketingName": "Example Model 5",
+            "platform": "iOS",
+            "productType": "Example5,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000005"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 5",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 6",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "hardwareModel": "X6AP",
+          "marketingName": "Example Model 6",
+          "platform": "iOS",
+          "productType": "Example6,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000006"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000006",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "hasActionButton": false,
+            "marketingName": "Example Model 6",
+            "platform": "iOS",
+            "productType": "Example6,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000006"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 6",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 7",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "hardwareModel": "X7AP",
+          "marketingName": "Example Model 7",
+          "platform": "iOS",
+          "productType": "Example7,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000007"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000007",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "hasActionButton": false,
+            "marketingName": "Example Model 7",
+            "platform": "iOS",
+            "productType": "Example7,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000007"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateLetterComponent": "a",
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 7",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 7",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "hardwareModel": "X7AP",
+          "marketingName": "Example Model 7",
+          "platform": "iOS",
+          "productType": "Example7,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000008"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000008",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "hasActionButton": false,
+            "marketingName": "Example Model 7",
+            "platform": "iOS",
+            "productType": "Example7,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000008"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 7",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 8",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "hardwareModel": "X8AP",
+          "marketingName": "Example Model 8",
+          "platform": "iOS",
+          "productType": "Example8,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-000000000009"
+        },
+        "identifier": "00000000-0000-4000-8000-000000000009",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "hasActionButton": false,
+            "marketingName": "Example Model 8",
+            "platform": "iOS",
+            "productType": "Example8,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-000000000009"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 8",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 8",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "hardwareModel": "X8AP",
+          "marketingName": "Example Model 8",
+          "platform": "iOS",
+          "productType": "Example8,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-00000000000A"
+        },
+        "identifier": "00000000-0000-4000-8000-00000000000A",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "hasActionButton": false,
+            "marketingName": "Example Model 8",
+            "platform": "iOS",
+            "productType": "Example8,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-00000000000A"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 8",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "implicit",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [],
+          "transportType": "sameMachine",
+          "tunnelState": "disconnected"
+        },
+        "deviceProperties": {
+          "bootState": "shutdown",
+          "ddiServicesAvailable": false,
+          "hasInternalOSBuild": false,
+          "name": "Example Simulator 8",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "provider": "Example Value 10"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "hardwareModel": "X8AP",
+          "marketingName": "Example Model 8",
+          "platform": "iOS",
+          "productType": "Example8,1",
+          "reality": "simulated",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "udid": "00000000-0000-4000-8000-00000000000B"
+        },
+        "identifier": "00000000-0000-4000-8000-00000000000B",
+        "properties": {
+          "connection": {
+            "authenticationType": "implicit",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "sameMachine"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "hasActionButton": false,
+            "marketingName": "Example Model 8",
+            "platform": "iOS",
+            "productType": "Example8,1",
+            "reality": "simulated",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportsSiri": false,
+            "udid": "00000000-0000-4000-8000-00000000000B"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "updateLetterComponent": "a",
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "bootState": "shutdown",
+            "name": "Example Simulator 8",
+            "preparednessState": 0,
+            "visibilityClass": "simulators"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "simulators"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "manualPairing",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [
+            "example-1.local",
+            "example-2.local",
+            "example-3.local"
+          ],
+          "tunnelState": "unavailable"
+        },
+        "deviceProperties": {
+          "bootedFromSnapshot": true,
+          "bootedSnapshotName": "com.example.snapshot",
+          "ddiServicesAvailable": false,
+          "developerModeStatus": "enabled",
+          "hasInternalOSBuild": false,
+          "name": "Example Device 1",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "rootFileSystemIsWritable": false,
+          "supportsCheckedAllocations": false
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "ecid": 1000000000000001,
+          "hardwareModel": "X91AP",
+          "internalStorageCapacity": 100000000000,
+          "isProductionFused": true,
+          "marketingName": "Example Phone 1",
+          "platform": "iOS",
+          "productType": "Example91,1",
+          "reality": "physical",
+          "serialNumber": "SERIAL-1",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "supportedDeviceFamilies": [
+            1
+          ],
+          "thinningProductType": "Example91,1",
+          "udid": "00000000-0000000000000001"
+        },
+        "identifier": "00000000-0000-4000-8000-00000000000C",
+        "properties": {
+          "connection": {
+            "authenticationType": "manualPairing",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "unavailable"
+          },
+          "hardware": {
+            "cpuCount": {
+              "logicalCores": 4,
+              "packages": 1,
+              "physicalCores": 4
+            },
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "ecid": 1000000000000001,
+            "hasActionButton": false,
+            "internalStorageCapacity": 100000000000,
+            "marketingName": "Example Phone 1",
+            "platform": "iOS",
+            "productType": "Example91,1",
+            "reality": "physical",
+            "serialNumber": "SERIAL-1",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportedDeviceFamilies": [
+              1
+            ],
+            "supportsSiri": false,
+            "thinningProductType": "Example91,1",
+            "udid": "00000000-0000000000000001"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "trainProgram": "Example",
+                "updateNumberComponent": 100
+              },
+              "supplementalBuildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "trainProgram": "Example",
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            },
+            "supportsCheckedAllocations": false
+          },
+          "state": {
+            "developerModeStatus": {
+              "enabled": {
+                "mode": 1
+              }
+            },
+            "name": "Example Device 1"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "default"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "manualPairing",
+          "isMobileDeviceOnly": false,
+          "lastConnectionDate": "2026-01-01T00:00:00.000Z",
+          "pairingState": "paired",
+          "potentialHostnames": [
+            "example-4.local",
+            "example-5.local",
+            "example-6.local"
+          ],
+          "transportType": "localNetwork",
+          "tunnelState": "disconnected",
+          "tunnelTransportProtocol": "tcp"
+        },
+        "deviceProperties": {
+          "bootState": "booted",
+          "bootedFromSnapshot": true,
+          "bootedSnapshotName": "com.example.snapshot",
+          "ddiServicesAvailable": false,
+          "developerModeStatus": "enabled",
+          "hasInternalOSBuild": false,
+          "name": "Example Device 2",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0",
+          "rootFileSystemIsWritable": false,
+          "supportsCheckedAllocations": false
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPad",
+          "ecid": 1000000000000002,
+          "hardwareModel": "X92AP",
+          "internalStorageCapacity": 100000000000,
+          "isProductionFused": true,
+          "marketingName": "Example Tablet 1",
+          "platform": "iOS",
+          "productType": "Example92,1",
+          "reality": "physical",
+          "serialNumber": "SERIAL-2",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "supportedDeviceFamilies": [
+            1
+          ],
+          "thinningProductType": "Example92,1",
+          "udid": "00000000-0000000000000002"
+        },
+        "identifier": "00000000-0000-4000-8000-00000000000D",
+        "properties": {
+          "connection": {
+            "authenticationType": "manualPairing",
+            "lastConnectionDate": 790000000,
+            "pairingState": "paired",
+            "state": "disconnected",
+            "transportType": "localNetwork",
+            "tunnelTransportProtocol": "tcp"
+          },
+          "hardware": {
+            "cpuCount": {
+              "logicalCores": 4,
+              "packages": 1,
+              "physicalCores": 4
+            },
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPad",
+            "ecid": 1000000000000002,
+            "hasActionButton": false,
+            "internalStorageCapacity": 100000000000,
+            "marketingName": "Example Tablet 1",
+            "platform": "iOS",
+            "productType": "Example92,1",
+            "reality": "physical",
+            "serialNumber": "SERIAL-2",
+            "supportedBiometrics": [
+              "exampleBiometric"
+            ],
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportedDeviceFamilies": [
+              1
+            ],
+            "supportsSiri": false,
+            "thinningProductType": "Example92,1",
+            "udid": "00000000-0000000000000002"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "trainProgram": "Example",
+                "updateNumberComponent": 100
+              },
+              "supplementalBuildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "trainProgram": "Example",
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            },
+            "supportsCheckedAllocations": false
+          },
+          "state": {
+            "bootState": "booted",
+            "developerModeStatus": {
+              "enabled": {
+                "mode": 1
+              }
+            },
+            "name": "Example Device 2"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "default"
+      },
+      {
+        "_deprecationNotice": {
+          "deprecatedFields": [
+            "hardwareProperties",
+            "deviceProperties",
+            "connectionProperties"
+          ],
+          "message": "The 'hardwareProperties', 'deviceProperties', 'connectionProperties' fields are deprecated and will be removed in a future release. Use the 'properties' dictionary instead.",
+          "replacement": "properties"
+        },
+        "capabilities": [
+          {
+            "featureIdentifier": "com.example.feature.1",
+            "name": "Example feature 1"
+          },
+          {
+            "featureIdentifier": "com.example.feature.2",
+            "name": "Example feature 2"
+          },
+          {
+            "featureIdentifier": "com.example.feature.3",
+            "name": "Example feature 3"
+          }
+        ],
+        "connectionProperties": {
+          "authenticationType": "manualPairing",
+          "isMobileDeviceOnly": false,
+          "pairingState": "paired",
+          "potentialHostnames": [
+            "example-7.local",
+            "example-8.local",
+            "example-9.local"
+          ],
+          "tunnelState": "unavailable"
+        },
+        "deviceProperties": {
+          "ddiServicesAvailable": false,
+          "name": "Example Device 3",
+          "osBuildUpdate": "99A100",
+          "osVersionNumber": "99.0"
+        },
+        "hardwareProperties": {
+          "cpuType": {
+            "name": "exampleCPU",
+            "subType": 1,
+            "type": 1
+          },
+          "deviceType": "iPhone",
+          "ecid": 1000000000000003,
+          "hardwareModel": "X93AP",
+          "platform": "iOS",
+          "productType": "Example93,1",
+          "supportedCPUTypes": [
+            {
+              "name": "exampleCPU",
+              "subType": 1,
+              "type": 1
+            }
+          ],
+          "supportedDeviceFamilies": [
+            1
+          ],
+          "udid": "00000000-0000000000000003"
+        },
+        "identifier": "00000000-0000-4000-8000-00000000000E",
+        "properties": {
+          "connection": {
+            "authenticationType": "manualPairing",
+            "pairingState": "paired",
+            "state": "unavailable"
+          },
+          "hardware": {
+            "cpuType": {
+              "subtype": 1,
+              "type": 1
+            },
+            "deviceType": "iPhone",
+            "ecid": 1000000000000003,
+            "platform": "iOS",
+            "productType": "Example93,1",
+            "supportedCPUTypes": [
+              {
+                "subtype": 1,
+                "type": 1
+              }
+            ],
+            "supportedDeviceFamilies": [
+              1
+            ],
+            "udid": "00000000-0000000000000003"
+          },
+          "software": {
+            "osBuildVersions": {
+              "buildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "trainProgram": "Example",
+                "updateNumberComponent": 100
+              },
+              "supplementalBuildVersion": {
+                "majorLetterComponent": "A",
+                "majorNumberComponent": 99,
+                "name": "99A100",
+                "revisionVersion": {
+                  "components": [
+                    99,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "originalComponentsCount": 2,
+                  "stringValue": "99.0"
+                },
+                "trainProgram": "Example",
+                "updateNumberComponent": 100
+              }
+            },
+            "osVersionNumber": {
+              "components": [
+                99,
+                0,
+                0,
+                0,
+                0
+              ],
+              "originalComponentsCount": 2,
+              "stringValue": "99.0"
+            }
+          },
+          "state": {
+            "name": "Example Device 3"
+          }
+        },
+        "propertyDisplayNames": null,
+        "visibilityClass": "default"
+      }
+    ]
+  }
+}

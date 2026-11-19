@@ -1,0 +1,1 @@
+NVIDIA Example GPU, 16384, 590.48.01

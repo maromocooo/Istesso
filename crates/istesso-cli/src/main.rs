@@ -1,5 +1,7 @@
 //! `istesso` — the command line entry point of Istesso.
 
+mod projects;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -45,6 +47,17 @@ enum Command {
     Apps {
         #[command(subcommand)]
         action: AppsAction,
+    },
+    /// List projects and their development machines, or manage local registrations
+    Projects {
+        /// Show the project with this name across all machines
+        #[arg(long)]
+        name: Option<String>,
+        /// Print the list as JSON
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<projects::Action>,
     },
     /// Pair this device with another one
     Pair {
@@ -700,9 +713,9 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Doctor { json } => {
-            let manifest = istesso_doctor::detect();
-            // Other commands and the agent reuse this inspection for a while.
-            cache::remember_local_manifest(&Paths::from_env(), &manifest);
+            let paths = Paths::from_env();
+            let mut manifest = cache::refresh_local_manifest(&paths);
+            manifest.projects = istesso_agent::projects::list(&paths)?;
             if json {
                 print_json(&manifest)
             } else {
@@ -726,6 +739,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         }
+        Command::Projects { action, name, json } => projects::run(action, name.as_deref(), json),
         Command::Apps { action } => run_apps(action),
         Command::Pair { action } => run_pair(action),
         Command::Peers { action } => run_peers(action),
@@ -1067,7 +1081,7 @@ fn format_bytes(bytes: u64) -> String {
 fn render_manifest(m: &HostManifest) -> String {
     let mut out = String::new();
     let mut row = |label: &str, value: String| {
-        out.push_str(&format!("{label:<10}{value}\n"));
+        out.push_str(&format!("{label:<9} {value}\n"));
     };
 
     row("Host", m.name.clone());
@@ -1156,27 +1170,6 @@ fn render_manifest(m: &HostManifest) -> String {
         };
         row("Network", format!("{} {kind}, {state}", interface.name));
     }
-    let mut tools = Vec::new();
-    if let Some(xcode) = &m.tools.xcode {
-        tools.push(format!("Xcode {xcode}"));
-    }
-    if m.tools.cargo {
-        tools.push("cargo".to_string());
-    }
-    if m.tools.docker {
-        tools.push("docker".to_string());
-    }
-    if m.tools.gstreamer {
-        tools.push("gstreamer".to_string());
-    }
-    row(
-        "Tools",
-        if tools.is_empty() {
-            "none found".to_string()
-        } else {
-            tools.join(", ")
-        },
-    );
     row(
         "Roles",
         if m.roles.is_empty() {
@@ -1187,6 +1180,74 @@ fn render_manifest(m: &HostManifest) -> String {
                 .map(|r| role_label(*r))
                 .collect::<Vec<_>>()
                 .join(", ")
+        },
+    );
+    let caps = &m.capabilities;
+    let tools = caps
+        .tools
+        .iter()
+        .filter_map(|(name, info)| {
+            let info = info.as_ref()?;
+            Some(match &info.version {
+                Some(version) => format!("{name} {version}"),
+                None => name.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    row(
+        "Tools",
+        if tools.is_empty() {
+            "none found".into()
+        } else {
+            tools.join(", ")
+        },
+    );
+    let with_details = |count: usize, details: Vec<String>| {
+        if details.is_empty() {
+            count.to_string()
+        } else {
+            format!("{count} ({})", details.join(", "))
+        }
+    };
+    row(
+        "iOS devices",
+        caps.attached.ios.as_ref().map_or_else(
+            || "devicectl not available".into(),
+            |devices| {
+                with_details(
+                    devices.len(),
+                    devices
+                        .iter()
+                        .map(|d| d.model.as_deref().unwrap_or("unknown model").to_owned())
+                        .collect(),
+                )
+            },
+        ),
+    );
+    row(
+        "Simulators",
+        caps.attached.simulators.as_ref().map_or_else(
+            || "simctl not available".into(),
+            |counts| {
+                with_details(
+                    counts.available as usize,
+                    counts
+                        .by_platform
+                        .iter()
+                        .map(|(platform, n)| format!("{platform} {n}"))
+                        .collect(),
+                )
+            },
+        ),
+    );
+    row(
+        "Android",
+        match &caps.attached.android {
+            Some(android) => android.count.to_string(),
+            None if caps.tools.get("adb").is_some_and(Option::is_some) => {
+                "adb server not running".into()
+            }
+            None => "adb not found".into(),
         },
     );
     if !m.warnings.is_empty() {
@@ -2349,7 +2410,7 @@ mod tests {
 
     #[test]
     fn manifest_rendering_mentions_roles_and_warnings() {
-        let mut manifest = istesso_doctor::detect();
+        let mut manifest = sample_manifest("");
         manifest.warnings = vec!["something to know".to_string()];
         let text = render_manifest(&manifest);
         assert!(text.contains("Host"));
@@ -2359,7 +2420,7 @@ mod tests {
 
     /// A made-up manifest, so that most tests do not have to inspect the
     /// machine they run on (slow on macOS).
-    fn sample_manifest(name: &str) -> HostManifest {
+    pub(super) fn sample_manifest(name: &str) -> HostManifest {
         HostManifest {
             schema: istesso_proto::MANIFEST_SCHEMA,
             name: name.to_string(),
@@ -2386,9 +2447,49 @@ mod tests {
             },
             power: istesso_proto::PowerCaps::default(),
             tools: istesso_proto::Tools::default(),
+            capabilities: Default::default(),
+            projects: Vec::new(),
             roles: vec![Role::MacApps, Role::HardwareEncode],
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn manifest_renders_capabilities_and_carries_them_in_the_host_view() {
+        let mut host = view("", false, HostState::Awake);
+        let mut manifest = sample_manifest("");
+        let caps = serde_json::json!({
+            "tools": {"simctl": {"version": null}, "adb": {"version": "1.0.41"}, "docker": null},
+            "attached": {
+                "ios": [{"model": "Example Phone 1"}, {"model": "Example Tablet 1"}, {}],
+                "simulators": {"available": 39, "by_platform": {"iOS":33, "watchOS":5, "xrOS":1}},
+                "android": {"count": 0}
+            }
+        });
+        manifest.capabilities = serde_json::from_value(caps).unwrap();
+        let text = render_manifest(&manifest);
+        for row in [
+            "Tools     adb 1.0.41, simctl",
+            "iOS devices 3 (Example Phone 1, Example Tablet 1, unknown model)",
+            "Simulators 39 (iOS 33, watchOS 5, xrOS 1)",
+            "Android   0",
+        ] {
+            assert!(text.lines().any(|line| line == row), "{text}");
+        }
+        host.manifest = Some(manifest.clone());
+        let hosts = serde_json::to_value([host]).unwrap();
+        assert_eq!(
+            hosts[0]["manifest"]["capabilities"],
+            serde_json::to_value(&manifest.capabilities).unwrap()
+        );
+
+        manifest.capabilities.attached = Default::default();
+        let text = render_manifest(&manifest);
+        assert!(text.contains("iOS devices devicectl not available"));
+        assert!(text.contains("Simulators simctl not available"));
+        assert!(text.contains("Android   adb server not running"));
+        manifest.capabilities.tools.insert("adb".into(), None);
+        assert!(render_manifest(&manifest).contains("Android   adb not found"));
     }
 
     #[test]
@@ -2475,7 +2576,7 @@ mod tests {
         assert_eq!(ago(3 * 86_400), "3 days ago");
     }
 
-    fn view(name: &str, local: bool, state: HostState) -> HostView {
+    pub(super) fn view(name: &str, local: bool, state: HostState) -> HostView {
         let mut manifest = sample_manifest(name);
         manifest.power.interfaces = vec![istesso_proto::NetInterface {
             name: "en0".to_string(),

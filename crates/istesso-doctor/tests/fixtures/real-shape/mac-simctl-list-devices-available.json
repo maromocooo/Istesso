@@ -1,0 +1,426 @@
+{
+  "devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-90-0": [
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000C/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000000C",
+        "udid": "00000000-0000-4000-8000-00000000000C",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-1",
+        "state": "Shutdown",
+        "name": "Example Simulator 1"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000F/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000000F",
+        "udid": "00000000-0000-4000-8000-00000000000F",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-2",
+        "state": "Shutdown",
+        "name": "Example Simulator 2"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000010/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000010",
+        "udid": "00000000-0000-4000-8000-000000000010",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-3",
+        "state": "Shutdown",
+        "name": "Example Simulator 3"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000011/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000011",
+        "udid": "00000000-0000-4000-8000-000000000011",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-4",
+        "state": "Shutdown",
+        "name": "Example Simulator 4"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000008/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000008",
+        "udid": "00000000-0000-4000-8000-000000000008",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-5",
+        "state": "Shutdown",
+        "name": "Example Simulator 5"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000012/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000012",
+        "udid": "00000000-0000-4000-8000-000000000012",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-6",
+        "state": "Shutdown",
+        "name": "Example Simulator 6"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000013/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000013",
+        "udid": "00000000-0000-4000-8000-000000000013",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-7",
+        "state": "Shutdown",
+        "name": "Example Simulator 7"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000014/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000014",
+        "udid": "00000000-0000-4000-8000-000000000014",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-8",
+        "state": "Shutdown",
+        "name": "Example Simulator 8"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000015/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000015",
+        "udid": "00000000-0000-4000-8000-000000000015",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-9",
+        "state": "Shutdown",
+        "name": "Example Simulator 9"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000016/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000016",
+        "udid": "00000000-0000-4000-8000-000000000016",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-10",
+        "state": "Shutdown",
+        "name": "Example Simulator 10"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000017/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000017",
+        "udid": "00000000-0000-4000-8000-000000000017",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-11",
+        "state": "Shutdown",
+        "name": "Example Simulator 11"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.watchOS-90-0": [
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000004/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000004",
+        "udid": "00000000-0000-4000-8000-000000000004",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-12",
+        "state": "Shutdown",
+        "name": "Example Simulator 12"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000018/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000018",
+        "udid": "00000000-0000-4000-8000-000000000018",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-13",
+        "state": "Shutdown",
+        "name": "Example Simulator 13"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000005/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000005",
+        "udid": "00000000-0000-4000-8000-000000000005",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-14",
+        "state": "Shutdown",
+        "name": "Example Simulator 14"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000003/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000003",
+        "udid": "00000000-0000-4000-8000-000000000003",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-15",
+        "state": "Shutdown",
+        "name": "Example Simulator 15"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000019/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000019",
+        "udid": "00000000-0000-4000-8000-000000000019",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-16",
+        "state": "Shutdown",
+        "name": "Example Simulator 16"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-90-1": [
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000A/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000000A",
+        "udid": "00000000-0000-4000-8000-00000000000A",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-1",
+        "state": "Shutdown",
+        "name": "Example Simulator 1"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000001A/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000001A",
+        "udid": "00000000-0000-4000-8000-00000000001A",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-2",
+        "state": "Shutdown",
+        "name": "Example Simulator 2"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000001B/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000001B",
+        "udid": "00000000-0000-4000-8000-00000000001B",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-4",
+        "state": "Shutdown",
+        "name": "Example Simulator 4"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000009/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000009",
+        "udid": "00000000-0000-4000-8000-000000000009",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-5",
+        "state": "Shutdown",
+        "name": "Example Simulator 5"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000007/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000007",
+        "udid": "00000000-0000-4000-8000-000000000007",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-17",
+        "state": "Shutdown",
+        "name": "Example Simulator 17"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000001C/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000001C",
+        "udid": "00000000-0000-4000-8000-00000000001C",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-6",
+        "state": "Shutdown",
+        "name": "Example Simulator 6"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000001D/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000001D",
+        "udid": "00000000-0000-4000-8000-00000000001D",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-7",
+        "state": "Shutdown",
+        "name": "Example Simulator 7"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000001E/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000001E",
+        "udid": "00000000-0000-4000-8000-00000000001E",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-8",
+        "state": "Shutdown",
+        "name": "Example Simulator 8"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000001F/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000001F",
+        "udid": "00000000-0000-4000-8000-00000000001F",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-11",
+        "state": "Shutdown",
+        "name": "Example Simulator 11"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000020/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000020",
+        "udid": "00000000-0000-4000-8000-000000000020",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-18",
+        "state": "Shutdown",
+        "name": "Example Simulator 18"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000021/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000021",
+        "udid": "00000000-0000-4000-8000-000000000021",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-19",
+        "state": "Shutdown",
+        "name": "Example Simulator 19"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-90-2": [
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000000B/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000000B",
+        "udid": "00000000-0000-4000-8000-00000000000B",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-1",
+        "state": "Shutdown",
+        "name": "Example Simulator 1"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000022/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000022",
+        "udid": "00000000-0000-4000-8000-000000000022",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-2",
+        "state": "Shutdown",
+        "name": "Example Simulator 2"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000023/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000023",
+        "udid": "00000000-0000-4000-8000-000000000023",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-3",
+        "state": "Shutdown",
+        "name": "Example Simulator 3"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000024/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000024",
+        "udid": "00000000-0000-4000-8000-000000000024",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-4",
+        "state": "Shutdown",
+        "name": "Example Simulator 4"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000025/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000025",
+        "udid": "00000000-0000-4000-8000-000000000025",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-5",
+        "state": "Shutdown",
+        "name": "Example Simulator 5"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000006/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000006",
+        "udid": "00000000-0000-4000-8000-000000000006",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-6",
+        "state": "Shutdown",
+        "name": "Example Simulator 6"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000026/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000026",
+        "udid": "00000000-0000-4000-8000-000000000026",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-7",
+        "state": "Shutdown",
+        "name": "Example Simulator 7"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000027/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000027",
+        "udid": "00000000-0000-4000-8000-000000000027",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-8",
+        "state": "Shutdown",
+        "name": "Example Simulator 8"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000028/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000028",
+        "udid": "00000000-0000-4000-8000-000000000028",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-9",
+        "state": "Shutdown",
+        "name": "Example Simulator 9"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000029/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000029",
+        "udid": "00000000-0000-4000-8000-000000000029",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-10",
+        "state": "Shutdown",
+        "name": "Example Simulator 10"
+      },
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-00000000002A/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-00000000002A",
+        "udid": "00000000-0000-4000-8000-00000000002A",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-11",
+        "state": "Shutdown",
+        "name": "Example Simulator 11"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.xrOS-90-0": [
+      {
+        "dataPath": "/Users/user/Library/Developer/CoreSimulator/Devices/00000000-0000-4000-8000-000000000002/data",
+        "dataPathSize": 1048576,
+        "logPath": "/Users/user/Library/Logs/CoreSimulator/00000000-0000-4000-8000-000000000002",
+        "udid": "00000000-0000-4000-8000-000000000002",
+        "lastUsedAt": "2026-01-01T00:00:00Z",
+        "isAvailable": true,
+        "logPathSize": 4096,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.Example-Model-20",
+        "state": "Shutdown",
+        "name": "Example Simulator 20"
+      }
+    ]
+  }
+}
