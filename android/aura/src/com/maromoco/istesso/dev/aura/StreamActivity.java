@@ -42,8 +42,6 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private String pictureLine = "";
     /** The picture is not there (connecting, cut, or waiting to connect again): the status line stays. */
     private boolean away;
-    /** How often in a row the input's connection was over; for the wait before it is opened again. */
-    private int inputAttempt;
 
     private Picture picture;
     private boolean surfaceReady;
@@ -226,7 +224,6 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     protected void onResume() {
         super.onResume();
         resumed = true;
-        inputAttempt = 0;
         openInput();
         statsSince = 0;
         status.removeCallbacks(inputWatch); // one loop, also when the panel comes back within a second
@@ -238,7 +235,6 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     @Override
     protected void onPause() {
         resumed = false;
-        status.removeCallbacks(reopenInput);
         stopPicture();
         if (input != 0) {
             Native.inputClose(input);
@@ -295,6 +291,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         pictureWidth = width;
         pictureHeight = height;
         runOnUiThread(() -> {
+            if (!resumed || picture == null) {
+                return; // a picture thread of a panel that has gone to the background
+            }
             away = false;
             takeWifi();
             frame.setAspect(width, height);
@@ -382,37 +381,16 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         }
         long[] s = Native.inputState(input);
         if (s != null && s[3] != 0) {
-            // Over for this connection: it is let go (the host lets go of whatever was held down)
-            // and opened again after a wait, 0.25 s doubling up to 5 s, as the picture does.
-            Native.inputClose(input);
-            input = 0;
-            buttons = 0;
-            touchDown = false;
-            inputAttempt++;
-            long wait = Picture.againAfter(inputAttempt);
-            Log.i("IstessoAura", "input: over; opening it again in " + wait + " ms");
-            inputLine = getString(R.string.input_again);
-            status.removeCallbacks(reopenInput);
-            status.postDelayed(reopenInput, wait);
+            // Over: the host refused the input for good (not paired, may not control, another
+            // version). The input library takes up every passing cut itself, so this is not tried
+            // again; the panel says why.
+            String why = Native.inputWhy(input);
+            inputLine = getString(R.string.input_over) + (why == null || why.isEmpty() ? "" : "：" + why);
         } else if (s != null) {
-            if (s[1] != 0) {
-                inputAttempt = 0;
-            }
             inputLine = s[1] != 0 ? getString(R.string.input_open) : getString(R.string.input_waiting);
         }
         show();
     }
-
-    /** Opens the input's connection again, after it was over (see showInput). */
-    private final Runnable reopenInput = new Runnable() {
-        @Override
-        public void run() {
-            if (resumed && input == 0) {
-                openInput();
-                showInput();
-            }
-        }
-    };
 
     private void openInput() {
         // Both connections name the paired host; without one, nothing is connected.

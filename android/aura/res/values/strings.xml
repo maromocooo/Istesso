@@ -20,7 +20,6 @@
     <string name="again_set_aside">つなぎ直しています…（ホストが絵を止めています。計測のあいだなど）</string>
     <string name="again_not_shown">つなぎ直しています…（ホストがほかの機器に絵を出しています）</string>
     <string name="again_no_answer">つなぎ直しています…（ホストが答えません）</string>
-    <string name="input_again">入力：つなぎ直しています…</string>
     <string name="over">終わりました：%1$s</string>
     <string name="decoder">復号器：%1$s%2$s</string>
     <string name="low_latency">（低遅延）</string>

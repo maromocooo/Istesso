@@ -629,6 +629,72 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_watchClo
     }
 }
 
+/// Why each input's connection is over, by the number given to it as its context: the
+/// sentence the input library says once (`told` event 4). Shown on the panel, never logged here.
+#[cfg(unix)]
+static INPUT_WHY: std::sync::Mutex<Vec<(usize, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(unix)]
+static INPUT_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+/// The input's handle and the number of its context.
+#[cfg(unix)]
+static INPUT_HANDLES: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(unix)]
+unsafe extern "C" fn input_told(
+    context: *mut c_void,
+    event: i32,
+    _cuts: u64,
+    _after_ms: f64,
+    _failure: i32,
+    why: *const c_char,
+) {
+    if event != 4 {
+        return;
+    }
+    let text = if why.is_null() {
+        String::new()
+    } else {
+        // SAFETY: the library's promise: a C string, valid during the call.
+        unsafe { CStr::from_ptr(why) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let mut list = INPUT_WHY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = list.iter_mut().find(|(n, _)| *n == context as usize) {
+        entry.1 = Some(text);
+    }
+}
+
+/// Why the input `input` is over, or None while it is not.
+#[cfg(unix)]
+fn input_why(input: usize) -> Option<String> {
+    let number = INPUT_HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, _)| *h == input)
+        .map(|(_, n)| *n)?;
+    INPUT_WHY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(n, _)| *n == number)
+        .and_then(|(_, why)| why.clone())
+}
+
+#[cfg(unix)]
+fn forget_input(input: usize) {
+    let mut handles = INPUT_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = handles.iter().position(|(h, _)| *h == input) {
+        let (_, number) = handles.remove(at);
+        INPUT_WHY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(n, _)| *n != number);
+    }
+}
+
 /// `long inputOpen(String configDir, String peer, String address)`: the input's connection
 /// to the paired device `peer` (its id; never empty) at `address`, or 0 (`lastError(0)` when no
 /// device was named, `lastError(2)` otherwise). Its thread keeps
@@ -657,15 +723,32 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputOpe
             return 0;
         };
         let address = c_text(env, address);
-        istesso_input_open(
+        let number = INPUT_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        INPUT_WHY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((number, None));
+        let input = istesso_input_open(
             dir.as_ptr(),
             peer.as_ptr(),
             address.as_ref().map_or(ptr::null(), |a| a.as_ptr()),
             ptr::null(),
             0,
-            None,
-            ptr::null_mut(),
-        ) as jlong
+            Some(input_told),
+            number as *mut c_void,
+        );
+        if input.is_null() {
+            INPUT_WHY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(n, _)| *n != number);
+        } else {
+            INPUT_HANDLES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((input as usize, number));
+        }
+        input as jlong
     }
 }
 
@@ -754,6 +837,26 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputClo
     if input != 0 {
         // SAFETY: the caller's promise.
         unsafe { istesso_input_close(input as *mut c_void) }
+        forget_input(input as usize);
+    }
+}
+
+/// `String inputWhy(long input)`: why the input's connection is over (the host refused it: not
+/// paired, may not control, ...), or null while it is not. From any thread.
+///
+/// # Safety
+/// Called by the Java virtual machine.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputWhy(
+    env: *mut JNIEnv,
+    _class: jclass,
+    input: jlong,
+) -> jstring {
+    match input_why(input as usize) {
+        // SAFETY: the virtual machine's promise.
+        Some(why) => unsafe { java_text(env, &why) },
+        None => ptr::null_mut(),
     }
 }
 

@@ -70,6 +70,9 @@ final class Native {
 
     static native void inputClose(long input);
 
+    /** Why the input's connection is over (the host refused it for good), or null while it is not. */
+    static native String inputWhy(long input);
+
     static native String lastError(int which);
 
     /** TRIAL ONLY: how often quick acknowledgements were set on the picture's socket; -1 without. */

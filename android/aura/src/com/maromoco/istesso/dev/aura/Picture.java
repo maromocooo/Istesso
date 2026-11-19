@@ -358,6 +358,12 @@ final class Picture {
                 into = scratch();
             }
             int got = Native.watchNext(watch, 100, into, meta);
+            if (stop) {
+                // The panel has gone while this waited (a first connection may take up to 3 s,
+                // longer than stop() waits): nothing more is opened or told, and the connection
+                // is closed by the caller.
+                return WATCH_DONE;
+            }
             switch (got) {
                 case Native.NEXT_FRAME: {
                     // When the whole frame had been read: istesso_media_now_ns(), which on Android is the
