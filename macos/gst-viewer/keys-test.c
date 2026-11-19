@@ -49,6 +49,8 @@ enum {
     SHIFT_KEY = 0x38,
     CAPS = 0x39,
     B = 0x0B,
+    C = 0x08,
+    V = 0x09,
     RIGHT_COMMAND_KEY = 0x36,
     OPTION_KEY = 0x3A,
     CONTROL_KEY = 0x3B,
@@ -299,6 +301,34 @@ int main(void) {
     EXPECT("A with Shift's flag after Option's release was lost: Option up, Shift lent",
            keys_key_down(&keys, A, KEYS_FLAG_SHIFT, false, out), -56, 42, 30, -42);
     EXPECT("the letter comes up", keys_key_up(&keys, A, KEYS_FLAG_SHIFT, out), -30);
+
+    // Command-C, X and V taken for copy and paste (ADR 0022): the viewer sends nothing for the
+    // letter's press and passes every release on to keys_key_up(), which sends a release only for
+    // a key that is down over there. While Command is held no release comes, so a C let go before
+    // Command stays taken in the viewer, and the release of its next plain press must go.
+    memset(&keys, 0, sizeof keys);
+    keys.command_is_control = true;
+    EXPECT("Command by hand", keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, out), 29);
+    // C goes down and is taken: nothing is sent, nothing is noted.
+    EXPECT_NOTHING("a taken C's release with Command held sends nothing",
+                   keys_key_up(&keys, C, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, out));
+    EXPECT("Command let go", keys_flags_changed(&keys, COMMAND_KEY, 0, out), -29);
+    EXPECT_NOTHING("a taken C's release after Command's sends nothing", keys_key_up(&keys, C, 0, out));
+    // Command-C again, and C let go first: its release never comes.
+    EXPECT("Command by hand again", keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, out), 29);
+    EXPECT("Command let go after C", keys_flags_changed(&keys, COMMAND_KEY, 0, out), -29);
+    EXPECT("the next plain C goes down", keys_key_down(&keys, C, 0, false, out), 46);
+    EXPECT_NOTHING("its repeats are the host's", keys_key_down(&keys, C, 0, true, out));
+    EXPECT("its release goes: it went down over there", keys_key_up(&keys, C, 0, out), -46);
+    EXPECT("the press after it is not lost", keys_key_down(&keys, C, 0, false, out), 46);
+    EXPECT("nor its release", keys_key_up(&keys, C, 0, out), -46);
+    // V held down plain, then Command: V's repeat under Command is taken for a paste. When Command
+    // comes up first, V's release comes, and lets go of the V that is down over there.
+    EXPECT("V held down plain", keys_key_down(&keys, V, 0, false, out), 47);
+    EXPECT("Command by hand under it", keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, out), 29);
+    EXPECT("Command let go before V", keys_flags_changed(&keys, COMMAND_KEY, 0, out), -29);
+    EXPECT("V's release lets it go over there", keys_key_up(&keys, V, 0, out), -47);
+    EXPECT_NOTHING("nothing stays down", keys_let_go(&keys, out));
 
     // Only the key itself makes a press to count.
     memset(&keys, 0, sizeof keys);

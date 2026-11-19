@@ -1882,7 +1882,9 @@ static BOOL command_is_control = YES;
     ScrollState _scroll; // parts of a pixel and of a notch not yet passed on
     BOOL _inside;        // the pointer is over the view
     NSPoint _at;         // where, in the view's own coordinates (from its bottom left)
-    NSMutableIndexSet *_taken;  // keys taken for copy and paste: their release is not passed on
+    // Keys taken for copy and paste. Their release sends nothing because they never went down over
+    // there (keyUp:, keys_key_up()), not because they are here.
+    NSMutableIndexSet *_taken;
 }
 
 // A cursor that shows nothing: over the view the cursor is the one drawn into the layer.
@@ -2124,10 +2126,12 @@ static NSCursor *empty_cursor(void) {
 }
 
 - (void)keyUp:(NSEvent *)event {
-    if ([_taken containsIndex:event.keyCode]) {
-        [_taken removeIndex:event.keyCode];
-        return;
-    }
+    // A key taken for copy and paste never went down over there, and keys_key_up() sends nothing
+    // for a key that is not down there: its release goes no further by itself. It is not skipped
+    // here: while Command is held no release comes (keys.h), so a C let go before Command stays
+    // taken, and the release of its next plain press, which did go down over there, must go
+    // (else the host repeats the letter, and the press after it is lost).
+    [_taken removeIndex:event.keyCode];
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
     [self send:changes count:keys_key_up(&_keys, event.keyCode, event.modifierFlags, changes)];
@@ -2250,8 +2254,20 @@ static NSCursor *empty_cursor(void) {
 - (void)mouseUp:(NSEvent *)event { [self button:0x110 pressed:NO event:event]; }
 - (void)rightMouseDown:(NSEvent *)event { [self button:0x111 pressed:YES event:event]; }
 - (void)rightMouseUp:(NSEvent *)event { [self button:0x111 pressed:NO event:event]; }
-- (void)otherMouseDown:(NSEvent *)event { [self button:0x112 pressed:YES event:event]; }
-- (void)otherMouseUp:(NSEvent *)event { [self button:0x112 pressed:NO event:event]; }
+// Only the middle button (AppKit's button 2) goes over, as the middle one; a mouse's further
+// buttons (back, forward) are not passed on.
+- (void)otherMouseDown:(NSEvent *)event {
+    if (event.buttonNumber != 2) {
+        return;
+    }
+    [self button:0x112 pressed:YES event:event];
+}
+- (void)otherMouseUp:(NSEvent *)event {
+    if (event.buttonNumber != 2) {
+        return;
+    }
+    [self button:0x112 pressed:NO event:event];
+}
 
 static void send_scroll(void *context, const char *message) {
     (void)context;
@@ -2390,6 +2406,14 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     [self updatePasswordField];
 }
 
+// The picture is back, or the first one is there (picture_is_back()): the host's notice of a
+// password field usually comes while the picture is not yet, and Secure Event Input is put on
+// now. Only while this window is the key window (updatePasswordField).
+- (void)fallInLine {
+    [super fallInLine];
+    [self updatePasswordField];
+}
+
 - (void)viewWillMoveToWindow:(NSWindow *)window {
     if (window == nil) {
         secure_input(NO);
@@ -2462,6 +2486,9 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     [super rightMouseDown:event];
 }
 - (void)otherMouseDown:(NSEvent *)event {
+    if (event.buttonNumber != 2) {
+        return;  // Not passed on (InputView): nothing to commit for, and no focus moves over there.
+    }
     [self commitComposition];
     _movesSinceNotice++;
     [super otherMouseDown:event];
