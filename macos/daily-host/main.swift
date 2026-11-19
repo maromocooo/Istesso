@@ -104,6 +104,9 @@ struct Settings {
     var newWindow = false
     /// Copy and paste of text with the trial agent (ADR 0022); off unless asked for.
     var clipboard = false
+    /// Local use first (docs/m4-daily-host.md): while this Mac's own keyboard, mouse or trackpad
+    /// was used within this many seconds, nothing is raised and nothing but releases is posted.
+    var localQuiet: Double = 3
 }
 
 func usage() -> Never {
@@ -112,7 +115,7 @@ func usage() -> Never {
            [--display | --app NAME|BUNDLE-ID|PATH] [--size WxH] [--fps N] [--chroma 444|420]
            [--bitrate KBIT] [--keep-awake FPS] [--min-qp N] [--input-socket PATH] [--input-dry]
            [--control FIFO] [--log FILE|-] [--no-fit-window] [--click-form 1|2|3] [--generated]
-           [--pid-file FILE] [--signal FILE] [--system-prompt-owner BUNDLE_ID]...
+           [--pid-file FILE] [--signal FILE] [--system-prompt-owner BUNDLE_ID]... [--local-quiet SECONDS]
 
     """.utf8))
     exit(2)
@@ -176,6 +179,10 @@ func readSettings() -> Settings {
         case "--virtual-slot": s.virtualSlot = max(1, min(3, number()))
         case "--new-window": s.newWindow = true
         case "--clipboard": s.clipboard = true
+        case "--local-quiet":
+            // Bounded, never off: local use always wins (the owner's rule).
+            guard let seconds = Double(value()), seconds.isFinite, (1...60).contains(seconds) else { usage() }
+            s.localQuiet = seconds
         default: usage()
         }
     }
@@ -1908,6 +1915,59 @@ func selfTest() -> Never {
         checkPanel(!gate.expired(now: 0.1) && gate.expired(now: 0.3) && gate.end() == [Data([1]), Data([2])], true,
                    "clipboard: what comes after a late paste is held 0.2 s at most, then given in order")
     }
+    // Local use first: the rule, its changes, and the injector, with a stand-in idle clock.
+    checkPanel(localUseRecent(idle: 2.9, quiet: 3), true, "local use: input 2.9 s ago holds the other side")
+    checkPanel(localUseRecent(idle: 3.0, quiet: 3), false, "local use: quiet for 3 s, the other side goes on")
+    checkPanel(localUseRecent(idle: .infinity, quiet: 3), false, "local use: never any local input, the other side goes on")
+    do {
+        var idle = 100.0
+        var told: [Bool] = []
+        let use = LocalUse(quiet: 3)
+        use.idle = { idle }
+        use.onChange = { told.append($0) }
+        let first = use.recent()
+        idle = 0.2
+        let during = use.recent() && use.recent()
+        idle = 2.5
+        let still = use.recentQuietly()
+        idle = 3.1
+        let after = use.recent()
+        checkPanel(!first && during && still && !after && told == [true, false], true,
+                   "local use: begins and ends once each, told once each; the quiet reading tells nobody")
+    }
+    do {
+        var idle = 100.0
+        var downs: [UInt32] = [], ups = 0, focus = 0, resized = 0
+        let use = LocalUse(quiet: 3)
+        use.idle = { idle }
+        let injector = Injector()
+        injector.mayPost = true
+        injector.target = { 100 }
+        injector.keysAllowed = { true }
+        injector.lockedNow = { false }
+        injector.localRecent = { use.recent() }
+        injector.onFocus = { focus += 1 }
+        injector.onResize = { _, _ in resized += 1 }
+        injector.postProcess = { event, _ in
+            if event.type == .keyDown { downs.append(UInt32(event.getIntegerValueField(.keyboardEventKeycode))) }
+            if event.type == .keyUp { ups += 1 }
+        }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        send(["kind": "key", "code": 30, "pressed": true])   // before any local use: goes
+        idle = 0.5                                             // the Studio's own keyboard is used
+        send(["kind": "key", "code": 30, "pressed": false])  // the release of a key sent before: goes
+        send(["kind": "key", "code": 48, "pressed": true])   // a new press: dropped
+        send(["kind": "key", "code": 48, "pressed": false])  // its release (never sent): dropped
+        send(["kind": "text", "text": "x"])                  // text: dropped
+        send(["kind": "focus"])                               // a raise asked for: dropped
+        send(["kind": "resize", "width": 800, "height": 600]) // a new size: still taken
+        let during = (downs.count, ups, focus, resized, injector.counts["dropped_local_input"] ?? 0)
+        idle = 3.2                                             // quiet again: the other side goes on
+        send(["kind": "key", "code": 48, "pressed": true])
+        send(["kind": "focus"])
+        checkPanel(during == (1, 1, 0, 1, 4) && downs.count == 2 && focus == 1, true,
+                   "local use: only releases pass and nothing is raised while the Mac is used at its own keyboard; dropped, not queued")
+    }
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -2074,6 +2134,51 @@ func screenLocked() -> Bool {
     return !onConsole || ((session["CGSSessionScreenIsLocked"] as? Bool) ?? false)
 }
 
+// MARK: - Local use first (the owner's rule, 2026-11-19)
+
+/// The kinds of event that count as local use: keys, buttons, moves, drags and scrolls.
+let localInputTypes: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+                                      .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]
+
+/// Seconds since the last of those events from this Mac's own keyboard, mouse or trackpad, read
+/// from the HID system's state table, which "reflects the combined state of all hardware event
+/// sources posting from the HID system" (CGEventSource.h). The host's own events come from a
+/// private source (or none) and are posted to a process or to the session tap, not from the HID
+/// system. Each kind is read on its own, never "any input": a declared user activity (the keep-
+/// awake assertion) may count as input there. Needs no Input Monitoring (docs/m4-daily-host.md).
+func localIdleSeconds() -> Double {
+    localInputTypes.map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min() ?? .infinity
+}
+
+/// The rule itself: local input within the last `quiet` seconds wins over the other device.
+func localUseRecent(idle: Double, quiet: Double) -> Bool { idle < quiet }
+
+/// When the host last posted an event of its own (uptime), to tell in the log how far a local
+/// event came after it: if local use began right after the host's own posts again and again,
+/// the host's events would be counting as local ones.
+var lastOwnPost: TimeInterval = 0
+
+/// Local use, looked at before anything is raised or posted, and every second; `onChange` says
+/// when it begins and ends. The idle source is a stand-in in --self-test.
+final class LocalUse {
+    let quiet: Double
+    var idle: () -> Double = localIdleSeconds
+    var onChange: (Bool) -> Void = { _ in }
+    private(set) var present = false
+    init(quiet: Double) { self.quiet = quiet }
+    /// Whether local input is recent now (on the main queue: a change is told here).
+    func recent() -> Bool {
+        let now = localUseRecent(idle: idle(), quiet: quiet)
+        if now != present {
+            present = now
+            onChange(now)
+        }
+        return now
+    }
+    /// The same reading, told to nobody: the last look on the Accessibility queue before a raise.
+    func recentQuietly() -> Bool { localUseRecent(idle: idle(), quiet: quiet) }
+}
+
 /// Makes an application the one in front, and the window at `bounds` its front window, through
 /// Accessibility (ADR 0017: bringing the application's window to the front). An accessory
 /// program's own NSRunningApplication.activate() is only a request that macOS may decline.
@@ -2155,8 +2260,11 @@ final class Injector {
     var lockedNow: () -> Bool = screenLocked
     /// Closed while the host makes a new stream (a resize): as when locked, only releases pass.
     var gateClosed: () -> Bool = { false }
-    var postSession: (CGEvent) -> Void = { $0.post(tap: .cgSessionEventTap) }
-    var postProcess: (CGEvent, pid_t) -> Void = { $0.postToPid($1) }
+    var postSession: (CGEvent) -> Void = { lastOwnPost = ProcessInfo.processInfo.systemUptime; $0.post(tap: .cgSessionEventTap) }
+    var postProcess: (CGEvent, pid_t) -> Void = { lastOwnPost = ProcessInfo.processInfo.systemUptime; $0.postToPid($1) }
+    /// The Mac's own keyboard or mouse was used just now: as when locked, only releases pass
+    /// (a new size for the stream is still taken: it raises and posts nothing).
+    var localRecent: () -> Bool = { false }
     /// When each modifier key went down (uptime).
     private var modifierSince: [UInt32: TimeInterval] = [:]
 
@@ -2277,13 +2385,15 @@ final class Injector {
                 return
             }
         }
-        if !settings.inputDry && (lockedNow() || gateClosed()) {
+        let locked = !settings.inputDry && (lockedNow() || gateClosed())
+        if locked || (!settings.inputDry && kind != "resize" && localRecent()) {
             // Locked, or not on the console: nothing but the release of what is down here, in every
-            // form (ADR 0017, "守ること" 3).
+            // form (ADR 0017, "守ること" 3). The same while the Mac is used at its own keyboard or
+            // mouse (local use first): dropped, never queued.
             let pressed = object["pressed"] as? Bool
             let code = (object["code"] as? NSNumber)?.uint32Value ?? 0
             let held = kind == "key" ? keysDown.contains(code) : buttonsDown.contains(code)
-            guard passesWhileLocked(kind: kind, pressed: pressed, held: held) else { return count("dropped_locked") }
+            guard passesWhileLocked(kind: kind, pressed: pressed, held: held) else { return count(locked ? "dropped_locked" : "dropped_local_input") }
         }
         if settings.inputDry || !mayPost {
             if settings.inputDry, kind == "text", let text = object["text"] as? String {
@@ -2545,6 +2655,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     let lookout = Lookout()
     let clipboard = ClipboardBridge(board: SystemBoard())
     let pasteGate = PasteGate()
+    let localUse = LocalUse(quiet: settings.localQuiet)
     private lazy var gateWired: Void = { injector.gateClosed = { [weak self] in self?.restarting ?? false } }()
     var width = 0, height = 0
     var app: NSRunningApplication?
@@ -2576,10 +2687,25 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.injector.releaseAll()
         }
+        // Local use first: what the other side holds down is let go at once, and the change is
+        // said for the title of the other side's window.
+        injector.localRecent = { [weak self] in self?.localUse.recent() ?? false }
+        localUse.onChange = { [weak self] present in
+            guard let self else { return }
+            if present {
+                self.injector.releaseAll()
+                let sinceOwn = lastOwnPost > 0 ? ProcessInfo.processInfo.systemUptime - lastOwnPost : nil
+                let after = sinceOwn.map { Int((($0 - self.localUse.idle()) * 1000).rounded()) }
+                say("local-input", [("present", true), ("ms_after_own_post", after)])
+            } else {
+                say("local-input", [("present", false)])
+            }
+        }
         // Something held, and no input for 8 s: a release was lost on the way; let go.
         let watchdog = DispatchSource.makeTimerSource(queue: .main)
         watchdog.schedule(deadline: .now() + 1, repeating: .seconds(1))
         watchdog.setEventHandler { [weak self] in
+            _ = self?.localUse.recent()
             self?.keepAwakeAndTellLock()
             self?.manageVirtualDisplay()
             self?.injector.releaseStaleModifiers(olderThan: 8)
@@ -2707,6 +2833,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             say("refused", [("word", "start"), ("reason", "no application called \(name) was found")])
             return quit(1)
         }
+        // Opening brings the application to the front: not while the Mac is used at its own
+        // keyboard or mouse. Looked at again every half second (said once, by the change).
+        if localUse.recent() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.startApp(name) }
+            return
+        }
         // The picture's size: as asked (and the window is made that size), or else the window's
         // own size in its screen's pixels, found when it is first seen (one picture pixel for one
         // pixel of the screen: no scaling, and the viewer's window has the window's shape).
@@ -2802,10 +2934,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// the one typed into, or a first key comes): through Accessibility, away from the input.
     var raisedWindow: CGWindowID?
     func raiseShownWindow() {
-        guard let pid = app?.processIdentifier, windowBounds != .zero else { return }
+        guard let pid = app?.processIdentifier, windowBounds != .zero, !localUse.recent() else { return }
         let bounds = windowBounds
         raisedWindow = windowId
-        lookout.act { bringToFront(pid, bounds: bounds) }
+        lookout.act { [localUse] in if !localUse.recentQuietly() { bringToFront(pid, bounds: bounds) } }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
     }
 
@@ -2924,7 +3056,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let all = windowList(onScreenOnly: false).filter { $0.pid == app.processIdentifier && $0.layer == 0 && $0.bounds.width > 40 && $0.bounds.height > 40 }
         if settings.newWindow {
             if windowsAtOpen == nil { windowsAtOpen = Set(all.map(\.id)) }
-            if !askedNewWindow, appInFront(), injector.mayPost {
+            if !askedNewWindow, appInFront(), injector.mayPost, !localUse.recent() {
                 // Command-N, to the application's process only.
                 askedNewWindow = true
                 for (key, down) in [(UInt16(0x37), true), (UInt16(0x2d), true), (UInt16(0x2d), false), (UInt16(0x37), false)] {
@@ -3398,14 +3530,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         // Behind whatever waits for a raise, in order: a copy right after a select-all goes after it.
         if !waiting.isEmpty { return waiting.append(data) }
         let notRaised = app != nil && raisedWindow != windowId && isKeyOrText(data)
-        if needsFront(data), !screenLocked(), let running = frontCandidate(data),
+        // Local use first: nothing is raised; the injector drops the event (releases pass).
+        if needsFront(data), !screenLocked(), !localUse.recent(), let running = frontCandidate(data),
            notRaised || running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
             if app != nil && isKeyOrText(data) { raisedWindow = windowId }
             // The window under the pointer for a press, else the application's shown window.
             let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
             let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
             let pid = running.processIdentifier
-            lookout.act { bringToFront(pid, bounds: bounds) }
+            lookout.act { [localUse] in if !localUse.recentQuietly() { bringToFront(pid, bounds: bounds) } }
             waiting = [data]
             // The raise is looked at again before anything is sent: the keys go only if it took.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
@@ -3428,6 +3561,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
            let kind = object["kind"] as? String, kind == "clipboard_copy" || kind == "clipboard_paste",
            let nonce = object["nonce"] as? String {
             guard !detached, picture == "running" else { return }
+            // A copy or a paste posts keys and touches the Mac's pasteboard: not during local use.
+            if localUse.recent() { return clipboard.answer(nonce, "none", what: kind == "clipboard_copy" ? "copy" : "paste") }
             if kind == "clipboard_copy" { return clipboard.copy(nonce: nonce, cut: object["cut"] as? Bool ?? false) }
             let withText = object["with_text"] as? Bool ?? false
             if withText && clipboard.textFor(nonce) == nil {
@@ -3435,7 +3570,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 func look() {
                     let now = ProcessInfo.processInfo.systemUptime
                     if clipboard.textFor(nonce) != nil {
-                        clipboard.paste(nonce: nonce, withText: true)
+                        if localUse.recent() {
+                            clipboard.answer(nonce, "none", what: "paste")
+                        } else {
+                            clipboard.paste(nonce: nonce, withText: true)
+                        }
                     } else if !pasteGate.expired(now: now) {
                         return DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { look() }
                     } else {

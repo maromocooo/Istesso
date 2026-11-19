@@ -525,12 +525,13 @@ do_guard() {
 for run in "$D"/run/*/; do
     [ -r "$run/host.log" ] || continue
     awk -F'"' -v name="$(basename "$run")" '
-        BEGIN { lock = "unlocked"; keys = "keys-taken"; prompt = "false" }
+        BEGIN { lock = "unlocked"; keys = "keys-taken"; prompt = "false"; here = "false" }
         $2 == "istesso" && ($4 == "locked" || $4 == "unlocked") { lock = $4 }
         $2 == "istesso" && ($4 == "keys-taken" || $4 == "keys-dropped") { keys = $4 }
         $0 == "{\"istesso\":\"system-prompt\",\"present\":true}" { prompt = "true" }
         $0 == "{\"istesso\":\"system-prompt\",\"present\":false}" { prompt = "false" }
-        END { print name, lock, keys, prompt }
+        $2 == "istesso" && $4 == "local-input" { here = ($0 ~ /"present":true/) ? "true" : "false" }
+        END { print name, lock, keys, prompt, here }
     ' "$run/host.log"
 done
 HOST
@@ -538,12 +539,14 @@ HOST
             for mine in "$state"/*/; do
                 name=$(basename "$mine")
                 still_runs "$mine/viewer.pid" || continue
-                local lock_word keys_word prompt_word base wanted
-                read -r lock_word keys_word prompt_word <<< "$(awk -v n="$name" '$1 == n {print $2, $3, $4; exit}' <<< "$states")"
+                local lock_word keys_word prompt_word local_word base wanted
+                read -r lock_word keys_word prompt_word local_word <<< "$(awk -v n="$name" '$1 == n {print $2, $3, $4, $5; exit}' <<< "$states")"
                 base="$(cat "$mine/app" 2>/dev/null) (Mac host)"
                 wanted=$base
                 # Never silently: a key that the host could not hand over is said in the title.
                 [ "$keys_word" = keys-dropped ] && wanted="$base — この窓にまだ打てません。クリックしてください"
+                # Local use first: the Studio's own keyboard or mouse was used; input from here is dropped until it is quiet again.
+                [ "$local_word" = true ] && wanted="$base — Studio で手元の入力があります"
                 [ "$lock_word" = locked ] && wanted="$base — Studio はロック中"
                 [ "$prompt_word" = true ] && wanted="$wanted — Studio で確認が出ています"
                 if [ "$(head -1 "$mine/title" 2>/dev/null)" != "$wanted" ]; then
