@@ -274,7 +274,10 @@ do_open() {
     fi
     # Copy and paste of text (ADR 0022, trial only): only with DAILY_CLIPBOARD=1 for now.
     local clipboard_agent="" clipboard_host=""
-    if [ "${DAILY_CLIPBOARD:-}" = 1 ] && [ "$for_whom" != aura ]; then clipboard_agent="--clipboard"; clipboard_host="--clipboard"; fi
+    # The application form only: not the whole display, not AURA, not a generated picture.
+    if [ "${DAILY_CLIPBOARD:-}" = 1 ] && [ "$for_whom" != aura ] && [ -z "$display" ] && [[ "${DAILY_HOST_EXTRA:-}" != *--generated* ]]; then
+        clipboard_agent="--clipboard"; clipboard_host="--clipboard"
+    fi
     local target_args size_arg="--size $size"
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$what")"; fi
     [ "$start" = new-window ] && target_args="$target_args --new-window"
@@ -420,7 +423,7 @@ open_here() {
     # The viewer composes Japanese itself and sends committed text (ADR 0007) when the relay says
     # the host takes it; and connects again by itself after a cut.
     local clip_env=()
-    [ "${DAILY_CLIPBOARD:-}" = 1 ] && clip_env=(ISTESSO_CLIPBOARD=1)
+    [ "${DAILY_CLIPBOARD:-}" = 1 ] && [ "$name" != display ] && clip_env=(ISTESSO_CLIPBOARD=1)
     local settings=(${clip_env[@]+"${clip_env[@]}"} ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)

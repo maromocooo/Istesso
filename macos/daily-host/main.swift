@@ -1650,6 +1650,22 @@ func selfTest() -> Never {
         send(["kind": "key", "code": 30, "pressed": true]); send(["kind": "key", "code": 30, "pressed": false])
         checkPanel(posted == 2 && !injector.holdingForChord, true, "Command-V then typing: the letter goes at once")
     }
+    do {
+        // A clipboard chord goes through the same rules as a key: closed, nothing is posted.
+        let injector = Injector()
+        var posted = 0
+        injector.mayPost = true
+        injector.target = { 100 }
+        injector.keysAllowed = { true }
+        injector.lockedNow = { false }
+        injector.gateClosed = { true }
+        injector.postProcess = { _, _ in posted += 1 }
+        injector.postChord(46)
+        let closed = posted
+        injector.gateClosed = { false }
+        injector.postChord(46)
+        checkPanel(closed == 0 && posted == 4, true, "clipboard chord: through the input's rules (none while closed, Command and C when open)")
+    }
     let flushed = chordRun(flush: true)
     checkPanel(flushed.posted == 1 && flushed.discarded == 0, true, "chord then typing: the held keys go once the key window is confirmed")
     let dropped = chordRun(flush: false)
@@ -2309,11 +2325,16 @@ final class Injector {
     /// A Command chord for copy and paste: with the host's own Command as it is now - only the key
     /// when Command is down already, else Command down, the key, Command up. Nothing stays down.
     func postChord(_ code: UInt32) {
+        // Through handle(), as any key: the lock, the restart's gate, the chord's hold, a dry run
+        // and the front rule all apply.
         let commandDown = keysDown.contains(125) || keysDown.contains(126)
-        if !commandDown { key(125, true) }
-        key(code, true)
-        key(code, false)
-        if !commandDown { key(125, false) }
+        func send(_ key: UInt32, _ pressed: Bool) {
+            if let data = try? JSONSerialization.data(withJSONObject: ["kind": "key", "code": key, "pressed": pressed]) { handle(data) }
+        }
+        if !commandDown { send(125, true) }
+        send(code, true)
+        send(code, false)
+        if !commandDown { send(125, false) }
     }
 
     func releaseAll() {
@@ -3186,6 +3207,35 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     func take(_ data: Data) {
         // A paste that waits for its text holds everything after it, in order (0.2 s at most).
         if pasteGate.waitingFor != nil { return pasteGate.hold(data) }
+        // Behind whatever waits for a raise, in order: a copy right after a select-all goes after it.
+        if !waiting.isEmpty { return waiting.append(data) }
+        let notRaised = app != nil && raisedWindow != windowId && isKeyOrText(data)
+        if needsFront(data), !screenLocked(), let running = frontCandidate(data),
+           notRaised || running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
+            if app != nil && isKeyOrText(data) { raisedWindow = windowId }
+            // The window under the pointer for a press, else the application's shown window.
+            let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
+            let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
+            let pid = running.processIdentifier
+            lookout.act { bringToFront(pid, bounds: bounds) }
+            waiting = [data]
+            // The raise is looked at again before anything is sent: the keys go only if it took.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                let events = self.waiting
+                self.waiting = []
+                for event in events where !self.detached && self.picture == "running" {
+                    if self.pasteGate.waitingFor != nil { self.pasteGate.hold(event) } else { self.dispatch(event) }
+                }
+            }
+            return
+        }
+        dispatch(data)
+    }
+
+    /// One event in its turn: a mark of copy or paste to the clipboard's part, anything else to the
+    /// injector.
+    func dispatch(_ data: Data) {
         if settings.clipboard, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let kind = object["kind"] as? String, kind == "clipboard_copy" || kind == "clipboard_paste",
            let nonce = object["nonce"] as? String {
@@ -3210,32 +3260,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             }
             return clipboard.paste(nonce: nonce, withText: withText)
         }
-        if !waiting.isEmpty { return waiting.append(data) }
-        let notRaised = app != nil && raisedWindow != windowId && isKeyOrText(data)
-        if needsFront(data), !screenLocked(), let running = frontCandidate(data),
-           notRaised || running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
-            if app != nil && isKeyOrText(data) { raisedWindow = windowId }
-            // The window under the pointer for a press, else the application's shown window.
-            let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
-            let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
-            let pid = running.processIdentifier
-            lookout.act { bringToFront(pid, bounds: bounds) }
-            waiting = [data]
-            // The raise is looked at again before anything is sent: the keys go only if it took.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                let events = self.waiting
-                self.waiting = []
-                for event in events where !self.detached && self.picture == "running" { self.injector.handle(event) }
-            }
-            return
-        }
         injector.handle(data)
     }
 
     private func isKeyOrText(_ data: Data) -> Bool {
         let kind = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String
-        return kind == "key" || kind == "text"
+        return kind == "key" || kind == "text" || kind == "clipboard_copy" || kind == "clipboard_paste"
     }
 
     private func needsFront(_ data: Data) -> Bool {
@@ -3243,7 +3273,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return false }
         switch kind {
-        case "key", "text": return true
+        case "key", "text", "clipboard_copy", "clipboard_paste": return true
         case "button": return object["pressed"] as? Bool == true
         default: return false
         }

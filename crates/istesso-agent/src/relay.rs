@@ -286,13 +286,13 @@ impl InputLine {
         self.text_dropped
     }
 
-    /// Whether the device takes copy and paste, as it said when the conversation was last
-    /// opened (trial only).
     /// The level of scrolls the device takes, as it said when the conversation was opened.
     pub fn scroll_level(&self) -> u8 {
         self.scroll
     }
 
+    /// Whether the device takes copy and paste, as it said when the conversation was last
+    /// opened (trial only).
     pub fn takes_clipboard(&self) -> bool {
         self.clipboard
     }

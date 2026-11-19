@@ -15,6 +15,8 @@ protocol Board: AnyObject {
     /// Every type of every item (to look for the secret markers before any text is read).
     func types() -> [String]
     func plainText() -> String?
+    /// The bytes of the plain text, without making a string of it.
+    func plainTextLength() -> Int?
     /// Puts text for this Mac only (not handed to other devices), marked as transient (clipboard
     /// tools do not keep it); says the change count after.
     func put(_ text: String) -> Int
@@ -27,6 +29,7 @@ final class SystemBoard: Board {
     var changeCount: Int { pasteboard.changeCount }
     func types() -> [String] { (pasteboard.pasteboardItems ?? []).flatMap { $0.types.map(\.rawValue) } }
     func plainText() -> String? { pasteboard.string(forType: NSPasteboard.PasteboardType("public.utf8-plain-text")) }
+    func plainTextLength() -> Int? { pasteboard.data(forType: NSPasteboard.PasteboardType("public.utf8-plain-text"))?.count }
     func put(_ text: String) -> Int {
         pasteboard.prepareForNewContents(with: .currentHostOnly)
         let item = NSPasteboardItem()
@@ -181,6 +184,9 @@ final class ClipboardBridge {
 
     private func copyAfterLook(nonce: String, cut: Bool, subrole: String?) {
         if subrole == "AXSecureTextField" { return answer(nonce, "refused", why: "password_field", what: "copy") }
+        // Looked at again after the Accessibility look, which took time: still allowed, not locked.
+        guard keysAllowed(), !screenLocked() else { return answer(nonce, "none", what: "copy") }
+        if IsSecureEventInputEnabled() { return answer(nonce, "refused", why: "secure_input", what: "copy") }
         let before = board.changeCount
         postChord(cut ? 45 : 46)  // X or C
         let began = ProcessInfo.processInfo.systemUptime
@@ -193,11 +199,15 @@ final class ClipboardBridge {
     }
 
     func finishCopy(nonce: String) {
+        // The markers, the size and the text all from one and the same contents (change count).
+        let seen = board.changeCount
         // The markers first; the text is not read when one is there.
         if board.types().contains(where: { secretMarkers.contains($0) }) {
             return answer(nonce, "refused", why: "secret_marker", what: "copy")
         }
-        guard let text = board.plainText() else { return answer(nonce, "none", what: "copy") }
+        // Too large is told by the data's length, before any string is made of it.
+        if let length = board.plainTextLength(), length > 65536 { return answer(nonce, "too_large", what: "copy") }
+        guard let text = board.plainText(), board.changeCount == seen else { return answer(nonce, "none", what: "copy") }
         switch judgeText(text) {
         case .text: answer(nonce, "text", text: text, what: "copy")
         case .tooLarge: answer(nonce, "too_large", what: "copy")
