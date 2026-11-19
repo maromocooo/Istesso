@@ -1,0 +1,36 @@
+#!/bin/sh
+# ish-mount: shows a folder of the Ubuntu host on this Mac, read-only, at
+# $ISTESSO_MOUNT_ROOT/ubuntu/<folder-id> (~/Istesso/ubuntu/<folder-id> unless
+# set), over Istesso's own encrypted channel (prototype, branch
+# proto-ish-mount; ADR 0007, "ish とマウント"). The host shows only the
+# folders its owner named, by id (`istesso agent --mount-folder
+# <folder-id>=<folder> --allow-mount <this Mac>`); Git-ignored files and .git
+# are not shown. The cd switch (cd-switch.zsh) runs it; by hand:
+#   ish-mount <folder-id>            mounts it unless it is mounted; prints where
+#   ish-mount --release <folder-id>  unmounts it unless something on this Mac
+#                                    uses it (status 3 then: it stays mounted)
+# Like `ish`, it uses a test identity of its own (ISH_DIR), and the host's
+# agent on 26850 (ISH_PORT).
+D=${ISH_DIR:-"$HOME/Library/Application Support/istesso-dev-shell-test"}
+root=${ISTESSO_MOUNT_ROOT:-"$HOME/Istesso"}
+prog="$D/bin/unified-mount-proto"
+usage() {
+    echo "usage: ish-mount <folder-id> | ish-mount --release <folder-id>" >&2
+    exit 2
+}
+case "${1:-}" in
+    --release)
+        [ $# -eq 2 ] || usage
+        exec "$prog" release "$2" --base "$root" --machine-folder ubuntu
+        ;;
+    "" | -*) usage ;;
+esac
+[ $# -eq 1 ] || usage
+addr=$(/usr/bin/ssh -G istesso-ubuntu 2>/dev/null | /usr/bin/awk '/^hostname /{print $2; exit}')
+if [ -z "$addr" ]; then
+    echo "ish-mount: no address for istesso-ubuntu in the ssh settings" >&2
+    exit 1
+fi
+port=${ISH_PORT:-26850}
+ISTESSO_CONFIG_DIR="$D/config" exec "$prog" ensure proto-host "$1" --base "$root" \
+    --machine-folder ubuntu --address "$addr:$port"

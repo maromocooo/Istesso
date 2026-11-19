@@ -1,0 +1,39 @@
+#!/bin/sh
+# ish: a shell on the Ubuntu host over Istesso's own encrypted channel, not
+# ssh (prototype, branches proto-ish-forward and proto-ish-mount). It uses a
+# test identity of its own; the Istesso settings and keys of this Mac are not
+# used.
+#   ish              back in the folder used last (home the first time)
+#   ish work/proj    in ~/work/proj on the host (or an absolute host path); remembered
+#   ish --home       at home on the host; forgets the remembered folder
+# A server started in the shell (by you or a coding agent) is forwarded to
+# this Mac: http://localhost:<its port> opens it here (a line `istesso: …`
+# says where, and says so when it listens on every network). A request
+# from the shell to open such a page (BROWSER, xdg-open) opens it in this
+# Mac's default browser; pages elsewhere are not opened.
+#   ish-forwards     list them; ish-forwards stop 8000, or stop --all
+# Leave with `exit` or Control-D, or close the window.
+# Fallback without forwarding: ish-shell-only (same options).
+#
+# ISH_DIR: the folder with the test identity (config/) and the programs
+# (bin/), instead of the one below; ISH_PORT: the host's agent on another
+# port. Both for checks.
+D=${ISH_DIR:-"$HOME/Library/Application Support/istesso-dev-shell-test"}
+# The host's address comes from the ssh settings (no network is used for it).
+addr=$(/usr/bin/ssh -G istesso-ubuntu 2>/dev/null | /usr/bin/awk '/^hostname /{print $2; exit}')
+if [ -z "$addr" ]; then
+    echo "ish: no address for istesso-ubuntu in the ssh settings" >&2
+    exit 255
+fi
+# The host's agent for this test listens on 26850 (ISH_PORT: another one, for checks).
+port=${ISH_PORT:-26850}
+case "${1:-}" in
+    "") set -- ;;
+    --home) set -- --home ;;
+    # A folder below this Mac's home, as the shell here wrote `~/…`: meant on the host.
+    "$HOME") set -- --project "~" ;;
+    "$HOME"/*) set -- --project "~${1#"$HOME"}" ;;
+    /*) set -- --project "$1" ;;
+    *) set -- --project "~/$1" ;;
+esac
+ISTESSO_CONFIG_DIR="$D/config" exec "$D/bin/istesso" shell proto-host --address "$addr:$port" "$@"

@@ -3,12 +3,30 @@
 //! docs/research/unified-mount.md and ADR 0007 (proposal "フォルダーを読むだけで見せる").
 //!
 //!   unified-mount-proto mount <device> <folder-id> [--address ADDR[:PORT]] [--base DIR]
+//!                             [--machine-folder NAME]
 //!       Asks the paired <device> (its name or the beginning of its id, as for `istesso
 //!       peers`) for its folder <folder-id> over Istesso's control channel, serves it as a
 //!       read-only NFSv3 server on 127.0.0.1, and mounts that with the built-in NFS client at
 //!       <base>/<device name>/<folder-id>. <base> is ~/Istesso unless given; it and the device
 //!       folder are made private (0700), and are refused when they are not. Unmounts on Ctrl-C
-//!       or SIGTERM, and stops when the folder is unmounted from outside.
+//!       or SIGTERM, and stops when the folder is unmounted from outside. --machine-folder
+//!       names the folder below <base> instead of the device's name (`ubuntu`, say, for the
+//!       name the shell's cd switch knows the machine by).
+//!
+//!   unified-mount-proto ensure <device> <folder-id> --base DIR --machine-folder NAME
+//!                              [--address ADDR[:PORT]] [--state DIR] [--wait-ms N]
+//!       The mount on first use, for the cd switch: when nothing is mounted at
+//!       <base>/<NAME>/<folder-id>, starts `mount` for it on its own (a session of its own,
+//!       its messages in a log in <state>), and waits until the folder is mounted, the
+//!       `mount` ends, or N ms (20 s) have gone by. Prints the mount point when it is
+//!       mounted; says why not, and ends with 1, when it is not.
+//!
+//!   unified-mount-proto release <folder-id> --base DIR --machine-folder NAME [--state DIR]
+//!       Unmounts <base>/<NAME>/<folder-id> when nothing on this Mac uses it: a plain
+//!       unmount, which the system refuses while any program has a file or a folder in it
+//!       open. Ends with 0 when nothing is mounted there any more, 3 when it is in use (it
+//!       stays mounted), 1 on any other failure. The `mount` that served it sees it gone and
+//!       ends.
 //!
 //!       For tests only: --hold-before-mount-ms N waits N ms between opening the loopback port
 //!       and mounting, and prints the port, so that another process can try to mount first.
@@ -29,6 +47,7 @@ macro_rules! say {
     }};
 }
 
+mod glue;
 mod nfs_side;
 
 use istesso_agent::mount::client::Remote;
@@ -52,6 +71,8 @@ struct Options {
     folder: String,
     address: Option<String>,
     base: Option<PathBuf>,
+    /// The folder below the base, instead of one named after the device.
+    machine: Option<String>,
     hold: Option<Duration>,
 }
 
@@ -68,6 +89,7 @@ fn parse(args: &[String]) -> Option<Options> {
         folder,
         address: None,
         base: None,
+        machine: None,
         hold: None,
     };
     let mut rest = args[3..].iter();
@@ -76,6 +98,7 @@ fn parse(args: &[String]) -> Option<Options> {
         match flag.as_str() {
             "--address" => options.address = Some(value.clone()),
             "--base" => options.base = Some(PathBuf::from(value)),
+            "--machine-folder" => options.machine = Some(value.clone()),
             "--hold-before-mount-ms" => {
                 options.hold = Some(Duration::from_millis(value.parse().ok()?))
             }
@@ -91,6 +114,31 @@ fn main() -> ExitCode {
         (args.first().map(String::as_str), args.get(1), args.len())
     {
         return run_watch(Path::new(point));
+    }
+    match args.first().map(String::as_str) {
+        Some("ensure") => {
+            return match glue::parse_ensure(&args[1..]) {
+                Some(options) if cfg!(target_os = "macos") => glue::run_ensure(options),
+                Some(_) => {
+                    say!("ensure: this prototype mounts with the macOS NFS client only");
+                    ExitCode::FAILURE
+                }
+                None => {
+                    say!("usage: unified-mount-proto ensure <device> <folder-id> --base DIR --machine-folder NAME [--address ADDR[:PORT]] [--state DIR] [--wait-ms N]");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        Some("release") => {
+            return match glue::parse_release(&args[1..]) {
+                Some(options) => glue::run_release(options),
+                None => {
+                    say!("usage: unified-mount-proto release <folder-id> --base DIR --machine-folder NAME [--state DIR]");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        _ => {}
     }
     match parse(&args) {
         Some(options) if cfg!(target_os = "macos") => run_mount(options),
@@ -133,13 +181,14 @@ fn private_dir(dir: &Path) -> Result<(), String> {
     istesso_agent::mount::private_folder(dir).map_err(|why| format!("{}: {why}", dir.display()))
 }
 
-/// The empty folder to mount at: <base>/<device>/<folder-id>, with the two above it private.
-/// The path is the real one (no links in it), as the mount table has it. A mount left there
-/// by an earlier run that was killed is taken off first; the mount point itself is not
-/// looked at before that (a mount whose server is gone may not answer).
-fn mount_point(base: &Path, device: &str, folder: &str) -> Result<PathBuf, String> {
+/// The empty folder to mount at: <base>/<machine>/<folder-id>, with the two above it private.
+/// `machine` is a checked folder name ([`glue::valid_machine_folder`]). The path is the real
+/// one (no links in it), as the mount table has it. A mount left there by an earlier run that
+/// was killed is taken off first; the mount point itself is not looked at before that (a
+/// mount whose server is gone may not answer).
+fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<PathBuf, String> {
     private_dir(base)?;
-    let machine = base.join(folder_name(device));
+    let machine = base.join(machine);
     private_dir(&machine)?;
     let machine = std::fs::canonicalize(&machine).map_err(|e| e.to_string())?;
     let point = machine.join(folder);
@@ -182,7 +231,7 @@ fn mount_point(base: &Path, device: &str, folder: &str) -> Result<PathBuf, Strin
 /// without asking any file server (`MNT_NOWAIT`), so a mount whose server is gone, or
 /// answers every question with an error, is still seen. In doubt (the table cannot be
 /// read): mounted, so that the program does not leave a mount behind.
-fn is_mounted(point: &Path) -> bool {
+pub(crate) fn is_mounted(point: &Path) -> bool {
     let want = point.as_os_str().as_bytes();
     for _ in 0..3 {
         // SAFETY: with a null buffer, getfsstat only counts.
@@ -258,6 +307,12 @@ fn run_mount(options: Options) -> ExitCode {
         say!("mount: a folder id is 1 to 32 of a-z, 0-9 and -, not starting with -");
         return ExitCode::from(2);
     }
+    if let Some(machine) = &options.machine {
+        if !glue::valid_machine_folder(machine) {
+            say!("mount: {}", glue::MACHINE_FOLDER_RULE);
+            return ExitCode::from(2);
+        }
+    }
     let began = Instant::now();
     let paths = Paths::from_env();
     // The place first, from the list of paired devices, without asking the device: a mount
@@ -288,7 +343,11 @@ fn run_mount(options: Options) -> ExitCode {
             }
         },
     };
-    let point = match mount_point(&base, &device, &options.folder) {
+    let machine = options
+        .machine
+        .clone()
+        .unwrap_or_else(|| folder_name(&device));
+    let point = match mount_point(&base, &machine, &options.folder) {
         Ok(point) => point,
         Err(why) => {
             say!("mount: {why}");
