@@ -356,7 +356,7 @@ impl<S: Read + Write> Channel<S> {
             scratch,
             ..
         } = self;
-        receive(stream, scratch, |frame, out| {
+        receive(stream, scratch, MAX_MESSAGE, |frame, out| {
             transport.read_message(frame, out).map_err(Error::crypto)
         })
     }
@@ -392,6 +392,7 @@ fn seal(
 fn receive<R: Read>(
     stream: &mut R,
     scratch: &mut [u8],
+    limit: usize,
     mut open: impl FnMut(&[u8], &mut [u8]) -> Result<usize>,
 ) -> Result<Vec<u8>> {
     let mut plain: Vec<u8> = Vec::new();
@@ -411,7 +412,7 @@ fn receive<R: Read>(
                     return Err(Error::Malformed);
                 }
                 let len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
-                if len > MAX_MESSAGE {
+                if len > limit {
                     return Err(Error::TooLarge);
                 }
                 expected = Some(4 + len);
@@ -454,11 +455,14 @@ impl Channel<TcpStream> {
                 transport: transport.clone(),
                 peer_key: self.peer_key,
                 scratch: self.scratch,
+                limit: MAX_MESSAGE,
+                failed: false,
             },
             ChannelWriter {
                 stream: writing,
                 transport,
                 scratch: vec![0u8; MAX_FRAME],
+                failed: false,
             },
         ))
     }
@@ -476,22 +480,41 @@ pub struct ChannelReader {
     transport: Arc<Mutex<snow::TransportState>>,
     peer_key: [u8; 32],
     scratch: Vec<u8>,
+    /// The largest message taken, refused before it is gathered.
+    limit: usize,
+    /// A receive failed: nothing more is read, since the two ends may no
+    /// longer agree on the state of the encryption.
+    failed: bool,
 }
 
 impl ChannelReader {
-    /// As [`Channel::recv`].
+    /// As [`Channel::recv`]. After an error every later call fails too.
     pub fn recv(&mut self) -> Result<Vec<u8>> {
+        if self.failed {
+            return Err(Error::Closed);
+        }
         let ChannelReader {
             stream,
             transport,
             scratch,
+            limit,
             ..
         } = self;
-        receive(stream, scratch, |frame, out| {
+        let received = receive(stream, scratch, *limit, |frame, out| {
             locked(transport)?
                 .read_message(frame, out)
                 .map_err(Error::crypto)
-        })
+        });
+        self.failed = received.is_err();
+        received
+    }
+
+    /// Refuses messages larger than `limit` from now on ([`Error::TooLarge`]),
+    /// as soon as their length has been read: a conversation whose messages
+    /// are small does not have to take in [`MAX_MESSAGE`] bytes before it
+    /// can tell that one is too large.
+    pub fn set_max_message(&mut self, limit: usize) {
+        self.limit = limit.min(MAX_MESSAGE);
     }
 
     /// The identity key of the device at the other end.
@@ -510,16 +533,31 @@ pub struct ChannelWriter {
     stream: TcpStream,
     transport: Arc<Mutex<snow::TransportState>>,
     scratch: Vec<u8>,
+    /// A send failed: part of a message may be on the wire, and what follows
+    /// it would be read as its rest. Nothing more is sent, and the
+    /// connection is shut.
+    failed: bool,
 }
 
 impl ChannelWriter {
-    /// As [`Channel::send`].
+    /// As [`Channel::send`]. After an error (a write that timed out half way,
+    /// say) every later call fails too, and the connection is shut down, so
+    /// that nothing more is put on the wire behind a broken message.
     pub fn send(&mut self, message: &[u8]) -> Result<()> {
-        let wire = {
-            let mut transport = locked(&self.transport)?;
-            seal(&mut transport, &mut self.scratch, message)?
-        };
-        write_all(&mut self.stream, &wire)
+        if self.failed {
+            return Err(Error::Closed);
+        }
+        if message.len() > MAX_MESSAGE {
+            return Err(Error::TooLarge);
+        }
+        let sent = locked(&self.transport)
+            .and_then(|mut transport| seal(&mut transport, &mut self.scratch, message))
+            .and_then(|wire| write_all(&mut self.stream, &wire));
+        if sent.is_err() {
+            self.failed = true;
+            self.shut_down();
+        }
+        sent
     }
 
     /// Ends the connection in both directions: whoever waits on either half
@@ -813,6 +851,44 @@ mod tests {
         // Bytes that were not produced by the other end's encryption.
         write_frame(&mut client.stream, &[0x5a; 40]).unwrap();
         assert!(matches!(reader.recv(), Err(Error::Crypto(_))));
+    }
+
+    #[test]
+    fn a_writing_half_whose_write_failed_half_way_sends_nothing_more() {
+        let (client, mut server, _, _) = pair();
+        let (_reader, mut writer) = client.split().unwrap();
+        // The other end does not read; a large message cannot leave in time.
+        writer
+            .stream()
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let large = vec![7u8; MAX_MESSAGE];
+        assert!(writer.send(&large).is_err());
+        // Whatever comes next is refused here, not put on the wire behind the
+        // broken message.
+        assert!(matches!(writer.send(b"after"), Err(Error::Closed)));
+        // The other end reads what arrived and then finds the connection shut:
+        // never a message made of the broken one's rest and the next one.
+        server
+            .stream()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(server.recv().is_err());
+    }
+
+    #[test]
+    fn a_reading_half_refuses_a_message_over_its_limit_before_gathering_it() {
+        let (client, mut server, _, _) = pair();
+        let (mut reader, _writer) = client.split().unwrap();
+        reader.set_max_message(100);
+        server.send(&[1u8; 100]).unwrap();
+        assert_eq!(reader.recv().unwrap().len(), 100);
+        // Announced as 200 bytes: refused once the length is read, and the
+        // half refuses everything afterwards.
+        server.send(&[2u8; 200]).unwrap();
+        assert!(matches!(reader.recv(), Err(Error::TooLarge)));
+        server.send(b"x").unwrap();
+        assert!(matches!(reader.recv(), Err(Error::Closed)));
     }
 
     #[test]

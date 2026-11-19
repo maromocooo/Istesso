@@ -48,6 +48,14 @@ impl Pair {
                 .unwrap();
         }
         crate::cache::remember_local_manifest(&host.paths(), &manifest("a host"));
+        // The host names the device by its id, as `--allow-shell` takes it.
+        let laptop = PeerStore::open(host.paths().peers())
+            .unwrap()
+            .find("a laptop")
+            .unwrap()
+            .unwrap()
+            .id
+            .clone();
         let log = Arc::new(Mutex::new(Vec::new()));
         let lines = log.clone();
         let options = crate::AgentOptions {
@@ -55,7 +63,7 @@ impl Pair {
             port: 0,
             discovery: false,
             refresh_peers: None,
-            shell_for: vec!["a laptop".to_string()],
+            shell_for: vec![laptop],
             shell_program: Some("/bin/sh".into()),
             workspace_scopes: false,
             open_requests: false,

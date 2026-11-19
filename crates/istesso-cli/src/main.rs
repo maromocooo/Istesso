@@ -81,11 +81,12 @@ enum Command {
         /// file can be read by its owner only
         #[arg(long, value_name = "PATH")]
         input_timings: Option<PathBuf>,
-        /// Let this paired device (id or name) open a shell here, as the
-        /// user this agent runs as, with `istesso shell`. Off unless given;
-        /// may be given more than once. The device must also be allowed to
-        /// control this machine. A prototype (ADR 0007, proposal)
-        #[arg(long, value_name = "DEVICE")]
+        /// Let the paired device with this id (`istesso peers list` shows
+        /// it) open a shell here, as the user this agent runs as, with
+        /// `istesso shell`. Off unless given; may be given more than once.
+        /// The device must also be allowed to control this machine. Never as
+        /// root. A prototype (ADR 0007, proposal)
+        #[arg(long, value_name = "DEVICE_ID")]
         allow_shell: Vec<String>,
     },
     /// Open a shell on a paired device in this terminal, over Istesso's own
@@ -97,9 +98,13 @@ enum Command {
         /// Id or name of the paired device
         device: String,
         /// Start in this folder on the device: an absolute path there, or
-        /// one that starts with `~/`
-        #[arg(long, value_name = "DIR")]
+        /// one that starts with `~/`. Remembered for the device: without
+        /// this, the shell starts in the folder used last time
+        #[arg(long, value_name = "DIR", conflicts_with = "home")]
         project: Option<String>,
+        /// Start at home, and forget the folder remembered from last time
+        #[arg(long)]
+        home: bool,
         /// Reach the device at this address (and port) instead of where it
         /// was last seen
         #[arg(long, value_name = "ADDRESS[:PORT]")]
@@ -642,6 +647,7 @@ fn main() -> ExitCode {
     if let Command::Shell {
         device,
         project,
+        home,
         address,
         no_forward,
         forward_pin,
@@ -675,6 +681,7 @@ fn main() -> ExitCode {
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from),
             },
+            home: *home,
         };
         return ExitCode::from(istesso_agent::remote_shell::client::run(
             &Paths::from_env(),
@@ -1594,13 +1601,12 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     let addresses = istesso_doctor::lan_addresses();
     let paired = open_peers()?.peers().len();
 
-    let shells = options.shell_for.len();
     let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
     println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
-    if shells > 0 {
-        println!("Shells are open to {shells} paired device(s), as the user this agent runs as.");
+    for device in agent.shell_devices() {
+        println!("Shells are open to {device}, as the user this agent runs as.");
     }
     let reachable: Vec<String> = addresses
         .iter()
