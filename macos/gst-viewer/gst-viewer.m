@@ -38,6 +38,9 @@
 //   ISTESSO_PRETEND_RESIZE=WxH for checks with ISTESSO_DAILY_RECONNECT: four seconds after the start,
 //                              as if the person had resized the window by hand to WxH points
 //   ISTESSO_TITLE_FILE=PATH    the signal USR1 sets the window's title to the first line of PATH
+//   ISTESSO_CLIPBOARD=1        the everyday trial's copy and paste of text (ADR 0022): Command-C,
+//                              Command-X and Command-V in the window copy from, cut from and paste
+//                              into the host's application, when the relay says the host takes them
 //                              (a window of the application wants attention, and back); when the
 //                              second line is "attention", the Dock tile asks for attention once
 //
@@ -169,6 +172,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #import <IOKit/hidsystem/IOLLEvent.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
@@ -872,6 +876,8 @@ static long input_cuts = -1;
 static BOOL input_reconnecting = NO;
 static NSWindow *counted_window = nil;
 static NSString *counted_title = nil;
+// A short line about copy and paste, shown in the title for two seconds (ADR 0022).
+static NSString *clipboard_shown = nil;
 
 static void log_reconnections(const char *at) {
     if (frame_log != NULL) {
@@ -890,8 +896,9 @@ static void show_counts(void) {
         if (input_reconnecting) {
             input = [input stringByAppendingString:input_cuts == 0 ? @"（入力をつないでいます…）" : @"（入力をつなぎ直しています…）"];
         }
-        counted_window.title = [NSString stringWithFormat:@"%@ — 再接続：映像 %lu 回、%@",
-                                counted_title, atomic_load(&picture_cuts), input];
+        counted_window.title = [NSString stringWithFormat:@"%@ — 再接続：映像 %lu 回、%@%@",
+                                counted_title, atomic_load(&picture_cuts), input,
+                                clipboard_shown ? [@" — " stringByAppendingString:clipboard_shown] : @""];
     } else {
         NSString *input = input_cuts < 0 ? @"input not counted" : [NSString stringWithFormat:@"input %ld", input_cuts];
         counted_window.title = [NSString stringWithFormat:@"%@ \u2014 reconnections: picture %lu, %@",
@@ -901,6 +908,8 @@ static void show_counts(void) {
 
 // Whether the host said it takes committed text (ADR 0007, "確定した文字"): only then is any sent.
 static BOOL host_takes_text = NO;
+// Whether the host said it takes copy and paste (ADR 0022): only then are Command-C, X and V taken.
+static BOOL host_takes_clipboard = NO;
 
 // Looks once a second at what the relay says about its own connection, off the main thread:
 // reading a file must never hold up a key on its way out.
@@ -911,26 +920,39 @@ static void watch_relay_state(const char *socket_path) {
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
     dispatch_source_set_event_handler(timer, ^{
-        long now = -1, text = 0;
+        long now = -1, text = 0, clipboard = 0;
         BOOL reconnecting = NO;
         FILE *file = fopen(path.fileSystemRepresentation, "r");
+        char content[256] = {0};
         if (file != NULL) {
-            long pid = 0, count = -1, takes = 0;
+            size_t got = fread(content, 1, sizeof content - 1, file);
+            content[got] = 0;
+            fclose(file);
+        }
+        if (content[0] != 0) {
+            long pid = 0, count = -1, takes = 0, copies = 0;
             // Only a relay that still runs counts: a file left by an earlier one says nothing.
-            // "text" (whether the host takes committed text) is left out by an older relay, and
-            // "reconnecting" is said by a relay of the everyday trial's reconnecting kind only.
-            int cut = 0;
-            int fields = fscanf(file, "{\"pid\":%ld,\"input\":%ld,\"text\":%ld,\"reconnecting\":%d}", &pid, &count, &takes, &cut);
+            // "text" (whether the host takes committed text) is left out by an older relay, so is
+            // "clipboard" (copy and paste), and "reconnecting" is said by a relay of the everyday
+            // trial's reconnecting kind only.
+            int cut = 0, with_clipboard = 1;
+            int fields = sscanf(content, "{\"pid\":%ld,\"input\":%ld,\"text\":%ld,\"clipboard\":%ld,\"reconnecting\":%d}", &pid, &count, &takes, &copies, &cut);
+            if (fields < 4) {
+                with_clipboard = 0;
+                fields = sscanf(content, "{\"pid\":%ld,\"input\":%ld,\"text\":%ld,\"reconnecting\":%d}", &pid, &count, &takes, &cut);
+            }
+            int all = with_clipboard ? 5 : 4;
             if (fields >= 2 && pid > 0 && count >= 0
                 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
                 now = count;
                 text = fields >= 3 && takes == 1;
-                reconnecting = daily_reconnect && fields == 4 && cut == 1;
+                clipboard = with_clipboard && fields >= 4 && copies == 1;
+                reconnecting = daily_reconnect && fields == all && cut == 1;
             }
-            fclose(file);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             host_takes_text = text != 0;
+            host_takes_clipboard = clipboard != 0;
             if (now != input_cuts || reconnecting != input_reconnecting) {
                 if (daily_reconnect && now >= 0 && !reconnecting && !picture_stale &&
                     [cursor_view respondsToSelector:@selector(fallInLine)]) {
@@ -1551,6 +1573,193 @@ static void send_input(const char *format, ...) {
 // Which keys go to the other side for what happens on the keyboard: keys.h, tested by keys-test.c.
 #include "keys.h"
 
+// ---- Copy and paste of text with the host's application (ADR 0022, the everyday trial) ----
+//
+// Only on Command-C, Command-X and Command-V in this window, and only when the relay says the host
+// takes them. The window sends its requests from a socket of its own, in a folder only its user
+// can open, with a nonce of 128 random bits; the relay answers to that socket only, with that
+// nonce, and only the answer to the latest request, within two seconds, is used. What was copied
+// or pasted is never written anywhere by this program.
+
+#include "clipboard.h"
+
+static BOOL clipboard_on = NO;
+static uint32_t clipboard_next_id = 1;
+static uint32_t clipboard_waiting = 0;
+static char clipboard_nonce[33];
+static BOOL clipboard_cut = NO;
+static BOOL clipboard_pasting = NO;
+static char clipboard_folder[PATH_MAX];
+static char clipboard_socket_path[sizeof ((struct sockaddr_un *)0)->sun_path];
+
+// Shows `note` in the title for two seconds; nil shows nothing.
+static void clipboard_show(NSString *note) {
+    if (note == nil) {
+        return;
+    }
+    clipboard_shown = note;
+    show_counts();
+    if (counted_window == nil) {
+        // A window without the counted title (not the everyday trial's): only that something
+        // was not done, never what.
+        fprintf(stderr, "note: a copy or paste was not done\n");
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (clipboard_shown == note) {
+            clipboard_shown = nil;
+            show_counts();
+        }
+    });
+}
+
+// One datagram of a request. The relay reads at once; a full socket is tried again for 50 ms.
+static BOOL clipboard_send(NSData *datagram) {
+    for (int attempt = 0; attempt < 50; attempt++) {
+        if (sendto(input_socket, datagram.bytes, datagram.length, 0, (const struct sockaddr *)&input_to, sizeof input_to)
+            == (ssize_t)datagram.length) {
+            return YES;
+        }
+        if (errno != ENOBUFS && errno != EAGAIN) {
+            return NO;
+        }
+        usleep(1000);
+    }
+    return NO;
+}
+
+// Asks for a copy ('c'), a cut ('x') or a paste ('v'). On the main thread.
+static void clipboard_ask(char which) {
+    uint8_t random[16];
+    arc4random_buf(random, sizeof random);
+    for (int i = 0; i < 16; i++) {
+        snprintf(clipboard_nonce + 2 * i, 3, "%02x", random[i]);
+    }
+    uint32_t id = clipboard_next_id++;
+    NSMutableDictionary *request = [@{@"id": @(id), @"nonce": @(clipboard_nonce)} mutableCopy];
+    if (which == 'v') {
+        NSPasteboard *board = NSPasteboard.generalPasteboard;
+        // The markers are looked at before any text is read: what is marked secret is not read.
+        NSMutableArray<NSString *> *types = [NSMutableArray array];
+        for (NSPasteboardItem *item in board.pasteboardItems) {
+            [types addObjectsFromArray:item.types];
+        }
+        PasteKind kind = clipboard_paste_kind(types, nil);
+        NSString *text = nil;
+        if (kind != PASTE_SECRET) {
+            text = [board stringForType:NSPasteboardTypeString];
+            kind = clipboard_paste_kind(types, text);
+        }
+        switch (kind) {
+        case PASTE_SECRET: clipboard_show(clipboard_note("paste:secret", NULL, NO)); return;
+        case PASTE_TOO_LARGE: clipboard_show(clipboard_note("paste:too_large", NULL, NO)); return;
+        case PASTE_NOT_TEXT: clipboard_show(clipboard_note("paste:not_text", NULL, NO)); return;
+        case PASTE_WITH_TEXT: request[@"text"] = text; break;
+        case PASTE_KEY_ONLY: break;
+        }
+        request[@"kind"] = @"paste";
+    } else {
+        request[@"kind"] = @"copy";
+        if (which == 'x') {
+            request[@"cut"] = @YES;
+        }
+    }
+    NSData *datagram = [NSJSONSerialization dataWithJSONObject:request options:0 error:NULL];
+    if (datagram == nil || !clipboard_send(datagram)) {
+        clipboard_show(clipboard_note("timeout", NULL, NO));
+        return;
+    }
+    clipboard_waiting = id;
+    clipboard_cut = which == 'x';
+    clipboard_pasting = which == 'v';
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(CLIPBOARD_WITHIN * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (clipboard_waiting == id) {
+            clipboard_waiting = 0;
+            clipboard_show(clipboard_note("timeout", NULL, NO));
+        }
+    });
+}
+
+// An answer from the relay. On the main thread.
+static void clipboard_answered(NSDictionary *answer) {
+    if (![answer isKindOfClass:NSDictionary.class] || ![answer[@"kind"] isEqual:@"clipboard"]) {
+        return;
+    }
+    NSNumber *id = answer[@"id"];
+    NSString *nonce = answer[@"nonce"], *result = answer[@"result"], *why = answer[@"why"], *text = answer[@"text"];
+    if (clipboard_waiting == 0 || ![id isKindOfClass:NSNumber.class] || id.unsignedIntValue != clipboard_waiting ||
+        ![nonce isKindOfClass:NSString.class] || strcmp(nonce.UTF8String, clipboard_nonce) != 0 ||
+        ![result isKindOfClass:NSString.class]) {
+        return;
+    }
+    clipboard_waiting = 0;
+    if (![why isKindOfClass:NSString.class]) {
+        why = nil;
+    }
+    if (clipboard_pasting) {
+        clipboard_show(clipboard_note([result isEqual:@"pasted"] ? "pasted" : "paste:none", NULL, NO));
+        return;
+    }
+    if ([result isEqual:@"text"]) {
+        if (![text isKindOfClass:NSString.class] || clipboard_text_problem(text) != NULL) {
+            clipboard_show(clipboard_note("not_text", NULL, clipboard_cut));
+            return;
+        }
+        NSPasteboard *board = NSPasteboard.generalPasteboard;
+        // This Mac only: not handed to other devices by Universal Clipboard (ADR 0022, decision 2).
+        [board prepareForNewContentsWithOptions:NSPasteboardContentsCurrentHostOnly];
+        [board setString:text forType:NSPasteboardTypeString];
+        return;
+    }
+    clipboard_show(clipboard_note(result.UTF8String, why.UTF8String, clipboard_cut));
+}
+
+// The window's own socket, in a folder of its own, for requests and their answers.
+static BOOL clipboard_start(void) {
+    snprintf(clipboard_folder, sizeof clipboard_folder, "%sistesso-viewer-XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);
+    if (mkdtemp(clipboard_folder) == NULL) {
+        return NO;
+    }
+    struct sockaddr_un own = {.sun_family = AF_UNIX};
+    if ((size_t)snprintf(own.sun_path, sizeof own.sun_path, "%s/w.sock", clipboard_folder) >= sizeof own.sun_path) {
+        rmdir(clipboard_folder);
+        return NO;
+    }
+    if (bind(input_socket, (const struct sockaddr *)&own, sizeof own) != 0) {
+        rmdir(clipboard_folder);
+        return NO;
+    }
+    strcpy(clipboard_socket_path, own.sun_path);
+    chmod(clipboard_socket_path, 0600);
+    atexit_b(^{
+        unlink(clipboard_socket_path);
+        rmdir(clipboard_folder);
+    });
+    int size = 256 * 1024;
+    setsockopt(input_socket, SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
+    setsockopt(input_socket, SOL_SOCKET, SO_RCVBUF, &size, sizeof size);
+    static dispatch_source_t reading;
+    reading = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)input_socket, 0,
+                                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    dispatch_source_set_event_handler(reading, ^{
+        static uint8_t buffer[192 * 1024];
+        for (;;) {
+            ssize_t length = recv(input_socket, buffer, sizeof buffer, 0);
+            if (length <= 0) {
+                break;
+            }
+            NSData *data = [NSData dataWithBytes:buffer length:(NSUInteger)length];
+            NSDictionary *answer = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+            if (answer != nil) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    clipboard_answered(answer);
+                });
+            }
+        }
+    });
+    dispatch_resume(reading);
+    return YES;
+}
+
 // Whether the Command keys go to the other side as Control (the default) or as the Super
 // ("Windows") keys. ISTESSO_COMMAND_KEY=super in the environment sends Super.
 static BOOL command_is_control = YES;
@@ -1566,6 +1775,7 @@ static BOOL command_is_control = YES;
     double _scroll[2];   // parts of a pixel not yet passed on
     BOOL _inside;        // the pointer is over the view
     NSPoint _at;         // where, in the view's own coordinates (from its bottom left)
+    NSMutableIndexSet *_taken;  // keys taken for copy and paste: their release is not passed on
 }
 
 // A cursor that shows nothing: over the view the cursor is the one drawn into the layer.
@@ -1674,6 +1884,7 @@ static NSCursor *empty_cursor(void) {
 - (void)letGo {
     KeyChange changes[256];
     [self send:changes count:keys_let_go(&_keys, changes)];
+    [_taken removeAllIndexes];
 }
 
 // The line that says "what you type does not arrive" has come up: whatever is held on the other
@@ -1698,6 +1909,21 @@ static NSCursor *empty_cursor(void) {
 }
 
 - (void)keyDown:(NSEvent *)event {
+    // Copy, cut and paste with the host (ADR 0022): the key itself does not go; the host presses
+    // its own. Once for each press: a repeat, and the release, do not go either.
+    if (clipboard_on && host_takes_clipboard) {
+        char which = clipboard_key(event.keyCode, event.charactersIgnoringModifiers, event.modifierFlags);
+        if (which != 0) {
+            if (_taken == nil) {
+                _taken = [NSMutableIndexSet indexSet];
+            }
+            [_taken addIndex:event.keyCode];
+            if (!event.isARepeat && !picture_stale) {
+                clipboard_ask(which);
+            }
+            return;
+        }
+    }
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
     size_t count = keys_key_down(&_keys, event.keyCode, event.modifierFlags, event.isARepeat, changes);
@@ -1713,6 +1939,10 @@ static NSCursor *empty_cursor(void) {
 }
 
 - (void)keyUp:(NSEvent *)event {
+    if ([_taken containsIndex:event.keyCode]) {
+        [_taken removeIndex:event.keyCode];
+        return;
+    }
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
     [self send:changes count:keys_key_up(&_keys, event.keyCode, changes)];
@@ -2085,6 +2315,13 @@ int main(int argc, char *argv[]) {
             if (input_socket < 0 || fcntl(input_socket, F_SETFL, O_NONBLOCK) != 0) {
                 fprintf(stderr, "error: cannot open a socket for the input\n");
                 return 1;
+            }
+            const char *clipboard = getenv("ISTESSO_CLIPBOARD");
+            if (clipboard != NULL && strcmp(clipboard, "1") == 0) {
+                clipboard_on = clipboard_start();
+                if (!clipboard_on) {
+                    fprintf(stderr, "note: copy and paste are off: no socket of this window's own\n");
+                }
             }
         }
         if (argc >= 9 && channel_address == NULL) {

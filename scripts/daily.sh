@@ -135,7 +135,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial27/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial28/target/release'}
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 state="$HOME/Library/Caches/istesso-daily"
@@ -1007,7 +1007,7 @@ echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/pipeline.sid
 # The words for the pipeline are written into this pipe; it is held open so that it never ends.
 exec 3<>$run/control
-exec python3 -u $src/scripts/daily-pipeline.py --text ${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
+exec python3 -u $src/scripts/daily-pipeline.py --text --clipboard ${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
     [ -n "$MIN_QP" ] && echo "host: $NAME's encoder gets the quality floor min-qp $MIN_QP (trial only)"
@@ -1088,7 +1088,7 @@ SCRIPT
 export ISTESSO_DAILY_RECONNECT=1 XDG_RUNTIME_DIR=$run/rt ISTESSO_CACHE_DIR=$run/agent-cache ${config:+ISTESSO_CONFIG_DIR=$config}
 echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/agent.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/agent.sid
-exec $src/target/release/istesso agent --port $agent_port --no-discovery
+exec $src/target/release/istesso agent --port $agent_port --no-discovery --clipboard
 SCRIPT
     chmod +x "$run/agent.sh"; : > "$run/agent.exit"
     tmux new-session -d -s "daily-$NAME-agent" "bash -c '$run/agent.sh > $run/agent.log 2>&1; echo \$? > $run/agent.exit'" 9>&-
@@ -1224,7 +1224,7 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         local x y frames=- n=$slot
         if [ -n "${POSITION:-}" ]; then x=${POSITION%,*}; y=${POSITION#*,}; else x=$((60 + 48 * n)); y=$((60 + 36 * n)); fi
         [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="$mine/frames-$(date +%s).jsonl"
-        local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1
+        local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CLIPBOARD=1
             ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
         # The title the window has; the guard changes it while a window of the application is calling.
         printf '%s\n\n' "$(app_title "$name")" > "$mine/title"
