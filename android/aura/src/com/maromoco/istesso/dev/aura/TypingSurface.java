@@ -103,11 +103,11 @@ final class TypingSurface extends SurfaceView {
         }
         out.inputType = password ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
                 : InputType.TYPE_CLASS_TEXT;
+        out.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | EditorInfo.IME_ACTION_NONE;
         if (password) {
             out.imeOptions |= EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
         }
-        out.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI
-                | EditorInfo.IME_ACTION_NONE;
         out.initialSelStart = 0;
         out.initialSelEnd = 0;
         connection = new Connection();

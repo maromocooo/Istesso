@@ -42,8 +42,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private int fieldDropped = -1;
     /** Composing text has been sent to the host and not cleared yet. */
     private boolean preeditSent;
-    /** The committed text sent last: shown again when the host says it had nowhere to put it. */
-    private String lastSent = "";
+    /**
+     * The committed text sent last, and when: shown again when the host says, within 3 s, that
+     * it had nowhere to put it. Never kept for a password field; let go once shown.
+     */
+    private String lastSent;
+    private long lastSentNs;
 
     /** Composing text goes into the host's application: it takes it, and has a field (not a password one). */
     private boolean inline() {
@@ -63,14 +67,14 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     @Override
     public void textInput(int state, int serial, int dropped) {
         runOnUiThread(() -> {
-            if (!resumed) {
-                return;
-            }
+            // Kept also while the panel is in the background, so that it is current on its return.
             android.view.inputmethod.InputMethodManager imm =
                     (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
             boolean wasPassword = fieldState == 2;
-            // Another field has the keyboard over there: what is being composed here is dropped.
-            if (fieldSerial >= 0 && serial != fieldSerial && view.composing()) {
+            boolean toPassword = state == 2 && !wasPassword;
+            // Another field has the keyboard over there, or the field became a password field:
+            // what is being composed here is dropped, never committed into it.
+            if ((fieldSerial >= 0 && serial != fieldSerial || toPassword) && view.composing()) {
                 clearInlinePreedit();
                 view.cancelComposing(imm);
             }
@@ -79,15 +83,18 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             // A password field: the input method is told so (no composing, nothing learnt).
             if ((state == 2) != wasPassword) {
                 view.setPassword(state == 2);
-                if (view.typing() && imm != null) {
+                if (resumed && view.typing() && imm != null) {
                     imm.restartInput(view);
                 }
             }
-            if (fieldDropped >= 0 && dropped != fieldDropped && !lastSent.isEmpty()) {
-                // The host had nowhere to put the last text: it is shown here for the person.
+            // The host had nowhere to put the text just sent (its count went up within 3 s of
+            // the commit; a count that went back, as after a restart of the host, says nothing).
+            if (resumed && fieldDropped >= 0 && dropped > fieldDropped && lastSent != null
+                    && System.nanoTime() - lastSentNs < 3_000_000_000L) {
                 composingLine.setText(getString(R.string.text_dropped, lastSent));
                 composingLine.setVisibility(View.VISIBLE);
                 composingLine.postDelayed(() -> composingLine.setVisibility(View.GONE), 10000);
+                lastSent = null;
             }
             fieldDropped = dropped;
         });
@@ -243,7 +250,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 clearInlinePreedit();
                 if (input != 0 && hostTakesText) {
                     Native.inputText(input, text);
-                    lastSent = text;
+                    lastSent = fieldState == 2 ? null : text;
+                    lastSentNs = System.nanoTime();
                 }
             }
 
@@ -812,7 +820,6 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
 
     private boolean touch(MotionEvent e) {
         view.requestFocus();
-        commitBeforeClick(e);
         noteKind("touch", e);
         // The puck's touchpad: a two-finger swipe is a scroll; a three-or-more-finger swipe is left to the system.
         int c = e.getClassification();
@@ -836,6 +843,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (c == 4) { // MotionEvent.CLASSIFICATION_MULTI_FINGER_SWIPE (API 34), not in the stubs this build compiles against
             return true;
         }
+        // A tap or a press, not a scroll: what is being composed is taken first.
+        commitBeforeClick(e);
         if (!place(e)) {
             return true;
         }
