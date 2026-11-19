@@ -177,6 +177,16 @@ func extraPlace(bounds: CGRect, width: Int, height: Int) -> WindowPlace {
     WindowPlace(origin: bounds.origin, scaleX: bounds.width / Double(max(1, width)), scaleY: bounds.height / Double(max(1, height)))
 }
 
+/// Which of the application's windows (their frames, by Accessibility) a close request for the
+/// window at `want` presses: only the one window at that place, and never when that place is also
+/// the place of a window to keep (the first, another streamed one). Accessibility does not say a
+/// window's number; two windows at one place would make it guess, so it is refused then.
+func closeChoice(frames: [CGRect], want: CGRect, keep: [CGRect]) -> Int? {
+    guard !keep.contains(where: { samePlace($0, want) }) else { return nil }
+    let matches = frames.indices.filter { samePlace(frames[$0], want) }
+    return matches.count == 1 ? matches[0] : nil
+}
+
 /// Which window keys go to (see ExtraWindows.focus).
 enum KeyFocus: Equatable {
     case first
@@ -517,24 +527,30 @@ extension DailyHost {
         }
         guard !settings.inputDry, injector.mayPost, !screenLocked(), let pid = app?.processIdentifier else { return }
         let bounds = s.bounds
+        // The windows that must never be closed by this request: the first, and the other streamed ones.
+        let keep = [windowBounds] + extras.streams.values.filter { $0.number != number }.map(\.bounds)
         lookout.act {
             let element = AXUIElementCreateApplication(pid)
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value) == .success,
                   let windows = value as? [AXUIElement] else { return }
-            for window in windows {
+            let frames = windows.map { window -> CGRect in
                 var position: CFTypeRef?, extent: CFTypeRef?
                 AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &position)
                 AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &extent)
                 var p = CGPoint.zero, z = CGSize.zero
                 if let position { AXValueGetValue(position as! AXValue, .cgPoint, &p) }
                 if let extent { AXValueGetValue(extent as! AXValue, .cgSize, &z) }
-                guard samePlace(CGRect(origin: p, size: z), bounds) else { continue }
-                var button: CFTypeRef?
-                if AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &button) == .success, let button {
-                    _ = AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString)
+                return CGRect(origin: p, size: z)
+            }
+            guard let index = closeChoice(frames: frames, want: bounds, keep: keep) else {
+                return DispatchQueue.main.async {
+                    say("window-close", [("window", Int(number)), ("pressed", false), ("reason", "its place is not one window's alone")])
                 }
-                return
+            }
+            var button: CFTypeRef?
+            if AXUIElementCopyAttributeValue(windows[index], kAXCloseButtonAttribute as CFString, &button) == .success, let button {
+                _ = AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString)
             }
         }
     }
@@ -708,6 +724,12 @@ func windowsSelfTest() -> Int {
     check(keyTarget(.none, first: firstWin, listed: streamed).bounds == .zero && keyTarget(.window(3), first: firstWin, listed: streamed).bounds == .zero
               && !keysMayGo(appInFront: true, focused: firstWin.1, shown: keyTarget(.none, first: firstWin, listed: streamed).bounds),
           "no window, or one gone: no key goes, also when the first window has the host's keyboard")
+    // Review 4: a close presses only the one window at the place asked, never the first.
+    let w1 = CGRect(x: 0, y: 0, width: 800, height: 600), w2 = CGRect(x: 28, y: 28, width: 800, height: 600)
+    check(closeChoice(frames: [w1, w2], want: w2, keep: [w1]) == 1, "the window at the place asked")
+    check(closeChoice(frames: [w1, w1], want: w1, keep: [CGRect(x: 5, y: 5, width: 10, height: 10)]) == nil, "two windows at one place: refused")
+    check(closeChoice(frames: [w1, w2], want: w1, keep: [w1]) == nil, "the first window's place: refused")
+    check(closeChoice(frames: [w1], want: w2, keep: [w1]) == nil, "no window at the place: nothing")
     // Review 9: without --windows Accessibility is asked nothing more than before.
     check(!axAsksTitle(windows: false) && axAsksTitle(windows: true), "a window's title is read only with --windows")
     return failed
