@@ -16,6 +16,7 @@ pub mod declared;
 pub mod guard;
 #[cfg(feature = "hid")]
 pub mod hid;
+pub mod inventory;
 pub mod picture;
 pub mod record;
 pub mod registry;

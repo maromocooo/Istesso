@@ -1,0 +1,554 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>Transport</key>
+		<string>Audio</string>
+		<key>Product</key>
+		<string>Example Product 29</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>12</integer>
+		<key>PrimaryUsage</key>
+		<integer>1</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>255</integer>
+		<key>LocationID</key>
+		<integer>2147483648</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>VendorID</key>
+		<integer>65523</integer>
+		<key>ProductID</key>
+		<integer>65239</integer>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>3</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-13</string>
+		<key>LocationID</key>
+		<integer>2147483648</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>VendorID</key>
+		<integer>65523</integer>
+		<key>ProductID</key>
+		<integer>65239</integer>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>9</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-13</string>
+		<key>LocationID</key>
+		<integer>2147483648</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>VendorID</key>
+		<integer>65523</integer>
+		<key>ProductID</key>
+		<integer>65239</integer>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>32</integer>
+		<key>PrimaryUsage</key>
+		<integer>138</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-14</string>
+		<key>LocationID</key>
+		<integer>2147483648</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>4</integer>
+		<key>LocationID</key>
+		<integer>2147483653</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65292</integer>
+		<key>PrimaryUsage</key>
+		<integer>1</integer>
+		<key>LocationID</key>
+		<integer>2147483648</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65292</integer>
+		<key>PrimaryUsage</key>
+		<integer>5</integer>
+		<key>LocationID</key>
+		<integer>2147483648</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>SPU</string>
+		<key>Built-In</key>
+		<true/>
+		<key>VendorID</key>
+		<integer>65523</integer>
+		<key>ProductID</key>
+		<integer>65239</integer>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>5</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-14</string>
+		<key>LocationID</key>
+		<integer>2147483648</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>FIFO</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Product</key>
+		<string>Example Product 30</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>2</integer>
+		<key>LocationID</key>
+		<integer>2147483873</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>FIFO</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Product</key>
+		<string>Example Product 30</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>95</integer>
+		<key>LocationID</key>
+		<integer>2147483873</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>FIFO</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Product</key>
+		<string>Example Product 30</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>11</integer>
+		<key>LocationID</key>
+		<integer>2147483873</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>FIFO</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Product</key>
+		<string>Example Product 30</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>6</integer>
+		<key>LocationID</key>
+		<integer>2147483873</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>FIFO</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Product</key>
+		<string>Example Product 30</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>3</integer>
+		<key>LocationID</key>
+		<integer>2147483873</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>FIFO</string>
+		<key>Built-In</key>
+		<true/>
+		<key>Product</key>
+		<string>Example Product 30</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 15</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>13</integer>
+		<key>LocationID</key>
+		<integer>2147483873</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65532</integer>
+		<key>ProductID</key>
+		<integer>65277</integer>
+		<key>Product</key>
+		<string>Example Product 13</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 7</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65440</integer>
+		<key>PrimaryUsage</key>
+		<integer>1</integer>
+		<key>LocationID</key>
+		<integer>2148798720</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65532</integer>
+		<key>ProductID</key>
+		<integer>65277</integer>
+		<key>Product</key>
+		<string>Example Product 13</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 7</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>6</integer>
+		<key>LocationID</key>
+		<integer>2148798720</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65531</integer>
+		<key>ProductID</key>
+		<integer>65276</integer>
+		<key>Product</key>
+		<string>Example Product 14</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 8</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>6</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-5</string>
+		<key>LocationID</key>
+		<integer>2148798976</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65531</integer>
+		<key>ProductID</key>
+		<integer>65276</integer>
+		<key>Product</key>
+		<string>Example Product 14</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 8</string>
+		<key>PrimaryUsagePage</key>
+		<integer>4919</integer>
+		<key>PrimaryUsage</key>
+		<integer>1</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-5</string>
+		<key>LocationID</key>
+		<integer>2148798976</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65531</integer>
+		<key>ProductID</key>
+		<integer>65276</integer>
+		<key>Product</key>
+		<string>Example Product 14</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 8</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>6</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-5</string>
+		<key>LocationID</key>
+		<integer>2148798976</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65531</integer>
+		<key>ProductID</key>
+		<integer>65276</integer>
+		<key>Product</key>
+		<string>Example Product 14</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 8</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>128</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-5</string>
+		<key>LocationID</key>
+		<integer>2148798976</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65529</integer>
+		<key>ProductID</key>
+		<integer>65274</integer>
+		<key>Product</key>
+		<string>Example Product 2</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 2</string>
+		<key>PrimaryUsagePage</key>
+		<integer>12</integer>
+		<key>PrimaryUsage</key>
+		<integer>1</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-6</string>
+		<key>LocationID</key>
+		<integer>2148802560</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65527</integer>
+		<key>ProductID</key>
+		<integer>65272</integer>
+		<key>Product</key>
+		<string>Example Product 17</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 10</string>
+		<key>PrimaryUsagePage</key>
+		<integer>12</integer>
+		<key>PrimaryUsage</key>
+		<integer>1</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-8</string>
+		<key>LocationID</key>
+		<integer>2148807184</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65528</integer>
+		<key>ProductID</key>
+		<integer>65273</integer>
+		<key>Product</key>
+		<string>Example Product 16</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 9</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>2</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-7</string>
+		<key>LocationID</key>
+		<integer>2148807680</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>VendorID</key>
+		<integer>65528</integer>
+		<key>ProductID</key>
+		<integer>65273</integer>
+		<key>Product</key>
+		<string>Example Product 16</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 9</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>1</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-7</string>
+		<key>LocationID</key>
+		<integer>2148807680</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>Example Value 25</string>
+		<key>Product</key>
+		<string>Example Product 31</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 16</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>72</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>USB</string>
+		<key>Built-In</key>
+		<true/>
+		<key>VendorID</key>
+		<integer>65523</integer>
+		<key>ProductID</key>
+		<integer>65238</integer>
+		<key>Product</key>
+		<string>Example Product 32</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>15</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>Bluetooth</string>
+		<key>VendorID</key>
+		<integer>65522</integer>
+		<key>ProductID</key>
+		<integer>65237</integer>
+		<key>Product</key>
+		<string>Example Product 33</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 3</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>18</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-15</string>
+		<key>LocationID</key>
+		<integer>2196921371</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>Bluetooth</string>
+		<key>VendorID</key>
+		<integer>65522</integer>
+		<key>ProductID</key>
+		<integer>65237</integer>
+		<key>Product</key>
+		<string>Example Product 33</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 3</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>11</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-15</string>
+		<key>LocationID</key>
+		<integer>2196921371</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>Bluetooth</string>
+		<key>VendorID</key>
+		<integer>65522</integer>
+		<key>ProductID</key>
+		<integer>65237</integer>
+		<key>Product</key>
+		<string>Example Product 33</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 3</string>
+		<key>PrimaryUsagePage</key>
+		<integer>1</integer>
+		<key>PrimaryUsage</key>
+		<integer>2</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-15</string>
+		<key>LocationID</key>
+		<integer>2196921371</integer>
+	</dict>
+	<dict>
+		<key>Transport</key>
+		<string>Bluetooth</string>
+		<key>VendorID</key>
+		<integer>65522</integer>
+		<key>ProductID</key>
+		<integer>65237</integer>
+		<key>Product</key>
+		<string>Example Product 33</string>
+		<key>Manufacturer</key>
+		<string>Example Maker 3</string>
+		<key>PrimaryUsagePage</key>
+		<integer>65280</integer>
+		<key>PrimaryUsage</key>
+		<integer>13</integer>
+		<key>SerialNumber</key>
+		<string>SERIAL-15</string>
+		<key>LocationID</key>
+		<integer>2196921371</integer>
+	</dict>
+</array>
+</plist>
