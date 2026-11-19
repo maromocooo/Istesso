@@ -8,12 +8,15 @@
 //!     the frames are written to FILE as they came. With --ask-every a key
 //!     frame is asked for every so many seconds.
 //! picture replay FILE --bind ADDR [--config DIR] [--fps N] [--cursor image|hidden|named]
+//!     [--field field|password|outside]
 //!     Shows a stream kept by `watch` to paired devices, again and again,
 //!     N frames a second (85 unless given): a host without a compositor and
 //!     an encoder, for trying a viewer on one machine. With --cursor it also
 //!     says what the cursor is: a made-up image (a magenta triangle of 64
 //!     pixels with a white edge, its tip the hot spot), hidden, or one
-//!     without an image.
+//!     without an image. With --field (trial only) it says that the
+//!     application's text field is a field, a password field, or that the
+//!     keyboard is outside a field (ADR 0015, "文字の入力の欄").
 //! picture stay ADDR [--config DIR] [--peer NAME] [--seconds S]
 //!     A viewer that lasts: it takes the host's frames as `watch` does, and
 //!     when the connection is cut it connects again. Says each thing that
@@ -221,6 +224,7 @@ fn replay(mut args: Args) -> Result<(), Failure> {
         .ok_or("where to listen? --bind ADDR:PORT")?;
     let fps: f64 = args.option("--fps").map_or(Ok(85.0), |s| s.parse())?;
     let cursor = args.option("--cursor");
+    let field = args.option("--field");
     let path = args.0.first().ok_or("which file?")?;
     let mut file = BufReader::new(std::fs::File::open(path)?);
     let (mut magic, mut info) = (String::new(), String::new());
@@ -271,6 +275,22 @@ fn replay(mut args: Args) -> Result<(), Failure> {
             scale: 1,
             rgba: &triangle,
         }))?,
+    }
+    if let Some(field) = field.as_deref() {
+        let state = match field {
+            "field" => 1,
+            "password" => 2,
+            "outside" => 3,
+            _ => return Err("--field is field, password or outside".into()),
+        };
+        host.set_text_field(&istesso_media::wire::TextField {
+            state,
+            serial: 1,
+            x: 40,
+            y: 40,
+            width: 0,
+            height: 20,
+        })?;
     }
     println!(
         "showing {} frames, {fps} a second, on port {}",
