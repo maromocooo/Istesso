@@ -5,7 +5,9 @@
 //! descriptor, with symbolic links refused (`O_NOFOLLOW`); names such as
 //! `..` or names with `/` are refused. Links inside the folder are listed as
 //! links; their text is returned and resolved (if at all) on the device,
-//! never here. Pipes, sockets and devices are listed and never opened.
+//! never here. Pipes, sockets and devices are listed and never opened: a file
+//! is opened only after it was seen to be a regular one. Nothing on another
+//! file system (a volume mounted inside the folder) is shown.
 //!
 //! This began as `export.rs` of the research prototype (branch
 //! `research-unified-mount`, `research/unified-mount-proto`), which answered
@@ -13,26 +15,48 @@
 //! questions of [`istesso_link::mount`] and hides what [`super::rules`]
 //! says.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::Arc;
 
 use istesso_link::mount::{
     valid_name, Answer, Attr, Entry, Failure, Kind, Question, MAX_ENTRIES, MAX_READ, ROOT_ID,
 };
 
-use super::rules::{Rules, MAX_RULES_FILE};
+use super::rules::{Rules, Unreadable, MAX_RULES_FILE};
 use super::MAX_IDS;
+
+/// The most entries of a folder looked at for one page: a page of a folder
+/// whose entries are mostly hidden still comes back soon.
+const MAX_SCANNED: usize = 4 * MAX_ENTRIES;
+/// The most folders whose listing is kept.
+const MAX_LISTINGS: usize = 256;
+
+/// What says that a folder's entries have not changed since it was listed.
+type Stamp = (u64, u64, i64, i64, i64, i64, i64);
+
+/// The names in one folder, sorted, and when they were read.
+struct Listing {
+    stamp: Stamp,
+    names: Arc<Vec<Vec<u8>>>,
+}
 
 pub struct Export {
     root: OwnedFd,
+    /// The file system of the folder: nothing on another one is shown.
+    dev: u64,
     /// id -> names from the root. The root is the empty list.
     paths: HashMap<u64, Vec<Vec<u8>>>,
     ids: HashMap<Vec<Vec<u8>>, u64>,
+    /// The ids in the order they were handed out, for letting the oldest go.
+    order: VecDeque<u64>,
     next_id: u64,
+    max_ids: usize,
     rules: Rules,
+    listings: HashMap<Vec<Vec<u8>>, Listing>,
     /// Bytes read for the device so far.
     pub bytes_read: u64,
 }
@@ -128,40 +152,110 @@ fn to_attr(st: &libc::stat) -> Attr {
     }
 }
 
-/// Opens a folder below `root`, one name at a time, refusing links.
-fn open_dir(root: &OwnedFd, names: &[Vec<u8>]) -> io::Result<OwnedFd> {
-    let mut cur = openat(root, b".", libc::O_RDONLY | libc::O_DIRECTORY)?;
+#[allow(clippy::unnecessary_cast)] // field types differ between macOS and Linux
+fn dev_of(st: &libc::stat) -> u64 {
+    st.st_dev as u64
+}
+
+#[allow(clippy::unnecessary_cast)] // field types differ between macOS and Linux
+fn stamp(st: &libc::stat) -> Stamp {
+    (
+        st.st_dev as u64,
+        st.st_ino as u64,
+        st.st_mtime as i64,
+        st.st_mtime_nsec as i64,
+        st.st_ctime as i64,
+        st.st_ctime_nsec as i64,
+        st.st_size as i64,
+    )
+}
+
+fn errno(e: &io::Error) -> i32 {
+    e.raw_os_error().unwrap_or(0)
+}
+
+/// Opens a folder below `root`, one name at a time, refusing links and
+/// other file systems.
+fn open_dir(root: &OwnedFd, dev: u64, names: &[Vec<u8>]) -> Result<OwnedFd, Failure> {
+    let mut cur = openat(root, b".", libc::O_RDONLY | libc::O_DIRECTORY).map_err(io_failure)?;
     for name in names {
-        cur = openat(&cur, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        cur = openat(&cur, name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(io_failure)?;
+        if dev_of(&fstat(&cur).map_err(io_failure)?) != dev {
+            return Err(Failure::NoEnt);
+        }
     }
     Ok(cur)
 }
 
-/// Whether every name of `names` is still in its folder, spelled byte for
-/// byte as it is stored. On a volume that folds case or Unicode forms the
-/// file system would also find another spelling; such a name is answered as
-/// missing, so that the rules are only ever asked about stored names (in
-/// doubt, hide).
-fn stored_as_named(root: &OwnedFd, names: &[Vec<u8>]) -> Result<(), Failure> {
-    let mut dir = openat(root, b".", libc::O_RDONLY | libc::O_DIRECTORY).map_err(io_failure)?;
-    for (i, name) in names.iter().enumerate() {
-        if !read_names(&dir).map_err(io_failure)?.contains(name) {
-            return Err(Failure::NoEnt);
-        }
-        if i + 1 < names.len() {
-            dir = openat(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(io_failure)?;
+/// The folder `names` below `root` for reading a rules file in it: `None`
+/// when it is not there or is a file (`.git` of a worktree); unreadable
+/// when it is anything else that cannot be entered (a link, another file
+/// system, no permission).
+fn open_dir_for_rules(
+    root: &OwnedFd,
+    dev: u64,
+    names: &[Vec<u8>],
+) -> Result<Option<OwnedFd>, Unreadable> {
+    let mut cur = openat(root, b".", libc::O_RDONLY | libc::O_DIRECTORY).map_err(|_| Unreadable)?;
+    for name in names {
+        match openat(&cur, name, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(next) => {
+                if dev_of(&fstat(&next).map_err(|_| Unreadable)?) != dev {
+                    return Err(Unreadable);
+                }
+                cur = next;
+            }
+            Err(e) if errno(&e) == libc::ENOENT => return Ok(None),
+            Err(e) if errno(&e) == libc::ENOTDIR || errno(&e) == libc::ELOOP => {
+                // Not a folder: fine when it is a regular file; a link is not
+                // followed and its rules are not known.
+                return match lstat_at(&cur, name) {
+                    Ok(st) if is_type(&st, libc::S_IFREG) => Ok(None),
+                    Err(e) if errno(&e) == libc::ENOENT => Ok(None),
+                    _ => Err(Unreadable),
+                };
+            }
+            Err(_) => return Err(Unreadable),
         }
     }
-    Ok(())
+    Ok(Some(cur))
 }
 
-/// The contents of a small regular file below `root`, never through a link.
-fn read_small(root: &OwnedFd, folder: &[Vec<u8>], name: &[u8]) -> Option<Vec<u8>> {
-    let dir = open_dir(root, folder).ok()?;
-    let fd = openat(&dir, name, libc::O_RDONLY | libc::O_NONBLOCK).ok()?;
-    let st = fstat(&fd).ok()?;
-    if !is_type(&st, libc::S_IFREG) || st.st_size as u64 > MAX_RULES_FILE as u64 {
-        return None;
+/// A rules file below `root`: `None` when it is not there, or is a link or
+/// not a regular file (Git does not follow a linked `.gitignore`); the
+/// contents when it can be read whole; unreadable otherwise (no permission,
+/// larger than [`MAX_RULES_FILE`], an error while reading). The caller hides
+/// what unreadable rules would have decided.
+fn read_rules(
+    root: &OwnedFd,
+    dev: u64,
+    folder: &[Vec<u8>],
+    name: &[u8],
+) -> Result<Option<Vec<u8>>, Unreadable> {
+    let Some(dir) = open_dir_for_rules(root, dev, folder)? else {
+        return Ok(None);
+    };
+    let seen = match lstat_at(&dir, name) {
+        Ok(st) => st,
+        Err(e) if errno(&e) == libc::ENOENT => return Ok(None),
+        Err(_) => return Err(Unreadable),
+    };
+    if !is_type(&seen, libc::S_IFREG) {
+        return Ok(None);
+    }
+    if dev_of(&seen) != dev || seen.st_size as u64 > MAX_RULES_FILE as u64 {
+        return Err(Unreadable);
+    }
+    let fd = openat(
+        &dir,
+        name,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+    )
+    .map_err(|_| Unreadable)?;
+    let st = fstat(&fd).map_err(|_| Unreadable)?;
+    // The same regular file that was looked at, not something put there since.
+    if !is_type(&st, libc::S_IFREG) || st.st_ino != seen.st_ino || dev_of(&st) != dev {
+        return Err(Unreadable);
     }
     let mut file = std::fs::File::from(fd);
     let mut contents = Vec::new();
@@ -169,8 +263,11 @@ fn read_small(root: &OwnedFd, folder: &[Vec<u8>], name: &[u8]) -> Option<Vec<u8>
         &mut io::Read::take(&mut file, MAX_RULES_FILE as u64 + 1),
         &mut contents,
     )
-    .ok()?;
-    (contents.len() <= MAX_RULES_FILE).then_some(contents)
+    .map_err(|_| Unreadable)?;
+    if contents.len() > MAX_RULES_FILE {
+        return Err(Unreadable);
+    }
+    Ok(Some(contents))
 }
 
 impl Export {
@@ -191,20 +288,32 @@ impl Export {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: fresh descriptor, owned by nobody else.
+        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        let dev = dev_of(&fstat(&root)?);
         let mut paths = HashMap::new();
         let mut ids = HashMap::new();
         paths.insert(ROOT_ID, Vec::new());
         ids.insert(Vec::new(), ROOT_ID);
-        // SAFETY: fresh descriptor, owned by nobody else.
-        let root_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Export {
+            root,
+            dev,
             paths,
             ids,
+            order: VecDeque::new(),
             next_id: ROOT_ID + 1,
+            max_ids: MAX_IDS,
             rules: Rules::new(show_ignored, global_rules),
-            root: root_fd,
+            listings: HashMap::new(),
             bytes_read: 0,
         })
+    }
+
+    /// The same, letting go of ids sooner (tests).
+    #[cfg(test)]
+    pub fn with_max_ids(mut self, max_ids: usize) -> Self {
+        self.max_ids = max_ids;
+        self
     }
 
     /// The attributes of the folder itself.
@@ -212,41 +321,114 @@ impl Export {
         fstat(&self.root).map(|st| to_attr(&st))
     }
 
+    /// The id of an entry. When as many ids are out as allowed, the oldest
+    /// tenth are let go first: the device gets `stale` for them and looks the
+    /// names up again, which hands out new ids. An id is never used twice.
     fn id_for(&mut self, names: Vec<Vec<u8>>) -> Result<u64, Failure> {
         if let Some(id) = self.ids.get(&names) {
             return Ok(*id);
         }
-        if self.paths.len() >= MAX_IDS {
-            return Err(Failure::TooMany);
+        if self.paths.len() >= self.max_ids {
+            let release = (self.max_ids / 10).max(1);
+            let mut released = 0;
+            while released < release {
+                let Some(old) = self.order.pop_front() else {
+                    break;
+                };
+                if let Some(old_names) = self.paths.remove(&old) {
+                    self.ids.remove(&old_names);
+                    released += 1;
+                }
+            }
+            if self.paths.len() >= self.max_ids {
+                return Err(Failure::TooMany);
+            }
         }
         let id = self.next_id;
         self.next_id += 1;
         self.paths.insert(id, names.clone());
         self.ids.insert(names, id);
+        self.order.push_back(id);
         Ok(id)
-    }
-
-    fn stat_path(&self, names: &[Vec<u8>]) -> io::Result<libc::stat> {
-        match names.split_last() {
-            None => fstat(&self.root),
-            Some((last, parent)) => lstat_at(&open_dir(&self.root, parent)?, last),
-        }
     }
 
     fn names(&self, id: u64) -> Result<Vec<Vec<u8>>, Failure> {
         self.paths.get(&id).cloned().ok_or(Failure::Stale)
     }
 
-    /// An entry that is not shown, or no longer stored under the name it was
-    /// handed out with, is answered as one that is not there.
-    fn shown(&mut self, names: &[Vec<u8>], is_dir: bool) -> Result<(), Failure> {
-        stored_as_named(&self.root, names)?;
-        let root = &self.root;
-        let read = |folder: &[Vec<u8>], name: &[u8]| read_small(root, folder, name);
-        if self.rules.hides(names, is_dir, &read) {
+    /// The sorted names in the folder `names` (open as `dir`), read again
+    /// only when the folder has changed.
+    fn listed(&mut self, names: &[Vec<u8>], dir: &OwnedFd) -> Result<Arc<Vec<Vec<u8>>>, Failure> {
+        let now = stamp(&fstat(dir).map_err(io_failure)?);
+        if let Some(listing) = self.listings.get(names) {
+            if listing.stamp == now {
+                return Ok(listing.names.clone());
+            }
+        }
+        let mut listed = read_names(dir).map_err(io_failure)?;
+        listed.sort();
+        let listed = Arc::new(listed);
+        if self.listings.len() >= MAX_LISTINGS {
+            self.listings.clear();
+        }
+        self.listings.insert(
+            names.to_vec(),
+            Listing {
+                stamp: now,
+                names: listed.clone(),
+            },
+        );
+        Ok(listed)
+    }
+
+    /// Whether every name of `names` is still in its folder, spelled byte for
+    /// byte as it is stored. On a volume that folds case or Unicode forms the
+    /// file system would also find another spelling; such a name is answered
+    /// as missing, so that the rules are only ever asked about stored names
+    /// (in doubt, hide).
+    fn check_stored(&mut self, names: &[Vec<u8>]) -> Result<(), Failure> {
+        let mut dir = open_dir(&self.root, self.dev, &[])?;
+        for (i, name) in names.iter().enumerate() {
+            if self.listed(&names[..i], &dir)?.binary_search(name).is_err() {
+                return Err(Failure::NoEnt);
+            }
+            if i + 1 < names.len() {
+                dir = openat(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(io_failure)?;
+                if dev_of(&fstat(&dir).map_err(io_failure)?) != self.dev {
+                    return Err(Failure::NoEnt);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An entry that is not shown, is on another file system, or is no longer
+    /// stored under the name it was handed out with, is answered as one that
+    /// is not there.
+    fn shown(&mut self, names: &[Vec<u8>], st: &libc::stat) -> Result<(), Failure> {
+        if dev_of(st) != self.dev {
+            return Err(Failure::NoEnt);
+        }
+        self.check_stored(names)?;
+        let (root, dev) = (&self.root, self.dev);
+        let read = |folder: &[Vec<u8>], name: &[u8]| read_rules(root, dev, folder, name);
+        if self.rules.hides(names, is_type(st, libc::S_IFDIR), &read) {
             Err(Failure::NoEnt)
         } else {
             Ok(())
+        }
+    }
+
+    /// Looks at an entry without following it: the folder itself, or the
+    /// last name in its folder.
+    fn look(&self, names: &[Vec<u8>]) -> Result<(Option<OwnedFd>, libc::stat), Failure> {
+        match names.split_last() {
+            None => Ok((None, fstat(&self.root).map_err(io_failure)?)),
+            Some((last, parent)) => {
+                let dir = open_dir(&self.root, self.dev, parent)?;
+                let st = lstat_at(&dir, last).map_err(io_failure)?;
+                Ok((Some(dir), st))
+            }
         }
     }
 
@@ -265,8 +447,8 @@ impl Export {
             Question::Unknown => Err(Failure::Invalid),
             Question::Stat { id } => {
                 let names = self.names(id)?;
-                let st = self.stat_path(&names).map_err(io_failure)?;
-                self.shown(&names, is_type(&st, libc::S_IFDIR))?;
+                let (_, st) = self.look(&names)?;
+                self.shown(&names, &st)?;
                 Ok((Answer::Attr { attr: to_attr(&st) }, Vec::new()))
             }
             Question::Lookup { dir, name } => {
@@ -274,14 +456,12 @@ impl Export {
                     return Err(Failure::Invalid);
                 }
                 let mut names = self.names(dir)?;
-                let dir_fd = open_dir(&self.root, &names).map_err(io_failure)?;
-                // Only a name as it is stored (checked in `shown`, before anything
-                // is handed out): on a volume that folds case or Unicode forms,
-                // another spelling would reach the same file (`.GIT`, `.Env`, a
-                // decomposed name).
-                let st = lstat_at(&dir_fd, &name).map_err(io_failure)?;
                 names.push(name);
-                self.shown(&names, is_type(&st, libc::S_IFDIR))?;
+                // Only a name as it is stored (checked in `shown`, before anything is
+                // handed out): on a volume that folds case or Unicode forms, another
+                // spelling would reach the same file (`.GIT`, `.Env`, a decomposed name).
+                let (_, st) = self.look(&names)?;
+                self.shown(&names, &st)?;
                 let id = self.id_for(names)?;
                 Ok((
                     Answer::Found {
@@ -293,33 +473,40 @@ impl Export {
             }
             Question::ReadDir { id, start } => {
                 let names = self.names(id)?;
-                let dir_fd = open_dir(&self.root, &names).map_err(io_failure)?;
-                self.shown(&names, true)?;
-                let mut listed = read_names(&dir_fd).map_err(io_failure)?;
-                listed.sort();
-                let mut shown = Vec::with_capacity(listed.len());
-                for name in listed {
+                let (_, st) = self.look(&names)?;
+                if !is_type(&st, libc::S_IFDIR) {
+                    return Err(Failure::NotDir);
+                }
+                self.shown(&names, &st)?;
+                let dir_fd = open_dir(&self.root, self.dev, &names)?;
+                let listed = self.listed(&names, &dir_fd)?;
+                // `start` is a place in the folder's own sorted listing, hidden
+                // entries included, so that a page costs what it holds.
+                let mut at = start as usize;
+                let mut entries = Vec::new();
+                let mut scanned = 0;
+                while at < listed.len() && entries.len() < MAX_ENTRIES && scanned < MAX_SCANNED {
+                    let name = listed[at].clone();
+                    at += 1;
+                    scanned += 1;
                     // An entry may vanish between the listing and its stat; skip it.
                     let Ok(st) = lstat_at(&dir_fd, &name) else {
                         continue;
                     };
+                    if dev_of(&st) != self.dev {
+                        continue;
+                    }
                     let mut child = names.clone();
-                    child.push(name);
-                    let root = &self.root;
-                    let read = |folder: &[Vec<u8>], file: &[u8]| read_small(root, folder, file);
+                    child.push(name.clone());
+                    let (root, dev) = (&self.root, self.dev);
+                    let read =
+                        |folder: &[Vec<u8>], file: &[u8]| read_rules(root, dev, folder, file);
                     if self
                         .rules
                         .hides_last(&child, is_type(&st, libc::S_IFDIR), &read)
                     {
                         continue;
                     }
-                    shown.push((child, st));
-                }
-                let start = start as usize;
-                let more = shown.len() > start.saturating_add(MAX_ENTRIES);
-                let mut entries = Vec::new();
-                for (child, st) in shown.into_iter().skip(start).take(MAX_ENTRIES) {
-                    let name = child.last().cloned().unwrap_or_default();
                     let id = self.id_for(child)?;
                     entries.push(Entry {
                         id,
@@ -327,20 +514,46 @@ impl Export {
                         attr: to_attr(&st),
                     });
                 }
-                Ok((Answer::Entries { entries, more }, Vec::new()))
+                let next = u32::try_from(at).map_err(|_| Failure::TooMany)?;
+                Ok((
+                    Answer::Entries {
+                        entries,
+                        more: at < listed.len(),
+                        next: Some(next),
+                    },
+                    Vec::new(),
+                ))
             }
             Question::Read { id, offset, count } => {
                 let names = self.names(id)?;
-                let (last, parent) = names.split_last().ok_or(Failure::IsDir)?;
-                let dir_fd = open_dir(&self.root, parent).map_err(io_failure)?;
-                // O_NONBLOCK: a pipe in the folder must not make us wait for a writer.
-                let fd =
-                    openat(&dir_fd, last, libc::O_RDONLY | libc::O_NONBLOCK).map_err(io_failure)?;
-                let st = fstat(&fd).map_err(io_failure)?;
-                if !is_type(&st, libc::S_IFREG) {
+                let (dir, seen) = self.look(&names)?;
+                let dir = dir.ok_or(Failure::IsDir)?;
+                // Looked at before it is opened: a pipe or a device is never opened.
+                if is_type(&seen, libc::S_IFDIR) {
+                    return Err(Failure::IsDir);
+                }
+                if is_type(&seen, libc::S_IFLNK) {
+                    return Err(Failure::Loop);
+                }
+                if !is_type(&seen, libc::S_IFREG) {
                     return Err(Failure::Invalid);
                 }
-                self.shown(&names, false)?;
+                self.shown(&names, &seen)?;
+                let last = names.last().ok_or(Failure::IsDir)?;
+                let fd = openat(
+                    &dir,
+                    last,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+                )
+                .map_err(io_failure)?;
+                let st = fstat(&fd).map_err(io_failure)?;
+                // The same regular file that was looked at, not something put there since.
+                if !is_type(&st, libc::S_IFREG)
+                    || st.st_ino != seen.st_ino
+                    || dev_of(&st) != self.dev
+                {
+                    return Err(Failure::Invalid);
+                }
                 let count = count.min(MAX_READ) as usize;
                 let mut buf = vec![0u8; count];
                 let mut done = 0usize;
@@ -371,15 +584,19 @@ impl Export {
             }
             Question::ReadLink { id } => {
                 let names = self.names(id)?;
-                let (last, parent) = names.split_last().ok_or(Failure::Invalid)?;
-                let dir_fd = open_dir(&self.root, parent).map_err(io_failure)?;
-                self.shown(&names, false)?;
+                let (dir, seen) = self.look(&names)?;
+                let dir = dir.ok_or(Failure::Invalid)?;
+                if !is_type(&seen, libc::S_IFLNK) {
+                    return Err(Failure::Invalid);
+                }
+                self.shown(&names, &seen)?;
+                let last = names.last().ok_or(Failure::Invalid)?;
                 let c = CString::new(last.as_slice()).map_err(|_| Failure::Invalid)?;
                 let mut buf = vec![0u8; 4096];
                 // SAFETY: valid descriptor, C string and buffer.
                 let n = unsafe {
                     libc::readlinkat(
-                        dir_fd.as_raw_fd(),
+                        dir.as_raw_fd(),
                         c.as_ptr(),
                         buf.as_mut_ptr().cast(),
                         buf.len(),

@@ -138,9 +138,11 @@ impl MountPolicy {
 }
 
 /// Where the user's global Git ignore file is, as Git would look for it
-/// (`core.excludesFile`, or `~/.config/git/ignore`).
+/// (`core.excludesFile`, or `~/.config/git/ignore`). It may not be there
+/// (no rules) or not be readable (every entry hidden): [`rules::Rules::new`]
+/// tells.
 pub fn global_ignore_file() -> Option<PathBuf> {
-    ignore::gitignore::gitconfig_excludes_path().filter(|path| path.is_file())
+    ignore::gitignore::gitconfig_excludes_path()
 }
 
 /// Whether `path` is a folder only its owner can enter or read: what the

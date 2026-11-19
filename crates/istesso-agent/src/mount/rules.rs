@@ -19,6 +19,13 @@
 //! hidden when either says so; a `!` rule that matches only when folded
 //! does not let it out. `.git` is hidden in any spelling. The caller asks
 //! only about names as they are stored on disk ([`super::export`]).
+//!
+//! A rules file that is not there means no rules (and so does a link or a
+//! file that is not a regular one, which Git does not read either). A rules
+//! file that is there but cannot be read whole (no permission, too large,
+//! an error while reading) hides everything it would have decided: the
+//! entries below its folder, or, for `.git/info/exclude` and the global
+//! file, every entry.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -36,9 +43,16 @@ const KEEP: Duration = Duration::from_secs(2);
 /// The largest ignore file that is read. Larger ones are taken as empty.
 pub const MAX_RULES_FILE: usize = 1 << 20;
 
-/// Reads a small regular file below the shown folder, given the folder's
-/// names from the shown folder and the file's name, without following links.
-pub type ReadSmall<'a> = &'a dyn Fn(&[Vec<u8>], &[u8]) -> Option<Vec<u8>>;
+/// A rules file is there and could not be read whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreadable;
+
+/// What reading a rules file gave: `None` when there is none.
+pub type RulesFile = Result<Option<Vec<u8>>, Unreadable>;
+
+/// Reads a rules file below the shown folder, given the folder's names from
+/// the shown folder and the file's name, without following links.
+pub type ReadSmall<'a> = &'a dyn Fn(&[Vec<u8>], &[u8]) -> RulesFile;
 
 /// The two ways a name is judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,10 +90,12 @@ fn is_git(name: &[u8]) -> bool {
         || std::str::from_utf8(name).is_ok_and(|text| fold(text) == ".git")
 }
 
-/// The rules of one ignore file, read both ways.
+/// The rules of one ignore file, read both ways, or the fact that it could
+/// not be read.
 struct Set {
     as_is: Gitignore,
     folded: Gitignore,
+    unreadable: bool,
 }
 
 impl Set {
@@ -87,6 +103,14 @@ impl Set {
         Set {
             as_is: Gitignore::empty(),
             folded: Gitignore::empty(),
+            unreadable: false,
+        }
+    }
+
+    fn unreadable() -> Self {
+        Set {
+            unreadable: true,
+            ..Set::empty()
         }
     }
 
@@ -94,6 +118,15 @@ impl Set {
         Set {
             as_is: build(contents, Way::AsIs),
             folded: build(contents, Way::Folded),
+            unreadable: false,
+        }
+    }
+
+    fn from_read(read: Result<Option<Vec<u8>>, Unreadable>) -> Self {
+        match read {
+            Ok(Some(contents)) => Set::parse(&contents),
+            Ok(None) => Set::empty(),
+            Err(Unreadable) => Set::unreadable(),
         }
     }
 
@@ -132,6 +165,22 @@ fn relative(names: &[Vec<u8>], way: Way) -> PathBuf {
     Path::new(OsStr::from_bytes(&names.join(&b'/'))).to_path_buf()
 }
 
+/// The user's global ignore file. It is the user's own, outside the shown
+/// folder, so a link to it is followed.
+fn read_global(path: &Path) -> Result<Option<Vec<u8>>, Unreadable> {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_RULES_FILE as u64 => {
+            let contents = std::fs::read(path).map_err(|_| Unreadable)?;
+            if contents.len() > MAX_RULES_FILE {
+                return Err(Unreadable);
+            }
+            Ok(Some(contents))
+        }
+        _ => Err(Unreadable),
+    }
+}
+
 pub struct Rules {
     show_all: bool,
     global: Set,
@@ -141,14 +190,12 @@ pub struct Rules {
 }
 
 impl Rules {
-    /// `global` is the user's global ignore file, read now.
+    /// `global` is the user's global ignore file, read now (once for each
+    /// folder that is opened): missing means no rules, unreadable hides
+    /// everything.
     pub fn new(show_all: bool, global: Option<&Path>) -> Self {
         let global = match (show_all, global) {
-            (false, Some(path)) => std::fs::read(path)
-                .ok()
-                .filter(|contents| contents.len() <= MAX_RULES_FILE)
-                .map(|contents| Set::parse(&contents))
-                .unwrap_or_else(Set::empty),
+            (false, Some(path)) => Set::from_read(read_global(path)),
             _ => Set::empty(),
         };
         Rules {
@@ -196,7 +243,11 @@ impl Rules {
         // The folder the entry is in first, then each folder above it.
         for j in (0..names.len()).rev() {
             let folder = &names[..j];
-            let rules = self.folder_rules(folder, read).way(way);
+            let set = self.folder_rules(folder, read);
+            if set.unreadable {
+                return true;
+            }
+            let rules = set.way(way);
             match rules.matched(relative(&names[j..], way), is_dir) {
                 Match::Ignore(_) => return true,
                 Match::Whitelist(_) => return false,
@@ -204,20 +255,22 @@ impl Rules {
             }
         }
         let path = relative(names, way);
-        match self.exclude_rules(read).way(way).matched(&path, is_dir) {
+        let exclude = self.exclude_rules(read);
+        if exclude.unreadable {
+            return true;
+        }
+        match exclude.way(way).matched(&path, is_dir) {
             Match::Ignore(_) => return true,
             Match::Whitelist(_) => return false,
             Match::None => {}
         }
-        self.global.way(way).matched(&path, is_dir).is_ignore()
+        self.global.unreadable || self.global.way(way).matched(&path, is_dir).is_ignore()
     }
 
     fn folder_rules(&mut self, folder: &[Vec<u8>], read: ReadSmall<'_>) -> &Set {
         let fresh = matches!(self.folders.get(folder), Some((at, _)) if at.elapsed() < KEEP);
         if !fresh {
-            let rules = read(folder, b".gitignore")
-                .map(|contents| Set::parse(&contents))
-                .unwrap_or_else(Set::empty);
+            let rules = Set::from_read(read(folder, b".gitignore"));
             self.folders
                 .insert(folder.to_vec(), (Instant::now(), rules));
         }
@@ -228,9 +281,7 @@ impl Rules {
         let fresh = matches!(&self.exclude, Some((at, _)) if at.elapsed() < KEEP);
         if !fresh {
             let folder = [b".git".to_vec(), b"info".to_vec()];
-            let rules = read(&folder, b"exclude")
-                .map(|contents| Set::parse(&contents))
-                .unwrap_or_else(Set::empty);
+            let rules = Set::from_read(read(&folder, b"exclude"));
             self.exclude = Some((Instant::now(), rules));
         }
         &self.exclude.as_ref().expect("just set").1
@@ -250,14 +301,15 @@ mod tests {
     /// Rules from ignore files given by folder.
     fn files(
         list: &'static [(&'static str, &'static str)],
-    ) -> impl Fn(&[Vec<u8>], &[u8]) -> Option<Vec<u8>> {
+    ) -> impl Fn(&[Vec<u8>], &[u8]) -> RulesFile {
         move |folder: &[Vec<u8>], name: &[u8]| {
             let mut path = folder.to_vec();
             path.push(name.to_vec());
             let path = String::from_utf8(path.join(&b'/')).unwrap();
-            list.iter()
+            Ok(list
+                .iter()
                 .find(|(at, _)| *at == path)
-                .map(|(_, contents)| contents.as_bytes().to_vec())
+                .map(|(_, contents)| contents.as_bytes().to_vec()))
         }
     }
 
@@ -341,6 +393,61 @@ mod tests {
         assert!(hides(".Git/config", false));
         assert!(!hides("README.md", false));
         assert!(!hides("Read me.txt", false));
+    }
+
+    #[test]
+    fn an_unreadable_rules_file_hides_what_it_would_have_decided() {
+        // web/.gitignore is there and cannot be read: everything below web is
+        // hidden, web itself and the rest are not.
+        let read = |folder: &[Vec<u8>], name: &[u8]| {
+            if folder == names("web").as_slice() && name == b".gitignore" {
+                Err(Unreadable)
+            } else {
+                Ok(None)
+            }
+        };
+        let mut rules = Rules::new(false, None);
+        assert!(rules.hides(&names("web/index.html"), false, &read));
+        assert!(rules.hides(&names("web/src/a.js"), false, &read));
+        assert!(!rules.hides(&names("web"), true, &read));
+        assert!(!rules.hides(&names("README.md"), false, &read));
+
+        // .git/info/exclude unreadable: every entry.
+        let read = |folder: &[Vec<u8>], name: &[u8]| {
+            if folder == names(".git/info").as_slice() && name == b"exclude" {
+                Err(Unreadable)
+            } else {
+                Ok(None)
+            }
+        };
+        let mut rules = Rules::new(false, None);
+        assert!(rules.hides(&names("README.md"), false, &read));
+    }
+
+    #[test]
+    fn a_global_file_that_is_missing_is_no_rules_and_one_that_cannot_be_read_hides_all() {
+        let none = files(&[]);
+        let base =
+            std::env::temp_dir().join(format!("istesso-rules-global-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut missing = Rules::new(false, Some(&base.join("not-there")));
+        assert!(!missing.hides(&names("README.md"), false, &none));
+        // A folder where the file should be cannot be read as rules.
+        let mut folder = Rules::new(false, Some(&base));
+        assert!(folder.hides(&names("README.md"), false, &none));
+        // Too large.
+        let large = base.join("large");
+        std::fs::write(&large, vec![b'#'; MAX_RULES_FILE + 1]).unwrap();
+        let mut too_large = Rules::new(false, Some(&large));
+        assert!(too_large.hides(&names("README.md"), false, &none));
+        let small = base.join("small");
+        std::fs::write(&small, b"*.log\n").unwrap();
+        let mut read = Rules::new(false, Some(&small));
+        assert!(read.hides(&names("a.log"), false, &none));
+        assert!(!read.hides(&names("a.txt"), false, &none));
+        std::fs::remove_file(&large).unwrap();
+        std::fs::remove_file(&small).unwrap();
+        std::fs::remove_dir(&base).unwrap();
     }
 
     #[test]

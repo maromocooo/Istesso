@@ -66,7 +66,8 @@ pub enum Question {
     Stat { id: u64 },
     /// The entry `name` in the folder `dir`.
     Lookup { dir: u64, name: Vec<u8> },
-    /// The entries of a folder, from the `start`-th on, in name order.
+    /// The entries of a folder in name order, from the place `start` on: 0,
+    /// then the `next` of the answer before.
     ReadDir { id: u64, start: u32 },
     /// Up to `count` bytes of a file from `offset`.
     Read { id: u64, offset: u64, count: u32 },
@@ -150,9 +151,14 @@ pub enum Answer {
     },
     Entries {
         entries: Vec<Entry>,
-        /// There are entries after these: ask again from `start` plus the
-        /// number of entries so far.
+        /// There may be entries after these (the page can even be empty when
+        /// the host looked at many entries it does not show): ask again
+        /// from `next`.
         more: bool,
+        /// Where the next page starts. A host that does not say counts
+        /// shown entries: `start` plus the number of entries so far.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<u32>,
     },
     /// The bytes follow the JSON in the same frame.
     Data {
@@ -266,6 +272,7 @@ mod tests {
                     attr: attr(Kind::Symlink),
                 }],
                 more: true,
+                next: Some(4096),
             },
             Answer::Link {
                 target: b"../x".to_vec(),

@@ -698,20 +698,20 @@ impl Shared {
     > {
         use crate::mount::{export::Export, MAX_ON_HOST, MAX_PER_DEVICE};
         let peer = session.peer();
+        // One answer for every refusal of this kind, so that it does not tell
+        // whether the folder id exists.
+        let refused = || {
+            Response::error(
+                ErrorCode::Forbidden,
+                "this host does not show that folder to this device",
+            )
+        };
         let folder = match self.mount_policy.folder(&request.folder) {
             Some(folder) if self.mount_policy.names(peer) => folder,
-            _ => {
-                return Err(Response::error(
-                    ErrorCode::Forbidden,
-                    "this host does not show that folder to this device",
-                ))
-            }
+            _ => return Err(refused()),
         };
         if !may_still_control(&self.paths, peer) {
-            return Err(Response::error(
-                ErrorCode::Forbidden,
-                "this device may not control the host",
-            ));
+            return Err(refused());
         }
         let slot = {
             let mut mounts = self.mounts.lock().unwrap_or_else(|e| e.into_inner());

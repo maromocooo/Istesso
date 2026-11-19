@@ -77,7 +77,10 @@ pub fn serve(
         return served;
     };
 
-    let (frames, arrived) = mpsc::channel();
+    // One question is answered at a time: at most two frames wait here, and a
+    // device that sends more without reading the answers is held back by the
+    // connection itself, not queued in memory.
+    let (frames, arrived) = mpsc::sync_channel(2);
     let listening = std::thread::spawn(move || loop {
         let frame = reader.recv();
         let over = frame.is_err();
