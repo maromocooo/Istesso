@@ -16,3 +16,5 @@ __pycache__/
 /Claude outputs/
 # Output of macos/daily-host/build.sh
 /macos/daily-host/build/
+# Output of macos/input-method/build.sh
+/macos/input-method/build/
