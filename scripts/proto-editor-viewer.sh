@@ -5,12 +5,15 @@
 # and passes keyboard and mouse on with `istesso input relay`, both from a built copy of branch
 # trial-daily-next, as `scripts/daily.sh open` does there.
 #
-#   scripts/proto-editor-viewer.sh HOST PICTURE INPUT TITLE      (what `istesso shell` runs)
-#   scripts/proto-editor-viewer.sh stop                          closes the window and the relay
+#   scripts/proto-editor-viewer.sh HOST PICTURE INPUT     (what `istesso shell` runs)
+#   scripts/proto-editor-viewer.sh stop                   closes the window and the relay
 #
 # ISTESSO_CHANNEL_PEER is the host's id, set by `istesso shell` (the key its handshake checked): the
-# picture and the input go to that host and no other. When the window is open already, it is brought
-# to the front instead (the host hands a second file to the editor that runs).
+# picture and the input go to that host and no other. ISTESSO_WINDOW_TITLE is the window's title (the
+# host's text: never taken as an argument, and kept to letters, digits, spaces and a few marks here,
+# never beginning with `-`, before it is handed to the viewer). When the window is open already,
+# nothing is done: the host has handed the file to the editor in it, and the window is not pulled to
+# the front over what the person is doing.
 #
 # Settings (this Mac's own):
 #   EDITOR_VIEWER_SRC     a built copy of trial-daily-next: macos/gst-viewer/build/gst-viewer and
@@ -43,8 +46,10 @@ if [ "${1:-}" = stop ]; then
     stop_written_down "$dir/relay.pid"
     exit 0
 fi
-[ $# -eq 4 ] || { echo "$(date '+%H:%M:%S') wrong arguments" >> "$log"; exit 2; }
-host=$1 picture=$2 input=$3 title=$4
+[ $# -eq 3 ] || { echo "$(date '+%H:%M:%S') wrong arguments" >> "$log"; exit 2; }
+host=$1 picture=$2 input=$3
+title=$(printf '%s' "${ISTESSO_WINDOW_TITLE:-Main editor}" | LC_ALL=C tr -c 'A-Za-z0-9 ._()-' '?' | cut -c1-64)
+case "$title" in -*) title="?${title#-}" ;; "") title="Main editor" ;; esac
 peer=${ISTESSO_CHANNEL_PEER:-}
 [[ "$picture" =~ ^[0-9]+$ && "$input" =~ ^[0-9]+$ && -n "$peer" ]] || { echo "$(date '+%H:%M:%S') no ports or no host id" >> "$log"; exit 2; }
 case "$host" in *:*) at="[$host]" ;; *) at=$host ;; esac
@@ -64,9 +69,8 @@ fi
 [ -x "$viewer" ] && [ -x "$istesso" ] || { echo "$(date '+%H:%M:%S') EDITOR_VIEWER_SRC is not built" >> "$log"; exit 1; }
 
 if still_runs "$dir/viewer.pid"; then
-    # The window is open: brought to the front (the trial viewer's switch).
-    kill -USR2 "$(read -r pid _ < "$dir/viewer.pid"; echo "$pid")" 2>/dev/null
-    echo "$(date '+%H:%M:%S') the window is open already: brought to the front" >> "$log"
+    # The window is open: the file is in it already, as a new tab of the editor.
+    echo "$(date '+%H:%M:%S') the window is open already" >> "$log"
     exit 0
 fi
 mkdir -p "$dir/cache"

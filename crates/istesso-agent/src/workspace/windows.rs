@@ -5,14 +5,16 @@
 //! The host says on which of its ports the window's picture and input
 //! wait ([`istesso_link::shell::ShellFrame::OpenWindow`]). What shows the
 //! window here is this device's own setting (`ISTESSO_WINDOW_OPENER`): it is
-//! started with the address this device opened the shell at, the two
-//! ports, and the window's title, and with `ISTESSO_CHANNEL_PEER` set to
-//! the host's id, the key the shell's handshake checked. The frame names no
-//! address and no key, so the window is looked for on the host of the shell
-//! and nowhere else.
+//! started with three arguments, the address this device opened the shell
+//! at (with its IPv6 scope, when it has one) and the two ports, and with
+//! `ISTESSO_CHANNEL_PEER` set to the host's id, the key the shell's
+//! handshake checked. The window's title comes in `ISTESSO_WINDOW_TITLE`,
+//! never as an argument: a title is the host's text, and a program may take
+//! an argument for an option. The frame names no address and no key, so the
+//! window is looked for on the host of the shell and nowhere else.
 
 use std::collections::VecDeque;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,11 +29,14 @@ const SHOWING_WINDOW: Duration = Duration::from_secs(5);
 
 /// The variable that names the program that shows a window of the host.
 pub const OPENER_VARIABLE: &str = "ISTESSO_WINDOW_OPENER";
+/// The variable that carries the window's title to that program.
+pub const TITLE_VARIABLE: &str = "ISTESSO_WINDOW_TITLE";
 
 /// Shows the windows that the host of one shell opened for it.
 pub struct Windows {
     program: Option<PathBuf>,
-    host: IpAddr,
+    /// The host's address as the program is given it.
+    host: String,
     host_id: String,
     shown: Mutex<VecDeque<Instant>>,
     notice: Notice,
@@ -40,7 +45,16 @@ pub struct Windows {
 impl Windows {
     /// For the shell on the host at `host` whose key has the id `host_id`;
     /// `program` shows a window (none: the person is told instead).
-    pub fn new(program: Option<PathBuf>, host: IpAddr, host_id: &str, notice: Notice) -> Windows {
+    pub fn new(
+        program: Option<PathBuf>,
+        host: SocketAddr,
+        host_id: &str,
+        notice: Notice,
+    ) -> Windows {
+        let host = match host {
+            SocketAddr::V6(v6) if v6.scope_id() != 0 => format!("{}%{}", v6.ip(), v6.scope_id()),
+            other => other.ip().to_string(),
+        };
         Windows {
             program,
             host,
@@ -78,11 +92,11 @@ impl Windows {
             return false;
         };
         let started = std::process::Command::new(program)
-            .arg(self.host.to_string())
+            .arg(&self.host)
             .arg(window.picture.to_string())
             .arg(window.input.to_string())
-            .arg(&window.title)
             .env("ISTESSO_CHANNEL_PEER", &self.host_id)
+            .env(TITLE_VARIABLE, &window.title)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -143,7 +157,7 @@ mod tests {
         std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$ISTESSO_CHANNEL_PEER\" > '{}.new'\nmv '{0}.new' '{0}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" \"$ISTESSO_CHANNEL_PEER\" \"$ISTESSO_WINDOW_TITLE\" > '{}.new'\nmv '{0}.new' '{0}'\n",
                 written.display()
             ),
         )
@@ -152,7 +166,7 @@ mod tests {
         let (notice, lines) = heard();
         let windows = Windows::new(
             Some(program),
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:26890".parse().unwrap(),
             "the-hosts-id",
             notice,
         );
@@ -163,7 +177,7 @@ mod tests {
         }
         assert_eq!(
             std::fs::read_to_string(&written).unwrap(),
-            "127.0.0.1\n26891\n26892\nText Editor\nthe-hosts-id\n"
+            "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\nText Editor\n"
         );
         assert!(lines.lock().unwrap()[0].contains("shown here"));
     }
@@ -171,7 +185,7 @@ mod tests {
     #[test]
     fn without_a_program_or_beyond_the_limit_the_person_is_told_instead() {
         let (notice, lines) = heard();
-        let windows = Windows::new(None, "127.0.0.1".parse().unwrap(), "id", notice);
+        let windows = Windows::new(None, "127.0.0.1:26890".parse().unwrap(), "id", notice);
         assert!(!windows.open(&window(26891)));
         assert!(lines.lock().unwrap()[0].contains(OPENER_VARIABLE));
         for _ in 0..MAX_SHOWN {

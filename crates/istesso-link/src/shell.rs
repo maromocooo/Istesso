@@ -73,6 +73,18 @@ pub enum ShellFrame {
     Unknown(u8),
 }
 
+/// A window's title as it may be shown and handed on: ASCII that can be
+/// seen and spaces, [`MAX_TITLE`] characters at most, and never beginning
+/// with `-` (a program it is handed to as an argument would take it for an
+/// option). Anything else is replaced with `?`.
+pub fn harmless_title(text: &str) -> String {
+    let title = ascii_name(text, MAX_TITLE);
+    match title.strip_prefix('-') {
+        Some(rest) => format!("?{rest}"),
+        None => title,
+    }
+}
+
 /// A window that the host opened for the shell's workspace: where its
 /// picture and its input wait, and what to call it. Never a path, a file's
 /// name, an address or a key.
@@ -82,9 +94,8 @@ pub struct WindowOpen {
     pub picture: u16,
     /// The host's port of the agent that takes the window's input.
     pub input: u16,
-    /// What to call the window, for showing only: ASCII that can be seen
-    /// and spaces, [`MAX_TITLE`] characters at most (anything else is
-    /// replaced when the frame is read).
+    /// What to call the window, for showing only: as [`harmless_title`]
+    /// makes it when the frame is read.
     #[serde(default)]
     pub title: String,
 }
@@ -208,8 +219,9 @@ impl ShellFrame {
                 if window.picture == 0 || window.input == 0 {
                     return Err(Error::Malformed);
                 }
-                // Nothing in it that a terminal or a title bar would act on.
-                window.title = ascii_name(&window.title, MAX_TITLE);
+                // Nothing in it that a terminal, a title bar or a program's
+                // options would act on.
+                window.title = harmless_title(&window.title);
                 Ok(ShellFrame::OpenWindow(window))
             }
             other => Ok(ShellFrame::Unknown(other)),
@@ -342,6 +354,15 @@ mod tests {
         };
         assert_eq!(window.title.chars().count(), MAX_TITLE);
         assert!(window.title.starts_with("?]0;evil?"));
+        // Never an option for a program it is handed to.
+        let mut option = vec![0x07];
+        option.extend_from_slice(br#"{"picture":5,"input":6,"title":"--gst-plugin-path=/tmp/x"}"#);
+        let ShellFrame::OpenWindow(window) = ShellFrame::decode(&option).unwrap() else {
+            panic!("not a window");
+        };
+        assert_eq!(window.title, "?-gst-plugin-path=/tmp/x");
+        assert_eq!(harmless_title("-"), "?");
+        assert_eq!(harmless_title("Text Editor"), "Text Editor");
         // A title may be left out; fields of a later version are passed over.
         let with = |json: &[u8]| {
             let mut raw = vec![0x07];

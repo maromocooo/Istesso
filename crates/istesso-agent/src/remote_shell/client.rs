@@ -170,7 +170,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
             });
             Some(crate::workspace::windows::Windows::new(
                 options.window_opener.clone(),
-                address.ip(),
+                *address,
                 &peer_id,
                 notice,
             ))
