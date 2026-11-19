@@ -16,9 +16,19 @@ import AppKit
 final class Counting: NSTextView {
     var counts: [String: Int] = [:]
     var lastClick: NSPoint?
+    private var downAt: [UInt16: TimeInterval] = [:]
     override func keyDown(with event: NSEvent) {
         counts["key", default: 0] += 1
+        if event.isARepeat { counts["repeat", default: 0] += 1 } else { downAt[event.keyCode] = event.timestamp }
         super.keyDown(with: event)
+    }
+    override func keyUp(with event: NSEvent) {
+        counts["key_up", default: 0] += 1
+        if let at = downAt.removeValue(forKey: event.keyCode) {
+            // How long the key was down, in milliseconds (the longest so far); never which key.
+            counts["held_ms_max"] = max(counts["held_ms_max"] ?? 0, Int((event.timestamp - at) * 1000))
+        }
+        super.keyUp(with: event)
     }
     override func flagsChanged(with event: NSEvent) {
         counts["flags", default: 0] += 1

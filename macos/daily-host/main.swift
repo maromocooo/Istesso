@@ -1953,6 +1953,7 @@ final class Injector {
     var lastInput: TimeInterval = 0
     var holding: Bool { !keysDown.isEmpty || !buttonsDown.isEmpty }
     private var keysDown: Set<UInt32> = []
+    private var keyDownPostedAt: [UInt32: UInt64] = [:]
     private var buttonsDown: Set<UInt32> = []
     private var point = CGPoint.zero
     var pointerPlace: CGPoint { point }
@@ -2041,7 +2042,14 @@ final class Injector {
         // anything on the way: it is made one here.
         if modifierFlag(code) != nil { event.type = .flagsChanged }
         if pressed { log("{\"kind\":\"key_in\",\"t_ns\":\(nowNs())}") }
+        // Never repeated by anyone: a posted key is one press, however long it is held.
+        event.setIntegerValueField(.keyboardEventAutorepeat, value: 0)
         postProcess(event, pid)
+        // How long each key was down between our own down and up (times only, never which key).
+        let at = nowNs()
+        if pressed { keyDownPostedAt[code] = at } else if let down = keyDownPostedAt.removeValue(forKey: code) {
+            log("{\"kind\":\"key_hold\",\"t_ns\":\(at),\"ms\":\(String(format: "%.1f", Double(at - down) / 1e6))}")
+        }
         if pressed && modifierFlag(code) == nil && flags.contains(.maskCommand) { onCommandChord(code) }
         count("key")
     }
