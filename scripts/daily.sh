@@ -1064,7 +1064,7 @@ SCRIPT
     # devices are only read.
     cat > "$run/agent.sh" <<SCRIPT
 #!/bin/bash
-export XDG_RUNTIME_DIR=$run/rt ISTESSO_CACHE_DIR=$run/agent-cache ${config:+ISTESSO_CONFIG_DIR=$config}
+export ISTESSO_DAILY_RECONNECT=1 XDG_RUNTIME_DIR=$run/rt ISTESSO_CACHE_DIR=$run/agent-cache ${config:+ISTESSO_CONFIG_DIR=$config}
 echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/agent.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/agent.sid
 exec $src/target/release/istesso agent --port $agent_port --no-discovery
@@ -1187,8 +1187,8 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         : > "$mine/relay.log"
         # Without the hang-up of the terminal it was started from, so that closing that terminal leaves
         # it running; and without the lock's descriptor.
-        nohup env ${config_env[@]+"${config_env[@]}"} ISTESSO_CACHE_DIR="$state/cache" "$istesso" input relay --to "$peer" --socket "$mine/in.sock" \
-            --address "$host_side:$((47920 + slot))" --keep-trying 30 > "$mine/relay.log" 2>&1 9>&- &
+        nohup env ISTESSO_DAILY_RECONNECT=1 ${config_env[@]+"${config_env[@]}"} ISTESSO_CACHE_DIR="$state/cache" "$istesso" input relay --to "$peer" --socket "$mine/in.sock" \
+            --address "$host_side:$((47920 + slot))" > "$mine/relay.log" 2>&1 9>&- &
         write_down "$mine/relay.pid" $!
         local i
         for i in $(seq 1 60); do grep -q "goes to the paired device" "$mine/relay.log" 2>/dev/null && break; sleep 0.25; done
@@ -1203,7 +1203,7 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         local x y frames=- n=$slot
         if [ -n "${POSITION:-}" ]; then x=${POSITION%,*}; y=${POSITION#*,}; else x=$((60 + 48 * n)); y=$((60 + 36 * n)); fi
         [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="$mine/frames-$(date +%s).jsonl"
-        local settings=(ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
+        local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
             ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
         # The title the window has; the guard changes it while a window of the application is calling.
         printf '%s\n\n' "$(app_title "$name")" > "$mine/title"

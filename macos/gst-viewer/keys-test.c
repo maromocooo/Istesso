@@ -119,20 +119,28 @@ int main(void) {
     EXPECT_NOTHING("Shift pressed during a cut",
                    keys_hold_back(&keys, out,
                                   keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out), &dropped));
-    EXPECT("the picture is back and Shift is held", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out), 42);
-    EXPECT_NOTHING("in line already", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out));
+    EXPECT("the picture is back and Shift is held", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, false, out), 42);
+    EXPECT_NOTHING("in line already", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, false, out));
     EXPECT("a letter under it is plain again", keys_key_down(&keys, A, KEYS_FLAG_SHIFT, false, out), 30);
     // Shift was let go while nobody was told (the window lost the keyboard meanwhile, say).
-    EXPECT("Shift is not held any more: it comes up, the letter stays", keys_fall_in_line(&keys, 0, out), -42);
+    EXPECT("Shift is not held any more: it comes up, the letter stays", keys_fall_in_line(&keys, 0, false, out), -42);
     EXPECT("the letter comes up by itself", keys_key_up(&keys, A, out), -30);
 
     // Command goes over as Control, and falls in line as Control.
-    EXPECT("Command held when the picture is back", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, out), 29);
-    EXPECT_NOTHING("Control and Command are one key over there", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_CONTROL, out));
-    EXPECT("both let go", keys_fall_in_line(&keys, 0, out), -29);
+    EXPECT("Command held when the picture is back", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, false, out), 29);
+    EXPECT_NOTHING("Control and Command are one key over there", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_CONTROL, false, out));
+    EXPECT("both let go", keys_fall_in_line(&keys, 0, false, out), -29);
     keys.command_is_control = false;
-    EXPECT("Command as Super", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, out), 125);
-    EXPECT("and let go", keys_fall_in_line(&keys, 0, out), -125);
+    EXPECT("Command as Super", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, false, out), 125);
+    EXPECT("and let go", keys_fall_in_line(&keys, 0, false, out), -125);
+
+    // A daily reconnect restores the physical side, so its ordinary release clears it.
+    keys.command_is_control = true;
+    unsigned long held = KEYS_FLAG_SHIFT | KEYS_DEVICE_RIGHT_SHIFT | KEYS_FLAG_COMMAND | KEYS_DEVICE_RIGHT_COMMAND;
+    EXPECT("right Shift and right Command are still held", keys_fall_in_line(&keys, held, true, out), 54, 97);
+    EXPECT("right Shift comes up", keys_flags_changed(&keys, 0x3C, KEYS_FLAG_COMMAND | KEYS_DEVICE_RIGHT_COMMAND, out), -54);
+    EXPECT("right Command comes up", keys_flags_changed(&keys, 0x36, 0, out), -97);
+    EXPECT_NOTHING("no synthetic left modifier stays down", keys_let_go(&keys, out));
 
     if (failures == 0) {
         printf("keys: all tests passed\n");

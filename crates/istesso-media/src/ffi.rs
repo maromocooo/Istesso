@@ -758,6 +758,20 @@ pub unsafe extern "C" fn istesso_media_watch_open(
 }
 
 /// # Safety
+/// `watch` is a newly opened handle, exclusively held by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_watch_follow_restarts(watch: *mut IstessoMediaWatch) {
+    // SAFETY: the caller enables this before sharing the watch with any other thread.
+    if let Some(watch) = unsafe { watch.as_mut() } {
+        watch
+            .lasting
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .follow_pipeline_restarts();
+    }
+}
+
+/// # Safety
 /// `watch` came from `istesso_media_watch_open` and has not been closed; `frame` points to
 /// room for the result. What `frame.data` points to stays valid until the next call with
 /// this watch.
@@ -1269,6 +1283,7 @@ mod tests {
                 istesso_media_watch_open(device_dir.as_ptr(), addr.as_ptr(), std::ptr::null());
             assert!(!watch.is_null(), "{}", last_error());
 
+            istesso_media_watch_follow_restarts(watch);
             let mut frame = std::mem::zeroed::<IstessoMediaFrame>();
             let mut state = IstessoMediaWatchState::default();
             let mut info = std::mem::zeroed::<IstessoMediaStreamInfo>();
@@ -1290,14 +1305,14 @@ mod tests {
             assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
             assert_eq!((state.cuts, state.again, state.why), (0, 0, 0));
 
-            let until_shown = || {
+            let until_shown = |host| {
                 let began = std::time::Instant::now();
                 while istesso_media_host_viewers(host) != 1 {
                     assert!(began.elapsed() < Duration::from_secs(5), "waited too long");
                     std::thread::sleep(Duration::from_millis(5));
                 }
             };
-            until_shown();
+            until_shown(host);
             let mut sent = std::mem::zeroed::<IstessoMediaSent>();
             assert_eq!(
                 istesso_media_host_send(host, b"key".as_ptr(), 3, 1, 2, 1, &mut sent),
@@ -1321,7 +1336,7 @@ mod tests {
             istesso_media_client_close(second);
             assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
             assert_eq!((state.cuts, state.again, state.why), (1, 1, 0));
-            until_shown();
+            until_shown(host);
             // From any thread, with whichever connection there is.
             istesso_media_watch_ask_key_frame(watch);
             assert_eq!(
@@ -1330,6 +1345,30 @@ mod tests {
             );
             assert_eq!(next(&mut frame), 1);
             assert_eq!(std::slice::from_raw_parts(frame.data, frame.len), b"key 2");
+            assert_eq!(frame.key_frame, 1);
+
+            // A daily window stays on the same watch across a clean pipeline restart.
+            istesso_media_host_close(host);
+            assert_eq!(next(&mut frame), 3);
+            // Leave the port empty through a failed attempt.
+            assert_eq!(istesso_media_watch_next(watch, 500, &mut frame), 0);
+            let host = istesso_media_host_listen(host_dir.as_ptr(), addr.as_ptr(), &INFO);
+            assert!(!host.is_null(), "{}", last_error());
+            assert_eq!(next(&mut frame), 4);
+            assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
+            assert_eq!((state.cuts, state.again), (2, 1));
+            until_shown(host);
+            assert_eq!(
+                istesso_media_host_send(host, b"delta".as_ptr(), 5, 4, 5, 0, &mut sent),
+                0
+            );
+            assert_eq!(sent.viewers, 0);
+            assert_eq!(
+                istesso_media_host_send(host, b"fresh".as_ptr(), 5, 5, 6, 1, &mut sent),
+                0
+            );
+            assert_eq!(next(&mut frame), 1);
+            assert_eq!(std::slice::from_raw_parts(frame.data, frame.len), b"fresh");
             assert_eq!(frame.key_frame, 1);
 
             // The picture is put aside: said on the connection, and that is the end.

@@ -61,6 +61,8 @@ pub struct AgentOptions {
     /// instead of [`Paths::input_socket`]. For tests, which must never
     /// write to the socket of a pipeline that is really running.
     pub input_socket: Option<std::path::PathBuf>,
+    /// Daily trial: end the channel when the pipeline replaces its local socket.
+    pub follow_input_restarts: bool,
     /// For measuring: write down when input was passed on, and never what it
     /// was ([`crate::passing`]). `None`, the default, writes nothing.
     pub input_timings: Option<std::path::PathBuf>,
@@ -75,6 +77,7 @@ impl Default for AgentOptions {
             refresh_peers: Some(Duration::from_secs(300)),
             verbose: false,
             input_socket: None,
+            follow_input_restarts: false,
             input_timings: None,
         }
     }
@@ -96,6 +99,7 @@ struct Shared {
     verbose: bool,
     /// Where input is handed over on this machine.
     input_socket: std::path::PathBuf,
+    follow_input_restarts: bool,
     /// The conversation each device sends its input on, by the device's id:
     /// one for each device. A device that opens another ends the one before.
     inputs: Mutex<HashMap<String, InputHold>>,
@@ -142,6 +146,7 @@ impl Agent {
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
                 input_socket: options.input_socket.clone().unwrap_or(paths_input_socket),
+                follow_input_restarts: options.follow_input_restarts,
                 inputs: Mutex::new(HashMap::new()),
                 passing,
                 log,
@@ -230,6 +235,8 @@ impl Agent {
 struct InputSink {
     #[cfg(unix)]
     socket: std::os::unix::net::UnixDatagram,
+    #[cfg(unix)]
+    file_id: Option<(u64, u64)>,
     /// What this conversation has down on the application's side.
     held: Arc<Mutex<Held>>,
 }
@@ -245,12 +252,21 @@ struct Held {
 
 impl InputSink {
     #[cfg(unix)]
-    fn open(path: &std::path::Path) -> std::io::Result<InputSink> {
+    fn file_id(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    #[cfg(unix)]
+    fn open(path: &std::path::Path, follow_restarts: bool) -> std::io::Result<InputSink> {
+        let file_id = follow_restarts.then(|| Self::file_id(path)).transpose()?;
         let socket = std::os::unix::net::UnixDatagram::unbound()?;
         socket.connect(path)?;
         socket.set_nonblocking(true)?;
         Ok(InputSink {
             socket,
+            file_id,
             held: Arc::default(),
         })
     }
@@ -261,6 +277,7 @@ impl InputSink {
     fn another(&self) -> std::io::Result<InputSink> {
         Ok(InputSink {
             socket: self.socket.try_clone()?,
+            file_id: self.file_id,
             held: self.held.clone(),
         })
     }
@@ -330,7 +347,7 @@ impl InputSink {
     }
 
     #[cfg(not(unix))]
-    fn open(_path: &std::path::Path) -> std::io::Result<InputSink> {
+    fn open(_path: &std::path::Path, _follow_restarts: bool) -> std::io::Result<InputSink> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
@@ -429,38 +446,48 @@ impl Shared {
                     if !(events.is_empty() && answers_alive) {
                         continue;
                     }
+                    // A heartbeat must not vouch for a pipeline whose socket was replaced.
+                    #[cfg(unix)]
+                    if sink
+                        .file_id
+                        .is_some_and(|id| InputSink::file_id(&self.input_socket).ok() != Some(id))
+                    {
+                        break;
+                    }
                     Response::InputAlive
                 }
                 Request::InputOpen { .. } if !session.allows(Permission::Control) => {
                     Response::error(ErrorCode::Forbidden, "this device may not control the host")
                 }
-                Request::InputOpen { alive } => match InputSink::open(&self.input_socket) {
-                    Ok(sink) => {
-                        // One conversation carries a device's input. An earlier one (cut
-                        // off somewhere on the way, perhaps, without either end having
-                        // been told) is over now, and what it had down comes up before
-                        // this one presses anything.
-                        if let Some(earlier) = input.take() {
-                            earlier.let_go();
-                            // Asked twice in one conversation: it is not its own
-                            // predecessor, and is not ended for it.
-                            self.forget_input(session.peer(), &earlier);
+                Request::InputOpen { alive } => {
+                    match InputSink::open(&self.input_socket, self.follow_input_restarts) {
+                        Ok(sink) => {
+                            // One conversation carries a device's input. An earlier one (cut
+                            // off somewhere on the way, perhaps, without either end having
+                            // been told) is over now, and what it had down comes up before
+                            // this one presses anything.
+                            if let Some(earlier) = input.take() {
+                                earlier.let_go();
+                                // Asked twice in one conversation: it is not its own
+                                // predecessor, and is not ended for it.
+                                self.forget_input(session.peer(), &earlier);
+                            }
+                            self.take_over_input(&session, &sink);
+                            input = Some(sink);
+                            answers_alive = alive;
+                            if alive {
+                                // It says "still here" twice a second from now on.
+                                let _ = session.set_wait(INPUT_SILENCE);
+                            }
+                            asked.push("input");
+                            Response::InputOpen { alive }
                         }
-                        self.take_over_input(&session, &sink);
-                        input = Some(sink);
-                        answers_alive = alive;
-                        if alive {
-                            // It says "still here" twice a second from now on.
-                            let _ = session.set_wait(INPUT_SILENCE);
-                        }
-                        asked.push("input");
-                        Response::InputOpen { alive }
+                        Err(_) => Response::error(
+                            ErrorCode::Internal,
+                            "nothing on this host takes input at the moment",
+                        ),
                     }
-                    Err(_) => Response::error(
-                        ErrorCode::Internal,
-                        "nothing on this host takes input at the moment",
-                    ),
-                },
+                }
                 request if session.allows(Permission::View) => self.answer(&request, &mut asked),
                 _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
@@ -634,13 +661,13 @@ mod tests {
         let dir = TempDir::new("in");
         let path = dir.paths().config.join("i.sock");
         // Nobody listens: there is nothing to open.
-        assert!(InputSink::open(&path).is_err());
+        assert!(InputSink::open(&path, false).is_err());
 
         let listener = UnixDatagram::bind(&path).unwrap();
         listener
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let sink = InputSink::open(&path).unwrap();
+        let sink = InputSink::open(&path, false).unwrap();
         sink.send(&InputEvent::Key {
             code: 30,
             pressed: true,
