@@ -1658,6 +1658,163 @@ static NSCursor *empty_cursor(void) {
 
 @end
 
+// ADR 0007 ("確定した文字"), ADR 0020 route d: local composition in the trial viewer
+// is switched on by ISTESSO_TEXT_INPUT=1.
+#include "text-input.h"
+
+@interface TextInputView : InputView <NSTextInputClient>
+@end
+
+@implementation TextInputView {
+    NSString *_marked;
+    NSRange _selection;
+    CATextLayer *_markedStrip;
+    NSEvent *_interpretedEvent;
+    BOOL _startedWithMark, _passKey, _discardingMark;
+}
+
+- (void)letGo {
+    _interpretedEvent = nil;
+    _discardingMark = YES;
+    [self.inputContext discardMarkedText];
+    [self unmarkText];
+    _discardingMark = NO;
+    [super letGo];
+}
+
+- (void)keyDown:(NSEvent *)event {
+    // Eisu and Kana select the local input method, even with modifiers held.
+    if (event.keyCode == 0x66 || event.keyCode == 0x68) {
+        [self.inputContext handleEvent:event];
+        return;
+    }
+    _startedWithMark = self.hasMarkedText;
+    if (!_startedWithMark && (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl))) {
+        [super keyDown:event];
+        return;
+    }
+    _interpretedEvent = event;
+    _passKey = NO;
+    BOOL handled = [self.inputContext handleEvent:event];
+    if (_interpretedEvent && (_passKey || !handled)) {
+        [super keyDown:event];
+    }
+    _interpretedEvent = nil;
+}
+
+- (NSRect)markedStripRect {
+    return NSMakeRect(8, 8, MAX(1, NSWidth(self.bounds) - 16), 24);
+}
+
+- (BOOL)hasMarkedText {
+    return _marked.length > 0;
+}
+
+- (NSRange)markedRange {
+    return self.hasMarkedText ? NSMakeRange(0, _marked.length) : NSMakeRange(NSNotFound, 0);
+}
+
+- (NSRange)selectedRange {
+    return self.hasMarkedText ? _selection : NSMakeRange(0, 0);
+}
+
+static NSString *plain_text(id value) {
+    return [value isKindOfClass:NSAttributedString.class] ? [value string] : value;
+}
+
+- (void)setMarkedText:(id)value selectedRange:(NSRange)selection replacementRange:(NSRange)replacement {
+    if (_discardingMark) {
+        return;
+    }
+    _marked = [plain_text(value) copy];
+    if (!self.hasMarkedText) {
+        [self unmarkText];
+        return;
+    }
+    NSUInteger start = MIN(selection.location, _marked.length);
+    _selection = NSMakeRange(start, MIN(selection.length, _marked.length - start));
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (!_markedStrip) {
+        self.wantsLayer = YES;
+        _markedStrip = [CATextLayer layer];
+        _markedStrip.frame = self.markedStripRect;
+        _markedStrip.autoresizingMask = kCALayerWidthSizable;
+        _markedStrip.backgroundColor = [NSColor colorWithWhite:0 alpha:0.75].CGColor;
+        _markedStrip.zPosition = 15;
+        [self.layer addSublayer:_markedStrip];
+    }
+    _markedStrip.contentsScale = self.window.backingScaleFactor;
+    NSMutableAttributedString *display = [[NSMutableAttributedString alloc] initWithString:_marked attributes:@{
+        NSForegroundColorAttributeName : NSColor.whiteColor, NSFontAttributeName : [NSFont systemFontOfSize:16]
+    }];
+    [display addAttribute:NSUnderlineStyleAttributeName value:@(NSUnderlineStyleSingle) range:_selection];
+    _markedStrip.string = display;
+    _markedStrip.hidden = NO;
+    [CATransaction commit];
+}
+
+- (void)unmarkText {
+    _marked = nil;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _markedStrip.string = nil;
+    _markedStrip.hidden = YES;
+    [CATransaction commit];
+}
+
+- (void)insertText:(id)value replacementRange:(NSRange)replacement {
+    if (_discardingMark) {
+        return;
+    }
+    NSString *text = plain_text(value);
+    if (_interpretedEvent && !_startedWithMark && !self.hasMarkedText && [text isEqualToString:_interpretedEvent.characters]) {
+        _passKey = YES;
+        return;
+    }
+    [self unmarkText];
+    if (picture_stale) {
+        held_back_count += text.length > 0;
+        return;
+    }
+    if (input_socket >= 0) {
+        text_input_packets(text, ^(const char *packet, size_t length) {
+            note_press();
+            sendto(input_socket, packet, length, 0, (const struct sockaddr *)&input_to, sizeof input_to);
+        });
+    }
+}
+
+- (void)doCommandBySelector:(SEL)selector {
+    if (_interpretedEvent && !_startedWithMark && !self.hasMarkedText) {
+        _passKey = YES;
+    }
+}
+
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    if (actual) {
+        *actual = self.hasMarkedText ? self.markedRange : self.selectedRange;
+    }
+    NSRect rect = [self convertRect:self.markedStripRect toView:nil];
+    return [self.window convertRectToScreen:rect];
+}
+
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    if (actual) {
+        *actual = NSMakeRange(NSNotFound, 0);
+    }
+    return nil;
+}
+
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText {
+    return @[];
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    return NSNotFound;
+}
+@end
+
 // The everyday trial's ISTESSO_END_WITH_WINDOW: the program ends with its window.
 @interface EndWithWindow : NSObject <NSApplicationDelegate>
 @end
@@ -1798,9 +1955,12 @@ int main(int argc, char *argv[]) {
         }
         const char *command_key = getenv("ISTESSO_COMMAND_KEY");
         command_is_control = command_key == NULL || strcmp(command_key, "super") != 0;
-        // The view that follows the pointer: to pass it on, and, with the channel, to draw the cursor.
-        NSView *view = input_socket >= 0 || channel_address != NULL ? [[InputView alloc] initWithFrame:NSMakeRect(0, 0, width, height)]
-                                                                    : [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+        const char *text_input = getenv("ISTESSO_TEXT_INPUT");
+        Class viewClass = NSView.class;
+        if (input_socket >= 0 || channel_address != NULL) {
+            viewClass = input_socket >= 0 && text_input != NULL && strcmp(text_input, "1") == 0 ? TextInputView.class : InputView.class;
+        }
+        NSView *view = [[viewClass alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         window.contentView = view;
         if (input_socket >= 0) {
             [window makeFirstResponder:view];

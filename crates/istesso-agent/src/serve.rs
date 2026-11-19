@@ -278,32 +278,39 @@ impl InputSink {
             return;
         }
         for event in events {
-            match *event {
+            match event {
                 InputEvent::Key {
                     code,
                     pressed: true,
                 } => {
-                    held.keys.insert(code);
+                    held.keys.insert(*code);
                 }
                 InputEvent::Key {
                     code,
                     pressed: false,
                 } => {
-                    held.keys.remove(&code);
+                    held.keys.remove(code);
                 }
                 InputEvent::Button {
                     code,
                     pressed: true,
                 } => {
-                    held.buttons.insert(code);
+                    held.buttons.insert(*code);
                 }
                 InputEvent::Button {
                     code,
                     pressed: false,
                 } => {
-                    held.buttons.remove(&code);
+                    held.buttons.remove(code);
                 }
                 InputEvent::PointerAt { .. } | InputEvent::Scroll { .. } => {}
+                // Committed text (trial only): nothing is held down by it. A piece that is not
+                // within the limits is dropped here; the text is never logged.
+                InputEvent::Text { text } => {
+                    if !istesso_proto::text_is_acceptable(text) {
+                        continue;
+                    }
+                }
             }
             self.send(event);
         }
@@ -740,6 +747,33 @@ mod tests {
                 pair.all_handed_over(A_MOMENT),
                 [key(42, false), button(0x110, false)]
             );
+        }
+
+        #[test]
+        fn committed_text_is_passed_on_in_order_and_text_over_the_limits_is_not() {
+            let pair = InputPair::new("it");
+            let mut client = pair.connect();
+            client.open_input().unwrap();
+            let text = |text: &str| InputEvent::Text { text: text.into() };
+            client
+                .send_input(&[
+                    key(30, true),
+                    text("日本語"),
+                    text(&"あ".repeat(257)),
+                    text(""),
+                    text("a\nb"),
+                    key(30, false),
+                ])
+                .unwrap();
+            assert_eq!(
+                pair.all_handed_over(A_MOMENT),
+                [key(30, true), text("日本語"), key(30, false)]
+            );
+            // Text holds nothing down: only the keys come up when the conversation ends.
+            client.send_input(&[key(31, true), text("か")]).unwrap();
+            assert_eq!(pair.all_handed_over(A_MOMENT).len(), 2);
+            drop(client);
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(31, false)]);
         }
 
         #[test]
