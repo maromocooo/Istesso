@@ -115,10 +115,10 @@ index 8338561..c075c39 100644
                      | Command::ClipboardCopy { .. }
 diff --git a/wayland-display-core/src/comp/scroll.rs b/wayland-display-core/src/comp/scroll.rs
 new file mode 100644
-index 0000000..25120e6
+index 0000000..8b7ed99
 --- /dev/null
 +++ b/wayland-display-core/src/comp/scroll.rs
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,311 @@
 +//! Trial only (the patch gst-wayland-display-trial-y-scroll): scrolls that say what scrolled and
 +//! where the gesture is, from the custom upstream event `PointerScroll` (Istesso's ADR 0007,
 +//! "スクロールの種類と段階").
@@ -230,6 +230,49 @@ index 0000000..25120e6
 +    stop_timer: Option<RegistrationToken>,
 +    /// Read from the environment at the first scroll; tests set it.
 +    pub(crate) momentum: Option<Momentum>,
++    /// How fingers' pixels are told to this compositor's application (read at the first finger
++    /// scroll; tests set it).
++    pub(crate) tuning: Option<FingerTuning>,
++    /// With [`FingerTuning::whole`]: the parts of a pixel not told yet.
++    carry: (f64, f64),
++}
++
++/// How fingers' pixels are told to the application of this compositor (each trial application
++/// has a compositor of its own), so that its content moves as far as the fingers: applications
++/// scale touchpad values by factors of their own (measured in the trial: Chrome 12, GTK 4 2.5).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct FingerTuning {
++    /// `ISTESSO_SCROLL_FINGER_SCALE` (default 1, between 0.01 and 10): multiplies the pixels.
++    pub scale: f64,
++    /// `ISTESSO_SCROLL_WHOLE_PIXELS=1`: whole pixels only, the parts carried on (an application
++    /// that drops the parts of each value, as Blender does).
++    pub whole: bool,
++}
++
++impl Default for FingerTuning {
++    fn default() -> Self {
++        FingerTuning {
++            scale: 1.0,
++            whole: false,
++        }
++    }
++}
++
++impl FingerTuning {
++    fn from_environment() -> FingerTuning {
++        let scale = std::env::var("ISTESSO_SCROLL_FINGER_SCALE")
++            .ok()
++            .and_then(|v| v.parse::<f64>().ok())
++            .filter(|v| v.is_finite() && (0.01..=10.0).contains(v))
++            .unwrap_or(1.0);
++        let whole = std::env::var("ISTESSO_SCROLL_WHOLE_PIXELS").as_deref() == Ok("1");
++        tracing::info!(
++            scale,
++            whole,
++            "trial scroll: fingers' pixels for this application"
++        );
++        FingerTuning { scale, whole }
++    }
 +}
 +
 +impl State {
@@ -317,7 +360,25 @@ index 0000000..25120e6
 +            .map(|output| output.current_scale().fractional_scale())
 +            .filter(|scale| *scale > 0.0)
 +            .unwrap_or(1.0);
-+        let (x, y) = (x / scale, y / scale);
++        let tuning = *self
++            .scrolling
++            .tuning
++            .get_or_insert_with(FingerTuning::from_environment);
++        let (mut x, mut y) = (x / scale * tuning.scale, y / scale * tuning.scale);
++        if tuning.whole {
++            // Whole pixels only, the parts carried to the next value (an application that
++            // drops the parts of each value would lose them all).
++            let carry = &mut self.scrolling.carry;
++            carry.0 += x;
++            carry.1 += y;
++            (x, y) = (carry.0.trunc(), carry.1.trunc());
++            carry.0 -= x;
++            carry.1 -= y;
++        }
++        self.scrolling.open = true;
++        if x == 0.0 && y == 0.0 {
++            return;
++        }
 +        let mut frame = AxisFrame::new(time).source(AxisSource::Finger);
 +        for (axis, value) in [(Axis::Horizontal, x), (Axis::Vertical, y)] {
 +            if value != 0.0 {
@@ -325,12 +386,12 @@ index 0000000..25120e6
 +            }
 +        }
 +        self.tell_axis(frame);
-+        self.scrolling.open = true;
 +    }
 +
 +    /// Tells the stop of the finger scroll that is open, if one is.
 +    pub(crate) fn finish_finger_scroll(&mut self, time: u32) {
 +        self.cancel_scroll_stop();
++        self.scrolling.carry = (0.0, 0.0);
 +        if !std::mem::take(&mut self.scrolling.open) {
 +            return;
 +        }
@@ -403,15 +464,17 @@ index cea3dd4..ee1c00d 100644
  mod test_windows;
 diff --git a/wayland-display-core/src/tests/test_trial_scroll.rs b/wayland-display-core/src/tests/test_trial_scroll.rs
 new file mode 100644
-index 0000000..74def00
+index 0000000..00aa7ad
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_scroll.rs
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,335 @@
 +//! Integration tests for the trial's scrolls (`PointerScroll`): a wheel is told as a wheel with
 +//! its notches, fingers as fingers with their pixels and a stop when the gesture is over, and
 +//! the sender's inertia as more of the same scroll. A real Wayland client is told.
 +
-+use crate::comp::scroll::{IDLE_STOP, LOST_STOP, Momentum, ScrollFrom, ScrollInput, ScrollStage};
++use crate::comp::scroll::{
++    FingerTuning, IDLE_STOP, LOST_STOP, Momentum, ScrollFrom, ScrollInput, ScrollStage,
++};
 +use crate::tests::client::MouseEvents;
 +use crate::tests::fixture::Fixture;
 +use smithay::utils::Point;
@@ -690,6 +753,38 @@ index 0000000..74def00
 +            "frame"
 +        ]
 +    );
++}
++
++#[test]
++fn an_application_gets_the_fingers_pixels_scaled_or_whole_as_its_compositor_is_told() {
++    let mut f = fixture();
++    f.server.scrolling.tuning = Some(FingerTuning {
++        scale: 0.5,
++        whole: false,
++    });
++    f.server
++        .pointer_scroll(1, fingers(0.0, 8.0, ScrollStage::Changed));
++    assert_eq!(told(&mut f), ["finger", "v 4", "frame"]);
++    // Whole pixels, the parts carried on, and dropped when the gesture ends.
++    f.server.scrolling.tuning = Some(FingerTuning {
++        scale: 1.0,
++        whole: true,
++    });
++    for (time, y) in [(2, 0.4), (3, 0.4), (4, 0.4), (5, 2.9)] {
++        f.server
++            .pointer_scroll(time, fingers(0.0, y, ScrollStage::Changed));
++    }
++    assert_eq!(
++        told(&mut f),
++        ["finger", "v 1", "frame", "finger", "v 3", "frame"]
++    );
++    f.server.pointer_scroll(6, ended(false));
++    assert_eq!(told(&mut f), ["finger", "stop h", "stop v", "frame"]);
++    f.server
++        .pointer_scroll(7, fingers(0.0, 0.5, ScrollStage::Began));
++    f.server
++        .pointer_scroll(8, fingers(0.0, 0.4, ScrollStage::Changed));
++    assert!(told(&mut f).is_empty());
 +}
 +
 +#[test]
