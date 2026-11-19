@@ -293,6 +293,23 @@ print(interface.get_string("gtk-theme") + (":dark" if interface.get_string("colo
 PY
 }
 normal_settings_state() { stat -c '%y %s %i' "$1" 2>/dev/null || echo absent; }
+trial_location() { # KEY PATH: the trial's settings folder for KEY is PATH from now on. When PATH does
+    # not exist yet and the trial kept KEY somewhere else before, PATH is made from that previous
+    # TRIAL location (a copy; the previous one stays as it was), never from the owner's normal
+    # settings (the owner's rule, 2026-11-19). The location in use is written down in
+    # apps/locations, and each copy in apps/history.
+    local key=$1 new=$2 old
+    mkdir -p "$D/apps"
+    old=$(awk -v k="$key" '$1 == k {sub(/^[^ ]+ /, ""); print}' "$D/apps/locations" 2>/dev/null | tail -1)
+    [ "$old" = "$new" ] && return 0
+    if [ -n "$old" ] && [ ! -e "$new" ] && [ -e "$old" ]; then
+        mkdir -p "$(dirname "$new")"
+        cp -a "$old" "$new" || { echo "fail the trial's settings for $key could not be made from its previous location"; exit 1; }
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $key: $new made from the trial's previous location $old" >> "$D/apps/history"
+        echo "host: the trial's settings for $key moved: the new place was made from the trial's previous one (not from the owner's normal settings)"
+    fi
+    echo "$key $new" >> "$D/apps/locations"
+}
 firefox_policies() { # FIREFOX_DIR: the policies of the trial's Firefox, in its own folder: no updates
     # (it is updated with `firefox-get`), no usage statistics, no studies, no default-browser check
     mkdir -p "$1/distribution"
@@ -827,6 +844,7 @@ else
         # The trial's own test profile, in the trial's folder, silent; its settings, cache and data
         # folders are the trial's too, so that nothing goes to the owner's.
         home=$D/apps/firefox; profile=$home/profile
+        trial_location firefox "$home"
         mkdir -p "$profile" "$home/config" "$home/cache" "$home/data" "$home/state"; chmod 700 "$home"
         cat > "$profile/user.js" <<'PREFS'
 // Written by scripts/daily.sh at every start: the trial's Firefox is silent, Japanese, and asks
@@ -872,7 +890,14 @@ PREFS
         # folder of the newest earlier version, never from the owner's. A check gives a folder of
         # its own instead (DAILY_BLENDER_CONFIG), which is treated the same way.
         settings=$D/apps/blender/config
-        [ -n "$BLENDER_CONFIG" ] && settings=$(eval echo "$BLENDER_CONFIG")
+        if [ -n "$BLENDER_CONFIG" ]; then
+            # A check's folder: kept under a key of its own, so that the trial's real one never
+            # follows a check.
+            settings=$(eval echo "$BLENDER_CONFIG")
+            trial_location blender-check "$settings"
+        else
+            trial_location blender "$settings"
+        fi
         normal=$HOME/.config/blender/$version/config
         mine=$settings/blender/$version/config
         if [ ! -d "$mine" ]; then
@@ -901,12 +926,15 @@ PREFS
         app="env XDG_CONFIG_HOME=$settings $(printf '%q' "$blender") -noaudio"
         case "$doc" in *.blend) app="$app $doc" ;; esac ;;
     editor)
-        home=$D/apps/editor; mkdir -p "$home/data" "$home/config" "$home/state" "$home/cache" "$D/documents"
+        home=$D/apps/editor
+        trial_location editor "$home"
+        mkdir -p "$home/data" "$home/config" "$home/state" "$home/cache" "$D/documents"
         [ -e "$D/documents/trial.txt" ] || : > "$D/documents/trial.txt"
         look=$home/config
         app="env XDG_DATA_HOME=$home/data XDG_CONFIG_HOME=$home/config XDG_STATE_HOME=$home/state XDG_CACHE_HOME=$home/cache GSETTINGS_BACKEND=keyfile GIO_USE_VFS=local gnome-text-editor --standalone --ignore-session ${doc:-$D/documents/trial.txt}" ;;
     chrome)
         # Its own profile. Never TMPDIR below ~/.cache: Chrome then ends at once.
+        trial_location chrome "$D/apps/chrome"
         mkdir -p "$D/apps/chrome/profile"
         # No usage statistics and no crash reports: the profile's own consent says no (Local State),
         # and the start says it again (--disable-breakpad, --disable-crash-reporter, and
