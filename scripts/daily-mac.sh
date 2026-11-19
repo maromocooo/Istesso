@@ -94,12 +94,12 @@ refuse_when_busy() {
     echo "a latency measurement is running (scripts/measuring.sh status): nothing is started until it is over"
     exit 3
 }
-write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
+write_down() { echo "$2 $(LC_ALL=C ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
 still_runs() {
     [ -s "$1" ] || return 1
     local pid started
     read -r pid started < "$1"
-    [ -n "$pid" ] && [ -n "$started" ] && [ "$(echo $(ps -o lstart= -p "$pid" 2>/dev/null))" = "$(echo $started)" ]
+    [ -n "$pid" ] && [ -n "$started" ] && [ "$(echo $(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null))" = "$(echo $started)" ]
 }
 number_in() { local pid _; read -r pid _ < "$1"; echo "$pid"; }
 stop_written_down() {
@@ -123,12 +123,12 @@ set -u
 case "$DIR" in "~/"*) ;; *) echo "fail the trial's folder on the host is not a ~/ name"; exit 1 ;; esac
 D="$HOME/${DIR#\~/}"
 mkdir -p "$D/run"
-write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
+write_down() { echo "$2 $(LC_ALL=C ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
 still_runs() {
     [ -s "$1" ] || return 1
     local pid started
     read -r pid started < "$1"
-    [ -n "$pid" ] && [ -n "$started" ] && [ "$(echo $(ps -o lstart= -p "$pid" 2>/dev/null))" = "$(echo $started)" ]
+    [ -n "$pid" ] && [ -n "$started" ] && [ "$(echo $(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null))" = "$(echo $started)" ]
 }
 number_in() { local pid _; read -r pid _ < "$1"; echo "$pid"; }
 stop_written_down() {
