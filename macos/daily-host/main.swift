@@ -201,37 +201,69 @@ let frameLog = FrameLog(path: settings.log)
 
 // MARK: - The transport
 
+/// Who is shown the picture: every paired device that may look, one device, or nobody.
+enum AdmitState: Equatable {
+    case paired
+    case only(id: String, key: String)
+    case nobody
+}
+
+/// The native calls a stream may still take: none once it is closed. A small lock-held flag, so
+/// that a frame on the encoder's thread and the close on the main thread never overlap.
+final class Guarded {
+    private let lock = NSLock()
+    private var closed = false
+    /// Runs `work` while not closed; nil once closed.
+    func use<T>(_ work: () -> T) -> T? {
+        lock.lock(); defer { lock.unlock() }
+        return closed ? nil : work()
+    }
+    /// Closes; `last` runs once, under the lock, after every `use` in progress has finished.
+    func close(_ last: () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed else { return }
+        closed = true
+        last()
+    }
+    var isClosed: Bool { lock.lock(); defer { lock.unlock() }; return closed }
+}
+
 final class Transport {
-    let host: OpaquePointer
-    init?(settings: Settings, width: Int, height: Int) {
+    private let native: OpaquePointer
+    private let guarded = Guarded()
+    /// Fail closed: the host always starts admitting nobody, and is then told who is shown the
+    /// picture (the remembered state), before anything else is done with it.
+    init?(settings: Settings, width: Int, height: Int, admitting: AdmitState) {
         var info = IstessoMediaStreamInfo(codec: 1, width: UInt32(width), height: UInt32(height),
                                           fps: UInt32(settings.fps), chroma: settings.chroma, colour: 1)
         let bind = "\(settings.bind):\(settings.port)"
-        let made: OpaquePointer?
-        if settings.admitNobody {
-            made = istesso_media_host_listen_closed(settings.configDir, bind, &info)
-        } else {
-            made = istesso_media_host_listen(settings.configDir, bind, &info)
-        }
-        guard let made else {
+        guard let made = istesso_media_host_listen_closed(settings.configDir, bind, &info) else {
             let why = istesso_media_last_error().map { String(cString: $0) } ?? "unknown"
             note("cannot listen for paired devices: \(why)")
             return nil
         }
-        host = made
-    }
-    var viewers: Int { Int(istesso_media_host_viewers(host)) }
-    /// Ends every stream and stops listening (nobody may use it afterwards).
-    func close() { istesso_media_host_close(host) }
-    func keyFrameWanted() -> Bool { istesso_media_host_key_frame_wanted(host) != 0 }
-    func offer(_ on: Bool) { istesso_media_host_offer(host, on ? 1 : 0) }
-    func admit(_ id: String?, _ key: String?) -> Bool { istesso_media_host_admit(host, id, key) == 0 }
-    func send(_ data: [UInt8], pts: UInt64, encoded: UInt64, key: Bool) -> IstessoMediaSent? {
-        var sent = IstessoMediaSent()
-        let result = data.withUnsafeBufferPointer {
-            istesso_media_host_send(host, $0.baseAddress, $0.count, pts, encoded, key ? 1 : 0, &sent)
+        native = made
+        switch admitting {
+        case .nobody: break
+        case .paired: _ = istesso_media_host_admit_paired(made)
+        case let .only(id, key): _ = istesso_media_host_admit(made, id, key)
         }
-        return result == 0 ? sent : nil
+    }
+    var closed: Bool { guarded.isClosed }
+    var viewers: Int { guarded.use { Int(istesso_media_host_viewers(native)) } ?? 0 }
+    /// Ends every stream and stops listening; nothing reaches the native host afterwards.
+    func close() { guarded.close { istesso_media_host_close(native) } }
+    func keyFrameWanted() -> Bool { guarded.use { istesso_media_host_key_frame_wanted(native) != 0 } ?? false }
+    func offer(_ on: Bool) { _ = guarded.use { istesso_media_host_offer(native, on ? 1 : 0) } }
+    func admit(_ id: String?, _ key: String?) -> Bool { guarded.use { istesso_media_host_admit(native, id, key) == 0 } ?? false }
+    func send(_ data: [UInt8], pts: UInt64, encoded: UInt64, key: Bool) -> IstessoMediaSent? {
+        guarded.use { () -> IstessoMediaSent? in
+            var sent = IstessoMediaSent()
+            let result = data.withUnsafeBufferPointer {
+                istesso_media_host_send(native, $0.baseAddress, $0.count, pts, encoded, key ? 1 : 0, &sent)
+            }
+            return result == 0 ? sent : nil
+        } ?? nil
     }
     /// The viewers draw the Mac's own cursor where their pointer is: the picture has none, and the
     /// host's pointer does not move (input goes to the application's process, not to the screen).
@@ -239,7 +271,7 @@ final class Transport {
         "default".withCString { name in
             var cursor = IstessoMediaCursor(shape: 1, width: 0, height: 0, hotspot_x: 0, hotspot_y: 0, scale: 1,
                                             pixels: nil, pixels_len: 0, name: name)
-            _ = istesso_media_host_set_cursor(host, &cursor)
+            _ = guarded.use { istesso_media_host_set_cursor(native, &cursor) }
         }
     }
 
@@ -271,7 +303,7 @@ final class Transport {
                                       hotspot_x: UInt32(min(Double(width - 1), max(0, hot.x * k))),
                                       hotspot_y: UInt32(min(Double(height - 1), max(0, hot.y * k))), scale: 1,
                                       pixels: pixels, pixels_len: width * height * 4, name: nil)
-        return istesso_media_host_set_cursor(host, &made) == 0
+        return guarded.use { istesso_media_host_set_cursor(native, &made) == 0 } ?? false
     }
 }
 
@@ -1018,6 +1050,18 @@ func selfTest() -> Never {
     checkPanel(clicks(list: []) == 0, true, "injector: a window that closed since the last look is not pressed")
     checkPanel(clicks(list: [moved]) == 0, true, "injector: a window that moved away since the last look is not pressed")
     checkPanel(clicks(list: [appWin], lockAfterPress: true) == 2, true, "injector: a press made before the lock is released in it")
+    checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: []), true, "resize: a running picture comes back")
+    checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["pause"]), false, "resize: a pause during the restart is kept")
+    checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["detach"]), false, "resize: a detach during the restart is kept")
+    checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: true, wordsMeanwhile: []), false, "resize: held for a measurement, it stays stopped")
+    checkPanel(restartResumes(picture: "paused", detached: false, offered: true, held: false, wordsMeanwhile: []), false, "resize: a stopped picture stays stopped")
+    let guardedFlag = Guarded()
+    var ran = 0
+    _ = guardedFlag.use { ran += 1 }
+    guardedFlag.close { ran += 10 }
+    _ = guardedFlag.use { ran += 100 }
+    guardedFlag.close { ran += 1000 }
+    checkPanel(ran == 11, true, "a closed stream takes no more calls, and is closed once")
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
 }
@@ -1053,6 +1097,13 @@ final class Lookout {
 
     /// Runs one Accessibility action away from the input; returns at once.
     func act(_ work: @escaping () -> Void) { queue.async(execute: work) }
+}
+
+/// After a resize, whether the picture is started again on the new stream: only when it runs now
+/// and nothing that came meanwhile says otherwise (a pause, a detach, a hold of the signal).
+func restartResumes(picture: String, detached: Bool, offered: Bool, held: Bool, wordsMeanwhile: [String]) -> Bool {
+    guard picture == "running", !detached, offered, !held else { return false }
+    return !wordsMeanwhile.contains { $0.hasPrefix("pause") || $0.hasPrefix("detach") }
 }
 
 /// Whether an input event may pass while the screen is locked or the session is not on the
@@ -1513,7 +1564,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     func listen(width: Int, height: Int) -> Bool {
         self.width = width
         self.height = height
-        guard let made = Transport(settings: settings, width: width, height: height) else {
+        guard let made = Transport(settings: settings, width: width, height: height, admitting: admitState) else {
             say("refused", [("word", "start"), ("reason", "cannot listen for paired devices")])
             quit(1)
             return false
@@ -1969,6 +2020,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var controlSource: DispatchSourceRead?
 
     func word(_ line: String) {
+        if restarting, !line.isEmpty { return wordsDuringRestart.append(line) }
         let words = line.split(separator: " ").map(String.init)
         switch words.first {
         case "pause":
@@ -2015,9 +2067,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         case "admit":
             if words.count == 3 {
                 let ok = transport.admit(words[1], words[2])
+                admitState = ok ? .only(id: words[1], key: words[2]) : .nobody
                 say("admitted", [("device", ok ? words[1] : nil)])
             } else {
                 _ = transport.admit(nil, nil)
+                admitState = .nobody
                 say("admitted", [("device", nil)])
             }
         case "close":
@@ -2216,6 +2270,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         pumpTimers = [tick, second]
     }
     var pumpTimers: [DispatchSourceTimer] = []
+    /// Who is shown the picture, as last said; a new stream (after a resize) starts with it.
+    var admitState: AdmitState = settings.admitNobody ? .nobody : .paired
+    /// Words that came while a new stream was being made: said to the new one, in order.
+    var wordsDuringRestart: [String] = []
 
     // ---- A new size: the application's window was resized ----
 
@@ -2247,7 +2305,6 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// the same port; the picture comes back as it was (running or not).
     func restartStream(width w: Int, height h: Int, windowSize: CGSize) {
         restarting = true
-        let wasRunning = picture == "running"
         let old = transport!
         let oldPump = pump!
         for timer in pumpTimers { timer.cancel() }
@@ -2261,8 +2318,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 // stream ended (nobody may use it afterwards) and its port taken again.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     old.close()
-                    guard let made = Transport(settings: settings, width: w, height: h) else {
+                    guard let made = Transport(settings: settings, width: w, height: h, admitting: self.admitState) else {
+                        // The old stream is closed: every call on it does nothing now; the program ends.
                         say("refused", [("word", "resize"), ("reason", "cannot listen again for paired devices")])
+                        self.restarting = false
                         return self.quit(1)
                     }
                     self.width = w
@@ -2277,7 +2336,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     say("resized", [("size", "\(w)x\(h)")])
                     self.windowBounds = .zero  // placed again for the new size
                     self.restarting = false
-                    if wasRunning { self.openPicture { why in if let why { note("after the resize: \(why)") } } }
+                    // Decided now, not on what was true before: the words that came meanwhile are
+                    // said first.
+                    let words = self.wordsDuringRestart
+                    self.wordsDuringRestart = []
+                    if restartResumes(picture: self.picture, detached: self.detached, offered: self.offered,
+                                      held: self.heldForSignal, wordsMeanwhile: words) {
+                        self.openPicture { why in if let why { note("after the resize: \(why)") } }
+                    }
+                    for word in words { self.word(word) }
                 }
             }
         }
