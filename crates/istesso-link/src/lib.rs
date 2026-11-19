@@ -23,7 +23,7 @@ pub mod message;
 pub mod server;
 
 pub use channel::{Channel, LocalKeys};
-pub use client::{Client, InputAnswer};
+pub use client::{Client, ClipboardAnswer, Heard, InputAnswer};
 pub use message::{ErrorCode, Request, Response};
 pub use server::{HangUp, Session};
 

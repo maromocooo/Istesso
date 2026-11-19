@@ -141,20 +141,28 @@ int main(void) {
     EXPECT_NOTHING("Shift pressed during a cut",
                    keys_hold_back(&keys, out,
                                   keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out), &dropped));
-    EXPECT("the picture is back and Shift is held", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out), 42);
-    EXPECT_NOTHING("in line already", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out));
+    EXPECT("the picture is back and Shift is held", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, false, out), 42);
+    EXPECT_NOTHING("in line already", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, false, out));
     EXPECT("a letter under it is plain again", keys_key_down(&keys, A, KEYS_FLAG_SHIFT, false, out), 30);
     // Shift was let go while nobody was told (the window lost the keyboard meanwhile, say).
-    EXPECT("Shift is not held any more: it comes up, the letter stays", keys_fall_in_line(&keys, 0, out), -42);
+    EXPECT("Shift is not held any more: it comes up, the letter stays", keys_fall_in_line(&keys, 0, false, out), -42);
     EXPECT("the letter comes up by itself", keys_key_up(&keys, A, 0, out), -30);
 
     // Command goes over as Control, and falls in line as Control.
-    EXPECT("Command held when the picture is back", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, out), 29);
-    EXPECT_NOTHING("Control and Command are one key over there", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_CONTROL, out));
-    EXPECT("both let go", keys_fall_in_line(&keys, 0, out), -29);
+    EXPECT("Command held when the picture is back", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, false, out), 29);
+    EXPECT_NOTHING("Control and Command are one key over there", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_CONTROL, false, out));
+    EXPECT("both let go", keys_fall_in_line(&keys, 0, false, out), -29);
     keys.command_is_control = false;
-    EXPECT("Command as Super", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, out), 125);
-    EXPECT("and let go", keys_fall_in_line(&keys, 0, out), -125);
+    EXPECT("Command as Super", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, false, out), 125);
+    EXPECT("and let go", keys_fall_in_line(&keys, 0, false, out), -125);
+
+    // A daily reconnect restores the physical side, so its ordinary release clears it.
+    keys.command_is_control = true;
+    unsigned long held = KEYS_FLAG_SHIFT | KEYS_DEVICE_RIGHT_SHIFT | KEYS_FLAG_COMMAND | KEYS_DEVICE_RIGHT_COMMAND;
+    EXPECT("right Shift and right Command are still held", keys_fall_in_line(&keys, held, true, out), 54, 97);
+    EXPECT("right Shift comes up", keys_flags_changed(&keys, 0x3C, KEYS_FLAG_COMMAND | KEYS_DEVICE_RIGHT_COMMAND, out), -54);
+    EXPECT("right Command comes up", keys_flags_changed(&keys, 0x36, 0, out), -97);
+    EXPECT_NOTHING("no synthetic left modifier stays down", keys_let_go(&keys, out));
 
     // (a) A modifier's event with the modifier's flag and neither of its two keys' bits: the
     // modifier is down all the same, and goes over as its left key.
@@ -166,7 +174,7 @@ int main(void) {
            keys_flags_changed(&keys, RIGHT_SHIFT_KEY, KEYS_FLAG_SHIFT, out), 42);
     EXPECT("and comes up", keys_flags_changed(&keys, RIGHT_SHIFT_KEY, 0, out), -42);
     EXPECT("Option with no key bit goes as left Alt", keys_flags_changed(&keys, OPTION_KEY, KEYS_FLAG_OPTION, out), 56);
-    EXPECT_NOTHING("a drag under it finds it in line already", keys_fall_in_line(&keys, KEYS_FLAG_OPTION, out));
+    EXPECT_NOTHING("a drag under it finds it in line already", keys_fall_in_line(&keys, KEYS_FLAG_OPTION, false, out));
     EXPECT("Option comes up", keys_flags_changed(&keys, OPTION_KEY, 0, out), -56);
     EXPECT("Command with no key bit goes as left Control", keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_COMMAND, out), 29);
     EXPECT("and comes up", keys_flags_changed(&keys, COMMAND_KEY, 0, out), -29);
@@ -207,7 +215,7 @@ int main(void) {
     // (b) Every key, button and scroll brings the modifiers in line with its flags first.
     memset(&keys, 0, sizeof keys);
     keys.command_is_control = true;
-    EXPECT_NOTHING("nothing comes up that was not down", keys_fall_in_line(&keys, 0, out));
+    EXPECT_NOTHING("nothing comes up that was not down", keys_fall_in_line(&keys, 0, false, out));
     EXPECT("a letter with nothing held is only the letter", keys_key_down(&keys, A, 0, false, out), 30);
     EXPECT("its release", keys_key_up(&keys, A, 0, out), -30);
     EXPECT("Shift by hand", keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out), 42);
@@ -222,14 +230,14 @@ int main(void) {
     EXPECT("a repeat without Shift lets the stale Shift go and is not sent", keys_key_down(&keys, A, 0, true, out), -42);
     EXPECT("the letter comes up", keys_key_up(&keys, A, 0, out), -30);
     // Before a button or a scroll the missing modifiers are pressed and stay down.
-    EXPECT("Shift held for a scroll, never seen pressed", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out), 42);
-    EXPECT_NOTHING("the next scroll finds it in line", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out));
-    EXPECT("a scroll without it lets it go", keys_fall_in_line(&keys, 0, out), -42);
-    EXPECT("Option held for a drag", keys_fall_in_line(&keys, KEYS_FLAG_OPTION, out), 56);
+    EXPECT("Shift held for a scroll, never seen pressed", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, false, out), 42);
+    EXPECT_NOTHING("the next scroll finds it in line", keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, false, out));
+    EXPECT("a scroll without it lets it go", keys_fall_in_line(&keys, 0, false, out), -42);
+    EXPECT("Option held for a drag", keys_fall_in_line(&keys, KEYS_FLAG_OPTION, false, out), 56);
     EXPECT("Option let go by hand, with no key bit", keys_flags_changed(&keys, OPTION_KEY, 0, out), -56);
-    EXPECT("Command held for a click goes as Control", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, out), 29);
-    EXPECT("Command with Shift for the next", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_SHIFT, out), 42);
-    EXPECT("all let go", keys_fall_in_line(&keys, 0, out), -42, -29);
+    EXPECT("Command held for a click goes as Control", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND, false, out), 29);
+    EXPECT("Command with Shift for the next", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_SHIFT, false, out), 42);
+    EXPECT("all let go", keys_fall_in_line(&keys, 0, false, out), -42, -29);
     // A modifier's own event brings the others in line too.
     EXPECT("Shift by hand", keys_flags_changed(&keys, SHIFT_KEY, KEYS_FLAG_SHIFT | KEYS_DEVICE_LEFT_SHIFT, out), 42);
     EXPECT("Option pressed while Shift's release was lost",
@@ -243,7 +251,7 @@ int main(void) {
     EXPECT("a letter during a cut: only the stale Shift's release",
            keys_hold_back(&keys, out, keys_key_down(&keys, A, 0, false, out), &dropped), -42);
     EXPECT_NOTHING("Shift held for a scroll during a cut is not pressed",
-                   keys_hold_back(&keys, out, keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, out), &dropped));
+                   keys_hold_back(&keys, out, keys_fall_in_line(&keys, KEYS_FLAG_SHIFT, false, out), &dropped));
     EXPECT_NOTHING("nothing is down", keys_let_go(&keys, out));
 
     // (c) The window stops being the one typed into, and is again.
@@ -253,9 +261,9 @@ int main(void) {
     keys.command_is_control = true;
     EXPECT("Command by hand", keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, out), 29);
     EXPECT("Command-Tab away lets Control go over there", keys_let_go(&keys, out), -29);
-    EXPECT_NOTHING("back with nothing held", keys_fall_in_line(&keys, 0, out));
+    EXPECT_NOTHING("back with nothing held", keys_fall_in_line(&keys, 0, false, out));
     // Command-Tab back: Command is still held when the window is back, and let go after.
-    EXPECT("back with Command still held", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, out), 29);
+    EXPECT("back with Command still held", keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, false, out), 29);
     EXPECT("Command let go in the window", keys_flags_changed(&keys, COMMAND_KEY, 0, out), -29);
     // Command-Shift-4: both go down here, 4 goes to the system.
     EXPECT("Command by hand", keys_flags_changed(&keys, COMMAND_KEY, KEYS_FLAG_COMMAND | KEYS_DEVICE_LEFT_COMMAND, out), 29);
@@ -266,13 +274,13 @@ int main(void) {
     // If the window loses the keyboard to the screenshot, both come up then...
     Keys copy = keys;
     EXPECT("the screenshot takes the keyboard", keys_let_go(&keys, out), -29, -42);
-    EXPECT_NOTHING("back with nothing held", keys_fall_in_line(&keys, 0, out));
+    EXPECT_NOTHING("back with nothing held", keys_fall_in_line(&keys, 0, false, out));
     // ...and if it does not, and their releases never come, the next click lets them go first.
     keys = copy;
-    EXPECT("the next click, nothing held", keys_fall_in_line(&keys, 0, out), -42, -29);
+    EXPECT("the next click, nothing held", keys_fall_in_line(&keys, 0, false, out), -42, -29);
     // Back with Command and Shift held: both go down, as left keys.
     EXPECT("back with Command and Shift held",
-           keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_SHIFT | KEYS_DEVICE_RIGHT_SHIFT, out), 42, 29);
+           keys_fall_in_line(&keys, KEYS_FLAG_COMMAND | KEYS_FLAG_SHIFT | KEYS_DEVICE_RIGHT_SHIFT, false, out), 42, 29);
     EXPECT("the window lets them go", keys_let_go(&keys, out), -29, -42);
 
     // Control with no key bit goes as left Control.

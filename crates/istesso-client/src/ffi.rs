@@ -731,6 +731,11 @@ mod tests {
                 pair.handed_over(wait).unwrap(),
                 r#"{"kind":"button","code":272,"pressed":false}"#
             );
+            // And the agent clears any composing text (trial agents since the preedit event).
+            assert_eq!(
+                pair.handed_over(wait).unwrap(),
+                r#"{"kind":"preedit","text":"","cursor":[0,0]}"#
+            );
             assert!(pair.handed_over(Duration::from_millis(200)).is_none());
             istesso_input_close(std::ptr::null_mut());
         }

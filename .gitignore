@@ -16,3 +16,9 @@ __pycache__/
 /Claude outputs/
 # Output of macos/client/build.sh
 /macos/client/build/
+
+# What the owner noticed while using the everyday trial (scripts/daily.sh note); never committed
+/trial-notes.md
+
+# Local trial shortcut bundles include this checkout's absolute path.
+/build/shortcuts/

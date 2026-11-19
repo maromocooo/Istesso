@@ -16,7 +16,7 @@ use istesso_pair::{Peer, PeerStore};
 use crate::clock;
 use crate::timed::{wait_for, Ready, Timed, Wake};
 use crate::wire::{
-    self, Ask, Codec, Cursor, ErrorCode, Header, Kind, Reply, StreamInfo, WireError,
+    self, Ask, Codec, Cursor, ErrorCode, Header, Kind, Reply, StreamInfo, TextField, WireError,
 };
 use crate::{Error, Result};
 
@@ -46,6 +46,8 @@ pub struct Viewer {
     /// from the frames, which come and go while the cursor stays.
     cursor_packet: Vec<u8>,
     cursor_at: Option<std::ops::Range<usize>>,
+    /// What the host last said the text field is (trial only).
+    text_field: Option<TextField>,
 }
 
 /// What a host sends a viewer.
@@ -55,6 +57,8 @@ pub enum Event<'a> {
     /// The pointer's cursor looks like this from now on. The viewer draws it where its own
     /// pointer is; the host does not draw it into the frames.
     Cursor(Cursor<'a>),
+    /// The text input field of the application with the keyboard (trial only).
+    TextField(TextField),
 }
 
 /// What [`Viewer::pull`] found, without the bytes.
@@ -66,6 +70,7 @@ pub(crate) enum Pulled {
         whole_ns: u64,
     },
     Cursor,
+    TextField,
 }
 
 struct Asking {
@@ -183,6 +188,7 @@ impl Viewer {
             packet: Vec::new(),
             cursor_packet: Vec::new(),
             cursor_at: None,
+            text_field: None,
         })
     }
 
@@ -223,7 +229,13 @@ impl Viewer {
                 whole_ns,
             } => Some(Event::Frame(self.frame(header, at, first_ns, whole_ns))),
             Pulled::Cursor => self.cursor().map(Event::Cursor),
+            Pulled::TextField => self.text_field.map(Event::TextField),
         }
+    }
+
+    /// What the host last said the text field is (trial only). `None` until it has.
+    pub fn text_field(&self) -> Option<TextField> {
+        self.text_field
     }
 
     /// What the host last said the cursor is. `None` until it has said so: a host that
@@ -252,7 +264,7 @@ impl Viewer {
                     first_ns,
                     whole_ns,
                 }) => return Ok(Some(self.frame(header, at, first_ns, whole_ns))),
-                Some(Pulled::Cursor) => continue,
+                Some(Pulled::Cursor | Pulled::TextField) => continue,
                 None => return Ok(None),
             }
         }
@@ -269,6 +281,7 @@ impl Viewer {
                 whole_ns,
             }) => Some(Event::Frame(self.frame(header, at, first_ns, whole_ns))),
             Some(Pulled::Cursor) => self.cursor().map(Event::Cursor),
+            Some(Pulled::TextField) => self.text_field.map(Event::TextField),
             None => None,
         })
     }
@@ -355,6 +368,14 @@ impl Viewer {
                             std::mem::swap(&mut self.packet, &mut self.cursor_packet);
                             self.cursor_at = Some(at);
                             return Ok(Some(Pulled::Cursor));
+                        }
+                    }
+                    Kind::TextField => {
+                        // Not trusted either: a state this version does not know is passed
+                        // over, and the field stays as it was.
+                        if let Ok(field) = wire::decode_text_field(&self.packet[at]) {
+                            self.text_field = Some(field);
+                            return Ok(Some(Pulled::TextField));
                         }
                     }
                 },

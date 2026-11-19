@@ -18,6 +18,7 @@ istesso-pair = { path = "crates/istesso-pair" }
 istesso-link = { path = "crates/istesso-link" }
 istesso-agent = { path = "crates/istesso-agent" }
 istesso-measure = { path = "crates/istesso-measure" }
+istesso-devices = { path = "crates/istesso-devices", default-features = false }
 istesso-device-api = { path = "crates/istesso-device-api" }
 istesso-device-adapters = { path = "crates/istesso-device-adapters" }
 
