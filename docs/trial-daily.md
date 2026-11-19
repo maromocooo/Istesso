@@ -318,13 +318,17 @@ scripts/daily.sh shortcuts build
 scripts/daily.sh shortcuts install
 ```
 
-`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ設定で署名します。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。Ubuntu のアイコンは、このときだけ `ISTESSO_HOST` のホストから読みます。Ubuntu のアイコンを取得できないときと、Mac ホスト用の近道には、標準のアイコンを使います。
+`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ署名 ID で署名します。持ち主用の包みには強化ランタイムを付けます。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。Ubuntu のアイコンは、このときだけ `ISTESSO_HOST` のホストから読みます。Ubuntu のアイコンを取得できないときと、Mac ホスト用の近道には、標準のアイコンを使います。
 
 Spotlight か Alfred で `Blender (Ubuntu)`、`Firefox (Ubuntu)`、`Text Editor (Ubuntu)`、`Chrome (Ubuntu)` を検索して開きます。Dock に置くには、Finder で使いたい近道を Dock にドラッグします。
 
-近道は受付役に URL を渡すだけです。たとえば Text Editor の近道は `istesso-dev-open://open/editor?host=ubuntu` を開きます。URL に `&for=aura` を足すと、AURA に開きます。受付役が試用版の `daily.sh open` を呼び、中継が LAN に接続します。初回に「ローカルネットワーク」の許可を尋ねられたら、`Istesso Dev Open` に許可してください。近道ごとの許可は要りません。ビューアーの許可はこれまでどおりです。[許可をまとめた理由](adr/0024-trial-daily-shortcuts.md)。
+通常の近道は受付役に URL を渡します。たとえば Text Editor の近道は `istesso-dev-open://open/editor?host=ubuntu` を開きます。URL に `&for=aura` を足すと、AURA に開きます。受付役が試用版の `daily.sh open` を呼び、中継が LAN に接続します。初回に「ローカルネットワーク」の許可を尋ねられたら、`Istesso Dev Open` に許可してください。[許可をまとめた理由](adr/0024-trial-daily-shortcuts.md)。
 
-Mac ホスト用の近道は `TextEdit (Studio)` から始めます。`macos/daily-shortcuts/mac-apps.txt` にアプリ名を 1 行ずつ書き、作成と登録をやり直すと一覧が替わります。Safari、Notes、Finder、Preview、Dia と画面全体（`desktop`）は、持ち主がターミナルで開きます。たとえば `DAILY_OWNER=1 scripts/daily.sh open Safari --host mac` と打ちます。この 6 つは近道に追加できません。Mac ホスト用のスクリプトの場所は `daily.sh` が決めます。
+Mac ホスト用の通常の近道は `TextEdit (Studio)` から始めます。`macos/daily-shortcuts/mac-apps.txt` にアプリ名を 1 行ずつ書き、作成と登録をやり直すと一覧が替わります。
+
+**Dia を Air で開くには**、持ち主が `~/.config/istesso/daily-shortcuts-owner-apps.txt` に `Dia` と 1 行書いてから、上の `build` と `install` を実行します。Spotlight か Alfred で `Dia (Studio)` を検索して開きます。Dock にも置けます。この近道は持ち主だけが手で開きます。エージェントは起動しません。
+
+持ち主の一覧には Safari、Notes、Finder、Preview、Dia のうち、使うものだけを 1 行に 1 つ書きます。大文字と小文字はどちらでもよく、末尾の `.app` は省けます。ほかの名前があると作成を中止し、行番号を知らせます。ファイルがなければ持ち主用の近道は作りません。名前を消したときも作成と登録をやり直してください。URL ではこの 5 つを開けません。画面全体（`desktop`）に近道はありません。持ち主が自分のターミナルで開きます。
 
 近道は作成時のチェックアウトを使います。場所を移したときも作成と登録をやり直してください。起動には `daily.sh open <アプリ名> --host ubuntu|mac` に対応した試用版が要ります。開けなかったときは、受付役が理由をログに書きます。続けて失敗しても、記録は 10 秒に 1 回までです。以前の版を使っているときは、受付役を終了してから作成と登録をやり直してください。
 

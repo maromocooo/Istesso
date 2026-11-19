@@ -63,8 +63,13 @@ class ShortcutsTest(unittest.TestCase):
             with self.subTest(app=app):
                 contents = self.bundles / (title + ".staged") / "Contents"
                 info = plistlib.loads((contents / "Info.plist").read_bytes())
-                self.assertNotIn("NSLocalNetworkUsageDescription", info)
                 self.assertNotIn("CFBundleURLTypes", info)
+                if host == "mac" and app in sc.OWNER_APPS:
+                    self.assertEqual(info["CFBundleExecutable"], "istesso-owner-shim")
+                    self.assertTrue((contents / "MacOS/istesso-owner-shim").is_file())
+                    self.assertFalse(any(args[1] == app for args in self.config["routes"].values()))
+                    continue
+                self.assertNotIn("NSLocalNetworkUsageDescription", info)
                 base = "istesso-dev-open://open/" + quote(app, safe="") + "?"
                 url = base + "host=" + host
                 self.assertIn(url.encode() + b"\0", (contents / "MacOS/Shortcut").read_bytes())
@@ -107,7 +112,7 @@ class ShortcutsTest(unittest.TestCase):
                                          "open", app, "--host", host)
                 self.assertEqual(flags.read_text().splitlines(), ["unset", "unset"])
 
-    def test_owner_apps_refused_at_build_and_dispatch(self):
+    def test_owner_apps_refused_in_url_shortcuts_and_at_dispatch(self):
         apps = self.checkout / "mac-apps.txt"
         for app in ("Safari", "Notes", "Finder", "Preview", "Dia", "desktop", "SAFARI.app"):
             with self.subTest(app=app):
@@ -122,6 +127,93 @@ class ShortcutsTest(unittest.TestCase):
                 for link in routes:
                     self.assertNotEqual(self.dispatch(link).returncode, 0)
                     self.assertFalse(self.record.exists())
+
+    def test_owner_list_accepts_only_the_five_apps(self):
+        owner_list = self.checkout / "daily-shortcuts-owner-apps.txt"
+        mac_list = sc.SOURCE / "mac-apps.txt"
+        self.assertEqual(sc.app_list("", mac_list, owner_list), sc.app_list("", mac_list))
+        owner_list.write_text("sAfArI.app\nNOTES\nFinder.App\nPreview\nDia\n")
+        self.assertEqual(sc.app_list("", mac_list, owner_list)[-5:], [
+            ("mac", name.lower(), name + " (Studio)")
+            for name in ("Safari", "Notes", "Finder", "Preview", "Dia")])
+        for invalid in ("desktop", "DESKTOP.App", "TextEdit", "../Dia", "Dia.app.app"):
+            with self.subTest(invalid=invalid):
+                owner_list.write_text("Dia\n" + invalid + "\n")
+                with self.assertRaisesRegex(ValueError, "line 2: only Safari, Notes, Finder, Preview and Dia"):
+                    sc.app_list("", mac_list, owner_list)
+
+    def test_listed_owner_bundle_requests_hardened_runtime(self):
+        owner_list = self.checkout / "daily-shortcuts-owner-apps.txt"
+        owner_list.write_text("dIA.ApP\n")
+        stage = self.checkout / "stage"
+        (self.scripts / "measuring.sh").symlink_to(sc.ROOT / "scripts/measuring.sh")
+        with patch.object(sc, "OWNER_LIST", owner_list), patch.object(sc, "STAGE", stage), \
+                patch.object(sc, "ROOT", self.checkout), patch.object(sc, "sign") as sign:
+            sc.run("build", "", "")
+        bundles = stage / "bundles"
+        title = "Dia (Studio)"
+        declared = json.loads((bundles / "apps.json").read_text())["apps"]
+        self.assertIn(["mac", "dia", title], declared)
+        self.assertEqual({p.stem for p in bundles.glob("*.staged")},
+                         {title, "TextEdit (Studio)", sc.HANDLER})
+        contents = bundles / (title + ".staged") / "Contents"
+        info = plistlib.loads((contents / "Info.plist").read_bytes())
+        self.assertTrue((contents / "MacOS/istesso-owner-shim").is_file())
+        for call in sign.call_args_list:
+            bundle, identifier, *options = call.args
+            self.assertEqual(identifier, sc.bundle_id(bundle.stem))
+            self.assertEqual(options, ["--options", "runtime"] if bundle.stem == title else [])
+        self.assertEqual({call.args[0].stem for call in sign.call_args_list},
+                         {title, "TextEdit (Studio)", sc.HANDLER})
+        self.assertEqual(info["CFBundleExecutable"], "istesso-owner-shim")
+        self.assertEqual(info["CFBundleIdentifier"], sc.bundle_id(title))
+        self.assertNotIn("CFBundleURLTypes", info)
+        config = plistlib.loads((bundles / (sc.HANDLER + ".staged") /
+                                 "Contents/Resources/Routes.plist").read_bytes())
+        self.assertFalse(any(args[1].lower() == "dia" for args in config["routes"].values()))
+
+    def build_spawn_test(self, *, stub_tempdir=False):
+        # Compile a stand-alone driver with an inert child. Only the owner runs the bundled shim.
+        driver = self.checkout / "spawn-test"
+        cc = ["clang", "-Wall", "-Wextra", "-Werror"]
+        if stub_tempdir:
+            cc += ["-Dconfstr=fixture_confstr", sc.SOURCE / "test-owner-tempdir.c"]
+        sc.check_measurement()
+        subprocess.run([*cc, sc.SOURCE / "test-owner-child.c", "-o", self.daily], check=True)
+        sc.check_measurement()
+        subprocess.run([*cc, sc.SOURCE / "owner-shim.c", '-DOWNER_APP="fixture"',
+                        "-DDAILY_SCRIPT=" + json.dumps(str(self.daily)), "-o", driver], check=True)
+        return driver
+
+    def run_spawn_test(self, driver, *, sources_available=True):
+        env = dict.fromkeys(("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "DAILY_OWNER",
+                             "DAILY_OPEN_HANDLER", "DAILY_MAC_SCRIPT", "ISTESSO_MAC_HOST", "BASH_ENV",
+                             "DYLD_TEST_MARKER", "SSH_AUTH_SOCK", "EXTRA_MARKER"), "ignored")
+        env["TMPDIR"] = str(self.checkout)
+        with subprocess.Popen([driver, "--for", "aura", "--slot", "3"], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            output, error = process.communicate(timeout=10)
+            if sources_available:
+                self.assertEqual((process.returncode, error), (37, ""))
+                self.assertEqual(output.splitlines(), [str(process.pid), "open", "fixture", "--host", "mac"])
+            else:
+                self.assertEqual((process.returncode, output, error),
+                                 (1, "", "Could not build the owner shortcut environment.\n"))
+
+    def test_owner_spawn_system_lookups(self):
+        driver = self.build_spawn_test()
+        result = subprocess.run([self.daily, "--check-sources"], env={})
+        self.assertIn(result.returncode, (0, 1))
+        self.run_spawn_test(driver, sources_available=result.returncode == 0)
+
+    def test_owner_spawn_environment_arguments_and_status(self):
+        driver = self.build_spawn_test(stub_tempdir=True)
+        for hardened in (False, True):
+            with self.subTest(hardened=hardened):
+                if hardened:
+                    subprocess.run(["codesign", "--force", "--sign", "-", "--options", "runtime", driver],
+                                   check=True, capture_output=True)
+                self.run_spawn_test(driver)
 
     def test_repeated_refusals_log_once(self):
         url = f"{sc.SCHEME}://open/desktop?host=mac"
@@ -210,11 +302,13 @@ class ShortcutsTest(unittest.TestCase):
         (stage / "bundles").mkdir(parents=True)
         ubuntu = "editor\tText Editor"
         rows = sc.app_list(ubuntu, sc.SOURCE / "mac-apps.txt")
-        (stage / "bundles/apps.json").write_text(json.dumps(rows))
-        with patch.object(sc, "STAGE", stage), patch.object(sc, "DEST", self.checkout / "dest"):
-            with patch.object(sc, "install") as install, self.assertRaisesRegex(ValueError, "build first"):
-                sc.run("install", "", ubuntu)
-            install.assert_not_called()
+        with patch.object(sc, "STAGE", stage), patch.object(sc, "DEST", self.checkout / "dest"), \
+                patch.object(sc, "OWNER_LIST", self.checkout / "missing"):
+            for old in (rows, {"version": 2, "apps": rows}):
+                (stage / "bundles/apps.json").write_text(json.dumps(old))
+                with patch.object(sc, "install") as install, self.assertRaisesRegex(ValueError, "build first"):
+                    sc.run("install", "", ubuntu)
+                install.assert_not_called()
 
     def test_icon_size_and_signature_checked_before_conversion(self):
         signature = b"\x89PNG\r\n\x1a\n"
