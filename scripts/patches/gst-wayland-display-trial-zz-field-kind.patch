@@ -24,6 +24,10 @@ Firefox and the Text Editor (GTK 3 and 4) say the content type together with `en
   and says the content type (seen, 8 of 8). (3) If it still says none, it is left at that: a
   client that has said a content type at some time stays a password field for the device; one
   that has never said any gets the protocol's default, a normal field.
+- Not without end: at most 200 steps of asking in a second, over all text inputs (a held Tab
+  key makes some thirty moves a second, two steps each at most; seen: 61 moves in two seconds,
+  never near it). Past that an enabling is left as in (3) for the rest of the second, so that a
+  client that answered every step by enabling its text input anew is not asked in a loop.
 - While the client is being asked, nothing is told; what comes of it is told at once. Seen with
   Chrome, 201 moves by click and Tab: the right state 4 ms after the move in the middle, 9 ms at
   the longest (step 2 was needed 8 times, step 3 never).
@@ -132,10 +136,10 @@ index ee1c00d..8e839c6 100644
  mod test_windows;
 diff --git a/wayland-display-core/src/tests/test_trial_field_kind.rs b/wayland-display-core/src/tests/test_trial_field_kind.rs
 new file mode 100644
-index 0000000..4996add
+index 0000000..1322fd4
 --- /dev/null
 +++ b/wayland-display-core/src/tests/test_trial_field_kind.rs
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,208 @@
 +//! Trial only (Istesso's ADR 0015, "文字の入力の欄"): the kind of the field with the keyboard is
 +//! known only once its client has said a content type. Until then the field is taken for a
 +//! secret one: a client may say it late, or only when asked (Chrome 145, seen on the host).
@@ -308,20 +312,58 @@ index 0000000..4996add
 +    f.round_trip();
 +    assert_eq!(f.client.text_input_events(), (3, 1));
 +}
++
++#[test]
++fn a_client_that_enables_anew_at_every_answer_is_not_asked_without_end() {
++    let mut f = typed_into();
++    let input = f.client.text_input();
++    // It has said a content type once, and from then on answers every `done` by disabling and
++    // enabling its text input again, saying nothing.
++    input.enable();
++    f.client.say_content_type(&input, ContentPurpose::Normal);
++    input.commit();
++    f.round_trip();
++    let mut answered = 0;
++    for _ in 0..400 {
++        let (dones, _) = f.client.text_input_events();
++        if dones == answered {
++            if answered > 0 {
++                break;
++            }
++        } else {
++            answered = dones;
++        }
++        input.disable();
++        input.commit();
++        input.enable();
++        input.commit();
++        f.update_server();
++        f.update_client();
++        f.update_server();
++        f.update_client();
++    }
++    // It was asked at most 200 times (within the one second this takes), then left alone: a
++    // secret field, since it is a client that says content types.
++    let (dones, _) = f.client.text_input_events();
++    assert!(dones <= 200, "asked {dones} times");
++    assert_eq!(f.server.text_input_field_for_tests(), (2, false));
++}
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
-index 08f76f5..f825bd9 100644
+index 08f76f5..845b4e8 100644
 --- a/wayland-display-core/src/wayland/handlers/text_input.rs
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -95,6 +95,8 @@ pub struct TextInputs {
+@@ -95,6 +95,10 @@ pub struct TextInputs {
      focus: Option<WlSurface>,
      /// The surfaces that were told the keyboard again (below): each one once, never again.
      retold: Vec<WlSurface>,
 +    /// Counts the steps of asking a field's kind, so that only the last wait acts.
 +    kind_generation: u64,
++    /// How many such steps were taken since when: no more than MOST_ASKS in a second.
++    asks: Option<(std::time::Instant, u32)>,
  }
  
  struct Instance {
-@@ -120,8 +122,49 @@ struct Instance {
+@@ -120,8 +124,53 @@ struct Instance {
      /// preedit's report and the clipboard's refusal both go by it.)
      rect: Option<(i32, i32, i32, i32)>,
      pending_rect: Option<(i32, i32, i32, i32)>,
@@ -365,13 +407,17 @@ index 08f76f5..f825bd9 100644
 +/// How long a client has to answer when it is asked the kind of its field (below), before the
 +/// next step is taken.
 +const KIND_WAIT: std::time::Duration = std::time::Duration::from_millis(40);
++/// The most steps of asking in one second, over all text inputs. A person moves the focus a few
++/// times a second, a held Tab key some thirty times (two steps each at most); a client that
++/// answered every step by enabling its text input anew would otherwise be asked without end.
++const MOST_ASKS: u32 = 200;
 +/// How long after this side's leave and enter an enabling counts as the answer to it.
 +const REENTRY_ANSWER: std::time::Duration = std::time::Duration::from_millis(250);
 +
  /// Told whenever the field with the keyboard changes: 0 none, 1 a field, 2 a password field;
  /// and the text cursor's rectangle in the output (x, y, width, height). Trial only.
  /// The last number is the field's serial: one more (mod 256) whenever another field has the
-@@ -131,6 +174,13 @@ struct Instance {
+@@ -131,6 +180,13 @@ struct Instance {
  /// input enabled and not ASCII), so that the device can keep them for the person.
  pub type TextInputSink = Box<dyn Fn(u32, i32, i32, u32, u32, u32, u32) + Send>;
  
@@ -385,7 +431,7 @@ index 08f76f5..f825bd9 100644
  /// Tells a sink about the field with the keyboard, only when that changed.
  #[derive(Default)]
  pub struct TextInputReport {
-@@ -138,7 +188,7 @@ pub struct TextInputReport {
+@@ -138,7 +194,7 @@ pub struct TextInputReport {
      last: Option<(u32, i32, i32, u32, u32, u32)>,
      /// Which field it was (the surface with the keyboard and its enabled text input), and its
      /// serial.
@@ -394,7 +440,7 @@ index 08f76f5..f825bd9 100644
      serial: u8,
      /// A "not in a field" (3) waits to be told until it has held for THREE_HOLDS: between two
      /// fields a client says it briefly (Tab, Control+L, a click), and the device would send
-@@ -160,7 +210,7 @@ impl TextInputReport {
+@@ -160,7 +216,7 @@ impl TextInputReport {
          self.last = None;
      }
  
@@ -403,7 +449,7 @@ index 08f76f5..f825bd9 100644
          if identity != self.identity {
              self.identity = identity;
              self.serial = self.serial.wrapping_add(1);
-@@ -211,6 +261,14 @@ impl TextInputs {
+@@ -211,6 +267,14 @@ impl TextInputs {
              entered: None,
              rect: None,
              pending_rect: None,
@@ -418,7 +464,7 @@ index 08f76f5..f825bd9 100644
          };
          if let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) {
              if same_client(&instance.object.id(), &focus.id()) {
-@@ -247,6 +305,9 @@ impl TextInputs {
+@@ -247,6 +311,9 @@ impl TextInputs {
              instance.pending = None;
              instance.secret = false;
              instance.pending_secret = None;
@@ -428,7 +474,7 @@ index 08f76f5..f825bd9 100644
          }
          self.focus = surface;
          if let Some(focus) = &self.focus {
-@@ -273,6 +334,16 @@ impl TextInputs {
+@@ -273,6 +340,16 @@ impl TextInputs {
              .then_some(focus)
      }
  
@@ -445,7 +491,7 @@ index 08f76f5..f825bd9 100644
      /// The client of the surface with the keyboard.
      pub(crate) fn focus_client(&self) -> Option<ClientId> {
          self.focus.as_ref().filter(|s| s.is_alive()).and_then(|s| s.client()).map(|c| c.id())
-@@ -290,14 +361,14 @@ impl TextInputs {
+@@ -290,14 +367,14 @@ impl TextInputs {
  
      /// Which field has the keyboard: the surface, and its enabled text input (None in second
      /// place: the surface's client has a text input there, none enabled).
@@ -462,7 +508,7 @@ index 08f76f5..f825bd9 100644
          }
          self.instances
              .iter()
-@@ -316,7 +387,8 @@ impl TextInputs {
+@@ -316,7 +393,8 @@ impl TextInputs {
              .iter()
              .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
          {
@@ -472,7 +518,7 @@ index 08f76f5..f825bd9 100644
              // 3: the client has a text input there and none is enabled: the keyboard is not in
              // a text field (the device sends plain keys); 0: it has none (nothing is known).
              None if self.instances.iter().any(|i| i.entered.as_ref() == Some(focus)) => (3, None),
-@@ -339,7 +411,8 @@ impl TextInputs {
+@@ -339,7 +417,8 @@ impl TextInputs {
          };
          // Never into a password field, whatever the device thought the field was (its notice
          // of the field may still be on its way). Clearing is still done.
@@ -482,7 +528,7 @@ index 08f76f5..f825bd9 100644
              return false;
          }
          let text = (!text.is_empty()).then(|| text.to_string());
-@@ -356,7 +429,7 @@ impl TextInputs {
+@@ -356,7 +435,7 @@ impl TextInputs {
          };
          self.instances
              .iter()
@@ -491,7 +537,7 @@ index 08f76f5..f825bd9 100644
      }
  
      /// Hands `text` to the enabled text input of the client that has the keyboard. False when
-@@ -405,6 +478,81 @@ impl State {
+@@ -405,6 +484,95 @@ impl State {
          );
      }
  
@@ -525,6 +571,20 @@ index 08f76f5..f825bd9 100644
 +        else {
 +            return;
 +        };
++        // Not without end (MOST_ASKS): past that, this enabling is left as it is.
++        let now = std::time::Instant::now();
++        let asks = match self.text_inputs.asks {
++            Some((since, count)) if now.duration_since(since) < std::time::Duration::from_secs(1) => (since, count + 1),
++            _ => (now, 1),
++        };
++        self.text_inputs.asks = Some(asks);
++        if asks.1 > MOST_ASKS {
++            i.gave_up = true;
++            if asks.1 == MOST_ASKS + 1 {
++                tracing::warn!("text input: asked for a field's kind too often in a second: not asked for now");
++            }
++            return;
++        }
 +        if i.asked == 0 {
 +            i.asked = 1;
 +            i.object.done(i.commits);
@@ -573,7 +633,7 @@ index 08f76f5..f825bd9 100644
      /// The keyboard moved: nothing waits for the client that had it any more. What waited goes
      /// on the next turn of the loop (not from inside the keyboard's own handling).
      pub(crate) fn text_order_focus_moved(&mut self) {
-@@ -434,6 +582,12 @@ impl State {
+@@ -434,6 +602,12 @@ impl State {
                  }
              }
          }
@@ -586,7 +646,7 @@ index 08f76f5..f825bd9 100644
          let identity = self.text_inputs.field_identity();
          if told.0 == 3 && self.text_input_report.last.map(|l| l.0) != Some(3) {
              if !self.text_input_report.three_pending {
-@@ -635,6 +789,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -635,6 +809,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                      // Enabling starts the state again: the content type is told after it.
                      instance.pending_secret = Some(false);
                      instance.pending_purpose = Some("normal");
@@ -595,7 +655,7 @@ index 08f76f5..f825bd9 100644
                  }
              }
              zwp_text_input_v3::Request::Disable => {
-@@ -649,12 +805,31 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -649,12 +825,31 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.commits = instance.commits.wrapping_add(1);
                      if let Some(enable) = instance.pending.take() {
@@ -629,7 +689,7 @@ index 08f76f5..f825bd9 100644
                          }
                      }
                      if let Some(rect) = instance.pending_rect.take() {
-@@ -664,6 +839,10 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -664,6 +859,10 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                      if let Some(secret) = instance.pending_secret.take() {
                          instance.secret = secret;
                      }
@@ -640,7 +700,7 @@ index 08f76f5..f825bd9 100644
                      if let Some(purpose) = instance.pending_purpose.take() {
                          instance.purpose = purpose;
                      }
-@@ -678,6 +857,10 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -678,6 +877,10 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                          );
                      }
                  }
@@ -651,7 +711,7 @@ index 08f76f5..f825bd9 100644
                  // The device is told about the field as the client has it now.
                  state.tell_text_input();
                  // Then what waited for this goes, with the field as it is now (its `done`
-@@ -714,6 +897,7 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -714,6 +917,7 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                  };
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.pending_secret = Some(secret_purpose || secret_hint);
