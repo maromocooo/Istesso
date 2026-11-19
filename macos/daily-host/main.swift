@@ -1651,6 +1651,23 @@ func selfTest() -> Never {
     checkPanel(flushed.posted == 1 && flushed.discarded == 0, true, "chord then typing: the held keys go once the key window is confirmed")
     let dropped = chordRun(flush: false)
     checkPanel(dropped.posted == 0 && dropped.discarded > 0, true, "chord that opened a new window: the held keys are let go of, with the notice")
+    do {
+        var carry = (0.0, 0.0)
+        let finger = scrollPlan(dx: 0, dy: 10, source: "finger", v120: nil, pixels: [0, 21], phase: "changed", momentum: nil,
+                                pointsPerPixel: 0.5, carry: &carry)
+        checkPanel(finger == ScrollPlan(lines: false, wheel1: -10, wheel2: 0, exact1: -10.5, exact2: -0, continuous: true, phase: 2, momentum: 0), true,
+                   "scroll: fingers in points, continuous, the phase said")
+        checkPanel(abs(carry.1 + 0.5) < 1e-9, true, "scroll: the half point left over is kept for the next")
+        var carry2 = (0.0, 0.0)
+        let wheel = scrollPlan(dx: 0, dy: 15, source: "wheel", v120: [0, 360], pixels: nil, phase: nil, momentum: nil, pointsPerPixel: 1, carry: &carry2)
+        checkPanel(wheel.lines && wheel.wheel1 == -3 && !wheel.continuous, true, "scroll: a wheel in lines, three notches, not continuous")
+        var carry3 = (0.0, 0.0)
+        let inertia = scrollPlan(dx: 0, dy: 4, source: "finger", v120: nil, pixels: [0, 4], phase: nil, momentum: "ended", pointsPerPixel: 1, carry: &carry3)
+        checkPanel(inertia.momentum == 3 && inertia.phase == 0, true, "scroll: the inertia's end is momentum 3")
+        var carry4 = (0.0, 0.0)
+        let old = scrollPlan(dx: 2, dy: -7, source: nil, v120: nil, pixels: nil, phase: nil, momentum: nil, pointsPerPixel: 1, carry: &carry4)
+        checkPanel(old.wheel1 == 7 && old.wheel2 == -2 && !old.lines, true, "scroll: without a source, as before")
+    }
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -1753,6 +1770,46 @@ func lockResumes(pausedForLock: Bool, detached: Bool, held: Bool) -> Bool {
 func restartResumes(picture: String, detached: Bool, offered: Bool, held: Bool, wordsMeanwhile: [String]) -> Bool {
     guard picture == "running", !detached, offered, !held else { return false }
     return !wordsMeanwhile.contains { $0.hasPrefix("pause") || $0.hasPrefix("detach") }
+}
+
+/// One scroll event for the Mac, from the other side's (ADR 0007, the trial's scroll section):
+/// fingers in pixels (scaled from picture pixels to points, fractions kept), continuous, with the
+/// gesture's phase and the inertia's momentum phase; a wheel in lines (notches, 120 to one), not
+/// continuous; neither said, the old dx and dy in pixels.
+struct ScrollPlan: Equatable {
+    var lines: Bool
+    var wheel1: Int32
+    var wheel2: Int32
+    var exact1: Double
+    var exact2: Double
+    var continuous: Bool
+    var phase: Int64
+    var momentum: Int64
+}
+
+func scrollPlan(dx: Int32, dy: Int32, source: String?, v120: [Double]?, pixels: [Double]?, phase: String?, momentum: String?,
+                pointsPerPixel: Double, carry: inout (Double, Double)) -> ScrollPlan {
+    let phases: [String: Int64] = ["began": 1, "changed": 2, "ended": 4, "cancelled": 8]
+    let momenta: [String: Int64] = ["began": 1, "changed": 2, "ended": 3]
+    func whole(_ x: Double, _ y: Double) -> (Int32, Int32) {
+        // The Mac's axis 1 is up and down, positive towards the top: the other way round.
+        let a = -y + carry.1, b = -x + carry.0
+        let ra = a.rounded(.towardZero), rb = b.rounded(.towardZero)
+        carry = (b - rb, a - ra)
+        return (Int32(ra), Int32(rb))
+    }
+    if source == "finger", let p = pixels {
+        let x = p[0] * pointsPerPixel, y = p[1] * pointsPerPixel
+        let (w1, w2) = whole(x, y)
+        return ScrollPlan(lines: false, wheel1: w1, wheel2: w2, exact1: -y, exact2: -x, continuous: true,
+                          phase: phase.flatMap { phases[$0] } ?? 0, momentum: momentum.flatMap { momenta[$0] } ?? 0)
+    }
+    if source == "wheel", let n = v120 {
+        let x = n[0] / 120, y = n[1] / 120
+        let (w1, w2) = whole(x, y)
+        return ScrollPlan(lines: true, wheel1: w1, wheel2: w2, exact1: -y, exact2: -x, continuous: false, phase: 0, momentum: 0)
+    }
+    return ScrollPlan(lines: false, wheel1: -dy, wheel2: -dx, exact1: -Double(dy), exact2: -Double(dx), continuous: false, phase: 0, momentum: 0)
 }
 
 /// Whether an input event may pass while the screen is locked or the session is not on the
@@ -2007,7 +2064,15 @@ final class Injector {
             button(code, pressed)
         case "scroll":
             guard let dx = (object["dx"] as? NSNumber)?.int32Value, let dy = (object["dy"] as? NSNumber)?.int32Value else { return count("unreadable") }
-            scroll(dx: dx, dy: dy)
+            let numbers = { (key: String) -> [Double]? in
+                guard let list = object[key] as? [NSNumber], list.count == 2 else { return nil }
+                let values = list.map(\.doubleValue)
+                return values.allSatisfy { $0.isFinite && abs($0) <= 120_000 } ? values : nil
+            }
+            let plan = scrollPlan(dx: dx, dy: dy, source: object["source"] as? String, v120: numbers("v120"), pixels: numbers("pixels"),
+                                  phase: object["phase"] as? String, momentum: object["momentum"] as? String,
+                                  pointsPerPixel: scale, carry: &scrollCarry)
+            scroll(plan)
         case "text":
             guard let text = object["text"] as? String else { return count("unreadable") }
             type(text)
@@ -2132,12 +2197,21 @@ final class Injector {
         count("button")
     }
 
-    private func scroll(dx: Int32, dy: Int32) {
+    /// What is left over of fractions of pixels or notches, so that nothing is lost by rounding.
+    private var scrollCarry: (Double, Double) = (0, 0)
+
+    private func scroll(_ plan: ScrollPlan) {
         freshWindowList()
         guard let window = windowAt(point) else { return count("dropped_no_window") }
         let pid = window.pid
         // The other side says how far to scroll; the Mac, how far the content moves.
-        guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: -dy, wheel2: -dx, wheel3: 0) else { return }
+        guard let event = CGEvent(scrollWheelEvent2Source: source, units: plan.lines ? .line : .pixel, wheelCount: 2,
+                                  wheel1: plan.wheel1, wheel2: plan.wheel2, wheel3: 0) else { return }
+        event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: plan.exact1)
+        event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: plan.exact2)
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: plan.continuous ? 1 : 0)
+        if plan.phase != 0 { event.setIntegerValueField(.scrollWheelEventScrollPhase, value: plan.phase) }
+        if plan.momentum != 0 { event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: plan.momentum) }
         event.location = point
         withHeld(event)
         aim(event, at: window)
