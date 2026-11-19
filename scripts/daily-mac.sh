@@ -412,14 +412,17 @@ do_guard() {
             [ "$open_ones" = 1 ] || { echo "$(date '+%H:%M:%S') no window is open: the guard ends"; exit 0; }
             # Whether the host's screen is locked (its host programs say so): shown in the titles.
             local states
-            states=$(printf 'for r in "$D"/run/*/; do n=$(basename "$r"); w=$(grep -o "\"istesso\":\"\\(locked\\|unlocked\\)\"" "$r/host.log" 2>/dev/null | tail -1 | cut -d\\" -f4); echo "$n ${w:-unlocked}"; done\n' | on_host 2>/dev/null)
+            states=$(printf 'for r in "$D"/run/*/; do n=$(basename "$r"); w=$(grep -o "\"istesso\":\"\\(locked\\|unlocked\\)\"" "$r/host.log" 2>/dev/null | tail -1 | cut -d\\" -f4); k=$(grep -o "\"istesso\":\"keys-\\(dropped\\|taken\\)\"" "$r/host.log" 2>/dev/null | tail -1 | cut -d\\" -f4); echo "$n ${w:-unlocked} ${k:-keys-taken}"; done\n' | on_host 2>/dev/null)
             for mine in "$state"/*/; do
                 name=$(basename "$mine")
                 still_runs "$mine/viewer.pid" || continue
-                local lock_word base wanted
+                local lock_word keys_word base wanted
                 lock_word=$(printf '%s\n' "$states" | awk -v n="$name" '$1 == n {print $2}')
+                keys_word=$(printf '%s\n' "$states" | awk -v n="$name" '$1 == n {print $3}')
                 base="$(cat "$mine/app" 2>/dev/null) (Mac host)"
                 wanted=$base
+                # Never silently: a key that the host could not hand over is said in the title.
+                [ "$keys_word" = keys-dropped ] && wanted="$base — クリックすると打てます"
                 [ "$lock_word" = locked ] && wanted="$base — Studio はロック中"
                 if [ "$(head -1 "$mine/title" 2>/dev/null)" != "$wanted" ]; then
                     printf '%s\n\n' "$wanted" > "$mine/title"

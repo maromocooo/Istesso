@@ -1258,6 +1258,12 @@ final class Injector {
     /// this process is in it, and whether keys may be sent now. Set by the host for its mode.
     var inRange: (CGPoint, WindowInfo?) -> Bool = { _, _ in false }
     var keysAllowed: () -> Bool = { false }
+    /// The other side's window became the one typed into; it was resized (picture pixels).
+    var onFocus: () -> Void = {}
+    var onResize: (Int, Int) -> Void = { _, _ in }
+    /// A key was not taken because the application was not in front (said once until one is).
+    var onKeysDropped: (Bool) -> Void = { _ in }
+    private var keysDroppedSaid = false
     /// What the injector looks at and where it posts; replaced by stand-ins in --self-test, so that
     /// the tests go through the same path as the input does.
     var listNow: () -> [WindowInfo] = { windowList() }
@@ -1405,6 +1411,14 @@ final class Injector {
         case "text":
             guard let text = object["text"] as? String else { return count("unreadable") }
             type(text)
+        case "focus":
+            count("focus")
+            onFocus()
+        case "resize":
+            guard let w = (object["width"] as? NSNumber)?.intValue, let h = (object["height"] as? NSNumber)?.intValue,
+                  (64...8192).contains(w), (64...8192).contains(h) else { return count("unreadable") }
+            count("resize")
+            onResize(w, h)
         default:
             count("unknown")
         }
@@ -1413,7 +1427,11 @@ final class Injector {
     private func key(_ code: UInt32, _ pressed: Bool) {
         guard let pid = target() else { return count("dropped_no_target") }
         // A release is always let through for a key that went down, so that none stays down.
-        guard keysAllowed() || (!pressed && keysDown.contains(code)) else { return count("dropped_not_in_front") }
+        guard keysAllowed() || (!pressed && keysDown.contains(code)) else {
+            if !keysDroppedSaid { keysDroppedSaid = true; onKeysDropped(true) }
+            return count("dropped_not_in_front")
+        }
+        if pressed && keysDroppedSaid { keysDroppedSaid = false; onKeysDropped(false) }
         guard let virtual = virtualKeys[code] else { return count("unknown_key") }
         if pressed { keysDown.insert(code) } else { keysDown.remove(code) }
         if modifierFlag(code) != nil { modifierSince[code] = pressed ? (modifierSince[code] ?? ProcessInfo.processInfo.systemUptime) : nil }
@@ -1771,6 +1789,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     return top.pid == pid || self.appPanels().contains { $0.id == top.id }
                 }
                 self.injector.keysAllowed = { [weak self] in self?.appInFront() ?? false }
+                self.injector.onFocus = { [weak self] in self?.raiseShownWindow() }
+                self.injector.onResize = { [weak self] w, h in self?.resizeAsked(width: w, height: h) }
+                self.injector.onKeysDropped = { dropped in say(dropped ? "keys-dropped" : "keys-taken") }
                 self.injector.windowAt = { [weak self] point in self?.appWindow(at: point) }
                 self.watchApp()
             }
@@ -1796,6 +1817,55 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let own = lookout.windows
         let front = appInFront()
         return services.filter { panelAllowed(serviceWindow: $0.bounds, appWindows: own, appInFront: front) }
+    }
+
+    /// The application and the window that is shown, to the front (the other side's window became
+    /// the one typed into, or a first key comes): through Accessibility, away from the input.
+    var raisedWindow: CGWindowID?
+    func raiseShownWindow() {
+        guard let pid = app?.processIdentifier, windowBounds != .zero else { return }
+        let bounds = windowBounds
+        raisedWindow = windowId
+        lookout.act { bringToFront(pid, bounds: bounds) }
+    }
+
+    /// The other side asks for another size (once its resizing has ended). The shown window of
+    /// the application is made that size, as near as the application and the screen let it
+    /// (Accessibility); the answer is a new stream of the size taken, also when nothing changed.
+    func resizeAsked(width: Int, height: Int) {
+        guard settings.size == nil, let pid = app?.processIdentifier, windowBounds != .zero, !restarting else { return }
+        let density = pixelsPerPoint(CGMainDisplayID())
+        let bounds = windowBounds
+        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: bounds.midX, y: NSScreen.screens[0].frame.maxY - bounds.midY)) } ?? NSScreen.main
+        let room = screen?.visibleFrame.size ?? CGSize(width: 8192, height: 8192)
+        var target = CGSize(width: Double(width) / density, height: Double(height) / density)
+        target.width = min(target.width, room.width); target.height = min(target.height, room.height)
+        lookout.act {
+            let element = AXUIElementCreateApplication(pid)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value) == .success,
+                  let windows = value as? [AXUIElement] else { return }
+            for window in windows {
+                var position: CFTypeRef?, extent: CFTypeRef?
+                AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &position)
+                AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &extent)
+                var p = CGPoint.zero, s = CGSize.zero
+                if let position { AXValueGetValue(position as! AXValue, .cgPoint, &p) }
+                if let extent { AXValueGetValue(extent as! AXValue, .cgSize, &s) }
+                guard abs(p.x - bounds.minX) < 2, abs(p.y - bounds.minY) < 2,
+                      abs(s.width - bounds.width) < 2, abs(s.height - bounds.height) < 2 else { continue }
+                var size = target
+                if let made = AXValueCreate(.cgSize, &size) { AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, made) }
+                break
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                // The answer: a stream of the size the window has now (the look that follows the
+                // window would also notice a change; this answers when nothing changed as well).
+                guard let self, let now = windowList(onScreenOnly: true).first(where: { $0.id == self.windowId }) else { return }
+                let w = max(64, min(3840, Int(now.bounds.width * density)) & ~1), h = max(64, min(2160, Int(now.bounds.height * density)) & ~1)
+                if !self.restarting { self.restartStream(width: w, height: h, windowSize: now.bounds.size) }
+            }
+        }
     }
 
     func appInFront() -> Bool {
@@ -2278,8 +2348,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var waiting: [Data] = []
     func take(_ data: Data) {
         if !waiting.isEmpty { return waiting.append(data) }
+        let notRaised = app != nil && raisedWindow != windowId && isKeyOrText(data)
         if needsFront(data), !screenLocked(), let running = frontCandidate(data),
-           running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
+           notRaised || running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
+            if app != nil && isKeyOrText(data) { raisedWindow = windowId }
             // The window under the pointer for a press, else the application's shown window.
             let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
             let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
@@ -2294,6 +2366,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             return
         }
         injector.handle(data)
+    }
+
+    private func isKeyOrText(_ data: Data) -> Bool {
+        let kind = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String
+        return kind == "key" || kind == "text"
     }
 
     private func needsFront(_ data: Data) -> Bool {
