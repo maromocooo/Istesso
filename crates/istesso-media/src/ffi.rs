@@ -603,6 +603,8 @@ pub unsafe extern "C" fn istesso_media_client_next(
     match viewer.next(Duration::from_millis(wait_ms.into())) {
         // What the cursor is now is fetched with `istesso_media_client_cursor`.
         Ok(Some(Event::Cursor(_))) => 2,
+        // The text field (trial only) is told to watches only; here it is nothing new.
+        Ok(Some(Event::TextField(_))) => 0,
         Ok(Some(Event::Frame(got))) => {
             // SAFETY: not null, and room for the result by the caller's
             // promise. The bytes belong to the viewer, which lives until
@@ -653,6 +655,90 @@ fn frame_for_c(got: &Frame<'_>) -> IstessoMediaFrame {
         messages: got.messages,
         reserved: 0,
     }
+}
+
+/// The text input field of the application with the keyboard, for C (trial only).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IstessoMediaTextInput {
+    /// 0 nothing known, 1 a field, 2 a password field, 3 not in a field.
+    pub state: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// The field's serial (0 to 255): changes whenever another field has the keyboard.
+    pub serial: u32,
+}
+
+/// # Safety
+/// `host` as for `istesso_media_host_send`; `field` points to one, or is null.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_set_text_input(
+    host: *const IstessoMediaHost,
+    field: *const IstessoMediaTextInput,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let (Some(host), Some(field)) = (unsafe { host.as_ref() }, unsafe { field.as_ref() }) else {
+        remember("no host, or no field, was given");
+        return -1;
+    };
+    let (Ok(state), Ok(width), Ok(height), Ok(serial)) = (
+        u8::try_from(field.state),
+        u16::try_from(field.width),
+        u16::try_from(field.height),
+        u8::try_from(field.serial),
+    ) else {
+        remember("the text field's numbers are out of range");
+        return -1;
+    };
+    let field = crate::wire::TextField {
+        state,
+        serial,
+        x: field.x,
+        y: field.y,
+        width,
+        height,
+    };
+    match host.host.set_text_field(&field) {
+        Ok(()) => 0,
+        Err(err) => {
+            remember(err);
+            -1
+        }
+    }
+}
+
+/// # Safety
+/// `watch` as for `istesso_media_watch_cursor`; `field` points to room for the result.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_watch_text_input(
+    watch: *const IstessoMediaWatch,
+    field: *mut IstessoMediaTextInput,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let (Some(watch), false) = (unsafe { watch.as_ref() }, field.is_null()) else {
+        return -1;
+    };
+    let lasting = watch.lasting.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(viewer) = lasting.viewer() else {
+        return -1;
+    };
+    let Some(now) = viewer.text_field() else {
+        return 0;
+    };
+    // SAFETY: not null, and room for the result by the caller's promise.
+    unsafe {
+        *field = IstessoMediaTextInput {
+            state: u32::from(now.state),
+            x: now.x,
+            y: now.y,
+            width: u32::from(now.width),
+            height: u32::from(now.height),
+            serial: u32::from(now.serial),
+        }
+    };
+    1
 }
 
 /// What the cursor is, for C. A name is kept in `kept`, which has to outlive the use of
@@ -758,6 +844,20 @@ pub unsafe extern "C" fn istesso_media_watch_open(
 }
 
 /// # Safety
+/// `watch` is a newly opened handle, exclusively held by the caller.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_watch_follow_restarts(watch: *mut IstessoMediaWatch) {
+    // SAFETY: the caller enables this before sharing the watch with any other thread.
+    if let Some(watch) = unsafe { watch.as_mut() } {
+        watch
+            .lasting
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .follow_pipeline_restarts();
+    }
+}
+
+/// # Safety
 /// `watch` came from `istesso_media_watch_open` and has not been closed; `frame` points to
 /// room for the result. What `frame.data` points to stays valid until the next call with
 /// this watch.
@@ -785,6 +885,8 @@ pub unsafe extern "C" fn istesso_media_watch_next(
         }
         // What the cursor is now is fetched with `istesso_media_watch_cursor`.
         Ok(Some(Step::Event(Event::Cursor(_)))) => 2,
+        // What the text field is now is fetched with `istesso_media_watch_text_input`.
+        Ok(Some(Step::Event(Event::TextField(_)))) => 5,
         Ok(Some(Step::Cut)) => {
             state.cuts += 1;
             3
@@ -1269,6 +1371,7 @@ mod tests {
                 istesso_media_watch_open(device_dir.as_ptr(), addr.as_ptr(), std::ptr::null());
             assert!(!watch.is_null(), "{}", last_error());
 
+            istesso_media_watch_follow_restarts(watch);
             let mut frame = std::mem::zeroed::<IstessoMediaFrame>();
             let mut state = IstessoMediaWatchState::default();
             let mut info = std::mem::zeroed::<IstessoMediaStreamInfo>();
@@ -1290,14 +1393,14 @@ mod tests {
             assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
             assert_eq!((state.cuts, state.again, state.why), (0, 0, 0));
 
-            let until_shown = || {
+            let until_shown = |host| {
                 let began = std::time::Instant::now();
                 while istesso_media_host_viewers(host) != 1 {
                     assert!(began.elapsed() < Duration::from_secs(5), "waited too long");
                     std::thread::sleep(Duration::from_millis(5));
                 }
             };
-            until_shown();
+            until_shown(host);
             let mut sent = std::mem::zeroed::<IstessoMediaSent>();
             assert_eq!(
                 istesso_media_host_send(host, b"key".as_ptr(), 3, 1, 2, 1, &mut sent),
@@ -1321,7 +1424,7 @@ mod tests {
             istesso_media_client_close(second);
             assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
             assert_eq!((state.cuts, state.again, state.why), (1, 1, 0));
-            until_shown();
+            until_shown(host);
             // From any thread, with whichever connection there is.
             istesso_media_watch_ask_key_frame(watch);
             assert_eq!(
@@ -1330,6 +1433,30 @@ mod tests {
             );
             assert_eq!(next(&mut frame), 1);
             assert_eq!(std::slice::from_raw_parts(frame.data, frame.len), b"key 2");
+            assert_eq!(frame.key_frame, 1);
+
+            // A daily window stays on the same watch across a clean pipeline restart.
+            istesso_media_host_close(host);
+            assert_eq!(next(&mut frame), 3);
+            // Leave the port empty through a failed attempt.
+            assert_eq!(istesso_media_watch_next(watch, 500, &mut frame), 0);
+            let host = istesso_media_host_listen(host_dir.as_ptr(), addr.as_ptr(), &INFO);
+            assert!(!host.is_null(), "{}", last_error());
+            assert_eq!(next(&mut frame), 4);
+            assert_eq!(istesso_media_watch_state(watch, &mut state), 0);
+            assert_eq!((state.cuts, state.again), (2, 1));
+            until_shown(host);
+            assert_eq!(
+                istesso_media_host_send(host, b"delta".as_ptr(), 5, 4, 5, 0, &mut sent),
+                0
+            );
+            assert_eq!(sent.viewers, 0);
+            assert_eq!(
+                istesso_media_host_send(host, b"fresh".as_ptr(), 5, 5, 6, 1, &mut sent),
+                0
+            );
+            assert_eq!(next(&mut frame), 1);
+            assert_eq!(std::slice::from_raw_parts(frame.data, frame.len), b"fresh");
             assert_eq!(frame.key_frame, 1);
 
             // The picture is put aside: said on the connection, and that is the end.

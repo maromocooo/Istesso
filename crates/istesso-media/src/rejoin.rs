@@ -10,7 +10,8 @@
 //! It only does so when nobody said why the connection ended
 //! ([`Error::again`]). A host that says that the stream is over, that the
 //! picture is for another device now, or that this device may not look, is
-//! not asked again.
+//! not asked again. Daily windows opt into following a clean pipeline restart
+//! with [`Lasting::follow_pipeline_restarts`].
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -143,6 +144,7 @@ pub struct Lasting {
     cuts: u64,
     /// It is over, and was said to be: nothing is tried again.
     over: bool,
+    follow_restarts: bool,
     asker: Arc<Mutex<Option<Asker>>>,
 }
 
@@ -161,8 +163,15 @@ impl Lasting {
             ever: false,
             cuts: 0,
             over: false,
+            follow_restarts: false,
             asker: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Keep a daily window watching the same device when its pipeline exits
+    /// cleanly. Detach, reassignment and refusal still end the watch.
+    pub fn follow_pipeline_restarts(&mut self) {
+        self.follow_restarts = true;
     }
 
     /// What the host said about its picture on the connection there is.
@@ -209,7 +218,12 @@ impl Lasting {
                 let heard = viewer.last_heard();
                 self.viewer = None;
                 *self.asker.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                match self.pace.after(err.again(), Instant::now()) {
+                let again = if self.follow_restarts && matches!(err, Error::Ended) {
+                    Again::Soon
+                } else {
+                    err.again()
+                };
+                match self.pace.after(again, Instant::now()) {
                     Next::Never => {
                         self.over = true;
                         Err(err)

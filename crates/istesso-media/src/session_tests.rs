@@ -1274,6 +1274,7 @@ fn events(viewer: &mut Viewer, count: usize) -> (String, Vec<Vec<u8>>) {
                     Cursor::Image(image) => image.rgba.to_vec(),
                 });
             }
+            Event::TextField(_) => order.push('t'),
         }
     }
     (order, cursors)
@@ -1493,6 +1494,7 @@ fn a_cursor_that_changes_all_the_time_does_not_flood_the_connection_or_hold_fram
                         last = number;
                     }
                     Some(Event::Cursor(other)) => panic!("unexpected: {other:?}"),
+                    Some(Event::TextField(other)) => panic!("unexpected: {other:?}"),
                     None => {}
                 }
                 if done.lock().unwrap().is_some_and(|set| set == last) {
@@ -1568,6 +1570,54 @@ fn a_viewer_that_takes_nothing_is_not_sent_cursor_after_cursor() {
 }
 
 #[test]
+fn nothing_is_sealed_behind_a_packet_that_went_out_only_in_part_behind_a_frame() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    // Two frames that go out whole and are read.
+    for seq in 0..2 {
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            pair.host
+                .send_frame(b"key", seq, seq, true)
+                .unwrap()
+                .viewers,
+            1
+        );
+        assert_eq!(events(&mut viewer, 1).0, "f");
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    // The next packet after one that goes whole goes out only in part. A cursor change and a
+    // field change are due behind the next frame: the frame goes whole, what follows it
+    // goes in part, and nothing may be sealed behind that (a debug build checks it).
+    pair.host.part_after("air", 1);
+    let pixels = picture(24 * 16 * 4, 3);
+    pair.host.set_cursor(&arrow(&pixels)).unwrap();
+    let field = crate::wire::TextField {
+        state: 1,
+        serial: 1,
+        x: 10,
+        y: 20,
+        width: 0,
+        height: 18,
+    };
+    pair.host.set_text_field(&field).unwrap();
+    assert_eq!(
+        pair.host.send_frame(b"next", 2, 2, false).unwrap().viewers,
+        1
+    );
+    // All of it arrives, in order: the frame, the field (small, first), the cursor.
+    let began = Instant::now();
+    let (order, _) = events(&mut viewer, 3);
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(order, "ftc");
+    assert_eq!(viewer.text_field(), Some(field));
+}
+
+#[test]
 fn a_frame_does_not_wait_for_a_viewer_whose_own_thread_holds_its_connection() {
     let pair = pair();
     let book = pair.another_device("book");
@@ -1620,6 +1670,37 @@ fn a_frame_does_not_wait_for_a_viewer_whose_own_thread_holds_its_connection() {
     // Having missed frames, it began again with a key frame, which the host asked for.
     assert!(pair.host.key_frame_wanted());
     held.finish();
+}
+
+#[test]
+fn the_text_field_reaches_a_viewer_and_a_viewer_that_comes_later_and_only_once_set() {
+    let pair = pair();
+    let mut viewer = pair.watching();
+    // Never set: frames only, nothing else.
+    assert_eq!(pair.host.send_frame(b"key", 0, 0, true).unwrap().viewers, 1);
+    assert_eq!(events(&mut viewer, 1).0, "f");
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(matches!(viewer.next(Duration::from_millis(100)), Ok(None)));
+    assert_eq!(viewer.text_field(), None);
+
+    let field = crate::wire::TextField {
+        state: 1,
+        serial: 7,
+        x: 114,
+        y: 128,
+        width: 0,
+        height: 34,
+    };
+    pair.host.set_text_field(&field).unwrap();
+    assert_eq!(events(&mut viewer, 1).0, "t");
+    assert_eq!(viewer.text_field(), Some(field));
+    // A viewer that comes later is told what it is then.
+    let mut later = pair.watching();
+    assert_eq!(events(&mut later, 1).0, "t");
+    assert_eq!(later.text_field(), Some(field));
+    // A state this version does not know is refused at the host.
+    let odd = crate::wire::TextField { state: 4, ..field };
+    assert!(pair.host.set_text_field(&odd).is_err());
 }
 
 #[test]
@@ -1692,6 +1773,7 @@ fn nobody_is_told_the_cursor_while_the_list_of_paired_devices_cannot_be_read() {
         match viewer.next(SOON) {
             Ok(Some(Event::Cursor(cursor))) => assert_ne!(cursor, Cursor::Named("after")),
             Ok(Some(Event::Frame(_))) => panic!("a frame"),
+            Ok(Some(Event::TextField(_))) => panic!("a text field"),
             Ok(None) => panic!("the viewer was left waiting"),
             Err(err) => break err,
         }
@@ -1889,6 +1971,7 @@ fn step(viewer: &mut Lasting) -> crate::Result<Stepped> {
                 key_frame: frame.key_frame,
             },
             Some(Step::Event(Event::Cursor(_))) => Stepped::Cursor,
+            Some(Step::Event(Event::TextField(_))) => continue,
             Some(Step::Cut) => Stepped::Cut,
             Some(Step::Connected { again, silent_for }) => Stepped::Connected { again, silent_for },
         });

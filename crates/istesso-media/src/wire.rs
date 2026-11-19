@@ -8,7 +8,8 @@
 //! ```text
 //!   offset  bytes  content
 //!   0       1      version of this layout (1)
-//!   1       1      kind: 1 frame, 2 nothing to show at the moment, 3 end, 4 the cursor
+//!   1       1      kind: 1 frame, 2 nothing to show at the moment, 3 end, 4 the cursor,
+//!                  5 the text input field (trial only)
 //!   2       2      length of the header (40 in this version)
 //!   4       4      flags: bit 0, a key frame; bit 1, does not follow on from
 //!                  the frame sent before it on this connection
@@ -45,6 +46,25 @@
 //! the numbers say. A viewer that does not know kind 4 passes the packet over, like any kind
 //! it does not know.
 //!
+//! A packet of kind 5 (trial only, ADR 0015, "文字の入力の欄") says whether the application
+//! with the keyboard has a text input field, whether it is a password field, and where its
+//! text cursor is, so that the viewer's input method can put its candidates there:
+//!
+//! ```text
+//!   offset  bytes  content
+//!   0       1      state: 0 nothing known, 1 a field, 2 a password field, 3 not in a field
+//!                  (the application has a text input there and none is enabled)
+//!   1       1      the field's serial: one more (mod 256) whenever another field, or the
+//!                  same one enabled again, has the keyboard (an earlier version wrote 0)
+//!   2       2      length of this fixed part (16 in this version)
+//!   4       4      text cursor, x, in the picture's pixels (signed)
+//!   8       4      y
+//!   12      2      width
+//!   14      2      height
+//! ```
+//!
+//! No typed text is in it. A viewer that does not know kind 5 passes the packet over.
+//!
 //! All numbers are little-endian. A reader goes by the length of the header
 //! that the packet states and skips what lies between the fields it knows and
 //! the frame: a later version can add fields without a new layout version.
@@ -72,6 +92,8 @@ pub const MAX_CURSOR_SCALE: u16 = 8;
 pub const MAX_CURSOR_NAME: usize = 64;
 /// Bytes in front of a cursor's name or pixels, as this version writes them.
 pub const CURSOR_FIXED_LEN: usize = 16;
+/// The fixed part of what a packet of kind 5 carries.
+pub const TEXT_FIELD_FIXED_LEN: usize = 16;
 
 const FLAG_KEY_FRAME: u32 = 1;
 const FLAG_DISCONTINUITY: u32 = 2;
@@ -220,6 +242,23 @@ pub enum Kind {
     End,
     /// What the pointer's cursor looks like from now on ([`Cursor`]).
     Cursor,
+    /// The text input field of the application with the keyboard ([`TextField`]). Trial only.
+    TextField,
+}
+
+/// The text input field of the application with the keyboard, and where its text cursor
+/// is, in the picture's pixels. Trial only (ADR 0015, "文字の入力の欄").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextField {
+    /// 0 nothing known, 1 a field, 2 a password field, 3 not in a field.
+    pub state: u8,
+    /// One more (mod 256) whenever another field has the keyboard: the viewer ends its
+    /// composition when it changes.
+    pub serial: u8,
+    pub x: i32,
+    pub y: i32,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// What the pointer's cursor looks like on the host.
@@ -318,6 +357,8 @@ pub enum WireError {
          it, or not as long as its size says"
     )]
     Cursor,
+    #[error("the text field is not one this version knows")]
+    TextField,
 }
 
 /// Writes one packet into `out`, replacing what was there.
@@ -330,6 +371,7 @@ pub fn encode(header: &Header, frame: &[u8], out: &mut Vec<u8>) {
         Kind::Idle => 2,
         Kind::End => 3,
         Kind::Cursor => 4,
+        Kind::TextField => 5,
     });
     out.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
     out.extend_from_slice(&flags(header).to_le_bytes());
@@ -397,6 +439,7 @@ pub fn decode(packet: &[u8]) -> Result<(Header, std::ops::Range<usize>), WireErr
         2 => Kind::Idle,
         3 => Kind::End,
         4 => Kind::Cursor,
+        5 => Kind::TextField,
         other => return Err(WireError::Kind(other)),
     };
     let flags = quad(4);
@@ -473,6 +516,46 @@ pub fn decode_cursor(body: &[u8]) -> Result<Cursor<'_>, WireError> {
     };
     cursor.check()?;
     Ok(cursor)
+}
+
+/// Writes one packet that says what the text field is into `out`, replacing what was there.
+/// A state above 3 is not written.
+pub fn encode_text_field(field: &TextField, seq: u64, out: &mut Vec<u8>) -> Result<(), WireError> {
+    if field.state > 3 {
+        return Err(WireError::TextField);
+    }
+    let mut body = Vec::with_capacity(TEXT_FIELD_FIXED_LEN);
+    body.push(field.state);
+    body.push(field.serial);
+    body.extend_from_slice(&(TEXT_FIELD_FIXED_LEN as u16).to_le_bytes());
+    body.extend_from_slice(&field.x.to_le_bytes());
+    body.extend_from_slice(&field.y.to_le_bytes());
+    body.extend_from_slice(&field.width.to_le_bytes());
+    body.extend_from_slice(&field.height.to_le_bytes());
+    encode(&Header::without_frame(Kind::TextField, seq), &body, out);
+    Ok(())
+}
+
+/// Reads what a packet of kind [`Kind::TextField`] carries. Fields a later version adds after
+/// the fixed part are passed over; a state this version does not know is refused.
+pub fn decode_text_field(body: &[u8]) -> Result<TextField, WireError> {
+    if body.len() < TEXT_FIELD_FIXED_LEN {
+        return Err(WireError::TextField);
+    }
+    let fixed = usize::from(u16::from_le_bytes([body[2], body[3]]));
+    if fixed < TEXT_FIELD_FIXED_LEN || fixed > body.len() || body[0] > 3 {
+        return Err(WireError::TextField);
+    }
+    let quad = |at: usize| i32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+    let pair = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
+    Ok(TextField {
+        state: body[0],
+        serial: body[1],
+        x: quad(4),
+        y: quad(8),
+        width: pair(12),
+        height: pair(14),
+    })
 }
 
 /// How many messages of the encrypted channel a frame of `frame_len` bytes
@@ -672,6 +755,41 @@ mod tests {
         let (header, at) = decode(&packet).unwrap();
         assert_eq!((header.kind, header.seq), (Kind::Cursor, 9));
         packet[at].to_vec()
+    }
+
+    #[test]
+    fn a_text_field_comes_back_as_it_was_written_and_an_unknown_state_is_refused() {
+        let field = TextField {
+            state: 2,
+            serial: 201,
+            x: -3,
+            y: 191,
+            width: 0,
+            height: 28,
+        };
+        let mut packet = Vec::new();
+        encode_text_field(&field, 7, &mut packet).unwrap();
+        let (header, at) = decode(&packet).unwrap();
+        assert_eq!((header.kind, header.seq), (Kind::TextField, 7));
+        assert_eq!(packet.len() - at.start, TEXT_FIELD_FIXED_LEN);
+        assert_eq!(decode_text_field(&packet[at.clone()]), Ok(field));
+        // A later version's longer fixed part is passed over.
+        let mut longer = packet[at.clone()].to_vec();
+        longer[2] = 20;
+        longer.extend_from_slice(&[9, 9, 9, 9]);
+        assert_eq!(decode_text_field(&longer), Ok(field));
+        let mut unknown = packet[at.clone()].to_vec();
+        unknown[0] = 4;
+        assert_eq!(decode_text_field(&unknown), Err(WireError::TextField));
+        assert_eq!(
+            decode_text_field(&packet[at][..15]),
+            Err(WireError::TextField)
+        );
+        let odd = TextField { state: 4, ..field };
+        assert_eq!(
+            encode_text_field(&odd, 0, &mut Vec::new()),
+            Err(WireError::TextField)
+        );
     }
 
     #[test]
