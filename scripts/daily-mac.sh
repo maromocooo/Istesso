@@ -302,7 +302,8 @@ else
         XDG_RUNTIME_DIR=\$run/rt ISTESSO_CACHE_DIR=\$run/agent-cache ISTESSO_CONFIG_DIR=\$config nohup "\$D/bin/istesso" agent --port \$agent_port --no-discovery > "\$run/agent.log" 2>&1 < /dev/null &
         write_down "\$run/agent.pid" \$!
     fi
-    [ -p "\$run/control" ] || mkfifo "\$run/control"
+    [ -p "\$run/control" ] || mkfifo -m 600 "\$run/control"
+    chmod 600 "\$run/control"
     : > "\$run/host.log"; : > "\$run/host.err"; : > "\$run/host.number"
     document=""
     if [ -n "$document_arg" ]; then

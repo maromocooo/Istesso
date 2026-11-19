@@ -1420,6 +1420,7 @@ func closeWindowAt(_ arguments: [String]) -> Never {
 
 /// `--self-test`: the rule of the session form, without any window or permission.
 func selfTest() -> Never {
+    setvbuf(stdout, nil, _IONBF, 0)
     let win = CGRect(x: 100, y: 100, width: 200, height: 100)
     let inside = CGPoint(x: 150, y: 150), outside = CGPoint(x: 500, y: 500)
     var failed = 0
@@ -1728,8 +1729,9 @@ func axFocusedWindowBounds(_ pid: pid_t) -> CGRect? {
 
 /// Command chords that edit or format and never open or switch a window: no hold after them
 /// (C, V, X, Z, A, L, F, B, I, U, G, E, by the Linux key numbers).
-let chordsWithoutWindows: Set<UInt32> = [46, 47, 45, 44, 30, 38, 33, 48, 23, 22, 34, 18]
-func chordMayChangeWindow(_ code: UInt32) -> Bool { !chordsWithoutWindows.contains(code) }
+// (A function, not a global constant: main.swift's globals are made in the order the file runs,
+// and --self-test runs before this line would.)
+func chordMayChangeWindow(_ code: UInt32) -> Bool { ![46, 47, 45, 44, 30, 38, 33, 48, 23, 22, 34, 18].contains(code) }
 
 /// Whether keys may go to the application now: it is in front, and the window keys go to (its
 /// focused window, by Accessibility) is the very window that is shown, by its place and size in

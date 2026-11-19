@@ -15,3 +15,4 @@ notes         com.apple.Notes                                           as-is  o
 preview       com.apple.Preview                                         as-is  owner
 finder        com.apple.finder                                          new-window  owner
 input-target  ~/.cache/istesso-daily-mac/Istesso_Dev_Input_Target.app  as-is
+dia           company.thebrowser.dia                                    new-window  owner
