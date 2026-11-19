@@ -27,9 +27,11 @@ jobs:
         run: bash scripts/tests/check-private-test.sh
       - name: Check that the measurement scripts parse
         run: python3 -m py_compile scripts/*.py
-      - name: Test the main editor prototype's launcher (no editor is started)
+      - name: Test the main editor prototype's launchers (no editor or app is started)
         if: runner.os == 'Linux'
-        run: python3 -I scripts/tests/proto-editor-window-test.py
+        run: |
+          python3 -I scripts/tests/proto-editor-window-test.py
+          python3 -I scripts/tests/proto-editor-window-mac-test.py
       - name: Build the screen probe
         if: runner.os == 'macOS'
         run: swift build --package-path macos/screen-probe
