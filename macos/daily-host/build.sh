@@ -26,7 +26,7 @@ bundle="$output/Istesso Dev Daily Host.app"
 
 (cd "$repo" && cargo build --release -p istesso-media >&2)
 mkdir -p "$bundle/Contents/MacOS"
-swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
+swiftc -O -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.2 \
     -import-objc-header "$here/bridge.h" -I "$repo/crates/istesso-media/include" \
     -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" "$here/clipboard.swift" \
     "$repo/target/release/libistesso_media.a" -liconv \
@@ -75,7 +75,7 @@ echo "$bundle"
 # it needs no permission, and is signed ad hoc).
 target="$output/Istesso Dev Input Target.app"
 mkdir -p "$target/Contents/MacOS"
-swiftc -O -swift-version 5 -target arm64-apple-macos14.2 -o "$target/Contents/MacOS/istesso-input-target" "$here/input-target.swift"
+swiftc -O -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.2 -o "$target/Contents/MacOS/istesso-input-target" "$here/input-target.swift"
 cat > "$target/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

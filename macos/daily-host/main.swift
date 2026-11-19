@@ -1968,6 +1968,13 @@ func selfTest() -> Never {
         checkPanel(during == (1, 1, 0, 1, 4) && downs.count == 2 && focus == 1, true,
                    "local use: only releases pass and nothing is raised while the Mac is used at its own keyboard; dropped, not queued")
     }
+    do {
+        // The host posted 2 s ago, local use came 0.5 s ago; the releases at the onset post too.
+        var last: TimeInterval = 98
+        let after = localUseOnset(lastPost: { last }, now: 100, idle: 0.5, release: { last = 100 })
+        checkPanel(after == 1500 && last == 100, true, "local use: the time after the host's own post is read before the releases")
+        checkPanel(localUseOnset(lastPost: { 0 }, now: 100, idle: 0.5, release: {}) == nil, true, "local use: nothing posted yet, no time")
+    }
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -2158,6 +2165,15 @@ func localUseRecent(idle: Double, quiet: Double) -> Bool { idle < quiet }
 /// the host's events would be counting as local ones.
 var lastOwnPost: TimeInterval = 0
 
+/// When local use begins: how many ms after the host's own last post it came (nil if the host has
+/// posted nothing yet), read BEFORE everything held is let go (those releases are posts too).
+func localUseOnset(lastPost: () -> TimeInterval, now: TimeInterval, idle: Double, release: () -> Void) -> Int? {
+    let last = lastPost()
+    let after = last > 0 ? Int(((now - last - idle) * 1000).rounded()) : nil
+    release()
+    return after
+}
+
 /// Local use, looked at before anything is raised or posted, and every second; `onChange` says
 /// when it begins and ends. The idle source is a stand-in in --self-test.
 final class LocalUse {
@@ -2182,7 +2198,11 @@ final class LocalUse {
 /// Makes an application the one in front, and the window at `bounds` its front window, through
 /// Accessibility (ADR 0017: bringing the application's window to the front). An accessory
 /// program's own NSRunningApplication.activate() is only a request that macOS may decline.
-func bringToFront(_ pid: pid_t, bounds: CGRect?) {
+/// `allowed` is looked at again right before each step (local use first): a raise that began just
+/// before the Mac's own keyboard or mouse was used stops there. What already happened is not undone
+/// (undoing it would be one more activation).
+func bringToFront(_ pid: pid_t, bounds: CGRect?, allowed: () -> Bool = { true }) {
+    guard allowed() else { return }
     let app = AXUIElementCreateApplication(pid)
     AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
     if let bounds {
@@ -2197,6 +2217,7 @@ func bringToFront(_ pid: pid_t, bounds: CGRect?) {
                 if let position { AXValueGetValue(position as! AXValue, .cgPoint, &p) }
                 if let extent { AXValueGetValue(extent as! AXValue, .cgSize, &s) }
                 if abs(p.x - bounds.minX) < 2 && abs(p.y - bounds.minY) < 2 && abs(s.width - bounds.width) < 2 && abs(s.height - bounds.height) < 2 {
+                    guard allowed() else { return }
                     AXUIElementPerformAction(window, kAXRaiseAction as CFString)
                     AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
                     break
@@ -2204,6 +2225,7 @@ func bringToFront(_ pid: pid_t, bounds: CGRect?) {
             }
         }
     }
+    guard allowed() else { return }
     NSRunningApplication(processIdentifier: pid)?.activate()
 }
 
@@ -2358,6 +2380,8 @@ final class Injector {
     /// When the last input came (uptime): the watchdog lets go of what is held after a silence.
     var lastInput: TimeInterval = 0
     var holding: Bool { !keysDown.isEmpty || !buttonsDown.isEmpty }
+    /// Anything down here: keys, buttons, or presses posted through the session.
+    var holdingAny: Bool { holding || !sessionPresses.isEmpty }
     private var keysDown: Set<UInt32> = []
     private var keyDownPostedAt: [UInt32: UInt64] = [:]
     private var buttonsDown: Set<UInt32> = []
@@ -2693,14 +2717,23 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         localUse.onChange = { [weak self] present in
             guard let self else { return }
             if present {
-                self.injector.releaseAll()
-                let sinceOwn = lastOwnPost > 0 ? ProcessInfo.processInfo.systemUptime - lastOwnPost : nil
-                let after = sinceOwn.map { Int((($0 - self.localUse.idle()) * 1000).rounded()) }
+                let after = localUseOnset(lastPost: { lastOwnPost }, now: ProcessInfo.processInfo.systemUptime,
+                                          idle: self.localUse.idle(), release: self.injector.releaseAll)
                 say("local-input", [("present", true), ("ms_after_own_post", after)])
             } else {
                 say("local-input", [("present", false)])
             }
         }
+        // While the other side holds a key or a button, local use is looked at every 100 ms, so
+        // that what it holds is let go within 0.1 s of the Mac's own keyboard or mouse being used.
+        let heldWatch = DispatchSource.makeTimerSource(queue: .main)
+        heldWatch.schedule(deadline: .now() + 0.1, repeating: .milliseconds(100))
+        heldWatch.setEventHandler { [weak self] in
+            guard let self, self.injector.holdingAny else { return }
+            _ = self.localUse.recent()
+        }
+        heldWatch.resume()
+        timers.append(heldWatch)
         // Something held, and no input for 8 s: a release was lost on the way; let go.
         let watchdog = DispatchSource.makeTimerSource(queue: .main)
         watchdog.schedule(deadline: .now() + 1, repeating: .seconds(1))
@@ -2846,7 +2879,6 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             guard listen(width: size.0, height: size.1) else { return }
         }
         let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
         configuration.addsToRecentItems = false
         let opened: (NSRunningApplication?, Error?) -> Void = { running, error in
             DispatchQueue.main.async {
@@ -2911,8 +2943,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             // With a document of the trial's own, so that the application opens no panel of its
             // own at the start and none of the owner's documents.
             let file = URL(fileURLWithPath: (document as NSString).expandingTildeInPath)
+            // Looked at again right before the opening (listening may have taken a while): during
+            // local use the application opens behind, and comes to the front only with a later raise.
+            configuration.activates = !localUse.recent()
             NSWorkspace.shared.open([file], withApplicationAt: url, configuration: configuration, completionHandler: opened)
         } else {
+            configuration.activates = !localUse.recent()
             NSWorkspace.shared.openApplication(at: url, configuration: configuration, completionHandler: opened)
         }
     }
@@ -2937,7 +2973,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         guard let pid = app?.processIdentifier, windowBounds != .zero, !localUse.recent() else { return }
         let bounds = windowBounds
         raisedWindow = windowId
-        lookout.act { [localUse] in if !localUse.recentQuietly() { bringToFront(pid, bounds: bounds) } }
+        lookout.act { [localUse] in bringToFront(pid, bounds: bounds, allowed: { !localUse.recentQuietly() }) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
     }
 
@@ -3538,7 +3574,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
             let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
             let pid = running.processIdentifier
-            lookout.act { [localUse] in if !localUse.recentQuietly() { bringToFront(pid, bounds: bounds) } }
+            lookout.act { [localUse] in bringToFront(pid, bounds: bounds, allowed: { !localUse.recentQuietly() }) }
             waiting = [data]
             // The raise is looked at again before anything is sent: the keys go only if it took.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
