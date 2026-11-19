@@ -4,6 +4,8 @@
 //   istesso-ime-probe status              read only: is the input source installed, enabled, selected
 //   istesso-ime-probe serve [script]      owns the socket, waits for the input method, runs commands
 //                                         from the script (or standard input), prints its answers
+//   istesso-ime-probe register            TISRegisterInputSource on the placed bundle (no enable,
+//                                         no select)
 //   istesso-ime-probe select              selects Istesso Dev Input (after the owner added it);
 //                                         prints the source that was selected before
 //   istesso-ime-probe restore <id>        selects that source again
@@ -16,7 +18,8 @@
 //                                         byte-to-UTF-16 selection
 //
 // Commands: `mark <sel start byte> <sel end byte> <text>`, `commit <text>`, `clear`, `caret`,
-// `wait <seconds>`, `check marked <text>` / `check before <text>` (TextEdit only: does the marked
+// `wait <seconds>`, `burst <n> ack|noack`, `click <dx> <dy>`, `drop`, `post-access`,
+// `check at <location> <text>`, `check marked <text>` / `check before <text>` (TextEdit only: does the marked
 // text, or the text just before the caret, hash the same as <text>). Text is never printed back: the answers carry lengths and rectangles only.
 import AppKit
 import ApplicationServices
@@ -54,10 +57,21 @@ func status() {
         let enabled: Bool = property(source, kTISPropertyInputSourceIsEnabled) ?? false
         let selected: Bool = property(source, kTISPropertyInputSourceIsSelected) ?? false
         let selectable: Bool = property(source, kTISPropertyInputSourceIsSelectCapable) ?? false
-        print("source: \(id) enabled=\(enabled) selected=\(selected) select_capable=\(selectable)")
+        let languages: [String] = property(source, kTISPropertyInputSourceLanguages) ?? []
+        let ascii: Bool = property(source, kTISPropertyInputSourceIsASCIICapable) ?? false
+        let name: String = property(source, kTISPropertyLocalizedName) ?? "?"
+        print("source: \(id) name=\"\(name)\" enabled=\(enabled) selected=\(selected) select_capable=\(selectable) languages=\(languages) ascii_capable=\(ascii)")
     }
     print("current: \(currentSourceID())")
     print("secure_event_input: \(IsSecureEventInputEnabled())")
+}
+
+/// Tells the system about the bundle the owner allowed to be placed (instead of logging out). It
+/// neither enables nor selects it.
+func register() {
+    let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Input Methods/Istesso Dev Input.app")
+    let result = TISRegisterInputSource(url as CFURL)
+    print("register: \(result == noErr ? "ok" : "error \(result)")")
 }
 
 func select() {
@@ -160,14 +174,16 @@ func answers(_ fd: Int32, _ reader: Wire.LineReader, until op: String?, timeout:
         if n <= 0 { print("closed"); break }
         guard let messages = reader.feed(Data(buffer[0..<n])) else { print("line too long"); break }
         for message in messages {
-            if let data = try? JSONSerialization.data(withJSONObject: message, options: [.sortedKeys]) {
-                print("answer: \(String(decoding: data, as: UTF8.self))")
-            }
+            show(message)
             got.append(message)
         }
         if let op, got.contains(where: { $0["op"] as? String == op }) { break }
     }
     return got
+}
+
+func digest(_ text: String) -> String {
+    SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
 func command(_ line: String) -> [String: Any]? {
@@ -182,13 +198,167 @@ func command(_ line: String) -> [String: Any]? {
         return ["op": "commit", "text": parts.dropFirst().joined(separator: " ")]
     case "clear": return ["op": "clear"]
     case "caret": return ["op": "caret"]
-    case "check" where parts.count >= 3 && (parts[1] == "marked" || parts[1] == "before"):
-        // The text is only hashed here; the input method answers with the hash of what it reads.
-        let text = parts.dropFirst(2).joined(separator: " ")
-        let expected = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
-        return parts[1] == "marked" ? ["op": "check", "where": "marked", "expect": expected]
-                                    : ["op": "check", "units": text.utf16.count, "expect": expected]
+    case "check" where parts.count >= 3 && parts[1] == "marked":
+        // The text is only hashed here; the input method answers with the hash of the marked text
+        // it reads. Neither hash is ever printed: only whether they match.
+        return ["op": "check", "expect": digest(parts.dropFirst(2).joined(separator: " "))]
+    case "check" where parts.count == 2 && parts[1] == "none":
+        return ["op": "check"]
     default: return nil
+    }
+}
+
+/// One answer, printed without any hash.
+func show(_ message: [String: Any]) {
+    var message = message
+    message.removeValue(forKey: "sha256")
+    if let data = try? JSONSerialization.data(withJSONObject: message, options: [.sortedKeys]) {
+        print("answer: \(String(decoding: data, as: UTF8.self))")
+    }
+}
+
+final class Session {
+    let listener: Int32
+    var fd: Int32
+    var reader = Wire.LineReader()
+    var seq = 0
+    /// The composition serial, as the client keeps it: one per composition, a new one after each
+    /// commit, clear, or end by the application.
+    var comp = 1
+    /// The last caret answer (global points, top from the primary screen's top).
+    var lastCaret: [String: Any] = [:]
+
+    init(listener: Int32, fd: Int32) { self.listener = listener; self.fd = fd }
+
+    func read(until: (([String: Any]) -> Bool)?, timeout: Double) -> [[String: Any]] {
+        var got: [[String: Any]] = []
+        let deadline = Date().addingTimeInterval(timeout)
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while Date() < deadline {
+            var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            if poll(&poller, 1, 20) <= 0 { if until == nil && !got.isEmpty { break }; continue }
+            let n = Darwin.read(fd, &buffer, buffer.count)
+            if n <= 0 { print("closed"); break }
+            guard let messages = reader.feed(Data(buffer[0..<n])) else { print("line too long"); break }
+            for message in messages {
+                show(message)
+                if ["caret", "active", "mark", "commit"].contains(message["op"] as? String ?? ""), message["x"] != nil { lastCaret = message }
+                if message["op"] as? String == "ended" { comp += 1 }
+                got.append(message)
+            }
+            if let until, got.contains(where: until) { break }
+        }
+        return got
+    }
+
+    /// Sends one message with a sequence number; waits (bounded) for the answer with that number.
+    @discardableResult
+    func ask(_ message: [String: Any], wait: Double = 2) -> [String: Any]? {
+        seq += 1
+        var message = message
+        message["seq"] = seq
+        let want = seq
+        guard let data = Wire.encode(message), Wire.writeAll(fd, data) else { print("closed"); return nil }
+        return read(until: { ($0["seq"] as? Int) == want }, timeout: wait).last { ($0["seq"] as? Int) == want }
+    }
+
+    func run(_ line: String) {
+        let words = line.split(separator: " ").map(String.init)
+        switch words.first {
+        case "wait":
+            let seconds = Double(words.dropFirst().first ?? "1") ?? 1
+            print("wait \(seconds)")
+            _ = read(until: nil, timeout: seconds)
+        case "post-access":
+            print("post_event_access: \(CGPreflightPostEventAccess())")
+        case "burst":
+            // `burst <n> ack|noack [keycode]`: n times a commit of one kana (the input-source path)
+            // and at once a key (the CGEvent path, default "a") posted to TextEdit, with or without
+            // holding the key until the commit's "inserted" answer (at most 50 ms; a timeout is sent
+            // anyway and counted). In order, commit i lands at the first one's place + 2 i (one
+            // unit of kana, one of the key's character): reordering shows in the places, no text is read.
+            guard words.count >= 3, let n = Int(words[1]), let pid = textEditPid() else { print("burst: no TextEdit or bad arguments"); return }
+            let withAck = words[2] == "ack"
+            let keyCode = CGKeyCode(words.count == 4 ? Int(words[3]) ?? 0 : 0)
+            let began = Date()
+            var places: [Int: Int] = [:]
+            var timeouts = 0
+            var waits: [Double] = []
+            for _ in 0..<n {
+                seq += 1
+                let want = seq
+                _ = Wire.writeAll(fd, Wire.encode(["op": "commit", "text": "あ", "comp": comp, "seq": want])!)
+                comp += 1
+                if withAck {
+                    let t0 = Date()
+                    let got = read(until: { ($0["seq"] as? Int) == want }, timeout: 0.05)
+                    for m in got { if let s = m["seq"] as? Int, let at = m["at"] as? Int { places[s] = at } }
+                    if !got.contains(where: { ($0["seq"] as? Int) == want }) { timeouts += 1 }
+                    waits.append(Date().timeIntervalSince(t0) * 1000)
+                }
+                postKey(pid, keyCode: keyCode)
+            }
+            for m in read(until: nil, timeout: 1.0) { if let s = m["seq"] as? Int, let at = m["at"] as? Int { places[s] = at } }
+            let first = seq - n + 1
+            var outOfOrder = 0
+            if let base = places[first] {
+                for i in 0..<n { if places[first + i] != base + 2 * i { outOfOrder += 1 } }
+            } else { outOfOrder = -1 }
+            waits.sort()
+            let median = waits.isEmpty ? 0 : waits[waits.count / 2]
+            print("burst: \(n) in \(Int(Date().timeIntervalSince(began) * 1000)) ms, places known \(places.count), out of order \(outOfOrder), ack timeouts \(timeouts), ack wait median \(String(format: "%.2f", median)) ms max \(String(format: "%.2f", waits.last ?? 0)) ms")
+        case "click":
+            // `click <dx> <dy>`: a click at the last caret position moved by dx, dy points.
+            guard words.count == 3, let dx = Double(words[1]), let dy = Double(words[2]), let pid = textEditPid(),
+                  let x = lastCaret["x"] as? Double, let top = lastCaret["top"] as? Double, let h = lastCaret["h"] as? Double else {
+                print("click: no caret yet or bad arguments"); return
+            }
+            postClick(pid, at: CGPoint(x: x + dx, y: top + h / 2 + dy))
+            print("click: posted")
+            _ = read(until: nil, timeout: 0.5)
+        case "recommit":
+            // A commit of the composition just ended (as if it crossed "ended" on the wire): must
+            // be refused as stale.
+            guard words.count >= 2 else { return }
+            let answer = ask(["op": "commit", "text": words.dropFirst().joined(separator: " "), "comp": comp - 1])
+            print("stale refused: \((answer?["why"] as? String) == "stale")")
+        case "drop":
+            // The host goes away during a composition, and the input method comes back.
+            close(fd)
+            print("drop: closed; waiting for the input method to connect again")
+            guard let again = acceptInputMethod(listener, timeout: 5) else { print("drop: not back in 5 s"); return }
+            fd = again
+            reader = Wire.LineReader()
+            _ = read(until: nil, timeout: 1.0)
+        default:
+            guard var message = command(line) else { print("not a command"); return }
+            let expected = message.removeValue(forKey: "expect") as? String
+            let op = message["op"] as! String
+            if op == "mark" || op == "commit" { message["comp"] = comp }
+            if op == "commit" || op == "clear" { comp += 1 }
+            print("send: \(op) (\((message["text"] as? String)?.utf8.count ?? 0) bytes)")
+            let answer = ask(message)
+            if let expected { print("match: \((answer?["sha256"] as? String) == expected)") }
+        }
+    }
+}
+
+func textEditPid() -> pid_t? {
+    let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit")
+    return running.count == 1 ? running[0].processIdentifier : nil
+}
+
+func postKey(_ pid: pid_t, keyCode: CGKeyCode) {
+    let source = CGEventSource(stateID: .privateState)
+    for down in [true, false] {
+        CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: down)?.postToPid(pid)
+    }
+}
+
+func postClick(_ pid: pid_t, at point: CGPoint) {
+    let source = CGEventSource(stateID: .privateState)
+    for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+        CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left)?.postToPid(pid)
     }
 }
 
@@ -198,8 +368,8 @@ func serve(script: String?) {
     defer { close(listener); unlink(path) }
     print("waiting for Istesso Dev Input (it connects once a second while it runs)")
     guard let fd = acceptInputMethod(listener, timeout: 60) else { fail("Istesso Dev Input did not connect in 60 s") }
-    let reader = Wire.LineReader()
-    _ = answers(fd, reader, until: nil, timeout: 1.5)
+    let session = Session(listener: listener, fd: fd)
+    _ = session.read(until: nil, timeout: 1.5)
     let lines: [String]
     if let script {
         guard let text = try? String(contentsOfFile: script, encoding: .utf8) else { fail("script not read") }
@@ -208,25 +378,9 @@ func serve(script: String?) {
         lines = AnyIterator { readLine() }.map { $0 }
     }
     for line in lines where !line.isEmpty && !line.hasPrefix("#") {
-        if line.hasPrefix("wait "), let seconds = Double(line.dropFirst(5)) {
-            print("wait \(seconds)")
-            _ = answers(fd, reader, until: nil, timeout: seconds)
-            continue
-        }
-        guard var message = command(line) else { print("not a command"); continue }
-        let expected = message.removeValue(forKey: "expect") as? String
-        guard let data = Wire.encode(message) else { print("not a command"); continue }
-        let op = message["op"] as! String
-        let length = (message["text"] as? String)?.utf8.count ?? 0
-        print("send: \(op) (\(length) bytes)")
-        guard Wire.writeAll(fd, data) else { print("closed"); break }
-        let got = answers(fd, reader, until: op == "check" ? "check" : "caret", timeout: 2)
-        if let expected {
-            let digest = got.last { $0["op"] as? String == "check" }?["sha256"] as? String
-            print("match: \(digest == expected)")
-        }
+        session.run(line)
     }
-    close(fd)
+    close(session.fd)
 }
 
 // MARK: - Self-test
@@ -241,7 +395,11 @@ func selfTest(_ binary: String) {
     check(Wire.utf16Offset("にほん", utf8: 4) == nil, "an offset inside a character is refused")
     check(Wire.utf16Offset("a😀b", utf8: 5) == 3, "an emoji counts two UTF-16 units")
     check(!Wire.acceptable("a\u{7}", allowEmpty: false), "control characters are refused")
-    check(!Wire.acceptable(String(repeating: "あ", count: 400), allowEmpty: false), "too long is refused")
+    check(!Wire.acceptable(String(repeating: "あ", count: 300), allowEmpty: false), "too long is refused")
+    check(Wire.acceptable("👨\u{200D}👩\u{200D}👧 🇯🇵", allowEmpty: false), "joined emoji and flags pass (only Cc is refused)")
+    check(!Wire.acceptable("a\u{0}b", allowEmpty: false), "NUL is refused")
+    check(Wire.acceptable(String(repeating: "a", count: 256), allowEmpty: false) && !Wire.acceptable(String(repeating: "a", count: 257), allowEmpty: false),
+          "the limit is 256 scalars, as the agent counts")
     check(Wire.ownLeafHash() != nil, "this program is signed with a certificate")
 
     guard let base = Wire.userTemporaryFolder() else { fail("no temporary folder") }
@@ -270,24 +428,30 @@ func selfTest(_ binary: String) {
     child.executableURL = URL(fileURLWithPath: binary)
     child.arguments = ["--wire-test", path]
     do { try child.run() } catch { fail("input method binary not started") }
-    guard let fd = acceptInputMethod(listener, timeout: 5) else { check(false, "the input method connects and is accepted"); exit(1) }
+    guard let fd = acceptInputMethod(listener, timeout: 5) else {
+        check(false, "the input method connects and is accepted")
+        close(listener); unlink(path); rmdir(folder)
+        exit(1)
+    }
     check(true, "the input method connects and is accepted")
     let reader = Wire.LineReader()
     func ask(_ message: [String: Any], _ op: String) -> [String: Any] {
         _ = Wire.writeAll(fd, Wire.encode(message)!)
         return answers(fd, reader, until: op, timeout: 2).last ?? [:]
     }
-    let mark = ask(["op": "mark", "text": "にほんご", "sel": [3, 9]], "mark")
+    let mark = ask(["op": "mark", "text": "にほんご", "sel": [3, 9], "comp": 1], "mark")
     check(mark["ok"] as? Bool == true && (mark["sel16"] as? [Int]) == [1, 2], "a mark's selection is turned into UTF-16")
-    let bad = ask(["op": "mark", "text": "にほんご", "sel": [1, 3]], "mark")
+    let bad = ask(["op": "mark", "text": "にほんご", "sel": [1, 3], "comp": 1], "mark")
     check(bad["ok"] as? Bool == false, "a selection inside a character is refused")
-    let empty = ask(["op": "commit", "text": ""], "commit")
+    let empty = ask(["op": "commit", "text": "", "comp": 1], "commit")
     check(empty["ok"] as? Bool == false, "an empty commit is refused")
     _ = Wire.writeAll(fd, Wire.encode(["op": "bye"])!)
     child.waitUntilExit()
     check(child.terminationStatus == 0, "the input method checked this program and ended cleanly")
     close(fd)
     print(failures == 0 ? "self-test: passed" : "self-test: \(failures) failed")
+    // exit() runs no defer: the socket and its folder are removed here.
+    close(listener); unlink(path); rmdir(folder)
     exit(failures == 0 ? 0 : 1)
 }
 
@@ -295,6 +459,7 @@ let arguments = CommandLine.arguments
 switch arguments.dropFirst().first {
 case "status": status()
 case "select": select()
+case "register": register()
 case "restore" where arguments.count == 3: restore(arguments[2])
 case "secure": secure()
 case "serve": serve(script: arguments.count == 3 ? arguments[2] : nil)

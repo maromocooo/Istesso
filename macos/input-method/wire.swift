@@ -12,7 +12,7 @@ import Security
 import CryptoKit
 
 enum Wire {
-    static let inputMethodIdentifier = "com.maromoco.istesso-dev.inputmethod"
+    static let inputMethodIdentifier = "com.maromoco.istesso-dev.inputmethod.trial"
     /// The programs the input method takes text from.
     static let hostIdentifiers = ["com.maromoco.istesso-dev.ime-probe", "com.maromoco.istesso-dev.daily-host"]
     static let maxLine = 8192
@@ -33,11 +33,13 @@ enum Wire {
     }
 
     /// Text that may be shown or committed: not empty unless allowed, within the limits, no
-    /// control characters.
+    /// control characters. Counted and judged as the agent does (Rust `char`: Unicode scalars, and
+    /// `is_control`: general category Cc only), so that joiners (emoji sequences, flags) pass here
+    /// as they pass there.
     static func acceptable(_ text: String, allowEmpty: Bool) -> Bool {
         if text.isEmpty { return allowEmpty }
-        if text.count > maxCharacters || text.utf8.count > maxBytes { return false }
-        return !text.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+        if text.unicodeScalars.count > maxCharacters || text.utf8.count > maxBytes { return false }
+        return !text.unicodeScalars.contains { $0.properties.generalCategory == .control }
     }
 
     /// A UTF-8 byte offset (ADR 0007 counts the selected range that way) as a UTF-16 offset, or nil
@@ -127,14 +129,18 @@ enum Wire {
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString("(\(names)) and certificate leaf = H\"\(leaf)\"" as CFString, [], &requirement) == errSecSuccess,
               let requirement else { return .refused("requirement not made") }
-        let status = SecCodeCheckValidity(code, [], requirement)
+        let status = SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement)
         guard status == errSecSuccess else { return .refused("peer signature does not match (\(status))") }
         var staticCode: SecStaticCode?
         var info: CFDictionary?
-        if SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode {
-            _ = SecCodeCopySigningInformation(staticCode, [], &info)
-        }
-        let identifier = (info as? [String: Any])?[kSecCodeInfoIdentifier as String] as? String ?? "?"
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dict = info as? [String: Any] else { return .refused("peer signing information not read") }
+        // The hardened runtime (0x10000 in the code directory's flags), so that no library is
+        // loaded into the peer from elsewhere.
+        let flags = (dict[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+        guard flags & 0x10000 != 0 else { return .refused("peer without the hardened runtime") }
+        let identifier = dict[kSecCodeInfoIdentifier as String] as? String ?? "?"
         return .ok(identifier)
     }
 

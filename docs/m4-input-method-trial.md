@@ -1,6 +1,6 @@
 # Mac ホスト：変換中の文字をアプリの中に出す入力ソース（試作、試用だけ）
 
-2026-11-19。対象：Mac Studio をホストにして、Air の変換中の文字（下線つき）を、ホストのアプリの中に、アプリの字で出す。候補の窓は Air の入力方式が、アプリのキャレットのすぐ下に出す（[ADR 0020](adr/0020-japanese-input.md) の道 d、[ADR 0007](adr/0007-control-channel.md) の `preedit`、[ADR 0015](adr/0015-media-transport.md) の種類 5）。
+2026-11-19。決めたことと理由は [ADR 0023](adr/0023-mac-inline-input-source.md)（切り替え、言語の宣言、順番、1 回だけの確定、つなぎ方）。対象：Mac Studio をホストにして、Air の変換中の文字（下線つき）を、ホストのアプリの中に、アプリの字で出す。候補の窓は Air の入力方式が、アプリのキャレットのすぐ下に出す（[ADR 0020](adr/0020-japanese-input.md) の道 d、[ADR 0007](adr/0007-control-channel.md) の `preedit`、[ADR 0015](adr/0015-media-transport.md) の種類 5）。
 
 **試用だけ。** この入力ソースは、どのアプリにも文字を入れられるので、`main` に向かう前に Fable の見直しを通す。金曜までに確かめられなければ、Studio は帯のまま。
 
@@ -20,14 +20,16 @@
 
 場所：`macos/input-method/`（`build.sh`、`main.swift`、`wire.swift`、`probe/main.swift`、`icon.swift`）。
 
-- **Istesso Dev Input**（`com.maromoco.istesso-dev.inputmethod`）：入力ソースの束。
+- **Istesso Dev Input**（`com.maromoco.istesso-dev.inputmethod.trial`）：入力ソースの束。
   - Studio のキーボードは取らない：`recognizedEvents` は空、`handle` はいつも「受けない」。キーは、入力ソースがないときと同じく、アプリへ行く（結論）。
   - 文字は、ホストのプログラムからだけ来る。ホストが持つソケットにつなぐ（毎秒、つながるまで試す）。
   - `mark`（文字の全体と、選んでいる範囲。ADR 0007 と同じく UTF-8 のバイトで数える）→ 選んでいる文節は太い下線、残りは細い下線で `setMarkedText`。空なら消す。`commit` → `insertText`。`clear` → 消す。どれのあとも、キャレットの四角を返す。
   - アプリが自分で変換を終えたとき（ほかの所を押したなど）：入力方式のふつうのとおり、出している文字を確定し、ホストに `ended` を送る（Air の側も変換を終えるため）。
   - 文字（変換中も確定も）は、どこにも書かない。ログは文字数だけ（`os.Logger`、subsystem は束の識別子）。
 - **istesso-ime-probe**（`com.maromoco.istesso-dev.ime-probe`）：ホストの側の試しのプログラム。あとで、Mac ホスト（`macos/daily-host`）が同じことをする。
-  - `status`（読むだけ）、`serve [手順のファイル]`、`select`、`restore <ID>`、`secure`、`self-test`。
+  - `status`（読むだけ）、`register`、`serve [手順のファイル]`、`select`、`restore <ID>`、`secure`、`self-test`。
+  - 試しの手順：`macos/input-method/trial-textedit.txt`（TextEdit の自分の書類だけで）。
+- **試しのための読み戻し（`check`）は試作だけ。** `build.sh --trial-check` で作ったときだけ入る。TextEdit の中だけで、変換中の文字の範囲だけのハッシュを返し、試しのプログラムは「一致したか」だけを出す。**製品の入力ソースには入れない**（アプリの文字を読める部品になるため）。ハッシュそのものは、どこにも書かない（短い文字のハッシュは元に戻せる）。
 - **つなぎ方**：ホストが、この利用者の一時フォルダー（`confstr(_CS_DARWIN_USER_TEMP_DIR)`、この利用者だけのもの）の中に、自分のフォルダー（0700）と、ソケット（0600。umask 0177 で作るので、作った瞬間から 0600）を作る。入力ソースは、つなぐ前に、フォルダーとソケットの持ち主と権限を確かめる（リンクは不可）。
 - **相手の確かめ**：両方とも、つないだ相手の audit token（プロセス番号ではない）から、署名を確かめる。同じ利用者で、自分と同じ葉の証明書で署名され、識別子が決まった一覧にあること（入力ソースが受けるのは `ime-probe` と `daily-host`、ホストが受けるのは入力ソースだけ）。自分がアドホック署名なら、だれも受けない。
 - **キャレットの四角**：入力ソースは、大域の点（AppKit の向き：主画面の左下が原点）で返す。`top` は上からの y（主画面の高さ −（y + 高さ））。ホストは、窓の左上（CGWindow の点）を引き、窓の点あたりの絵のピクセル数を掛けて、種類 5 の「絵のピクセル」にする。`scale` は、その場所の画面の倍率（参考）。

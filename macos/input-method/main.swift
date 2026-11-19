@@ -1,4 +1,4 @@
-// Istesso Dev Input (com.maromoco.istesso-dev.inputmethod): a trial input source that shows the
+// Istesso Dev Input (com.maromoco.istesso-dev.inputmethod.trial): a trial input source that shows the
 // remote client's composing text inline in the application in front on this Mac (ADR 0020, route
 // d: the client's own input method composes; this one only shows and commits what it is given).
 //
@@ -22,37 +22,48 @@ let log = Logger(subsystem: Wire.inputMethodIdentifier, category: "link")
 /// What the input method does with a message from the host, kept apart from InputMethodKit so the
 /// wire test can run it without a client.
 enum Commands {
-    struct Mark { let text: String; let selection: NSRange }
+    struct Mark { let text: String; let selection: NSRange; let serial: Int }
 
-    /// A "mark" message as text and a UTF-16 selection, or the reason it is refused.
+    /// A "mark" message as text, a UTF-16 selection and the composition's serial, or the reason it
+    /// is refused. The serial is the client's: one per composition, never used again.
     static func mark(_ message: [String: Any]) -> Result<Mark, Refusal> {
         guard let text = message["text"] as? String, Wire.acceptable(text, allowEmpty: true) else { return .failure(.init("text")) }
+        guard let serial = message["comp"] as? Int else { return .failure(.init("comp")) }
         guard let cursor = message["sel"] as? [Int], cursor.count == 2, cursor[0] <= cursor[1],
               let start = Wire.utf16Offset(text, utf8: cursor[0]), let end = Wire.utf16Offset(text, utf8: cursor[1]) else {
             return .failure(.init("sel"))
         }
-        return .success(Mark(text: text, selection: NSRange(location: start, length: end - start)))
+        return .success(Mark(text: text, selection: NSRange(location: start, length: end - start), serial: serial))
     }
 
-    static func commit(_ message: [String: Any]) -> Result<String, Refusal> {
+    struct Commit { let text: String; let serial: Int }
+
+    static func commit(_ message: [String: Any]) -> Result<Commit, Refusal> {
         guard let text = message["text"] as? String, Wire.acceptable(text, allowEmpty: false) else { return .failure(.init("text")) }
-        return .success(text)
+        guard let serial = message["comp"] as? Int else { return .failure(.init("comp")) }
+        return .success(Commit(text: text, serial: serial))
     }
 
     struct Refusal: Error { let field: String; init(_ field: String) { self.field = field } }
 }
 
-/// The connection to the host, and the controller of the client that is active now.
+/// The connection to the host, and which controller shows which composition.
+///
+/// Each controller (one per text session of a client) keeps its own composition. A composition
+/// ends exactly once: committed by the host, committed by the application (a click elsewhere, the
+/// focus moving), or cleared (the host gone). Its serial is then remembered, so that a commit or a
+/// mark that crossed the end on the wire is dropped instead of landing a second time.
 final class Link {
     static let shared = Link()
     weak var active: IstessoDevInputController?
+    /// The controller showing a composition now (it may no longer be the active one).
+    weak var showing: IstessoDevInputController?
+    private var ended: [Int] = []
     private var fd: Int32 = -1
     private var source: DispatchSourceRead?
     private var reader = Wire.LineReader()
     private var timer: Timer?
-    /// The marked text shown now (to commit it when the application ends the composition) and its
-    /// selection in UTF-16.
-    private(set) var marked: Commands.Mark?
+    private let nowhere = NSRange(location: NSNotFound, length: NSNotFound)
 
     func start() {
         tryConnect()
@@ -79,10 +90,24 @@ final class Link {
         source.setCancelHandler { close(fd) }
         source.resume()
         self.source = source
-        if let active { send(["op": "active", "client": active.clientIdentifier]) }
+        if let active { send(active.activeMessage()) }
     }
 
+    private func end(_ serial: Int) {
+        ended.append(serial)
+        if ended.count > 64 { ended.removeFirst(ended.count - 64) }
+    }
+
+    /// The host went away (the viewer disconnected, the host stopped): what is composing is
+    /// cleared, never committed and never left behind in the application.
     private func disconnect() {
+        if let controller = showing, let shown = controller.shown {
+            controller.client()?.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
+            controller.shown = nil
+            end(shown.serial)
+            log.info("host gone: composing text cleared")
+        }
+        showing = nil
         source?.cancel()
         source = nil
         fd = -1
@@ -96,81 +121,123 @@ final class Link {
         for message in messages { handle(message) }
     }
 
-    func send(_ object: [String: Any]) {
+    func send(_ object: [String: Any], seq: Any? = nil) {
+        var object = object
+        if let seq = seq as? Int { object["seq"] = seq }
         guard fd >= 0, let data = Wire.encode(object) else { return }
         if !Wire.writeAll(fd, data) { disconnect() }
     }
 
     private func handle(_ message: [String: Any]) {
         let op = message["op"] as? String ?? ""
+        let seq = message["seq"]
         guard let controller = active, let client = controller.client() else {
-            send(["op": op, "ok": false, "why": "no active client"])
+            send(["op": op, "ok": false, "why": "no active client"], seq: seq)
             return
         }
-        let nowhere = NSRange(location: NSNotFound, length: NSNotFound)
         switch op {
         case "mark":
             // A password field (secure event input on): never show composing text there. The host
             // tells the client, which then sends plain keys without its input method.
             if IsSecureEventInputEnabled() {
-                send(["op": "mark", "ok": false, "why": "secure", "secure": true])
+                send(["op": "mark", "ok": false, "why": "secure", "secure": true], seq: seq)
                 return
             }
             switch Commands.mark(message) {
-            case .failure(let refusal): send(["op": "mark", "ok": false, "why": refusal.field])
+            case .failure(let refusal): send(["op": "mark", "ok": false, "why": refusal.field], seq: seq)
             case .success(let mark):
+                if ended.contains(mark.serial) {
+                    send(["op": "mark", "ok": false, "why": "stale", "comp": mark.serial], seq: seq)
+                    return
+                }
+                // A composition still shown in another session (its deactivation not come yet)
+                // ends there first, so that it lands in its own application.
+                if let other = showing, other !== controller { applicationEnded(other) }
                 if mark.text.isEmpty {
                     client.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
-                    marked = nil
+                    controller.shown = nil
+                    showing = nil
                 } else {
                     client.setMarkedText(controller.styled(mark), selectionRange: mark.selection, replacementRange: nowhere)
-                    marked = mark
+                    controller.shown = mark
+                    showing = controller
                 }
                 log.info("mark: \(mark.text.utf16.count) units")
-                send(caret(client))
+                send(caret(client, controller), seq: seq)
             }
         case "commit":
             switch Commands.commit(message) {
-            case .failure(let refusal): send(["op": "commit", "ok": false, "why": refusal.field])
-            case .success(let text):
-                client.insertText(text, replacementRange: nowhere)
-                marked = nil
-                log.info("commit: \(text.utf16.count) units")
-                send(caret(client))
+            case .failure(let refusal): send(["op": "commit", "ok": false, "why": refusal.field], seq: seq)
+            case .success(let commit):
+                // Ended already (committed by the application, or cleared): it landed or was
+                // dropped once; never again.
+                if ended.contains(commit.serial) {
+                    send(["op": "commit", "ok": false, "why": "stale", "comp": commit.serial], seq: seq)
+                    return
+                }
+                // Where the composition is shown (the session it was typed into), or else where the
+                // caret is now (a commit with no composition before it).
+                let target = (showing?.shown?.serial == commit.serial ? showing : nil) ?? controller
+                guard let targetClient = target.client() else {
+                    send(["op": "commit", "ok": false, "why": "no client"], seq: seq)
+                    return
+                }
+                if let shown = target.shown, shown.serial != commit.serial {
+                    send(["op": "commit", "ok": false, "why": "other composition", "comp": commit.serial], seq: seq)
+                    return
+                }
+                let at = target.shown != nil ? targetClient.markedRange().location : targetClient.selectedRange().location
+                targetClient.insertText(IstessoDevInputController.japanese(commit.text), replacementRange: nowhere)
+                target.shown = nil
+                if showing === target { showing = nil }
+                end(commit.serial)
+                log.info("commit: \(commit.text.utf16.count) units")
+                // "inserted": the answer is made after a call that returns a value from the client
+                // (caret() asks for its ranges), which the client answers only after the insert
+                // before it. Keys the host posts after a commit wait for this (bounded), so that text
+                // and keys never change places.
+                var answer = caret(targetClient, target)
+                answer["op"] = "commit"
+                answer["inserted"] = true
+                answer["comp"] = commit.serial
+                #if ISTESSO_TRIAL_CHECK
+                answer["at"] = at == NSNotFound ? -1 : at
+                #else
+                _ = at
+                #endif
+                send(answer, seq: seq)
             }
         case "clear":
+            if let shown = controller.shown { end(shown.serial) }
             client.setMarkedText("", selectionRange: NSRange(location: 0, length: 0), replacementRange: nowhere)
-            marked = nil
-            send(caret(client))
+            controller.shown = nil
+            if showing === controller { showing = nil }
+            send(caret(client, controller), seq: seq)
         case "caret":
-            send(caret(client))
+            send(caret(client, controller), seq: seq)
+        #if ISTESSO_TRIAL_CHECK
         case "check":
-            send(check(client, message))
+            send(check(client), seq: seq)
+        #endif
         default:
-            send(["op": op, "ok": false, "why": "unknown"])
+            send(["op": op, "ok": false, "why": "unknown"], seq: seq)
         }
     }
 
-    /// Trial check that what was sent arrived, read back through the client and not through
-    /// Accessibility or the screen: the marked range, the selection, the document's length, and a
-    /// SHA-256 of either the marked text or the `units` UTF-16 units just before the caret (text the
-    /// host itself sent). Never the text. Only in TextEdit, so that it cannot read any other
-    /// application's document.
-    func check(_ client: IMKTextInput & NSObjectProtocol, _ message: [String: Any]) -> [String: Any] {
+    #if ISTESSO_TRIAL_CHECK
+    /// PROTOTYPE ONLY, built only with --trial-check; the product input source never has it (it
+    /// would be a part that can read an application's text). Reads back, through the client and not
+    /// through Accessibility or the screen, the marked range, the selection, the document's length,
+    /// and a SHA-256 of the MARKED text only (text the host itself sent). Never the text; the probe
+    /// prints only whether the hashes match. Only in TextEdit.
+    func check(_ client: IMKTextInput & NSObjectProtocol) -> [String: Any] {
         guard client.bundleIdentifier() == "com.apple.TextEdit" else { return ["op": "check", "ok": false, "why": "only in TextEdit"] }
         let markedRange = client.markedRange()
         let selected = client.selectedRange()
-        var range = NSRange(location: NSNotFound, length: 0)
-        if message["where"] as? String == "marked" {
-            range = markedRange
-        } else if let units = message["units"] as? Int, units > 0, units <= 2 * Wire.maxCharacters,
-                  selected.location != NSNotFound, selected.location >= units {
-            range = NSRange(location: selected.location - units, length: units)
-        }
         var digest = ""
-        if range.location != NSNotFound, range.length > 0 {
+        if markedRange.location != NSNotFound, markedRange.length > 0 {
             var actual = NSRange(location: NSNotFound, length: 0)
-            if let text = client.string(from: range, actualRange: &actual) {
+            if let text = client.string(from: markedRange, actualRange: &actual) {
                 digest = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
             }
         }
@@ -178,26 +245,29 @@ final class Link {
         return ["op": "check", "ok": !digest.isEmpty, "marked": pair(markedRange), "selected": pair(selected),
                 "length": client.length(), "sha256": digest]
     }
+    #endif
 
     /// The application ended the composition itself (a click elsewhere, another window): what was
-    /// shown is committed, as an input method does, and the host is told so that the client can end
-    /// its own composition too.
+    /// shown is committed once into that same session, as an input method does, and the host is
+    /// told so that the client ends its own composition without committing it again.
     func applicationEnded(_ controller: IstessoDevInputController) {
-        guard controller === active, let mark = marked, let client = controller.client() else { return }
-        client.insertText(mark.text, replacementRange: NSRange(location: NSNotFound, length: NSNotFound))
-        marked = nil
-        send(["op": "ended", "by": "application"])
+        guard let shown = controller.shown else { return }
+        controller.shown = nil
+        if showing === controller { showing = nil }
+        end(shown.serial)
+        controller.client()?.insertText(IstessoDevInputController.japanese(shown.text), replacementRange: nowhere)
+        send(["op": "ended", "by": "application", "comp": shown.serial])
     }
 
     /// The caret's rectangle in global points, AppKit's way round (origin at the bottom left of the
     /// primary screen). The host turns it into picture pixels of the window it sends (ADR 0015,
     /// kind 5): y from the top = primary height - (y + h), less the window's origin, times the
     /// window's pixels per point.
-    func caret(_ client: IMKTextInput & NSObjectProtocol) -> [String: Any] {
+    func caret(_ client: IMKTextInput & NSObjectProtocol, _ controller: IstessoDevInputController) -> [String: Any] {
         var rect = NSRect.zero
         var via = "none"
         let markedRange = client.markedRange()
-        let selection = marked?.selection ?? NSRange(location: 0, length: 0)
+        let selection = controller.shown?.selection ?? NSRange(location: 0, length: 0)
         if markedRange.location != NSNotFound {
             var actual = NSRange(location: NSNotFound, length: 0)
             rect = client.firstRect(forCharacterRange: NSRange(location: markedRange.location + selection.location, length: selection.length),
@@ -233,6 +303,19 @@ final class Link {
 @objc(IstessoDevInputController)
 final class IstessoDevInputController: IMKInputController {
     var clientIdentifier: String { client()?.bundleIdentifier() ?? "?" }
+    /// The composition this session shows now.
+    var shown: Commands.Mark?
+
+    /// "active" with the client's application and where its caret is: the host goes inline only
+    /// when this names the application it shows and the caret lies inside the shown window.
+    func activeMessage() -> [String: Any] {
+        var message: [String: Any] = ["client": clientIdentifier]
+        if let client = client() {
+            for (key, value) in Link.shared.caret(client, self) where key != "op" { message[key] = value }
+        }
+        message["op"] = "active"
+        return message
+    }
 
     /// No events: this Mac's own keys never come here.
     override func recognizedEvents(_ sender: Any!) -> Int { 0 }
@@ -241,9 +324,11 @@ final class IstessoDevInputController: IMKInputController {
 
     override func activateServer(_ sender: Any!) {
         super.activateServer(sender)
+        // A composition another session still shows ends there before this one takes over.
+        if let other = Link.shared.showing, other !== self { Link.shared.applicationEnded(other) }
         Link.shared.active = self
         log.info("active: \(self.clientIdentifier, privacy: .public)")
-        Link.shared.send(["op": "active", "client": clientIdentifier])
+        Link.shared.send(activeMessage())
     }
 
     override func deactivateServer(_ sender: Any!) {
@@ -263,7 +348,7 @@ final class IstessoDevInputController: IMKInputController {
     /// raw input (an empty selection) all thin.
     func styled(_ mark: Commands.Mark) -> NSAttributedString {
         let whole = NSRange(location: 0, length: mark.text.utf16.count)
-        let out = NSMutableAttributedString(string: mark.text)
+        let out = NSMutableAttributedString(attributedString: Self.japanese(mark.text))
         func attributes(_ style: Int, _ range: NSRange) -> [NSAttributedString.Key: Any] {
             var result: [NSAttributedString.Key: Any] = [:]
             for (key, value) in self.mark(forStyle: style, at: range) ?? [:] {
@@ -272,12 +357,18 @@ final class IstessoDevInputController: IMKInputController {
             return result
         }
         if mark.selection.length == 0 {
-            out.setAttributes(attributes(Int(kTSMHiliteRawText), whole), range: whole)
+            out.addAttributes(attributes(Int(kTSMHiliteRawText), whole), range: whole)
         } else {
-            out.setAttributes(attributes(Int(kTSMHiliteConvertedText), whole), range: whole)
-            out.setAttributes(attributes(Int(kTSMHiliteSelectedConvertedText), mark.selection), range: mark.selection)
+            out.addAttributes(attributes(Int(kTSMHiliteConvertedText), whole), range: whole)
+            out.addAttributes(attributes(Int(kTSMHiliteSelectedConvertedText), mark.selection), range: mark.selection)
         }
         return out
+    }
+
+    /// Text tagged Japanese, so that a client that keeps the attribute draws Han characters with
+    /// Japanese glyphs (the input source itself declares no language).
+    static func japanese(_ text: String) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [NSAttributedString.Key(kCTLanguageAttributeName as String): "ja"])
     }
 }
 
@@ -307,7 +398,7 @@ func wireTest(_ path: String) -> Int32 {
                 }
             case "commit":
                 switch Commands.commit(message) {
-                case .success(let t): reply = ["op": "commit", "ok": true, "units": t.utf16.count]
+                case .success(let t): reply = ["op": "commit", "ok": true, "units": t.text.utf16.count, "comp": t.serial]
                 case .failure(let r): reply = ["op": "commit", "ok": false, "why": r.field]
                 }
             case "bye": return 0
