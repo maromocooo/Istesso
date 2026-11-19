@@ -1585,7 +1585,8 @@ fn nothing_is_sealed_behind_a_packet_that_went_out_only_in_part_behind_a_frame()
         );
         assert_eq!(events(&mut viewer, 1).0, "f");
     }
-    std::thread::sleep(Duration::from_millis(30));
+    // At once: while frames are going, the viewer's own thread leaves the cursor and the
+    // field to the next frame (so this goes through the frame path, not that thread).
     // The next packet after one that goes whole goes out only in part. A cursor change and a
     // field change are due behind the next frame: the frame goes whole, what follows it
     // goes in part, and nothing may be sealed behind that (a debug build checks it).
@@ -1599,6 +1600,7 @@ fn nothing_is_sealed_behind_a_packet_that_went_out_only_in_part_behind_a_frame()
         y: 20,
         width: 0,
         height: 18,
+        dropped: 0,
     };
     pair.host.set_text_field(&field).unwrap();
     assert_eq!(
@@ -1690,6 +1692,7 @@ fn the_text_field_reaches_a_viewer_and_a_viewer_that_comes_later_and_only_once_s
         y: 128,
         width: 0,
         height: 34,
+        dropped: 0,
     };
     pair.host.set_text_field(&field).unwrap();
     assert_eq!(events(&mut viewer, 1).0, "t");

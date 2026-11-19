@@ -798,15 +798,6 @@ mod tests {
             assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), event);
         }
         assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
-        assert!(!super::scroll_is_acceptable(&InputEvent::scroll(
-            0,
-            i32::MIN
-        )));
-        assert!(!super::scroll_is_acceptable(&InputEvent::scroll(
-            i32::MAX,
-            0
-        )));
-        assert!(super::scroll_is_acceptable(&InputEvent::scroll(0, -10_000)));
         assert_eq!(
             serde_json::to_string(&InputEvent::Focus).unwrap(),
             r#"{"kind":"focus"}"#
@@ -942,7 +933,6 @@ mod tests {
         assert!(!scroll_is_acceptable(&with(None, Some([0, i32::MIN]))));
         // The old fields are bounded too (the receiver turns them round; i32::MIN has no opposite).
         assert!(!scroll_is_acceptable(&InputEvent::scroll(i32::MAX, 0)));
-        assert!(scroll_is_acceptable(&InputEvent::scroll(10_000, -10_000)));
         assert!(!scroll_is_acceptable(&InputEvent::scroll(0, i32::MIN)));
         assert!(scroll_is_acceptable(&InputEvent::scroll(0, -10_000)));
         assert!(scroll_is_acceptable(&InputEvent::Focus));

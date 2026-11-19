@@ -89,6 +89,9 @@ struct Settings {
     var clickForm = 1
     var pidFile: String?
     var document: String?
+    /// The application is launched without its windows of last time (an argument for this launch
+    /// only; nothing of its settings is changed).
+    var noRestore = false
     var signal = NSHomeDirectory() + "/.local/state/istesso/measuring"
     /// The application form on a virtual display of this size (points, at 2 pixels a point) and
     /// rate: the receiver's screen. Made while a device is shown the picture (trial only).
@@ -155,6 +158,7 @@ func readSettings() -> Settings {
             promptOwnerCount += 1
             s.promptOwners.insert(owner)
         case "--document": s.document = value()
+        case "--no-restore": s.noRestore = true
         case "--size":
             let parts = value().split(separator: "x").compactMap { Int($0) }
             guard parts.count == 2, parts[0] >= 64, parts[1] >= 64, parts[0] <= 8192, parts[1] <= 8192 else { usage() }
@@ -440,7 +444,7 @@ final class Transport {
     }
     /// Kind 5, the text input field (trial only; only with --inline).
     func setTextInput(_ field: FieldReport) {
-        var made = IstessoMediaTextInput(state: field.state, x: field.x, y: field.y, width: field.width, height: field.height, serial: field.serial)
+        var made = IstessoMediaTextInput(state: field.state, x: field.x, y: field.y, width: field.width, height: field.height, serial: field.serial, dropped: 0)
         _ = guarded.use { istesso_media_host_set_text_input(native, &made) }
     }
     /// The viewers draw the Mac's own cursor where their pointer is: the picture has none, and the
@@ -2784,6 +2788,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
+        // For this launch only (the argument domain of its defaults; never written): no windows of
+        // last time come back with a new document, so no one else's old document opens.
+        if settings.noRestore { configuration.arguments = ["-ApplePersistenceIgnoreState", "YES"] }
         let opened: (NSRunningApplication?, Error?) -> Void = { running, error in
             DispatchQueue.main.async {
                 guard let running else {
@@ -2843,6 +2850,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.watchApp()
                 self.startInline(running)
             }
+        }
+        // The windows the application has before this open: with a new document only the window
+        // that comes with it is shown, never one the application had open already (another
+        // stream's document, the owner's own).
+        if settings.document != nil, let bundle = Bundle(url: url)?.bundleIdentifier,
+           let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundle).first {
+            windowsAtOpen = Set(windowList(onScreenOnly: false).filter { $0.pid == running.processIdentifier }.map(\.id))
+        } else if settings.document != nil {
+            windowsAtOpen = []
         }
         if let document = settings.document {
             // With a document of the trial's own, so that the application opens no panel of its
@@ -3012,8 +3028,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             say("windows", [("count", all.count)])
         }
         var shown = all.filter { $0.onScreen && $0.alpha > 0.05 }
-        // With a new window asked for, only windows that came after the start are shown.
-        if settings.newWindow, let before = windowsAtOpen { shown = shown.filter { !before.contains($0.id) } }
+        // With a new window or a new document, only windows that came after the start are shown.
+        if settings.newWindow || settings.document != nil, let before = windowsAtOpen { shown = shown.filter { !before.contains($0.id) } }
         // Keep the window shown so far while it is there; else the largest one.
         let chosen = shown.first { $0.id == windowId } ?? shown.max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
         guard let chosen else { return }

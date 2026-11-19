@@ -96,10 +96,12 @@ typedef struct IstessoMediaTextInput {
     uint32_t height;
     uint32_t serial;  /* 0 to 255: changes whenever another field, or the same one enabled again,
                          has the keyboard; the client ends its composition then */
+    uint32_t dropped; /* 0 to 65535: pieces of committed text the host had nowhere to put so far;
+                         when it grows, the client keeps what it sent last for the person */
 } IstessoMediaTextInput;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(IstessoMediaTextInput) == 24, "IstessoMediaTextInput differs from src/ffi.rs");
+_Static_assert(sizeof(IstessoMediaTextInput) == 28, "IstessoMediaTextInput differs from src/ffi.rs");
 _Static_assert(sizeof(IstessoMediaStreamInfo) == 24, "IstessoMediaStreamInfo differs from src/ffi.rs");
 _Static_assert(sizeof(IstessoMediaSent) == 24, "IstessoMediaSent differs from src/ffi.rs");
 _Static_assert(sizeof(void *) != 8 || sizeof(IstessoMediaFrame) == 72, "IstessoMediaFrame differs from src/ffi.rs");
@@ -193,7 +195,8 @@ int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const Istess
  * Trial only: says what the text input field of the application with the keyboard is, as
  * istesso_media_host_set_cursor() says what the cursor is (the latest only, behind frames, to
  * viewers that may be sent the frames, and to one that connects later). Nothing is sent until
- * this is first called. 0, or -1 for a state above 3, a side above 65535 or a serial above 255.
+ * this is first called. 0, or -1 for a state above 3, a side above 65535, a serial above 255 or
+ * a count of dropped text above 65535.
  */
 int32_t istesso_media_host_set_text_input(const IstessoMediaHost *host, const IstessoMediaTextInput *field);
 

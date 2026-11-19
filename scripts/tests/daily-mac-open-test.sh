@@ -1,0 +1,77 @@
+#!/bin/bash
+# What scripts/daily-mac.sh open asks of the host and of this Mac, recorded without a host:
+# ssh, the relay and the viewer are stand-ins that write down what they were given. Checks the
+# owner's decisions of 2026-11-19: copy and paste on by default for an application's windows
+# (also with the fixed, small environment of a shortcut), off with DAILY_CLIPBOARD=0 and for
+# AURA; every new document named by who opened it, in its own folder; never with the
+# application's windows of last time.
+set -u
+
+here=$(cd "$(dirname "$0")" && pwd)
+script="$here/../daily-mac.sh"
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/daily-mac-open.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+mkdir -p "$scratch/bin"
+
+# ssh: -G says where the host is; a check of the way (true) succeeds; a script for the host is
+# kept, and the host's answer is made up.
+cat > "$scratch/bin/ssh" <<'EOF'
+#!/bin/bash
+for a in "$@"; do [ "$a" = -G ] && { echo "hostname 127.0.0.1"; exit 0; }; done
+last=${!#}
+[ "$last" = true ] && exit 0
+n=$(ls "$RECORD"/host-*.sh 2>/dev/null | wc -l | tr -d ' ')
+cat > "$RECORD/host-$n.sh"
+printf 'slot 1\nsize 640x480\npeer 0000-0000-0000-0000\n'
+EOF
+# The relay and the viewer: what they were started with, and they stay a few seconds.
+cat > "$scratch/bin/record" <<'EOF'
+#!/bin/bash
+{ printf 'argv:'; printf ' %s' "$@"; echo; env | grep '^ISTESSO_' | sort; } >> "$RECORD/$(basename "$0").log"
+sleep 3
+EOF
+chmod +x "$scratch/bin/ssh" "$scratch/bin/record"
+ln -s record "$scratch/bin/relay"
+ln -s record "$scratch/bin/viewer"
+
+failed=0
+check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; failed=$((failed + 1)); fi; }
+
+run() { # NAME ENV... -- ARGS...
+    local name=$1; shift
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done
+    shift
+    export RECORD="$scratch/$name"
+    mkdir -p "$RECORD"
+    # The small environment of a shortcut: only what it fixes, and the stand-ins.
+    env -i HOME="$HOME" PATH="$scratch/bin:/usr/bin:/bin" RECORD="$RECORD" \
+        ISTESSO_MAC_HOST=stand-in DAILY_MAC_STATE="$RECORD/state" DAILY_VIRTUAL=0 \
+        DAILY_ISTESSO_BIN="$scratch/bin/relay" DAILY_VIEWER="$scratch/bin/viewer" ${envs[@]+"${envs[@]}"} \
+        bash "$script" open "$@" > "$RECORD/out.txt" 2>&1
+    sleep 1
+}
+
+run plain -- textedit
+host=$(cat "$scratch/plain"/host-*.sh 2>/dev/null)
+check "the shortcut's environment: copy and paste on for the agent and the host" '[ "$(grep -o -- "--clipboard" <<< "$host" | wc -l | tr -d " ")" = 2 ]'
+check "the shortcut's environment: copy and paste on for the viewer" 'grep -q "^ISTESSO_CLIPBOARD=1$" "$scratch/plain/viewer.log"'
+check "the owner's new document is owner-... in documents/owner/" '[[ "$host" == *"documents/owner/owner-textedit-"* ]]'
+check "a new document comes without the application's old windows" '[[ "$host" == *"--no-restore"* ]]'
+
+run off DAILY_CLIPBOARD=0 -- textedit
+host=$(cat "$scratch/off"/host-*.sh 2>/dev/null)
+check "DAILY_CLIPBOARD=0: no copy and paste for the host" '[[ "$host" != *"--clipboard"* ]]'
+check "DAILY_CLIPBOARD=0: none for the viewer" '! grep -q "^ISTESSO_CLIPBOARD=" "$scratch/off/viewer.log"'
+
+run stream DAILY_STREAM=m4 DAILY_CLIPBOARD=0 -- textedit
+host=$(cat "$scratch/stream"/host-*.sh 2>/dev/null)
+check "a stream's new document is stream-NAME-... in documents/streams/" '[[ "$host" == *"documents/streams/stream-m4-textedit-"* ]]'
+
+run aura -- textedit --for aura --slot 2
+host=$(cat "$scratch/aura"/host-*.sh 2>/dev/null)
+check "AURA: no copy and paste" '[[ "$host" != *"--clipboard"* ]]'
+check "AURA: a new document of the owner's, without old windows" '[[ "$host" == *"documents/owner/owner-textedit-"* && "$host" == *"--no-restore"* ]]'
+
+sleep 3  # the stand-ins and the guard end by themselves
+[ "$failed" = 0 ] && echo "all passed" || { echo "$failed failed"; exit 1; }
