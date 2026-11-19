@@ -2309,6 +2309,35 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     _discardingMark = NO;
 }
 
+// What is being composed is committed, once, into the field it was composed for (as a Mac does),
+// before what comes next goes: a paste lands after it, never inside the composition, and the
+// composition is not lost. Committed text goes on the input socket like the paste's request, so
+// it arrives first.
+- (void)commitComposition {
+    if (!self.hasMarkedText) {
+        return;
+    }
+    NSString *text = [_marked copy];
+    [self discardComposition];
+    if (_field.state != 2 && host_takes_text && !picture_stale && input_socket >= 0) {
+        if (!text_input_packets(text, ^BOOL(const char *packet, size_t length) {
+                return send_text_datagram(packet, length);
+            })) {
+            text_lost_count++;
+            fprintf(stderr, "viewer: a commit could not be passed on whole, and the rest of it was not sent (%lu so far; the text is never shown)\n", text_lost_count);
+        }
+    }
+}
+
+// Command-V (the Edit menu's Paste) while Japanese is being composed: performKeyEquivalent: left
+// it to the menu, so the input method never saw it. The composition is committed first.
+- (void)paste:(id)sender {
+    if (clipboard_on && host_takes_clipboard && self.window.firstResponder == self) {
+        [self commitComposition];
+    }
+    [super paste:sender];
+}
+
 - (void)letGo {
     [self discardComposition];
     [super letGo];
@@ -2721,8 +2750,9 @@ int main(int argc, char *argv[]) {
             fclose(file);
         }
         [NSApplication sharedApplication];
-        if (getenv("ISTESSO_CLIPBOARD") != NULL) {
-            // An Edit menu with Paste on Command-V (sent to the window's view: paste:). See
+        if (clipboard_on) {
+            // With copy and paste on (ISTESSO_CLIPBOARD=1 and its socket made, above): an Edit
+            // menu with Paste on Command-V (sent to the window's view: paste:). See
             // performKeyEquivalent: of InputView. The first item is the application's own menu.
             NSMenu *bar = [NSMenu new];
             NSMenuItem *own = [NSMenuItem new];
