@@ -307,6 +307,30 @@ scripts/daily.sh note "気づいたこと"
 - Mac の窓の Dock のタイルは、いまは窓ごとに 1 つです（窓 2 枚の形）。ランチャーができたら、`DAILY_DOCK_TILE=none` で、タイルをランチャーの 1 つだけにします。
 - 持ち主の Mac に窓が初めて出るときは、まとめ役が、先に知らせます。
 
+## ホストのポート（2026-11-19）
+
+試用版の窓は、ホストのポート 4791N（絵）と 4792N（入力）、AURA の枠は 4793N と 4794N で待ちます。Ubuntu では、32768〜60999 が「外へつなぐときに、たまたま割り当てるポート」の範囲で、試用版のポートはその中にあります。ほかのプログラム（ブラウザーなど）の外へのつなぎが、たまたまそのポートを持っていると、窓を開くときに待ち受けられません（スクロールの流れの確かめで、Chrome のつなぎが 47962 を持っていた）。
+
+- いま：開く前に、ポートが待ち受けでも、つなぎでも使われていないかを確かめ、使われていれば「1 分ほどして開き直してください」と言って開きません。確かめたあとに取られたときは、ホストが「`close` してから開き直してください」と言います。
+- 持ち主が選ぶもの（どちらか）：
+  - **A：ホストで、試用版のポートを取っておく**（1 行。持ち主が打つ。ずっと効く。AURA もそのまま）：
+    `echo 'net.ipv4.ip_local_reserved_ports = 47910-47949' | sudo tee /etc/sysctl.d/60-istesso-trial-ports.conf && sudo sysctl --system`
+    （IPv6 にも効く。そのとき、すでにそのポートを持っているつなぎは、終わるまでそのまま）
+  - **B：試用版のポートを、その範囲の下に移す**（sudo は要らない）：Air で `scripts/daily.sh ports low`。それから開く窓は 2791N と 2792N、AURA は 2793N と 2794N。開いている窓は、閉じて開き直すまで、前のポートのまま。AURA のアプリには、新しいポートを知らせる必要がある（AURA の流れ）。戻すときは `scripts/daily.sh ports high`。今の選びは `scripts/daily.sh ports`。一度だけ試すときは `DAILY_PORTS=low`。選びは `~/.config/istesso/daily-ports` に、このコマンドだけが書く。
+
+## 次の setup で変わること（2026-11-19、`trial-daily-next`）
+
+- コンポジターのプラグインが `gwd-trial34` になる（`gwd-c8` の全部に、アプリごとのトラックパッドの量の直し）。Chrome、テキストエディター、Blender のスクロールが、指の動きと同じ量になる（Firefox は、その設定ですでに）。
+- コピーと貼り付けの直し（窓の口を、道と NUL の長さで作る。中継が NUL のあとを捨てる）と、数だけの記録は、17:54 の setup にもう入っている。
+- 持ち主が手で開く近道（Safari、Notes、Finder、Preview、Dia）を作れる（ADR 0024）。
+- ポートの選び（上の A か B）。
+- 持ち主の順：
+  1. ポートを選ぶ：A ならホストで上の 1 行。B なら Air で `scripts/daily.sh ports low`。
+  2. Air で `scripts/daily.sh stop` → `scripts/daily.sh setup` → ビューアーの窓が 1 つも開いていないことを確かめて `scripts/daily.sh bundle --finish`。
+  3. Dia の近道を使うなら：`~/.config/istesso/daily-shortcuts-owner-apps.txt` を自分で作り、`Dia` と 1 行書く。
+  4. 計測が走っていないときに `scripts/daily.sh shortcuts build` → `scripts/daily.sh shortcuts install`（登録で、Air の LAN のつなぎが一時的に切れる）。最初に近道から開いたとき、「ローカルネットワーク」の問いが出たら `Istesso Dev Open` に許す。
+  5. いつもどおり `open`（または近道）で開く。
+
 ## Spotlight、Alfred、Dock から開く
 
 登録（`install`）と外すこと（`remove`）は、持ち主が手で確かめるときに、持ち主がします（「ローカルネットワーク」の問いも、そのとき）。エージェントは、`build` と試験（`macos/daily-shortcuts` で `python3 -m unittest`）だけをします（2026-11-19、統合のとき：12 件が通り、`~/Applications/Istesso Dev/` には何も足していない）。

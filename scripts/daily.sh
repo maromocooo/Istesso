@@ -13,6 +13,9 @@
 #                                     `open` starts the windows through it (the first start asks
 #                                     whether it may use the local network); one that is there
 #                                     already is moved aside (no window of it may be open)
+#   scripts/daily.sh ports [low|high]
+#                                     which ports the trial's windows use on the host (see below);
+#                                     without a word, says which
 #   scripts/daily.sh shortcuts build|install|remove
 #                                     manage the trial's Spotlight, Alfred and Dock shortcuts
 #   scripts/daily.sh                  what is open, and how to open, close, list and stop (= `start`)
@@ -95,6 +98,10 @@
 #   LAYOUT              what is printed on the keys, as the host names it: us (default) or jp
 #   ISTESSO_COMMAND_KEY super to send the Command keys as Super instead of Control
 #   DAILY_DOCK_TILE     none: the windows get no Dock tile (for when the launcher has the one tile)
+#   DAILY_PORTS=low|high  for this command only, in place of `scripts/daily.sh ports`:
+#                       high (the default) is 4791N to 4794N, inside Linux's range for the ports
+#                       of outgoing connections (32768-60999), where another program's outgoing
+#                       connection can now and then hold one; low is 2791N to 2794N, below it
 #   DAILY_CLIPBOARD=0   the window does not take Command-C, X and V for copy and paste with this
 #                       Mac: they go to the application as Control-C, X and V (copies inside the
 #                       host only). For a window opened now; the default is copy and paste on
@@ -151,9 +158,25 @@ cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
 plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-scroll-wip/gwd-trial34/target/release'}
+# The trial's ports on the host (picture 4791N, input 4792N; for AURA 4793N and 4794N), or with
+# `scripts/daily.sh ports low` 2791N to 2794N: below Linux's range for the ports of outgoing
+# connections, so that no outgoing connection of another program (a browser's, say) can hold one
+# when a window is opened. The choice is written in ports_file by that command only; DAILY_PORTS
+# overrides it for one command. AURA's own application has to be told the AURA ports.
+ports_file="$HOME/.config/istesso/daily-ports"
+port_choice=${DAILY_PORTS:-$(head -1 "$ports_file" 2>/dev/null)}
+case "${port_choice:-high}" in
+low) port_base=27900 ;;
+high) port_base=47900 ;;
+*) port_base=47900
+   # `ports low|high` may set it right.
+   [ "${1:-}" = ports ] || { echo "error: DAILY_PORTS (or $ports_file) says neither low nor high"; exit 2; } ;;
+esac
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
-state="$HOME/Library/Caches/istesso-daily"
+# DAILY_STATE_DIR and DAILY_BUNDLE_PLACE are for a rehearsal of `setup` that touches nothing of the
+# person's trial (with DAILY_HOST_DIR on the host): its own state and lock, its own staged bundle.
+state=${DAILY_STATE_DIR:-"$HOME/Library/Caches/istesso-daily"}
 istesso="$repo/target/release/istesso"
 viewer="$repo/macos/gst-viewer/build/gst-viewer"
 notes="$repo/trial-notes.md"
@@ -161,7 +184,7 @@ notes="$repo/trial-notes.md"
 # under a name that is not an application's until the person finishes it.
 bundle_name="Istesso Dev Daily Viewer"
 bundle_id=com.maromoco.istesso-dev.daily-viewer
-bundle_place="$HOME/Applications/Istesso Dev"
+bundle_place=${DAILY_BUNDLE_PLACE:-"$HOME/Applications/Istesso Dev"}
 bundle="$bundle_place/$bundle_name.app"
 staged="$bundle_place/$bundle_name.staged"
 
@@ -565,7 +588,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SCROLL_MOMENTUM=$([ "${DAILY_SCROLL_MOMENTUM:-}" = app ] && echo app) SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SCROLL_MOMENTUM=$([ "${DAILY_SCROLL_MOMENTUM:-}" = app ] && echo app) SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max PORT_BASE=$port_base MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -828,7 +851,7 @@ else
         if [ "$(echo $open_now | wc -w)" -ge "$AURA_MAX" ]; then
             echo "fail $AURA_MAX applications are open for AURA already (at most $AURA_MAX at once:$open_now): close one first"; exit 5
         fi
-        slot=aura$n; port=$((47930 + n)); agent_port=$((47940 + n))
+        slot=aura$n; port=$((PORT_BASE + 30 + n)); agent_port=$((PORT_BASE + 40 + n))
     else
         # A slot of the three: the first that no running application has.
         slot=""
@@ -838,10 +861,12 @@ else
             [ -n "$taken" ] || { slot=$s; break; }
         done
         [ -n "$slot" ] || { echo "fail three applications are open already: close one first"; exit 5; }
-        port=$((47910 + slot)); agent_port=$((47920 + slot))
+        port=$((PORT_BASE + 10 + slot)); agent_port=$((PORT_BASE + 20 + slot))
     fi
-    if ss -Hltn "( sport = :$port or sport = :$agent_port )" 2>/dev/null | grep -q .; then
-        echo "fail port $port or $agent_port is taken on the host by something else"; exit 5
+    # Taken by a listener, or held by a connection of another program (an outgoing connection gets
+    # a port of 32768-60999 at random): the trial's programs could not listen on it.
+    if ss -Htan "( sport = :$port or sport = :$agent_port )" 2>/dev/null | grep -q .; then
+        echo "fail port $port or $agent_port is in use on the host by another program: open it again in a minute (it is free once that connection ends); \`scripts/daily.sh ports low\` takes ports no outgoing connection is given"; exit 5
     fi
     mkdir -p "$run/rt/istesso" "$run/agent-cache"; chmod 700 "$run" "$run/rt" "$run/rt/istesso"
     echo "$slot" > "$run/slot"
@@ -1132,6 +1157,15 @@ exec $src/target/release/istesso agent --port $agent_port --no-discovery --clipb
 SCRIPT
     chmod +x "$run/agent.sh"; : > "$run/agent.exit"
     tmux new-session -d -s "daily-$NAME-agent" "bash -c '$run/agent.sh > $run/agent.log 2>&1; echo \$? > $run/agent.exit'" 9>&-
+    # A port taken between the check above and the listening: said plainly, with what to do.
+    for i in $(seq 1 12); do
+        if grep -q "cannot listen on port" "$run/agent.log" 2>/dev/null || said "$NAME" | grep -q "cannot listen for paired devices"; then
+            echo "host: port $port or $agent_port was taken by another program just as $NAME opened: run \`scripts/daily.sh close ${NAME#aura-}${FOR:+ --for aura}\` and open it again"
+            break
+        fi
+        grep -q "Answering paired devices" "$run/agent.log" 2>/dev/null && break
+        sleep 0.25
+    done
     for i in $(seq 1 80); do [ -n "$(windows_of "$NAME")" ] && [ "$(windows_of "$NAME")" != 0 ] && break; sleep 0.25; done
     if [ -z "$(members "$run" app)" ]; then
         echo "host: $NAME did NOT stay. It said:"; head -3 "$run/app.log" | cut -c1-200
@@ -1178,7 +1212,7 @@ open_for_aura() {
     printf '%s\n' "$answer" | grep -q '^fail ' && { printf '%s\n' "$answer" | sed -n 's/^fail /error: /p' | head -1; return 1; }
     host_side=$(printf '%s\n' "$answer" | sed -n 's/^way //p' | tail -1)
     [ -n "$host_side" ] || { echo "error: the host did not start $kind for AURA"; return 1; }
-    echo "$kind: open for AURA in AURA slot $n: picture on the host's port $((47930 + n)) (4:2:0, 72 frames a second, $size), input on $((47940 + n)); the host's address on this network: $host_side"
+    echo "$kind: open for AURA in AURA slot $n: picture on the host's port $((port_base + 30 + n)) (4:2:0, 72 frames a second, $size), input on $((port_base + 40 + n)); the host's address on this network: $host_side"
 }
 
 # Writes down the settings an application was opened with, so that the guard opens it again the same way.
@@ -1190,7 +1224,7 @@ remember_settings() { # FOLDER
     # that the guard has to start again is started without them, as a person may be typing by then.
     local setting
     for setting in DAILY_NO_WINDOW DAILY_FRAME_LOGS DAILY_MAC_CONFIG DAILY_HOST_CONFIG DAILY_BLENDER_CONFIG \
-        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY DAILY_CLIPBOARD; do
+        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY DAILY_CLIPBOARD DAILY_PORTS; do
         eval "echo \"export $setting=\$(quoted \"\${$setting:-}\")\""
     done > "$1/settings"
     echo "export SIZE=$(quoted "$size") LAYOUT=$(quoted "$layout")" >> "$1/settings"
@@ -1249,7 +1283,7 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         # Without the hang-up of the terminal it was started from, so that closing that terminal leaves
         # it running; and without the lock's descriptor.
         nohup env ISTESSO_DAILY_RECONNECT=1 ${config_env[@]+"${config_env[@]}"} ISTESSO_CACHE_DIR="$state/cache" "$istesso" input relay --to "$peer" --socket "$mine/in.sock" \
-            --address "$host_side:$((47920 + slot))" > "$mine/relay.log" 2>&1 9>&- &
+            --address "$host_side:$((port_base + 20 + slot))" > "$mine/relay.log" 2>&1 9>&- &
         write_down "$mine/relay.pid" $!
         local i
         for i in $(seq 1 60); do grep -q "goes to the paired device" "$mine/relay.log" 2>/dev/null && break; sleep 0.25; done
@@ -1264,7 +1298,7 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         local x y frames=- n=$slot
         if [ -n "${POSITION:-}" ]; then x=${POSITION%,*}; y=${POSITION#*,}; else x=$((60 + 48 * n)); y=$((60 + 36 * n)); fi
         [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="$mine/frames-$(date +%s).jsonl"
-        local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1
+        local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((port_base + 10 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1
             ISTESSO_CLIPBOARD="$([ "${DAILY_CLIPBOARD:-1}" = 0 ] && echo 0 || echo 1)" ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
         # The title the window has; the guard changes it while a window of the application is calling.
         printf '%s\n\n' "$(app_title "$name")" > "$mine/title"
@@ -1489,7 +1523,7 @@ HOST
         if [ "${each#aura-}" != "$each" ]; then
             [ "$what" = ended ] && continue
             local n=${slot#aura}
-            printf 'ubuntu\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "AURA slot $n" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window on AURA (picture $((47930 + n)), input $((47940 + n)))"
+            printf 'ubuntu\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "AURA slot $n" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window on AURA (picture $((port_base + 30 + n)), input $((port_base + 40 + n)))"
             continue
         fi
         known_name "$each" || continue
@@ -1586,6 +1620,15 @@ case "${1:-start}" in
 -h | --help) sed -n '2,/^# Made to be typed/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
 setup) shift; split_host "$@"; my_turn "setup --host $host_choice"; if [ "$host_choice" = mac ]; then refuse_when_busy; on_mac setup; else do_setup; fi ;;
 bundle) my_turn bundle; do_bundle "${2:-}" ;;
+ports)
+    case "${2:-}" in
+    "") echo "the trial's windows use the ${port_choice:-high} ports on the host (picture and input from $((port_base + 11)) and $((port_base + 21)); for AURA from $((port_base + 31)) and $((port_base + 41)))" ;;
+    low | high)
+        mkdir -p "$(dirname "$ports_file")" && printf '%s\n' "$2" > "$ports_file" || exit 1
+        echo "from now on the $2 ports, for windows opened from now on; an open window keeps its ports until it is closed and opened again"
+        [ "$2" = low ] && echo "AURA's application has to be told its new ports: picture $((27900 + 31))-$((27900 + 34)), input $((27900 + 41))-$((27900 + 44))" ;;
+    *) echo "usage: scripts/daily.sh ports [low|high]"; exit 2 ;;
+    esac ;;
 start) do_start ;;
 apps) do_apps ;;
 open) shift; split_host "$@"; my_turn "open $*"
