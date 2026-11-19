@@ -4,6 +4,8 @@
 # (docs/trial-daily.md). A stopgap built from the parts of scripts/try.sh; it is kept apart from the
 # builds that are measured, and nothing of it is merged.
 #
+#   scripts/daily.sh setup [--host mac]
+#                                     (--host mac: the Mac host stream's setup of the Mac host)
 #   scripts/daily.sh setup            build here, copy this checkout to the host and build it there,
 #                                     copy the compositor plugin, and stage the viewer's bundle
 #   scripts/daily.sh bundle           build and stage the signed viewer bundle only (not started)
@@ -13,7 +15,10 @@
 #                                     already is moved aside (no window of it may be open)
 #   scripts/daily.sh                  what is open, and how to open, close, list and stop (= `start`)
 #   scripts/daily.sh apps             the applications that can be opened
-#   scripts/daily.sh open NAME [--document PATH] [--min-qp N] [--for aura [--size WxH]]
+#   scripts/daily.sh open NAME [--host ubuntu|mac] [--document PATH] [--min-qp N] [--for aura [--size WxH]]
+#                                     --host mac: an application of the Mac host (any name, such
+#                                     as TextEdit), through the Mac host stream's daily-mac.sh;
+#                                     ubuntu (the default) as below
 #                                     start the application on the host and show it; one that already
 #                                     runs is shown again. --document: a file of the trial's copy of
 #                                     the source (e.g. crates/istesso-agent/src/serve.rs), copied once
@@ -24,12 +29,13 @@
 #                                     paired with; at most 3 at once; nothing is shown here.
 #                                     --min-qp N: the encoder's quality floor (18 if not said, 0 is
 #                                     off; below)
-#   scripts/daily.sh list             what is open, and in which state
-#   scripts/daily.sh close NAME [--for aura]
+#   scripts/daily.sh list             what is open on both hosts, and in which state (a line each,
+#                                     the host first: ubuntu or mac)
+#   scripts/daily.sh close NAME [--host ubuntu|mac] [--for aura]
 #                                     ask the application to close its windows; one that is still
 #                                     there 10 s later is ended by its process numbers
 #   scripts/daily.sh stop             close every application that way, and stop everything of the
-#                                     trial on both machines
+#                                     trial on both machines; then everything of it on the Mac host
 #   scripts/daily.sh note TEXT        write down something that was noticed (trial-notes.md, not in git)
 #   scripts/daily.sh aura-pair-line   the one command the owner types on the host, in a terminal of
 #                                     their own, to pair AURA with the trial identity (not run here)
@@ -110,6 +116,9 @@
 #                       and at the bit rate it started with, as before (default 1: a frame is
 #                       encoded only when the one before it has been taken, so that nothing queues
 #                       up, and the bit rate follows the link; scripts/daily_flow.py)
+#   DAILY_MAC_SCRIPT    the Mac host stream's scripts/daily-mac.sh (default: in its worktree,
+#                       ~/link-proj-m4-daily); DAILY_DRY_RUN=1 says what would be handed to it
+#                       instead of running it (the Ubuntu host's part runs as always)
 #   DAILY_AURA_CONFIG   the trial identity of the host that AURA is paired with (only read;
 #                       default ~/.cache/istesso-aura-trial/config on the host)
 #   DAILY_BLENDER_CONFIG
@@ -1358,6 +1367,63 @@ stop_windows() {
     for each in $apps; do stop_window "$each"; done
 }
 
+# ---- The Mac host (the Mac Studio) ----
+#
+# One launcher for both hosts: `--host mac` hands the command to the Mac host stream's
+# scripts/daily-mac.sh (branch m4-daily-host; that stream edits it and its host program, this script
+# only calls it), with the same words: open APP [--for aura] [--size WxH], list, close APP, stop,
+# setup. It is run without this script's lock descriptor (its guard must not hold the lock), after
+# the measuring signal was read here; it reads the signal itself as well, and stops everything of
+# its own by the numbers it wrote down.
+mac_script=${DAILY_MAC_SCRIPT:-"$HOME/link-proj-m4-daily/scripts/daily-mac.sh"}
+on_mac() { # COMMAND [ARGUMENTS...]
+    [ -x "$mac_script" ] || { echo "error: the Mac host's script is not there: $mac_script (DAILY_MAC_SCRIPT)"; return 1; }
+    if [ -n "${DAILY_DRY_RUN:-}" ]; then
+        echo "dry run: would run $(basename "$mac_script") $*"
+        return 0
+    fi
+    "$mac_script" "$@" 9>&-
+}
+# Takes --host ubuntu|mac out of the arguments: host_choice, and the rest in `rest`.
+split_host() {
+    host_choice=ubuntu
+    rest=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --host) host_choice=${2:-}; shift 2 ;;
+        *) rest+=("$1"); shift ;;
+        esac
+    done
+    case "$host_choice" in ubuntu | mac) ;; *) echo "error: --host is ubuntu (the default) or mac"; exit 2 ;; esac
+}
+do_open_mac() { # APP [--for aura] [--size WxH]
+    [ $# -ge 1 ] || { echo "usage: scripts/daily.sh open APP --host mac [--for aura] [--size WxH]"; exit 2; }
+    local app=$1 passed=()
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --for | --size) passed+=("$1" "${2:-}"); shift 2 ;;
+        --document | --min-qp) echo "error: $1 is for the Ubuntu host only"; exit 2 ;;
+        *) echo "error: open APP --host mac [--for aura] [--size WxH]"; exit 2 ;;
+        esac
+    done
+    refuse_when_busy
+    on_mac open "$app" ${passed[@]+"${passed[@]}"}
+}
+do_close_mac() { # APP [--for aura]
+    [ $# -ge 1 ] || { echo "usage: scripts/daily.sh close APP --host mac [--for aura]"; exit 2; }
+    case "${2:-} ${3:-}" in
+    "--for aura") on_mac close "aura-$1" ;;
+    " ") on_mac close "$1" ;;
+    *) echo "usage: scripts/daily.sh close APP --host mac [--for aura]"; exit 2 ;;
+    esac
+}
+list_mac() { # what is open on the Mac host, one line each, after "mac" (nothing when it is not set up)
+    [ -x "$mac_script" ] || return 0
+    if [ -n "${DAILY_DRY_RUN:-}" ]; then on_mac list; return 0; fi
+    limited 20 "$mac_script" list 9>&- 2>&1 | awk '{print "mac\t" $0}'
+}
+
 # ---- Looking, closing, stopping ----
 
 do_list() {
@@ -1372,7 +1438,7 @@ HOST
         if [ "${each#aura-}" != "$each" ]; then
             [ "$what" = ended ] && continue
             local n=${slot#aura}
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "AURA slot $n" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window on AURA (picture $((47930 + n)), input $((47940 + n)))"
+            printf 'ubuntu\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "AURA slot $n" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window on AURA (picture $((47930 + n)), input $((47940 + n)))"
             continue
         fi
         known_name "$each" || continue
@@ -1380,8 +1446,10 @@ HOST
         still_runs "$state/$each/viewer.pid" && window=open
         [ -s "$state/$each/not-back" ] && window="not-back: $(head -1 "$state/$each/not-back")"
         [ "$what" = ended ] && [ "$window" = closed ] && continue
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window $window"
+        printf 'ubuntu\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$each" "slot ${slot}" "$what" "windows ${windows:--}" "calling ${calling:-0}" "picture ${picture:--}" "window $window"
     done
+    # And the Mac host's, when it is set up here.
+    list_mac
 }
 
 # Asks the applications to close and says what became of them; the windows here follow.
@@ -1426,18 +1494,25 @@ else
 fi
 exit 0
 HOST
+    # And everything of the trial on the Mac host (its windows here, relays, host programs and
+    # their virtual displays), when it is set up here.
+    if [ -x "$mac_script" ]; then
+        echo "the Mac host:"
+        on_mac stop
+    fi
 }
 
 do_note() {
     [ $# -ge 1 ] || { echo "usage: scripts/daily.sh note TEXT"; exit 2; }
     local open
-    open=$(do_list 2>/dev/null | awk -F'\t' 'NF == 7 {printf "%s(%s,%s,%s,%s) ", $1, $3, $5, $6, $7}')
+    open=$(do_list 2>/dev/null | awk -F'\t' '$1 == "ubuntu" && NF == 8 {printf "%s(%s,%s,%s,%s) ", $2, $4, $6, $7, $8} $1 == "mac" {printf "mac:%s ", $2}')
     printf -- '- %s　%s　[%s]\n' "$(date '+%Y-%m-%d %H:%M')" "$*" "${open:-nothing open}" >> "$notes"
     echo "written down in $notes"
 }
 
 do_start() {
     echo "open an application:    scripts/daily.sh open NAME     (NAME: $(echo $apps | sed 's/ /, /g'))"
+    echo "   on the Mac host:     scripts/daily.sh open APP --host mac     (APP: TextEdit, Safari, …)"
     echo "close its window only:  the window's red button (the application goes on; open brings it back)"
     echo "close the application:  scripts/daily.sh close NAME"
     echo "what is open:           scripts/daily.sh list"
@@ -1449,15 +1524,17 @@ do_start() {
 mkdir -p "$state"
 case "${1:-start}" in
 -h | --help) sed -n '2,/^# Made to be typed/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
-setup) my_turn setup; do_setup ;;
+setup) shift; split_host "$@"; my_turn "setup --host $host_choice"; if [ "$host_choice" = mac ]; then refuse_when_busy; on_mac setup; else do_setup; fi ;;
 bundle) my_turn bundle; do_bundle "${2:-}" ;;
 start) do_start ;;
 apps) do_apps ;;
-open) shift; my_turn "open $*"; do_open "$@" ;;
+open) shift; split_host "$@"; my_turn "open $*"
+    if [ "$host_choice" = mac ]; then do_open_mac ${rest[@]+"${rest[@]}"}; else do_open ${rest[@]+"${rest[@]}"}; fi ;;
 firefox-get) my_turn firefox-get; do_firefox_get "${2:-}" ;;
 aura-pair-line) echo "ISTESSO_CONFIG_DIR=$aura_config $host_dir/src/target/release/istesso pair host --name host-trial" ;;
 list) do_list ;;
-close) shift; my_turn "close $*"; do_close "$@" ;;
+close) shift; split_host "$@"; my_turn "close $*"
+    if [ "$host_choice" = mac ]; then do_close_mac ${rest[@]+"${rest[@]}"}; else do_close ${rest[@]+"${rest[@]}"}; fi ;;
 stop) my_turn stop; do_stop ;;
 note) shift; do_note "$@" ;;
 guard) do_guard ;;

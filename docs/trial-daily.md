@@ -35,6 +35,25 @@ Mac のホストの流れの決め（`m4-daily-host` の `docs/m4-daily-host.md`
 - 中継とエージェント：`istesso_proto::InputEvent` に `Focus` と `Resize` を足した（Mac のホストの流れの `9bf4b5f` と同じ中身を、この 2 つのファイルだけ持ってきた。`m4-daily-host` はマージしていない）。エージェントは、範囲の外の大きさを捨て、ほかはそのまま渡す。**Ubuntu のホストは、いまは無視する**（パイプラインの `m1-step3-host.py` は、知らない種類を読み飛ばす。コードから）。
 - 確かめ（窓を出さずに）：中継の代わりに口で待ち、`ISTESSO_PRETEND_RESIZE=1000x500`（手で引いたことにする確かめの切り替え）で、送られたのは `{"kind":"resize","width":1000,"height":500}` の 1 回だけ。代わりのホストを 1000x500 で出し直す（答え）と `window: 1000x500 …`、そのあと 1024x512 で出し直す（ホストが自分から）と `window: 1024x512 …`、どちらも頼み直しはなかった。窓のない確かめでは窓が打ち込む窓にならないので、`focus` は送られていない（見ていない）。中継の試験に、`Focus` と `Resize` が渡り、範囲の外の大きさは捨てられることを足した。`window-size-test`（大きさの計算）をビルドで動かす。
 
+## ホストが 2 台：1 つの起動口（2026-11-19）
+
+持ち主の決め（金曜日の試用）：Ubuntu のホストと Mac Studio のアプリを、同じコマンドで開け閉めする。`scripts/daily.sh` が、ただ 1 つの起動口です（Spotlight や Alfred からの呼び出しも、これを呼ぶ。下の形は変えない）。
+
+```sh
+scripts/daily.sh open APP [--host ubuntu|mac] [--for aura]   # 既定は ubuntu。mac は TextEdit などの名前
+scripts/daily.sh list                                        # 両方のホストの、開いているもの（行の先頭が ubuntu か mac）
+scripts/daily.sh close APP [--host ubuntu|mac] [--for aura]
+scripts/daily.sh stop                                        # Ubuntu のホストの全部、そのあと Mac のホストの全部
+scripts/daily.sh setup [--host mac]
+```
+
+- **だれが何を直すか**：`--host mac` は、Mac のホストの流れの `scripts/daily-mac.sh`（ブランチ `m4-daily-host`、そのワークツリー `~/link-proj-m4-daily`）に、同じ言葉（`open APP [--for aura] [--size WxH]`、`list`、`close APP`、`stop`、`setup`）で渡すだけです。`daily-mac.sh` と Mac のホストのプログラムは、その流れが直す。`daily.sh` は、その言葉が変わらないかぎり、直さない。置き場所は `DAILY_MAC_SCRIPT` で替えられる（`m4-daily-host` を試用版にマージしたら、ここの写しを指すだけ）。`m4-daily-host` は、まだマージしていない（107 のコミット、ビューアーや中継などの共通のファイルにもまたがる）。
+- 守りはそのまま：渡す前に計測の合図を読む（`daily-mac.sh` も自分で読む）。この Mac の鍵（ひとつずつ）の中で渡し、`daily-mac.sh` には鍵の記述子を持たせない（その見張りが鍵を持ち続けないため）。止めるのは、それぞれが書き留めた番号で。
+- `stop`：Ubuntu のホストのアプリを、いままでどおり閉じ、そのあと `daily-mac.sh stop`（Mac のホストのプログラム、エージェント、ここの窓と中継、見張りを止める。仮想ディスプレーはホストのプログラムと一緒に消える。Mac Studio のアプリそのものは開いたまま、が `daily-mac.sh` の決め）。
+- Ubuntu のホストだけのもの（`--document`、`--min-qp`）は、`--host mac` では断る。
+- `DAILY_DRY_RUN=1`：`daily-mac.sh` に渡すものを、渡さずに書くだけ（Ubuntu の側は、いつもどおり動く）。
+- 確かめ（窓を出さずに、Mac Studio には何もせずに）：`daily-mac.sh` の代わりの小さなスクリプトで、`open TextEdit --host mac [--for aura --size 1600x1000]`、`close … [--for aura]`（`aura-TextEdit` として渡る）、`setup --host mac`、`list`、`stop` が、その言葉のまま渡り、鍵の記述子を持っていないことを見た。`--min-qp` と `--host studio` は断った。Ubuntu の既定の道（`open editor`、`--host ubuntu`、`list`、`close`）は前のまま。本物の `daily-mac.sh` での `list` は、この Mac の ssh の名前 `istesso-mac` が引けず、その一行を `mac` の行として出して、すぐ終わった（Mac のホストへの ssh は、Mac のホストの流れの設定による）。
+
 ## いまの部品で、何が足りなかったか
 
 `scripts/try.sh` は、アプリを 1 つ映します。`ISTESSO_TRY_NAME` を付けると、2 つめを横で動かせますが、キーボードとマウスは届きません。ホストのエージェントが、入力を、ふだんのパイプラインの口 1 つにだけ渡すためです。
