@@ -20,7 +20,11 @@ int main(int argc, char **argv) {
     if (!account || !account->pw_dir || !account->pw_dir[0] ||
         !account->pw_name || !account->pw_name[0] || length <= 1 || length > sizeof(tmpdir)) return 1;
     if (argc == 2 && strcmp(argv[1], "--check-sources") == 0) return 0;
+    char icon[PATH_MAX];
+    snprintf(icon, sizeof(icon), "%s/Applications/Istesso Dev/Fixture.app/Contents/Resources/Shortcut.icns",
+             account->pw_dir);
     const char *expected[][2] = {
+        {"ISTESSO_APP_ICON", icon},
         {"HOME", account->pw_dir}, {"USER", account->pw_name}, {"LOGNAME", account->pw_name},
         {"PATH", "/usr/bin:/bin:/usr/sbin:/sbin"}, {"TMPDIR", tmpdir}, {"LANG", "en_US.UTF-8"},
         {"DAILY_OWNER", "1"}, {"DAILY_OPEN_HANDLER", "1"},

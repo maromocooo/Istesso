@@ -1224,7 +1224,7 @@ remember_settings() { # FOLDER
     # that the guard has to start again is started without them, as a person may be typing by then.
     local setting
     for setting in DAILY_NO_WINDOW DAILY_FRAME_LOGS DAILY_MAC_CONFIG DAILY_HOST_CONFIG DAILY_BLENDER_CONFIG \
-        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY DAILY_CLIPBOARD DAILY_PORTS; do
+        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY DAILY_CLIPBOARD DAILY_PORTS ISTESSO_APP_ICON; do
         eval "echo \"export $setting=\$(quoted \"\${$setting:-}\")\""
     done > "$1/settings"
     echo "export SIZE=$(quoted "$size") LAYOUT=$(quoted "$layout")" >> "$1/settings"
@@ -1303,6 +1303,7 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         # The title the window has; the guard changes it while a window of the application is calling.
         printf '%s\n\n' "$(app_title "$name")" > "$mine/title"
         [ "${DAILY_DOCK_TILE:-}" = none ] && settings+=(ISTESSO_DOCK_TILE=none)
+        [ -n "${ISTESSO_APP_ICON:-}" ] && settings+=(ISTESSO_APP_ICON="$ISTESSO_APP_ICON")
         [ -n "${ISTESSO_COMMAND_KEY:-}" ] && settings+=(ISTESSO_COMMAND_KEY="$ISTESSO_COMMAND_KEY")
         [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
         local arguments=("$x" "$y" "$width" "$height" "$(app_title "$name")" - "$frames" 0 "$mine/in.sock")

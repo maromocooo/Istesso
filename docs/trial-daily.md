@@ -343,7 +343,9 @@ scripts/daily.sh shortcuts build
 scripts/daily.sh shortcuts install
 ```
 
-`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ署名 ID で署名します。持ち主用の包みには強化ランタイムを付けます。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。Ubuntu のアイコンは、このときだけ `ISTESSO_HOST` のホストから読みます。Ubuntu のアイコンを取得できないときと、Mac ホスト用の近道には、標準のアイコンを使います。
+`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ署名 ID で署名します。持ち主用の包みには強化ランタイムを付けます。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。絵は登録のときだけ作ります。Ubuntu では、デスクトップエントリーが指す PNG を使います。Studio では、アプリの `Info.plist` の `CFBundleIconFile` が指す ICNS を、Studio の `sips` で PNG にします。Air は 2 MiB 以下の PNG を読み、絵を描き直します。展開時のメモリーを抑えるため、縦か横が 8192 ピクセルを超える絵は使いません。取得や復号に失敗したら、標準のアプリアイコンに印を付けます。Ubuntu で SVG しかない場合と、Studio で指定がない場合やアセットカタログしかない場合は unknown です。どちらも標準の絵を使います。
+
+右下の印は `Ubuntu` または `Studio` です。32 ピクセル以下では頭文字を使います。印を替えるには、Air の `~/.config/istesso/daily-machine-labels.txt` に `ubuntu=作業用` や `mac=編集用` と 1 行ずつ書き、`shortcuts install` をやり直します。名前は印刷できる文字で 1〜12 字です。近道の名前はそのままです。近道から開いたビューアーは、Dock と ⌘Tab に同じ絵を使います。ビューアーも作り直してください。Studio 側の起動スクリプトからビューアーまで絵が届くかは、持ち主の実機での確認がまだです。
 
 Spotlight か Alfred で `Blender (Ubuntu)`、`Firefox (Ubuntu)`、`Text Editor (Ubuntu)`、`Chrome (Ubuntu)` を検索して開きます。Dock に置くには、Finder で使いたい近道を Dock にドラッグします。
 

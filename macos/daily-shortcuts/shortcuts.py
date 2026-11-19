@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import plistlib
 import resource
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,13 +23,31 @@ HANDLER = "Istesso Dev Open"
 PREFIX = "com.maromoco.istesso-dev."
 SCHEME = "istesso-dev-open"
 MANIFEST = ".daily-shortcuts.json"
-BUILD_VERSION = 3
+BUILD_VERSION = 4
 LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
               "LaunchServices.framework/Support/lsregister")
 OWNER_LIST = Path.home() / ".config/istesso/daily-shortcuts-owner-apps.txt"
 OWNER_APPS = {app.lower(): app for app in ("Safari", "Notes", "Finder", "Preview", "Dia")}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-MAX_ICON_BYTES = 8 << 20
+MAX_ICON_BYTES = 2 << 20
+LABEL_FILE = Path.home() / ".config/istesso/daily-machine-labels.txt"
+DEFAULT_LABELS = {"ubuntu": "Ubuntu", "mac": "Studio"}
+
+
+def machine_labels(path):
+    labels = DEFAULT_LABELS.copy()
+    try:
+        lines = path.read_text(encoding="utf-8").split("\n")
+    except FileNotFoundError:
+        return labels
+    for number, line in enumerate(lines, 1):
+        if not line:
+            continue
+        host, _, label = line.partition("=")
+        if (host not in labels or not label.strip() or len(label) > 12 or not label.isprintable()):
+            raise ValueError(f"invalid machine label on line {number}")
+        labels[host] = label.strip()
+    return labels
 
 
 def valid_bundle_component(name):
@@ -47,12 +66,12 @@ def app_list(ubuntu, mac_list, owner_list=None):
         app, title = line.split("\t")
         if not valid_app_name(app):
             raise ValueError("invalid Ubuntu shortcut app name")
-        rows.append(("ubuntu", app, title + " (Ubuntu)"))
+        rows.append(("ubuntu", app, f"{title} ({DEFAULT_LABELS['ubuntu']})"))
     for app in mac_list.read_text().splitlines():
         if app and not app.startswith("#"):
             if not valid_app_name(app):
                 raise ValueError("invalid app name in mac-apps.txt")
-            rows.append(("mac", app, app + " (Studio)"))
+            rows.append(("mac", app, f"{app} ({DEFAULT_LABELS['mac']})"))
     if owner_list is not None:
         try:
             lines = owner_list.read_text().splitlines()
@@ -65,7 +84,7 @@ def app_list(ubuntu, mac_list, owner_list=None):
             if app not in OWNER_APPS:
                 raise ValueError(f"daily-shortcuts-owner-apps.txt line {number}: "
                                  "only Safari, Notes, Finder, Preview and Dia are allowed")
-            rows.append(("mac", app, OWNER_APPS[app] + " (Studio)"))
+            rows.append(("mac", app, f"{OWNER_APPS[app]} ({DEFAULT_LABELS['mac']})"))
     if len({unicodedata.normalize("NFC", title).casefold() for _, _, title in rows}) != len(rows):
         raise ValueError("duplicate shortcut name")
     return rows
@@ -109,14 +128,17 @@ def build_bundle(folder, title, source, flags, extra, routes=None, executable="S
 
 def build(folder, rows, checkout):
     routes = {}
+    titles = {}
     for host, app, title in rows:
         if host == "mac" and app in OWNER_APPS:
             build_bundle(folder, title, "owner-shim.c", [
                 "-DDAILY_SCRIPT=" + json.dumps(str(checkout / "scripts/daily.sh")),
+                "-DSHORTCUT_TITLE=" + json.dumps(title),
                 "-DOWNER_APP=" + json.dumps(app),
             ], dict(NSLocalNetworkUsageDescription="This shortcut starts the relay to the paired computer."),
                 executable="istesso-owner-shim")
             continue
+        titles.setdefault(host, {})[app] = title
         base = f"{SCHEME}://open/{quote(app, safe='')}?"
         url = base + "host=" + host
         argv = ["open", app, "--host", host]
@@ -130,49 +152,47 @@ def build(folder, rows, checkout):
     build_bundle(folder, HANDLER, "handler.m", ["-fobjc-arc", "-framework", "AppKit"], dict(
         LSUIElement=True, CFBundleURLTypes=[dict(CFBundleURLName=identifier, CFBundleURLSchemes=[SCHEME])],
         NSLocalNetworkUsageDescription="Istesso Dev Open starts the relay to the paired computer."),
-        dict(checkout=str(checkout), routes=routes))
+        dict(checkout=str(checkout), routes=routes, titles=titles))
 
 
-def convert_icon(png, work):
-    # A 256-pixel ICNS can be written directly, including on a Mac without a GUI session.
+def convert_icon(tool, png, work, machine, label):
     icon = work / "Shortcut.icns"
-    subprocess.run(["sips", "-z", "256", "256", "-s", "format", "icns", png, "--out", icon],
-                   capture_output=True, check=True)
+    subprocess.run([tool, "compose", png or "-", machine, label, icon], check=True)
     return icon
 
 
-def fetch_icon(png, app, host):
+def fetch_icon(png, app, host, machine):
     def limit_download():
         # Keep one extra byte so even a sender that ignores a short write is rejected.
         limit = MAX_ICON_BYTES + 1
         resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
 
-    with png.open("wb") as out, (SOURCE / "host-icon.py").open("rb") as script:
+    script_name = "mac-host-icon.py" if machine == "mac" else "host-icon.py"
+    with png.open("wb") as out, (SOURCE / script_name).open("rb") as script:
         subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host,
-                        "python3", "-I", "-", app], stdin=script, stdout=out,
+                        "python3", "-I", "-", shlex.quote(app)], stdin=script, stdout=out,
                        stderr=subprocess.DEVNULL, check=True, timeout=12, preexec_fn=limit_download)
 
 
-def add_icon(bundle, app, host, work):
-    # Only called during install. Failure leaves the ordinary macOS application icon.
+def add_icon(bundle, app, host, work, tool, machine, label):
     png = work / "original.png"
     try:
-        fetch_icon(png, app, host)
+        fetch_icon(png, OWNER_APPS.get(app, app) if machine == "mac" else app, host, machine)
         with png.open("rb") as source:
             if (os.fstat(source.fileno()).st_size > MAX_ICON_BYTES
                     or source.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE):
                 raise ValueError("invalid shortcut icon")
-        icon = convert_icon(png, work)
     except (OSError, ValueError, subprocess.SubprocessError):
-        print(f"Using the generic icon for {app}.")
-        return
+        png = None
+    icon = convert_icon(tool, png, work, machine, label)
     contents = bundle / "Contents"
     resources = contents / "Resources"
     resources.mkdir(exist_ok=True)
     icon.rename(resources / icon.name)
     plist = contents / "Info.plist"
     write_plist(plist, dict(plistlib.loads(plist.read_bytes()), CFBundleIconFile=icon.name))
-    sign(bundle, bundle_id(bundle.stem))
+    options = ["--options", "runtime"] if machine == "mac" and app in OWNER_APPS else []
+    sign(bundle, bundle_id(bundle.stem), *options)
 
 
 def installed_names(dest):
@@ -222,6 +242,7 @@ def remove(dest, names, obsolete):
 
 
 def install(stage, dest, rows, host):
+    labels = machine_labels(LABEL_FILE)
     names = installed_names(dest)
     wanted = {title for _, _, title in rows} | {HANDLER}
     for title in names | wanted:
@@ -232,12 +253,13 @@ def install(stage, dest, rows, host):
         pending = Path(tmp)
         for title in wanted:
             shutil.copytree(stage / (title + ".staged"), pending / (title + ".staged"))
-        for os_name, app, title in rows:
-            check_measurement()
-            if os_name == "ubuntu":
-                with tempfile.TemporaryDirectory(dir=pending) as icons:
-                    add_icon(pending / (title + ".staged"), app, host, Path(icons))
         tool = stage / "bundle-tool"
+        for machine, app, title in rows:
+            check_measurement()
+            host_name = os.environ["ISTESSO_MAC_HOST"] if machine == "mac" else host
+            with tempfile.TemporaryDirectory(dir=pending) as icons:
+                add_icon(pending / (title + ".staged"), app,
+                         host_name, Path(icons), tool, machine, labels[machine])
         for title in [HANDLER] + sorted(wanted - {HANDLER}):
             check_measurement()
             bundle = dest / (title + ".app")
@@ -293,7 +315,9 @@ def run(action, host, ubuntu):
                 (next_build / "apps.json").write_text(json.dumps({"version": BUILD_VERSION, "apps": rows}))
                 tool = next_build / "bundle-tool"
                 subprocess.run(["clang", "-Wall", "-Wextra", "-Werror", SOURCE / "bundle-tool.m",
-                                "-fobjc-arc", "-framework", "CoreServices", "-framework", "Foundation",
+                                "-fobjc-arc", "-framework", "CoreServices", "-framework", "AppKit",
+                                "-framework", "ImageIO", "-framework", "CoreText", "-framework", "CoreGraphics",
+                                "-framework", "UniformTypeIdentifiers",
                                 "-o", tool], check=True)
                 if current.exists():
                     subprocess.run([tool, "exchange", next_build, current], check=True)

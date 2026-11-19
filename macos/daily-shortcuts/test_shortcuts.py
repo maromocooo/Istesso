@@ -1,13 +1,17 @@
 """Headless checks. Run after shortcuts build. No registration, network or GUI."""
 from pathlib import Path
+import io
 import json
 import os
 import plistlib
+import runpy
+import shlex
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import quote
 
 import shortcuts as sc
@@ -24,6 +28,11 @@ class ShortcutsTest(unittest.TestCase):
         subprocess.run(["clang", "-DSHORTCUT_TEST", "-fobjc-arc", "-Wall", "-Wextra", "-Werror",
                         sc.SOURCE / "handler.m", "-framework", "AppKit", "-o", cls.runner], check=True)
         cls.bundles = sc.STAGE / "bundles"
+        cls.reader = cls.work / "icon-test"
+        subprocess.run(["clang", "-fobjc-arc", "-Wall", "-Wextra", "-Werror", sc.SOURCE / "test-icon.m",
+                        "-framework", "AppKit", "-framework", "ImageIO", "-framework", "CoreGraphics",
+                        "-o", cls.reader], check=True)
+        cls.tool = cls.bundles / "bundle-tool"
         cls.config = plistlib.loads((cls.bundles / (sc.HANDLER + ".staged") /
                                      "Contents/Resources/Routes.plist").read_bytes())
 
@@ -35,7 +44,8 @@ class ShortcutsTest(unittest.TestCase):
         self.scripts.mkdir()
         self.daily = self.scripts / "daily.sh"
         self.daily.write_text('#!/bin/sh\nprintf "%s\\0" "$@" > recorded\n'
-                              'printf "%s\\n" "${DAILY_OWNER-unset}" "${DAILY_OPEN_HANDLER-unset}" > flags\n')
+                              'printf "%s\\n" "${DAILY_OWNER-unset}" "${DAILY_OPEN_HANDLER-unset}" > flags\n'
+                              'printf "%s" "${ISTESSO_APP_ICON-unset}" > icon-path\n')
         self.daily.chmod(0o700)
         self.record = self.checkout / "recorded"
         self.routes = self.checkout / "Routes.plist"
@@ -99,11 +109,13 @@ class ShortcutsTest(unittest.TestCase):
         with patch.object(sc, "build_bundle", headless_bundle):
             sc.build(self.checkout, rows, self.checkout)
         env = dict(os.environ, TEST_HANDLER=str(self.runner), TEST_ROUTES=str(self.routes),
-                   DAILY_OWNER="inherited", DAILY_OPEN_HANDLER="inherited")
+                   ISTESSO_APP_ICON="inherited", DAILY_OWNER="inherited", DAILY_OPEN_HANDLER="inherited")
         for host, app, title in rows:
             with self.subTest(title=title):
                 subprocess.run([self.checkout / title], env=env, check=True)
                 self.assert_recorded("open", app, "--host", host)
+                icon = self.checkout / "icon-path"
+                self.assertEqual(Path(icon.read_text()), sc.DEST / (title + ".app") / "Contents/Resources/Shortcut.icns")
                 flags = self.checkout / "flags"
                 self.assertEqual(flags.read_text().splitlines(), ["unset", "unset"])
                 # A URL can also arrive without going through a shim.
@@ -181,14 +193,14 @@ class ShortcutsTest(unittest.TestCase):
         sc.check_measurement()
         subprocess.run([*cc, sc.SOURCE / "test-owner-child.c", "-o", self.daily], check=True)
         sc.check_measurement()
-        subprocess.run([*cc, sc.SOURCE / "owner-shim.c", '-DOWNER_APP="fixture"',
+        subprocess.run([*cc, sc.SOURCE / "owner-shim.c", '-DOWNER_APP="fixture"', '-DSHORTCUT_TITLE="Fixture"',
                         "-DDAILY_SCRIPT=" + json.dumps(str(self.daily)), "-o", driver], check=True)
         return driver
 
     def run_spawn_test(self, driver, *, sources_available=True):
         env = dict.fromkeys(("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "DAILY_OWNER",
                              "DAILY_OPEN_HANDLER", "DAILY_MAC_SCRIPT", "ISTESSO_MAC_HOST", "BASH_ENV",
-                             "DYLD_TEST_MARKER", "SSH_AUTH_SOCK", "EXTRA_MARKER"), "ignored")
+                             "DYLD_TEST_MARKER", "SSH_AUTH_SOCK", "EXTRA_MARKER", "ISTESSO_APP_ICON"), "ignored")
         env["TMPDIR"] = str(self.checkout)
         with subprocess.Popen([driver, "--for", "aura", "--slot", "3"], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
@@ -304,7 +316,7 @@ class ShortcutsTest(unittest.TestCase):
         rows = sc.app_list(ubuntu, sc.SOURCE / "mac-apps.txt")
         with patch.object(sc, "STAGE", stage), patch.object(sc, "DEST", self.checkout / "dest"), \
                 patch.object(sc, "OWNER_LIST", self.checkout / "missing"):
-            for old in (rows, {"version": 2, "apps": rows}):
+            for old in (rows, {"version": 2, "apps": rows}, {"version": 3, "apps": rows}):
                 (stage / "bundles/apps.json").write_text(json.dumps(old))
                 with patch.object(sc, "install") as install, self.assertRaisesRegex(ValueError, "build first"):
                     sc.run("install", "", ubuntu)
@@ -312,7 +324,7 @@ class ShortcutsTest(unittest.TestCase):
 
     def test_icon_size_and_signature_checked_before_conversion(self):
         signature = b"\x89PNG\r\n\x1a\n"
-        for prefix, size, allowed in ((signature, 8 << 20, True), (signature, (8 << 20) + 1, False),
+        for prefix, size, allowed in ((signature, 2 << 20, True), (signature, (2 << 20) + 1, False),
                                       (signature[:-1], 7, False), (b"not a PNG", 9, False)):
             with self.subTest(size=size):
                 def fetch(out, *_):
@@ -320,25 +332,123 @@ class ShortcutsTest(unittest.TestCase):
                         file.write(prefix)
                         file.truncate(size)
 
-                with patch.object(sc, "fetch_icon", fetch), patch.object(sc, "convert_icon", side_effect=OSError) as convert:
-                    sc.add_icon(self.checkout, "editor", "", self.checkout)
-                self.assertEqual(convert.call_count, int(allowed))
+                with patch.object(sc, "fetch_icon", fetch), patch.object(sc, "convert_icon",
+                        side_effect=OSError) as convert, self.assertRaises(OSError):
+                    sc.add_icon(self.checkout, "editor", "", self.checkout, self.tool, "ubuntu", "Ubuntu")
+                source = self.checkout / "original.png" if allowed else None
+                convert.assert_called_once_with(self.tool, source, self.checkout, "ubuntu", "Ubuntu")
 
     def test_icon_and_generic_fallback(self):
         title = "Firefox (Ubuntu)"
         bundle = self.checkout / (title + ".staged")
         shutil.copytree(self.bundles / bundle.name, bundle)
-        plist = bundle / "Contents/Info.plist"
-        with patch.object(sc, "fetch_icon", side_effect=OSError):
-            sc.add_icon(bundle, "firefox", "", self.checkout)
-        self.assertNotIn("CFBundleIconFile", plistlib.loads(plist.read_bytes()))
-        png = sc.ROOT / "docs/measurements/img/2026-11-16-hard-picture/sent.png"
-        with patch.dict(os.environ, HOME=str(self.checkout)):
-            with patch.object(sc, "fetch_icon", side_effect=lambda out, *_: shutil.copyfile(png, out)):
-                sc.add_icon(bundle, "firefox", "", self.checkout)
-        icon = plistlib.loads(plist.read_bytes())["CFBundleIconFile"]
-        self.assertEqual((bundle / "Contents/Resources" / icon).read_bytes()[:4], b"icns")
-        subprocess.run(["codesign", "--verify", "--strict", bundle], check=True)
+        fixture = sc.ROOT / "docs/measurements/img/2026-11-16-hard-picture/sent.png"
+        def sign_fixture(path, identifier, *options):
+            subprocess.run(["codesign", "--force", "--sign", "-", "--identifier", identifier,
+                            *options, path], check=True, capture_output=True)
+
+        results = []
+        for fetch in (OSError, lambda out, *_: out.write_bytes(sc.PNG_SIGNATURE + b"broken"),
+                      lambda out, *_: shutil.copyfile(fixture, out)):
+            with tempfile.TemporaryDirectory(dir=self.checkout) as tmp, patch.object(sc, "fetch_icon", side_effect=fetch):
+                with patch.object(sc, "sign", sign_fixture):
+                    sc.add_icon(bundle, "firefox", "", Path(tmp), self.tool, "ubuntu", "Ubuntu")
+            icon = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())["CFBundleIconFile"]
+            data = (bundle / "Contents/Resources" / icon).read_bytes()
+            self.assertEqual(data[:4], b"icns")
+            results.append(data)
+            subprocess.run(["codesign", "--verify", "--strict", bundle], check=True)
+        self.assertEqual(results[0], results[1])
+        self.assertNotEqual(results[1], results[2])
+
+    def test_badge_sizes_and_letter(self):
+        fixture = sc.ROOT / "docs/measurements/img/2026-11-16-hard-picture/sent.png"
+        def draw(label, machine="mac"):
+            folder = self.checkout / (machine + label + ".iconset")
+            folder.mkdir()
+            icon = sc.convert_icon(self.tool, fixture, folder, machine, label)
+            subprocess.run([self.reader, "unpack", icon, folder], check=True)
+            return {p.name: p.read_bytes() for p in folder.glob("*.png")}
+
+        first = draw("Studio")
+        same_initial = draw("Second")
+        other_initial = draw("Trial")
+        other_color = draw("Studio", "ubuntu")
+        sizes = [struct.unpack(">II", data[16:24]) for data in first.values()]
+        expected = [p * scale for p in (16, 32, 128, 256, 512) for scale in (1, 2)]
+        self.assertCountEqual(sizes, [(size, size) for size in expected])
+        for name, data in first.items():
+            size = struct.unpack(">I", data[16:20])[0]
+            with self.subTest(size=size):
+                self.assertEqual(first[name] == same_initial[name], size <= 32)
+                self.assertNotEqual(first[name], other_initial[name])
+                self.assertNotEqual(first[name], other_color[name])
+
+    def test_machine_labels(self):
+        path = self.checkout / "labels"
+        self.assertEqual(sc.machine_labels(path), {"ubuntu": "Ubuntu", "mac": "Studio"})
+        path.write_text("mac=編集室\nubuntu=123456789012\n")
+        self.assertEqual(sc.machine_labels(path), {"ubuntu": "123456789012", "mac": "編集室"})
+        for line in ("mac=", "mac= ", "mac=1234567890123", "ubuntu=one\ttwo", "other=one", "mac"):
+            path.write_text(line)
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                sc.machine_labels(path)
+
+    def test_mac_icon_plist(self):
+        icon_file = runpy.run_path(str(sc.SOURCE / "mac-host-icon.py"))["icon_file"]
+        contents = self.checkout / "Example.app/Contents"
+        resources = contents / "Resources"
+        resources.mkdir(parents=True)
+        icon = resources / "AppIcon.icns"
+        icon.touch()
+        outside = self.checkout / "outside.icns"
+        outside.touch()
+        (resources / "link.icns").symlink_to(outside)
+        for name in ("link.icns", "AppIcon", "AppIcon.icns", None, "../AppIcon.icns", 1, "Missing"):
+            with self.subTest(name=name):
+                sc.write_plist(contents / "Info.plist", {} if name is None else {"CFBundleIconFile": name})
+                self.assertEqual(icon_file(contents.parent), icon if name in ("AppIcon", "AppIcon.icns") else None)
+
+    def test_mac_icon_conversion(self):
+        host = runpy.run_path(str(sc.SOURCE / "mac-host-icon.py"))
+        bundle = self.checkout / "Example.app"
+        resources = bundle / "Contents/Resources"
+        resources.mkdir(parents=True)
+        fixture = sc.ROOT / "docs/measurements/img/2026-11-16-hard-picture/sent.png"
+        source = sc.convert_icon(self.tool, fixture, resources, "mac", "Studio")
+        sc.write_plist(bundle / "Contents/Info.plist", {"CFBundleIconFile": source.name})
+        output = io.BytesIO()
+        with patch.object(subprocess, "check_output", return_value=str(bundle) + "\n"), \
+                patch("sys.stdout", Mock(buffer=output)), patch.object(tempfile, "tempdir", str(self.checkout)):
+            self.assertEqual(host["main"]("Example"), 0)
+        self.assertTrue(output.getvalue().startswith(sc.PNG_SIGNATURE))
+        self.assertLessEqual(len(output.getvalue()), sc.MAX_ICON_BYTES)
+
+    def test_host_fetch_quotes_app_and_selects_script(self):
+        for machine, script in (("mac", "mac-host-icon.py"), ("ubuntu", "host-icon.py")):
+            app = "Example's App"
+            def record(command, **options):
+                self.assertEqual(shlex.split(" ".join(command[command.index("--") + 2:])), ["python3", "-I", "-", app])
+                self.assertEqual(Path(options["stdin"].name).name, script)
+            with patch.object(subprocess, "run", record):
+                sc.fetch_icon(self.checkout / "icon.png", app, "", machine)
+
+    def test_viewer_icon_confinement(self):
+        root = self.checkout / "Applications/Istesso Dev"
+        root.mkdir(parents=True)
+        icon = sc.convert_icon(self.tool, None, self.checkout, "mac", "Studio")
+        inside = root / "Shortcut.icns"
+        shutil.copyfile(icon, inside)
+        (root / "link.icns").symlink_to(icon)
+        (root / "linked-dir").symlink_to(self.checkout)
+        sibling = root.with_name("Istesso Dev Other")
+        sibling.mkdir()
+        shutil.copyfile(icon, sibling / icon.name)
+        for path in (inside, icon, root / "missing.icns", root / "../.." / icon.name,
+                     root / "link.icns", root / "linked-dir" / icon.name, sibling / icon.name):
+            with self.subTest(path=path.name):
+                self.assertEqual(subprocess.run([self.reader, "load", self.checkout, path]).returncode,
+                                 0 if path == inside else 1)
 
 
 if __name__ == "__main__":

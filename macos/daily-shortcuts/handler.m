@@ -15,6 +15,12 @@ static NSString *openShortcut(NSString *url, NSDictionary *config) {
     NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
     [environment removeObjectForKey:@"DAILY_OWNER"];
     [environment removeObjectForKey:@"DAILY_OPEN_HANDLER"];
+    [environment removeObjectForKey:@"ISTESSO_APP_ICON"];
+    NSString *title = config[@"titles"][args[3]][args[1]];
+    if (title && args.count == 4) {
+        NSString *relative = [NSString stringWithFormat:@"Applications/Istesso Dev/%@.app/Contents/Resources/Shortcut.icns", title];
+        environment[@"ISTESSO_APP_ICON"] = [NSHomeDirectory() stringByAppendingPathComponent:relative];
+    }
     task.environment = environment;
     task.currentDirectoryURL = checkout;
     task.executableURL = [checkout URLByAppendingPathComponent:@"scripts/daily.sh"];

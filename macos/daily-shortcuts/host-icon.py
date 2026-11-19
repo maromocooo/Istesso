@@ -31,8 +31,12 @@ def main(app):
             if not info or not info.get_filename():
                 continue
             path = Path(info.get_filename())
-        if path.suffix.lower() == ".png" and path.is_file() and path.stat().st_size <= 8 << 20:
-            sys.stdout.buffer.write(path.read_bytes())
+        if path.suffix.lower() == ".png" and path.is_file():
+            with path.open("rb") as image:
+                data = image.read((2 << 20) + 1)
+            if len(data) > 2 << 20:
+                continue
+            sys.stdout.buffer.write(data)
             return 0
     return 1
 

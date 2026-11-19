@@ -187,6 +187,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include "istesso_media.h"
+#import "app-icon.h"
 
 static FILE *frame_log = NULL;
 
@@ -2848,6 +2849,10 @@ int main(int argc, char *argv[]) {
             fclose(file);
         }
         [NSApplication sharedApplication];
+        if (!no_window) {
+            NSImage *icon = shortcutIcon(NSHomeDirectory(), NSProcessInfo.processInfo.environment[@"ISTESSO_APP_ICON"]);
+            if (icon) NSApp.applicationIconImage = icon;
+        }
         if (clipboard_on) {
             // With copy and paste on (ISTESSO_CLIPBOARD=1 and its socket made, above): an Edit
             // menu with Paste on Command-V (sent to the window's view: paste:). See
