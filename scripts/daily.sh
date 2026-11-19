@@ -18,6 +18,9 @@
 #   scripts/daily.sh open NAME [--host ubuntu|mac] [--document PATH] [--min-qp N] [--for aura [--size WxH]]
 #                                     --host mac: an application of the Mac host (any name, such
 #                                     as TextEdit), through the Mac host stream's daily-mac.sh;
+#                                     `open desktop --host mac` is the Mac host's whole display (for
+#                                     installers and questions; the owner's only: DAILY_OWNER=1, set
+#                                     by the owner, passed on as it is and never set here);
 #                                     ubuntu (the default) as below
 #                                     start the application on the host and show it; one that already
 #                                     runs is shown again. --document: a file of the trial's copy of
