@@ -1683,7 +1683,7 @@ fn the_text_field_reaches_a_viewer_and_a_viewer_that_comes_later_and_only_once_s
     assert_eq!(events(&mut later, 1).0, "t");
     assert_eq!(later.text_field(), Some(field));
     // A state this version does not know is refused at the host.
-    let odd = crate::wire::TextField { state: 3, ..field };
+    let odd = crate::wire::TextField { state: 4, ..field };
     assert!(pair.host.set_text_field(&odd).is_err());
 }
 

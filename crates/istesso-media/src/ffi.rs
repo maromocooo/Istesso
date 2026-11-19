@@ -661,7 +661,7 @@ fn frame_for_c(got: &Frame<'_>) -> IstessoMediaFrame {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IstessoMediaTextInput {
-    /// 0 no field, 1 a field, 2 a password field.
+    /// 0 nothing known, 1 a field, 2 a password field, 3 not in a field.
     pub state: u32,
     pub x: i32,
     pub y: i32,

@@ -867,6 +867,8 @@ static void show_counts(void) {
 static BOOL host_takes_text = NO;
 static BOOL host_takes_preedit = NO;
 static BOOL force_preedit_strip = NO;
+// ISTESSO_OUTSIDE_FIELD=ime: outside a field, keys go through the input method as before.
+static BOOL outside_field_keys_through_ime = NO;
 
 // Trial only (ADR 0007, password fields): Secure Event Input is on while a password field of the
 // host has the keyboard and this window takes keys, so that other applications on this Mac
@@ -1751,6 +1753,9 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     BOOL _startedWithMark, _passKey, _discardingMark;
     IstessoMediaTextInput _field;
     BOOL _preeditSent, _stripComposition;
+    // Clicks and keys that may move the focus over there (not plain typing), sent since the
+    // host last said what the field is.
+    unsigned long _movesSinceNotice;
 }
 
 // Cancel the local composition and clear any preedit still visible on the host.
@@ -1827,18 +1832,37 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
 }
 - (void)mouseDown:(NSEvent *)event {
     [self commitComposition];
+    _movesSinceNotice++;
     [super mouseDown:event];
 }
 - (void)rightMouseDown:(NSEvent *)event {
     [self commitComposition];
+    _movesSinceNotice++;
     [super rightMouseDown:event];
 }
 - (void)otherMouseDown:(NSEvent *)event {
     [self commitComposition];
+    _movesSinceNotice++;
     [super otherMouseDown:event];
 }
 
 - (void)keyDown:(NSEvent *)event {
+    if ([self outsideField]) {
+        // Not in a field over there: keys as they are, no input method, no strip. Eisu and
+        // Kana still switch this Mac's input method, and nothing is sent for them.
+        if (event.keyCode == 0x66 || event.keyCode == 0x68) {
+            [self.inputContext handleEvent:event];
+        } else {
+            [super keyDown:event];
+        }
+        if (moves_focus(event)) {
+            _movesSinceNotice++;
+        }
+        return;
+    }
+    if (moves_focus(event)) {
+        _movesSinceNotice++;
+    }
     if (_field.state == 2) {
         // A password field: keys as they are, never through the input method. Eisu and Kana
         // do nothing here.
@@ -1927,7 +1951,29 @@ static NSString *plain_text(id value) {
     }
 }
 
+// Outside a field (state 3, newer than any click or focus-moving key since): keys go as they
+// are, without the input method and without the strip. Otherwise, as before.
+- (BOOL)outsideField {
+    return !outside_field_keys_through_ime && host_takes_preedit && _field.state == 3 && _movesSinceNotice == 0
+        && !picture_stale && !self.hasMarkedText;
+}
+
+// Whether a key may move the focus over there: anything but plain typing.
+static BOOL moves_focus(NSEvent *event) {
+    if (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) {
+        return YES;
+    }
+    NSString *typed = event.charactersIgnoringModifiers;
+    if (typed.length != 1) {
+        return YES;
+    }
+    unichar c = [typed characterAtIndex:0];
+    // Tab, Return, Escape, Delete, arrows and other function keys are not plain typing.
+    return c < 0x20 || c == 0x7f || (c >= 0xF700 && c <= 0xF8FF);
+}
+
 - (void)setTextInputField:(IstessoMediaTextInput)field {
+    _movesSinceNotice = 0;
     BOOL toPassword = field.state == 2 && _field.state != 2;
     // Another field has the keyboard (the application moved it by itself, or it was enabled
     // again): what was being composed ends here, on this Mac too, without being committed.
@@ -2213,6 +2259,8 @@ int main(int argc, char *argv[]) {
         const char *command_key = getenv("ISTESSO_COMMAND_KEY");
         command_is_control = command_key == NULL || strcmp(command_key, "super") != 0;
         atexit(secure_input_off_at_exit);
+        const char *outside = getenv("ISTESSO_OUTSIDE_FIELD");
+        outside_field_keys_through_ime = outside != NULL && strcmp(outside, "ime") == 0;
         const char *preedit = getenv("ISTESSO_PREEDIT");
         force_preedit_strip = preedit != NULL && strcmp(preedit, "strip") == 0;
         const char *text_input = getenv("ISTESSO_TEXT_INPUT");

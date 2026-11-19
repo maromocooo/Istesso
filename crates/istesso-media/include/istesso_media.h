@@ -89,7 +89,7 @@ typedef struct IstessoMediaCursor {
  * keyboard, and where its text cursor is, in the picture's pixels. No typed text is in it.
  */
 typedef struct IstessoMediaTextInput {
-    uint32_t state;   /* 0: no field. 1: a field. 2: a password field */
+    uint32_t state;   /* 0: nothing known. 1: a field. 2: a password field. 3: not in a field */
     int32_t x;        /* the text cursor's rectangle, from the picture's top left */
     int32_t y;
     uint32_t width;   /* 0 to 65535 */
@@ -193,7 +193,7 @@ int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const Istess
  * Trial only: says what the text input field of the application with the keyboard is, as
  * istesso_media_host_set_cursor() says what the cursor is (the latest only, behind frames, to
  * viewers that may be sent the frames, and to one that connects later). Nothing is sent until
- * this is first called. 0, or -1 for a state above 2, a side above 65535 or a serial above 255.
+ * this is first called. 0, or -1 for a state above 3, a side above 65535 or a serial above 255.
  */
 int32_t istesso_media_host_set_text_input(const IstessoMediaHost *host, const IstessoMediaTextInput *field);
 
