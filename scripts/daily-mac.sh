@@ -46,6 +46,7 @@
 #   DAILY_VIEWER         a viewer program to start from the shell instead (no bundle)
 #   DAILY_NO_WINDOW=1    for checks: the viewer decodes but shows no window
 #   DAILY_FRAME_LOGS=1   frame logs on both sides
+#   DAILY_CLIPBOARD=1    copy and paste of text with the host (ADR 0022; the agent with --clipboard)
 #   DAILY_VIRTUAL_SIZE   the virtual display's size in points instead of this Mac's screen (WxH)
 #   DAILY_VIRTUAL=0      the application's window stays on the host's own screen (default: a virtual
 #                        display of this Mac's screen's size at 2x, 120 Hz, while the window is shown)
@@ -271,6 +272,9 @@ do_open() {
         here_size=${DAILY_VIRTUAL_SIZE:-$(osascript -l JavaScript -e 'ObjC.import("AppKit"); var f=$.NSScreen.mainScreen.frame; Math.round(f.size.width)+"x"+Math.round(f.size.height)' 2>/dev/null)}
         [[ "$here_size" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] && virtual_arg="--virtual-display $here_size@120"
     fi
+    # Copy and paste of text (ADR 0022, trial only): only with DAILY_CLIPBOARD=1 for now.
+    local clipboard_agent="" clipboard_host=""
+    if [ "${DAILY_CLIPBOARD:-}" = 1 ] && [ "$for_whom" != aura ]; then clipboard_agent="--clipboard"; clipboard_host="--clipboard"; fi
     local target_args size_arg="--size $size"
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$what")"; fi
     [ "$start" = new-window ] && target_args="$target_args --new-window"
@@ -316,7 +320,7 @@ else
     echo "\$BASE_PIC:\$slot" > "\$run/slot"
     port=\$((BASE_PIC + slot)); agent_port=\$((BASE_IN + slot))
     if true; then
-        XDG_RUNTIME_DIR=\$run/rt ISTESSO_CACHE_DIR=\$run/agent-cache ISTESSO_CONFIG_DIR=\$config nohup "\$D/bin/istesso" agent --port \$agent_port --no-discovery > "\$run/agent.log" 2>&1 < /dev/null &
+        XDG_RUNTIME_DIR=\$run/rt ISTESSO_CACHE_DIR=\$run/agent-cache ISTESSO_CONFIG_DIR=\$config nohup "\$D/bin/istesso" agent --port \$agent_port --no-discovery $clipboard_agent > "\$run/agent.log" 2>&1 < /dev/null &
         write_down "\$run/agent.pid" \$!
     fi
     [ -p "\$run/control" ] || mkfifo -m 600 "\$run/control"
@@ -330,7 +334,7 @@ else
         printf '%s\n' "\$document" > "\$run/document"
     fi
     set -- $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        $size_arg $virtual_arg --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg $virtual_arg $clipboard_host --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else
@@ -353,6 +357,13 @@ else
     fi
     echo "host: \$NAME opened in slot \$slot"
 fi
+# Handoff on the host: read only; said when it is on (the owner turned it off on 2026-11-19).
+handoff=\$(defaults -currentHost read com.apple.coreservices.useractivityd ActivityAdvertisingAllowed 2>/dev/null)
+case "\$handoff" in
+    0) ;;
+    1) echo "host: note: Handoff is on on the Mac host again (copy and paste could reach other devices of the account)" ;;
+    *) echo "host: note: whether Handoff is on cannot be read" ;;
+esac
 echo "slot \$slot"
 echo "size \$(sed -n 's/.*"istesso":"ready".*"size":"\([0-9]*x[0-9]*\)".*/\1/p' "\$run/host.log" | tail -1)"
 echo "peer \$(ISTESSO_CONFIG_DIR=\$config "\$D/bin/istesso" id 2>/dev/null | awk '/^Fingerprint/ {print \$2}')"
@@ -408,7 +419,9 @@ open_here() {
     printf '%s\n\n' "$title" > "$mine/title"
     # The viewer composes Japanese itself and sends committed text (ADR 0007) when the relay says
     # the host takes it; and connects again by itself after a cut.
-    local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
+    local clip_env=()
+    [ "${DAILY_CLIPBOARD:-}" = 1 ] && clip_env=(ISTESSO_CLIPBOARD=1)
+    local settings=(${clip_env[@]+"${clip_env[@]}"} ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
     local arguments=("$x" "$y" "$width" "$height" "$title" - "$frames" 0 "$mine/in.sock")

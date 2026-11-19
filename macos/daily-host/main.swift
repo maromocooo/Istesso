@@ -79,6 +79,8 @@ struct Settings {
     /// Start with a new window of the application's own (Command-N to its process once it is in
     /// front), never with what it opens by itself; the new window is the one shown.
     var newWindow = false
+    /// Copy and paste of text with the trial agent (ADR 0022); off unless asked for.
+    var clipboard = false
 }
 
 func usage() -> Never {
@@ -144,6 +146,7 @@ func readSettings() -> Settings {
         case "--virtual-now": s.virtualNow = true
         case "--virtual-slot": s.virtualSlot = max(1, min(3, number()))
         case "--new-window": s.newWindow = true
+        case "--clipboard": s.clipboard = true
         default: usage()
         }
     }
@@ -1674,6 +1677,35 @@ func selfTest() -> Never {
         let huge = scrollPlan(dx: 0, dy: 0, source: "finger", v120: nil, pixels: [1e300, -1e300], phase: nil, momentum: nil, pointsPerPixel: 1, carry: &carry6)
         checkPanel(abs(huge.wheel1) <= 1_000_000 && abs(huge.wheel2) <= 1_000_000, true, "scroll: enormous pixels are bounded, nothing traps")
     }
+    do {
+        checkPanel(judgeText(String(repeating: "a", count: 65536)) == .text, true, "clipboard: 65536 bytes go")
+        checkPanel(judgeText(String(repeating: "a", count: 65537)) == .tooLarge, true, "clipboard: one byte more is too large")
+        checkPanel(judgeText("") == .notText && judgeText("a\u{07}b") == .notText && judgeText("a\u{85}") == .notText, true, "clipboard: empty and control characters are not text")
+        checkPanel(judgeText("a\tb\nc\r") == .text, true, "clipboard: tab, line feed and carriage return are text")
+        let a = clipboardAnswer(nonce: "n", result: "text", text: "t", why: "x")
+        let b = clipboardAnswer(nonce: "n", result: "refused", text: "t", why: "password_field")
+        let c = clipboardAnswer(nonce: "n", result: "none", text: "t", why: "x")
+        checkPanel(a["text"] != nil && a["why"] == nil && b["text"] == nil && b["why"] != nil && c["text"] == nil && c["why"] == nil, true,
+                   "clipboard: text only with text, why only with refused")
+        // A pasteboard of its own (never the Studio's real one).
+        let own = SystemBoard(NSPasteboard.withUniqueName())
+        let change = own.put("trial")
+        checkPanel(own.changeCount == change && own.plainText() == "trial", true, "clipboard: a paste's text is put on the pasteboard")
+        checkPanel(own.types().contains("org.nspasteboard.TransientType"), true, "clipboard: and marked transient (no history keeps it)")
+        let bridge = ClipboardBridge(board: own)
+        bridge.finishCopy(nonce: String(repeating: "a", count: 32))
+        checkPanel(bridge.counts["copy_refused"] == 1, true, "clipboard: a copy finds a secret marker and refuses before reading")
+        own.clear()
+        own.pasteboard.setString("plain", forType: .string)
+        bridge.finishCopy(nonce: String(repeating: "b", count: 32))
+        checkPanel(bridge.counts["copy_text"] == 1, true, "clipboard: plain text is copied")
+        own.pasteboard.releaseGlobally()
+        let gate = PasteGate()
+        gate.begin("n", now: 0)
+        gate.hold(Data([1])); gate.hold(Data([2]))
+        checkPanel(!gate.expired(now: 0.1) && gate.expired(now: 0.3) && gate.end() == [Data([1]), Data([2])], true,
+                   "clipboard: what comes after a late paste is held 0.2 s at most, then given in order")
+    }
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -2274,6 +2306,16 @@ final class Injector {
         }
     }
 
+    /// A Command chord for copy and paste: with the host's own Command as it is now - only the key
+    /// when Command is down already, else Command down, the key, Command up. Nothing stays down.
+    func postChord(_ code: UInt32) {
+        let commandDown = keysDown.contains(125) || keysDown.contains(126)
+        if !commandDown { key(125, true) }
+        key(code, true)
+        key(code, false)
+        if !commandDown { key(125, false) }
+    }
+
     func releaseAll() {
         releaseSessionPresses()
         guard mayPost, !settings.inputDry else { keysDown.removeAll(); buttonsDown.removeAll(); flags = []; return }
@@ -2294,6 +2336,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var generated: Generated?
     let injector = Injector()
     let lookout = Lookout()
+    let clipboard = ClipboardBridge(board: SystemBoard())
+    let pasteGate = PasteGate()
     private lazy var gateWired: Void = { injector.gateClosed = { [weak self] in self?.restarting ?? false } }()
     var width = 0, height = 0
     var app: NSRunningApplication?
@@ -3111,6 +3155,13 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &room, socklen_t(MemoryLayout<Int32>.size))
         inputSocket = fd
         injector.log = { line in frameLog.write(line) }
+        if settings.clipboard {
+            clipboard.postChord = { [weak self] code in self?.injector.postChord(code) }
+            clipboard.keysAllowed = { [weak self] in self?.injector.keysAllowed() ?? false }
+            clipboard.targetPid = { [weak self] in self?.injector.target() }
+            clipboard.lookout = lookout
+            if !clipboard.open(beside: path) { note("the clipboard socket could not be opened: copy and paste stay off") }
+        }
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
         source.setEventHandler { [weak self] in
             var buffer = [UInt8](repeating: 0, count: 4096)
@@ -3133,6 +3184,32 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// 60 ms for that, in their order.
     var waiting: [Data] = []
     func take(_ data: Data) {
+        // A paste that waits for its text holds everything after it, in order (0.2 s at most).
+        if pasteGate.waitingFor != nil { return pasteGate.hold(data) }
+        if settings.clipboard, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let kind = object["kind"] as? String, kind == "clipboard_copy" || kind == "clipboard_paste",
+           let nonce = object["nonce"] as? String {
+            guard !detached, picture == "running" else { return }
+            if kind == "clipboard_copy" { return clipboard.copy(nonce: nonce, cut: object["cut"] as? Bool ?? false) }
+            let withText = object["with_text"] as? Bool ?? false
+            if withText && clipboard.textFor(nonce) == nil {
+                pasteGate.begin(nonce, now: ProcessInfo.processInfo.systemUptime)
+                func look() {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    if clipboard.textFor(nonce) != nil {
+                        clipboard.paste(nonce: nonce, withText: true)
+                    } else if !pasteGate.expired(now: now) {
+                        return DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { look() }
+                    } else {
+                        clipboard.answer(nonce, "none", what: "paste")
+                    }
+                    for event in pasteGate.end() { take(event) }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { look() }
+                return
+            }
+            return clipboard.paste(nonce: nonce, withText: withText)
+        }
         if !waiting.isEmpty { return waiting.append(data) }
         let notRaised = app != nil && raisedWindow != windowId && isKeyOrText(data)
         if needsFront(data), !screenLocked(), let running = frontCandidate(data),

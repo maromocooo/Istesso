@@ -28,7 +28,7 @@ bundle="$output/Istesso Dev Daily Host.app"
 mkdir -p "$bundle/Contents/MacOS"
 swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
     -import-objc-header "$here/bridge.h" -I "$repo/crates/istesso-media/include" \
-    -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" \
+    -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" "$here/clipboard.swift" \
     "$repo/target/release/libistesso_media.a" -liconv \
     -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
     -framework AppKit -framework ApplicationServices
