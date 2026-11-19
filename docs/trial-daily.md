@@ -18,13 +18,14 @@
 - **中継（Mac）とエージェント（ホスト）は、同じ統合版から**：新しい中継と古いエージェントでは、日本語は送られない（中継が、数だけを書いて知らせる）。古い中継と新しいエージェントは、かまわない。なので、統合のあとは `scripts/daily.sh setup` で、両方をそろえる。
 
 - 毎回のマージのあとに：`cargo fmt`、`cargo clippy --workspace --all-targets -D warnings`、触ったクレートのテスト、ビューアーのビルド（`keys-test`、`text-input-test` を含む）、3 つ目のあとは `daily_flow_test.py`（15 件）。どれも通った。
-- コンポジターの既定のプラグインは `gwd-trial32`（2026-11-19。文字入力（アプリの中の変換中の文字と、パスワードの欄では変換中の文字を受けないこと）、コピーと貼り付け、スクロールの種類と段階を 1 つにしたビルド。スクロールの流れが作った。ホストの `~/.cache/istesso-scroll-wip/gwd-trial32`、ブランチ `m3-compositor-trial2` の `223a9df`、コンポジターの試験 137 件。`check-plugin.sh` は、試用のビルドとして断る。その前の既定は `gwd-trial31`（`bba26db`。パスワードの欄の断りがない）。修正の一覧は `base`、`features`、`render-on-commit`、`cursor-messages`、`windows`、`dialogs`、`trial-windows`、`trial-x-text-input`、`trial-y-clipboard`、`trial-y-scroll`。その前は `gwd-trial27`：日本語の流れの、文字入力の修正の版。GTK のエディターがセッションを戻したときの、限った text-input の入り直しを含む）。ホストに写すのは、持ち主のひとことのあとの `scripts/daily.sh setup`（写すまでは、前に写したプラグインのまま）。
+- コンポジターの既定のプラグインは `gwd-c6`（2026-11-19。ホストの `~/.cache/istesso-compositor-wip/src-text/gwd-c6`、ブランチ `m3-compositor-text-order` の `17c3722`。日本語の流れの見直しを通った毎日用のビルド。修正の一覧は `base`、`features`、`render-on-commit`、`cursor-messages`、`windows`、`dialogs`、`trial-windows`、`trial-x-text-input`、`trial-y-clipboard`、`trial-y-scroll`、`trial-z-text-order`（ホストで読んで確かめた）。その前の既定は `gwd-trial32`（文字入力、コピーと貼り付け、スクロールを 1 つにしたスクロールの流れのビルド。`m3-compositor-trial2` の `223a9df`）、`gwd-trial31`（`bba26db`）、`gwd-trial27`（日本語の流れの、文字入力の修正の版）。`check-plugin.sh` は、どれも試用のビルドとして断る）。ホストに写すのは、持ち主のひとことのあとの `scripts/daily.sh setup`（写すまでは、前に写したプラグインのまま）。
+- **この統合のあとの `setup`（2026-11-19）**：Mac のビューアーに組み込む欄の構造体（`IstessoMediaTextInput`）が 20 バイトから 24 バイトになった（欄の番号 `serial`）。1 回の `scripts/daily.sh setup` が、同じチェックアウトから、Mac の `istesso`（中継）とビューアー（`istesso-media` を静的に組み込む）、ホストの `istesso` と `libistesso_media.so`、パイプラインのスクリプト（`daily-pipeline.py` の構造体も 24 バイト）を作り直し、プラグイン（`gwd-c6`）を写し、最後に新しいビューアーの包みを置く（まだ名前は付けない）。持ち主の順：開いている試用のアプリを `scripts/daily.sh stop` で閉じる → `scripts/daily.sh setup` → ビューアーの窓が 1 つも開いていないことを確かめて `scripts/daily.sh bundle --finish` → `open` で開き直す。古いまま開いていたものは、開き直すまで、前のプログラムのまま。
 
 ### 文字のコピーと貼り付け（2026-11-19、[ADR 0022](adr/0022-clipboard-text.md)）
 
 - Air の窓で ⌘C、⌘X、⌘V を押したときだけ、ホストのアプリとのあいだで文字（64 KiB まで）を運ぶ。ホストのアプリがパスワードの欄なら運ばない。ホストが「パスワードの欄がキーボードを持っている」（欄の状態 2）と言っているあいだは、ビューアー自身も ⌘C と ⌘X を断り、何も送らない（二重の壁。同じ知らせを出す。貼り付けは断らない）。Air で秘密の印が付いたものは貼らない。窓の題に、短く理由が出る（2 秒）。
 - Air のペーストボードのプライバシー（macOS 15.4 から。Apple の AppKit の更新の記録、2025 年 4 月）：アプリがプログラムで一般のペーストボードを読むと、macOS が知らせを出す。出さないのは、「システムがペーストに関わるとみなす UI の部品への、人の入力の結果」の読みだけ（ヘッダーの言い方では「人が始めた、ペーストに関わる」読み）。どの部品がそれに当たるかは、Apple は書いていない。そこでビューアーは、ホストがコピーと貼り付けを受けるあいだ、⌘V を自分では取らず、「編集」メニューの「ペースト」（⌘V、`paste:`）に渡し、そこで Air のペーストボードを読む（ペーストの標準の道）。メニューが受けなければ、前と同じく、キーとして受けて読む。日本語を変換している途中の ⌘V は、入力方式には渡らないので、変換中の文字を、その欄に 1 度だけ確定してから貼り付ける（なくならず、二重にもならない。確定した文字と貼り付けの頼みは、同じ口から順に出るので、確定が先に着く）。メニューは、コピーと貼り付けが入ったとき（`ISTESSO_CLIPBOARD=1` で、その口ができたとき）だけ作る。アプリごとの設定は `NSPasteboard.general.accessBehavior`（0 まだ一度も知らせていない、1 聞く、2 いつも許す、3 いつも断る）。ビューアーを `--pasteboard-access` だけで起動すると、その値だけを出して終わる（中身、型、変更の回数は読まない。窓もメニューも作らない）。包みの中で動かすときは：`open -n -W --stdout "$HOME/Library/Caches/istesso-daily/pasteboard-access.txt" "$HOME/Applications/Istesso Dev/Istesso Dev Daily Viewer.app" --args --pasteboard-access`（包みを作り直したあと）。試験（`clipboard-test`）は、自分だけの名前のペーストボードだけを使い、一般のペーストボードには触らない。
-- ブランチ `trial-daily-clipboard`。ビューアーは `ISTESSO_CLIPBOARD=1`、中継は相手が受けると言ったときだけ送る、試用のエージェントは `--clipboard`、パイプラインは `daily-pipeline.py --clipboard`、コンポジターは `trial-y-clipboard` の入ったもの（クリップボードの流れの `gwd-trial29`。統合した試用版の既定は、3 つを 1 つにした `gwd-trial32`）。どれかが古いと、⌘C と ⌘V は、これまでどおりのキーになる（ホストの中だけのコピー）。
+- ブランチ `trial-daily-clipboard`。ビューアーは `ISTESSO_CLIPBOARD=1`、中継は相手が受けると言ったときだけ送る、試用のエージェントは `--clipboard`、パイプラインは `daily-pipeline.py --clipboard`、コンポジターは `trial-y-clipboard` の入ったもの（クリップボードの流れの `gwd-trial29`。統合した試用版の既定は `gwd-c6`）。どれかが古いと、⌘C と ⌘V は、これまでどおりのキーになる（ホストの中だけのコピー）。
 - まだ、実機の 2 台では動かしていない（ADR 0022 の「動かして確かめること」）。Mac のホスト（Studio）は、`m4-daily-host` の流れが、同じ手元の口で作る。
 - Mac のホストの流れ（`m4-daily-host`）の `scripts/daily-mac.sh` は、ここにはマージしていない。それが使うビューアーの設定（`ISTESSO_CHANNEL`、`ISTESSO_CHANNEL_PEER`、`ISTESSO_END_WITH_WINDOW`、`ISTESSO_COMMAND_KEY`、`ISTESSO_PID_FILE`、`ISTESSO_TITLE_FILE`、`ISTESSO_NO_WINDOW`）と、中継の `--keep-trying` は、統合したものにもそのままある。つなぎ直しと文字入力は、それぞれ `ISTESSO_DAILY_RECONNECT` と `ISTESSO_TEXT_INPUT` を付けたときだけ働くので、`daily-mac.sh` から起動したときの振る舞いは前のまま（読んで確かめた。`daily-mac.sh` は動かしていない）。
 
@@ -72,7 +73,7 @@ scripts/daily.sh setup [--host mac]
 - 中継とエージェント：`InputEvent::Scroll` に、省ける項目を 6 つ足した。エージェントは、範囲の外のスクロールを捨てる（古い `dx`、`dy` も 1 万まで。Mac ホストの流れの `61bb12a` と同じ）。エージェントは `input_open` の答えに `"scroll": 1` を付ける。中継は、それを言わないエージェントには、種類のあるスクロールのうち `dx` も `dy` も 0 のものを送らず、接続ごとに 1 度だけ `note: the host's agent does not take: scroll kinds …` と出す。
 - パイプライン：`daily-pipeline.py --scroll`（`scripts/daily_scroll.py`）が、種類を言うスクロールを `PointerScroll` にしてコンポジターへ渡す。種類に見合う量（`v120`、`pixels`）のないものは、古い形として。`--scroll` なしで起動したとき（`trial-y-scroll` のないプラグイン）は、`dx` も `dy` も 0 のスクロールを捨て、1 度だけ `daily: this compositor does not take: scroll kinds …` と出す。`daily.sh` は、写したプラグインの修正の一覧に `trial-y-scroll` があるときだけ `--scroll` を付ける。
 - コンポジター：試用の 7 つ目の修正 `gst-wayland-display-trial-y-scroll.patch`（ブランチ `m3-compositor-scroll`、ビルドは `~/.cache/istesso-scroll-wip/gwd-scroll3`。`DAILY_PLUGIN_FROM` の既定をここにした）。指の画素は、出力の拡大率で割る（アプリの論理の画素にする）。終わりが届かなかった指のスクロールは、最後の値から 400 ms で止める。コンポジターの試験 120 件が通った。`check-plugin.sh` は、このビルドを試用と言う（1）。計測に使うプラグインは、これまでどおり 0。
-- **統合した試用版の既定のプラグインは、`gwd-trial32` に替えた**（2026-11-19。`gwd-trial31` を経て。文字入力、スクロール、クリップボードを 1 つにしたビルド。スクロールの流れが作った）。その前の `gwd-trial27` にはスクロールの修正が入っていなかったので、`daily.sh` はスクロールを種類ごとに送らず、前の形のままだった。`gwd-trial32` を `setup` で写したときから、スクロールの種類と段階が使われる（`daily.sh` が、プラグインの修正の一覧に `trial-y-scroll` があるかで決める）。
+- **統合した試用版の既定のプラグインは、`gwd-c6` に替えた**（2026-11-19。`gwd-trial31`、`gwd-trial32` を経て。`gwd-c6` は、これに文字の順の修正 `trial-z-text-order` を足したもの。文字入力、スクロール、クリップボードを 1 つにしたビルド。スクロールの流れが作った）。その前の `gwd-trial27` にはスクロールの修正が入っていなかったので、`daily.sh` はスクロールを種類ごとに送らず、前の形のままだった。`setup` で写したときから、スクロールの種類と段階が使われる（`daily.sh` が、プラグインの修正の一覧に `trial-y-scroll` があるかで決める）。
 - 慣性の切り替え：既定は Mac の慣性をそのまま渡す（手元の Mac のアプリ、Safari と同じ減り方を目指す）。`DAILY_SCROLL_MOMENTUM=app scripts/daily.sh open NAME` で、そのアプリのコンポジターだけ、Mac の慣性を捨ててアプリに任せる（`ISTESSO_SCROLL_MOMENTUM=app`）。比べるときは、`close` してから付けて、または外して、もう 1 度 `open`。
 
 確かめ（1 回目 13:58〜14:01、直したあと 14:22〜14:24、窓を出さずに）：中継、試用のエージェント、`daily-pipeline.py`、`m1-step3-host.py`、コンポジターは、試用版と同じ道（このブランチの写しを、流れ自身のフォルダーで、`daily.sh` と同じ引数で起動した。ポートは 47961、47962。確かめのための組）。アプリは、軸のイベントを 1 行ずつ書く試しのアプリ（`scripts/scroll-log.c`）。Mac の側は、ビューアーの `scroll.h` で作った NSEvent の形の値を、時刻どおりに中継の口へ書いた（ビューアーそのものは動かしていない）。身ぶりは作り物（下の「手元」は、手元の Mac のアプリが動かすはずの量で、NSScrollView がトラックパッドの点だけ動くこと、ホイールは行で動くことからの計算）。
@@ -446,7 +447,7 @@ ADR 0020 の「変換中の文字を、アプリの中に」、ADR 0007 の「�
 - ビューアー：窓がキーを受け、エージェントが `preedit` を受けると言い、ホストが「欄がある」（状態 1）と言っているときは、変換中の文字を `{"kind":"preedit",…}` で送り、帯は出さない。候補の窓は、ホストが返したキャレットの場所（絵のピクセルを、ポインターと同じ比で窓の点に直したもの）に出す。場所が分からないとき（全部 0）は、帯の場所。欄がないとき、`ISTESSO_PREEDIT=strip` のとき、エージェントが受けないときは、帯。
 - パスワードの欄（状態 2）：入力方式を通さず、キーだけ（入力ソースは英字だけ）。変換中の文字も帯もない。そのあいだ Secure Event Input を入れ、欄を離れる、窓がキーを受けなくなる、窓を閉じる、絵が切れる、プログラムが終わる（`atexit`）ときに切る。プログラムが落ちたときも外れる（Air で見た、2026-11-19 14:57：入れただけの小さなプログラムを `kill -9` で番号で止めると、`ioreg` の `kCGSSessionSecureInputPID` が消えた）。
 - パイプライン：`daily-pipeline.py --text` が、`preedit` を `TextPreedit` にしてコンポジターへ渡し、コンポジターの `text-input-messages` を入れ、`wayland.text-input` のメッセージを、メディアのライブラリーの `istesso_media_host_set_text_input` に渡す（ホストのスクリプトが作るライブラリーとホストを、この 1 回だけ `ctypes.CDLL` を包んで知る）。`m1-step3-host.py` は変えていない。
-- コンポジター：`gwd-trial30`（`m3-compositor-text-input`）。メディアのライブラリーは、種類 5 のパケット（`c27da47`）。統合した試用版の既定は、これにコピーと貼り付け、スクロールを足した `gwd-trial32`。
+- コンポジター：`gwd-trial30`（`m3-compositor-text-input`）。メディアのライブラリーは、種類 5 のパケット（`c27da47`）。統合した試用版の既定は `gwd-c6`（コピーと貼り付け、スクロール、文字の順の修正を含む）。
 - 文字は、どのログにも書かない。
 - 統合（2026-11-19、`trial-daily-text` の `5ce69ad`）：コピーと貼り付け、スクロールの種類と段階と、両方を残した。エージェントは `input_open` の答えに `text`、`scroll`、`clipboard`、`preedit` を付け、中継は、つなぐたびに 4 つとも覚え直す。中継の状態のファイルは `{"pid":…,"input":…,"text":…,"clipboard":…,"preedit":…}`（つなぎ直す種類の中継だけ `,"reconnecting":…` を足す）。ビューアーは、項目を名前で読む（古い中継の、項目の欠けた行も読める。ない項目は「受けない」）。パイプラインは、`--text` の手（確定した文字と変換中の文字）、`--clipboard` の手、`--scroll` の手を、同じ読み口で順に試す。
 
@@ -463,6 +464,21 @@ ADR 0020 の「変換中の文字を、アプリの中に」、ADR 0007 の「�
   - Chrome のパスワードの欄に Tab で移ると、Chrome は text-input を切る。ホストは「欄がない」（状態 0）と言うので、Air は入力方式を使ったまま：日本語は Air の帯に、伏せ字にならずに出る。ASCII はキーとしてパスワードの欄に入る。Secure Event Input も、英字だけにする制限も、かからない。クリックで入ったときは、パスワードの欄として扱われる。
   - Blender がパスワードの欄だと言うかは、見ていない（同じ危うさがあるかもしれない）。
   - 調べるための記録（`DAILY_KEY_RECORD=1`、GStreamer のデバッグ出力）からは、打った文字が組み立て直せる（前の節）。
+### アプリの表（`setup` のときに見るもの。2026-11-19 15:2x、結合した試用のコンポジターを自分のフォルダーでビルドしたもの、自分のフォルダーのアプリ、作った文字だけ）
+
+| アプリ | 変換中の文字 | パスワードの欄を見分けるか | メモ |
+|---|---|---|---|
+| Firefox（試用のフォルダーの Mozilla のビルド） | アプリの中（見た） | ときどき（見た）：クリックや Tab で入ると、パスワードだと言う（content_type 192, 8）ときと、text-input を切る（状態 0）ときがある | 欄の場所はキャレットに合う（見た）。プログラムがフォーカスを動かすと、変換中の文字を、元の欄に確定する（見た）。そのとき欄の番号が変わるので、Air の変換は取り消す（Air の側は考え） |
+| Blender（持ち主の設定の写し） | アプリの中（見た。アウトライナーの名前） | 分からない（パスワードの欄がない） | 場所は 1×1 の点。起動の窓（スプラッシュ）が出ているあいだのキーは、届かない |
+| テキストエディター | アプリの中（見た） | （パスワードの欄はない） | 前のページを覚えて開くと、最初は有効にしない（キーボードを伝え直して直した） |
+| Chrome | アプリの中（見た） | クリックで入ると言う。Tab では text-input を切る（分かっている危うさ） | |
+
+- 速く交互に打つ（確定、すぐに Enter や英字、30 回）：試用のコンポジターに順番の門（`gst-wayland-display-trial-z-text-order.patch`）を入れる前は、テキストエディターで 30 行すべての順が崩れた（確定した文字が、その前のキーを追い越した。見た）。入れたあとは、エディター、Firefox、Chrome で 30 行すべて正しい順（見た）。Chrome は、キーのあとに状態を返さないので、キーのあとの文字は最大 0.1 秒待つ。
+- 絵文字と、結合文字（か＋濁点）の変換中の文字：下線と選んでいる範囲が、正しい文字の上に出た（テキストエディター、見た）。Air の側の UTF-16 から UTF-8 への直しは、単体の試験で確かめた（見たのは試験の結果）。
+- クリック：変換中にクリックすると、Air で 1 回だけ確定し、そのあとでクリックが行く（手元の Mac と同じ。Air の側は考え。順番の門で、クリックは確定のあとに届く）。
+- 接続が切れたとき：エージェントが、変換中の文字を消す（試験で確かめた）。
+
+- **欄の外**（状態 3、2026-11-19）：アプリが text-input を持ち、どれも有効でないとき、Air は入力方式を通さずキーを送り、帯を出さない。ただし、その知らせが、最後のクリックやフォーカスを動かしうるキーより新しいときだけ。`ISTESSO_OUTSIDE_FIELD=ime` でこれまでどおり。ホストで見たこと（自分のコンポジター）：Tab、Ctrl+L、Ctrl+F、Esc でフォーカスが動くと、エディター、Firefox、Chrome は text-input を有効にしたり切ったりし、そのたびに知らせが届いた（あいだに、短い「欄の外」がはさまる）。結合した試用のビルドは、text-input の確定ごとの知らせを失っていた（直した。それまでは、キーボードが動いたときにしか知らせなかった）。
 - 確かめていないこと：Mac のビューアーで人が打つこと（帯、候補の窓の場所、パスワードの欄、Secure Event Input）。試用への `setup` は、まとめ役の合図を待つ。
 
 ## ランチャー（A の最初の一歩）※まだ作っていない

@@ -198,8 +198,13 @@ class Counting(unittest.TestCase):
             def get_name(self):
                 return "wayland.text-input"
 
+            values = {"state": 2, "x": 10, "y": 20, "width": 1, "height": 16, "serial": 257}
+
             def get_value(self, key):
-                return {"state": 2, "x": 10, "y": 20, "width": 1, "height": 16}[key]
+                return self.values[key]
+
+            def has_field(self, key):
+                return key in self.values
 
         with io.StringIO() as said, contextlib.redirect_stderr(said):
             tell(Structure())
@@ -209,6 +214,9 @@ class Counting(unittest.TestCase):
         self.assertEqual(args[0], 4660)
         self.assertEqual(args[1]._obj.state, 2)
         self.assertEqual((args[1]._obj.x, args[1]._obj.height), (10, 16))
+        # The field's serial goes as 0 to 255 (the struct of istesso_media.h has 24 bytes now).
+        self.assertEqual(args[1]._obj.serial, 1)
+        self.assertEqual(ctypes.sizeof(pipeline.MediaTextInput), 24)
 
     def test_the_line_says_what_went_through(self):
         flow, _ = flow_with(lambda now: 0)

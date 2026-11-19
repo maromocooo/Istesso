@@ -172,7 +172,7 @@ class MediaTextInput(ctypes.Structure):
 
     _fields_ = [
         ("state", ctypes.c_uint32), ("x", ctypes.c_int32), ("y", ctypes.c_int32),
-        ("width", ctypes.c_uint32), ("height", ctypes.c_uint32),
+        ("width", ctypes.c_uint32), ("height", ctypes.c_uint32), ("serial", ctypes.c_uint32),
     ]
 
 
@@ -222,7 +222,8 @@ def take_media():
         setter = lib.istesso_media_host_set_text_input
         setter.restype = ctypes.c_int32
         setter.argtypes = [ctypes.c_void_p, ctypes.POINTER(MediaTextInput)]
-        field = MediaTextInput(*(structure.get_value(k) for k in ("state", "x", "y", "width", "height")))
+        serial = structure.get_value("serial") if structure.has_field("serial") else 0
+        field = MediaTextInput(*(structure.get_value(k) for k in ("state", "x", "y", "width", "height")), serial % 256)
         result = setter(host, ctypes.byref(field))
         if not seen.get("said"):
             # Once: that the viewers are told about the field (never where it is).

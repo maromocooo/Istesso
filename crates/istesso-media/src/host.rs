@@ -216,6 +216,10 @@ struct Watcher {
     /// without saying that it will be long.
     #[cfg(test)]
     hold_ms: AtomicU64,
+    /// For tests: after this many more packets sealed whole, the next is sealed but not put
+    /// on the connection, as if the connection took only part of it. `u32::MAX`: never.
+    #[cfg(test)]
+    part_after: std::sync::atomic::AtomicU32,
     /// When something was last sent, on [`clock::now_ns`].
     last_sent_ns: AtomicU64,
     /// Which cursor this viewer was told last (its number), and when.
@@ -573,6 +577,17 @@ impl Host {
         }
     }
 
+    /// Makes the connection of the viewer called `name` take only part of the packet that
+    /// comes after `whole` more packets that it takes whole.
+    #[cfg(test)]
+    pub(crate) fn part_after(&self, name: &str, whole: u32) {
+        for watcher in self.shared.watchers().list.iter() {
+            if watcher.peer.name == name {
+                watcher.part_after.store(whole, Ordering::SeqCst);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         self.shared.pending.load(Ordering::SeqCst)
@@ -759,6 +774,21 @@ impl Shared {
         );
         // Sealing writes into memory; only `push` touches the connection.
         line.channel.send(packet)?;
+        #[cfg(test)]
+        {
+            let left = watcher.part_after.load(Ordering::SeqCst);
+            if left != u32::MAX {
+                if left == 0 {
+                    // Not pushed: it waits as the rest of a packet does.
+                    watcher.part_after.store(u32::MAX, Ordering::SeqCst);
+                    line.unsent_since = Some(Instant::now());
+                    watcher.unsent.store(true, Ordering::SeqCst);
+                    watcher.wake.wake();
+                    return Ok(Sealed::Part);
+                }
+                watcher.part_after.store(left - 1, Ordering::SeqCst);
+            }
+        }
         if line.channel.stream().push()? {
             return Ok(Sealed::Whole);
         }
@@ -828,18 +858,20 @@ impl Shared {
         if sealed == Sealed::Part {
             return Offered::Queued;
         }
-        // The cursor goes behind the frame, never in front of it.
-        if self.cursor_due(watcher) == Some(Duration::ZERO) {
-            if let Err(err) = self.tell_cursor(watcher, &mut line) {
+        // The text field goes behind the frame (trial only; never set, nothing happens here),
+        // before the cursor: it is small, and a large cursor that changes with every frame
+        // would otherwise keep it waiting.
+        if self.field_due(watcher) == Some(Duration::ZERO) {
+            if let Err(err) = self.tell_field(watcher, &mut line) {
                 drop(line);
                 self.close(watcher, &err);
                 return Offered::Written;
             }
         }
-        // So does the text field (trial only; never set, nothing happens here), but only on a
-        // connection with nothing left half sent: the cursor may have gone out only in part.
-        if line.unsent_since.is_none() && self.field_due(watcher) == Some(Duration::ZERO) {
-            if let Err(err) = self.tell_field(watcher, &mut line) {
+        // The cursor goes behind the frame, never in front of it, and only on a connection
+        // with nothing left half sent (the field may have gone out only in part).
+        if line.unsent_since.is_none() && self.cursor_due(watcher) == Some(Duration::ZERO) {
+            if let Err(err) = self.tell_cursor(watcher, &mut line) {
                 drop(line);
                 self.close(watcher, &err);
             }
@@ -1071,6 +1103,8 @@ impl Shared {
             last_frame_ns: AtomicU64::new(0),
             #[cfg(test)]
             hold_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            part_after: std::sync::atomic::AtomicU32::new(u32::MAX),
             last_sent_ns: AtomicU64::new(clock::now_ns()),
             cursor_told: AtomicU64::new(0),
             cursor_told_ns: AtomicU64::new(0),

@@ -723,6 +723,11 @@ mod tests {
             [
                 key(30, false),
                 key(42, false),
+                // No composing text stays in the application either.
+                InputEvent::Preedit {
+                    text: String::new(),
+                    cursor: [0, 0]
+                },
                 key(42, true),
                 InputEvent::PointerAt { x: 7, y: 8 }
             ]

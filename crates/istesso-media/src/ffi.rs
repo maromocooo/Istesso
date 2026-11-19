@@ -661,12 +661,14 @@ fn frame_for_c(got: &Frame<'_>) -> IstessoMediaFrame {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IstessoMediaTextInput {
-    /// 0 no field, 1 a field, 2 a password field.
+    /// 0 nothing known, 1 a field, 2 a password field, 3 not in a field.
     pub state: u32,
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// The field's serial (0 to 255): changes whenever another field has the keyboard.
+    pub serial: u32,
 }
 
 /// # Safety
@@ -681,16 +683,18 @@ pub unsafe extern "C" fn istesso_media_host_set_text_input(
         remember("no host, or no field, was given");
         return -1;
     };
-    let (Ok(state), Ok(width), Ok(height)) = (
+    let (Ok(state), Ok(width), Ok(height), Ok(serial)) = (
         u8::try_from(field.state),
         u16::try_from(field.width),
         u16::try_from(field.height),
+        u8::try_from(field.serial),
     ) else {
         remember("the text field's numbers are out of range");
         return -1;
     };
     let field = crate::wire::TextField {
         state,
+        serial,
         x: field.x,
         y: field.y,
         width,
@@ -731,6 +735,7 @@ pub unsafe extern "C" fn istesso_media_watch_text_input(
             y: now.y,
             width: u32::from(now.width),
             height: u32::from(now.height),
+            serial: u32::from(now.serial),
         }
     };
     1

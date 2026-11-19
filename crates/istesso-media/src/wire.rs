@@ -52,8 +52,10 @@
 //!
 //! ```text
 //!   offset  bytes  content
-//!   0       1      state: 0 no field, 1 a field, 2 a password field
-//!   1       1      reserved, 0
+//!   0       1      state: 0 nothing known, 1 a field, 2 a password field, 3 not in a field
+//!                  (the application has a text input there and none is enabled)
+//!   1       1      the field's serial: one more (mod 256) whenever another field, or the
+//!                  same one enabled again, has the keyboard (an earlier version wrote 0)
 //!   2       2      length of this fixed part (16 in this version)
 //!   4       4      text cursor, x, in the picture's pixels (signed)
 //!   8       4      y
@@ -248,8 +250,11 @@ pub enum Kind {
 /// is, in the picture's pixels. Trial only (ADR 0015, "文字の入力の欄").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TextField {
-    /// 0 no field, 1 a field, 2 a password field.
+    /// 0 nothing known, 1 a field, 2 a password field, 3 not in a field.
     pub state: u8,
+    /// One more (mod 256) whenever another field has the keyboard: the viewer ends its
+    /// composition when it changes.
+    pub serial: u8,
     pub x: i32,
     pub y: i32,
     pub width: u16,
@@ -514,14 +519,14 @@ pub fn decode_cursor(body: &[u8]) -> Result<Cursor<'_>, WireError> {
 }
 
 /// Writes one packet that says what the text field is into `out`, replacing what was there.
-/// A state other than 0, 1 or 2 is not written.
+/// A state above 3 is not written.
 pub fn encode_text_field(field: &TextField, seq: u64, out: &mut Vec<u8>) -> Result<(), WireError> {
-    if field.state > 2 {
+    if field.state > 3 {
         return Err(WireError::TextField);
     }
     let mut body = Vec::with_capacity(TEXT_FIELD_FIXED_LEN);
     body.push(field.state);
-    body.push(0);
+    body.push(field.serial);
     body.extend_from_slice(&(TEXT_FIELD_FIXED_LEN as u16).to_le_bytes());
     body.extend_from_slice(&field.x.to_le_bytes());
     body.extend_from_slice(&field.y.to_le_bytes());
@@ -538,13 +543,14 @@ pub fn decode_text_field(body: &[u8]) -> Result<TextField, WireError> {
         return Err(WireError::TextField);
     }
     let fixed = usize::from(u16::from_le_bytes([body[2], body[3]]));
-    if fixed < TEXT_FIELD_FIXED_LEN || fixed > body.len() || body[0] > 2 {
+    if fixed < TEXT_FIELD_FIXED_LEN || fixed > body.len() || body[0] > 3 {
         return Err(WireError::TextField);
     }
     let quad = |at: usize| i32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
     let pair = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
     Ok(TextField {
         state: body[0],
+        serial: body[1],
         x: quad(4),
         y: quad(8),
         width: pair(12),
@@ -755,6 +761,7 @@ mod tests {
     fn a_text_field_comes_back_as_it_was_written_and_an_unknown_state_is_refused() {
         let field = TextField {
             state: 2,
+            serial: 201,
             x: -3,
             y: 191,
             width: 0,
@@ -772,13 +779,13 @@ mod tests {
         longer.extend_from_slice(&[9, 9, 9, 9]);
         assert_eq!(decode_text_field(&longer), Ok(field));
         let mut unknown = packet[at.clone()].to_vec();
-        unknown[0] = 3;
+        unknown[0] = 4;
         assert_eq!(decode_text_field(&unknown), Err(WireError::TextField));
         assert_eq!(
             decode_text_field(&packet[at][..15]),
             Err(WireError::TextField)
         );
-        let odd = TextField { state: 3, ..field };
+        let odd = TextField { state: 4, ..field };
         assert_eq!(
             encode_text_field(&odd, 0, &mut Vec::new()),
             Err(WireError::TextField)
