@@ -903,6 +903,7 @@ dependencies = [
  "clap",
  "istesso-agent",
  "istesso-catalog",
+ "istesso-devices",
  "istesso-doctor",
  "istesso-link",
  "istesso-measure",
