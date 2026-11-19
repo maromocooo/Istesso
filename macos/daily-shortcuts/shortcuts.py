@@ -22,6 +22,7 @@ HANDLER = "Istesso Dev Open"
 PREFIX = "com.maromoco.istesso-dev."
 SCHEME = "istesso-dev-open"
 MANIFEST = ".daily-shortcuts.json"
+BUILD_VERSION = 3
 LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
               "LaunchServices.framework/Support/lsregister")
 OWNER_LIST = Path.home() / ".config/istesso/daily-shortcuts-owner-apps.txt"
@@ -84,8 +85,8 @@ def write_plist(path, data):
     path.write_bytes(plistlib.dumps(data))
 
 
-def sign(bundle, identifier):
-    subprocess.run(["/bin/bash", ROOT / "scripts/daily-sign.sh", bundle, identifier], check=True)
+def sign(bundle, identifier, *options):
+    subprocess.run(["/bin/bash", ROOT / "scripts/daily-sign.sh", bundle, identifier, *options], check=True)
 
 
 def build_bundle(folder, title, source, flags, extra, routes=None, executable="Shortcut"):
@@ -102,7 +103,8 @@ def build_bundle(folder, title, source, flags, extra, routes=None, executable="S
         write_plist(contents / "Resources/Routes.plist", routes)
     subprocess.run(["clang", "-O2", "-Wall", "-Wextra", "-Werror", SOURCE / source, *flags,
                     "-o", contents / "MacOS" / executable], check=True)
-    sign(contents.parent, identifier)
+    options = ["--options", "runtime"] if source == "owner-shim.c" else []
+    sign(contents.parent, identifier, *options)
 
 
 def build(folder, rows, checkout):
@@ -288,7 +290,7 @@ def run(action, host, ubuntu):
             with tempfile.TemporaryDirectory(dir=STAGE) as tmp:
                 next_build = Path(tmp) / "bundles"
                 build(next_build, rows, ROOT)
-                (next_build / "apps.json").write_text(json.dumps({"version": 2, "apps": rows}))
+                (next_build / "apps.json").write_text(json.dumps({"version": BUILD_VERSION, "apps": rows}))
                 tool = next_build / "bundle-tool"
                 subprocess.run(["clang", "-Wall", "-Wextra", "-Werror", SOURCE / "bundle-tool.m",
                                 "-fobjc-arc", "-framework", "CoreServices", "-framework", "Foundation",
@@ -299,7 +301,7 @@ def run(action, host, ubuntu):
                     next_build.rename(current)
             print("Built trial shortcuts in build/shortcuts/bundles.")
         elif action == "install":
-            expected = {"version": 2, "apps": [list(row) for row in rows]}
+            expected = {"version": BUILD_VERSION, "apps": [list(row) for row in rows]}
             if not current.exists() or json.loads((current / "apps.json").read_text()) != expected:
                 raise ValueError("run scripts/daily.sh shortcuts build first")
             DEST.mkdir(parents=True, exist_ok=True)

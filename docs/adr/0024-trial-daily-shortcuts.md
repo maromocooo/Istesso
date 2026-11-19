@@ -21,6 +21,8 @@ Safari、Notes、Finder、Preview、Dia には持ち主の内容が映ります�
 
 持ち主が Air で Dia などを手で開けるようにします。上の 5 つのアプリのうち、持ち主が自分の一覧に書いたものだけに専用の包みを作ります。`desktop` の包みは作りません。
 
-専用の包みの実行ファイルは `Contents/MacOS/istesso-owner-shim` です。同じチェックアウトの `scripts/daily.sh` を子として直接起動し、終わるまで待ちます。これで Mac 側が起動元をたどれます。引数は作成時に決めた `open <アプリ名> --host mac` で、表示先は Air です。子には `DAILY_OWNER=1` と `DAILY_OPEN_HANDLER=1` を渡します。
+専用の包みの実行ファイルは `Contents/MacOS/istesso-owner-shim` です。強化ランタイムを有効にして署名します。同じチェックアウトの `scripts/daily.sh` を子として直接起動し、終わるまで待ちます。これで Mac 側が起動元をたどれます。引数は作成時に決めた `open <アプリ名> --host mac` で、表示先は Air です。
+
+起動元の環境変数で Mac 側のスクリプトや接続先が変わるのを防ぐため、子の環境は毎回作ります。`HOME`、`USER`、`LOGNAME` は実ユーザー ID に対応するアカウントから、`TMPDIR` は macOS から取得します。取得に失敗したら起動しません。残りは `PATH=/usr/bin:/bin:/usr/sbin:/sbin`、`LANG=en_US.UTF-8`、`DAILY_OWNER=1`、`DAILY_OPEN_HANDLER=1` です。SSH は持ち主が開いている接続を使い回します。
 
 この包みを起動できるプログラムは、持ち主と同じようにそのアプリを開けます。起動元をたどっても、持ち主が手で開いたかは分かりません。試用版ではこの危うさを受け入れます。専用の近道を開くのは持ち主だけです。エージェントが起動しないことは、作業の規約で定めます。

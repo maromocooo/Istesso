@@ -289,7 +289,7 @@ scripts/daily.sh shortcuts build
 scripts/daily.sh shortcuts install
 ```
 
-`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ設定で署名します。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。Ubuntu のアイコンは、このときだけ `ISTESSO_HOST` のホストから読みます。Ubuntu のアイコンを取得できないときと、Mac ホスト用の近道には、標準のアイコンを使います。
+`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ署名 ID で署名します。持ち主用の包みには強化ランタイムを付けます。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。Ubuntu のアイコンは、このときだけ `ISTESSO_HOST` のホストから読みます。Ubuntu のアイコンを取得できないときと、Mac ホスト用の近道には、標準のアイコンを使います。
 
 Spotlight か Alfred で `Blender (Ubuntu)`、`Firefox (Ubuntu)`、`Text Editor (Ubuntu)`、`Chrome (Ubuntu)` を検索して開きます。Dock に置くには、Finder で使いたい近道を Dock にドラッグします。
 

@@ -142,13 +142,13 @@ class ShortcutsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "line 2: only Safari, Notes, Finder, Preview and Dia"):
                     sc.app_list("", mac_list, owner_list)
 
-    def test_listed_owner_shim_spawns_fixed_child(self):
+    def test_listed_owner_bundle_requests_hardened_runtime(self):
         owner_list = self.checkout / "daily-shortcuts-owner-apps.txt"
         owner_list.write_text("dIA.ApP\n")
         stage = self.checkout / "stage"
         (self.scripts / "measuring.sh").symlink_to(sc.ROOT / "scripts/measuring.sh")
         with patch.object(sc, "OWNER_LIST", owner_list), patch.object(sc, "STAGE", stage), \
-                patch.object(sc, "ROOT", self.checkout), patch.object(sc, "sign"):
+                patch.object(sc, "ROOT", self.checkout), patch.object(sc, "sign") as sign:
             sc.run("build", "", "")
         bundles = stage / "bundles"
         title = "Dia (Studio)"
@@ -158,21 +158,62 @@ class ShortcutsTest(unittest.TestCase):
                          {title, "TextEdit (Studio)", sc.HANDLER})
         contents = bundles / (title + ".staged") / "Contents"
         info = plistlib.loads((contents / "Info.plist").read_bytes())
+        self.assertTrue((contents / "MacOS/istesso-owner-shim").is_file())
+        for call in sign.call_args_list:
+            bundle, identifier, *options = call.args
+            self.assertEqual(identifier, sc.bundle_id(bundle.stem))
+            self.assertEqual(options, ["--options", "runtime"] if bundle.stem == title else [])
+        self.assertEqual({call.args[0].stem for call in sign.call_args_list},
+                         {title, "TextEdit (Studio)", sc.HANDLER})
         self.assertEqual(info["CFBundleExecutable"], "istesso-owner-shim")
         self.assertEqual(info["CFBundleIdentifier"], sc.bundle_id(title))
         self.assertNotIn("CFBundleURLTypes", info)
         config = plistlib.loads((bundles / (sc.HANDLER + ".staged") /
                                  "Contents/Resources/Routes.plist").read_bytes())
         self.assertFalse(any(args[1].lower() == "dia" for args in config["routes"].values()))
-        with self.daily.open("a") as script:
-            script.write('echo "$PPID" > parent\nexit 37\n')
-        env = dict(os.environ, DAILY_OWNER="0", DAILY_OPEN_HANDLER="0")
-        with subprocess.Popen([contents / "MacOS/istesso-owner-shim", "--for", "aura", "--slot", "3"],
-                              cwd=self.checkout, env=env) as shim:
-            self.assertEqual(shim.wait(timeout=10), 37)
-            self.assertEqual((self.checkout / "parent").read_text().strip(), str(shim.pid))
-        self.assert_recorded("open", "dia", "--host", "mac")
-        self.assertEqual((self.checkout / "flags").read_text().splitlines(), ["1", "1"])
+
+    def build_spawn_test(self, *, stub_tempdir=False):
+        # Compile a stand-alone driver with an inert child. Only the owner runs the bundled shim.
+        driver = self.checkout / "spawn-test"
+        cc = ["clang", "-Wall", "-Wextra", "-Werror"]
+        if stub_tempdir:
+            cc += ["-Dconfstr=fixture_confstr", sc.SOURCE / "test-owner-tempdir.c"]
+        sc.check_measurement()
+        subprocess.run([*cc, sc.SOURCE / "test-owner-child.c", "-o", self.daily], check=True)
+        sc.check_measurement()
+        subprocess.run([*cc, sc.SOURCE / "owner-shim.c", '-DOWNER_APP="fixture"',
+                        "-DDAILY_SCRIPT=" + json.dumps(str(self.daily)), "-o", driver], check=True)
+        return driver
+
+    def run_spawn_test(self, driver, *, sources_available=True):
+        env = dict.fromkeys(("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "DAILY_OWNER",
+                             "DAILY_OPEN_HANDLER", "DAILY_MAC_SCRIPT", "ISTESSO_MAC_HOST", "BASH_ENV",
+                             "DYLD_TEST_MARKER", "SSH_AUTH_SOCK", "EXTRA_MARKER"), "ignored")
+        env["TMPDIR"] = str(self.checkout)
+        with subprocess.Popen([driver, "--for", "aura", "--slot", "3"], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            output, error = process.communicate(timeout=10)
+            if sources_available:
+                self.assertEqual((process.returncode, error), (37, ""))
+                self.assertEqual(output.splitlines(), [str(process.pid), "open", "fixture", "--host", "mac"])
+            else:
+                self.assertEqual((process.returncode, output, error),
+                                 (1, "", "Could not build the owner shortcut environment.\n"))
+
+    def test_owner_spawn_system_lookups(self):
+        driver = self.build_spawn_test()
+        result = subprocess.run([self.daily, "--check-sources"], env={})
+        self.assertIn(result.returncode, (0, 1))
+        self.run_spawn_test(driver, sources_available=result.returncode == 0)
+
+    def test_owner_spawn_environment_arguments_and_status(self):
+        driver = self.build_spawn_test(stub_tempdir=True)
+        for hardened in (False, True):
+            with self.subTest(hardened=hardened):
+                if hardened:
+                    subprocess.run(["codesign", "--force", "--sign", "-", "--options", "runtime", driver],
+                                   check=True, capture_output=True)
+                self.run_spawn_test(driver)
 
     def test_repeated_refusals_log_once(self):
         url = f"{sc.SCHEME}://open/desktop?host=mac"
@@ -261,12 +302,13 @@ class ShortcutsTest(unittest.TestCase):
         (stage / "bundles").mkdir(parents=True)
         ubuntu = "editor\tText Editor"
         rows = sc.app_list(ubuntu, sc.SOURCE / "mac-apps.txt")
-        (stage / "bundles/apps.json").write_text(json.dumps(rows))
         with patch.object(sc, "STAGE", stage), patch.object(sc, "DEST", self.checkout / "dest"), \
                 patch.object(sc, "OWNER_LIST", self.checkout / "missing"):
-            with patch.object(sc, "install") as install, self.assertRaisesRegex(ValueError, "build first"):
-                sc.run("install", "", ubuntu)
-            install.assert_not_called()
+            for old in (rows, {"version": 2, "apps": rows}):
+                (stage / "bundles/apps.json").write_text(json.dumps(old))
+                with patch.object(sc, "install") as install, self.assertRaisesRegex(ValueError, "build first"):
+                    sc.run("install", "", ubuntu)
+                install.assert_not_called()
 
     def test_icon_size_and_signature_checked_before_conversion(self):
         signature = b"\x89PNG\r\n\x1a\n"
