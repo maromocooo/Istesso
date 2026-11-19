@@ -256,6 +256,8 @@ static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
 pub struct RawMode;
 
 impl RawMode {
+    /// What was typed before (while the connection was being made) is kept
+    /// and passed on, not thrown away.
     pub fn enter(fd: RawFd) -> io::Result<RawMode> {
         // SAFETY: `tcgetattr` fills a `termios` that lives for the call;
         // `cfmakeraw` changes it in place; `tcsetattr` reads it.
@@ -267,7 +269,7 @@ impl RawMode {
             *SAVED.lock().unwrap_or_else(|e| e.into_inner()) = Some(settings);
             let mut raw = settings;
             libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) != 0 {
+            if libc::tcsetattr(fd, libc::TCSADRAIN, &raw) != 0 {
                 return Err(io::Error::last_os_error());
             }
         }
@@ -279,16 +281,27 @@ impl RawMode {
         if let Some(settings) = SAVED.lock().unwrap_or_else(|e| e.into_inner()).take() {
             // SAFETY: `tcsetattr` reads the saved settings.
             unsafe {
-                libc::tcsetattr(fd, libc::TCSAFLUSH, &settings);
+                libc::tcsetattr(fd, libc::TCSADRAIN, &settings);
             }
         }
     }
 }
 
+/// Does nothing. Installed for the signals that [`wait_signal`] takes, and
+/// never run, since they are blocked.
+extern "C" fn take_nothing(_: libc::c_int) {}
+
 /// Blocks the signals in `signals` for the calling thread and for the
 /// threads it starts afterwards, so that only [`wait_signal`] receives them.
+///
+/// Each gets a handler that does nothing, which never runs. Without one,
+/// macOS drops a signal whose default is to be ignored (`SIGWINCH`, a new
+/// window size) as soon as it is sent, even while it is blocked and waited
+/// for.
 pub fn block_signals(signals: &[libc::c_int]) -> libc::sigset_t {
-    // SAFETY: the set is initialised by sigemptyset before use.
+    // SAFETY: the set is initialised by sigemptyset before use; the handler
+    // is a function that does nothing, installed after the signals are
+    // blocked in this thread.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
@@ -296,6 +309,9 @@ pub fn block_signals(signals: &[libc::c_int]) -> libc::sigset_t {
             libc::sigaddset(&mut set, *signal);
         }
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        for signal in signals {
+            libc::signal(*signal, take_nothing as *const () as libc::sighandler_t);
+        }
         set
     }
 }
@@ -308,4 +324,46 @@ pub fn wait_signal(set: &libc::sigset_t) -> libc::c_int {
         libc::sigwait(set, &mut signal);
     }
     signal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_window_size_is_heard_by_the_thread_that_waits_for_it() {
+        // In a thread of its own: the signals stay blocked there only.
+        let heard = std::thread::spawn(|| {
+            let set = block_signals(&[libc::SIGWINCH]);
+            // SAFETY: sends a signal to this thread, where it is blocked.
+            unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGWINCH) };
+            wait_signal(&set)
+        });
+        assert_eq!(heard.join().unwrap(), libc::SIGWINCH);
+    }
+
+    #[test]
+    fn a_terminal_has_a_size_and_a_pipe_has_none() {
+        let (master, slave) = open_pty(132, 43).unwrap();
+        assert_eq!(size(slave.as_raw_fd()), Some((132, 43)));
+        set_size(master.as_raw_fd(), 80, 24).unwrap();
+        assert_eq!(size(slave.as_raw_fd()), Some((80, 24)));
+        assert!(is_terminal(slave.as_raw_fd()));
+        let mut fds = [0; 2];
+        // SAFETY: `pipe` writes two descriptors, closed again below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pipe = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        assert_eq!(size(pipe.0.as_raw_fd()), None);
+        assert!(!is_terminal(pipe.0.as_raw_fd()));
+    }
+
+    #[test]
+    fn both_ends_of_a_new_terminal_are_closed_on_exec() {
+        let (master, slave) = open_pty(80, 24).unwrap();
+        for fd in [&master, &slave] {
+            // SAFETY: reads the flags of a descriptor this test owns.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
 }
