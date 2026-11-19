@@ -35,6 +35,8 @@
 //                              with nothing on the screen)
 //   ISTESSO_PID_FILE=PATH      write this program's process number to PATH once it runs: for a
 //                              program started through `open`, which does not say it
+//   ISTESSO_PRETEND_RESIZE=WxH for checks with ISTESSO_DAILY_RECONNECT: four seconds after the start,
+//                              as if the person had resized the window by hand to WxH points
 //   ISTESSO_TITLE_FILE=PATH    the signal USR1 sets the window's title to the first line of PATH
 //                              (a window of the application wants attention, and back); when the
 //                              second line is "attention", the Dock tile asks for attention once
@@ -1010,26 +1012,48 @@ static size_t split_access_unit(const uint8_t *data, size_t size, NalUnit *units
 // its top left where it was, and all of it on its screen (made smaller as a whole if needed).
 static NSWindow *picture_window = nil;
 static BOOL picture_whole_display = NO;
+// Points of the window to one pixel of the host's picture, as the window was first made (0: not
+// known yet). Kept when the window follows another size, so that the pixels stay as they were.
+static double points_per_pixel = 0;
+// A resize was asked of the host, and its answer (the next stream's size) is awaited.
+static BOOL resize_asked = NO;
 
-static void window_follows_picture(int width, int height, int was_width) {
+#include "window-size.h"
+
+static void window_follows_picture(int width, int height) {
     if (picture_window == nil || picture_whole_display || width <= 0 || height <= 0) {
         return;
     }
     NSRect frame = picture_window.frame;
     NSRect content = [picture_window contentRectForFrameRect:frame];
-    CGFloat each = was_width > 0 ? content.size.width / was_width : 1.0;
     CGFloat bar = frame.size.height - content.size.height;
     NSRect room = (picture_window.screen ?: NSScreen.mainScreen).visibleFrame;
-    CGFloat fit = MIN(1.0, MIN(room.size.width / (width * each), (room.size.height - bar) / (height * each)));
-    NSSize size = NSMakeSize(floor(width * each * fit), floor(height * each * fit));
+    double w, h;
+    window_size_for_picture((unsigned)width, (unsigned)height, points_per_pixel, room.size.width, room.size.height - bar, &w, &h);
     NSPoint top_left = NSMakePoint(NSMinX(frame), NSMaxY(frame));
-    [picture_window setContentSize:size];
+    [picture_window setContentSize:NSMakeSize(w, h)];
     NSRect now = picture_window.frame;
     top_left.x = MAX(NSMinX(room), MIN(top_left.x, NSMaxX(room) - now.size.width));
     top_left.y = MIN(NSMaxY(room), MAX(top_left.y, NSMinY(room) + now.size.height));
     [picture_window setFrameTopLeftPoint:top_left];
-    fprintf(stderr, "window: %.0fx%.0f points for a picture of %dx%d (top left %.0f,%.0f)\n", size.width, size.height, width, height,
-            top_left.x, top_left.y);
+    fprintf(stderr, "window: %.0fx%.0f points for a picture of %dx%d (top left %.0f,%.0f)\n", w, h, width, height, top_left.x, top_left.y);
+}
+
+// The person has stopped resizing the window by hand (the end of a live resize): once, the host is
+// asked for a picture of the size the window's picture area now has. While the window is being
+// resized nothing is sent (the picture is only made larger or smaller). The answer is the next
+// stream's size, to which the window then goes; that is never asked about again.
+static void send_input(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void ask_for_window_size(void) {
+    if (picture_window == nil || picture_whole_display) {
+        return;
+    }
+    NSRect content = [picture_window contentRectForFrameRect:picture_window.frame];
+    unsigned width, height;
+    picture_size_for_window(content.size.width, content.size.height, points_per_pixel, &width, &height);
+    resize_asked = YES;
+    send_input("{\"kind\":\"resize\",\"width\":%u,\"height\":%u}", width, height);
+    fprintf(stderr, "note: asked the host for a picture of %ux%u (the window was resized by hand)\n", width, height);
 }
 
 // Sets VideoToolbox up for a stream with these parameter sets, unless it is set up for them already.
@@ -1069,12 +1093,24 @@ static gboolean channel_configure(const NalUnit *sets[3]) {
     int was_width = picture_width, was_height = picture_height;
     picture_width = size.width;
     picture_height = size.height;
-    // A new decoder for the new parameter sets is made below; the window follows a new size.
-    if (daily_reconnect && was_width > 0 && (was_width != size.width || was_height != size.height)) {
+    // A new decoder for the new parameter sets is made below; the window follows a new size, and
+    // goes to the answer of a resize that was asked for even when the size stayed the same.
+    if (daily_reconnect) {
         int width = size.width, height = size.height;
-        fprintf(stderr, "note: the host's picture is %dx%d now (it was %dx%d)\n", width, height, was_width, was_height);
+        BOOL changed = was_width > 0 && (was_width != size.width || was_height != size.height);
+        if (changed) {
+            fprintf(stderr, "note: the host's picture is %dx%d now (it was %dx%d)\n", width, height, was_width, was_height);
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
-            window_follows_picture(width, height, was_width);
+            if (points_per_pixel <= 0 && picture_window != nil && !picture_whole_display) {
+                // As the window was made for the first picture.
+                NSRect content = [picture_window contentRectForFrameRect:picture_window.frame];
+                points_per_pixel = content.size.width / width;
+            }
+            if (changed || resize_asked) {
+                resize_asked = NO;
+                window_follows_picture(width, height);
+            }
         });
     }
     vt_srgb = channel_info.colour == 1;
@@ -2120,7 +2156,8 @@ int main(int argc, char *argv[]) {
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO]
             : [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
-                                          styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                          styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                     (daily_reconnect ? NSWindowStyleMaskResizable : 0))
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
         window.title = [NSString stringWithUTF8String:argv[5]];
@@ -2138,6 +2175,35 @@ int main(int argc, char *argv[]) {
         window.contentView = view;
         picture_window = window;
         picture_whole_display = whole_display;
+        if (daily_reconnect && !whole_display) {
+            // The everyday trial (the Mac host's docs/m4-daily-host.md): when this window becomes
+            // the one typed into, the host brings the application's window to the front; when the
+            // person has resized it by hand, the host is asked once for a picture of that size.
+            [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidBecomeKeyNotification
+                                                            object:window
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) {
+                                                            (void)note;
+                                                            send_input("{\"kind\":\"focus\"}");
+                                                        }];
+            [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidEndLiveResizeNotification
+                                                            object:window
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) {
+                                                            (void)note;
+                                                            ask_for_window_size();
+                                                        }];
+            // For checks that must not touch the window: behave, once the first picture is there,
+            // as if the person had resized the window by hand to WxH points.
+            const char *pretend = getenv("ISTESSO_PRETEND_RESIZE");
+            double pretend_w = 0, pretend_h = 0;
+            if (pretend != NULL && sscanf(pretend, "%lfx%lf", &pretend_w, &pretend_h) == 2 && pretend_w > 0 && pretend_h > 0) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                    [window setContentSize:NSMakeSize(pretend_w, pretend_h)];
+                    ask_for_window_size();
+                });
+            }
+        }
         if (input_socket >= 0) {
             [window makeFirstResponder:view];
         }

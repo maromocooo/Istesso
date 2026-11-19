@@ -434,6 +434,21 @@ pub enum InputEvent {
     /// has the keyboard. Never logged. See [`text_is_acceptable`] for the
     /// limits; a receiver drops a piece that is not within them.
     Text { text: String },
+    /// The sender's window that shows this picture became the one typed into (trial only, the
+    /// Mac host): the host brings the session's application and its shown window to the front,
+    /// so that the next key is taken at once.
+    Focus,
+    /// The sender's window was resized by its user, once the resizing has ended (trial only, the
+    /// Mac host): the size its picture area would like, in the picture's own pixels. The host
+    /// resizes the application's shown window as near to it as the application lets it, and
+    /// answers with a new stream of the size taken (the sender then takes that size and asks
+    /// nothing more). See [`resize_is_acceptable`].
+    Resize { width: u32, height: u32 },
+}
+
+/// The sizes a [`InputEvent::Resize`] may ask for: 64 to 8192 pixels a side.
+pub fn resize_is_acceptable(width: u32, height: u32) -> bool {
+    (64..=8192).contains(&width) && (64..=8192).contains(&height)
 }
 
 /// The most characters of one piece of committed text ([`InputEvent::Text`]).
@@ -477,6 +492,20 @@ mod tests {
             assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), event);
         }
         assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
+        assert_eq!(
+            serde_json::to_string(&InputEvent::Focus).unwrap(),
+            r#"{"kind":"focus"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&InputEvent::Resize {
+                width: 800,
+                height: 600
+            })
+            .unwrap(),
+            r#"{"kind":"resize","width":800,"height":600}"#
+        );
+        assert!(super::resize_is_acceptable(800, 600));
+        assert!(!super::resize_is_acceptable(10, 600));
     }
 
     #[test]

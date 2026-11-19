@@ -15,6 +15,8 @@ mkdir -p build
 cc -Wall -Wextra -o build/keys-test keys-test.c && build/keys-test
 # And how committed text is cut into input events (the everyday trial's Japanese input).
 clang -fobjc-arc -Wall -Wextra -o build/text-input-test text-input-test.m -framework Foundation && build/text-input-test
+# And how the everyday trial's window and its picture are sized against each other.
+cc -Wall -Wextra -o build/window-size-test window-size-test.c -lm && build/window-size-test
 # The encrypted channel (ISTESSO_CHANNEL) comes from the Rust crate istesso-media, linked statically.
 media=../../target/release/libistesso_media.a
 (cd ../.. && cargo build --release -p istesso-media)

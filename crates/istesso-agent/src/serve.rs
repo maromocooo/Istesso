@@ -322,7 +322,13 @@ impl InputSink {
                 } => {
                     held.buttons.remove(code);
                 }
-                InputEvent::PointerAt { .. } | InputEvent::Scroll { .. } => {}
+                InputEvent::PointerAt { .. } | InputEvent::Scroll { .. } | InputEvent::Focus => {}
+                // A size out of bounds is dropped here.
+                InputEvent::Resize { width, height } => {
+                    if !istesso_proto::resize_is_acceptable(*width, *height) {
+                        continue;
+                    }
+                }
                 // Committed text (trial only): nothing is held down by it. A piece that is not
                 // within the limits is dropped here; the text is never logged.
                 InputEvent::Text { text } => {

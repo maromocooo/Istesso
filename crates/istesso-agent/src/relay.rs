@@ -593,6 +593,35 @@ mod tests {
     }
 
     #[test]
+    fn focus_and_resize_are_handed_over_and_a_size_out_of_bounds_is_not() {
+        let pair = std::sync::Arc::new(InputPair::new("fr"));
+        let mut line = line_through(&pair, pair.addr);
+        let events = [
+            InputEvent::Focus,
+            InputEvent::Resize {
+                width: 1280,
+                height: 720,
+            },
+        ];
+        assert!(line.pass(&events, Instant::now()).sent);
+        assert_eq!(pair.all_handed_over(A_MOMENT), events);
+        // The agent drops a size it does not take (64 to 8192 a side); the keys beside it go on.
+        let beside = [
+            InputEvent::Resize {
+                width: 10,
+                height: 720,
+            },
+            key(30, true),
+            key(30, false),
+        ];
+        assert!(line.pass(&beside, Instant::now()).sent);
+        assert_eq!(
+            pair.all_handed_over(A_MOMENT),
+            [key(30, true), key(30, false)]
+        );
+    }
+
+    #[test]
     fn daily_recovery_releases_even_keys_whose_last_write_failed() {
         let mut held = HeldInput::default();
         held.record(&[key(30, true), key(42, true)], true);
