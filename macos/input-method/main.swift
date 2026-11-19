@@ -13,6 +13,7 @@
 // main.
 import AppKit
 import Carbon
+import CryptoKit
 import InputMethodKit
 import os
 
@@ -143,9 +144,39 @@ final class Link {
             send(caret(client))
         case "caret":
             send(caret(client))
+        case "check":
+            send(check(client, message))
         default:
             send(["op": op, "ok": false, "why": "unknown"])
         }
+    }
+
+    /// Trial check that what was sent arrived, read back through the client and not through
+    /// Accessibility or the screen: the marked range, the selection, the document's length, and a
+    /// SHA-256 of either the marked text or the `units` UTF-16 units just before the caret (text the
+    /// host itself sent). Never the text. Only in TextEdit, so that it cannot read any other
+    /// application's document.
+    func check(_ client: IMKTextInput & NSObjectProtocol, _ message: [String: Any]) -> [String: Any] {
+        guard client.bundleIdentifier() == "com.apple.TextEdit" else { return ["op": "check", "ok": false, "why": "only in TextEdit"] }
+        let markedRange = client.markedRange()
+        let selected = client.selectedRange()
+        var range = NSRange(location: NSNotFound, length: 0)
+        if message["where"] as? String == "marked" {
+            range = markedRange
+        } else if let units = message["units"] as? Int, units > 0, units <= 2 * Wire.maxCharacters,
+                  selected.location != NSNotFound, selected.location >= units {
+            range = NSRange(location: selected.location - units, length: units)
+        }
+        var digest = ""
+        if range.location != NSNotFound, range.length > 0 {
+            var actual = NSRange(location: NSNotFound, length: 0)
+            if let text = client.string(from: range, actualRange: &actual) {
+                digest = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+            }
+        }
+        func pair(_ r: NSRange) -> [Int] { r.location == NSNotFound ? [-1, -1] : [r.location, r.length] }
+        return ["op": "check", "ok": !digest.isEmpty, "marked": pair(markedRange), "selected": pair(selected),
+                "length": client.length(), "sha256": digest]
     }
 
     /// The application ended the composition itself (a click elsewhere, another window): what was

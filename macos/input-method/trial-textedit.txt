@@ -1,0 +1,18 @@
+# istesso-ime-probe serve macos/input-method/trial-textedit.txt
+# Run only with the agent's own TextEdit document in front and the input source selected.
+# Checks by reading back through the input method (no screenshot, no Accessibility).
+caret
+# Raw input, caret at the end (9 bytes = 3 kana).
+mark 9 9 にほん
+check marked にほん
+# Converted, the first clause (日本, 6 bytes) selected.
+mark 0 6 日本語
+check marked 日本語
+wait 1
+commit 日本語
+check before 日本語
+# A second composition, then cleared: nothing is left (expect "match: false", ok false).
+mark 0 0 か
+clear
+check marked か
+caret

@@ -16,10 +16,12 @@
 //                                         byte-to-UTF-16 selection
 //
 // Commands: `mark <sel start byte> <sel end byte> <text>`, `commit <text>`, `clear`, `caret`,
-// `wait <seconds>`. Text is never printed back: the answers carry lengths and rectangles only.
+// `wait <seconds>`, `check marked <text>` / `check before <text>` (TextEdit only: does the marked
+// text, or the text just before the caret, hash the same as <text>). Text is never printed back: the answers carry lengths and rectangles only.
 import AppKit
 import ApplicationServices
 import Carbon
+import CryptoKit
 import Foundation
 
 func fail(_ text: String) -> Never {
@@ -180,6 +182,12 @@ func command(_ line: String) -> [String: Any]? {
         return ["op": "commit", "text": parts.dropFirst().joined(separator: " ")]
     case "clear": return ["op": "clear"]
     case "caret": return ["op": "caret"]
+    case "check" where parts.count >= 3 && (parts[1] == "marked" || parts[1] == "before"):
+        // The text is only hashed here; the input method answers with the hash of what it reads.
+        let text = parts.dropFirst(2).joined(separator: " ")
+        let expected = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        return parts[1] == "marked" ? ["op": "check", "where": "marked", "expect": expected]
+                                    : ["op": "check", "units": text.utf16.count, "expect": expected]
     default: return nil
     }
 }
@@ -205,12 +213,18 @@ func serve(script: String?) {
             _ = answers(fd, reader, until: nil, timeout: seconds)
             continue
         }
-        guard let message = command(line), let data = Wire.encode(message) else { print("not a command"); continue }
+        guard var message = command(line) else { print("not a command"); continue }
+        let expected = message.removeValue(forKey: "expect") as? String
+        guard let data = Wire.encode(message) else { print("not a command"); continue }
         let op = message["op"] as! String
         let length = (message["text"] as? String)?.utf8.count ?? 0
         print("send: \(op) (\(length) bytes)")
         guard Wire.writeAll(fd, data) else { print("closed"); break }
-        _ = answers(fd, reader, until: "caret", timeout: 2)
+        let got = answers(fd, reader, until: op == "check" ? "check" : "caret", timeout: 2)
+        if let expected {
+            let digest = got.last { $0["op"] as? String == "check" }?["sha256"] as? String
+            print("match: \(digest == expected)")
+        }
     }
     close(fd)
 }
