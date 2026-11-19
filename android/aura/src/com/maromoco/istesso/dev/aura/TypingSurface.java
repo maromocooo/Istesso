@@ -75,6 +75,16 @@ final class TypingSurface extends SurfaceView {
         cancelling = false;
     }
 
+    /**
+     * Takes what is being composed away from the input method without committing it anywhere,
+     * and returns it ("" when nothing). The input method's own composition ends.
+     */
+    String takeComposing(android.view.inputmethod.InputMethodManager imm) {
+        String taken = connection == null ? "" : connection.composing;
+        cancelComposing(imm);
+        return taken;
+    }
+
     /** Takes what is being composed as it stands (a click goes after it, as on the Mac). */
     void commitComposing(android.view.inputmethod.InputMethodManager imm) {
         if (connection == null || connection.composing.isEmpty()) {

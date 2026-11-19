@@ -15,6 +15,20 @@ public final class FieldFollowTest {
         }
     }
 
+    static void hold(boolean want, boolean composing, int lastState, String what) {
+        if (FieldFollow.holdOnClose(composing, lastState) != want) {
+            failed++;
+            System.out.println("FAIL " + what);
+        }
+    }
+
+    static void place(boolean want, boolean held, int state, boolean takes, String what) {
+        if (FieldFollow.canPlaceHeld(held, state, takes) != want) {
+            failed++;
+            System.out.println("FAIL " + what);
+        }
+    }
+
     public static void main(String[] a) {
         expect(SHOW, 1, true, false, false, false, true, true, "a field has the keyboard: typing on");
         expect(SHOW, 2, true, false, false, false, true, true, "a password field too");
@@ -26,7 +40,16 @@ public final class FieldFollowTest {
         expect(NONE, 0, false, true, false, true, true, true, "nothing known: nothing changes");
         expect(NONE, 1, true, false, false, false, false, true, "the host takes no text: nothing");
         expect(NONE, 1, true, false, false, false, true, false, "the panel is in the background: nothing");
-        System.out.println(failed == 0 ? "FieldFollow: all 10 cases pass" : "FieldFollow: " + failed + " failed");
+        hold(true, true, 1, "composing when the field goes: kept on the panel");
+        hold(false, false, 1, "nothing composed: nothing kept");
+        hold(false, true, 2, "a password field: nothing of it kept");
+        place(true, true, 1, true, "kept text, a plain field again: may be put there");
+        place(false, true, 2, true, "kept text, a password field: not put there");
+        place(false, true, 3, true, "kept text, not in a field: waits");
+        place(false, true, 0, true, "kept text, nothing known: waits");
+        place(false, true, 1, false, "kept text, the host takes no text: waits");
+        place(false, false, 1, true, "nothing kept: nothing to put");
+        System.out.println(failed == 0 ? "FieldFollow: all 19 cases pass" : "FieldFollow: " + failed + " failed");
         System.exit(failed == 0 ? 0 : 1);
     }
 }

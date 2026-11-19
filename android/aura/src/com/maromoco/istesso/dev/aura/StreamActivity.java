@@ -85,6 +85,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             }
             fieldState = state;
             fieldSerial = serial;
+            if (fieldActive()) {
+                lastActiveState = state;
+            }
+            showHeld();
             boolean becameActive = fieldActive() && (!wasActive || otherSerial);
             // A password field: the input method is told so (no composing, nothing learnt).
             if ((state == 2) != wasPassword) {
@@ -346,6 +350,28 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         composingLine.setFocusable(false);
         root.addView(composingLine, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+        // Composing text kept when its field went away: put into the next field, or let go.
+        heldBar = new android.widget.LinearLayout(this);
+        heldBar.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        heldBar.setBackgroundColor(0xC0603020);
+        heldBar.setVisibility(View.GONE);
+        heldLine = new TextView(this);
+        heldLine.setTextColor(Color.WHITE);
+        heldLine.setTextSize(16);
+        heldLine.setPadding(16, 8, 16, 8);
+        heldBar.addView(heldLine);
+        heldPlace = new android.widget.Button(this);
+        heldPlace.setAllCaps(false);
+        heldPlace.setText(R.string.held_place);
+        heldPlace.setOnClickListener(v -> placeHeld());
+        heldBar.addView(heldPlace);
+        android.widget.Button heldDrop = new android.widget.Button(this);
+        heldDrop.setAllCaps(false);
+        heldDrop.setText(R.string.held_drop);
+        heldDrop.setOnClickListener(v -> { heldText = null; showHeld(); });
+        heldBar.addView(heldDrop);
+        root.addView(heldBar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
         status.setClickable(false);
         status.setFocusable(false);
         root.addView(status, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -404,18 +430,61 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         @Override
         public void run() {
             if (resumed && autoTyping && fieldState == 3 && view.typing()) {
-                // What is being composed is taken as it stands, never dropped without a word.
-                if (view.composing()) {
-                    view.commitComposing((android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE));
+                // What is being composed is neither committed (there is no field over there to
+                // take it) nor dropped: it is kept on the panel, to be put into the next field
+                // (the owner, 2026-11-19: "a lost typed character is the worst").
+                if (FieldFollow.holdOnClose(view.composing(), lastActiveState)) {
+                    clearInlinePreedit();
+                    String taken = view.takeComposing(
+                            (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE));
+                    if (!taken.isEmpty()) {
+                        heldText = heldText == null ? taken : heldText + taken;
+                    }
                 }
                 autoTyping = false;
                 setTyping(false);
+                showHeld();
             }
         }
     };
 
     private boolean fieldActive() {
         return fieldState == 1 || fieldState == 2;
+    }
+
+    /** Composing text kept when its field went away (never sent, never logged), or null. */
+    private String heldText;
+    /** The state of the last field that had the keyboard (2: a password field). */
+    private int lastActiveState;
+    private android.widget.LinearLayout heldBar;
+    private TextView heldLine;
+    private android.widget.Button heldPlace;
+
+    /** The kept text on the panel, with "put it here" usable only when a plain field has the keyboard. */
+    private void showHeld() {
+        if (heldBar == null) {
+            return;
+        }
+        if (heldText == null) {
+            heldBar.setVisibility(View.GONE);
+            return;
+        }
+        heldLine.setText(getString(R.string.held_text, heldText));
+        heldPlace.setEnabled(FieldFollow.canPlaceHeld(true, fieldState, hostTextKnown && hostTakesText) && input != 0);
+        heldBar.setVisibility(View.VISIBLE);
+    }
+
+    /** Puts the kept text into the field that has the keyboard now, as committed text. */
+    private void placeHeld() {
+        if (heldText == null || !FieldFollow.canPlaceHeld(true, fieldState, hostTextKnown && hostTakesText) || input == 0) {
+            return;
+        }
+        clearInlinePreedit();
+        Native.inputText(input, heldText);
+        lastSent = heldText;
+        lastSentNs = System.nanoTime();
+        heldText = null;
+        showHeld();
     }
 
     /**
@@ -453,10 +522,19 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         if (!on) {
             clearInlinePreedit();
+            // Whatever closes the keyboard (by hand, the panel going to the background, the field
+            // going away), what is being composed is kept on the panel, not dropped.
+            if (FieldFollow.holdOnClose(view.composing(), lastActiveState) && imm != null) {
+                String taken = view.takeComposing(imm);
+                if (!taken.isEmpty()) {
+                    heldText = heldText == null ? taken : heldText + taken;
+                }
+            }
         }
         view.setTyping(on);
         typingToggle.setText(getString(on ? R.string.typing_on : R.string.typing_off));
         composingLine.setVisibility(View.GONE);
+        showHeld();
         if (imm == null) {
             return;
         }

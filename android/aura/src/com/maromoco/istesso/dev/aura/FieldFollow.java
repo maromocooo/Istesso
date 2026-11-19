@@ -19,6 +19,23 @@ final class FieldFollow {
     }
 
     /**
+     * When a keyboard that was opened by the field closes because the host is "not in a field":
+     * whether what is being composed is kept on the panel (never committed into whatever has the
+     * keyboard over there, never dropped). Not from a password field (nothing of it is kept).
+     */
+    static boolean holdOnClose(boolean composing, int lastFieldState) {
+        return composing && lastFieldState != 2;
+    }
+
+    /**
+     * Whether text kept on the panel may be put into the field that has the keyboard now: a plain
+     * field (not a password field, not unknown, not outside a field) of a host that takes text.
+     */
+    static boolean canPlaceHeld(boolean held, int state, boolean takesText) {
+        return held && takesText && state == 1;
+    }
+
+    /**
      * @param state       the field's state (0 nothing known, 1 a field, 2 a password field, 3 not in a field)
      * @param becameActive whether a field has the keyboard newly (another serial, or from a state that was not one)
      * @param typing      typing is on

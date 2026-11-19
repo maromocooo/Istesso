@@ -29,6 +29,9 @@
     <string name="input_waiting">入力：つないでいます</string>
     <string name="input_over">入力：受け付けられません</string>
     <string name="typing_off">文字：切</string>
+    <string name="held_text">打ちかけの文字（欄がなくなったので、とっておきました）：%1$s</string>
+    <string name="held_place">いまの欄に入れる</string>
+    <string name="held_drop">捨てる</string>
     <string name="text_dropped">ホストに入らなかった文字：%1$s</string>
     <string name="typing_unsupported">文字：このホストは文字の入力にまだ対応していません</string>
     <string name="typing_on">文字：入（キーボードで打つ。確定した文字を送る）</string>
