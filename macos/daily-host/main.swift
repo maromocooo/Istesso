@@ -1158,7 +1158,11 @@ struct AXWindowInfo {
     var title: String = ""
 }
 
-func axWindows(_ pid: pid_t) -> [AXWindowInfo] {
+/// Whether a window's title is asked of Accessibility as well: only for the other windows' list
+/// (--windows, windows.swift); otherwise nothing more is asked of the application than before.
+func axAsksTitle(windows: Bool) -> Bool { windows }
+
+func axWindows(_ pid: pid_t, titles: Bool = false) -> [AXWindowInfo] {
     let app = AXUIElementCreateApplication(pid)
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
@@ -1175,7 +1179,7 @@ func axWindows(_ pid: pid_t) -> [AXWindowInfo] {
         AXUIElementCopyAttributeValue(window, kAXRoleAttribute as CFString, &role)
         AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subrole)
         var title: CFTypeRef?
-        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &title)
+        if titles { AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &title) }
         return AXWindowInfo(bounds: CGRect(origin: p, size: s), role: role as? String ?? "", subrole: subrole as? String ?? "",
                             title: title as? String ?? "")
     }
@@ -2002,7 +2006,7 @@ final class Lookout {
     private var cached: [AXWindowInfo] = []
     private var asked = false
     /// The lookup itself; a stand-in in --self-test.
-    var lookup: (pid_t) -> [AXWindowInfo] = axWindows
+    var lookup: (pid_t) -> [AXWindowInfo] = { axWindows($0, titles: axAsksTitle(windows: settings.windows)) }
 
     /// The application's windows as Accessibility listed them last; never waits.
     var windows: [AXWindowInfo] { lock.lock(); defer { lock.unlock() }; return cached }

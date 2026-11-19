@@ -577,6 +577,8 @@ func windowsSelfTest() -> Int {
     }
     check(extraPictureSize(CGRect(x: 0, y: 0, width: 600, height: 401), density: 2) == (1200, 802), "a window's picture at its display's density")
     check(extraPictureSize(CGRect(x: 0, y: 0, width: 20, height: 3000), density: 2) == (64, 2160), "within 64 and 3840 x 2160")
+    // Review 9: without --windows Accessibility is asked nothing more than before.
+    check(!axAsksTitle(windows: false) && axAsksTitle(windows: true), "a window's title is read only with --windows")
     return failed
 }
 
