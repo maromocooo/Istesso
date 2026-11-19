@@ -432,7 +432,11 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
     if let Some(address) = &options.address {
         command.arg("--address").arg(address);
     }
+    // Not in the folder of whoever asked: a shell that went into the empty folder where the
+    // mount will be would make the program stand in its own mount, and the mount would
+    // always be in use.
     command
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));

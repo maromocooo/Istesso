@@ -81,7 +81,8 @@ case "${1:-}" in
         exit 1
         ;;
     check-went-by-itself)
-        if grep -q "nothing on this Mac used the folder; unmounted it" "$ISH_MOUNT_STATE/ubuntu=$FOLDER.log"; then
+        # The state files are named <hash of the root>-ubuntu=<folder id>.
+        if cat "$ISH_MOUNT_STATE"/*-"ubuntu=$FOLDER.log" 2>/dev/null | grep -q "nothing on this Mac used the folder; unmounted it"; then
             echo "ok the mount took itself off"
             exit 0
         fi
@@ -103,7 +104,7 @@ case "${1:-}" in
         if mounted; then echo "FAIL still mounted"; exit 1; fi
         echo "ok not mounted"
         # The mount program ends within 2 s of its folder being unmounted.
-        pid=$(cat "$ISH_MOUNT_STATE/ubuntu=$FOLDER.pid" 2>/dev/null || true)
+        pid=$(cat "$ISH_MOUNT_STATE"/*-"ubuntu=$FOLDER.pid" 2>/dev/null || true)
         if [ -n "$pid" ]; then
             for _ in $(seq 40); do
                 kill -0 "$pid" 2>/dev/null || break

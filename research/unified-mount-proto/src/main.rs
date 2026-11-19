@@ -661,9 +661,11 @@ fn told(text: &str) -> Option<Option<Fsid>> {
 fn start_watcher(point: &Path) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(std::env::current_exe()?);
+    // In `/`: never in the folder that will be mounted, which would keep the mount in use.
     command
         .arg("watch")
         .arg(point)
+        .current_dir("/")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null());
     // SAFETY: setsid is safe between fork and exec.
