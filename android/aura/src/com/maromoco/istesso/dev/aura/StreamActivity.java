@@ -72,6 +72,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                     (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
             boolean wasPassword = fieldState == 2;
             boolean toPassword = state == 2 && !wasPassword;
+            if (fieldSerial >= 0 && serial != fieldSerial) {
+                manualOff = false; // another field: the keyboard follows the host again
+            }
             // Another field has the keyboard over there, or the field became a password field:
             // what is being composed here is dropped, never committed into it.
             if ((fieldSerial >= 0 && serial != fieldSerial || toPassword) && view.composing()) {
@@ -80,6 +83,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             }
             fieldState = state;
             fieldSerial = serial;
+            followField();
             // A password field: the input method is told so (no composing, nothing learnt).
             if ((state == 2) != wasPassword) {
                 view.setPassword(state == 2);
@@ -245,6 +249,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         view = new TypingSurface(this, new TypingSurface.Typed() {
             @Override
             public void text(String text) {
+                // The keyboard stays for the next words: the system may hide it around a commit
+                // (seen on AURA: hidden by the system, reason HIDE_BUBBLES), so it is asked again.
+                status.postDelayed(keepKeyboard, 300);
                 // Only to an agent that said it takes committed text (ADR 0007): one that does
                 // not could not read the message, keys and all. Otherwise it stays here.
                 clearInlinePreedit();
@@ -313,7 +320,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         typingToggle.setTextSize(12);
         typingToggle.setAlpha(0.7f);
         typingToggle.setText(getString(R.string.typing_off));
-        typingToggle.setOnClickListener(v -> setTyping(!view.typing()));
+        typingToggle.setOnClickListener(v -> {
+            boolean on = !view.typing();
+            manualOff = !on; // off by hand: it stays off until another field has the keyboard
+            autoTyping = false;
+            setTyping(on);
+        });
         FrameLayout.LayoutParams typingAt = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
         typingAt.bottomMargin = (int) (48 * getResources().getDisplayMetrics().density);
@@ -354,6 +366,70 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             typingToggle.setText(getString(hostTextKnown ? R.string.typing_unsupported : R.string.typing_off));
         } else if (!view.typing()) {
             typingToggle.setText(getString(R.string.typing_off));
+        }
+    }
+
+    /** Typing was turned off by hand; the host's field does not turn it on again until it changes. */
+    private boolean manualOff;
+    /** Typing was turned on because the host said a field has the keyboard (not by hand). */
+    private boolean autoTyping;
+    /** How long the host has to say "not in a field" before an automatic keyboard goes away. */
+    private static final long FIELD_GONE_MS = 1000;
+
+    /** The keyboard again, while typing is on and the host's field has the keyboard. Never restarts the input. */
+    private final Runnable keepKeyboard = new Runnable() {
+        @Override
+        public void run() {
+            if (!resumed || !view.typing() || !fieldActive()) {
+                return;
+            }
+            android.view.inputmethod.InputMethodManager imm =
+                    (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) {
+                if (!view.hasFocus()) {
+                    view.requestFocus();
+                }
+                imm.showSoftInput(view, 0);
+            }
+        }
+    };
+
+    /** An automatic keyboard goes away once the host has said "not in a field" for FIELD_GONE_MS. */
+    private final Runnable fieldGone = new Runnable() {
+        @Override
+        public void run() {
+            if (resumed && autoTyping && fieldState == 3 && view.typing()) {
+                autoTyping = false;
+                setTyping(false);
+            }
+        }
+    };
+
+    private boolean fieldActive() {
+        return fieldState == 1 || fieldState == 2;
+    }
+
+    /**
+     * The keyboard follows the host's text field (the media's kind 5): a field has the keyboard
+     * there → typing on and the keyboard shown here; "not in a field" for a second → an automatic
+     * keyboard goes away (a commit or a brief change does not hide it). Nothing known (state 0)
+     * changes nothing. Turned off by hand, it stays off until another field has the keyboard.
+     */
+    private void followField() {
+        if (!resumed || !hostTextKnown || !hostTakesText) {
+            return;
+        }
+        status.removeCallbacks(fieldGone);
+        if (fieldActive()) {
+            if (!view.typing() && !manualOff) {
+                autoTyping = true;
+                setTyping(true);
+            } else if (view.typing()) {
+                status.removeCallbacks(keepKeyboard);
+                status.post(keepKeyboard);
+            }
+        } else if (fieldState == 3 && autoTyping) {
+            status.postDelayed(fieldGone, FIELD_GONE_MS);
         }
     }
 
@@ -402,9 +478,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     @Override
     protected void onPause() {
         resumed = false;
+        status.removeCallbacks(keepKeyboard);
+        status.removeCallbacks(fieldGone);
         if (view.typing()) {
             setTyping(false);
         }
+        autoTyping = false;
         stopPicture();
         if (input != 0) {
             Native.inputClose(input);
@@ -567,8 +646,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                     }
                     showTypingToggle();
                 }
+                boolean known = hostTextKnown;
                 hostTextKnown = true;
                 showTypingToggle();
+                if (!known) {
+                    followField();
+                }
                 // Once a connection: a host that does not take the kinds of scroll gets dx and dy
                 // only, and a scroll whose dx and dy are both 0 is not sent (the input library).
                 long conversation = s[0];

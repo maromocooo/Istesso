@@ -101,10 +101,13 @@ final class TypingSurface extends SurfaceView {
         if (!typing) {
             return null;
         }
+        // Several lines, and no action on Enter: the keyboard's Enter key is a key for the host's
+        // application (a newline, a confirmation), never an action after which a keyboard may
+        // close itself. A password field is one line, as such fields are.
         out.inputType = password ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
-                : InputType.TYPE_CLASS_TEXT;
+                : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE;
         out.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI
-                | EditorInfo.IME_ACTION_NONE;
+                | EditorInfo.IME_ACTION_NONE | EditorInfo.IME_FLAG_NO_ENTER_ACTION;
         if (password) {
             out.imeOptions |= EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
         }
