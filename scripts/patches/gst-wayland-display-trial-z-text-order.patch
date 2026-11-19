@@ -6,10 +6,11 @@ ADR 0015, "文字の入力の欄"). Trial only.
   keys typed just before it, 30 of 30 lines out of order). For a client whose text input is
   enabled, text waits after a key press (not a modifier) until the client commits its text
   input's state (it has taken the key in), and keys and buttons wait after text the same way;
-  100 ms at most from when the one before was sent; a client whose waits ran out three times in
-  a row for a kind (Chrome does not answer keys, seen) is not waited for after that kind until
-  it answers again, so a backlog does not grow (counting from arrival instead let a burst
-  through out of order in the Text Editor and Firefox, seen). Keys after
+  100 ms at most from when the one before was sent. Only keys that type or edit set a wait
+  (not Escape, function keys or keys with Control, Alt or Super: they change no text and get no
+  answer). A wait that ran out with something held behind it is a miss; after three misses in a
+  row for a kind, a client is only watched for that kind (nothing held) until it answers, and
+  then held for again (Chrome does not answer keys, seen). Keys after
   keys and text after text never wait; key releases and modifiers never wait (a late release
   could make the client repeat a key); pointer motion and scrolling never wait unless a button
   waits before them; a client without an enabled text input never waits. Only a commit of the
@@ -20,6 +21,9 @@ ADR 0015, "文字の入力の欄"). Trial only.
 - wayland.text-input gains `serial`: one more (mod 256) whenever another field (the surface with
   the keyboard and its enabled text input), or the same one enabled again, has the keyboard; the
   device ends its composition when it changes.
+- "Not in a field" is told only after it has held for 100 ms: between two fields a client says
+  it briefly (Tab, Control+L, a click), and the device would send the first keys after it
+  without its input method. A field or a password field is told at once.
 - wayland.text-input gains state 3, "not in a field": the client has a text input on the surface
   with the keyboard and none is enabled (the device then sends plain keys, without its input
   method); 0 stays "nothing known" (no text input there). Seen on the host: the Text Editor,
@@ -55,10 +59,10 @@ index de5d50c..f001426 100644
          let message = Application::builder(structure).src(&element).build();
          let _ = element.post_message(message);
 diff --git a/wayland-display-core/src/comp/clipboard.rs b/wayland-display-core/src/comp/clipboard.rs
-index 0d47e91..c84665f 100644
+index 0d47e91..199b285 100644
 --- a/wayland-display-core/src/comp/clipboard.rs
 +++ b/wayland-display-core/src/comp/clipboard.rs
-@@ -304,20 +304,56 @@ impl State {
+@@ -304,20 +304,58 @@ impl State {
          if !is_input(&command) {
              return Some(command);
          }
@@ -66,7 +70,6 @@ index 0d47e91..c84665f 100644
 +        // Trial: also held while what came before it is still in hand, or while the text
 +        // input of the client with the keyboard has not yet taken in what was sent to it of the
 +        // other kind (keys after text, text after keys; text_input.rs, TextOrder).
-+        let arrived = std::time::Instant::now();
 +        // Pointer motion and scrolling never wait for the text order: they go at once, unless a
 +        // paste holds everything, or a button waits in the queue (it keeps its place behind
 +        // the motion before it, and the motion after it behind it).
@@ -84,12 +87,17 @@ index 0d47e91..c84665f 100644
 +            self.apply_input(command);
 +            return None;
 +        }
-+        if self.clipboard.holding() || !self.clipboard.held.is_empty() || self.order_blocks(&command, arrived) {
++        let blocked = self.order_blocks(&command);
++        if blocked {
++            if let Some(wait) = self.text_order.waiting.as_mut() {
++                wait.held = true;
++            }
++        }
++        if self.clipboard.holding() || !self.clipboard.held.is_empty() || blocked {
              self.clipboard.held.push_back(command);
-+            self.text_order.arrivals.push_back(arrived);
              return None;
          }
-+        self.note_sent(&command, arrived);
++        self.note_sent(&command);
          self.apply_input(command);
          None
      }
@@ -98,22 +106,20 @@ index 0d47e91..c84665f 100644
 -    fn release_held(&mut self) {
 +    pub(crate) fn release_held(&mut self) {
          while !self.clipboard.holding() {
-+            let arrived = self
-+                .text_order
-+                .arrivals
-+                .front()
-+                .copied()
-+                .unwrap_or_else(std::time::Instant::now);
 +            match self.clipboard.held.front() {
 +                None => break,
-+                Some(next) if self.order_blocks(next, arrived) => break,
++                Some(next) if self.order_blocks(next) => {
++                    if let Some(wait) = self.text_order.waiting.as_mut() {
++                        wait.held = true;
++                    }
++                    break;
++                }
 +                Some(_) => {}
 +            }
              let Some(command) = self.clipboard.held.pop_front() else {
                  break;
              };
-+            self.text_order.arrivals.pop_front();
-+            self.note_sent(&command, arrived);
++            self.note_sent(&command);
              self.apply_input(command);
          }
      }
@@ -150,10 +156,10 @@ index 9d884af..93f8895 100644
              let client = match surface {
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
-index 18846af..59b4bde 100644
+index 18846af..8928fc8 100644
 --- a/wayland-display-core/src/wayland/handlers/text_input.rs
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -124,13 +124,20 @@ struct Instance {
+@@ -124,28 +124,47 @@ struct Instance {
  
  /// Told whenever the field with the keyboard changes: 0 none, 1 a field, 2 a password field;
  /// and the text cursor's rectangle in the output (x, y, width, height). Trial only.
@@ -173,10 +179,18 @@ index 18846af..59b4bde 100644
 +    /// serial.
 +    identity: Option<(ObjectId, Option<ObjectId>)>,
 +    serial: u8,
++    /// A "not in a field" (3) waits to be told until it has held for THREE_HOLDS: between two
++    /// fields a client says it briefly (Tab, Control+L, a click), and the device would send
++    /// the first keys after it without its input method.
++    three_pending: bool,
  }
  
++/// How long "not in a field" has to hold before it is told.
++const THREE_HOLDS: std::time::Duration = std::time::Duration::from_millis(100);
++
  impl TextInputReport {
-@@ -139,13 +146,18 @@ impl TextInputReport {
+     pub fn set_sink(&mut self, sink: Option<TextInputSink>) {
+         self.sink = sink;
          self.last = None;
      }
  
@@ -197,7 +211,7 @@ index 18846af..59b4bde 100644
          }
      }
  }
-@@ -235,8 +247,40 @@ impl TextInputs {
+@@ -235,8 +254,40 @@ impl TextInputs {
              .then_some(focus)
      }
  
@@ -240,7 +254,7 @@ index 18846af..59b4bde 100644
      fn field(&self) -> (u32, Option<(i32, i32, i32, i32)>) {
          let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
              return (0, None);
-@@ -247,6 +291,9 @@ impl TextInputs {
+@@ -247,6 +298,9 @@ impl TextInputs {
              .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
          {
              Some(i) => (if i.secret { 2 } else { 1 }, i.rect),
@@ -250,7 +264,7 @@ index 18846af..59b4bde 100644
              None => (0, None),
          }
      }
-@@ -308,6 +355,14 @@ impl TextInputs {
+@@ -308,6 +362,14 @@ impl TextInputs {
  impl State {
      /// Tells the sink, if there is one, about the field with the keyboard: where its text
      /// cursor is in the output, for the device to put its input method's candidates there.
@@ -265,17 +279,33 @@ index 18846af..59b4bde 100644
      pub fn tell_text_input(&mut self) {
          use smithay::wayland::seat::WaylandFocus;
          let (state, rect) = self.text_inputs.field();
-@@ -329,7 +384,8 @@ impl State {
+@@ -329,7 +391,24 @@ impl State {
                  }
              }
          }
 -        self.text_input_report.tell(told);
 +        let identity = self.text_inputs.field_identity();
++        if told.0 == 3 && self.text_input_report.last.map(|l| l.0) != Some(3) {
++            if !self.text_input_report.three_pending {
++                self.text_input_report.three_pending = true;
++                use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++                let _ = self.handle.insert_source(Timer::from_duration(THREE_HOLDS), |_, _, state| {
++                    state.text_input_report.three_pending = false;
++                    // Told now only if it still holds (otherwise the field was told already).
++                    if state.text_inputs.field().0 == 3 {
++                        let identity = state.text_inputs.field_identity();
++                        state.text_input_report.tell((3, 0, 0, 0, 0), identity);
++                    }
++                    TimeoutAction::Drop
++                });
++            }
++            return;
++        }
 +        self.text_input_report.tell(told, identity);
      }
  
      /// After the keyboard moved to a window: if a text input of its client entered it and has
-@@ -507,6 +563,9 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -507,6 +586,9 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                  }
              }
              zwp_text_input_v3::Request::Commit => {
@@ -285,7 +315,7 @@ index 18846af..59b4bde 100644
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.commits = instance.commits.wrapping_add(1);
                      if let Some(enable) = instance.pending.take() {
-@@ -539,6 +598,18 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -539,6 +621,19 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                          );
                      }
                  }
@@ -294,9 +324,10 @@ index 18846af..59b4bde 100644
 +                // Then what waited for this goes, with the field as it is now (its `done`
 +                // serial, whether it is enabled, whether it is a password field).
 +                if focused {
-+                    if let Some((text, _, client)) = state.text_order.waiting.take() {
-+                        if let Some(client) = client {
-+                            state.text_order.missed.remove(&(client, text));
++                    if let Some(wait) = state.text_order.waiting.take() {
++                        // It answered: waited for again from now on.
++                        if let Some(client) = wait.client {
++                            state.text_order.missed.remove(&(client, wait.text));
 +                        }
 +                        state.release_held();
 +                    }
@@ -304,7 +335,7 @@ index 18846af..59b4bde 100644
              }
              zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
                  if let Some(instance) = state.text_inputs.instance(resource) {
-@@ -618,3 +689,94 @@ mod tests {
+@@ -618,3 +713,119 @@ mod tests {
          assert_eq!(us_key('\t'), None);
      }
  }
@@ -321,17 +352,29 @@ index 18846af..59b4bde 100644
 +/// text, keys and buttons wait the same way. Keys after keys and text after text never wait.
 +#[derive(Default)]
 +pub struct TextOrder {
-+    /// What was sent last that is not taken in yet: true text, false a key; when; and to
-+    /// which client.
-+    pub(crate) waiting: Option<(bool, std::time::Instant, Option<ClientId>)>,
-+    /// When each input in the clipboard's queue of held input arrived, in its order (kept for
-+    /// the queue; the wait itself is counted from when the one before was sent).
-+    pub(crate) arrivals: std::collections::VecDeque<std::time::Instant>,
-+    /// Waits that ran out, in a row, by client and kind (text, key): a client that does not
-+    /// say it took a kind in (Chrome after keys, seen) is not waited for after three, so that
-+    /// a backlog does not grow by 100 ms an item. An answer starts the count again.
++    /// What was sent last that is not taken in yet.
++    pub(crate) waiting: Option<Wait>,
++    /// Waits that ran out with something held behind them, in a row, by client and kind
++    /// (text, key): a client that does not say it took a kind in (Chrome after keys, seen) is
++    /// not held for after three, so that a backlog does not grow by 100 ms an item. It is
++    /// still watched (a probe that holds nothing): its next answer starts the count again.
 +    missed: std::collections::HashMap<(ClientId, bool), u32>,
 +    generation: u64,
++}
++
++/// One wait: for text (true) or a key; since when; for which client; whether it only watches
++/// for the answer (holds nothing); whether something was held behind it.
++pub(crate) struct Wait {
++    text: bool,
++    since: std::time::Instant,
++    client: Option<ClientId>,
++    probe: bool,
++    pub(crate) held: bool,
++}
++
++/// Keys that do not type or edit: Escape, F1 to F12, Print, Scroll Lock, Pause.
++fn types(scancode: u32) -> bool {
++    !is_modifier(scancode) && !matches!(scancode, 1 | 59..=68 | 87 | 88 | 99 | 70 | 119)
 +}
 +
 +fn is_modifier(scancode: u32) -> bool {
@@ -340,17 +383,16 @@ index 18846af..59b4bde 100644
 +
 +impl State {
 +    /// Whether `command` has to wait (see [`TextOrder`]).
-+    /// `arrived`: when `command` came. It waits at most ORDER_WAIT from then.
-+    pub(crate) fn order_blocks(&self, command: &crate::Command, arrived: std::time::Instant) -> bool {
++    pub(crate) fn order_blocks(&self, command: &crate::Command) -> bool {
 +        use crate::Command;
 +        use smithay::backend::input::KeyState;
-+        let _ = arrived;
-+        let Some((text_sent, since, _)) = self.text_order.waiting else {
++        let Some(wait) = &self.text_order.waiting else {
 +            return false;
 +        };
-+        if since.elapsed() >= ORDER_WAIT {
++        if wait.probe || wait.since.elapsed() >= ORDER_WAIT {
 +            return false;
 +        }
++        let text_sent = wait.text;
 +        match command {
 +            Command::TextCommit(_) | Command::TextPreedit(..) => !text_sent,
 +            // Presses of keys that type (not modifiers, not releases: a late release could
@@ -361,9 +403,15 @@ index 18846af..59b4bde 100644
 +        }
 +    }
 +
++    /// Whether Control, Alt or Super is held.
++    fn chording(&self) -> bool {
++        let held = self.seat.get_keyboard().unwrap().modifier_state();
++        held.ctrl || held.alt || held.logo
++    }
++
 +    /// Notes what is about to be sent, when the client with the keyboard has an enabled text
 +    /// input: a key press (not a modifier) or text.
-+    pub(crate) fn note_sent(&mut self, command: &crate::Command, arrived: std::time::Instant) {
++    pub(crate) fn note_sent(&mut self, command: &crate::Command) {
 +        use crate::Command;
 +        use smithay::backend::input::KeyState;
 +        if !matches!(self.text_inputs.field().0, 1 | 2) {
@@ -372,26 +420,34 @@ index 18846af..59b4bde 100644
 +        }
 +        let text = match command {
 +            Command::TextCommit(_) | Command::TextPreedit(..) => true,
-+            Command::KeyboardInput(code, KeyState::Pressed) if !is_modifier(*code) => false,
++            // Only keys that type or edit: Escape, the function keys and keys with Control, Alt
++            // or Super change no text, get no answer, and have nothing to keep in order with.
++            Command::KeyboardInput(code, KeyState::Pressed) if types(*code) && !self.chording() => false,
 +            _ => return,
 +        };
-+        let _ = arrived;
 +        let client = self.text_inputs.focus_client();
-+        if let Some(client) = &client {
-+            if self.text_order.missed.get(&(client.clone(), text)).copied().unwrap_or(0) >= 3 {
-+                // This client does not say it took this kind in: not waited for.
-+                self.text_order.waiting = None;
-+                return;
-+            }
-+        }
-+        self.text_order.waiting = Some((text, std::time::Instant::now(), client));
++        // A client that did not answer three times with something held: only watched.
++        let probe = client
++            .as_ref()
++            .is_some_and(|c| self.text_order.missed.get(&(c.clone(), text)).copied().unwrap_or(0) >= 3);
++        self.text_order.waiting = Some(Wait {
++            text,
++            since: std::time::Instant::now(),
++            client,
++            probe,
++            held: false,
++        });
 +        self.text_order.generation += 1;
 +        let generation = self.text_order.generation;
 +        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 +        let _ = self.handle.insert_source(Timer::from_duration(ORDER_WAIT), move |_, _, state| {
 +            if state.text_order.generation == generation {
-+                if let Some((text, _, Some(client))) = state.text_order.waiting.take() {
-+                    *state.text_order.missed.entry((client, text)).or_insert(0) += 1;
++                if let Some(wait) = state.text_order.waiting.take() {
++                    // A miss only when it kept something waiting (a key that changes nothing,
++                    // Escape or Control+S, gets no answer and is no miss).
++                    if let (false, true, Some(client)) = (wait.probe, wait.held, wait.client) {
++                        *state.text_order.missed.entry((client, wait.text)).or_insert(0) += 1;
++                    }
 +                    state.release_held();
 +                }
 +            }
