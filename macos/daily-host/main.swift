@@ -779,7 +779,8 @@ final class Injector {
         else if buttonsDown.contains(buttonRight) { type = .rightMouseDragged; button = .right }
         else if buttonsDown.contains(buttonMiddle) { type = .otherMouseDragged; button = .center }
         else { type = .mouseMoved; button = .left }
-        guard let window = windowAt(place), let pid = target() else { return count("dropped_no_window") }
+        guard let window = windowAt(place) else { return count("dropped_no_window") }
+        let pid = window.pid
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: place, mouseButton: button) else { return }
         event.flags = flags
         aim(event, at: window)
@@ -793,8 +794,8 @@ final class Injector {
     }
 
     private func button(_ code: UInt32, _ pressed: Bool) {
-        guard let pid = target() else { return count("dropped_no_target") }
         guard let window = windowAt(point) else { return count("dropped_no_window") }
+        let pid = window.pid
         if pressed { buttonsDown.insert(code) } else { buttonsDown.remove(code) }
         if pressed {
             let now = ProcessInfo.processInfo.systemUptime
@@ -838,8 +839,8 @@ final class Injector {
     }
 
     private func scroll(dx: Int32, dy: Int32) {
-        guard let pid = target() else { return count("dropped_no_target") }
         guard let window = windowAt(point) else { return count("dropped_no_window") }
+        let pid = window.pid
         // The other side says how far to scroll; the Mac, how far the content moves.
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: -dy, wheel2: -dx, wheel3: 0) else { return }
         event.location = point
@@ -985,7 +986,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.injector.origin = frame.origin
                 self.injector.scale = frame.width / Double(w)
                 // Keys go to the application in front; the pointer to the window under it, in its process.
-                self.injector.target = { [weak self] in self?.pointerPid ?? NSWorkspace.shared.frontmostApplication?.processIdentifier }
+                self.injector.target = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
                 self.injector.windowAt = { [weak self] point in self?.topWindow(at: point) }
                 self.openPicture { why in self.started(why) }
             }
@@ -1333,12 +1334,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 guard n > 0 else { break }
                 // Delivered only while the picture is shown (ADR 0017, "守ること" 1).
                 guard let self, !self.detached, self.picture == "running" else { continue }
-                self.injector.handle(Data(buffer[0..<n]))
-                if case .display = settings.target, let data = Optional(Data(buffer[0..<n])),
-                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   object["kind"] as? String == "button", object["pressed"] as? Bool == true {
-                    self.bringForward()
-                }
+                self.take(Data(buffer[0..<n]))
             }
         }
         source.resume()
@@ -1346,11 +1342,43 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
     var inputSource: DispatchSourceRead?
 
-    /// In the whole-display form, a press makes the application under the pointer the one in front.
-    func bringForward() {
-        guard let pid = pointerPid, pid != NSWorkspace.shared.frontmostApplication?.processIdentifier,
-              let running = NSRunningApplication(processIdentifier: pid) else { return }
-        running.activate()
+    /// One input event. An application that is not in front has no key window, and takes no
+    /// keys: a key, a press or committed text first makes the application the one in front
+    /// (in the whole-display form, the one under the pointer for a press), and the events wait
+    /// 60 ms for that, in their order.
+    var waiting: [Data] = []
+    func take(_ data: Data) {
+        if !waiting.isEmpty { return waiting.append(data) }
+        if needsFront(data), let running = frontCandidate(data),
+           running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
+            running.activate()
+            waiting = [data]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                let events = self.waiting
+                self.waiting = []
+                for event in events where !self.detached && self.picture == "running" { self.injector.handle(event) }
+            }
+            return
+        }
+        injector.handle(data)
+    }
+
+    private func needsFront(_ data: Data) -> Bool {
+        guard injector.mayPost, !settings.inputDry,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = object["kind"] as? String else { return false }
+        switch kind {
+        case "key", "text": return true
+        case "button": return object["pressed"] as? Bool == true
+        default: return false
+        }
+    }
+
+    private func frontCandidate(_ data: Data) -> NSRunningApplication? {
+        if let app { return app }
+        guard let pid = pointerPid else { return nil }
+        let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
+        return isPress ? NSRunningApplication(processIdentifier: pid) : nil
     }
 
     // ---- Timers ----

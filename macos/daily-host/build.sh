@@ -68,3 +68,29 @@ else
     codesign --force --sign - "$bundle" >&2
 fi
 echo "$bundle"
+
+# The window that counts what reaches it, for checking input into another process (development only;
+# it needs no permission, and is signed ad hoc).
+target="$output/Istesso Dev Input Target.app"
+mkdir -p "$target/Contents/MacOS"
+swiftc -O -swift-version 5 -target arm64-apple-macos14.2 -o "$target/Contents/MacOS/istesso-input-target" "$here/input-target.swift"
+cat > "$target/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>istesso-input-target</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.maromoco.istesso-dev.input-target</string>
+    <key>CFBundleName</key>
+    <string>Istesso Dev Input Target</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.2</string>
+</dict>
+</plist>
+PLIST
+codesign --force --sign - "$target" >&2
+echo "$target"
