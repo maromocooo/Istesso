@@ -620,6 +620,33 @@ func annexB(_ sample: CMSampleBuffer) -> ([UInt8], Bool)? {
 /// Everything between a picture and the transport, on one serial queue. The newest picture wins:
 /// while the encoder still has a frame, a new picture is kept, not queued, and goes in as soon as
 /// the encoder is free (no picture waits behind another).
+/// The picture is held back while the application's window is on its way to the virtual display.
+///
+/// Seen on the Air (2026-11-19 23:01, the owner's Dia session): the viewer fixes its points per
+/// picture pixel from the first picture it decodes. That was the picture of the window on the 1x
+/// main display (1906x1074 for a 1720-point window: 0.90); after the move onto the 2x virtual
+/// display the picture doubled (3420x2150) and the window followed at 0.90 points a pixel, so
+/// everything was shown about twice as large (sharp). So with a virtual display configured, no
+/// picture is sent until the window is on it and the stream has its size in that display's pixels;
+/// the viewer's first picture is then the 2x one. Never longer than 5 s (then the picture goes as
+/// it is), and not at all when the display could not be made lately or the screen is locked.
+func pictureHeldForVirtual(configured: Bool, onVirtual: Bool, streamMatches: Bool, restarting: Bool,
+                           failedRecently: Bool, locked: Bool, waited: Double) -> Bool {
+    guard configured, !failedRecently, !locked, waited < 5 else { return false }
+    return !onVirtual || !streamMatches || restarting
+}
+
+/// A flag set on the main queue and read on the pump's.
+final class SharedFlag {
+    private let lock = NSLock()
+    private var flag = false
+    var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return flag }
+        set { lock.lock(); flag = newValue; lock.unlock() }
+    }
+}
+let pictureHeld = SharedFlag()
+
 final class Pump {
     let queue = DispatchQueue(label: "istesso.daily-host.pump", qos: .userInteractive)
     let transport: Transport
@@ -705,7 +732,7 @@ final class Pump {
     /// (docs/m4-plan.md, step 2: 20 pictures a second while somebody watches).
     func tick() {
         if transport.keyFrameWanted() { keyWanted = true }
-        guard running, !inFlight, last != nil, transport.viewers > 0 || resumeAsked != nil else { return }
+        guard running, !inFlight, last != nil, transport.viewers > 0 || resumeAsked != nil, !pictureHeld.value else { return }
         let now = nowNs()
         let awake = settings.keepAwake > 0 ? UInt64(1_000_000_000 / settings.keepAwake) : UInt64.max
         if fresh {
@@ -1955,6 +1982,19 @@ func selfTest() -> Never {
     _ = guardedFlag.use { ran += 100 }
     guardedFlag.close { ran += 1000 }
     checkPanel(ran == 11, true, "a closed stream takes no more calls, and is closed once")
+    do {
+        func held(_ configured: Bool = true, on: Bool = false, matches: Bool = false, restarting: Bool = false,
+                  failed: Bool = false, locked: Bool = false, waited: Double = 0.5) -> Bool {
+            pictureHeldForVirtual(configured: configured, onVirtual: on, streamMatches: matches, restarting: restarting,
+                                  failedRecently: failed, locked: locked, waited: waited)
+        }
+        checkPanel(held(), true, "2x: no picture while the window is not on the virtual display yet")
+        checkPanel(held(on: true), true, "2x: nor while the stream still has the old size")
+        checkPanel(held(on: true, matches: true, restarting: true), true, "2x: nor while the new stream is made")
+        checkPanel(held(on: true, matches: true), false, "2x: on it, the stream of its size: the picture goes")
+        checkPanel(held(waited: 5.1), false, "2x: never held longer than 5 s")
+        checkPanel(held(failed: true) || held(locked: true) || held(false), false, "2x: not held when the display could not be made, when locked, or without a virtual display")
+    }
     failed += inlineSelfTest()
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
@@ -2782,6 +2822,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
 
     func startApp(_ name: String) {
+        // With a virtual display, no picture before the window is on it (see pictureHeldForVirtual).
+        if settings.virtualDisplay != nil { pictureHeld.value = true }
         guard let url = applicationURL(name) else {
             say("refused", [("word", "start"), ("reason", "no application called \(name) was found")])
             return quit(1)
@@ -3070,6 +3112,30 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             self.panelShown = panelShown
             windowBounds = chosen.bounds
             place(chosen)
+        }
+        updatePictureHold(chosen)
+    }
+
+    /// Since when the picture has been held back while a viewer was there (the 5 s limit).
+    var pictureHoldSince: TimeInterval?
+    func updatePictureHold(_ window: WindowInfo) {
+        let now = ProcessInfo.processInfo.systemUptime
+        // Held also while nobody is shown (nothing goes then anyway), so that the first frame a
+        // new viewer gets is never one from before the move.
+        let configured = settings.virtualDisplay != nil
+        let onVirtual = virtualScreen?.frame.map { $0.contains(CGPoint(x: window.bounds.midX, y: window.bounds.midY)) } ?? false
+        let density = densityAt(window.bounds)
+        let wantW = max(64, min(3840, Int(window.bounds.width * density)) & ~1), wantH = max(64, min(2160, Int(window.bounds.height * density)) & ~1)
+        let matches = settings.size != nil || (wantW == width && wantH == height)
+        let waiting = configured && (!onVirtual || !matches || restarting)
+        let viewed = transport != nil && transport.viewers > 0
+        if !waiting { pictureHoldSince = nil } else if viewed && pictureHoldSince == nil { pictureHoldSince = now }
+        let held = pictureHeldForVirtual(configured: configured, onVirtual: onVirtual, streamMatches: matches, restarting: restarting,
+                                         failedRecently: now - virtualFailedAt < 30, locked: screenLocked(),
+                                         waited: pictureHoldSince.map { now - $0 } ?? 0)
+        if held != pictureHeld.value {
+            pictureHeld.value = held
+            if frameLog.on { frameLog.write("{\"kind\":\"picture_hold\",\"t_ns\":\(nowNs()),\"held\":\(held)}") }
         }
     }
 
