@@ -60,7 +60,7 @@ scripts/daily.sh setup [--host mac]
 - 守りはそのまま：渡す前に計測の合図を読む（`daily-mac.sh` も自分で読む）。この Mac の鍵（ひとつずつ）の中で渡し、`daily-mac.sh` には鍵の記述子を持たせない（その見張りが鍵を持ち続けないため）。止めるのは、それぞれが書き留めた番号で。
 - `stop`：Ubuntu のホストのアプリを、いままでどおり閉じ、そのあと `daily-mac.sh stop`（Mac のホストのプログラム、エージェント、ここの窓と中継、見張りを止め、アプリの窓を元の画面に戻して、仮想ディスプレーを消す。Mac Studio のアプリそのものは開いたまま。`close APP` は、アプリを閉じ、窓が閉じたと確かめてから、その文書を消す。`daily-mac.sh` の決め）。
 - Ubuntu のホストだけのもの（`--document`、`--min-qp`）は、`--host mac` では断る。
-- `scripts/daily.sh open desktop --host mac`：Mac のホストの画面全体（インストーラーや、確認の問いのため）。`daily-mac.sh open desktop` に渡す。**持ち主だけ**：持ち主が `DAILY_OWNER=1` を付けて、自分のターミナル（か Istesso Dev Open）から打つ。`daily.sh` は、`DAILY_OWNER` をそのまま渡すだけで、自分では付けない（断るかどうかは `daily-mac.sh` が決める）。
+- `scripts/daily.sh open desktop --host mac`：Mac のホストの画面全体（インストーラーや、確認の問いのため）。`daily-mac.sh open desktop` に渡す。**持ち主だけ**：持ち主が `DAILY_OWNER=1` を付けて、自分のターミナルから打つ。`daily.sh` は、`DAILY_OWNER` をそのまま渡すだけで、自分では付けない（断るかどうかは `daily-mac.sh` が決める）。
 - `DAILY_DRY_RUN=1`：`daily-mac.sh` に渡すものを、渡さずに書くだけ（Ubuntu の側は、いつもどおり動く）。
 - 確かめ（窓を出さずに、Mac Studio には何もせずに）：`daily-mac.sh` の代わりの小さなスクリプトで、`open TextEdit --host mac [--for aura --size 1600x1000]`、`close … [--for aura]`（`aura-TextEdit` として渡る）、`setup --host mac`、`list`、`stop` が、その言葉のまま渡り、鍵の記述子を持っていないことを見た。`--min-qp` と `--host studio` は断った。Ubuntu の既定の道（`open editor`、`--host ubuntu`、`list`、`close`）は前のまま。Mac のホストの ssh の名前は `istesso-studio`（持ち主が開いている `ssh studio` のタブに相乗りする別名。`ISTESSO_MAC_HOST` で替えられる）。つながらないときは、`list` は `mac` の行に「Studio につながっていません（ssh studio のタブを開いてください）」と出し、ほかのコマンドも同じ一行を出して、すぐ終わる（つながらない名前で確かめた）。
 
@@ -277,6 +277,29 @@ scripts/daily.sh note "気づいたこと"
 - 中継（`istesso input relay`）は、いまもシェルから起動します。
 - Mac の窓の Dock のタイルは、いまは窓ごとに 1 つです（窓 2 枚の形）。ランチャーができたら、`DAILY_DOCK_TILE=none` で、タイルをランチャーの 1 つだけにします。
 - 持ち主の Mac に窓が初めて出るときは、まとめ役が、先に知らせます。
+
+## Spotlight、Alfred、Dock から開く
+
+登録（`install`）と外すこと（`remove`）は、持ち主が手で確かめるときに、持ち主がします（「ローカルネットワーク」の問いも、そのとき）。エージェントは、`build` と試験（`macos/daily-shortcuts` で `python3 -m unittest`）だけをします（2026-11-19、統合のとき：12 件が通り、`~/Applications/Istesso Dev/` には何も足していない）。
+
+試用版のチェックアウトで、次を順に実行します。**新しいアプリを登録すると、この Mac の LAN 接続が一時的に切れます。** 計測が走っていないときに登録してください。
+
+```sh
+scripts/daily.sh shortcuts build
+scripts/daily.sh shortcuts install
+```
+
+`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ設定で署名します。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。Ubuntu のアイコンは、このときだけ `ISTESSO_HOST` のホストから読みます。Ubuntu のアイコンを取得できないときと、Mac ホスト用の近道には、標準のアイコンを使います。
+
+Spotlight か Alfred で `Blender (Ubuntu)`、`Firefox (Ubuntu)`、`Text Editor (Ubuntu)`、`Chrome (Ubuntu)` を検索して開きます。Dock に置くには、Finder で使いたい近道を Dock にドラッグします。
+
+近道は受付役に URL を渡すだけです。たとえば Text Editor の近道は `istesso-dev-open://open/editor?host=ubuntu` を開きます。URL に `&for=aura` を足すと、AURA に開きます。受付役が試用版の `daily.sh open` を呼び、中継が LAN に接続します。初回に「ローカルネットワーク」の許可を尋ねられたら、`Istesso Dev Open` に許可してください。近道ごとの許可は要りません。ビューアーの許可はこれまでどおりです。[許可をまとめた理由](adr/0024-trial-daily-shortcuts.md)。
+
+Mac ホスト用の近道は `TextEdit (Studio)` から始めます。`macos/daily-shortcuts/mac-apps.txt` にアプリ名を 1 行ずつ書き、作成と登録をやり直すと一覧が替わります。Safari、Notes、Finder、Preview、Dia と画面全体（`desktop`）は、持ち主がターミナルで開きます。たとえば `DAILY_OWNER=1 scripts/daily.sh open Safari --host mac` と打ちます。この 6 つは近道に追加できません。Mac ホスト用のスクリプトの場所は `daily.sh` が決めます。
+
+近道は作成時のチェックアウトを使います。場所を移したときも作成と登録をやり直してください。起動には `daily.sh open <アプリ名> --host ubuntu|mac` に対応した試用版が要ります。開けなかったときは、受付役が理由をログに書きます。続けて失敗しても、記録は 10 秒に 1 回までです。以前の版を使っているときは、受付役を終了してから作成と登録をやり直してください。
+
+外すときは、先に近道を Dock から外し、`scripts/daily.sh shortcuts remove` を実行します。登録時に名前を記録した近道と受付役は、LaunchServices の登録を外してから消します。
 
 ## 持ち主が自分で開け閉めするとき（毎日）
 
