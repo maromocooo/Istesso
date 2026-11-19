@@ -16,14 +16,16 @@
 # Before the first translation, README.md has no language line and there is no README.<language>.md:
 # that is 0, with nothing to check.
 #
-# The head of a translation (README.md itself starts with the language line):
+# The head of a translation (README.md itself starts with its title, then the language line):
 #
 #   <!-- translation-of: README.md @ blob <git hash-object README.md> (YYYY-MM-DD) -->
 #   [the out-of-date line and an empty line, only while the English is newer]
-#   <the language line: this language in bold, every other one a link>
-#
 #   > <a note in this language: a translation, the English is canonical (a link to README.md),
 #   >  follows the English of YYYY-MM-DD — the same date as the marker>
+#
+#   # <title>, then the language line: this language in bold, every other one a link
+#
+# The order inside the head is not enforced; only the marker on line 1 and the language line are.
 #
 # The marker holds the hash of the English file's content, not a commit, so that it survives merges
 # that rewrite commits and can be compared in a clone without history. `git diff <blob> HEAD:README.md`
