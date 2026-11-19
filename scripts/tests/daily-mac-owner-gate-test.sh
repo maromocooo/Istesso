@@ -71,7 +71,7 @@ shell_status=0
 dscl_status=0
 DAILY_OPEN_HANDLER=1
 
-check "Open.app" 0 "$open_app"
+check "owner app from Open.app" 1 "$open_app"
 check "account home despite caller HOME" 0 "$apps/$shim" eXaMpLe
 check "caller HOME" 1 "$HOME/Applications/Istesso Dev/$shim"
 check "other folder" 1 "$real_home/Applications/$shim"
@@ -84,11 +84,11 @@ claimed_path="$open_app"
 check "exec -a claiming Open.app" 1 /bin/bash desktop
 later_text="$apps/$shim"
 check "shim only in later txt record" 1 /bin/bash
-check "desktop from Open.app" 0 "$open_app" desktop
+check "desktop from Open.app" 1 "$open_app" desktop
 check "desktop from shortcut" 1 "$apps/$shim" desktop
 check "empty lsof output" 1 ""
 lsof_status=1
-check "failed lsof with matching output" 1 "$open_app"
+check "failed lsof with matching output" 1 "$apps/$shim"
 lsof_status=0
 shell_status=1
 check "failed lookup before genuine launcher" 0 "$apps/$shim"
@@ -97,6 +97,7 @@ check "failed directory lookup with matching output" 1 "$apps/$shim"
 dscl_status=0
 home_record="$real_home"
 check "missing home attribute" 1 "$apps/$shim"
+home_record="NFSHomeDirectory: $real_home"
 unset DAILY_OPEN_HANDLER
-check "missing handler flag" 1 "$open_app"
+check "missing handler flag" 1 "$apps/$shim"
 echo "$count owner gate tests passed"
