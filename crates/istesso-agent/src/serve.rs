@@ -403,6 +403,12 @@ impl InputSink {
                     }
                     continue;
                 }
+                InputEvent::Preedit { text, cursor } => {
+                    if !istesso_proto::preedit_is_acceptable(text, *cursor) {
+                        dropped += 1;
+                        continue;
+                    }
+                }
             }
             self.send(event);
         }
@@ -594,13 +600,15 @@ impl Shared {
                             }
                             asked.push("input");
                             clipboard_on = self.clipboard_is_taken();
-                            // This agent takes committed text (InputEvent::Text), and
-                            // scrolls with their kind and stages.
+                            // This agent takes committed and composing text
+                            // (InputEvent::Text, InputEvent::Preedit), and scrolls with
+                            // their kind and stages.
                             Response::InputOpen {
                                 alive,
                                 text: true,
                                 scroll: istesso_proto::SCROLL_LEVEL,
                                 clipboard: clipboard_on,
+                                preedit: true,
                             }
                         }
                         Err(_) => Response::error(
@@ -1007,6 +1015,7 @@ mod tests {
                     text: true,
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: true,
+                    preedit: true,
                 }
             );
             client
@@ -1070,6 +1079,7 @@ mod tests {
                     text: true,
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
+                    preedit: true,
                 }
             );
             // Sent anyway, they are dropped; the keys around them arrive.
@@ -1122,6 +1132,7 @@ mod tests {
                     text: true,
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
+                    preedit: true,
                 }
             );
             asking.send_input(&[]).unwrap();
@@ -1253,6 +1264,7 @@ mod tests {
                     text: true,
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
+                    preedit: true,
                 }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
@@ -1269,6 +1281,7 @@ mod tests {
                     text: true,
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
+                    preedit: true,
                 }
             );
             second.send_input(&[key(29, true)]).unwrap();
@@ -1312,6 +1325,7 @@ mod tests {
                     text: true,
                     scroll: istesso_proto::SCROLL_LEVEL,
                     clipboard: false,
+                    preedit: true,
                 }
             );
             // What was down comes up, and the conversation carries on.

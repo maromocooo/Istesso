@@ -26,6 +26,61 @@ static inline BOOL text_input_key(TextInputEmit emit, unsigned code) {
     return emit(key, (size_t)length);
 }
 
+static inline BOOL text_input_control(unichar c) {
+    return c < 0x20 || (c >= 0x7f && c <= 0x9f);
+}
+
+// The caller has room for the UTF-8 bytes plus one escape per scalar.
+static inline size_t text_input_escape(char *out, const unsigned char *utf8, size_t length) {
+    size_t used = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (utf8[i] == '"' || utf8[i] == '\\') {
+            out[used++] = '\\';
+        }
+        out[used++] = (char)utf8[i];
+    }
+    return used;
+}
+
+// One whole marked string or nil if it cannot travel. Cursor offsets count unescaped,
+// printable UTF-8 bytes. An endpoint inside a surrogate pair stays before that scalar.
+static inline NSData *text_input_preedit(NSString *marked, NSRange selection, BOOL *hasText) {
+    if (marked.length > 2 * 256) {
+        return nil;
+    }
+    NSData *data = [marked dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data || data.length > 1024) {
+        return nil;
+    }
+    NSUInteger start = MIN(selection.location, marked.length);
+    NSUInteger end = start + MIN(selection.length, marked.length - start);
+    char packet[2048] = "{\"kind\":\"preedit\",\"text\":\"";
+    size_t used = strlen(packet), bytes = 0, beginByte = 0, endByte = 0;
+    const unsigned char *utf8 = data.bytes;
+    NSUInteger offset = 0, scalars = 0;
+    for (NSUInteger i = 0; i < data.length;) {
+        NSUInteger next = i + 1;
+        while (next < data.length && (utf8[next] & 0xc0) == 0x80) {
+            next++;
+        }
+        if (++scalars > 256) {
+            return nil;
+        }
+        NSUInteger length = next - i;
+        if (!text_input_control([marked characterAtIndex:offset])) {
+            used += text_input_escape(packet + used, utf8 + i, length);
+            bytes += length;
+        }
+        offset += length == 4 ? 2 : 1;
+        if (offset <= start) beginByte = bytes;
+        if (offset <= end) endByte = bytes;
+        i = next;
+    }
+    used += (size_t)snprintf(packet + used, sizeof packet - used, "\",\"cursor\":[%zu,%zu]}", beginByte, endByte);
+    *hasText = bytes != 0;
+    return [NSData dataWithBytes:packet length:used];
+}
+
 static inline BOOL text_input_packets(NSString *commit, TextInputEmit emit) {
     const char prefix[] = "{\"kind\":\"text\",\"text\":\"";
     NSMutableData *buffer = [NSMutableData dataWithLength:2048];
@@ -67,7 +122,7 @@ static inline BOOL text_input_packets(NSString *commit, TextInputEmit emit) {
         NSMutableString *clean = [NSMutableString string];
         for (NSUInteger i = 0; i < piece.length; i++) {
             unichar c = [piece characterAtIndex:i];
-            if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) {
+            if (text_input_control(c)) {
                 continue;
             }
             [clean appendFormat:@"%C", c];
@@ -94,12 +149,7 @@ static inline BOOL text_input_packets(NSString *commit, TextInputEmit emit) {
         scalars += count;
         bytes += sequence.length;
         // Escaping adds at most one byte per scalar to the 1024 payload bytes.
-        for (NSUInteger i = 0; i < sequence.length; i++) {
-            if (utf8[i] == '"' || utf8[i] == '\\') {
-                packet[used++] = '\\';
-            }
-            packet[used++] = (char)utf8[i];
-        }
+        used += text_input_escape(packet + used, utf8, sequence.length);
     }
     return flush();
 }

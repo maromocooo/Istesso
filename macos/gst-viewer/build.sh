@@ -30,7 +30,7 @@ link() { # OUTPUT [LINKER ARGUMENTS]
     clang -fobjc-arc -O2 -Wall -o "$output" gst-viewer.m \
         -I ../../crates/istesso-media/include "$media" -liconv \
         $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-video-1.0 gstreamer-app-1.0 gstreamer-net-1.0 gio-2.0) \
-        -framework Cocoa -framework QuartzCore -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
+        -framework Cocoa -framework Carbon -framework QuartzCore -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
         "$@"
 }
 link build/gst-viewer

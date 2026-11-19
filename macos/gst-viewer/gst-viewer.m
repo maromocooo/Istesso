@@ -168,6 +168,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <IOSurface/IOSurface.h>
+#import <Carbon/Carbon.h>  // EnableSecureEventInput (the trial's password fields)
 #include <gio/gio.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -693,6 +694,7 @@ static unsigned long press_count = 0;
 @interface NSView (IstessoHeldBack)
 - (void)holdBack;
 - (void)fallInLine;
+- (void)windowIsKeyOrNot;
 @end
 
 static void note_press(void) {
@@ -910,6 +912,56 @@ static void show_counts(void) {
 static BOOL host_takes_text = NO;
 // Whether the host said it takes copy and paste (ADR 0022): only then are Command-C, X and V taken.
 static BOOL host_takes_clipboard = NO;
+static BOOL host_takes_preedit = NO;
+static BOOL force_preedit_strip = NO;
+
+// Trial only (ADR 0007, password fields): Secure Event Input is on while a password field of the
+// host has the keyboard and this window takes keys, so that other applications on this Mac
+// cannot see the keystrokes. Always let go: when that ends, and when the program ends (atexit;
+// the window's end and the stop signals end the program through exit()).
+// Atomic: the handler at exit may run on another thread than the main one.
+static atomic_bool secure_input_on = false;
+
+static void secure_input(BOOL on) {
+    bool was = !on;
+    if (atomic_compare_exchange_strong(&secure_input_on, &was, on ? true : false)) {
+        if (on) {
+            EnableSecureEventInput();
+        } else {
+            DisableSecureEventInput();
+        }
+    }
+}
+
+static void secure_input_off_at_exit(void) {
+    secure_input(NO);
+}
+
+@interface NSView (IstessoTextInput)
+- (void)setTextInputField:(IstessoMediaTextInput)field;
+- (void)textInputContextChanged;
+@end
+
+// Field descriptions belong to one picture connection. Only the text input view consumes them.
+static void update_text_input_field(IstessoMediaTextInput field) {
+    if ([cursor_view respondsToSelector:@selector(setTextInputField:)]) {
+        [cursor_view setTextInputField:field];
+    }
+}
+
+// The number after "NAME": in the relay's state line, or `otherwise` when the line does not say it.
+static long relay_state_field(const char *line, const char *name, long otherwise) {
+    char key[32];
+    snprintf(key, sizeof key, "\"%s\":", name);
+    const char *at = strstr(line, key);
+    if (at == NULL) {
+        return otherwise;
+    }
+    const char *digits = at + strlen(key);
+    char *end = NULL;
+    long value = strtol(digits, &end, 10);
+    return end == digits ? otherwise : value;
+}
 
 // Looks once a second at what the relay says about its own connection, off the main thread:
 // reading a file must never hold up a key on its way out.
@@ -920,7 +972,7 @@ static void watch_relay_state(const char *socket_path) {
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
     dispatch_source_set_event_handler(timer, ^{
-        long now = -1, text = 0, clipboard = 0;
+        long now = -1, text = 0, clipboard = 0, preedit = 0;
         BOOL reconnecting = NO;
         FILE *file = fopen(path.fileSystemRepresentation, "r");
         char content[256] = {0};
@@ -929,30 +981,30 @@ static void watch_relay_state(const char *socket_path) {
             content[got] = 0;
             fclose(file);
         }
-        if (content[0] != 0) {
-            long pid = 0, count = -1, takes = 0, copies = 0;
+        if (strncmp(content, "{\"pid\":", 7) == 0) {
             // Only a relay that still runs counts: a file left by an earlier one says nothing.
-            // "text" (whether the host takes committed text) is left out by an older relay, so is
-            // "clipboard" (copy and paste), and "reconnecting" is said by a relay of the everyday
-            // trial's reconnecting kind only.
-            int cut = 0, with_clipboard = 1;
-            int fields = sscanf(content, "{\"pid\":%ld,\"input\":%ld,\"text\":%ld,\"clipboard\":%ld,\"reconnecting\":%d}", &pid, &count, &takes, &copies, &cut);
-            if (fields < 4) {
-                with_clipboard = 0;
-                fields = sscanf(content, "{\"pid\":%ld,\"input\":%ld,\"text\":%ld,\"reconnecting\":%d}", &pid, &count, &takes, &cut);
-            }
-            int all = with_clipboard ? 5 : 4;
-            if (fields >= 2 && pid > 0 && count >= 0
-                && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
+            // "text" (whether the host takes committed text) is left out by an older relay, so are
+            // "clipboard" (copy and paste) and "preedit" (composing text), and "reconnecting" is
+            // said by a relay of the everyday trial's reconnecting kind only.
+            long pid = relay_state_field(content, "pid", 0);
+            long count = relay_state_field(content, "input", -1);
+            if (pid > 0 && count >= 0 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
                 now = count;
-                text = fields >= 3 && takes == 1;
-                clipboard = with_clipboard && fields >= 4 && copies == 1;
-                reconnecting = daily_reconnect && fields == all && cut == 1;
+                text = relay_state_field(content, "text", 0) == 1;
+                clipboard = relay_state_field(content, "clipboard", 0) == 1;
+                preedit = relay_state_field(content, "preedit", 0) == 1;
+                reconnecting = daily_reconnect && relay_state_field(content, "reconnecting", 0) == 1;
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            host_takes_text = text != 0;
             host_takes_clipboard = clipboard != 0;
+            if (host_takes_text != (text != 0) || host_takes_preedit != (preedit != 0)) {
+                host_takes_text = text != 0;
+                host_takes_preedit = preedit != 0;
+                if ([cursor_view respondsToSelector:@selector(textInputContextChanged)]) {
+                    [cursor_view textInputContextChanged];
+                }
+            }
             if (now != input_cuts || reconnecting != input_reconnecting) {
                 if (daily_reconnect && now >= 0 && !reconnecting && !picture_stale &&
                     [cursor_view respondsToSelector:@selector(fallInLine)]) {
@@ -1329,6 +1381,13 @@ static void *channel_thread(void *unused) {
             if (istesso_media_watch_cursor(watch, &cursor) == 1) {
                 on_channel_cursor(&cursor);
             }
+        } else if (got == 5) {
+            IstessoMediaTextInput field;
+            if (istesso_media_watch_text_input(watch, &field) == 1) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    update_text_input_field(field);
+                });
+            }
         } else if (got == 3) {
             // Cut, and nobody said why: the library is connecting again.
             cut_at = now_ns();
@@ -1340,6 +1399,7 @@ static void *channel_thread(void *unused) {
             guint64 t = cut_at;
             dispatch_async(dispatch_get_main_queue(), ^{
                 show_counts();
+                update_text_input_field((IstessoMediaTextInput){0});
                 picture_was_cut(t);
             });
         } else if (got == 4) {
@@ -1383,6 +1443,7 @@ static void *channel_thread(void *unused) {
             }
             int32_t why = state.why;
             dispatch_async(dispatch_get_main_queue(), ^{
+                update_text_input_field((IstessoMediaTextInput){0});
                 picture_is_over(why);
             });
             return NULL;
@@ -2099,9 +2160,11 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     CATextLayer *_markedStrip;
     NSEvent *_interpretedEvent;
     BOOL _startedWithMark, _passKey, _discardingMark;
+    IstessoMediaTextInput _field;
+    BOOL _preeditSent, _stripComposition;
 }
 
-// What is being composed is thrown away: it never goes to the other side.
+// Cancel the local composition and clear any preedit still visible on the host.
 - (void)discardComposition {
     _interpretedEvent = nil;
     _discardingMark = YES;
@@ -2113,6 +2176,47 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
 - (void)letGo {
     [self discardComposition];
     [super letGo];
+    [self updatePasswordField];
+}
+
+- (void)windowIsKeyOrNot {
+    [super windowIsKeyOrNot];
+    [self updatePasswordField];
+}
+
+- (void)viewWillMoveToWindow:(NSWindow *)window {
+    if (window == nil) {
+        secure_input(NO);
+    }
+    [super viewWillMoveToWindow:window];
+}
+
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    if (self.window == nil) {
+        return;
+    }
+    // The candidates' place is in screen points: asked again when the window moves or changes
+    // size.
+    for (NSNotificationName name in @[ NSWindowDidMoveNotification, NSWindowDidResizeNotification ]) {
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(windowPlaceChanged)
+                                                   name:name
+                                                 object:self.window];
+    }
+}
+
+- (void)windowPlaceChanged {
+    [self.inputContext invalidateCharacterCoordinates];
+}
+
+// A password field of the host (field state 2): plain keys only, as on this Mac, without the
+// input method (Latin input sources only), no composing text and no strip; Secure Event Input
+// while this window takes keys.
+- (void)updatePasswordField {
+    BOOL password = _field.state == 2;
+    self.inputContext.allowedInputSourceLocales = password ? @[ NSAllRomanInputSourcesLocaleIdentifier ] : nil;
+    secure_input(password && self.window.isKeyWindow && !picture_stale);
 }
 
 // A click may put the cursor into another field over there: the composition is not carried into
@@ -2131,6 +2235,14 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
 }
 
 - (void)keyDown:(NSEvent *)event {
+    if (_field.state == 2) {
+        // A password field: keys as they are, never through the input method. Eisu and Kana
+        // do nothing here.
+        if (event.keyCode != 0x66 && event.keyCode != 0x68) {
+            [super keyDown:event];
+        }
+        return;
+    }
     // Eisu and Kana select the local input method, even with modifiers held.
     if (event.keyCode == 0x66 || event.keyCode == 0x68) {
         [self.inputContext handleEvent:event];
@@ -2181,6 +2293,56 @@ static NSString *plain_text(id value) {
     }
     NSUInteger start = MIN(selection.location, _marked.length);
     _selection = NSMakeRange(start, MIN(selection.length, _marked.length - start));
+    if ([self canUseInlinePreedit]) {
+        BOOL hasText = NO;
+        NSData *packet = text_input_preedit(_marked, _selection, &hasText);
+        if (packet && send_text_datagram(packet.bytes, packet.length)) {
+            _preeditSent = hasText;
+            [self hideStrip];
+            return;
+        }
+        // Never send just part of a mark, even if it gets shorter on the next edit.
+        _stripComposition = YES;
+    }
+    [self clearInlinePreedit];
+    [self showStrip:_marked selection:_selection];
+}
+
+- (BOOL)canUseInlinePreedit {
+    return !force_preedit_strip && !_stripComposition && host_takes_preedit && host_takes_text
+        && _field.state == 1 && !picture_stale && !cut_pending;
+}
+
+- (void)clearInlinePreedit {
+    if (_preeditSent) {
+        _preeditSent = NO;
+        // Also when the host has just said it takes no more: the relay drops it then, and it
+        // costs nothing; otherwise the application would go on showing a stale composition.
+        const char clear[] = "{\"kind\":\"preedit\",\"text\":\"\",\"cursor\":[0,0]}";
+        send_text_datagram(clear, sizeof clear - 1);
+    }
+}
+
+- (void)setTextInputField:(IstessoMediaTextInput)field {
+    BOOL toPassword = field.state == 2 && _field.state != 2;
+    _field = field;
+    if (toPassword && self.hasMarkedText) {
+        // What was being composed does not go into a password field.
+        [self discardComposition];
+    }
+    [self updatePasswordField];
+    [self textInputContextChanged];
+}
+
+- (void)textInputContextChanged {
+    if (self.hasMarkedText && ![self canUseInlinePreedit]) {
+        [self clearInlinePreedit];
+        [self showStrip:_marked selection:_selection];
+    }
+    [self.inputContext invalidateCharacterCoordinates];
+}
+
+- (void)showStrip:(NSString *)text selection:(NSRange)selection {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     if (!_markedStrip) {
@@ -2193,10 +2355,10 @@ static NSString *plain_text(id value) {
         [self.layer addSublayer:_markedStrip];
     }
     _markedStrip.contentsScale = self.window.backingScaleFactor;
-    NSMutableAttributedString *display = [[NSMutableAttributedString alloc] initWithString:_marked attributes:@{
+    NSMutableAttributedString *display = [[NSMutableAttributedString alloc] initWithString:text attributes:@{
         NSForegroundColorAttributeName : NSColor.whiteColor, NSFontAttributeName : [NSFont systemFontOfSize:16]
     }];
-    [display addAttribute:NSUnderlineStyleAttributeName value:@(NSUnderlineStyleSingle) range:_selection];
+    [display addAttribute:NSUnderlineStyleAttributeName value:@(NSUnderlineStyleSingle) range:selection];
     _markedStrip.string = display;
     _markedStrip.hidden = NO;
     [CATransaction commit];
@@ -2204,8 +2366,7 @@ static NSString *plain_text(id value) {
 
 // A line in the strip for a few seconds, unless something is being composed by then.
 - (void)showNotice:(NSString *)notice {
-    [self setMarkedText:notice selectedRange:NSMakeRange(notice.length, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
-    _marked = nil;  // Shown, but nothing is being composed.
+    [self showStrip:notice selection:NSMakeRange(notice.length, 0)];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         if (!self.hasMarkedText) {
             [self unmarkText];
@@ -2213,13 +2374,19 @@ static NSString *plain_text(id value) {
     });
 }
 
-- (void)unmarkText {
-    _marked = nil;
+- (void)hideStrip {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     _markedStrip.string = nil;
     _markedStrip.hidden = YES;
     [CATransaction commit];
+}
+
+- (void)unmarkText {
+    [self clearInlinePreedit];
+    _marked = nil;
+    _stripComposition = NO;
+    [self hideStrip];
 }
 
 - (void)insertText:(id)value replacementRange:(NSRange)replacement {
@@ -2231,14 +2398,15 @@ static NSString *plain_text(id value) {
         _passKey = YES;
         return;
     }
-    [self unmarkText];
     if (picture_stale) {
+        [self unmarkText];
         held_back_count += text.length > 0;
         return;
     }
     if (!host_takes_text) {
         // An agent that does not take committed text could not read the message at all
         // (keys and all): the text stays here, and the strip says why.
+        [self unmarkText];
         [self showNotice:@"このホストは文字の入力にまだ対応していません"];
         return;
     }
@@ -2249,6 +2417,7 @@ static NSString *plain_text(id value) {
         text_lost_count++;
         fprintf(stderr, "viewer: a commit could not be passed on whole, and the rest of it was not sent (%lu so far; the text is never shown)\n", text_lost_count);
     }
+    [self unmarkText];
 }
 
 - (void)doCommandBySelector:(SEL)selector {
@@ -2261,7 +2430,23 @@ static NSString *plain_text(id value) {
     if (actual) {
         *actual = self.hasMarkedText ? self.markedRange : self.selectedRange;
     }
-    NSRect rect = [self convertRect:self.markedStripRect toView:nil];
+    NSRect anchor = self.markedStripRect;
+    NSSize size = self.bounds.size;
+    CGFloat width = picture_width, height = picture_height;
+    // A field whose place the host does not know (all zero) keeps the strip's place.
+    BOOL placed = _field.x != 0 || _field.y != 0 || _field.width != 0 || _field.height != 0;
+    if ([self canUseInlinePreedit] && placed && (!self.hasMarkedText || _markedStrip.hidden || !_markedStrip)
+        && width > 0 && height > 0 && size.width > 0 && size.height >= 1) {
+        // Clip both edges in picture pixels before reversing -pointer:'s top-left mapping.
+        CGFloat left = MAX(0, MIN(width, (CGFloat)_field.x));
+        CGFloat right = MAX(0, MIN(width, (CGFloat)_field.x + _field.width));
+        CGFloat top = MAX(0, MIN(height, (CGFloat)_field.y));
+        CGFloat bottom = MAX(0, MIN(height, (CGFloat)_field.y + _field.height));
+        CGFloat h = MAX(1, (bottom - top) * size.height / height);
+        anchor = NSMakeRect(left * size.width / width, MIN(size.height - h, size.height - bottom * size.height / height),
+                            (right - left) * size.width / width, h);
+    }
+    NSRect rect = [self convertRect:anchor toView:nil];
     return [self.window convertRectToScreen:rect];
 }
 
@@ -2430,6 +2615,9 @@ int main(int argc, char *argv[]) {
         }
         const char *command_key = getenv("ISTESSO_COMMAND_KEY");
         command_is_control = command_key == NULL || strcmp(command_key, "super") != 0;
+        atexit(secure_input_off_at_exit);
+        const char *preedit = getenv("ISTESSO_PREEDIT");
+        force_preedit_strip = preedit != NULL && strcmp(preedit, "strip") == 0;
         const char *text_input = getenv("ISTESSO_TEXT_INPUT");
         Class viewClass = NSView.class;
         if (input_socket >= 0 || channel_address != NULL) {

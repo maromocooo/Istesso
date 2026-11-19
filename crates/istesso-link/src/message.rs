@@ -77,6 +77,9 @@ pub enum Response {
         /// that does not say so is sent neither; they would be dropped without a word.
         #[serde(default, skip_serializing_if = "is_false")]
         clipboard: bool,
+        /// Composing text (`InputEvent::Preedit`) is taken too.
+        #[serde(default, skip_serializing_if = "is_false")]
+        preedit: bool,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
@@ -194,7 +197,8 @@ mod tests {
                 alive: false,
                 text: false,
                 scroll: 0,
-                clipboard: false
+                clipboard: false,
+                preedit: false
             })
             .unwrap(),
             plain
@@ -209,7 +213,8 @@ mod tests {
                 alive: false,
                 text: false,
                 scroll: 0,
-                clipboard: false
+                clipboard: false,
+                preedit: false
             }
         );
         // Asked for, and agreed to.
@@ -224,7 +229,8 @@ mod tests {
                 alive: true,
                 text: false,
                 scroll: 0,
-                clipboard: false
+                clipboard: false,
+                preedit: false
             }
         );
         assert_eq!(
@@ -234,7 +240,8 @@ mod tests {
                 alive: true,
                 text: true,
                 scroll: 0,
-                clipboard: false
+                clipboard: false,
+                preedit: false
             }
         );
         assert_eq!(
@@ -244,7 +251,8 @@ mod tests {
                 alive: false,
                 text: true,
                 scroll: 1,
-                clipboard: false
+                clipboard: false,
+                preedit: false
             }
         );
         // An earlier version reads both as what it knows, and its own answer says
@@ -260,7 +268,8 @@ mod tests {
                 alive: false,
                 text: false,
                 scroll: 0,
-                clipboard: false
+                clipboard: false,
+                preedit: false
             }
         );
         assert_eq!(
@@ -364,7 +373,8 @@ mod tests {
                 alive: true,
                 text: true,
                 scroll: 0,
-                clipboard: true
+                clipboard: true,
+                preedit: false
             }
         );
     }

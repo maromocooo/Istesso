@@ -498,6 +498,12 @@ pub enum InputEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<SecretText>,
     },
+    /// The text being composed by the sender's input method, all of it, and
+    /// the selected part of it as UTF-8 byte offsets (trial only,
+    /// docs/adr/0007-control-channel.md, "変換中の文字"): for the client that
+    /// has the keyboard to draw. Empty text clears it. Never logged. See
+    /// [`preedit_is_acceptable`].
+    Preedit { text: String, cursor: [u32; 2] },
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -560,6 +566,11 @@ impl std::fmt::Debug for InputEvent {
                 .debug_struct("Paste")
                 .field("id", id)
                 .field("text", &text.as_ref().map(|_| ".."))
+                .finish(),
+            InputEvent::Preedit { cursor, .. } => f
+                .debug_struct("Preedit")
+                .field("text", &"..")
+                .field("cursor", cursor)
                 .finish(),
         }
     }
@@ -735,6 +746,18 @@ pub fn scroll_is_acceptable(event: &InputEvent) -> bool {
 /// The sizes a [`InputEvent::Resize`] may ask for: 64 to 8192 pixels a side.
 pub fn resize_is_acceptable(width: u32, height: u32) -> bool {
     (64..=8192).contains(&width) && (64..=8192).contains(&height)
+}
+
+/// Whether composing text is within the limits: as committed text, except
+/// that it may be empty, and the selected part lies within it, on character
+/// boundaries, begin before end.
+pub fn preedit_is_acceptable(text: &str, cursor: [u32; 2]) -> bool {
+    let [begin, end] = cursor.map(|c| c as usize);
+    (text.is_empty() || text_is_acceptable(text))
+        && begin <= end
+        && end <= text.len()
+        && text.is_char_boundary(begin)
+        && text.is_char_boundary(end)
 }
 
 /// The most characters of one piece of committed text ([`InputEvent::Text`]).
@@ -934,6 +957,24 @@ mod tests {
         assert!(!text_is_acceptable(""));
         assert!(!text_is_acceptable("a\nb"));
         assert!(!text_is_acceptable("a\u{85}"));
+    }
+
+    #[test]
+    fn composing_text_is_tagged_and_its_range_lies_on_character_boundaries() {
+        use super::{preedit_is_acceptable, InputEvent};
+        let preedit = InputEvent::Preedit {
+            text: "にほん".into(),
+            cursor: [0, 6],
+        };
+        let json = serde_json::to_string(&preedit).unwrap();
+        assert_eq!(json, r#"{"kind":"preedit","text":"にほん","cursor":[0,6]}"#);
+        assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), preedit);
+        assert!(preedit_is_acceptable("", [0, 0]));
+        assert!(preedit_is_acceptable("にほん", [3, 9]));
+        assert!(!preedit_is_acceptable("にほん", [1, 3]));
+        assert!(!preedit_is_acceptable("にほん", [6, 3]));
+        assert!(!preedit_is_acceptable("にほん", [0, 10]));
+        assert!(!preedit_is_acceptable("a\tb", [0, 0]));
     }
 
     use super::*;

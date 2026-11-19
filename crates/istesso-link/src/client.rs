@@ -23,6 +23,7 @@ pub enum InputAnswer {
         text: bool,
         scroll: u8,
         clipboard: bool,
+        preedit: bool,
     },
     /// It is not, and this is why: callers decide by the code.
     Refused { code: ErrorCode, message: String },
@@ -190,11 +191,13 @@ impl Client {
                 text,
                 scroll,
                 clipboard,
+                preedit,
             } => Ok(InputAnswer::Open {
                 alive,
                 text,
                 scroll,
                 clipboard,
+                preedit,
             }),
             Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
             _ => Err(Error::Malformed),

@@ -84,7 +84,20 @@ typedef struct IstessoMediaCursor {
     const char *name;     /* the cursor's name when shape is 1; may be NULL */
 } IstessoMediaCursor;
 
+/*
+ * Trial only (ADR 0015, "文字の入力の欄"): the text input field of the application with the
+ * keyboard, and where its text cursor is, in the picture's pixels. No typed text is in it.
+ */
+typedef struct IstessoMediaTextInput {
+    uint32_t state;   /* 0: no field. 1: a field. 2: a password field */
+    int32_t x;        /* the text cursor's rectangle, from the picture's top left */
+    int32_t y;
+    uint32_t width;   /* 0 to 65535 */
+    uint32_t height;
+} IstessoMediaTextInput;
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(IstessoMediaTextInput) == 20, "IstessoMediaTextInput differs from src/ffi.rs");
 _Static_assert(sizeof(IstessoMediaStreamInfo) == 24, "IstessoMediaStreamInfo differs from src/ffi.rs");
 _Static_assert(sizeof(IstessoMediaSent) == 24, "IstessoMediaSent differs from src/ffi.rs");
 _Static_assert(sizeof(void *) != 8 || sizeof(IstessoMediaFrame) == 72, "IstessoMediaFrame differs from src/ffi.rs");
@@ -175,6 +188,14 @@ int32_t istesso_media_host_key_frame_wanted(const IstessoMediaHost *host);
 int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const IstessoMediaCursor *cursor);
 
 /*
+ * Trial only: says what the text input field of the application with the keyboard is, as
+ * istesso_media_host_set_cursor() says what the cursor is (the latest only, behind frames, to
+ * viewers that may be sent the frames, and to one that connects later). Nothing is sent until
+ * this is first called. 0, or -1 for a state above 2 or a side above 65535.
+ */
+int32_t istesso_media_host_set_text_input(const IstessoMediaHost *host, const IstessoMediaTextInput *field);
+
+/*
  * Offers the picture to paired devices (1, as from the start) or stops offering it (0): every
  * viewer is cut off at once and no caller is taken, or even answered, until it is offered again.
  * For a session that is shown to nobody for the time being.
@@ -260,6 +281,8 @@ void istesso_media_watch_follow_restarts(IstessoMediaWatch *watch);
  *       made again. What is on the screen is not the host's picture of this moment any more.
  *    4: connected, the first time or again; istesso_media_watch_info() says what the host
  *       sends now, and the first frame that follows is a key frame.
+ *    5: (trial only) the host has said what the text input field is; fetch it with
+ *       istesso_media_watch_text_input().
  *   -1: it is over and is not tried again; istesso_media_watch_state() says why, and
  *       istesso_media_last_error() in a sentence.
  * One thread calls this.
@@ -272,6 +295,10 @@ int32_t istesso_media_watch_info(const IstessoMediaWatch *watch, IstessoMediaStr
 
 /* As istesso_media_client_cursor(), on the connection there is. */
 int32_t istesso_media_watch_cursor(const IstessoMediaWatch *watch, IstessoMediaCursor *cursor);
+
+/* Trial only: what the host last said the text input field is. 1: `field` is filled in. 0: it
+ * has said nothing yet. -1: no connection. The thread that calls istesso_media_watch_next(). */
+int32_t istesso_media_watch_text_input(const IstessoMediaWatch *watch, IstessoMediaTextInput *field);
 
 /* How it stands. From any thread. 0, or -1. */
 int32_t istesso_media_watch_state(const IstessoMediaWatch *watch, IstessoMediaWatchState *state);

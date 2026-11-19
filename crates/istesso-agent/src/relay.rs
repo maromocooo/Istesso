@@ -169,7 +169,9 @@ pub struct InputLine {
     alive: bool,
     /// The device takes committed text; without, none is sent to it.
     text: bool,
-    /// Pieces of committed text not sent because the device does not take them.
+    /// The device takes composing text; without, none is sent to it.
+    preedit: bool,
+    /// Pieces of committed or composing text not sent because the device does not take them.
     text_dropped: u64,
     /// The level of scrolls the device takes (`istesso_proto::SCROLL_LEVEL`; 0: `dx`, `dy` only).
     scroll: u8,
@@ -212,11 +214,12 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let (alive, text, scroll, clipboard) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let (alive, text, scroll, clipboard, preedit) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let mut line = Self::waiting(connect);
         line.client = Some(client);
         line.alive = alive;
         line.text = text;
+        line.preedit = preedit;
         line.scroll = scroll;
         line.clipboard = clipboard;
         Ok(line)
@@ -237,6 +240,7 @@ impl InputLine {
             client: None,
             alive: false,
             text: false,
+            preedit: false,
             text_dropped: 0,
             scroll: 0,
             scroll_told: false,
@@ -285,7 +289,13 @@ impl InputLine {
         self.scroll
     }
 
-    /// How many pieces of committed text were not sent because the device
+    /// Whether the device takes composing text, as it said when the
+    /// conversation was last opened.
+    pub fn takes_preedit(&self) -> bool {
+        self.preedit
+    }
+
+    /// How many pieces of committed or composing text were not sent because the device
     /// does not take them.
     pub fn text_dropped(&self) -> u64 {
         self.text_dropped
@@ -349,6 +359,7 @@ impl InputLine {
         // The same for copy and paste.
         let not_taken = |e: &InputEvent| match e {
             InputEvent::Text { .. } => !self.text,
+            InputEvent::Preedit { .. } => !self.preedit,
             InputEvent::Copy { .. } | InputEvent::Paste { .. } => !self.clipboard,
             _ => false,
         };
@@ -356,7 +367,7 @@ impl InputLine {
             kept = events.iter().filter(|e| !not_taken(e)).cloned().collect();
             for event in events.iter().filter(|e| not_taken(e)) {
                 match event {
-                    InputEvent::Text { .. } => self.text_dropped += 1,
+                    InputEvent::Text { .. } | InputEvent::Preedit { .. } => self.text_dropped += 1,
                     _ => self.clipboard_dropped += 1,
                 }
             }
@@ -541,7 +552,7 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let (alive, text, scroll, clipboard) = match ask(&mut client, within) {
+        let (alive, text, scroll, clipboard, preedit) = match ask(&mut client, within) {
             Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
@@ -562,6 +573,7 @@ impl InputLine {
         self.client = Some(client);
         self.alive = alive;
         self.text = text;
+        self.preedit = preedit;
         self.scroll = scroll;
         self.scroll_told = false;
         self.clipboard = clipboard;
@@ -571,11 +583,17 @@ impl InputLine {
     }
 }
 
+/// What the device said when the conversation was opened: whether it answers "still here",
+/// takes committed text, the level of scrolls it takes, whether it takes copy and paste, and
+/// whether it takes composing text.
+type Taken = (bool, bool, u8, bool, bool);
+
 /// Asks whether input is taken, and to be answered when saying "still
 /// here"; the answer has `within` this time. `Ok` says whether the device
 /// answers; `Err` what to do about its refusal, and the refusal in a
 /// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
-fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, u8, bool), (Again, String)> {
+/// `Ok`: what the device said ([`Taken`]).
+fn ask(client: &mut Client, within: Duration) -> Result<Taken, (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
@@ -591,7 +609,8 @@ fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, u8, bool), 
             text,
             scroll,
             clipboard,
-        } => Ok((alive, text, scroll, clipboard && alive)),
+            preedit,
+        } => Ok((alive, text, scroll, clipboard && alive, preedit)),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -1121,6 +1140,7 @@ mod tests {
                             text: false,
                             scroll: 0,
                             clipboard: false,
+                            preedit: false,
                         })
                         .unwrap();
                 }
