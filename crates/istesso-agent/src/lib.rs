@@ -13,6 +13,7 @@ pub mod cache;
 pub mod discovery;
 pub mod passing;
 pub mod paths;
+pub mod projects;
 pub mod relay;
 pub mod serve;
 pub mod status;
@@ -73,6 +74,7 @@ pub(crate) mod testing {
             power: PowerCaps::default(),
             tools: Tools::default(),
             capabilities: Default::default(),
+            projects: Vec::new(),
             roles: vec![Role::AlwaysOnCandidate],
             warnings: Vec::new(),
         }

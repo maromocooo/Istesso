@@ -21,7 +21,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 2: network interfaces list only real adapters and carry their kind and
 /// current addresses.
 /// 3: capabilities: tools found and devices attached.
-pub const MANIFEST_SCHEMA: u32 = 3;
+/// 4: projects owned by this machine.
+pub const MANIFEST_SCHEMA: u32 = 4;
 
 /// Reads a list and drops the items this version does not understand.
 ///
@@ -297,6 +298,37 @@ pub enum Role {
     AppAudioCapture,
 }
 
+/// A project as published by its development machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub kinds: Vec<ProjectKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectKind {
+    Rust,
+    Node,
+    Apple,
+    Blender,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProjectKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Node => "node",
+            Self::Apple => "apple",
+            Self::Blender => "blender",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostManifest {
     pub schema: u32,
@@ -309,6 +341,8 @@ pub struct HostManifest {
     pub tools: Tools,
     #[serde(default)]
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub projects: Vec<Project>,
     #[serde(deserialize_with = "known_only")]
     pub roles: Vec<Role>,
     /// Things the user should know before relying on this host.
@@ -607,6 +641,7 @@ mod tests {
             },
             tools: Tools::default(),
             capabilities: Capabilities::default(),
+            projects: Vec::new(),
             roles: vec![Role::MacApps],
             warnings: Vec::new(),
         };

@@ -1,5 +1,7 @@
 //! `istesso` — the command line entry point of Istesso.
 
+mod projects;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -45,6 +47,14 @@ enum Command {
     Apps {
         #[command(subcommand)]
         action: AppsAction,
+    },
+    /// List projects and their development machines, or manage local registrations
+    Projects {
+        /// Print the list as JSON
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<projects::Action>,
     },
     /// Pair this device with another one
     Pair {
@@ -462,9 +472,9 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Doctor { json } => {
-            let manifest = istesso_doctor::detect();
-            // Other commands and the agent reuse this inspection for a while.
-            cache::remember_local_manifest(&Paths::from_env(), &manifest);
+            let paths = Paths::from_env();
+            let mut manifest = cache::refresh_local_manifest(&paths);
+            manifest.projects = istesso_agent::projects::list(&paths)?;
             if json {
                 print_json(&manifest)
             } else {
@@ -488,6 +498,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         }
+        Command::Projects { action, json } => projects::run(action, json),
         Command::Apps { action } => run_apps(action),
         Command::Pair { action } => run_pair(action),
         Command::Peers { action } => run_peers(action),
@@ -2155,7 +2166,7 @@ mod tests {
 
     /// A made-up manifest, so that most tests do not have to inspect the
     /// machine they run on (slow on macOS).
-    fn sample_manifest(name: &str) -> HostManifest {
+    pub(super) fn sample_manifest(name: &str) -> HostManifest {
         HostManifest {
             schema: istesso_proto::MANIFEST_SCHEMA,
             name: name.to_string(),
@@ -2183,6 +2194,7 @@ mod tests {
             power: istesso_proto::PowerCaps::default(),
             tools: istesso_proto::Tools::default(),
             capabilities: Default::default(),
+            projects: Vec::new(),
             roles: vec![Role::MacApps, Role::HardwareEncode],
             warnings: Vec::new(),
         }
@@ -2310,7 +2322,7 @@ mod tests {
         assert_eq!(ago(3 * 86_400), "3 days ago");
     }
 
-    fn view(name: &str, local: bool, state: HostState) -> HostView {
+    pub(super) fn view(name: &str, local: bool, state: HostState) -> HostView {
         let mut manifest = sample_manifest(name);
         manifest.power.interfaces = vec![istesso_proto::NetInterface {
             name: "en0".to_string(),

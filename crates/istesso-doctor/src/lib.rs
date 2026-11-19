@@ -52,6 +52,7 @@ pub fn detect() -> HostManifest {
         power,
         tools,
         capabilities,
+        projects: Vec::new(),
         roles,
         warnings,
     }

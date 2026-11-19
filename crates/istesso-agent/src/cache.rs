@@ -152,7 +152,7 @@ pub fn remember_local_manifest(paths: &Paths, manifest: &HostManifest) {
 
 /// Writes a file only its owner can read, replacing any earlier version in
 /// one step.
-fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
     if let Some(parent) = path.parent() {

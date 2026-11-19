@@ -365,12 +365,11 @@ impl Shared {
         // was removed a moment ago must not be honoured any more.
         let peers = match PeerStore::open(self.paths.peers()) {
             Ok(peers) => peers,
-            Err(err) => {
-                (self.log)(format!("cannot read the list of paired devices: {err}"));
+            Err(_) => {
+                (self.log)("cannot read the list of paired devices".into());
                 return;
             }
         };
-        let remote = stream.peer_addr().ok();
         let mut session = match Session::accept(stream, &self.keys, &peers, WAIT) {
             Ok(session) => session,
             Err(err) => {
@@ -382,8 +381,7 @@ impl Shared {
                         | istesso_link::Error::Version { .. }
                         | istesso_link::Error::BadIdentity
                 ) {
-                    let from = remote.map(|a| a.ip().to_string()).unwrap_or_default();
-                    (self.log)(format!("refused a connection from {from}: {err}"));
+                    (self.log)(format!("refused a connection: {err}"));
                 }
                 return;
             }
@@ -524,8 +522,15 @@ impl Shared {
             Request::Ping => Response::Pong,
             Request::Manifest => {
                 asked.push("manifest");
-                Response::Manifest {
-                    manifest: Box::new(self.manifest()),
+                match crate::projects::list(&self.paths) {
+                    Ok(projects) => {
+                        let mut manifest = self.manifest();
+                        manifest.projects = projects;
+                        Response::Manifest {
+                            manifest: Box::new(manifest),
+                        }
+                    }
+                    Err(message) => Response::error(ErrorCode::Internal, message),
                 }
             }
             Request::Apps => {
@@ -625,6 +630,23 @@ mod tests {
         agent.shared.refresh_manifest();
         assert_ne!(agent.shared.manifest().name, "planted for this test");
         assert!(paths.local_manifest().exists());
+    }
+
+    #[test]
+    fn manifest_requests_pick_up_registration_changes_while_running() {
+        let dir = TempDir::new("serve-projects");
+        let paths = dir.paths();
+        cache::remember_local_manifest(&paths, &testing::manifest(""));
+        let agent = agent(&paths);
+        let published = || match agent.shared.answer(&Request::Manifest, &mut Vec::new()) {
+            Response::Manifest { manifest } => manifest.projects,
+            _ => panic!("expected a manifest"),
+        };
+        assert!(published().is_empty());
+        crate::projects::add(&paths, "demo", &paths.config).unwrap();
+        assert_eq!(published(), crate::projects::list(&paths).unwrap());
+        crate::projects::remove(&paths, "demo").unwrap();
+        assert!(published().is_empty());
     }
 
     #[cfg(unix)]
