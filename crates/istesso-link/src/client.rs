@@ -21,8 +21,9 @@ pub enum InputAnswer {
     Open {
         alive: bool,
         text: bool,
-        clipboard: bool,
         scroll: u8,
+        clipboard: bool,
+        preedit: bool,
     },
     /// It is not, and this is why: callers decide by the code.
     Refused { code: ErrorCode, message: String },
@@ -188,13 +189,15 @@ impl Client {
             Response::InputOpen {
                 alive,
                 text,
-                clipboard,
                 scroll,
+                clipboard,
+                preedit,
             } => Ok(InputAnswer::Open {
                 alive,
                 text,
-                clipboard,
                 scroll,
+                clipboard,
+                preedit,
             }),
             Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
             _ => Err(Error::Malformed),

@@ -68,13 +68,18 @@ pub enum Response {
         alive: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         text: bool,
+        /// Trial: the level of scrolls taken (`istesso_proto::SCROLL_LEVEL`); 0
+        /// (left out): only `dx` and `dy` of a scroll are used.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        scroll: u8,
         /// Copy and paste (`InputEvent::Copy`, `InputEvent::Paste`) are taken too: what takes
         /// input here said so just now (trial only, docs/adr/0022-clipboard-text.md). A device
         /// that does not say so is sent neither; they would be dropped without a word.
         #[serde(default, skip_serializing_if = "is_false")]
         clipboard: bool,
-        #[serde(default, skip_serializing_if = "is_zero")]
-        scroll: u8,
+        /// Composing text (`InputEvent::Preedit`) is taken too.
+        #[serde(default, skip_serializing_if = "is_false")]
+        preedit: bool,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
@@ -191,8 +196,9 @@ mod tests {
             serde_json::to_string(&Response::InputOpen {
                 alive: false,
                 text: false,
+                scroll: 0,
                 clipboard: false,
-                scroll: 0
+                preedit: false
             })
             .unwrap(),
             plain
@@ -206,8 +212,9 @@ mod tests {
             Response::InputOpen {
                 alive: false,
                 text: false,
+                scroll: 0,
                 clipboard: false,
-                scroll: 0
+                preedit: false
             }
         );
         // Asked for, and agreed to.
@@ -221,8 +228,9 @@ mod tests {
             Response::InputOpen {
                 alive: true,
                 text: false,
+                scroll: 0,
                 clipboard: false,
-                scroll: 0
+                preedit: false
             }
         );
         assert_eq!(
@@ -231,8 +239,9 @@ mod tests {
             Response::InputOpen {
                 alive: true,
                 text: true,
+                scroll: 0,
                 clipboard: false,
-                scroll: 0
+                preedit: false
             }
         );
         assert_eq!(
@@ -241,8 +250,9 @@ mod tests {
             Response::InputOpen {
                 alive: false,
                 text: true,
+                scroll: 1,
                 clipboard: false,
-                scroll: 1
+                preedit: false
             }
         );
         // An earlier version reads both as what it knows, and its own answer says
@@ -257,8 +267,9 @@ mod tests {
             Response::InputOpen {
                 alive: false,
                 text: false,
+                scroll: 0,
                 clipboard: false,
-                scroll: 0
+                preedit: false
             }
         );
         assert_eq!(
@@ -361,8 +372,9 @@ mod tests {
             Response::InputOpen {
                 alive: true,
                 text: true,
+                scroll: 0,
                 clipboard: true,
-                scroll: 0
+                preedit: false
             }
         );
     }

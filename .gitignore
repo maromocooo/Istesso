@@ -18,3 +18,9 @@ __pycache__/
 /macos/daily-host/build/
 # Output of macos/input-method/build.sh
 /macos/input-method/build/
+
+# What the owner noticed while using the everyday trial (scripts/daily.sh note); never committed
+/trial-notes.md
+
+# Local trial shortcut bundles include this checkout's absolute path.
+/build/shortcuts/

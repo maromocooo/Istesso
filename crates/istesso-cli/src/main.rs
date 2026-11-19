@@ -648,8 +648,12 @@ fn relay_input(
     // for the program that shows the window.
     let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
     // "text": whether the device takes committed text (1) or not (0), for the window;
-    // "clipboard": the same for copy and paste (trial only, ADR 0022).
-    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool, clipboard: bool| {
+    // "clipboard": the same for copy and paste (trial only, ADR 0022); "preedit": the same for
+    // composing text (trial only).
+    let tell = |event: &str,
+                cuts: u64,
+                after: Option<Duration>,
+                (text, clipboard, preedit): (bool, bool, bool)| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -674,10 +678,11 @@ fn relay_input(
             String::new()
         };
         let line = format!(
-            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{}{status}}}\n",
+            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{},\"preedit\":{}{status}}}\n",
             std::process::id(),
             u8::from(text),
-            u8::from(clipboard)
+            u8::from(clipboard),
+            u8::from(preedit)
         );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
@@ -721,12 +726,20 @@ fn relay_input(
     istesso_agent::clipboard::set_buffers(&answering, istesso_agent::clipboard::SOCKET_BUFFER);
     let askers = std::cell::RefCell::new(Askers::default());
     let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
+    // What the device said it takes, for the state line.
+    let takes = |line: &InputLine| {
+        (
+            line.takes_text(),
+            line.takes_clipboard(),
+            line.takes_preedit(),
+        )
+    };
     let opened = |line: &InputLine| {
         println!(
             "Input written to {} goes to the paired device.",
             socket.display()
         );
-        tell("open", 0, None, line.takes_text(), line.takes_clipboard());
+        tell("open", 0, None, takes(line));
         if !line.is_answered() {
             eprintln!(
                 "note: the device is of a version that does not answer \"still here\"; a connection \
@@ -735,7 +748,7 @@ fn relay_input(
         }
     };
     if daily {
-        tell("waiting", 0, None, false, false);
+        tell("waiting", 0, None, (false, false, false));
     } else {
         opened(&line);
     }
@@ -848,23 +861,10 @@ fn relay_input(
                 "note: {text_dropped} piece(s) of committed text were not sent: the device does not take text"
             );
         }
-        if line.text_dropped() != text_dropped {
-            text_dropped = line.text_dropped();
-            // How many, never what.
-            eprintln!(
-                "note: {text_dropped} piece(s) of committed text were not sent: the device does not take text"
-            );
-        }
         match happened {
             Some(Happened::Cut) => {
                 eprintln!("note: the conversation with the device was cut; opening it again");
-                tell(
-                    "cut",
-                    line.cuts(),
-                    None,
-                    line.takes_text(),
-                    line.takes_clipboard(),
-                );
+                tell("cut", line.cuts(), None, takes(&line));
             }
             Some(Happened::Back { .. }) if daily && line.cuts() == 0 => opened(&line),
             Some(Happened::Back { after }) => {
@@ -872,13 +872,7 @@ fn relay_input(
                     "note: the conversation with the device is back after {:.2} s",
                     after.as_secs_f64()
                 );
-                tell(
-                    "back",
-                    line.cuts(),
-                    Some(after),
-                    line.takes_text(),
-                    line.takes_clipboard(),
-                );
+                tell("back", line.cuts(), Some(after), takes(&line));
             }
             None => {}
         }
