@@ -171,6 +171,10 @@ pub struct InputLine {
     text: bool,
     /// Pieces of committed text not sent because the device does not take them.
     text_dropped: u64,
+    /// The level of scrolls the device takes (`istesso_proto::SCROLL_LEVEL`; 0: `dx`, `dy` only).
+    scroll: u8,
+    /// Said once in this conversation that the device does not take the kind of scrolls.
+    scroll_told: bool,
     /// The device takes copy and paste (trial only); without, none is sent to it.
     clipboard: bool,
     /// Copies and pastes not sent because the device does not take them.
@@ -208,12 +212,13 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let (alive, text, clipboard) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let (alive, text, clipboard, scroll) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let mut line = Self::waiting(connect);
         line.client = Some(client);
         line.alive = alive;
         line.text = text;
         line.clipboard = clipboard;
+        line.scroll = scroll;
         Ok(line)
     }
 
@@ -233,6 +238,8 @@ impl InputLine {
             alive: false,
             text: false,
             text_dropped: 0,
+            scroll: 0,
+            scroll_told: false,
             clipboard: false,
             clipboard_dropped: 0,
             awaiting: BTreeMap::new(),
@@ -281,6 +288,11 @@ impl InputLine {
 
     /// Whether the device takes copy and paste, as it said when the conversation was last
     /// opened (trial only).
+    /// The level of scrolls the device takes, as it said when the conversation was opened.
+    pub fn scroll_level(&self) -> u8 {
+        self.scroll
+    }
+
     pub fn takes_clipboard(&self) -> bool {
         self.clipboard
     }
@@ -349,6 +361,28 @@ impl InputLine {
                 }
             }
             &kept[..]
+        } else {
+            events
+        };
+        // A device that does not take the kind of scrolls uses their dx and dy only: one whose
+        // dx and dy are both 0 (a stage of a gesture) would only be an empty scroll there. Said
+        // once a conversation, in a plain line, instead of the scrolls being less without a word.
+        let fewer: Vec<InputEvent>;
+        let events = if self.scroll < istesso_proto::SCROLL_LEVEL
+            && events.iter().any(istesso_proto::scroll_has_kind)
+        {
+            if !self.scroll_told && self.client.is_some() {
+                self.scroll_told = true;
+                eprintln!(
+                    "note: the host's agent does not take: scroll kinds (wheel notches, finger pixels, stages); scrolls go as dx and dy only"
+                );
+            }
+            fewer = events
+                .iter()
+                .filter(|e| !matches!(e, InputEvent::Scroll { dx: 0, dy: 0, .. }))
+                .cloned()
+                .collect();
+            &fewer[..]
         } else {
             events
         };
@@ -507,7 +541,7 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let (alive, text, clipboard) = match ask(&mut client, within) {
+        let (alive, text, clipboard, scroll) = match ask(&mut client, within) {
             Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
@@ -529,6 +563,8 @@ impl InputLine {
         self.alive = alive;
         self.text = text;
         self.clipboard = clipboard;
+        self.scroll = scroll;
+        self.scroll_told = false;
         self.unanswered_since = None;
         (self.said, self.listened, self.made_at) = (now_open, now_open, now_open);
         Ok(Some(Happened::Back { after }))
@@ -539,7 +575,7 @@ impl InputLine {
 /// here"; the answer has `within` this time. `Ok` says whether the device
 /// answers; `Err` what to do about its refusal, and the refusal in a
 /// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
-fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, bool), (Again, String)> {
+fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, bool, u8), (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
@@ -554,7 +590,8 @@ fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, bool), (Aga
             alive,
             text,
             clipboard,
-        } => Ok((alive, text, clipboard && alive)),
+            scroll,
+        } => Ok((alive, text, clipboard && alive, scroll)),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -1069,6 +1106,7 @@ mod tests {
                             alive: false,
                             text: false,
                             clipboard: false,
+                            scroll: 0,
                         })
                         .unwrap();
                 }

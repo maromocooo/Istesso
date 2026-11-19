@@ -73,6 +73,8 @@ pub enum Response {
         /// that does not say so is sent neither; they would be dropped without a word.
         #[serde(default, skip_serializing_if = "is_false")]
         clipboard: bool,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        scroll: u8,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
@@ -105,6 +107,10 @@ pub enum ErrorCode {
     Internal,
     #[serde(other)]
     Other,
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -185,7 +191,8 @@ mod tests {
             serde_json::to_string(&Response::InputOpen {
                 alive: false,
                 text: false,
-                clipboard: false
+                clipboard: false,
+                scroll: 0
             })
             .unwrap(),
             plain
@@ -199,7 +206,8 @@ mod tests {
             Response::InputOpen {
                 alive: false,
                 text: false,
-                clipboard: false
+                clipboard: false,
+                scroll: 0
             }
         );
         // Asked for, and agreed to.
@@ -213,7 +221,8 @@ mod tests {
             Response::InputOpen {
                 alive: true,
                 text: false,
-                clipboard: false
+                clipboard: false,
+                scroll: 0
             }
         );
         assert_eq!(
@@ -222,7 +231,18 @@ mod tests {
             Response::InputOpen {
                 alive: true,
                 text: true,
-                clipboard: false
+                clipboard: false,
+                scroll: 0
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"type":"input_open","text":true,"scroll":1}"#)
+                .unwrap(),
+            Response::InputOpen {
+                alive: false,
+                text: true,
+                clipboard: false,
+                scroll: 1
             }
         );
         // An earlier version reads both as what it knows, and its own answer says
@@ -237,7 +257,8 @@ mod tests {
             Response::InputOpen {
                 alive: false,
                 text: false,
-                clipboard: false
+                clipboard: false,
+                scroll: 0
             }
         );
         assert_eq!(
@@ -340,7 +361,8 @@ mod tests {
             Response::InputOpen {
                 alive: true,
                 text: true,
-                clipboard: true
+                clipboard: true,
+                scroll: 0
             }
         );
     }

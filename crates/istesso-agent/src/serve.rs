@@ -599,6 +599,7 @@ impl Shared {
                                 alive,
                                 text: true,
                                 clipboard: clipboard_on,
+                                scroll: istesso_proto::SCROLL_LEVEL,
                             }
                         }
                         Err(_) => Response::error(
@@ -1004,6 +1005,7 @@ mod tests {
                     alive: true,
                     text: true,
                     clipboard: true,
+                    scroll: istesso_proto::SCROLL_LEVEL,
                 }
             );
             client
@@ -1066,6 +1068,7 @@ mod tests {
                     alive: true,
                     text: true,
                     clipboard: false,
+                    scroll: istesso_proto::SCROLL_LEVEL,
                 }
             );
             // Sent anyway, they are dropped; the keys around them arrive.
@@ -1117,6 +1120,7 @@ mod tests {
                     alive: true,
                     text: true,
                     clipboard: false,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             asking.send_input(&[]).unwrap();
@@ -1175,6 +1179,7 @@ mod tests {
                 pixels: Some([0.0, y]),
                 phase,
                 momentum: None,
+                momentum_follows: false,
             };
             let wheel = |v120: i32| InputEvent::Scroll {
                 dx: 0,
@@ -1184,6 +1189,7 @@ mod tests {
                 pixels: None,
                 phase: None,
                 momentum: None,
+                momentum_follows: false,
             };
             client
                 .send_input(&[
@@ -1245,6 +1251,7 @@ mod tests {
                     alive: true,
                     text: true,
                     clipboard: false,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
@@ -1260,6 +1267,7 @@ mod tests {
                     alive: true,
                     text: true,
                     clipboard: false,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             second.send_input(&[key(29, true)]).unwrap();
@@ -1302,6 +1310,7 @@ mod tests {
                     alive: true,
                     text: true,
                     clipboard: false,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             // What was down comes up, and the conversation carries on.
