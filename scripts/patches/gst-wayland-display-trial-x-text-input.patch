@@ -11,6 +11,13 @@ without an enabled text input gets printable ASCII as key presses (US layout; on
 only letters, digits and the space; Caps Lock is taken into account); anything else is dropped. The text is never logged, only
 how many characters went which way.
 
+Composing text (Istesso's ADR 0007, "変換中の文字"): the upstream event TextPreedit (text,
+cursor-begin, cursor-end as UTF-8 byte offsets) goes to the same text input as preedit_string and
+done, so that the application draws it in its own font; empty text clears it. With the property
+text-input-messages the element posts wayland.text-input (state: 0 no field, 1 a field, 2 a
+password field by its content type; and the text cursor's rectangle in the output) whenever that
+changes; no typed text is in it (ADR 0015, "文字の入力の欄").
+
 A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
 MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
 gst-wayland-display-cursor-messages.patch, gst-wayland-display-windows.patch,
@@ -22,10 +29,45 @@ FOR TRIALS AND EVERYDAY USE ONLY. It is not in the build the M1 gate and verdict
 does not go into main before a review (it touches the input path and input rights).
 
 diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
-index 5dafbc7..8d36da5 100644
+index 5dafbc7..35552ba 100644
 --- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
 +++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
-@@ -220,6 +220,12 @@ impl EventHandler for WaylandDisplaySrc {
+@@ -56,6 +56,7 @@ pub struct Settings {
+     render_on_commit: bool,
+     cursor_messages: bool,
+     window_messages: bool,
++    text_input_messages: bool,
+     #[cfg(feature = "cuda")]
+     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
+     #[cfg(feature = "cuda")]
+@@ -70,6 +71,26 @@ pub struct State {
+ /// element's bus: the structure `wayland.windows` with a `count`. 0 says that the last window
+ /// has gone. `attention` is how many of them want attention: their application asked for
+ /// them to come forward, or they came, while another application had the keyboard.
++/// Trial only: posts the field with the keyboard as an application message, the structure
++/// `wayland.text-input` with `state` (0 none, 1 a field, 2 a password field) and the text
++/// cursor's rectangle in the picture (`x`, `y`, `width`, `height`), whenever it changes.
++fn text_input_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddisplaycore::TextInputSink {
++    Box::new(move |state, x, y, width, height| {
++        let Some(element) = element.upgrade() else {
++            return;
++        };
++        let structure = Structure::builder("wayland.text-input")
++            .field("state", state)
++            .field("x", x)
++            .field("y", y)
++            .field("width", width)
++            .field("height", height)
++            .build();
++        let message = Application::builder(structure).src(&element).build();
++        let _ = element.post_message(message);
++    })
++}
++
+ fn window_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddisplaycore::WindowSink {
+     Box::new(move |windows, attention| {
+         let Some(element) = element.upgrade() else {
+@@ -220,6 +241,22 @@ impl EventHandler for WaylandDisplaySrc {
                          },
                      ));
  
@@ -35,14 +77,62 @@ index 5dafbc7..8d36da5 100644
 +                    if let Ok(text) = structure.get::<String>("text") {
 +                        let _ = self.command_tx.send(Command::TextCommit(text));
 +                    }
++                    return true;
++                } else if structure.has_name("TextPreedit") {
++                    // Trial only: composing text (never logged).
++                    if let (Ok(text), Ok(begin), Ok(end)) = (
++                        structure.get::<String>("text"),
++                        structure.get::<u32>("cursor-begin"),
++                        structure.get::<u32>("cursor-end"),
++                    ) {
++                        let _ = self.command_tx.send(Command::TextPreedit(text, begin, end));
++                    }
                      return true;
                  } else if structure.has_name("TouchDown") {
                      let x = structure.get::<f64>("x").expect("Should contain x");
+@@ -356,6 +393,13 @@ impl ObjectImpl for WaylandDisplaySrc {
+                     )
+                     .default_value(false)
+                     .build(),
++                glib::ParamSpecBoolean::builder("text-input-messages")
++                    .nick("Text input messages")
++                    .blurb(
++                        "Trial only: post an application message, wayland.text-input, with the field that has the keyboard and where its text cursor is, whenever that changes",
++                    )
++                    .default_value(false)
++                    .build(),
+                 glib::ParamSpecBoolean::builder("cursor-messages")
+                     .nick("Cursor messages")
+                     .blurb(
+@@ -439,6 +483,12 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 // Taken in by the compositor when it runs; it may be changed while it does.
+                 let _ = self.command_tx.send(Command::WindowSink(sink));
+             }
++            "text-input-messages" => {
++                let enabled = value.get::<bool>().expect("Type checked upstream");
++                self.settings.lock().unwrap().text_input_messages = enabled;
++                let sink = enabled.then(|| text_input_sink(self.obj().downgrade()));
++                let _ = self.command_tx.send(Command::TextInputSink(sink));
++            }
+             "cursor-messages" => {
+                 let enabled = value.get::<bool>().expect("Type checked upstream");
+                 self.settings.lock().unwrap().cursor_messages = enabled;
+@@ -492,6 +542,10 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 let settings = self.settings.lock().unwrap();
+                 settings.window_messages.to_value()
+             }
++            "text-input-messages" => {
++                let settings = self.settings.lock().unwrap();
++                settings.text_input_messages.to_value()
++            }
+             _ => unreachable!(),
+         }
+     }
 diff --git a/wayland-display-core/src/comp/focus.rs b/wayland-display-core/src/comp/focus.rs
-index f4bd241..00b047e 100644
+index f4bd241..13577f9 100644
 --- a/wayland-display-core/src/comp/focus.rs
 +++ b/wayland-display-core/src/comp/focus.rs
-@@ -54,6 +54,16 @@ impl KeyboardTarget<State> for FocusTarget {
+@@ -54,6 +54,17 @@ impl KeyboardTarget<State> for FocusTarget {
          keys: Vec<KeysymHandle<'_>>,
          serial: Serial,
      ) {
@@ -56,24 +146,26 @@ index f4bd241..00b047e 100644
 +        };
 +        data.text_inputs.focus_changed(Some(surface));
 +        data.text_inputs_check_soon();
++        data.tell_text_input();
          match self {
              FocusTarget::Wayland(w) => match w.underlying_surface() {
                  WindowSurface::Wayland(w) => {
 diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
-index 8007d2c..6a3c352 100644
+index 8007d2c..939ee92 100644
 --- a/wayland-display-core/src/comp/mod.rs
 +++ b/wayland-display-core/src/comp/mod.rs
-@@ -175,6 +175,9 @@ pub struct State {
+@@ -175,6 +175,10 @@ pub struct State {
      pub shm_state: ShmState,
      viewporter_state: ViewporterState,
      pub(crate) activation_state: XdgActivationState,
 +    /// Trial only: the clients' text inputs, for committed text.
 +    pub(crate) text_inputs: crate::wayland::handlers::text_input::TextInputs,
++    pub(crate) text_input_report: crate::wayland::handlers::text_input::TextInputReport,
 +    _text_input_global: smithay::reexports::wayland_server::backend::GlobalId,
      /// The last key presses and button presses, for telling an activation token that comes
      /// of one from one made at will.
      pub(crate) input_serials: windows::InputSerials<ClientId>,
-@@ -218,6 +221,7 @@ impl State {
+@@ -218,6 +222,7 @@ impl State {
          let shell_state = XdgShellState::new::<State>(&dh);
          let viewporter_state = ViewporterState::new::<State>(&dh);
          let activation_state = XdgActivationState::new::<State>(&dh);
@@ -81,36 +173,57 @@ index 8007d2c..6a3c352 100644
          let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
  
          let render_node: Option<DrmNode> = render_target.clone().into();
-@@ -319,6 +323,8 @@ impl State {
+@@ -319,6 +324,9 @@ impl State {
              shm_state,
              viewporter_state,
              activation_state,
 +            text_inputs: Default::default(),
++            text_input_report: Default::default(),
 +            _text_input_global: text_input_global,
              input_serials: windows::InputSerials::default(),
              pointer_window_at: None,
              keyboard_holder: None,
-@@ -1242,6 +1248,9 @@ pub(crate) fn init(
+@@ -1242,6 +1250,16 @@ pub(crate) fn init(
                          };
                      }
                  }
 +                Event::Msg(Command::TextCommit(text)) => {
 +                    state.commit_text(&text);
 +                }
++                Event::Msg(Command::TextPreedit(text, begin, end)) => {
++                    state.preedit_text(&text, begin, end);
++                }
++                Event::Msg(Command::TextInputSink(sink)) => {
++                    state.text_input_report.set_sink(sink);
++                    state.tell_text_input();
++                }
                  Event::Msg(Command::CloseWindows) => {
                      let asked = state.close_windows();
                      tracing::info!(asked, "Asked the windows to close.");
 diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
-index e307e15..442eb42 100644
+index e307e15..215c4db 100644
 --- a/wayland-display-core/src/lib.rs
 +++ b/wayland-display-core/src/lib.rs
-@@ -60,6 +60,9 @@ pub enum Command {
+@@ -25,6 +25,7 @@ pub(crate) mod wayland;
+ 
+ pub use crate::comp::cursor::{Cursor, CursorImage, CursorSink};
+ pub use crate::comp::windows::WindowSink;
++pub use crate::wayland::handlers::text_input::TextInputSink;
+ pub use crate::utils::video_info::GstVideoInfo;
+ 
+ pub enum Command {
+@@ -60,6 +61,14 @@ pub enum Command {
      /// Tell the sink how many windows the clients have, now and whenever that changes; with
      /// `None`, nobody.
      WindowSink(Option<WindowSink>),
 +    /// Trial only: committed text for the client that has the keyboard (its text input, or
 +    /// printable ASCII as keys).
 +    TextCommit(String),
++    /// Trial only: composing text (all of it, and the selected part as UTF-8 byte offsets) for
++    /// the client that has the keyboard; empty clears it.
++    TextPreedit(String, u32, u32),
++    /// Trial only: who is told about the field with the keyboard; `None`, nobody.
++    TextInputSink(Option<crate::wayland::handlers::text_input::TextInputSink>),
      Quit,
  }
  
@@ -127,10 +240,10 @@ index b764f27..67b820f 100644
  pub mod wl_drm;
  pub mod xdg;
 diff --git a/wayland-display-core/src/wayland/handlers/seat.rs b/wayland-display-core/src/wayland/handlers/seat.rs
-index b0ef369..8583d4b 100644
+index b0ef369..9d884af 100644
 --- a/wayland-display-core/src/wayland/handlers/seat.rs
 +++ b/wayland-display-core/src/wayland/handlers/seat.rs
-@@ -18,6 +18,11 @@ impl SeatHandler for State {
+@@ -18,6 +18,12 @@ impl SeatHandler for State {
  
      fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
          self.tell_windows_which_is_active(focus);
@@ -139,15 +252,16 @@ index b0ef369..8583d4b 100644
 +            FocusTarget::Popup(p) => p.wl_surface().clone(),
 +        });
 +        self.text_inputs.focus_changed(surface);
++        self.tell_text_input();
          if let Some(surface) = focus {
              let client = match surface {
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
 new file mode 100644
-index 0000000..a5d91e4
+index 0000000..b878c84
 --- /dev/null
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,563 @@
 +//! Trial only: committed text for the client that has the keyboard (Istesso's ADR 0007,
 +//! "確定した文字", and ADR 0020, route d). The device a person types on composes the text with
 +//! its own input method and sends only what was committed; here it is handed to the text input
@@ -256,6 +370,40 @@ index 0000000..a5d91e4
 +    enabled: bool,
 +    /// The surface it was told it entered, if any.
 +    entered: Option<WlSurface>,
++    /// Where the text cursor is, in the surface (as the client last committed), and
++    /// whether the field is for a password or other secret; and what is pending.
++    rect: Option<(i32, i32, i32, i32)>,
++    secret: bool,
++    pending_rect: Option<(i32, i32, i32, i32)>,
++    pending_secret: Option<bool>,
++}
++
++/// Told whenever the field with the keyboard changes: 0 none, 1 a field, 2 a password field;
++/// and the text cursor's rectangle in the output (x, y, width, height). Trial only.
++pub type TextInputSink = Box<dyn Fn(u32, i32, i32, u32, u32) + Send>;
++
++/// Tells a sink about the field with the keyboard, only when that changed.
++#[derive(Default)]
++pub struct TextInputReport {
++    sink: Option<TextInputSink>,
++    last: Option<(u32, i32, i32, u32, u32)>,
++}
++
++impl TextInputReport {
++    pub fn set_sink(&mut self, sink: Option<TextInputSink>) {
++        self.sink = sink;
++        self.last = None;
++    }
++
++    fn tell(&mut self, now: (u32, i32, i32, u32, u32)) {
++        if self.last == Some(now) {
++            return;
++        }
++        self.last = Some(now);
++        if let Some(sink) = &self.sink {
++            sink(now.0, now.1, now.2, now.3, now.4);
++        }
++    }
 +}
 +
 +fn same_client(a: &ObjectId, b: &ObjectId) -> bool {
@@ -274,6 +422,10 @@ index 0000000..a5d91e4
 +            pending: None,
 +            enabled: false,
 +            entered: None,
++            rect: None,
++            secret: false,
++            pending_rect: None,
++            pending_secret: None,
 +        };
 +        if let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) {
 +            if same_client(&instance.object.id(), &focus.id()) {
@@ -334,6 +486,41 @@ index 0000000..a5d91e4
 +            .then_some(focus)
 +    }
 +
++    /// The field with the keyboard: its state (0 none, 1 a field, 2 a secret one), and the
++    /// text cursor's rectangle in the surface.
++    fn field(&self) -> (u32, Option<(i32, i32, i32, i32)>) {
++        let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
++            return (0, None);
++        };
++        match self
++            .instances
++            .iter()
++            .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
++        {
++            Some(i) => (if i.secret { 2 } else { 1 }, i.rect),
++            None => (0, None),
++        }
++    }
++
++    /// Hands composing text to the enabled text input of the client that has the keyboard
++    /// (`preedit_string`, then `done`); empty text clears it. False when there is none.
++    pub fn preedit(&mut self, text: &str, begin: u32, end: u32) -> bool {
++        let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
++            return false;
++        };
++        let Some(instance) = self
++            .instances
++            .iter()
++            .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
++        else {
++            return false;
++        };
++        let text = (!text.is_empty()).then(|| text.to_string());
++        instance.object.preedit_string(text, begin as i32, end as i32);
++        instance.object.done(instance.commits);
++        true
++    }
++
 +    /// Hands `text` to the enabled text input of the client that has the keyboard. False when
 +    /// there is none.
 +    pub fn commit(&mut self, text: &str) -> bool {
@@ -354,6 +541,32 @@ index 0000000..a5d91e4
 +}
 +
 +impl State {
++    /// Tells the sink, if there is one, about the field with the keyboard: where its text
++    /// cursor is in the output, for the device to put its input method's candidates there.
++    pub fn tell_text_input(&mut self) {
++        use smithay::wayland::seat::WaylandFocus;
++        let (state, rect) = self.text_inputs.field();
++        let mut told = (0, 0, 0, 0, 0);
++        if state != 0 {
++            // The place is not known for a popup's field, or before the client says it.
++            told = (state, 0, 0, 0, 0);
++            let focus = self.text_inputs.focus.clone();
++            let window = self
++                .space
++                .elements()
++                .find(|w| w.wl_surface().map(|s| s.into_owned()) == focus)
++                .cloned();
++            if let (Some(window), Some((x, y, w, h))) = (window.as_ref(), rect) {
++                if let Some(at) = self.space.element_location(window) {
++                    // The surface's origin lies at the window's place less its geometry's.
++                    let origin = at - window.geometry().loc;
++                    told = (state, origin.x + x, origin.y + y, w.max(0) as u32, h.max(0) as u32);
++                }
++            }
++        }
++        self.text_input_report.tell(told);
++    }
++
 +    /// After the keyboard moved to a window: if a text input of its client entered it and has
 +    /// not enabled itself 0.3 s (or 1 s) later, the window is told once more that it has the
 +    /// keyboard (keyboard leave, then enter, to that surface only). Seen on the host: the Text
@@ -392,6 +605,25 @@ index 0000000..a5d91e4
 +        KeyboardTarget::leave(&surface, &seat, self, SERIAL_COUNTER.next_serial());
 +        KeyboardTarget::enter(&surface, &seat, self, Vec::new(), SERIAL_COUNTER.next_serial());
 +        tracing::info!("text input not enabled: the keyboard was told to its window again");
++    }
++
++    /// Composing text from the device (ADR 0007, "変換中の文字"): to the enabled text input of
++    /// the client that has the keyboard, or nowhere. Never logged, nor counted per piece (it
++    /// changes with every key).
++    pub fn preedit_text(&mut self, text: &str, begin: u32, end: u32) {
++        let (b, e) = (begin as usize, end as usize);
++        let fits = (text.is_empty() || acceptable(text))
++            && b <= e
++            && e <= text.len()
++            && text.is_char_boundary(b)
++            && text.is_char_boundary(e);
++        if !fits {
++            tracing::info!("composing text dropped: not within the limits");
++            return;
++        }
++        if !self.text_inputs.preedit(text, begin, end) {
++            tracing::debug!("composing text dropped: no text input enabled");
++        }
 +    }
 +
 +    /// Committed text from the device (ADR 0007, "確定した文字"): to the enabled text input of
@@ -512,7 +744,42 @@ index 0000000..a5d91e4
 +                    if let Some(enable) = instance.pending.take() {
 +                        // Only a text input that was told it entered a surface may be enabled.
 +                        instance.enabled = enable && instance.entered.is_some();
++                        if enable {
++                            // Enabling starts afresh.
++                            instance.rect = None;
++                            instance.secret = false;
++                        }
 +                    }
++                    if let Some(rect) = instance.pending_rect.take() {
++                        instance.rect = Some(rect);
++                    }
++                    if let Some(secret) = instance.pending_secret.take() {
++                        instance.secret = secret;
++                    }
++                }
++                state.tell_text_input();
++            }
++            zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
++                if let Some(instance) = state.text_inputs.instance(resource) {
++                    instance.pending_rect = Some((x, y, width, height));
++                }
++            }
++            zwp_text_input_v3::Request::SetContentType { hint, purpose } => {
++                use smithay::reexports::wayland_server::WEnum;
++                let secret_purpose = matches!(
++                    purpose,
++                    WEnum::Value(zwp_text_input_v3::ContentPurpose::Password)
++                        | WEnum::Value(zwp_text_input_v3::ContentPurpose::Pin)
++                );
++                let secret_hint = match hint {
++                    WEnum::Value(hint) => hint.intersects(
++                        zwp_text_input_v3::ContentHint::HiddenText
++                            | zwp_text_input_v3::ContentHint::SensitiveData,
++                    ),
++                    WEnum::Unknown(_) => false,
++                };
++                if let Some(instance) = state.text_inputs.instance(resource) {
++                    instance.pending_secret = Some(secret_purpose || secret_hint);
 +                }
 +            }
 +            zwp_text_input_v3::Request::Destroy => {
