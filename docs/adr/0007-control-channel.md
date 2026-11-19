@@ -591,6 +591,7 @@ Studio には、触れていない（ssh も、写しも、起動も、しない
 実機で見たこと（ホストで、この流れのフォルダー。試しの身元とペアリングの一覧は、この流れのために作ったもの。持ち主の鍵と一覧には触れていない。試用版の作り（`trial-daily-next` のビルド）と合成の係のプラグインは、試作の確かめのフォルダーのものを、読むだけで使った。Air の画面には、何も出していない）：
 
 - 起動の係を直接（エージェントの代わりのスクリプトから）：初めのファイルで答えまで 1617 ms、2 つめは 110 ms。バスの記録（`run/bus.log`）は 0 バイト。`stop` で、全部が終わり、ポートが閉じた。起動ごとのフォルダーは、残った（消していない）。
+- 実行時のフォルダーの場所を長くして（70 バイト。合成の係のソケットには足り、エディターのバスのソケットには長すぎる）始めると、起動の係は「the editor did not take the file: its own session bus did not start (see run/bus.log in EDITOR_WINDOW_DIR)」と答えた（10.9 秒後。バスの場所を 10 秒待つため）。`run/bus.log` には「Failed to start message bus: Socket name too long」があった。全部が終わり、ポートが閉じた。
 - エージェントと、Air の `istesso shell` をつないで（エージェントは、ホストの有線のアドレスのポート 26895。窓を出すプログラムの代わりに、起動の引数と環境変数を書き留めるだけのものを使った）：
   - プロンプトで `istesso-edit test-1.txt`：題名 `Text Editor`、`ISTESSO_WINDOW_ASKED_BY=prompt`。Air の端末に「the host opened a window (Text Editor): shown here」。
   - `sh -c 'xdg-open test-2.txt; true'`（シェルの中のプログラム）：題名 `(from a program) Text Editor`、`program`。端末に「asked by a program in the shell (not typed at its prompt)」。
