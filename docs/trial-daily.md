@@ -339,6 +339,8 @@ scripts/daily.sh note "気づいたこと"
 
 登録（`install`）と外すこと（`remove`）は、持ち主が手で確かめるときに、持ち主がします（「ローカルネットワーク」の問いも、そのとき）。エージェントは、`build` と試験（`macos/daily-shortcuts` で `python3 -m unittest`）だけをします（2026-11-19、統合のとき：12 件が通り、`~/Applications/Istesso Dev/` には何も足していない）。
 
+試験の動かし方：先に `scripts/daily.sh shortcuts build` を実行し（試験は、作った `bundle-tool` と包みを使います）、`cd macos/daily-shortcuts && python3 test_shortcuts.py` とします。`python3 -I` では、試験が `shortcuts` を読み込めません（`-I` は、スクリプトのフォルダーから読み込まないため）。
+
 試用版のチェックアウトで、次を順に実行します。**新しいアプリを登録すると、この Mac の LAN 接続が一時的に切れます。** 計測が走っていないときに登録してください。
 
 ```sh
@@ -346,9 +348,11 @@ scripts/daily.sh shortcuts build
 scripts/daily.sh shortcuts install
 ```
 
-`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ署名 ID で署名します。持ち主用の包みには強化ランタイムを付けます。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。絵は登録のときだけ作ります。Ubuntu では、デスクトップエントリーが指す PNG を使います。Studio では、アプリの `Info.plist` の `CFBundleIconFile` が指す ICNS を、Studio の `sips` で PNG にします。Air は 2 MiB 以下の PNG を読み、絵を描き直します。展開時のメモリーを抑えるため、縦か横が 8192 ピクセルを超える絵は使いません。取得や復号に失敗したら、標準のアプリアイコンに印を付けます。Ubuntu で SVG しかない場合と、Studio で指定がない場合やアセットカタログしかない場合は unknown です。どちらも標準の絵を使います。
+`build` は `build/shortcuts/` に包みを作り、ビューアーと同じ署名 ID で署名します。持ち主用の包みには強化ランタイムを付けます。ここではまだ登録しません。`install` は `~/Applications/Istesso Dev/` に近道と受付役の `Istesso Dev Open` を置きます。絵は登録のときだけ作ります。Ubuntu では、デスクトップエントリーが指す絵を使います。PNG はそのまま送り、SVG はホストの GTK で 512 ピクセルの PNG に描いてから送ります（Text Editor と Blender は SVG です）。snap のアプリ（Firefox）のデスクトップエントリーも探します。Studio では、アプリの `Info.plist` の `CFBundleIconFile` が指す ICNS を、Studio の `sips` で PNG にします。Air が受け取るのは PNG だけです。2 MiB 以下で、先頭の見出し（IHDR）の縦と横が 2048 ピクセル以下のものだけを、PNG だけを読むように絞った ImageIO に渡し、絵を描き直します。見出しは ImageIO より先に読みます。取得に失敗したとき、受け取った絵を使えないとき（ImageIO が落ちたときも）は、標準のアプリアイコンに印を付けます。標準の絵は、別のプロセスで描き直します。標準の絵も作れないときは、その近道だけ macOS の普通のアプリアイコンのままにして、登録を続けます。Studio で指定がない場合やアセットカタログしかない場合も、標準の絵です。1 つの絵の取得は 8 秒までです（計測の合図に間に合わせるため）。
 
-右下の印は `Ubuntu` または `Studio` です。32 ピクセル以下では頭文字を使います。印を替えるには、Air の `~/.config/istesso/daily-machine-labels.txt` に `ubuntu=作業用` や `mac=編集用` と 1 行ずつ書き、`shortcuts install` をやり直します。名前は印刷できる文字で 1〜12 字です。近道の名前はそのままです。近道から開いたビューアーは、Dock と ⌘Tab に同じ絵を使います。ビューアーも作り直してください。Studio 側の起動スクリプトからビューアーまで絵が届くかは、持ち主の実機での確認がまだです。
+右下の印は `Ubuntu` または `Studio` です。32 ピクセル以下では頭文字を使います。印を替えるには、Air の `~/.config/istesso/daily-machine-labels.txt` に `ubuntu=作業用` や `mac=編集用` と 1 行ずつ書き、`shortcuts install` をやり直します。名前は印刷できる文字で 1〜12 字です。近道の名前はそのままです。Ubuntu の近道から開いたビューアーは、Dock と ⌘Tab に同じ絵を使います。ビューアーも作り直してください。ビューアーが開くのは、アカウントのホーム（環境変数 `HOME` ではなく、ユーザーの登録から引いたもの）の `Applications/Istesso Dev/` の下の ICNS だけです。
+
+**Studio の近道から開いた窓は、いまは Dock と ⌘Tab にこの絵が出ません（分かっている欠けです）。** 近道そのもの（Finder、Spotlight、Dock に置いた近道）には、印の付いた絵が付きます。`daily.sh` は `ISTESSO_APP_ICON` を `daily-mac.sh` にそのまま渡します（`scripts/daily_mac_pass_test.py` で確かめる）。ところが `daily-mac.sh`（M4 の流れ、`m4-daily-host` のもの）は、ビューアーを `open -n --env` で起動するときの一覧に、これをまだ入れていません。`open` で起動したビューアーは、その一覧のほかの環境を受け継がないので、絵が届きません。その一覧に入れば、Studio の窓にも出ます。
 
 Spotlight か Alfred で `Blender (Ubuntu)`、`Firefox (Ubuntu)`、`Text Editor (Ubuntu)`、`Chrome (Ubuntu)` を検索して開きます。Dock に置くには、Finder で使いたい近道を Dock にドラッグします。
 

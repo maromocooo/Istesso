@@ -1444,7 +1444,9 @@ do_guard() {
             echo "$(date '+%H:%M:%S') the measurement is over: opening again:${held:- nothing}"
             for each in $held; do
                 [ "$each" = busy ] && continue
-                if (. "$state/$each/settings" 2>/dev/null; DAILY_IN_BACKGROUND=1 "$0" open "$each") >> "$state/guard.log" 2>&1; then
+                # A settings file written before the shortcuts' icons does not name ISTESSO_APP_ICON:
+                # the guard's own (from the shortcut it was started by) is not another window's icon.
+                if (unset ISTESSO_APP_ICON; . "$state/$each/settings" 2>/dev/null; DAILY_IN_BACKGROUND=1 "$0" open "$each") >> "$state/guard.log" 2>&1; then
                     echo "$(date '+%H:%M:%S') $each: back"
                 else
                     [ -s "$state/$each/not-back" ] || echo "it did not open again" > "$state/$each/not-back"

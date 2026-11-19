@@ -2872,7 +2872,9 @@ int main(int argc, char *argv[]) {
         }
         [NSApplication sharedApplication];
         if (!no_window) {
-            NSImage *icon = shortcutIcon(NSHomeDirectory(), NSProcessInfo.processInfo.environment[@"ISTESSO_APP_ICON"]);
+            // The allowed folder is under the account's home (not $HOME, which the caller sets).
+            NSString *home = accountHome();
+            NSImage *icon = home ? shortcutIcon(home, NSProcessInfo.processInfo.environment[@"ISTESSO_APP_ICON"]) : nil;
             if (icon) NSApp.applicationIconImage = icon;
         }
         if (clipboard_on) {

@@ -6,24 +6,40 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdio.h>
 
-// ImageIO only sees a bounded PNG. Decode once and copy only its pixels into each new bitmap.
+// The host's image is untrusted. ImageIO only sees a PNG of at most 2 MiB whose header says at
+// most 2048 x 2048 pixels; the header is read here, before ImageIO parses anything, and ImageIO is
+// held to PNG for the rest of this process. Decode once and copy only its pixels into each bitmap.
+static const NSUInteger maxPNGBytes = 2 << 20, maxPNGSide = 2048;
+
+static uint32_t bigEndian(const unsigned char *p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
+}
+
 static CGImageRef readPNG(NSString *path) {
+    if (@available(macOS 14.2, *)) {
+        if (CGImageSourceSetAllowableTypes((__bridge CFArrayRef)@[UTTypePNG.identifier]) != noErr) return NULL;
+    }
     NSFileHandle *file = [NSFileHandle fileHandleForReadingAtPath:path];
-    NSUInteger limit = 2 << 20;
-    NSData *bytes = [file readDataUpToLength:limit + 1 error:NULL];
-    const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
-    if (bytes.length < sizeof(signature) || bytes.length > limit ||
-        memcmp(bytes.bytes, signature, sizeof(signature))) return NULL;
-    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)bytes, NULL);
+    NSData *bytes = [file readDataUpToLength:maxPNGBytes + 1 error:NULL];
+    // The signature, then the first chunk: its length (13), "IHDR", the width and the height.
+    const unsigned char header[] = {137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 'I', 'H', 'D', 'R'};
+    if (bytes.length < sizeof(header) + 8 || bytes.length > maxPNGBytes ||
+        memcmp(bytes.bytes, header, sizeof(header))) return NULL;
+    const unsigned char *raw = bytes.bytes;
+    uint32_t width = bigEndian(raw + sizeof(header)), height = bigEndian(raw + sizeof(header) + 4);
+    if (!width || !height || width > maxPNGSide || height > maxPNGSide) return NULL;
+    NSDictionary *hint = @{(__bridge NSString *)kCGImageSourceTypeIdentifierHint: UTTypePNG.identifier};
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)bytes, (__bridge CFDictionaryRef)hint);
     if (!source) return NULL;
     CGImageRef image = NULL;
     CFStringRef type = CGImageSourceGetType(source);
+    // Also the guard where the allowed types cannot be set: the data's own type, before decoding.
     if (type && CFEqual(type, (__bridge CFStringRef)UTTypePNG.identifier) &&
         CGImageSourceGetStatus(source) == kCGImageStatusComplete) {
         NSDictionary *info = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
         NSUInteger w = [info[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedIntegerValue];
         NSUInteger h = [info[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedIntegerValue];
-        if (w && h && w <= 8192 && h <= 8192) {
+        if (w == width && h == height) {
             NSDictionary *options = @{
                 (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
                 (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @1024,
@@ -85,11 +101,15 @@ static CGImageRef renderSize(CGImageRef base, size_t size, NSString *label, BOOL
 
 static BOOL compose(NSString *path, NSString *machine, NSString *label, NSURL *url) {
     if (!label.length) return NO;
-    CGImageRef base = [path isEqualToString:@"-"] ? NULL : readPNG(path);
-    if (!base) {
+    // "-" is the generic application icon. An image that cannot be used fails here, and the caller
+    // draws the generic icon in a new process: ImageIO is held to PNG in this one.
+    CGImageRef base = NULL;
+    if ([path isEqualToString:@"-"]) {
         NSImage *generic = [NSWorkspace.sharedWorkspace iconForContentType:UTTypeApplicationBundle];
         NSRect bounds = NSMakeRect(0, 0, 1024, 1024);
         base = CGImageRetain([generic CGImageForProposedRect:&bounds context:nil hints:nil]);
+    } else {
+        base = readPNG(path);
     }
     if (!base) return NO;
     CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url,

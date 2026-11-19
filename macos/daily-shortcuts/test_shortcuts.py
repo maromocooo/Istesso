@@ -4,13 +4,17 @@ import io
 import json
 import os
 import plistlib
+import pwd
+import re
 import runpy
 import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
+import zlib
 from unittest.mock import Mock, patch
 from urllib.parse import quote
 
@@ -333,10 +337,14 @@ class ShortcutsTest(unittest.TestCase):
                         file.truncate(size)
 
                 with patch.object(sc, "fetch_icon", fetch), patch.object(sc, "convert_icon",
-                        side_effect=OSError) as convert, self.assertRaises(OSError):
+                        side_effect=OSError) as convert:
                     sc.add_icon(self.checkout, "editor", "", self.checkout, self.tool, "ubuntu", "Ubuntu")
                 source = self.checkout / "original.png" if allowed else None
-                convert.assert_called_once_with(self.tool, source, self.checkout, "ubuntu", "Ubuntu")
+                self.assertEqual(convert.call_args_list[0].args, (self.tool, source, self.checkout, "ubuntu", "Ubuntu"))
+                # An image that passed is tried first, then the generic icon. When neither can be
+                # made, the shortcut is left as it was and the install goes on.
+                self.assertEqual([call.args[1] for call in convert.call_args_list], [source, None] if allowed else [None])
+                self.assertFalse((self.checkout / "Contents").exists())
 
     def test_icon_and_generic_fallback(self):
         title = "Firefox (Ubuntu)"
@@ -360,6 +368,87 @@ class ShortcutsTest(unittest.TestCase):
             subprocess.run(["codesign", "--verify", "--strict", bundle], check=True)
         self.assertEqual(results[0], results[1])
         self.assertNotEqual(results[1], results[2])
+
+    def test_bundle_tool_takes_png_up_to_2048_pixels(self):
+        def png(width, height):
+            def chunk(kind, data):
+                return (len(data).to_bytes(4, "big") + kind + data
+                        + zlib.crc32(kind + data).to_bytes(4, "big"))
+            header = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([8, 0, 0, 0, 0])
+            rows = zlib.compress(bytes(height * (width + 1)))
+            path = self.checkout / f"{width}x{height}.png"
+            path.write_bytes(sc.PNG_SIGNATURE + chunk(b"IHDR", header) + chunk(b"IDAT", rows) + chunk(b"IEND", b""))
+            return path
+
+        for width, height, allowed in ((2048, 1, True), (1, 2048, True), (2049, 1, False), (1, 2049, False)):
+            with self.subTest(size=(width, height)):
+                sc.check_measurement()
+                done = subprocess.run([self.tool, "compose", png(width, height), "ubuntu", "Ubuntu",
+                                       self.checkout / "out.icns"])
+                self.assertEqual(done.returncode == 0, allowed)
+
+    def test_failed_compose_leaves_the_generic_icon(self):
+        # The host's PNG passed the Air's checks, but the bundle tool cannot use it (here: it fails,
+        # as it does when ImageIO crashes). The generic icon with the badge is drawn instead.
+        bundle = self.checkout / "Firefox (Ubuntu).staged"
+        shutil.copytree(self.bundles / bundle.name, bundle)
+        fixture = sc.ROOT / "docs/measurements/img/2026-11-16-hard-picture/sent.png"
+        real = sc.convert_icon
+        tried = []
+
+        def convert(tool, png, *args):
+            tried.append(png)
+            if png is not None:
+                raise subprocess.CalledProcessError(-11, [tool, "compose"])
+            return real(tool, png, *args)
+
+        with patch.object(sc, "fetch_icon", lambda out, *_: shutil.copyfile(fixture, out)), \
+                patch.object(sc, "convert_icon", convert), patch.object(sc, "sign") as sign:
+            sc.add_icon(bundle, "firefox", "", self.checkout, self.tool, "ubuntu", "Ubuntu")
+        self.assertEqual(tried, [self.checkout / "original.png", None])
+        generic = real(self.tool, None, self.checkout / "scripts", "ubuntu", "Ubuntu").read_bytes()
+        self.assertEqual((bundle / "Contents/Resources/Shortcut.icns").read_bytes(), generic)
+        sign.assert_called_once()
+
+    def test_owner_shortcut_keeps_the_hardened_runtime(self):
+        # install() signs each shortcut again after its icon is added. The owner's shortcuts keep
+        # the hardened runtime they were built with (ADR 0024); the others do not get it. Signed
+        # ad hoc through the trial's own signing script and its checks: no keychain is asked.
+        def sign_ad_hoc(path, identifier, *options):
+            subprocess.run(["/bin/bash", "-c", '. "$1"; shift; daily_sign_bundle "$1" "$2" - "${@:3}"', "sign",
+                            sc.ROOT / "scripts/daily-sign.sh", path, identifier, *options], check=True)
+
+        def runtime(bundle):
+            shown = subprocess.run(["codesign", "-dv", bundle], capture_output=True, text=True, check=True).stderr
+            flags = re.search(r"^CodeDirectory .* flags=0x[0-9a-f]+\(([^)]*)\)", shown, re.MULTILINE)
+            return "runtime" in flags.group(1).split(",")
+
+        folder = self.checkout / "built"
+        folder.mkdir()
+        owner = folder / "Safari (Studio).staged"
+        other = folder / "Firefox (Ubuntu).staged"
+        shutil.copytree(self.bundles / other.name, other)
+        with patch.object(sc, "sign", sign_ad_hoc), patch.object(sc, "fetch_icon", side_effect=OSError):
+            sc.build_bundle(folder, "Safari (Studio)", "owner-shim.c", [
+                "-DDAILY_SCRIPT=" + json.dumps(str(self.daily)), '-DSHORTCUT_TITLE="Safari (Studio)"',
+                '-DOWNER_APP="safari"'], {}, executable="istesso-owner-shim")
+            self.assertTrue(runtime(owner))
+            for bundle, app, machine, label in ((owner, "safari", "mac", "Studio"), (other, "firefox", "ubuntu", "Ubuntu")):
+                with self.subTest(bundle=bundle.name), tempfile.TemporaryDirectory(dir=self.checkout) as tmp:
+                    sc.add_icon(bundle, app, "", Path(tmp), self.tool, machine, label)
+                    self.assertTrue((bundle / "Contents/Resources/Shortcut.icns").is_file())
+                    subprocess.run(["codesign", "--verify", "--strict", bundle], check=True)
+                    self.assertEqual(runtime(bundle), bundle == owner)
+
+    def test_the_viewer_takes_the_accounts_home_not_HOME(self):
+        done = subprocess.run([self.reader, "home"], env=dict(os.environ, HOME=str(self.checkout)),
+                              capture_output=True, text=True, check=True)
+        self.assertEqual(done.stdout, pwd.getpwuid(os.getuid()).pw_dir)
+
+    def test_no_traceback_from_the_command(self):
+        # Paths in a traceback may be private; the command says only what failed.
+        done = subprocess.run([sys.executable, sc.SOURCE / "shortcuts.py", "build"], capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stderr), (1, "The shortcut operation failed (TypeError).\n"))
 
     def test_badge_sizes_and_letter(self):
         fixture = sc.ROOT / "docs/measurements/img/2026-11-16-hard-picture/sent.png"
@@ -430,6 +519,8 @@ class ShortcutsTest(unittest.TestCase):
             def record(command, **options):
                 self.assertEqual(shlex.split(" ".join(command[command.index("--") + 2:])), ["python3", "-I", "-", app])
                 self.assertEqual(Path(options["stdin"].name).name, script)
+                # A measurement that begins meanwhile waits no longer than this (AGENTS.md).
+                self.assertLessEqual(options["timeout"], 8)
             with patch.object(subprocess, "run", record):
                 sc.fetch_icon(self.checkout / "icon.png", app, "", machine)
 
@@ -467,12 +558,16 @@ class InstallsApplicationsFromTheFirstMoment(unittest.TestCase):
                 contents = stage / (title + ".staged") / "Contents"
                 contents.mkdir(parents=True)
                 sc.write_plist(contents / "Info.plist", dict(CFBundleIdentifier=sc.bundle_id(title)))
-            copied, ran, imported = [], [], []
+            copied, ran, imported, fetched = [], [], [], []
             real_copytree = shutil.copytree
 
             def copytree(source, target, *args, **kwargs):
                 copied.append(Path(target))
                 return real_copytree(source, target, *args, **kwargs)
+
+            def fetch_icon(png, app, host, machine):
+                fetched.append((machine, host))
+                raise OSError("no host in this test")
 
             def convert_icon(tool, png, work, machine, label):
                 # The bundle tool is not run here (subprocess.run only records); stand in for its ICNS.
@@ -485,9 +580,13 @@ class InstallsApplicationsFromTheFirstMoment(unittest.TestCase):
                  patch.object(sc, "convert_icon", convert_icon), \
                  patch.object(subprocess, "run", lambda argv, **_: (ran.append([str(a) for a in argv]),
                                                                    subprocess.CompletedProcess(argv, 0, "free\n", ""))[1]), \
-                 patch.object(sc, "fetch_icon", side_effect=OSError), \
+                 patch.object(sc, "fetch_icon", fetch_icon), \
+                 patch.dict(os.environ), \
                  patch.object(sc, "spotlight_import", imported.append):
-                sc.install(stage, dest, rows, "")
+                os.environ.pop("ISTESSO_MAC_HOST", None)
+                sc.install(stage, dest, rows, "stand-in-ubuntu")
+            # Without ISTESSO_MAC_HOST (shortcuts.py run by itself), the same default as daily.sh.
+            self.assertEqual(fetched, [("ubuntu", "stand-in-ubuntu"), ("mac", sc.DEFAULT_MAC_HOST)])
             titles = [title for _, _, title in rows] + [sc.HANDLER]
             # copytree calls itself for the folders inside; the copies themselves are in the hidden folder.
             top = [c for c in copied if c.parent.name.startswith(".pending-")]

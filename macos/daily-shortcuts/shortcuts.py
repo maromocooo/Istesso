@@ -32,6 +32,10 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_ICON_BYTES = 2 << 20
 LABEL_FILE = Path.home() / ".config/istesso/daily-machine-labels.txt"
 DEFAULT_LABELS = {"ubuntu": "Ubuntu", "mac": "Studio"}
+# The same default as scripts/daily.sh, which passes ISTESSO_MAC_HOST on.
+DEFAULT_MAC_HOST = "istesso-studio"
+# The fetch has to give way to a measurement within seconds (AGENTS.md, the measuring signal).
+FETCH_SECONDS = 8
 
 
 def machine_labels(path):
@@ -156,8 +160,10 @@ def build(folder, rows, checkout):
 
 
 def convert_icon(tool, png, work, machine, label):
+    # The host's image is decoded in a process of its own: whatever it does to ImageIO, the
+    # generic icon is drawn afresh by the next call.
     icon = work / "Shortcut.icns"
-    subprocess.run([tool, "compose", png or "-", machine, label, icon], check=True)
+    subprocess.run([tool, "compose", png or "-", machine, label, icon], check=True, timeout=60)
     return icon
 
 
@@ -171,7 +177,7 @@ def fetch_icon(png, app, host, machine):
     with png.open("wb") as out, (SOURCE / script_name).open("rb") as script:
         subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host,
                         "python3", "-I", "-", shlex.quote(app)], stdin=script, stdout=out,
-                       stderr=subprocess.DEVNULL, check=True, timeout=12, preexec_fn=limit_download)
+                       stderr=subprocess.DEVNULL, check=True, timeout=FETCH_SECONDS, preexec_fn=limit_download)
 
 
 def add_icon(bundle, app, host, work, tool, machine, label):
@@ -183,8 +189,21 @@ def add_icon(bundle, app, host, work, tool, machine, label):
                     or source.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE):
                 raise ValueError("invalid shortcut icon")
     except (OSError, ValueError, subprocess.SubprocessError):
+        print(f"Using the generic icon for {bundle.stem}.")
         png = None
-    icon = convert_icon(tool, png, work, machine, label)
+    # A host image that the bundle tool cannot use (it fails, or ImageIO crashes on it) leaves the
+    # generic icon with the badge. If even that cannot be written, the shortcut keeps the ordinary
+    # application icon and the install goes on: the viewer then keeps its own icon too.
+    for source in ([png, None] if png else [None]):
+        try:
+            icon = convert_icon(tool, source, work, machine, label)
+            break
+        except (OSError, subprocess.SubprocessError):
+            if source:
+                print(f"Using the generic icon for {bundle.stem}.")
+    else:
+        print(f"Could not make an icon for {bundle.stem}; it keeps the ordinary application icon.")
+        return
     contents = bundle / "Contents"
     resources = contents / "Resources"
     resources.mkdir(exist_ok=True)
@@ -260,7 +279,7 @@ def install(stage, dest, rows, host):
         tool = stage / "bundle-tool"
         for machine, app, title in rows:
             check_measurement()
-            host_name = os.environ["ISTESSO_MAC_HOST"] if machine == "mac" else host
+            host_name = (os.environ.get("ISTESSO_MAC_HOST") or DEFAULT_MAC_HOST) if machine == "mac" else host
             with tempfile.TemporaryDirectory(dir=pending, prefix=".icons-") as icons:
                 add_icon(pending / (title + ".app"), app,
                          host_name, Path(icons), tool, machine, labels[machine])
@@ -353,6 +372,7 @@ def run(action, host, ubuntu):
 if __name__ == "__main__":
     try:
         run(*sys.argv[1:])
-    except (ValueError, OSError, subprocess.SubprocessError, plistlib.InvalidFileException) as error:
-        # Paths and signing identities may be private.
-        sys.exit(str(error) if isinstance(error, ValueError) else "The shortcut operation failed.")
+    except Exception as error:
+        # Paths and signing identities may be private: no traceback, only what failed.
+        sys.exit(str(error) if isinstance(error, ValueError)
+                 else f"The shortcut operation failed ({type(error).__name__}).")

@@ -24,6 +24,12 @@ static BOOL unpack(NSURL *icon, NSURL *dir) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        if (argc == 2 && !strcmp(argv[1], "home")) {
+            NSString *home = accountHome();
+            if (!home) return 1;
+            printf("%s", home.fileSystemRepresentation);
+            return 0;
+        }
         if (argc != 4) return 2;
         if (!strcmp(argv[1], "load")) return shortcutIcon(@(argv[2]), @(argv[3])) ? 0 : 1;
         return unpack([NSURL fileURLWithPath:@(argv[2])], [NSURL fileURLWithPath:@(argv[3])]) ? 0 : 1;

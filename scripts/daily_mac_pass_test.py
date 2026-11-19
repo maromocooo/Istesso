@@ -13,7 +13,8 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SWITCHES = ("DAILY_OWNER", "DAILY_CLIPBOARD", "DAILY_OPEN_HANDLER", "DAILY_STREAM")
+# ISTESSO_APP_ICON: the shortcut's badged icon, for the window daily-mac.sh opens (Dock, Command-Tab).
+SWITCHES = ("DAILY_OWNER", "DAILY_CLIPBOARD", "DAILY_OPEN_HANDLER", "DAILY_STREAM", "ISTESSO_APP_ICON")
 
 
 def signal_busy():
@@ -63,7 +64,7 @@ class PassesToTheMacHost(unittest.TestCase):
                                      DAILY_OWNER="1", DAILY_CLIPBOARD="1", DAILY_OPEN_HANDLER="1")
         self.assertEqual(words, ["open", "dia"])
         self.assertEqual(seen, {"DAILY_OWNER": "1", "DAILY_CLIPBOARD": "1", "DAILY_OPEN_HANDLER": "1",
-                                "DAILY_STREAM": "(unset)", "fd9": "no"})
+                                "DAILY_STREAM": "(unset)", "ISTESSO_APP_ICON": "(unset)", "fd9": "no"})
 
     def test_a_streams_test_open_says_its_name(self):
         words, seen = self.run_daily("open", "TextEdit", "--host", "mac", DAILY_STREAM="m4-daily", DAILY_CLIPBOARD="0")
@@ -74,11 +75,16 @@ class PassesToTheMacHost(unittest.TestCase):
         words, seen = self.run_daily("open", "TextEdit", "--host", "mac", "--for", "aura")
         self.assertEqual(words, ["open", "TextEdit", "--for", "aura"])
         self.assertEqual(seen, {"DAILY_OWNER": "(unset)", "DAILY_CLIPBOARD": "(unset)", "DAILY_OPEN_HANDLER": "(unset)",
-                                "DAILY_STREAM": "(unset)", "fd9": "no"})
+                                "DAILY_STREAM": "(unset)", "ISTESSO_APP_ICON": "(unset)", "fd9": "no"})
 
     def test_values_go_as_they_are(self):
         _, seen = self.run_daily("open", "dia", "--host", "mac", DAILY_OWNER="0", DAILY_CLIPBOARD="0")
         self.assertEqual((seen["DAILY_OWNER"], seen["DAILY_CLIPBOARD"]), ("0", "0"))
+
+    def test_the_shortcuts_icon_goes_as_it_is(self):
+        icon = "/stand-in-home/Applications/Istesso Dev/Dia (Studio).app/Contents/Resources/Shortcut.icns"
+        _, seen = self.run_daily("open", "dia", "--host", "mac", DAILY_OWNER="1", ISTESSO_APP_ICON=icon)
+        self.assertEqual(seen["ISTESSO_APP_ICON"], icon)
 
     def test_close_goes_too(self):
         words, seen = self.run_daily("close", "dia", "--host", "mac", DAILY_OWNER="1")
