@@ -94,9 +94,22 @@ class BitRate(unittest.TestCase):
 
     def test_a_link_that_carried_nothing_leaves_it_as_it_is(self):
         flow, _ = flow_with(lambda now: 0)
-        flow.c["waited"] = 5
+        flow.c["waited"] = 4
         flow.c["forced"] = 4
+        flow.c["encoded"] = 4
         self.assertEqual(flow.follow(), 30000)
+
+    def test_a_link_that_carries_a_little_takes_it_down(self):
+        flow, _ = flow_with(lambda now: 0)
+        flow.c["waited"] = 10
+        flow.c["forced"] = 1
+        flow.c["encoded"] = 10
+        self.assertEqual(flow.follow(), 22500)
+
+    def test_the_two_threads_may_both_find_the_list_empty(self):
+        flow, _ = flow_with(lambda now: 0)
+        flow.encoded(100, False)  # nothing in the encoder: no error
+        self.assertEqual(flow.c["encoded"], 1)
 
     def test_a_picture_that_stands_still_does_not_raise_it(self):
         flow, _ = flow_with(lambda now: 0)

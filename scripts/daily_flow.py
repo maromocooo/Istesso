@@ -16,7 +16,7 @@ What it does, in the pipeline of scripts/m1-step3-host.py --to-channel:
 - The bit rate follows the link (unless adapt is off): a second in which frames had to wait takes
   it down by a quarter, never below MIN_KBIT; two quiet seconds with pictures moving take it up by
   a fifth, never above what the pipeline was started with. A second in which the link carried
-  nothing at all (a frame waited WAIT_MAX) leaves it as it is. Only the bit rate is changed, never
+  nothing at all (every frame waited WAIT_MAX) leaves it as it is. Only the bit rate is changed, never
   the size of the rate-control buffer (that would start the encoder anew, with a key frame). Each
   panel does this for itself, so three panels on one link share it.
 - One line a second on standard error, starting with "daily-flow: ", with what went through.
@@ -144,8 +144,13 @@ class Flow:
         return most, unsent
 
     def room(self, now):
-        while self.in_encoder and now - self.in_encoder[0] > IN_ENCODER_MAX_NS:
-            self.in_encoder.popleft()
+        # The encoder's thread takes from the same list (encoded): whichever comes second finds
+        # it empty, which is fine.
+        try:
+            while self.in_encoder and now - self.in_encoder[0] > IN_ENCODER_MAX_NS:
+                self.in_encoder.popleft()
+        except IndexError:
+            pass
         most, unsent = self.queued()
         self.outq_max = max(self.outq_max, most)
         self.unsent_max = max(self.unsent_max, unsent)
@@ -174,8 +179,10 @@ class Flow:
         return waited
 
     def encoded(self, size, key):
-        if self.in_encoder:
+        try:
             self.in_encoder.popleft()
+        except IndexError:
+            pass  # given up on already (room), or the frame handed in on the way back
         self.c["encoded"] += 1
         self.c["bytes"] += size
         self.c["keys"] += 1 if key else 0
@@ -193,9 +200,11 @@ class Flow:
         """Once a second: the new bit rate, from what this second was like. Returns it."""
         if not self.adapt:
             return self.kbit
-        if self.c["forced"] > 0:
-            # The link carried nothing for a while (a blip, a sleeping device): that says nothing
-            # about how much it carries when it carries. The bit rate stays.
+        if self.c["forced"] > 0 and self.c["encoded"] <= self.c["forced"]:
+            # Every frame of this second waited the longest: the link carried nothing (a blip, a
+            # sleeping device), which says nothing about how much it carries when it carries.
+            # The bit rate stays. A link that carries a little (some frames went without the
+            # longest wait) is a slow one, and the rate comes down below.
             self.quiet = 0
         elif self.c["waited"] >= 3 and self.sockets:
             self.kbit = max(MIN_KBIT, int(self.kbit * DOWN))
