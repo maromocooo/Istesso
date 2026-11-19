@@ -162,6 +162,10 @@ pub struct InputLine {
     client: Option<Client>,
     /// The device answers "still here".
     alive: bool,
+    /// The device takes committed text; without, none is sent to it.
+    text: bool,
+    /// Pieces of committed text not sent because the device does not take them.
+    text_dropped: u64,
     /// When "still here" was last said.
     said: Instant,
     /// When it was first said without an answer having come since. Silence
@@ -190,10 +194,11 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let alive = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let (alive, text) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let mut line = Self::waiting(connect);
         line.client = Some(client);
         line.alive = alive;
+        line.text = text;
         Ok(line)
     }
 
@@ -211,6 +216,8 @@ impl InputLine {
             connect,
             client: None,
             alive: false,
+            text: false,
+            text_dropped: 0,
             said: now,
             unanswered_since: None,
             listened: now,
@@ -241,6 +248,18 @@ impl InputLine {
         self.due.saturating_duration_since(now).min(LISTEN_EVERY)
     }
 
+    /// Whether the device takes committed text, as it said when the
+    /// conversation was last opened.
+    pub fn takes_text(&self) -> bool {
+        self.text
+    }
+
+    /// How many pieces of committed text were not sent because the device
+    /// does not take them.
+    pub fn text_dropped(&self) -> u64 {
+        self.text_dropped
+    }
+
     /// Whether the device answers "still here", so that silence is noticed.
     pub fn is_answered(&self) -> bool {
         self.alive
@@ -267,6 +286,20 @@ impl InputLine {
     /// Sends what a person did. Without a conversation it is not sent, now
     /// or later.
     pub fn pass(&mut self, events: &[InputEvent], now: Instant) -> Passed {
+        // A device that did not say it takes committed text cannot read a message with
+        // it, keys and all: none goes to it.
+        let kept: Vec<InputEvent>;
+        let events = if !self.text && events.iter().any(|e| matches!(e, InputEvent::Text { .. })) {
+            kept = events
+                .iter()
+                .filter(|e| !matches!(e, InputEvent::Text { .. }))
+                .cloned()
+                .collect();
+            self.text_dropped += (events.len() - kept.len()) as u64;
+            &kept[..]
+        } else {
+            events
+        };
         self.observe_input(events);
         let Some(client) = &mut self.client else {
             return Passed {
@@ -394,8 +427,8 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let alive = match ask(&mut client, within) {
-            Ok(alive) => alive,
+        let (alive, text) = match ask(&mut client, within) {
+            Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
         if self.daily_held.is_some() {
@@ -414,6 +447,7 @@ impl InputLine {
         let after = now_open.saturating_duration_since(self.without_since.take().unwrap_or(now));
         self.client = Some(client);
         self.alive = alive;
+        self.text = text;
         self.unanswered_since = None;
         (self.said, self.listened, self.made_at) = (now_open, now_open, now_open);
         Ok(Some(Happened::Back { after }))
@@ -424,7 +458,7 @@ impl InputLine {
 /// here"; the answer has `within` this time. `Ok` says whether the device
 /// answers; `Err` what to do about its refusal, and the refusal in a
 /// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
-fn ask(client: &mut Client, within: Duration) -> Result<bool, (Again, String)> {
+fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool), (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
@@ -433,7 +467,7 @@ fn ask(client: &mut Client, within: Duration) -> Result<bool, (Again, String)> {
     let answer = client.open_input_alive().map_err(link)?;
     client.set_timeout(AGAIN_WITHIN).map_err(link)?;
     match answer {
-        InputAnswer::Open { alive } => Ok(alive),
+        InputAnswer::Open { alive, text } => Ok((alive, text)),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -643,10 +677,21 @@ mod tests {
             again.connect_to(again.addr, within)
         }));
         let wait = Duration::from_secs(5);
+        // Before the first conversation, the line does not know whether text is taken.
+        assert!(!line.takes_text());
         assert!(matches!(
             turn_until_something(&mut line, wait),
             Ok(Some(Happened::Back { .. }))
         ));
+        // The daily line learns it when the conversation opens, as the first line does:
+        // this agent takes committed text, and it is handed over.
+        assert!(line.takes_text());
+        let text = InputEvent::Text {
+            text: "日本語".into(),
+        };
+        assert!(line.pass(std::slice::from_ref(&text), Instant::now()).sent);
+        assert_eq!(pair.all_handed_over(A_MOMENT), [text]);
+        assert_eq!(line.text_dropped(), 0);
         let button = |pressed| InputEvent::Button {
             code: 0x110,
             pressed,
@@ -707,6 +752,14 @@ mod tests {
     fn typing_without_a_pause_is_not_silence() {
         let pair = std::sync::Arc::new(InputPair::new("re"));
         let mut line = line_through(&pair, pair.addr);
+        // This agent says it takes committed text, and it is handed over.
+        assert!(line.takes_text());
+        let text = InputEvent::Text {
+            text: "日本語".into(),
+        };
+        assert!(line.pass(std::slice::from_ref(&text), Instant::now()).sent);
+        assert_eq!(pair.all_handed_over(A_MOMENT), [text]);
+        assert_eq!(line.text_dropped(), 0);
         // Keys for two seconds, twenty a second: none of them is answered, and the
         // line is alive all the same, because "still here" is said beside them.
         let began = Instant::now();
@@ -824,7 +877,10 @@ mod tests {
             while let Ok(Some(request)) = session.next_request() {
                 if let Request::InputOpen { .. } = request {
                     session
-                        .respond(&Response::InputOpen { alive: false })
+                        .respond(&Response::InputOpen {
+                            alive: false,
+                            text: false,
+                        })
                         .unwrap();
                 }
             }
@@ -834,6 +890,16 @@ mod tests {
         assert_eq!(turn_until_something(&mut line, SILENT_AFTER * 2), Ok(None));
         assert!(line.is_open());
         assert!(line.pass(&[key(30, true)], Instant::now()).sent);
+        // It did not say it takes committed text: none is sent (it could not read the
+        // message, keys and all); the keys beside it are.
+        assert!(!line.takes_text());
+        let text = InputEvent::Text {
+            text: "日本語".into(),
+        };
+        assert!(line.pass(&[key(30, false), text], Instant::now()).sent);
+        assert_eq!(line.text_dropped(), 1);
+        assert_eq!(turn_until_something(&mut line, A_MOMENT), Ok(None));
+        assert_eq!(line.cuts(), 0);
     }
 
     #[test]

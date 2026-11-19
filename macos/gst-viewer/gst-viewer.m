@@ -897,6 +897,9 @@ static void show_counts(void) {
     }
 }
 
+// Whether the host said it takes committed text (ADR 0007, "確定した文字"): only then is any sent.
+static BOOL host_takes_text = NO;
+
 // Looks once a second at what the relay says about its own connection, off the main thread:
 // reading a file must never hold up a key on its way out.
 static void watch_relay_state(const char *socket_path) {
@@ -906,22 +909,26 @@ static void watch_relay_state(const char *socket_path) {
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
     dispatch_source_set_event_handler(timer, ^{
-        long now = -1;
+        long now = -1, text = 0;
         BOOL reconnecting = NO;
         FILE *file = fopen(path.fileSystemRepresentation, "r");
         if (file != NULL) {
-            long pid = 0, count = -1;
+            long pid = 0, count = -1, takes = 0;
             // Only a relay that still runs counts: a file left by an earlier one says nothing.
+            // "text" (whether the host takes committed text) is left out by an older relay, and
+            // "reconnecting" is said by a relay of the everyday trial's reconnecting kind only.
             int cut = 0;
-            int fields = fscanf(file, "{\"pid\":%ld,\"input\":%ld,\"reconnecting\":%d}", &pid, &count, &cut);
+            int fields = fscanf(file, "{\"pid\":%ld,\"input\":%ld,\"text\":%ld,\"reconnecting\":%d}", &pid, &count, &takes, &cut);
             if (fields >= 2 && pid > 0 && count >= 0
                 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
                 now = count;
-                reconnecting = daily_reconnect && fields == 3 && cut == 1;
+                text = fields >= 3 && takes == 1;
+                reconnecting = daily_reconnect && fields == 4 && cut == 1;
             }
             fclose(file);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
+            host_takes_text = text != 0;
             if (now != input_cuts || reconnecting != input_reconnecting) {
                 if (daily_reconnect && now >= 0 && !reconnecting && !picture_stale &&
                     [cursor_view respondsToSelector:@selector(fallInLine)]) {
@@ -1865,6 +1872,17 @@ static NSString *plain_text(id value) {
     [CATransaction commit];
 }
 
+// A line in the strip for a few seconds, unless something is being composed by then.
+- (void)showNotice:(NSString *)notice {
+    [self setMarkedText:notice selectedRange:NSMakeRange(notice.length, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+    _marked = nil;  // Shown, but nothing is being composed.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (!self.hasMarkedText) {
+            [self unmarkText];
+        }
+    });
+}
+
 - (void)unmarkText {
     _marked = nil;
     [CATransaction begin];
@@ -1886,6 +1904,12 @@ static NSString *plain_text(id value) {
     [self unmarkText];
     if (picture_stale) {
         held_back_count += text.length > 0;
+        return;
+    }
+    if (!host_takes_text) {
+        // An agent that does not take committed text could not read the message at all
+        // (keys and all): the text stays here, and the strip says why.
+        [self showNotice:@"このホストは文字の入力にまだ対応していません"];
         return;
     }
     if (input_socket >= 0 && !text_input_packets(text, ^BOOL(const char *packet, size_t length) {

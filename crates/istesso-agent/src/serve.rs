@@ -498,7 +498,8 @@ impl Shared {
                                 let _ = session.set_wait(INPUT_SILENCE);
                             }
                             asked.push("input");
-                            Response::InputOpen { alive }
+                            // This agent takes committed text (InputEvent::Text).
+                            Response::InputOpen { alive, text: true }
                         }
                         Err(_) => Response::error(
                             ErrorCode::Internal,
@@ -743,7 +744,10 @@ mod tests {
             let mut asking = pair.connect();
             assert_eq!(
                 asking.open_input_alive().unwrap(),
-                InputAnswer::Open { alive: true }
+                InputAnswer::Open {
+                    alive: true,
+                    text: true
+                }
             );
             asking.send_input(&[]).unwrap();
             assert!(hears_alive(&mut asking, SOON));
@@ -820,7 +824,10 @@ mod tests {
             let mut first = pair.connect();
             assert_eq!(
                 first.open_input_alive().unwrap(),
-                InputAnswer::Open { alive: true }
+                InputAnswer::Open {
+                    alive: true,
+                    text: true
+                }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
             assert_eq!(pair.all_handed_over(A_MOMENT).len(), 2);
@@ -831,7 +838,10 @@ mod tests {
             let mut second = pair.connect();
             assert_eq!(
                 second.open_input_alive().unwrap(),
-                InputAnswer::Open { alive: true }
+                InputAnswer::Open {
+                    alive: true,
+                    text: true
+                }
             );
             second.send_input(&[key(29, true)]).unwrap();
             assert_eq!(
@@ -869,7 +879,10 @@ mod tests {
             assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
             assert_eq!(
                 client.open_input_alive().unwrap(),
-                InputAnswer::Open { alive: true }
+                InputAnswer::Open {
+                    alive: true,
+                    text: true
+                }
             );
             // What was down comes up, and the conversation carries on.
             assert_eq!(pair.handed_over(SOON), Some(key(30, false)));

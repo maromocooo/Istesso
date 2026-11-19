@@ -551,7 +551,8 @@ fn relay_input(
     // output, in the log of times if there is one, and in a small file next to the socket
     // for the program that shows the window.
     let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
-    let tell = |event: &str, cuts: u64, after: Option<Duration>| {
+    // "text": whether the device takes committed text (1) or not (0), for the window.
+    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -576,8 +577,9 @@ fn relay_input(
             String::new()
         };
         let line = format!(
-            "{{\"pid\":{},\"input\":{cuts}{status}}}\n",
-            std::process::id()
+            "{{\"pid\":{},\"input\":{cuts},\"text\":{}{status}}}\n",
+            std::process::id(),
+            u8::from(text)
         );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
@@ -618,7 +620,7 @@ fn relay_input(
             "Input written to {} goes to the paired device.",
             socket.display()
         );
-        tell("open", 0, None);
+        tell("open", 0, None, line.takes_text());
         if !line.is_answered() {
             eprintln!(
                 "note: the device is of a version that does not answer \"still here\"; a connection \
@@ -627,10 +629,12 @@ fn relay_input(
         }
     };
     if daily {
-        tell("waiting", 0, None);
+        tell("waiting", 0, None, false);
     } else {
         opened(&line);
     }
+    // How many pieces of committed text were not sent so far (said when it grows).
+    let mut text_dropped = 0;
 
     let mut buffer = [0u8; 2048];
     let take = |events: &mut Vec<InputEvent>, datagram: &[u8]| {
@@ -699,10 +703,17 @@ fn relay_input(
                 })?;
         }
         listener.set_nonblocking(false).map_err(failed)?;
+        if line.text_dropped() != text_dropped {
+            text_dropped = line.text_dropped();
+            // How many, never what.
+            eprintln!(
+                "note: {text_dropped} piece(s) of committed text were not sent: the device does not take text"
+            );
+        }
         match happened {
             Some(Happened::Cut) => {
                 eprintln!("note: the conversation with the device was cut; opening it again");
-                tell("cut", line.cuts(), None);
+                tell("cut", line.cuts(), None, line.takes_text());
             }
             Some(Happened::Back { .. }) if daily && line.cuts() == 0 => opened(&line),
             Some(Happened::Back { after }) => {
@@ -710,7 +721,7 @@ fn relay_input(
                     "note: the conversation with the device is back after {:.2} s",
                     after.as_secs_f64()
                 );
-                tell("back", line.cuts(), Some(after));
+                tell("back", line.cuts(), Some(after), line.takes_text());
             }
             None => {}
         }
