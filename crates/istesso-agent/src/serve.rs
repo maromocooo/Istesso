@@ -61,6 +61,13 @@ pub struct AgentOptions {
     /// instead of [`Paths::input_socket`]. For tests, which must never
     /// write to the socket of a pipeline that is really running.
     pub input_socket: Option<std::path::PathBuf>,
+    /// The end of a pair of sockets without a name that input is handed
+    /// over on, instead of a socket with a name: the agent and the program
+    /// that shows an application were started one by the other and share
+    /// the pair ([`crate::endpoint`]). Nothing can connect to it or take
+    /// its place. `None`, the default, hands input over at the name.
+    #[cfg(unix)]
+    pub input_end: Option<Arc<std::os::unix::net::UnixDatagram>>,
     /// For measuring: write down when input was passed on, and never what it
     /// was ([`crate::passing`]). `None`, the default, writes nothing.
     pub input_timings: Option<std::path::PathBuf>,
@@ -75,6 +82,8 @@ impl Default for AgentOptions {
             refresh_peers: Some(Duration::from_secs(300)),
             verbose: false,
             input_socket: None,
+            #[cfg(unix)]
+            input_end: None,
             input_timings: None,
         }
     }
@@ -95,7 +104,9 @@ struct Shared {
     connections: AtomicUsize,
     verbose: bool,
     /// Where input is handed over on this machine.
-    input_socket: std::path::PathBuf,
+    input: InputPlace,
+    /// That input is handed over at a name has been said.
+    said_named: std::sync::atomic::AtomicBool,
     /// The conversation each device sends its input on, by the device's id:
     /// one for each device. A device that opens another ends the one before.
     inputs: Mutex<HashMap<String, InputHold>>,
@@ -129,7 +140,20 @@ impl Agent {
             ),
             None => None,
         };
-        let paths_input_socket = paths.input_socket();
+        let input = InputPlace::Named(
+            options
+                .input_socket
+                .clone()
+                .unwrap_or_else(|| paths.input_socket()),
+        );
+        #[cfg(unix)]
+        let input = match &options.input_end {
+            Some(end) => InputPlace::Held {
+                end: end.clone(),
+                gone: Arc::default(),
+            },
+            None => input,
+        };
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -141,7 +165,8 @@ impl Agent {
                 apps: Mutex::new(None),
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
-                input_socket: options.input_socket.clone().unwrap_or(paths_input_socket),
+                input,
+                said_named: std::sync::atomic::AtomicBool::new(false),
                 inputs: Mutex::new(HashMap::new()),
                 passing,
                 log,
@@ -224,12 +249,29 @@ impl Agent {
     }
 }
 
+/// How the agent reaches the program that shows an application.
+enum InputPlace {
+    /// At a name in the file system ([`Paths::input_socket`]), which that
+    /// program listens on. Every program of the same user can write there
+    /// and can take the name's place: the form the measuring tools use.
+    Named(std::path::PathBuf),
+    /// On the agent's end of a pair without a name ([`crate::endpoint`]).
+    #[cfg(unix)]
+    Held {
+        end: Arc<std::os::unix::net::UnixDatagram>,
+        /// The other end was closed: seen when something was sent.
+        gone: Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
 /// Where a paired device's keyboard and pointer input goes on this machine:
-/// to the program that shows it an application, through the socket that
-/// program listens on ([`Paths::input_socket`]).
+/// to the program that shows it an application ([`InputPlace`]).
 struct InputSink {
     #[cfg(unix)]
     socket: std::os::unix::net::UnixDatagram,
+    /// Set when sending finds that nobody holds the other end any more.
+    #[cfg(unix)]
+    gone: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// What this conversation has down on the application's side.
     held: Arc<Mutex<Held>>,
 }
@@ -245,12 +287,25 @@ struct Held {
 
 impl InputSink {
     #[cfg(unix)]
-    fn open(path: &std::path::Path) -> std::io::Result<InputSink> {
-        let socket = std::os::unix::net::UnixDatagram::unbound()?;
-        socket.connect(path)?;
+    fn open(place: &InputPlace) -> std::io::Result<InputSink> {
+        let (socket, gone) = match place {
+            InputPlace::Named(path) => {
+                let socket = std::os::unix::net::UnixDatagram::unbound()?;
+                socket.connect(path)?;
+                (socket, None)
+            }
+            InputPlace::Held { end, gone } => {
+                // As at a name nobody listens on: there is nothing to open.
+                if gone.load(Ordering::SeqCst) {
+                    return Err(std::io::ErrorKind::NotConnected.into());
+                }
+                (end.try_clone()?, Some(gone.clone()))
+            }
+        };
         socket.set_nonblocking(true)?;
         Ok(InputSink {
             socket,
+            gone,
             held: Arc::default(),
         })
     }
@@ -261,6 +316,7 @@ impl InputSink {
     fn another(&self) -> std::io::Result<InputSink> {
         Ok(InputSink {
             socket: self.socket.try_clone()?,
+            gone: self.gone.clone(),
             held: self.held.clone(),
         })
     }
@@ -330,7 +386,7 @@ impl InputSink {
     }
 
     #[cfg(not(unix))]
-    fn open(_path: &std::path::Path) -> std::io::Result<InputSink> {
+    fn open(_place: &InputPlace) -> std::io::Result<InputSink> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
@@ -339,7 +395,23 @@ impl InputSink {
     fn send(&self, event: &InputEvent) {
         #[cfg(unix)]
         if let Ok(bytes) = serde_json::to_vec(event) {
-            let _ = self.socket.send(&bytes);
+            use std::io::ErrorKind;
+            match (self.socket.send(&bytes), &self.gone) {
+                // The other end of the pair was closed. A full buffer is not
+                // that: the program does not keep up, and loses input.
+                (Err(e), Some(gone))
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionRefused
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::NotConnected
+                            | ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    gone.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            }
         }
         #[cfg(not(unix))]
         let _ = event;
@@ -434,8 +506,20 @@ impl Shared {
                 Request::InputOpen { .. } if !session.allows(Permission::Control) => {
                     Response::error(ErrorCode::Forbidden, "this device may not control the host")
                 }
-                Request::InputOpen { alive } => match InputSink::open(&self.input_socket) {
+                Request::InputOpen { alive } => match InputSink::open(&self.input) {
                     Ok(sink) => {
+                        // Said once, and plainly: a name guards against other
+                        // accounts only.
+                        if matches!(self.input, InputPlace::Named(_))
+                            && !self.said_named.swap(true, Ordering::SeqCst)
+                        {
+                            (self.log)(
+                                "note: input from paired devices is handed over at a socket \
+                                 with a name: any program of this account can write to it or \
+                                 take its place (a pair without a name: --input-fd)"
+                                    .to_string(),
+                            );
+                        }
                         // One conversation carries a device's input. An earlier one (cut
                         // off somewhere on the way, perhaps, without either end having
                         // been told) is over now, and what it had down comes up before
@@ -634,13 +718,14 @@ mod tests {
         let dir = TempDir::new("in");
         let path = dir.paths().config.join("i.sock");
         // Nobody listens: there is nothing to open.
-        assert!(InputSink::open(&path).is_err());
+        let place = InputPlace::Named(path.clone());
+        assert!(InputSink::open(&place).is_err());
 
         let listener = UnixDatagram::bind(&path).unwrap();
         listener
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let sink = InputSink::open(&path).unwrap();
+        let sink = InputSink::open(&place).unwrap();
         sink.send(&InputEvent::Key {
             code: 30,
             pressed: true,
@@ -658,6 +743,55 @@ mod tests {
         // The listener goes away: input is lost, nothing else happens.
         drop(listener);
         sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_end_carries_input_until_the_other_end_is_closed() {
+        let (agents, shows) = crate::endpoint::pair().unwrap();
+        shows
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let place = InputPlace::Held {
+            end: Arc::new(agents),
+            gone: Arc::default(),
+        };
+        let sink = InputSink::open(&place).unwrap();
+        sink.send(&InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        let mut buffer = [0u8; 256];
+        let length = shows.recv(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..length],
+            br#"{"kind":"key","code":30,"pressed":true}"#
+        );
+        // A second conversation gets the same end.
+        let second = InputSink::open(&place).unwrap();
+        second.send(&InputEvent::PointerAt { x: 3, y: 4 });
+        let length = shows.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], br#"{"kind":"pointer_at","x":3,"y":4}"#);
+
+        // The program that shows the application goes away: input is lost,
+        // and from then on there is nothing to open, as at a name nobody
+        // listens on.
+        drop(shows);
+        // Seen when something is sent. For a moment a program another test
+        // is just starting may still hold a copy of the end (until it has
+        // become that program), so more than one send may be needed.
+        let began = std::time::Instant::now();
+        loop {
+            sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
+            if InputSink::open(&place).is_err() {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "the closed end was never noticed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
@@ -717,6 +851,34 @@ mod tests {
             assert!(!hears_alive(&mut earlier, A_MOMENT));
             earlier.send_input(&[key(31, true)]).unwrap();
             assert_eq!(pair.handed_over(SOON), Some(key(31, true)));
+        }
+
+        /// The agent and the program that shows the application share a pair
+        /// without a name: the same conversation, and nothing at the name.
+        #[test]
+        fn input_goes_over_a_held_end_and_not_to_the_name() {
+            let pair = InputPair::held("ih");
+            let at_the_name =
+                std::os::unix::net::UnixDatagram::bind(pair.host.path().join("i.sock")).unwrap();
+            at_the_name.set_nonblocking(true).unwrap();
+            let mut client = pair.connect();
+            assert_eq!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Open { alive: true }
+            );
+            client
+                .send_input(&[key(30, true), InputEvent::PointerAt { x: 5, y: 6 }])
+                .unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            assert_eq!(
+                pair.handed_over(SOON),
+                Some(InputEvent::PointerAt { x: 5, y: 6 })
+            );
+            // What is down comes up on the same end when the device goes.
+            drop(client);
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(30, false)]);
+            let mut buffer = [0u8; 64];
+            assert!(at_the_name.recv(&mut buffer).is_err());
         }
 
         #[test]

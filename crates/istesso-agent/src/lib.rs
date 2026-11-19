@@ -11,6 +11,8 @@
 
 pub mod cache;
 pub mod discovery;
+#[cfg(unix)]
+pub mod endpoint;
 pub mod passing;
 pub mod paths;
 pub mod relay;
@@ -120,7 +122,18 @@ pub(crate) mod testing {
 
     #[cfg(unix)]
     impl InputPair {
+        /// Input is handed over at a name, as the measuring tools do it.
         pub fn new(tag: &str) -> Self {
+            Self::with(tag, false)
+        }
+
+        /// Input is handed over on a pair without a name, of which the test
+        /// holds the other end.
+        pub fn held(tag: &str) -> Self {
+            Self::with(tag, true)
+        }
+
+        fn with(tag: &str, held: bool) -> Self {
             use istesso_pair::{Hello, Peer};
             let (host, device) = (TempDir::new(tag), TempDir::new(tag));
             let identities = [&host, &device].map(|dir| dir.paths().keeping().identity().unwrap());
@@ -140,7 +153,13 @@ pub(crate) mod testing {
             }
             // Never the socket of a pipeline that may really be running on this machine.
             let socket = host.path().join("i.sock");
-            let taken = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
+            let (taken, input_end) = if held {
+                let (ours, agents) = crate::endpoint::pair().unwrap();
+                (ours, Some(std::sync::Arc::new(agents)))
+            } else {
+                let taken = std::os::unix::net::UnixDatagram::bind(&socket).unwrap();
+                (taken, None)
+            };
             // The agent knows what the machine can do, as after its first inspection.
             crate::cache::remember_local_manifest(&host.paths(), &manifest("a host"));
             let options = crate::AgentOptions {
@@ -149,6 +168,7 @@ pub(crate) mod testing {
                 discovery: false,
                 refresh_peers: None,
                 input_socket: Some(socket),
+                input_end,
                 ..crate::AgentOptions::default()
             };
             let agent =

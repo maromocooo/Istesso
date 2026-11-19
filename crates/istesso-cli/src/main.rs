@@ -76,6 +76,13 @@ enum Command {
         /// file can be read by its owner only
         #[arg(long, value_name = "PATH")]
         input_timings: Option<PathBuf>,
+        /// Hand input over on the socket this program was born with at this
+        /// descriptor number, instead of at a socket with a name: for the
+        /// program that shows an application and starts an agent of its own
+        /// with one end of a pair of sockets. No other program can write to
+        /// such a pair or take its place
+        #[arg(long, value_name = "NUMBER")]
+        input_fd: Option<i32>,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -127,9 +134,17 @@ enum InputAction {
         to: String,
         /// The socket to listen on; one left by an earlier run is replaced.
         /// It has to be directly in Istesso's cache directory (`istesso id`
-        /// shows it)
-        #[arg(long, value_name = "PATH")]
-        socket: PathBuf,
+        /// shows it). Every program of the same user can write to a socket
+        /// with a name, and can take its place: see --input-fd
+        #[arg(long, value_name = "PATH", required_unless_present = "input_fd")]
+        socket: Option<PathBuf>,
+        /// Instead of --socket: take input on the socket this program was
+        /// born with at this descriptor number. The program that shows the
+        /// window makes a pair of sockets, starts this command with one end
+        /// and writes to the other; no other program can write to the pair
+        /// or take its place. The command ends when that program is gone
+        #[arg(long, value_name = "NUMBER", conflicts_with = "socket")]
+        input_fd: Option<i32>,
         /// Reach the device at this address only, instead of at whichever
         /// of its remembered addresses answers first: for when the way the
         /// input takes matters, as in a measurement over a cable
@@ -507,14 +522,27 @@ fn run(cli: Cli) -> Result<(), String> {
             no_discovery,
             verbose,
             input_timings,
-        } => run_agent(AgentOptions {
-            bind,
-            port,
-            discovery: !no_discovery,
-            verbose,
-            input_timings,
-            ..AgentOptions::default()
-        }),
+            input_fd,
+        } => {
+            // Before the key is used, and before anything else could open a
+            // descriptor.
+            let input_end = input_fd.map(born_with_input).transpose()?;
+            let mut options = AgentOptions {
+                bind,
+                port,
+                discovery: !no_discovery,
+                verbose,
+                input_timings,
+                ..AgentOptions::default()
+            };
+            #[cfg(unix)]
+            {
+                options.input_end = input_end.map(Arc::new);
+            }
+            #[cfg(not(unix))]
+            let _ = input_end;
+            run_agent(options)
+        }
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
         Command::Id => {
             let paths = Paths::from_env();
@@ -530,12 +558,17 @@ fn run(cli: Cli) -> Result<(), String> {
             InputAction::Relay {
                 to,
                 socket,
+                input_fd,
                 address,
                 keep_trying,
                 timings,
             } => relay_input(
                 &to,
-                &socket,
+                match (input_fd, socket) {
+                    (Some(number), _) => InputFrom::BornWith(number),
+                    (None, Some(socket)) => InputFrom::Socket(socket),
+                    (None, None) => return Err("give --socket or --input-fd".to_string()),
+                },
                 address.as_deref(),
                 Duration::from_secs(keep_trying),
                 timings.as_deref(),
@@ -611,11 +644,45 @@ fn in_parts(
     out
 }
 
+/// Where `istesso input relay` takes the input it passes on.
+enum InputFrom {
+    /// A socket with a name, which every program of the same user can write
+    /// to and replace: the form the measuring tools use.
+    Socket(PathBuf),
+    /// The end of a pair without a name this program was born with, at this
+    /// descriptor number.
+    BornWith(i32),
+}
+
+/// The end of a pair of sockets this program was born with at descriptor
+/// `number`: taken first thing, and refused unless nothing else can reach it.
+#[cfg(unix)]
+fn born_with_input(number: i32) -> Result<std::os::unix::net::UnixDatagram, String> {
+    // SAFETY: called at the start, before this program has opened anything
+    // it could own at that number; whoever started the program gave it.
+    let end = unsafe { istesso_agent::endpoint::inherited(number) }
+        .map_err(|e| format!("cannot take input there: {e}"))?;
+    // The end is worth what the process is: no other program of the same
+    // user gets to look into this one, where the system offers that.
+    if !istesso_agent::endpoint::keep_others_out_of_this_process() {
+        eprintln!(
+            "note: on this system a program is kept from looking into this one only by how \
+             it is signed"
+        );
+    }
+    Ok(end)
+}
+
+#[cfg(not(unix))]
+fn born_with_input(_number: i32) -> Result<(), String> {
+    Err("taking input on an inherited socket needs a Unix system".to_string())
+}
+
 /// Takes input events from a local socket and sends them to a paired device.
 #[cfg(unix)]
 fn relay_input(
     to: &str,
-    socket: &std::path::Path,
+    from: InputFrom,
     address: Option<&str>,
     keep_trying: Duration,
     timings: Option<&std::path::Path>,
@@ -623,12 +690,25 @@ fn relay_input(
     use std::io::ErrorKind;
     use std::os::unix::net::UnixDatagram;
 
-    // Only in a place of Istesso's own, before anything else is done: the
-    // relay speaks for this device to another one, so whoever starts it does
-    // not choose where it listens.
-    let socket = &Paths::from_env()
-        .local_socket(socket)
-        .map_err(|e| e.to_string())?;
+    // Before anything else is done, and before the key is used: the relay
+    // speaks for this device to another one. Either the end of a pair it was
+    // born with, which nothing else can reach, or a name in a place of
+    // Istesso's own, so that whoever starts it does not choose where it
+    // listens.
+    let (born_with, socket) = match from {
+        InputFrom::BornWith(number) => (Some(born_with_input(number)?), None),
+        InputFrom::Socket(asked) => (
+            None,
+            Some(
+                Paths::from_env()
+                    .local_socket(&asked)
+                    .map_err(|e| e.to_string())?,
+            ),
+        ),
+    };
+    // The program that holds the other end of the pair. When it is gone the
+    // system gives this one another parent, and nothing can arrive any more.
+    let started_by = std::os::unix::process::parent_id();
     let passing = match timings {
         Some(path) => Some(
             istesso_agent::PassLog::create(path)
@@ -668,23 +748,47 @@ fn relay_input(
     };
     let mut line = InputLine::open(client, connect)
         .map_err(|(_, why)| format!("the device does not take input from here: {why}"))?;
-    // A socket left by an earlier run is in the way of a new one.
-    match std::fs::remove_file(socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot replace {}: {e}", socket.display())),
-    }
-    let listener = UnixDatagram::bind(socket)
-        .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
-    let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
-    println!(
-        "Input written to {} goes to the paired device.",
-        socket.display()
-    );
+    let listener: UnixDatagram = match (born_with, &socket) {
+        (Some(end), _) => {
+            println!("Input from the program that started this one goes to the paired device.");
+            end
+        }
+        (None, Some(socket)) => {
+            // A socket left by an earlier run is in the way of a new one.
+            match std::fs::remove_file(socket) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot replace {}: {e}", socket.display())),
+            }
+            let listener = UnixDatagram::bind(socket)
+                .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
+            // For the owner only, whatever the starter's umask says. This
+            // keeps other accounts out, not other programs of this one.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("cannot close {} to others: {e}", socket.display()))?;
+            }
+            println!(
+                "Input written to {} goes to the paired device.",
+                socket.display()
+            );
+            eprintln!(
+                "note: any program of this account can write to a socket with a name or take \
+                 its place (a pair without a name: --input-fd)"
+            );
+            listener
+        }
+        (None, None) => return Err("there is nowhere to take input from".to_string()),
+    };
+    let failed = |e: std::io::Error| format!("cannot read the input: {e}");
     // How often the conversation was cut is always said, also when it is 0: on standard
     // output, in the log of times if there is one, and in a small file next to the socket
-    // for the program that shows the window.
-    let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
+    // for the program that shows the window. A pair without a name has no such file: the
+    // program that started this one reads standard output.
+    let state = socket
+        .as_ref()
+        .map(|socket| std::path::PathBuf::from(format!("{}.state", socket.display())));
     let tell = |event: &str, cuts: u64, after: Option<Duration>| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -702,6 +806,9 @@ fn relay_input(
         // it checks that the process named in it still runs.
         // Made anew each time (never through a link left there), readable by
         // the owner only.
+        let Some(state) = &state else {
+            return;
+        };
         let beside = state.with_extension("state.new");
         let line = format!("{{\"pid\":{},\"input\":{cuts}}}\n", std::process::id());
         let _ = std::fs::remove_file(&beside);
@@ -716,7 +823,7 @@ fn relay_input(
                 .and_then(|mut file| file.write_all(line.as_bytes()))
         };
         if written.is_ok() {
-            let _ = std::fs::rename(&beside, &state);
+            let _ = std::fs::rename(&beside, state);
         }
     };
     tell("open", 0, None);
@@ -741,6 +848,10 @@ fn relay_input(
         }
     };
     loop {
+        if socket.is_none() && std::os::unix::process::parent_id() != started_by {
+            eprintln!("note: the program that started this one is gone; ending");
+            return Ok(());
+        }
         let mut events = Vec::new();
         // Wait for something to happen, but not for long: the conversation is looked
         // after in between (saying "still here", hearing the answers, opening it again
@@ -799,7 +910,7 @@ fn relay_input(
 #[cfg(not(unix))]
 fn relay_input(
     _to: &str,
-    _socket: &std::path::Path,
+    _from: InputFrom,
     _address: Option<&str>,
     _keep_trying: Duration,
     _timings: Option<&std::path::Path>,
