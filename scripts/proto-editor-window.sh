@@ -102,26 +102,43 @@ end_all() {
     done
     return 0
 }
-# Hands the file at EDITOR_WINDOW_PLACE to the editor on the bus at $1, the editor's own way of
-# opening files in a running instance (GApplication's "open"), with the place read from the
-# environment: it is never an argument of any program.
+# Hands the file at EDITOR_WINDOW_PLACE to the editor, the editor's own way of opening files in a
+# running instance (GApplication's "open"), with the place read from the environment: it is never an
+# argument of any program. It waits (10 s at most) for the editor's bus (its address is written to
+# the file $1 when the bus starts) and for the editor to own its name there, so that it is started
+# while the editor starts, and never becomes the editor's first instance itself.
 hand_to_editor() {
-    DBUS_SESSION_BUS_ADDRESS=$1 timeout 10 python3 -I -c '
-import os, sys
-from gi.repository import Gio
+    timeout 15 python3 -I -c '
+import os, sys, time
+from gi.repository import Gio, GLib
+deadline = time.time() + 10
+address = ""
+while not address and time.time() < deadline:
+    try:
+        address = open(sys.argv[1]).read().strip()
+    except OSError:
+        pass
+    if not address:
+        time.sleep(0.02)
+if not address:
+    sys.exit(4)
+os.environ["DBUS_SESSION_BUS_ADDRESS"] = address
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+def owned():
+    reply = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "NameHasOwner", GLib.Variant("(s)", ("org.gnome.TextEditor",)),
+                          GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, -1, None)
+    return reply.unpack()[0]
+while not owned():
+    if time.time() > deadline:
+        sys.exit(5)
+    time.sleep(0.02)
 app = Gio.Application(application_id="org.gnome.TextEditor", flags=Gio.ApplicationFlags.HANDLES_OPEN)
 if not app.register(None) or not app.get_is_remote():
     sys.exit(3)
 app.open([Gio.File.new_for_path(os.environ["EDITOR_WINDOW_PLACE"])], "")
 app.get_dbus_connection().flush_sync(None)
-' > /dev/null 2>&1
-}
-# Whether the editor owns its name on the bus at $1 (so that a hand-over goes to it, and never makes
-# the handing program the editor's first instance).
-editor_on_bus() {
-    DBUS_SESSION_BUS_ADDRESS=$1 timeout 5 gdbus call --session --dest org.freedesktop.DBus \
-        --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.NameHasOwner \
-        org.gnome.TextEditor 2>/dev/null | grep -q true
+' "$1" > /dev/null 2>&1
 }
 
 case "${1:-}" in
@@ -147,7 +164,7 @@ device_key=${EDITOR_WINDOW_DEVICE_KEY:-}
 # The editor of an earlier request of the same device still runs: the file goes to it.
 if still_runs "$run/app.pid" && still_runs "$run/pipeline.pid" && [ -s "$run/bus-address" ] &&
     [ "$(cat "$run/device" 2>/dev/null)" = "$device" ]; then
-    hand_to_editor "$(cat "$run/bus-address")" || say_fail "the running editor did not take the file"
+    hand_to_editor "$run/bus-address" || say_fail "the running editor did not take the file"
     echo "window $picture $input Text Editor"
     exit 0
 fi
@@ -300,14 +317,8 @@ chmod +x "$run/guard.sh"
 env -u EDITOR_WINDOW_PLACE setsid "$run/guard.sh" >> "$run/guard.log" 2>&1 < /dev/null &
 write_down "$run/guard.pid" $!
 
-# The editor on its bus, then the file handed to it.
-for _ in $(seq 1 200); do
-    [ -s "$run/bus-address" ] && editor_on_bus "$(cat "$run/bus-address")" && break
-    still_runs "$run/app.pid" || break
-    sleep 0.05
-done
-still_runs "$run/app.pid" && [ -s "$run/bus-address" ] || { end_all; say_fail "the editor did not stay"; }
-hand_to_editor "$(cat "$run/bus-address")" || { end_all; say_fail "the editor did not take the file"; }
+# The file handed to the editor, as soon as it is on its bus.
+hand_to_editor "$run/bus-address" || { end_all; say_fail "the editor did not take the file"; }
 
 # Ready when the picture's port listens and the editor has a window in the compositor.
 windows=""
