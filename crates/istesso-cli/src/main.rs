@@ -584,7 +584,8 @@ fn run_forwards(json: bool, action: Option<ForwardsAction>) -> Result<(), String
                         forward.process,
                         forward.open,
                         forward.connections,
-                        forward.refused,
+                        // At the look, and from programs of other users.
+                        forward.refused + forward.other_user,
                     );
                 }
             }

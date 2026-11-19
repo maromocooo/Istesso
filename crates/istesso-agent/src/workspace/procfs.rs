@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use super::peer::{address_v4, address_v6};
+
 /// Where the control groups are (cgroup v2).
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// How deep below a workspace's control group its members are looked for,
@@ -269,29 +271,6 @@ pub(crate) fn parse_net_tcp(text: &str, v6: bool) -> Vec<Socket> {
             })
         })
         .collect()
-}
-
-/// An IPv4 address as `/proc/net/tcp` prints it: the four bytes in the
-/// order they are in memory, as one number in hexadecimal.
-fn address_v4(hex: &str) -> Option<Ipv4Addr> {
-    if hex.len() != 8 {
-        return None;
-    }
-    let word = u32::from_str_radix(hex, 16).ok()?;
-    Some(Ipv4Addr::from(word.to_ne_bytes()))
-}
-
-/// An IPv6 address as `/proc/net/tcp6` prints it: four such numbers.
-fn address_v6(hex: &str) -> Option<Ipv6Addr> {
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut bytes = [0u8; 16];
-    for (i, chunk) in bytes.chunks_mut(4).enumerate() {
-        let word = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok()?;
-        chunk.copy_from_slice(&word.to_ne_bytes());
-    }
-    Some(Ipv6Addr::from(bytes))
 }
 
 /// Every listening socket of this machine (of its network namespace).
