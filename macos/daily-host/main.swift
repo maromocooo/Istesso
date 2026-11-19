@@ -1129,6 +1129,10 @@ func selfTest() -> Never {
     checkPanel(after.0 == .only(id: "a", key: "k") && after.1 == false && after.2 == true, true, "restart: words that came meanwhile decide the state first")
     let held = stateAfter(words: ["resume"], admit: .nobody, offered: false, detached: true, held: true)
     checkPanel(held.1 == false && held.2 == true, true, "restart: a resume while held for a measurement does not offer")
+    checkPanel(lockResumes(pausedForLock: true, detached: false, held: false), true, "unlock: the picture the lock stopped comes back")
+    checkPanel(lockResumes(pausedForLock: false, detached: false, held: false), false, "unlock: an explicit pause stays")
+    checkPanel(lockResumes(pausedForLock: true, detached: true, held: false), false, "unlock: a detach stays")
+    checkPanel(lockResumes(pausedForLock: true, detached: false, held: true), false, "unlock: held for a measurement, it stays stopped")
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -1171,6 +1175,12 @@ final class Lookout {
 
     /// Runs one Accessibility action away from the input; returns at once.
     func act(_ work: @escaping () -> Void) { queue.async(execute: work) }
+}
+
+/// After an unlock, whether the picture comes back: only when the lock stopped it, and the
+/// controller has not paused or detached it since, and no measurement holds it.
+func lockResumes(pausedForLock: Bool, detached: Bool, held: Bool) -> Bool {
+    pausedForLock && !detached && !held
 }
 
 /// After a resize, whether the picture is started again on the new stream: only when it runs now
@@ -1598,6 +1608,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         for name in ["com.apple.screenIsLocked", "com.apple.sessionDidMoveOffConsole"] {
             DistributedNotificationCenter.default().addObserver(forName: Notification.Name(name), object: nil, queue: .main) { [weak self] _ in
                 self?.injector.releaseAll()
+                self?.enforceLock()
             }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
@@ -2005,6 +2016,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// Opens the encoder and starts capturing (on the main thread).
     var opening = false
     func openPicture(resumeAsked: UInt64? = nil, done: @escaping (String?) -> Void) {
+        // Never while locked: the picture waits for the unlock.
+        if screenLocked() && !settings.generated {
+            if picture == "running" { picture = "paused" }
+            pausedForLock = true
+            return done(nil)
+        }
         opening = true
         let done: (String?) -> Void = { why in self.opening = false; done(why) }
         pump.queue.async {
@@ -2074,7 +2091,31 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         picture = "paused"
         if again {
             again = false
-            word("resume")
+            if screenLocked() { pausedForLock = true } else { word("resume") }
+        }
+    }
+
+    /// Said by the lock itself (not by whoever runs the session): a pause or a resume that must not
+    /// clear what the controller said.
+    var lockWord = false
+    func sayForLock(_ line: String) {
+        lockWord = true
+        word(line)
+        lockWord = false
+    }
+
+    /// The lock, enforced at every look (not only when it changes): locked, nothing of the
+    /// application is captured, and a resume that was on its way waits for the unlock.
+    func enforceLock() {
+        guard transport != nil else { return }
+        let locked = screenLocked()
+        if locked {
+            if picture == "stopping" && again { again = false; pausedForLock = true }
+            if picture == "running" { pausedForLock = true; sayForLock("pause") }
+        } else if lockResumes(pausedForLock: pausedForLock, detached: detached, held: heldForSignal) && picture == "paused" {
+            pausedForLock = false
+            if app != nil { windowBounds = .zero }
+            sayForLock("resume")
         }
     }
 
@@ -2118,12 +2159,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let words = line.split(separator: " ").map(String.init)
         switch words.first {
         case "pause":
+            // An explicit pause wins over the lock's own: an unlock does not undo it.
+            if !lockWord { pausedForLock = false }
             again = false
             if picture == "stopping" { return }  // answered when it has stopped
             guard picture == "running" else { return say("paused", [("offered", offered), ("took_ms", 0.0)]) }
             picture = "stopping"
             stopPicture(offered: true) { self.stopped() }
         case "detach":
+            if !lockWord { pausedForLock = false }
             detached = true
             again = false
             if picture != "running" {
@@ -2137,6 +2181,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         case "resume":
             guard !heldForSignal else {
                 return say("refused", [("word", "resume"), ("reason", "a latency measurement runs on this Mac; the picture comes back when it is over")])
+            }
+            // Locked: nothing of the application is shown; resumed once unlocked (unless a pause or
+            // a detach comes before).
+            guard !screenLocked() else {
+                pausedForLock = true
+                return say("refused", [("word", "resume"), ("reason", "the Mac is locked; the picture comes back once it is unlocked")])
             }
             detached = false
             transport.offer(true)
@@ -2326,16 +2376,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         if locked != wasLocked {
             wasLocked = locked
             say(locked ? "locked" : "unlocked")
-            // Nothing of the application while locked; back as it was once unlocked.
-            if locked && picture == "running" && transport != nil {
-                pausedForLock = true
-                word("pause")
-            } else if !locked && pausedForLock {
-                pausedForLock = false
-                if app != nil { windowBounds = .zero }
-                word("resume")
-            }
         }
+        enforceLock()
     }
 
     /// The Mac's cursor, as large as the host's screen looks in the viewer's window, and of the
