@@ -1667,6 +1667,12 @@ func selfTest() -> Never {
         var carry4 = (0.0, 0.0)
         let old = scrollPlan(dx: 2, dy: -7, source: nil, v120: nil, pixels: nil, phase: nil, momentum: nil, pointsPerPixel: 1, carry: &carry4)
         checkPanel(old.wheel1 == 7 && old.wheel2 == -2 && !old.lines, true, "scroll: without a source, as before")
+        var carry5 = (0.0, 0.0)
+        let least = scrollPlan(dx: Int32.max, dy: Int32.min, source: nil, v120: nil, pixels: nil, phase: nil, momentum: nil, pointsPerPixel: 1, carry: &carry5)
+        checkPanel(least.wheel1 == 10_000 && least.wheel2 == -10_000, true, "scroll: Int32's least and greatest are bounded, nothing traps")
+        var carry6 = (0.0, 0.0)
+        let huge = scrollPlan(dx: 0, dy: 0, source: "finger", v120: nil, pixels: [1e300, -1e300], phase: nil, momentum: nil, pointsPerPixel: 1, carry: &carry6)
+        checkPanel(abs(huge.wheel1) <= 1_000_000 && abs(huge.wheel2) <= 1_000_000, true, "scroll: enormous pixels are bounded, nothing traps")
     }
     let guardedFlag = Guarded()
     var ran = 0
@@ -1794,9 +1800,9 @@ func scrollPlan(dx: Int32, dy: Int32, source: String?, v120: [Double]?, pixels: 
     func whole(_ x: Double, _ y: Double) -> (Int32, Int32) {
         // The Mac's axis 1 is up and down, positive towards the top: the other way round.
         let a = -y + carry.1, b = -x + carry.0
-        let ra = a.rounded(.towardZero), rb = b.rounded(.towardZero)
+        let ra = min(max(a.rounded(.towardZero), -1_000_000), 1_000_000), rb = min(max(b.rounded(.towardZero), -1_000_000), 1_000_000)
         carry = (b - rb, a - ra)
-        return (Int32(ra), Int32(rb))
+        return (Int32(clamping: Int(ra)), Int32(clamping: Int(rb)))
     }
     if source == "finger", let p = pixels {
         let x = p[0] * pointsPerPixel, y = p[1] * pointsPerPixel
@@ -1809,7 +1815,8 @@ func scrollPlan(dx: Int32, dy: Int32, source: String?, v120: [Double]?, pixels: 
         let (w1, w2) = whole(x, y)
         return ScrollPlan(lines: true, wheel1: w1, wheel2: w2, exact1: -y, exact2: -x, continuous: false, phase: 0, momentum: 0)
     }
-    return ScrollPlan(lines: false, wheel1: -dy, wheel2: -dx, exact1: -Double(dy), exact2: -Double(dx), continuous: false, phase: 0, momentum: 0)
+    let y = min(max(dy, -10_000), 10_000), x = min(max(dx, -10_000), 10_000)
+    return ScrollPlan(lines: false, wheel1: 0 &- y, wheel2: 0 &- x, exact1: -Double(y), exact2: -Double(x), continuous: false, phase: 0, momentum: 0)
 }
 
 /// Whether an input event may pass while the screen is locked or the session is not on the
@@ -2063,7 +2070,10 @@ final class Injector {
             guard let code = (object["code"] as? NSNumber)?.uint32Value, let pressed = object["pressed"] as? Bool else { return count("unreadable") }
             button(code, pressed)
         case "scroll":
-            guard let dx = (object["dx"] as? NSNumber)?.int32Value, let dy = (object["dy"] as? NSNumber)?.int32Value else { return count("unreadable") }
+            // Bounded before anything is done with them: Int32's least value has no opposite.
+            guard let rawX = (object["dx"] as? NSNumber)?.doubleValue, let rawY = (object["dy"] as? NSNumber)?.doubleValue,
+                  rawX.isFinite, rawY.isFinite, abs(rawX) <= 10_000, abs(rawY) <= 10_000 else { return count("unreadable") }
+            let dx = Int32(rawX), dy = Int32(rawY)
             let numbers = { (key: String) -> [Double]? in
                 guard let list = object[key] as? [NSNumber], list.count == 2 else { return nil }
                 let values = list.map(\.doubleValue)

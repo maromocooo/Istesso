@@ -533,16 +533,28 @@ pub const SCROLL_MOST_V120: i32 = 120 * 1000;
 /// [`SCROLL_MOST_PIXELS`] and notches of at most [`SCROLL_MOST_V120`] on
 /// either axis. Any other event is acceptable here.
 pub fn scroll_is_acceptable(event: &InputEvent) -> bool {
-    let InputEvent::Scroll { v120, pixels, .. } = event else {
+    let InputEvent::Scroll {
+        dx,
+        dy,
+        v120,
+        pixels,
+        ..
+    } = event
+    else {
         return true;
     };
-    pixels.is_none_or(|p| {
-        p.iter()
-            .all(|v| v.is_finite() && v.abs() <= SCROLL_MOST_PIXELS)
-    }) && v120.is_none_or(|n| {
-        n.iter()
-            .all(|v| v.unsigned_abs() <= SCROLL_MOST_V120 as u32)
-    })
+    // The old fields too: a receiver turns them round, and Int32's least value has no opposite.
+    let most = SCROLL_MOST_PIXELS as i32;
+    dx.unsigned_abs() <= most as u32
+        && dy.unsigned_abs() <= most as u32
+        && pixels.is_none_or(|p| {
+            p.iter()
+                .all(|v| v.is_finite() && v.abs() <= SCROLL_MOST_PIXELS)
+        })
+        && v120.is_none_or(|n| {
+            n.iter()
+                .all(|v| v.unsigned_abs() <= SCROLL_MOST_V120 as u32)
+        })
 }
 
 /// The sizes a [`InputEvent::Resize`] may ask for: 64 to 8192 pixels a side.
@@ -591,6 +603,15 @@ mod tests {
             assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), event);
         }
         assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
+        assert!(!super::scroll_is_acceptable(&InputEvent::scroll(
+            0,
+            i32::MIN
+        )));
+        assert!(!super::scroll_is_acceptable(&InputEvent::scroll(
+            i32::MAX,
+            0
+        )));
+        assert!(super::scroll_is_acceptable(&InputEvent::scroll(0, -10_000)));
         assert_eq!(
             serde_json::to_string(&InputEvent::Focus).unwrap(),
             r#"{"kind":"focus"}"#
@@ -710,7 +731,9 @@ mod tests {
         )));
         assert!(scroll_is_acceptable(&with(None, Some([-120_000, 120_000]))));
         assert!(!scroll_is_acceptable(&with(None, Some([0, i32::MIN]))));
-        assert!(scroll_is_acceptable(&InputEvent::scroll(i32::MAX, 0)));
+        // The old fields are bounded too (the receiver turns them round; i32::MIN has no opposite).
+        assert!(!scroll_is_acceptable(&InputEvent::scroll(i32::MAX, 0)));
+        assert!(scroll_is_acceptable(&InputEvent::scroll(10_000, -10_000)));
         assert!(scroll_is_acceptable(&InputEvent::Focus));
     }
 
