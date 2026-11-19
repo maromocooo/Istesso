@@ -205,12 +205,19 @@ if CommandLine.arguments.dropFirst().first == "--access-behavior" {
 if CommandLine.arguments.dropFirst().first == "--prompt-windows" {
     // Read only, for collecting what the system's confirmations look like. Every on-screen window
     // above the normal layer, and the normal-layer windows of Apple's own processes: layer, size,
-    // whether on screen, and the owner - Apple's bundle id; or, with no bundle id, the
+    // whether on screen, and the owner - "an application" for any application the person uses
+    // (with a Dock tile), named or not; Apple's bundle id for the system's own agents; or, with
+    // no bundle id, the
     // executable's name when it lives below /System/ or /usr/ (the system's agents); else
     // "another application" (only counted). Never a title.
     func owner(_ pid: pid_t) -> (String, apple: Bool) {
-        if let id = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier, !id.isEmpty {
-            return id.hasPrefix("com.apple.") ? (id, true) : ("another application", false)
+        if let running = NSRunningApplication(processIdentifier: pid) {
+            // An application the person uses (it has a Dock tile): which one is their activity,
+            // never named, Apple's or not.
+            if running.activationPolicy == .regular { return ("an application", true) }
+            if let id = running.bundleIdentifier, !id.isEmpty {
+                return id.hasPrefix("com.apple.") ? (id, true) : ("another application", false)
+            }
         }
         var buffer = [CChar](repeating: 0, count: 4096)
         if proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 {
