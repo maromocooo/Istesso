@@ -54,6 +54,30 @@ scripts/daily.sh setup [--host mac]
 - `DAILY_DRY_RUN=1`：`daily-mac.sh` に渡すものを、渡さずに書くだけ（Ubuntu の側は、いつもどおり動く）。
 - 確かめ（窓を出さずに、Mac Studio には何もせずに）：`daily-mac.sh` の代わりの小さなスクリプトで、`open TextEdit --host mac [--for aura --size 1600x1000]`、`close … [--for aura]`（`aura-TextEdit` として渡る）、`setup --host mac`、`list`、`stop` が、その言葉のまま渡り、鍵の記述子を持っていないことを見た。`--min-qp` と `--host studio` は断った。Ubuntu の既定の道（`open editor`、`--host ubuntu`、`list`、`close`）は前のまま。本物の `daily-mac.sh` での `list` は、この Mac の ssh の名前 `istesso-mac` が引けず、その一行を `mac` の行として出して、すぐ終わった（Mac のホストへの ssh は、Mac のホストの流れの設定による）。
 
+### スクロール（2026-11-19、M3 の宿題 4）
+
+[ADR 0007 の「スクロールの種類と段階」](adr/0007-control-channel.md)の試用版の側。ホイールは目盛り、トラックパッドは画素と段階（指が触れている、離れた、そのあとの慣性）で送り、Ubuntu の試用のコンポジターは、ホイールをホイールとして、指を指として、アプリに伝える。
+
+- ビューアー：`scroll.h`（窓なしで試せる C。`scroll-test` をビルドで動かす）。`hasPreciseScrollingDeltas` のないもの（ホイール）は `v120`（1 行が 120）。あるもの（トラックパッド）は、`scrollingDeltaX/Y` に絵の画素と点の比を掛けた `pixels`（小数 3 桁。ロケールに左右されない書き方）と、`phase`、`momentumPhase` を送る。`dx`、`dy` は前と同じ値。動きのない「changed」と「触れただけ」は送らない。
+- 中継とエージェント：`istesso_proto::InputEvent::Scroll` に、省ける項目を 5 つ足した。エージェントは、範囲の外のスクロールを捨てる。
+- パイプライン：`daily-pipeline.py --scroll`（`scripts/daily_scroll.py`）が、種類を言うスクロールを、カスタムイベント `PointerScroll` にしてコンポジターへ渡す。古い形は、前のまま `m1-step3-host.py` の `MouseAxis`。`daily.sh` は、写したプラグインの修正の一覧に `trial-y-scroll` があるときだけ `--scroll` を付ける。
+- コンポジター：試用の 7 つ目の修正 `gst-wayland-display-trial-y-scroll.patch`（ブランチ `m3-compositor-scroll`、ビルドは `~/.cache/istesso-scroll-wip/gwd-scroll1`。`DAILY_PLUGIN_FROM` の既定をここにした）。コンポジターの試験 118 件（新しいスクロールの試験 6 件を含む）が通った。`check-plugin.sh` は、このビルドを試用と言う（1）。計測に使うプラグインは、これまでどおり 0。
+- Mac の慣性：既定は、そのまま渡す。`ISTESSO_SCROLL_MOMENTUM=app`（コンポジターの環境）で、捨てて、アプリに任せる。試用版からは、まだ渡していない（既定のまま）。
+
+確かめ（13:58〜14:01、窓を出さずに）：中継、試用のエージェント、`daily-pipeline.py`、`m1-step3-host.py`、コンポジターは、試用版と同じ道（このブランチの写しを、流れ自身のフォルダーで、`daily.sh` と同じ引数で起動した。ポートは 47961、47962。確かめのための組）。アプリは、軸のイベントを 1 行ずつ書く試しのアプリ（`scripts/scroll-log.c`）。Mac の側は、ビューアーの `scroll.h` で作った NSEvent の形の値を、中継の口へ書いた（ビューアーは動かしていない）。身ぶりは作り物（下の「手元」は、手元の Mac のアプリが動かすはずの量で、NSScrollView がトラックパッドの点だけ動くこと、ホイールは行で動くことからの計算）。
+
+| 身ぶり | 手元 | 直す前（いまの試用版） | 直したあと |
+|---|---|---|---|
+| はじく（指 17 回 120 点 + 慣性 165 点） | 285.15 点 | **ホイール**として 2.4 目盛り、軸の値 7.0 | 指として 285.02 画素、慣性のあと 8 ms で `axis_stop` |
+| ゆっくり引く（120 点、慣性なし） | 120 点 | ホイール 1.0 目盛り、軸の値 2.97 | 指 120.0 画素、指を離して 60 ms で `axis_stop` |
+| 小さく動かす（5.5 点） | 5.5 点 | ホイール 0.04 目盛り、軸の値 0.12 | 指 5.5 画素 |
+| ホイールを 1 目盛りずつ 5 回 | 5 行 | 0.625 目盛り（1 回が 1/8） | 5.0 目盛り（`axis_value120` 600、軸の値 50） |
+| ホイールを速く回す（Mac が 35 行に速めた） | 35 行 | 4.4 目盛り | 35.0 目盛り |
+
+- 新しいビューアーと古いホスト（いまの `gwd-trial27`、`--scroll` なし）では、5 つとも、直す前と同じ数になった（古い受け側は `dx`、`dy` だけを使う）。
+- `ISTESSO_SCROLL_MOMENTUM=app` では、はじく身ぶりは指 120 画素と、指を離した 8 ms あとの `axis_stop` だけになった（慣性はアプリが付ける）。
+- まだ見ていないこと：人の手のトラックパッドとホイール（本物の NSEvent。macOS が指を離してから慣性を始めるまでの間が、60 ms に収まるか）、本物のアプリ（GTK、Firefox、Chrome、Blender）での動き。Firefox と GTK は、`axis_stop` のあとに自分の慣性を付けることがある（考え）。Mac の慣性を渡しているあいだは止めないので、二重にはならない見込み。
+
 ## いまの部品で、何が足りなかったか
 
 `scripts/try.sh` は、アプリを 1 つ映します。`ISTESSO_TRY_NAME` を付けると、2 つめを横で動かせますが、キーボードとマウスは届きません。ホストのエージェントが、入力を、ふだんのパイプラインの口 1 つにだけ渡すためです。

@@ -135,7 +135,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial27/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-scroll-wip/gwd-scroll1/target/release'}
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 state="$HOME/Library/Caches/istesso-daily"
@@ -770,6 +770,11 @@ grep -q -- "--text" "$src/scripts/daily-pipeline.py" 2>/dev/null || { echo "fail
 flow=""
 [ "$FOR" = aura ] && [ "$FLOW" != 0 ] && flow="--flow"
 [ -z "$flow" ] || [ -f "$src/scripts/daily_flow.py" ] || { echo "fail the trial's copy on the host has no scripts/daily_flow.py yet (scripts/daily.sh setup)"; exit 1; }
+# Scrolls by their kind (a wheel's notches, fingers' pixels and stages; docs/adr/0007-control-channel.md,
+# "スクロールの種類と段階") only for a compositor that knows them: one built with the patch
+# trial-y-scroll. Without it the scrolls go as before.
+scroll=""
+grep -q "trial-y-scroll" "$plugin/patches.txt" 2>/dev/null && [ -f "$src/scripts/daily_scroll.py" ] && scroll="--scroll"
 config=""
 [ -n "$HOST_CONFIG" ] && config=$(eval echo "$HOST_CONFIG")
 # For AURA (--for aura): the application's own AURA slot (picture 4793N, input 4794N), 4:2:0 at 72
@@ -1007,7 +1012,7 @@ echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/pipeline.sid
 # The words for the pipeline are written into this pipe; it is held open so that it never ends.
 exec 3<>$run/control
-exec python3 -u $src/scripts/daily-pipeline.py --text ${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
+exec python3 -u $src/scripts/daily-pipeline.py --text ${scroll:+$scroll }${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
     [ -n "$MIN_QP" ] && echo "host: $NAME's encoder gets the quality floor min-qp $MIN_QP (trial only)"

@@ -17,6 +17,8 @@ cc -Wall -Wextra -o build/keys-test keys-test.c && build/keys-test
 clang -fobjc-arc -Wall -Wextra -o build/text-input-test text-input-test.m -framework Foundation && build/text-input-test
 # And how the everyday trial's window and its picture are sized against each other.
 cc -Wall -Wextra -o build/window-size-test window-size-test.c -lm && build/window-size-test
+# And what goes to the other side for a scroll of the wheel or the trackpad.
+cc -Wall -Wextra -o build/scroll-test scroll-test.c -lm && build/scroll-test
 # The encrypted channel (ISTESSO_CHANNEL) comes from the Rust crate istesso-media, linked statically.
 media=../../target/release/libistesso_media.a
 (cd ../.. && cargo build --release -p istesso-media)
