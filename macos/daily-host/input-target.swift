@@ -12,6 +12,7 @@
 // Usage: istesso-input-target [REPORT [SECONDS]]   (REPORT: ~/.cache/istesso-daily-mac/input-target.jsonl)
 
 import AppKit
+import Carbon
 
 final class Counting: NSTextView {
     var counts: [String: Int] = [:]
@@ -74,6 +75,8 @@ final class Target: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let seconds: Double
     var window: NSWindow!
     var view: Counting!
+    var secure: NSSecureTextField!
+    var secureInputSeen = false
     init(report: String, seconds: Double) {
         self.report = report
         self.seconds = seconds
@@ -83,7 +86,13 @@ final class Target: NSObject, NSApplicationDelegate, NSWindowDelegate {
                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = "Istesso Dev Input Target"
         window.delegate = self
-        view = Counting(frame: window.contentView!.bounds)
+        // A password field along the bottom (40 points), the text area above it. The field counts
+        // how many characters it holds, never which.
+        let bounds = window.contentView!.bounds
+        secure = NSSecureTextField(frame: NSRect(x: 10, y: 6, width: bounds.width - 20, height: 28))
+        secure.autoresizingMask = [.width]
+        window.contentView!.addSubview(secure)
+        view = Counting(frame: NSRect(x: 0, y: 40, width: bounds.width, height: bounds.height - 40))
         view.autoresizingMask = [.width, .height]
         view.font = NSFont.systemFont(ofSize: 24)
         window.contentView!.addSubview(view)
@@ -97,6 +106,9 @@ final class Target: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func write() {
         var line = "{\"t\":\(Date().timeIntervalSince1970),\"window\":\(window.windowNumber),\"active\":\(NSApp.isActive)"
         for (key, value) in view.counts.sorted(by: { $0.key < $1.key }) { line += ",\"\(key)\":\(value)" }
+        // The password field: how many characters it holds, and whether macOS's secure input was on.
+        if IsSecureEventInputEnabled() { secureInputSeen = true }
+        line += ",\"secure_characters\":\(secure.stringValue.count),\"secure_input_seen\":\(secureInputSeen)"
         if let click = view.lastClick { line += ",\"last_click\":[\(Int(click.x)),\(Int(click.y))]" }
         line += "}\n"
         if let handle = FileHandle(forWritingAtPath: report) {

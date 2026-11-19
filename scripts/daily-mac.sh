@@ -18,6 +18,8 @@
 #                                        --display: the whole display instead (first checks only).
 #                                        --for aura: the host side only, 4:2:0, picture 4793N and
 #                                        input 4794N, for AURA to connect to
+#   scripts/daily-mac.sh open desktop    the whole display, for installing (the owner's only; clicks
+#                                        through the session, keys to the application in front)
 #   scripts/daily-mac.sh list           what is open
 #   scripts/daily-mac.sh close APP      ask APP to quit (as its Quit menu does: unsaved work asks and
 #                                        stays), then stop its host side and its window here
@@ -210,6 +212,15 @@ do_open() {
             *) echo "error: unknown: $1"; exit 2 ;;
         esac
     done
+    # "desktop": the whole display, for installing (installers, password and permission prompts
+    # are not an application's windows). It shows everything on the Mac: the owner's only.
+    if [ "$app" = desktop ]; then
+        display=1
+        if [ "${DAILY_OWNER:-}" != 1 ] || { { [ ! -t 0 ] || [ ! -t 1 ]; } && ! started_by_open_handler; }; then
+            echo "error: desktop shows the whole Mac: only the owner opens it (DAILY_OWNER=1, from the owner's terminal)"
+            exit 2
+        fi
+    fi
     [[ "$size" =~ ^[0-9]{2,4}x[0-9]{2,4}$ ]] || { echo "error: --size is WxH"; exit 2; }
     [ -z "$fps" ] || { [[ "$fps" =~ ^[0-9]{1,3}$ ]] && [ "$fps" -ge 1 ] && [ "$fps" -le 240 ]; } || { echo "error: --fps is 1 to 240"; exit 2; }
     [ -z "$slot" ] || [[ "$slot" =~ ^[1-3]$ ]] || { echo "error: --slot is 1, 2 or 3"; exit 2; }
@@ -251,7 +262,7 @@ do_open() {
     # Friday's choice (the owner): the application form clicks through the session (form 4, with
     # the range checks); the whole display posts to the process unless DAILY_CLICK_FORM says else.
     local click_form=${DAILY_CLICK_FORM:-4}
-    [ -n "$display" ] && click_form=${DAILY_CLICK_FORM:-1}
+    [ -n "$display" ] && [ "$app" != desktop ] && click_form=${DAILY_CLICK_FORM:-1}
     # The application form on a virtual display of this Mac's screen's size at 2x, 120 Hz (the
     # owner's plan A, trial only; DAILY_VIRTUAL=0 leaves the window where it is).
     local virtual_arg=""
