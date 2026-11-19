@@ -14,10 +14,16 @@
 //! window is looked for on the host of the shell and nowhere else.
 //!
 //! When the host says that a program in the shell asked (a coding agent, a
-//! script: not a command typed at the shell's prompt), the person is told
+//! script: not the shell itself in its foreground job), the person is told
 //! so in the notice line, the title begins with [`BY_PROGRAM`], and
-//! `ISTESSO_WINDOW_ASKED_BY` is `program` (`prompt` otherwise), so that the
-//! program that shows the window may keep it from taking the keys.
+//! `ISTESSO_WINDOW_ASKED_BY` is `program`. A host that does not say (an
+//! earlier version) is not taken for the shell: the notice says so, the
+//! title begins with [`BY_UNKNOWN`], and the variable is `unknown`. When
+//! the shell itself asked, it is `shell`. The title is given only to a
+//! window being made: a file handed to a window that is open already does
+//! not change it (the notice line still says who asked). The notice line
+//! is written into the shell's terminal, where the asking program can
+//! write too: it may be erased or imitated.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -41,6 +47,8 @@ pub const TITLE_VARIABLE: &str = "ISTESSO_WINDOW_TITLE";
 pub const ASKED_BY_VARIABLE: &str = "ISTESSO_WINDOW_ASKED_BY";
 /// How the title of a window that a program asked for begins.
 pub const BY_PROGRAM: &str = "(from a program) ";
+/// How the title begins when the host did not say who asked.
+pub const BY_UNKNOWN: &str = "(asker unknown) ";
 
 /// Shows the windows that the host of one shell opened for it.
 pub struct Windows {
@@ -77,13 +85,20 @@ impl Windows {
     /// The host opened `window`: show it, or say why it is not shown.
     /// Returns whether the program that shows it was started.
     pub fn open(&self, window: &WindowOpen) -> bool {
-        let (title, who) = if window.asked_by_program {
-            (
-                istesso_link::shell::harmless_title(&format!("{BY_PROGRAM}{}", window.title)),
-                ", asked by a program in the shell (not typed at its prompt)",
-            )
-        } else {
-            (window.title.clone(), "")
+        let marked =
+            |mark: &str| istesso_link::shell::harmless_title(&format!("{mark}{}", window.title));
+        let (title, who, asked_by) = match window.asked_by_program {
+            Some(true) => (
+                marked(BY_PROGRAM),
+                ", asked by a program in the shell, not by the shell itself",
+                "program",
+            ),
+            Some(false) => (window.title.clone(), "", "shell"),
+            None => (
+                marked(BY_UNKNOWN),
+                ", from a host that does not say who asked",
+                "unknown",
+            ),
         };
         {
             let mut shown = self.shown.lock().unwrap_or_else(|e| e.into_inner());
@@ -115,14 +130,7 @@ impl Windows {
             .arg(window.input.to_string())
             .env("ISTESSO_CHANNEL_PEER", &self.host_id)
             .env(TITLE_VARIABLE, &title)
-            .env(
-                ASKED_BY_VARIABLE,
-                if window.asked_by_program {
-                    "program"
-                } else {
-                    "prompt"
-                },
-            )
+            .env(ASKED_BY_VARIABLE, asked_by)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -172,7 +180,7 @@ mod tests {
             picture,
             input: picture + 1,
             title: "Text Editor".into(),
-            asked_by_program: false,
+            asked_by_program: Some(false),
         }
     }
 
@@ -213,24 +221,36 @@ mod tests {
         let first = written_now(None);
         assert_eq!(
             first,
-            "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\nText Editor\nprompt\n"
+            "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\nText Editor\nshell\n"
         );
         assert!(lines.lock().unwrap()[0].contains("shown here"));
         assert!(!lines.lock().unwrap()[0].contains("program"));
         // Asked by a program in the shell: said in the notice and the title.
         assert!(windows.open(&WindowOpen {
-            asked_by_program: true,
+            asked_by_program: Some(true),
             ..window(26891)
         }));
+        let second = written_now(Some(first));
         assert_eq!(
-            written_now(Some(first)),
+            second,
             "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\n(from a program) Text Editor\nprogram\n"
         );
         let said = lines.lock().unwrap()[1].clone();
         assert!(
-            said.contains("asked by a program in the shell (not typed at its prompt)"),
+            said.contains("asked by a program in the shell, not by the shell itself"),
             "{said}"
         );
+        // A host that does not say who asked is not taken for the shell.
+        assert!(windows.open(&WindowOpen {
+            asked_by_program: None,
+            ..window(26891)
+        }));
+        assert_eq!(
+            written_now(Some(second)),
+            "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\n(asker unknown) Text Editor\nunknown\n"
+        );
+        let said = lines.lock().unwrap()[2].clone();
+        assert!(said.contains("does not say who asked"), "{said}");
     }
 
     #[test]

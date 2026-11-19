@@ -235,13 +235,13 @@ impl Workspace {
     }
 
     /// Whether the process `pid` (one of this workspace's) is a command
-    /// typed at the prompt of the shell itself, rather than one started by
-    /// a program in it (`procfs::typed_at_the_prompt`). Elsewhere
+    /// started by the shell itself in its foreground job, rather than by a
+    /// program in it (`procfs::started_by_the_shell`). Elsewhere
     /// than on Linux the host cannot tell, and says no.
-    pub fn typed_at_the_prompt(&self, pid: i32) -> bool {
+    pub fn started_by_the_shell(&self, pid: i32) -> bool {
         #[cfg(target_os = "linux")]
         {
-            super::procfs::typed_at_the_prompt(pid, self.shell)
+            super::procfs::started_by_the_shell(pid, self.shell)
         }
         #[cfg(not(target_os = "linux"))]
         {

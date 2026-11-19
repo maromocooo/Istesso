@@ -136,7 +136,7 @@ class LauncherTest(unittest.TestCase):
                 f"editor {self.editor}",
                 "start a new instance of the editor, not activated, with the argument domain "
                 "-ApplePersistenceIgnoreState YES -NSQuitAlwaysKeepsWindows NO "
-                "(no window restoration is read or written)",
+                "(meant to keep window restoration from being read or written; not verified)",
                 "hand the file over by an open-documents event to that instance's process number only, "
                 "the place taken from the environment",
                 f"ask the running host app {self.host_app} to show that process's window on "

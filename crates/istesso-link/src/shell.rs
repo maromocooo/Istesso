@@ -98,11 +98,13 @@ pub struct WindowOpen {
     /// makes it when the frame is read.
     #[serde(default)]
     pub title: String,
-    /// The request came from a program in the shell (a coding agent, a
-    /// script), not from a command typed at the shell's own prompt, as far
-    /// as the host can tell. For showing only: the device says so.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub asked_by_program: bool,
+    /// Whether the request came from a program in the shell (a coding
+    /// agent, a script) rather than from the shell's own foreground job, as
+    /// far as the host can tell. Always sent by this version; a frame
+    /// without it (an earlier host) means unknown, never "the shell". For
+    /// showing only: the device says so.
+    #[serde(default)]
+    pub asked_by_program: Option<bool>,
 }
 
 /// How a shell ended.
@@ -267,13 +269,13 @@ mod tests {
                 picture: 26891,
                 input: 26892,
                 title: "Text Editor".into(),
-                asked_by_program: false,
+                asked_by_program: Some(false),
             }),
             ShellFrame::OpenWindow(WindowOpen {
                 picture: 26891,
                 input: 26892,
                 title: "Text Editor".into(),
-                asked_by_program: true,
+                asked_by_program: Some(true),
             }),
         ];
         for frame in frames {
@@ -348,13 +350,16 @@ mod tests {
             picture: 1,
             input: 2,
             title: "x".into(),
-            asked_by_program: false,
+            asked_by_program: Some(false),
         };
         let frame = ShellFrame::OpenWindow(window.clone()).encode();
         assert_eq!(frame[0], 0x07);
-        // Typed at the prompt: the frame is as an earlier version sent it.
-        assert_eq!(&frame[1..], br#"{"picture":1,"input":2,"title":"x"}"#);
-        window.asked_by_program = true;
+        // Who asked is always said, also when it was the shell itself.
+        assert_eq!(
+            &frame[1..],
+            br#"{"picture":1,"input":2,"title":"x","asked_by_program":false}"#
+        );
+        window.asked_by_program = Some(true);
         let frame = ShellFrame::OpenWindow(window).encode();
         assert_eq!(
             &frame[1..],
@@ -391,7 +396,7 @@ mod tests {
         };
         assert!(matches!(
             with(br#"{"picture":5,"input":6}"#),
-            Ok(ShellFrame::OpenWindow(WindowOpen { title, asked_by_program: false, .. }))
+            Ok(ShellFrame::OpenWindow(WindowOpen { title, asked_by_program: None, .. }))
                 if title.is_empty()
         ));
         assert!(matches!(

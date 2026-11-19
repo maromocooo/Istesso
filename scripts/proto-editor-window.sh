@@ -52,8 +52,8 @@
 # Everything is ended by the process numbers written down when it started.
 #
 # When the file cannot be handed to the editor, the answer says why and names the log to look at:
-# run/bus.log (the editor's own session bus; always kept, it never names a file) or run/app.log (the
-# editor's output, kept with EDITOR_WINDOW_APP_LOG=1 only).
+# run/bus.log (the editor's own session bus; kept until the next start, it never names a file) or
+# run/app.log (the editor's output, kept with EDITOR_WINDOW_APP_LOG=1 only, until the next start).
 set -u
 export LC_ALL=C
 
@@ -143,11 +143,17 @@ while not address and time.time() < deadline:
 if not address:
     sys.exit(4)
 os.environ["DBUS_SESSION_BUS_ADDRESS"] = address
-bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+try:
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+except GLib.Error:
+    sys.exit(4)
 def owned():
-    reply = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                          "NameHasOwner", GLib.Variant("(s)", ("org.gnome.TextEditor",)),
-                          GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, -1, None)
+    try:
+        reply = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                              "NameHasOwner", GLib.Variant("(s)", ("org.gnome.TextEditor",)),
+                              GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, -1, None)
+    except GLib.Error:
+        sys.exit(5)
     return reply.unpack()[0]
 while not owned():
     if time.time() > deadline or ended():
@@ -164,7 +170,7 @@ app.get_dbus_connection().flush_sync(None)
 not_taken() {
     case "$1" in
     4) echo "its own session bus did not start (see run/bus.log in EDITOR_WINDOW_DIR)" ;;
-    5) echo "it did not appear on its session bus within 10 s (see run/bus.log; run/app.log with EDITOR_WINDOW_APP_LOG=1)" ;;
+    5) echo "it did not appear on its bus, or the bus failed (see run/app.log with EDITOR_WINDOW_APP_LOG=1, and run/bus.log)" ;;
     3) echo "it could not be reached on its session bus (see run/bus.log)" ;;
     *) echo "handing the file over failed or took too long (status $1; see run/bus.log)" ;;
     esac

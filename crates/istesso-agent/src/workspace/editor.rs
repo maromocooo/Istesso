@@ -19,8 +19,9 @@
 //! * The launcher says on which ports the window's picture and input wait,
 //!   and the device is told so on the shell's conversation
 //!   ([`istesso_link::shell::ShellFrame::OpenWindow`]), with whether a
-//!   program in the shell asked rather than a command typed at its prompt
-//!   (for showing only: [`super::watch::Workspace::typed_at_the_prompt`]).
+//!   program in the shell asked rather than the shell itself in its
+//!   foreground job (for showing only:
+//!   [`super::watch::Workspace::started_by_the_shell`]).
 //!
 //! The agent keeps the place and file name out of its request logs. The
 //! editor keeps its own session, recent files and drafts on the host.

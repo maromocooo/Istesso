@@ -554,11 +554,11 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
             picture: 26891,
             input: 26892,
             title: "Text Editor".into(),
-            asked_by_program: false,
+            asked_by_program: Some(false),
         }
     );
     // The same file asked for by a program in the shell (a script here), not
-    // typed at its prompt: the device is told so.
+    // the shell itself: the device is told so.
     let script = tools.path().join("via-program.sh");
     std::fs::write(
         &script,
@@ -579,7 +579,7 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
             picture: 26891,
             input: 26892,
             title: "Text Editor".into(),
-            asked_by_program: true,
+            asked_by_program: Some(true),
         }
     );
     shell.type_in(&asking(&format!("'{}'", secret.display())));
@@ -641,7 +641,7 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
         .any(|line| line.contains("in the main editor") && line.contains("port 26891")));
     assert!(log
         .iter()
-        .any(|line| line.contains("(typed at the shell's prompt)")));
+        .any(|line| line.contains("(from the shell's foreground job)")));
     assert!(log
         .iter()
         .any(|line| line.contains("(asked by a program in the shell)")));

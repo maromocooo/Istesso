@@ -72,7 +72,7 @@ fresh=$(mktemp -d "${TMPDIR:-/tmp}/istesso-editor.XXXXXXXX") && chmod 700 "$fres
 printf '%s\n' "$fresh" > "$run/fresh" || say_fail "the run folder could not be recorded"
 cat > "$fresh/plan" <<PLAN || say_fail "the plan could not be written"
 editor $editor
-start a new instance of the editor, not activated, with the argument domain -ApplePersistenceIgnoreState YES -NSQuitAlwaysKeepsWindows NO (no window restoration is read or written)
+start a new instance of the editor, not activated, with the argument domain -ApplePersistenceIgnoreState YES -NSQuitAlwaysKeepsWindows NO (meant to keep window restoration from being read or written; not verified)
 hand the file over by an open-documents event to that instance's process number only, the place taken from the environment
 ask the running host app $host_app to show that process's window on $at:$picture to device $device only, input on $at:$input
 guard: end the editor instance when the measuring signal says busy, when the agent is gone, or on stop

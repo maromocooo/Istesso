@@ -132,12 +132,16 @@ pub(crate) fn parse_stat(stat: &str) -> Option<(i32, i32)> {
     Some((session, parent))
 }
 
-/// Whether the process `pid` is a command typed at the prompt of the shell
-/// `shell`, as far as the system tells: its parent is that shell, and it is
-/// in the terminal's foreground job. A program the shell's programs started
-/// (a coding agent's command, a script's) is not. This is for showing who
-/// asked, not a guard: any program of the user may start such a command.
-pub fn typed_at_the_prompt(pid: i32, shell: i32) -> bool {
+/// Whether the process `pid` was started by the shell `shell` itself in the
+/// terminal's foreground job, as far as the system tells: its parent is
+/// that shell, and its process group is the terminal's foreground one.
+/// That is a command typed at the prompt, but also one the shell runs
+/// from a prompt hook, a sourced file, a function or a `$(…)`. A program
+/// that the shell's programs started (a coding agent's command, a
+/// script's, one in a terminal multiplexer) is not. This is for showing
+/// who asked, not a guard: any program of the user may get the shell to
+/// start such a command.
+pub fn started_by_the_shell(pid: i32, shell: i32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| parse_job(&stat))
@@ -623,15 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn only_a_command_of_the_shell_in_the_foreground_is_typed_at_its_prompt() {
+    fn only_a_process_of_the_shell_in_the_foreground_is_started_by_it() {
         let me = std::process::id() as i32;
         let parent = parse_stat(&std::fs::read_to_string("/proc/self/stat").unwrap())
             .unwrap()
             .1;
-        // Not the parent of this test: never typed at its prompt.
-        assert!(!typed_at_the_prompt(me, me));
-        assert!(!typed_at_the_prompt(i32::MAX, parent));
-        let typed = typed_at_the_prompt(me, parent);
+        // Not the parent of this test: never started by it.
+        assert!(!started_by_the_shell(me, me));
+        assert!(!started_by_the_shell(i32::MAX, parent));
+        let typed = started_by_the_shell(me, parent);
         let (_, group, foreground) =
             parse_job(&std::fs::read_to_string("/proc/self/stat").unwrap()).unwrap();
         assert_eq!(typed, foreground > 0 && group == foreground);

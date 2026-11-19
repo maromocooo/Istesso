@@ -290,7 +290,7 @@ fn decide_file(
     let checked = editor::checked_place(folder, place)
         .map_err(|why| refuse(&format!("{why:?}"), why.to_string()))?;
     // Looked at while the asker waits for the answer, so it is still there.
-    let asked_by_program = !workspace.typed_at_the_prompt(pid);
+    let asked_by_program = !workspace.started_by_the_shell(pid);
     let began = std::time::Instant::now();
     let opened = editor
         .open(&checked, &workspace)
@@ -299,7 +299,7 @@ fn decide_file(
         picture: opened.picture,
         input: opened.input,
         title: opened.title,
-        asked_by_program,
+        asked_by_program: Some(asked_by_program),
     }));
     if !shown {
         return Err(refuse("the shell is over", "the shell is over".into()));
@@ -307,7 +307,7 @@ fn decide_file(
     let who = if asked_by_program {
         "asked by a program in the shell"
     } else {
-        "typed at the shell's prompt"
+        "from the shell's foreground job"
     };
     log(format!(
         "opened a file of the workspace of the shell for {name} in the main editor ({who}) in {} ms: its window waits on port {} (picture) and {} (input)",
@@ -387,6 +387,7 @@ pub fn run_as(name: &str, args: &[OsString]) -> u8 {
 /// opens as it would without Istesso.
 fn text_file_place(given: &str) -> Option<String> {
     use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
     let place = match given.get(..5) {
         Some(scheme) if scheme.eq_ignore_ascii_case("file:") => file_address_place(given)?,
         _ if given.contains("://") => return None,
@@ -397,21 +398,20 @@ fn text_file_place(given: &str) -> Option<String> {
     } else {
         std::env::current_dir().ok()?.join(place)
     };
-    // Not followed: a link (or a FIFO, which would block a read) is not a
-    // text file here, and the agent refuses links anyway.
-    if !std::fs::symlink_metadata(&place)
-        .ok()?
-        .file_type()
-        .is_file()
-    {
+    // Opened without following a link at the end and without waiting (a
+    // FIFO would block), then the file that was opened is looked at: a
+    // link, a FIFO or anything but an ordinary file is not a text file here
+    // (the agent refuses links anyway).
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&place)
+        .ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
         return None;
     }
     let mut start = Vec::new();
-    std::fs::File::open(&place)
-        .ok()?
-        .take(TEXT_LOOK as u64)
-        .read_to_end(&mut start)
-        .ok()?;
+    file.take(TEXT_LOOK as u64).read_to_end(&mut start).ok()?;
     looks_like_text(&start).then(|| place.to_str().map(str::to_string))?
 }
 
@@ -516,6 +516,11 @@ mod tests {
         std::fs::write(&latin, b"caf\xe9").unwrap();
         let link = base.join("link.md");
         std::os::unix::fs::symlink(&text, &link).unwrap();
+        // A FIFO is passed over at once, never waited on.
+        let fifo = base.join("pipe.txt");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated name and a mode.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let place = |path: &std::path::Path| Some(path.to_str().unwrap().to_string());
         assert_eq!(text_file_place(text.to_str().unwrap()), place(&text));
         assert_eq!(text_file_place(empty.to_str().unwrap()), place(&empty));
@@ -530,6 +535,7 @@ mod tests {
             binary.to_str().unwrap().to_string(),
             latin.to_str().unwrap().to_string(),
             link.to_str().unwrap().to_string(),
+            fifo.to_str().unwrap().to_string(),
             base.to_str().unwrap().to_string(),
             base.join("missing.txt").to_str().unwrap().to_string(),
             format!("file://elsewhere{}", text.to_str().unwrap()),

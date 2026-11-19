@@ -59,7 +59,8 @@ class LauncherTest(unittest.TestCase):
             self.open("fail EDITOR_WINDOW_BIND does not name one address to listen on", 1)
 
     def test_a_record_without_a_start_time_is_not_a_running_process(self):
-        self.program("ps", "echo 'fixture start'")
+        # `ps` says nothing either: an empty record must not match an empty answer.
+        self.program("ps", "exit 0")
         self.program("timeout", "exit 0")
         for part in ("app", "pipeline"):
             (self.run / (part + ".pid")).write_text("123\n")
@@ -77,8 +78,8 @@ class LauncherTest(unittest.TestCase):
         (self.run / "owner.pid").write_text(f"{os.getpid()} fixture start\n")
         for status, why in (
             (4, "its own session bus did not start (see run/bus.log in EDITOR_WINDOW_DIR)"),
-            (5, "it did not appear on its session bus within 10 s (see run/bus.log; "
-                "run/app.log with EDITOR_WINDOW_APP_LOG=1)"),
+            (5, "it did not appear on its bus, or the bus failed (see run/app.log "
+                "with EDITOR_WINDOW_APP_LOG=1, and run/bus.log)"),
             (124, "handing the file over failed or took too long (status 124; see run/bus.log)"),
         ):
             self.program("timeout", f"exit {status}")  # Stands in for the handoff.
