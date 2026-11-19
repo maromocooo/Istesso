@@ -45,8 +45,13 @@ enum Target {
     case app(String)
 }
 
-let systemPromptOwners: Set<String> = [] // filled from an observed prompt; do not guess
-let systemPromptMinLayer = Int(CGWindowLevelForKey(.modalPanelWindow)) // to be confirmed from an observed prompt
+// The system's confirmations, as observed on the Mac Studio on 2026-11-19 (macOS 26 line,
+// --prompt-windows while the owner held each open): the administrator password dialog is a
+// window of com.apple.SecurityAgent at layer 1000; a Files-and-Folders privacy prompt is a
+// window of com.apple.UserNotificationCenter at layer 8 (the modal panel level). Others are
+// added only once seen.
+let systemPromptOwners: Set<String> = ["com.apple.SecurityAgent", "com.apple.UserNotificationCenter"]
+let systemPromptMinLayer = Int(CGWindowLevelForKey(.modalPanelWindow)) // 8: the lower of the two observed
 
 func validSystemPromptOwner(_ owner: String) -> Bool {
     guard owner.utf8.count <= 128 else { return false }
