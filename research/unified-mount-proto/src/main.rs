@@ -1,130 +1,227 @@
 //! Research prototype (not part of the product): show a folder that lives on another machine,
 //! read-only, at a fixed path on a Mac, with nothing added to macOS. See
-//! docs/research/unified-mount.md.
+//! docs/research/unified-mount.md and ADR 0007 (proposal "フォルダーを読むだけで見せる").
 //!
-//!   unified-mount-proto export <folder>
-//!       Answers requests about <folder> on standard input and output (the owning machine).
-//!   unified-mount-proto mount <mount-point> -- <command> [args...]
-//!       Runs <command> (which must run `export` on the owning machine, for example through
-//!       ssh), serves a read-only NFSv3 server on 127.0.0.1 backed by it, mounts it with the
-//!       built-in NFS client, and unmounts on Ctrl-C or SIGTERM.
-//!   unified-mount-proto serve -- <command> [args...]
-//!       Same, without mounting: prints the port and serves until stopped.
+//!   unified-mount-proto mount <device> <folder-id> [--address ADDR[:PORT]] [--base DIR]
+//!       Asks the paired <device> (its name or the beginning of its id, as for `istesso
+//!       peers`) for its folder <folder-id> over Istesso's control channel, serves it as a
+//!       read-only NFSv3 server on 127.0.0.1, and mounts that with the built-in NFS client at
+//!       <base>/<device name>/<folder-id>. <base> is ~/Istesso unless given; it and the device
+//!       folder are made private (0700), and are refused when they are not. Unmounts on Ctrl-C
+//!       or SIGTERM, and stops when the folder is unmounted from outside.
+//!
+//!       For tests only: --hold-before-mount-ms N waits N ms between opening the loopback port
+//!       and mounting, and prints the port, so that another process can try to mount first.
+//!
+//! The device's identity and its list of paired devices are those of `istesso`
+//! (`ISTESSO_CONFIG_DIR` points elsewhere).
 
-mod export;
 mod nfs_side;
-mod wire;
 
+use istesso_agent::mount::client::Remote;
+use istesso_agent::Paths;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
-use std::time::Duration;
+use std::process::{Command, ExitCode};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn usage() -> ExitCode {
-    eprintln!("usage: unified-mount-proto export <folder>");
-    eprintln!("       unified-mount-proto mount <mount-point> -- <command> [args...]");
-    eprintln!("       unified-mount-proto serve -- <command> [args...]");
+    eprintln!("usage: unified-mount-proto mount <device> <folder-id> [--address ADDR[:PORT]] [--base DIR]");
     ExitCode::from(2)
+}
+
+struct Options {
+    device: String,
+    folder: String,
+    address: Option<String>,
+    base: Option<PathBuf>,
+    hold: Option<Duration>,
+}
+
+fn parse(args: &[String]) -> Option<Options> {
+    let (Some("mount"), Some(device), Some(folder)) = (
+        args.first().map(String::as_str),
+        args.get(1).cloned(),
+        args.get(2).cloned(),
+    ) else {
+        return None;
+    };
+    let mut options = Options {
+        device,
+        folder,
+        address: None,
+        base: None,
+        hold: None,
+    };
+    let mut rest = args[3..].iter();
+    while let Some(flag) = rest.next() {
+        let value = rest.next()?;
+        match flag.as_str() {
+            "--address" => options.address = Some(value.clone()),
+            "--base" => options.base = Some(PathBuf::from(value)),
+            "--hold-before-mount-ms" => {
+                options.hold = Some(Duration::from_millis(value.parse().ok()?))
+            }
+            _ => return None,
+        }
+    }
+    Some(options)
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("export") if args.len() == 2 => run_export(Path::new(&args[1])),
-        Some("mount") if args.len() >= 4 && args[2] == "--" => {
-            run_mount(Some(PathBuf::from(&args[1])), &args[3..])
-        }
-        Some("serve") if args.len() >= 3 && args[1] == "--" => run_mount(None, &args[2..]),
-        _ => usage(),
-    }
-}
-
-fn run_export(folder: &Path) -> ExitCode {
-    let mut ex = match export::Export::open(folder) {
-        Ok(ex) => ex,
-        Err(e) => {
-            eprintln!("export: cannot open the folder: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    match export::serve(&mut ex, &mut stdin.lock(), &mut stdout.lock()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("export: {e}");
+    match parse(&args) {
+        Some(options) if cfg!(target_os = "macos") => run_mount(options),
+        Some(_) => {
+            eprintln!("mount: this prototype mounts with the macOS NFS client only (on Linux, mounting NFS needs root; the Linux client in the research document is FUSE)");
             ExitCode::FAILURE
         }
+        None => usage(),
     }
 }
 
-fn check_mount_point(p: &Path) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(p).map_err(|e| format!("mount point: {e}"))?;
-    if !meta.is_dir() {
-        return Err("mount point must be a folder (not a link)".into());
+/// A name for the device's folder: the device's name, with anything but letters, digits, `.`,
+/// `_` and `-` replaced.
+fn folder_name(device: &str) -> String {
+    let name: String = device
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    match name.trim_matches('.') {
+        "" => "device".to_string(),
+        _ => name,
     }
-    if std::fs::read_dir(p)
-        .map_err(|e| format!("mount point: {e}"))?
+}
+
+/// Makes `dir` a folder only this user can enter, or checks that it is one.
+fn private_dir(dir: &Path) -> Result<(), String> {
+    if std::fs::symlink_metadata(dir).is_err() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+    }
+    istesso_agent::mount::private_folder(dir).map_err(|why| format!("{}: {why}", dir.display()))
+}
+
+/// The empty folder to mount at: <base>/<device>/<folder-id>, with the two above it private.
+fn mount_point(base: &Path, device: &str, folder: &str) -> Result<PathBuf, String> {
+    private_dir(base)?;
+    let machine = base.join(folder_name(device));
+    private_dir(&machine)?;
+    let point = machine.join(folder);
+    if std::fs::symlink_metadata(&point).is_err() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&point)
+            .map_err(|e| format!("cannot make {}: {e}", point.display()))?;
+    }
+    let meta = std::fs::symlink_metadata(&point).map_err(|e| e.to_string())?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a folder", point.display()));
+    }
+    if std::fs::read_dir(&point)
+        .map_err(|e| e.to_string())?
         .next()
         .is_some()
     {
-        return Err("mount point must be empty".into());
+        return Err(format!(
+            "{} is not empty (something is mounted there already?)",
+            point.display()
+        ));
     }
-    Ok(())
+    Ok(point)
 }
 
-fn run_mount(mount_point: Option<PathBuf>, command: &[String]) -> ExitCode {
-    if let Some(mp) = &mount_point {
-        if let Err(e) = check_mount_point(mp) {
-            eprintln!("mount: {e}");
-            return ExitCode::FAILURE;
-        }
-        if !cfg!(target_os = "macos") {
-            eprintln!("mount: this prototype mounts with the macOS NFS client only (on Linux, mounting NFS needs root; the Linux client in the research document is FUSE)");
-            return ExitCode::FAILURE;
-        }
+/// Whether something other than the folder above it is mounted at `point`.
+fn is_mounted(point: &Path) -> bool {
+    match (
+        std::fs::metadata(point),
+        point.parent().map(std::fs::metadata),
+    ) {
+        (Ok(here), Some(Ok(above))) => here.dev() != above.dev(),
+        _ => false,
     }
-    let mut child = match Command::new(&command[0])
-        .args(&command[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("mount: cannot start the export command: {e}");
+}
+
+fn unmount(point: &Path) -> bool {
+    let run = |force: bool| {
+        let mut command = Command::new("/sbin/umount");
+        if force {
+            command.arg("-f");
+        }
+        command.arg(point).status().is_ok_and(|s| s.success())
+    };
+    !is_mounted(point) || run(false) || run(true)
+}
+
+fn run_mount(options: Options) -> ExitCode {
+    // The id becomes a folder name here: check it before anything is asked.
+    if !istesso_link::mount::valid_folder_id(&options.folder) {
+        eprintln!("mount: a folder id is 1 to 32 of a-z, 0-9 and -, not starting with -");
+        return ExitCode::from(2);
+    }
+    let began = Instant::now();
+    let device_asked = options.device.clone();
+    let (remote, opened) = match Remote::open(
+        &Paths::from_env(),
+        &options.device,
+        options.address.as_deref(),
+        &options.folder,
+        move |why| {
+            eprintln!("mount: lost the connection to {device_asked} ({why}); reads fail from now on, until this is stopped")
+        },
+    ) {
+        Ok(opened) => opened,
+        Err(why) => {
+            eprintln!("mount: {why}");
             return ExitCode::FAILURE;
         }
     };
-    let remote = match nfs_side::Remote::from_child(&mut child) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("mount: {e}");
-            let _ = child.kill();
-            let _ = child.wait();
+    let open_after = began.elapsed();
+    let base = match options.base {
+        Some(base) => base,
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join("Istesso"),
+            None => {
+                eprintln!("mount: no home folder");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let point = match mount_point(&base, &opened.device, &options.folder) {
+        Ok(point) => point,
+        Err(why) => {
+            eprintln!("mount: {why}");
             return ExitCode::FAILURE;
         }
     };
-    // Ask once before mounting, so that a missing owner shows up here and not as a hung mount.
-    match remote.call(&wire::Request::Getattr {
-        id: export::ROOT_ID,
-    }) {
-        Ok((wire::Response::Attr { .. }, _)) => {}
-        other => {
-            eprintln!("mount: the owning side did not answer: {other:?}");
-            let _ = child.kill();
-            let _ = child.wait();
+
+    let remote = Arc::new(remote);
+    let gate = Arc::new(nfs_side::Gate::default());
+    let fs = match nfs_side::RemoteFs::new(remote.clone(), gate.clone()) {
+        Ok(fs) => fs,
+        Err(e) => {
+            eprintln!("mount: {e}");
             return ExitCode::FAILURE;
         }
-    }
-    let fs = nfs_side::RemoteFs::new(remote);
+    };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("runtime");
-    let code = rt.block_on(async move {
+    let code = rt.block_on(async {
         let listener = match NFSTcpListener::bind("127.0.0.1:0", fs).await {
             Ok(l) => l,
             Err(e) => {
@@ -136,69 +233,76 @@ fn run_mount(mount_point: Option<PathBuf>, command: &[String]) -> ExitCode {
         tokio::spawn(async move {
             let _ = listener.handle_forever().await;
         });
-        eprintln!("serving read-only NFSv3 on 127.0.0.1:{port}");
-        if let Some(mp) = &mount_point {
-            let opts = format!(
-                "vers=3,tcp,port={port},mountport={port},rdonly,nobrowse,nolocks,soft,actimeo=2"
-            );
-            let mp2 = mp.clone();
-            let status = tokio::task::spawn_blocking(move || {
-                Command::new("/sbin/mount_nfs")
-                    .args(["-o", &opts, "127.0.0.1:/"])
-                    .arg(&mp2)
-                    .status()
-            })
-            .await;
-            match status {
-                Ok(Ok(s)) if s.success() => eprintln!("mounted at {}", mp.display()),
-                other => {
-                    eprintln!("mount: mount_nfs failed: {other:?}");
-                    return ExitCode::FAILURE;
+        if let Some(hold) = options.hold {
+            eprintln!("test: serving on 127.0.0.1:{port}; mounting in {} ms", hold.as_millis());
+            tokio::time::sleep(hold).await;
+        }
+        let opts =
+            format!("vers=3,tcp,port={port},mountport={port},rdonly,nobrowse,nolocks,soft,actimeo=2");
+        let at = point.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            Command::new("/sbin/mount_nfs")
+                .args(["-o", &opts, "127.0.0.1:/"])
+                .arg(&at)
+                .status()
+        })
+        .await;
+        match status {
+            Ok(Ok(s)) if s.success() => {}
+            other => {
+                // Another process may have taken the only MNT. Nothing but the folder's
+                // attributes was answered to anyone; stop before anything else is.
+                eprintln!(
+                    "mount: mount_nfs failed ({other:?}); {} later mount request(s) were refused; stopping",
+                    gate.refused_mounts.load(Ordering::Relaxed)
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        gate.open();
+        eprintln!(
+            "mounted {} of {} read-only at {} after {:.3} s (the folder was open after {:.3} s)",
+            options.folder,
+            opened.device,
+            point.display(),
+            began.elapsed().as_secs_f64(),
+            open_after.as_secs_f64(),
+        );
+
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("signal");
+        let mut every = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = term.recv() => break,
+                _ = every.tick() => {
+                    if !is_mounted(&point) {
+                        eprintln!("the folder was unmounted from outside");
+                        break;
+                    }
                 }
             }
         }
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("signal");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-        if let Some(mp) = &mount_point {
-            // Unmount while the server still answers; a hung server would make unmount wait.
-            let mp2 = mp.clone();
-            let ok = tokio::task::spawn_blocking(move || {
-                Command::new("/sbin/umount")
-                    .arg(&mp2)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-                    || Command::new("/sbin/umount")
-                        .arg("-f")
-                        .arg(&mp2)
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-            })
+        // Unmount while the server still answers; a server that is gone would make unmount wait.
+        let at = point.clone();
+        let ok = tokio::task::spawn_blocking(move || unmount(&at))
             .await
             .unwrap_or(false);
-            eprintln!(
-                "{} {}",
-                if ok { "unmounted" } else { "could not unmount" },
-                mp.display()
-            );
-        }
+        eprintln!(
+            "{} {}",
+            if ok { "unmounted" } else { "could not unmount" },
+            point.display()
+        );
         ExitCode::SUCCESS
     });
-    // Dropping the runtime drops the server and with it the export command's input, which
-    // ends that command. Give it a moment, then stop it.
+    remote.close();
+    eprintln!(
+        "refused: {} later mount request(s), {} unknown handle(s), {} question(s) before the mount",
+        gate.refused_mounts.load(Ordering::Relaxed),
+        gate.refused_handles.load(Ordering::Relaxed),
+        gate.refused_early.load(Ordering::Relaxed),
+    );
     drop(rt);
-    for _ in 0..20 {
-        if let Ok(Some(_)) = child.try_wait() {
-            return code;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
     code
 }
