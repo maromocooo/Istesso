@@ -28,6 +28,8 @@ final class Native {
     static final int NEXT_CURSOR = 2;
     static final int NEXT_CUT = 3;
     static final int NEXT_CONNECTED = 4;
+    /** TRIAL ONLY: the host has said what its text input field is (watchTextInput). */
+    static final int NEXT_TEXT_INPUT = 5;
 
     /** Input events, three ints each: kind, a, b (istesso_client.h). */
     static final int INPUT_KEY = 1;
@@ -58,6 +60,13 @@ final class Native {
 
     static native void watchAskKeyFrame(long watch);
 
+    /**
+     * TRIAL ONLY: what the host said last about its text input field, {state, serial, dropped, x,
+     * y, width, height} (state 0 nothing known, 1 a field, 2 a password field, 3 not in a field),
+     * or null. The thread that calls watchNext.
+     */
+    static native int[] watchTextInput(long watch);
+
     static native void watchClose(long watch);
 
     /** The input for the paired host `peer` (its id, never empty); 0 as for watchOpen. */
@@ -70,6 +79,12 @@ final class Native {
      * cut into pieces of at most 256 characters and 1024 bytes, newline and tab as keys. Never logged.
      */
     static native void inputText(long input, String text);
+
+    /**
+     * TRIAL ONLY: what the input method is composing (empty clears it), with the selected part in
+     * the string's own positions; only to a host that takes it (inputState's preedit). Never logged.
+     */
+    static native void inputPreedit(long input, String text, int selectionStart, int selectionEnd);
 
     /** inputScroll's source: a wheel of notches, or fingers on a touchpad. */
     static final int SCROLL_WHEEL = 1;
@@ -84,8 +99,9 @@ final class Native {
             double pixelsH, double pixelsV);
 
     /**
-     * {cuts, open, answered, over, failure, text, scroll}; text 1 when the host said it takes
-     * committed text, scroll the level of scrolls it takes (0: dx and dy only).
+     * {cuts, open, answered, over, failure, text, scroll, preedit}; text 1 when the host said it
+     * takes committed text, scroll the level of scrolls it takes (0: dx and dy only), preedit 1
+     * when it takes composing text.
      */
     static native long[] inputState(long input);
 

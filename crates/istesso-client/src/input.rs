@@ -78,6 +78,8 @@ pub struct State {
     /// The level of scrolls the host said it takes (`istesso_proto::SCROLL_LEVEL`; 0: dx and dy
     /// only, and a scroll whose dx and dy are both 0 is not sent).
     pub scroll: u8,
+    /// The host said it takes composing text (`InputEvent::Preedit`, trial only).
+    pub preedit: bool,
 }
 
 struct Batch {
@@ -230,6 +232,16 @@ impl Drop for Input {
             }
         }
     }
+}
+
+/// Composing text as `istesso_input_send_preedit` hands it over: the text and the selected part
+/// of it as UTF-8 byte offsets. None when it is not within the limits (too long, a control
+/// character, offsets outside or inside a character): such a piece is not sent.
+pub fn preedit_event(text: &str, cursor: [u32; 2]) -> Option<InputEvent> {
+    istesso_proto::preedit_is_acceptable(text, cursor).then(|| InputEvent::Preedit {
+        text: text.to_string(),
+        cursor,
+    })
 }
 
 /// A scroll as `istesso_input_send_scroll` says it: `source` 1 a wheel (its `v120` kept),
@@ -472,6 +484,7 @@ fn run(
                     let answered = opened.is_answered();
                     let text = opened.takes_text();
                     let scroll = opened.scroll_level();
+                    let preedit = opened.takes_preedit();
                     line = Some(opened);
                     // What was handed over while the conversation was being opened was
                     // typed before there was one: it is gone like everything before it,
@@ -500,6 +513,7 @@ fn run(
                         state.failure = None;
                         state.text = text;
                         state.scroll = scroll;
+                        state.preedit = preedit;
                     });
                     if let Some(passing) = passing {
                         passing.reconnection("open", 0);
@@ -573,12 +587,14 @@ fn run(
             Some(Happened::Back { after }) => {
                 let text = open_line.takes_text();
                 let scroll = open_line.scroll_level();
+                let preedit = open_line.takes_preedit();
                 set(&|state| {
                     state.open = is_open;
                     state.answered = answered;
                     state.failure = None;
                     state.text = text;
                     state.scroll = scroll;
+                    state.preedit = preedit;
                 });
                 if let Some(passing) = passing {
                     passing.reconnection("back", cuts);

@@ -47,7 +47,7 @@ typedef struct IstessoInputState {
                            * 0 otherwise */
     uint32_t text;        /* TRIAL ONLY: 1 when the host said it takes committed text; text is sent only then */
     uint32_t scroll;      /* TRIAL ONLY: the level of scrolls the host takes; 0: dx and dy only */
-    uint32_t reserved;
+    uint32_t preedit;     /* TRIAL ONLY: 1 when the host takes composing text; it is sent only then */
 } IstessoInputState;
 
 /* What happened to the conversation: the `event` of IstessoInputTold. */
@@ -102,6 +102,13 @@ void istesso_input_send(const IstessoInput *input, const IstessoInputEvent *even
  * key and a tab as the Tab key, other control characters left out. Never logged.
  */
 void istesso_input_send_text(const IstessoInput *input, const uint8_t *text, size_t len);
+
+/*
+ * TRIAL ONLY: composing text (UTF-8, len bytes; empty clears it) and its selected part as byte
+ * offsets, in order with the events; only to a host that takes it. Never logged.
+ */
+void istesso_input_send_preedit(const IstessoInput *input, const uint8_t *text, size_t len,
+                                uint32_t cursor_begin, uint32_t cursor_end);
 
 /*
  * TRIAL ONLY: a scroll that says what scrolled, in order with the events. dx, dy as for a scroll

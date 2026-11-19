@@ -21,14 +21,23 @@ final class TypingSurface extends SurfaceView {
     interface Typed {
         /** Text the input method committed. */
         void text(String text);
-        /** What the input method is composing now ("" when nothing). Shown here, never sent. */
-        void composing(String text);
+        /**
+         * What the input method is composing now ("" when nothing), and where its cursor is in
+         * it (as setComposingText's newCursorPosition says it; the part the input method is
+         * converting is not told through this interface).
+         */
+        void composing(String text, int cursor);
         /** A key the input method sends (Backspace, Enter, ...): as from a keyboard. */
         void key(KeyEvent event);
     }
 
     private final Typed typed;
     private boolean typing;
+    /** A password field on the host: the input method is told so (no composing, no learning). */
+    private boolean password;
+    /** The composition is being cancelled: what the input method finishes is dropped. */
+    private boolean cancelling;
+    private Connection connection;
 
     TypingSurface(Context context, Typed typed) {
         super(context);
@@ -43,6 +52,45 @@ final class TypingSurface extends SurfaceView {
         return typing;
     }
 
+    /** Whether the host's field is a password field; the caller restarts the input after a change. */
+    void setPassword(boolean on) {
+        password = on;
+    }
+
+    /** Whether something is being composed. */
+    boolean composing() {
+        return connection != null && !connection.composing.isEmpty();
+    }
+
+    /** Drops what is being composed (another field has the keyboard on the host). */
+    void cancelComposing(android.view.inputmethod.InputMethodManager imm) {
+        if (connection != null) {
+            connection.composing = "";
+        }
+        typed.composing("", 0);
+        cancelling = true;
+        if (imm != null) {
+            imm.restartInput(this);
+        }
+        cancelling = false;
+    }
+
+    /** Takes what is being composed as it stands (a click goes after it, as on the Mac). */
+    void commitComposing(android.view.inputmethod.InputMethodManager imm) {
+        if (connection == null || connection.composing.isEmpty()) {
+            return;
+        }
+        String done = connection.composing;
+        connection.composing = "";
+        typed.composing("", 0);
+        typed.text(done);
+        cancelling = true;
+        if (imm != null) {
+            imm.restartInput(this);
+        }
+        cancelling = false;
+    }
+
     @Override
     public boolean onCheckIsTextEditor() {
         return typing;
@@ -53,12 +101,17 @@ final class TypingSurface extends SurfaceView {
         if (!typing) {
             return null;
         }
-        out.inputType = InputType.TYPE_CLASS_TEXT;
+        out.inputType = password ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                : InputType.TYPE_CLASS_TEXT;
+        if (password) {
+            out.imeOptions |= EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
+        }
         out.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI
                 | EditorInfo.IME_ACTION_NONE;
         out.initialSelStart = 0;
         out.initialSelEnd = 0;
-        return new Connection();
+        connection = new Connection();
+        return connection;
     }
 
     /** An input connection without a text of its own: the text lives in the host's application. */
@@ -72,7 +125,10 @@ final class TypingSurface extends SurfaceView {
         @Override
         public boolean commitText(CharSequence text, int newCursorPosition) {
             composing = "";
-            typed.composing("");
+            typed.composing("", 0);
+            if (cancelling) {
+                return true;
+            }
             // Typing switched off (also when the panel goes to the background): the framework
             // finishes the old connection, and what was not converted yet is not sent.
             if (typing && text != null && text.length() > 0) {
@@ -84,7 +140,11 @@ final class TypingSurface extends SurfaceView {
         @Override
         public boolean setComposingText(CharSequence text, int newCursorPosition) {
             composing = text == null ? "" : text.toString();
-            typed.composing(composing);
+            // newCursorPosition (InputConnection): above 0, after the end of the text (1: right
+            // after it); otherwise from its start (0: at the start). Within the text here.
+            int n = composing.length();
+            int cursor = newCursorPosition > 0 ? n + newCursorPosition - 1 : newCursorPosition;
+            typed.composing(composing, Math.max(0, Math.min(n, cursor)));
             return true;
         }
 
@@ -93,8 +153,8 @@ final class TypingSurface extends SurfaceView {
             // What was being composed is taken as it stands.
             String done = composing;
             composing = "";
-            typed.composing("");
-            if (typing && !done.isEmpty()) {
+            typed.composing("", 0);
+            if (typing && !cancelling && !done.isEmpty()) {
                 typed.text(done);
             }
             return true;

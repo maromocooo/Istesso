@@ -117,7 +117,20 @@ struct InputState {
     failure: u32,
     text: u32,
     scroll: u32,
-    reserved: u32,
+    preedit: u32,
+}
+
+/// What the host says about the text input field (istesso_media.h, IstessoMediaTextInput).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct MediaTextInput {
+    state: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    serial: u32,
+    dropped: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MediaStreamInfo>() == 24);
@@ -125,6 +138,7 @@ const _: () = assert!(std::mem::size_of::<usize>() != 8 || std::mem::size_of::<M
 const _: () = assert!(std::mem::size_of::<MediaWatchState>() == 32);
 const _: () = assert!(std::mem::size_of::<InputEvent>() == 12);
 const _: () = assert!(std::mem::size_of::<InputState>() == 40);
+const _: () = assert!(std::mem::size_of::<MediaTextInput>() == 28);
 
 type InputTold = Option<
     unsafe extern "C" fn(
@@ -148,6 +162,7 @@ extern "C" {
     fn istesso_media_watch_info(watch: *const c_void, info: *mut MediaStreamInfo) -> i32;
     fn istesso_media_watch_state(watch: *const c_void, state: *mut MediaWatchState) -> i32;
     fn istesso_media_watch_ask_key_frame(watch: *const c_void);
+    fn istesso_media_watch_text_input(watch: *const c_void, field: *mut MediaTextInput) -> i32;
     fn istesso_media_watch_close(watch: *mut c_void);
     fn istesso_media_last_error() -> *const c_char;
 
@@ -162,6 +177,13 @@ extern "C" {
     ) -> *mut c_void;
     fn istesso_input_send(input: *const c_void, events: *const InputEvent, count: usize);
     fn istesso_input_send_text(input: *const c_void, text: *const u8, len: usize);
+    fn istesso_input_send_preedit(
+        input: *const c_void,
+        text: *const u8,
+        len: usize,
+        cursor_begin: u32,
+        cursor_end: u32,
+    );
     #[allow(clippy::too_many_arguments)]
     fn istesso_input_send_scroll(
         input: *const c_void,
@@ -868,6 +890,94 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputScr
     }
 }
 
+/// The byte offset in `text`'s UTF-8 of `index` UTF-16 units from its start (clamped to the text,
+/// and to the start of a character that `index` falls inside).
+fn utf8_offset(units: &[u16], index: usize) -> u32 {
+    let mut index = index.min(units.len());
+    // Inside a character of two units: its start.
+    if index > 0 && (0xD800..0xDC00).contains(&units[index - 1]) {
+        index -= 1;
+    }
+    String::from_utf16_lossy(&units[..index]).len() as u32
+}
+
+/// `void inputPreedit(long input, String text, int selectionStart, int selectionEnd)`: what the
+/// input method is composing (TRIAL ONLY, ADR 0007 "変換中の文字"), with its selected part in
+/// the string's own (UTF-16) positions; empty text clears it. Sent only to a host that takes it,
+/// and only within the limits. Never logged.
+///
+/// # Safety
+/// Called by the Java virtual machine; `input` came from inputOpen and is not closed.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputPreedit(
+    env: *mut JNIEnv,
+    _class: jclass,
+    input: jlong,
+    text: jstring,
+    selection_start: jint,
+    selection_end: jint,
+) {
+    if input == 0 || text.is_null() {
+        return;
+    }
+    // SAFETY: the virtual machine's promises.
+    unsafe {
+        let (Some(length), Some(region)) = ((**env).GetStringLength, (**env).GetStringRegion)
+        else {
+            return;
+        };
+        let n = length(env, text).max(0) as usize;
+        let mut units = vec![0u16; n];
+        region(env, text, 0, n as jsize, units.as_mut_ptr());
+        let begin = utf8_offset(&units, selection_start.max(0) as usize);
+        let end = utf8_offset(&units, selection_end.max(0) as usize).max(begin);
+        let text = String::from_utf16_lossy(&units);
+        istesso_input_send_preedit(
+            input as *const c_void,
+            text.as_ptr(),
+            text.len(),
+            begin,
+            end,
+        );
+    }
+}
+
+/// `int[] watchTextInput(long watch)`: what the host said last about its text input field,
+/// {state, serial, dropped, x, y, width, height} (state 0 nothing known, 1 a field, 2 a password
+/// field, 3 not in a field), or null when it said nothing or there is no connection. The thread
+/// that calls watchNext.
+///
+/// # Safety
+/// Called by the Java virtual machine; `watch` came from watchOpen and is not closed.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_watchTextInput(
+    env: *mut JNIEnv,
+    _class: jclass,
+    watch: jlong,
+) -> jintArray {
+    let mut field = MediaTextInput::default();
+    // SAFETY: the caller's promise.
+    unsafe {
+        if watch == 0 || istesso_media_watch_text_input(watch as *const c_void, &mut field) != 1 {
+            return ptr::null_mut();
+        }
+        java_ints(
+            env,
+            &[
+                field.state as i32,
+                field.serial as i32,
+                field.dropped as i32,
+                field.x,
+                field.y,
+                field.width as i32,
+                field.height as i32,
+            ],
+        )
+    }
+}
+
 fn events_from(flat: &[i32]) -> Vec<InputEvent> {
     flat.chunks_exact(3)
         .map(|e| InputEvent {
@@ -878,7 +988,7 @@ fn events_from(flat: &[i32]) -> Vec<InputEvent> {
         .collect()
 }
 
-/// `long[] inputState(long input)`: {cuts, open, answered, over, failure, text, scroll}. From any thread.
+/// `long[] inputState(long input)`: {cuts, open, answered, over, failure, text, scroll, preedit}. From any thread.
 ///
 /// # Safety
 /// Called by the Java virtual machine; `input` came from inputOpen and is not closed.
@@ -905,6 +1015,7 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputSta
                 state.failure as i64,
                 state.text as i64,
                 state.scroll as i64,
+                state.preedit as i64,
             ],
         )
     }
@@ -1067,5 +1178,21 @@ mod tests {
                 }
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod preedit_tests {
+    use super::utf8_offset;
+
+    #[test]
+    fn utf16_positions_become_utf8_byte_offsets() {
+        let units: Vec<u16> = "あa😀b".encode_utf16().collect();
+        assert_eq!(utf8_offset(&units, 0), 0);
+        assert_eq!(utf8_offset(&units, 1), 3); // after あ
+        assert_eq!(utf8_offset(&units, 2), 4); // after a
+        assert_eq!(utf8_offset(&units, 4), 8); // after the emoji (two UTF-16 units)
+        assert_eq!(utf8_offset(&units, 3), 4); // inside the emoji: its start
+        assert_eq!(utf8_offset(&units, 99), 9); // clamped to the end
     }
 }

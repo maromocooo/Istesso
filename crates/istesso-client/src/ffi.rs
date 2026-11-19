@@ -46,7 +46,8 @@ pub struct IstessoInputState {
     pub text: u32,
     /// The level of scrolls the host said it takes (trial only; 0: dx and dy only).
     pub scroll: u32,
-    pub reserved: u32,
+    /// 1 when the host said it takes composing text (trial only); it is sent only then.
+    pub preedit: u32,
 }
 
 /// Called on the input's thread for what happens to the conversation:
@@ -217,6 +218,38 @@ pub unsafe extern "C" fn istesso_input_send_scroll(
     )]);
 }
 
+/// Composing text from the device's input method (trial only, ADR 0007 "変換中の文字"): all of
+/// it, UTF-8 of `len` bytes, and the selected part as byte offsets; empty text clears it. Handed
+/// over in order with the events; sent only to a host that said it takes it. A piece outside the
+/// limits is left out. Never logged.
+///
+/// # Safety
+/// `input` came from `istesso_input_open` and has not been closed; `text` points to `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_input_send_preedit(
+    input: *const IstessoInput,
+    text: *const u8,
+    len: usize,
+    cursor_begin: u32,
+    cursor_end: u32,
+) {
+    // SAFETY: the caller's promise.
+    let Some(input) = (unsafe { input.as_ref() }) else {
+        return;
+    };
+    let bytes = if text.is_null() || len == 0 {
+        &[][..]
+    } else {
+        // SAFETY: `len` bytes by the caller's promise.
+        unsafe { std::slice::from_raw_parts(text, len) }
+    };
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if let Some(event) = crate::input::preedit_event(text, [cursor_begin, cursor_end]) {
+            input.input.send(vec![event]);
+        }
+    }
+}
+
 /// Committed text from the device's input method (trial only): handed over, in order with
 /// the events, as `crate::input::text_events` cuts it. `text` is UTF-8 of `len` bytes; text
 /// that is not UTF-8 is left out whole. Never logged.
@@ -298,6 +331,7 @@ pub unsafe extern "C" fn istesso_input_state(
         failure,
         text,
         scroll,
+        preedit,
     } = input.input.state();
     // SAFETY: not null, and room for the result by the caller's promise.
     unsafe {
@@ -314,7 +348,7 @@ pub unsafe extern "C" fn istesso_input_state(
             failure: failure.map_or(0, |failure| failure as u32),
             text: u32::from(text),
             scroll: u32::from(scroll),
-            reserved: 0,
+            preedit: u32::from(preedit),
         }
     };
     0

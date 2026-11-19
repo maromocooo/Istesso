@@ -9,6 +9,7 @@ public final class StandIn implements Picture.Told {
     public void cut(long cuts) { System.out.println(t() + " panel: つなぎ直しています…（切れたのは " + cuts + " 回目）"); }
     public void reconnecting(int why, long waitMs, int attempt) { System.out.println(t() + " panel: つなぎ直しています… why=" + why + " wait=" + waitMs + " ms attempt=" + attempt); }
     public void decoder(String name, boolean low) {}
+    public void textInput(int state, int serial, int dropped) { System.out.println(t() + " panel: text field state=" + state + " serial=" + serial + " dropped=" + dropped); }
     public void over(String why) { System.out.println(t() + " panel: over: " + why); }
     public static void main(String[] a) throws Exception {
         if (a.length >= 4 && a[3].equals("pair")) {
@@ -23,6 +24,38 @@ public final class StandIn implements Picture.Told {
             }
             java.nio.file.Files.writeString(java.nio.file.Path.of(a[2]), joined[0]);
             System.out.println(t() + " paired");
+            System.exit(0);
+        }
+        if (a.length >= 5 && a[3].equals("preedit")) {
+            // The picture (for the host's text field, kind 5) and the input, as a panel has them;
+            // then made-up composing text, its commit, and Ctrl+S. a[4]: the input's address.
+            Picture p = new Picture(a[0], a[1], a[2], null, new StandIn());
+            p.start();
+            Thread.sleep(3000);
+            long input = Native.inputOpen(a[0], a[2], a[4]);
+            long[] s = null;
+            for (int i = 0; i < 50 && input != 0; i++) {
+                s = Native.inputState(input);
+                if (s != null && s[1] != 0) {
+                    break;
+                }
+                Thread.sleep(100);
+            }
+            System.out.println(t() + " input open=" + (s == null ? "?" : s[1]) + " text=" + (s == null ? "?" : s[5])
+                    + " preedit=" + (s == null || s.length < 8 ? "?" : s[7]));
+            Native.inputPreedit(input, "にほんご", 4, 4);
+            Thread.sleep(400);
+            Native.inputPreedit(input, "日本語", 1, 3);
+            Thread.sleep(400);
+            Native.inputPreedit(input, "", 0, 0);
+            Native.inputText(input, "日本語");
+            Thread.sleep(400);
+            Native.inputSend(input, new int[] {Native.INPUT_KEY, 29, 1, Native.INPUT_KEY, 31, 1,
+                    Native.INPUT_KEY, 31, 0, Native.INPUT_KEY, 29, 0}, 4);
+            Thread.sleep(1500);
+            Native.inputClose(input);
+            p.stop();
+            System.out.println(t() + " sent");
             System.exit(0);
         }
         if (a.length >= 4 && a[3].equals("scroll")) {

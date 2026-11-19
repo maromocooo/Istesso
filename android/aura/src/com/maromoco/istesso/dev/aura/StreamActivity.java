@@ -36,6 +36,63 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private HostApp app;
     private Fitted frame;
     private TypingSurface view;
+    /** The host's text input field, as the picture's connection said last (Picture.Told.textInput). */
+    private int fieldState;
+    private int fieldSerial = -1;
+    private int fieldDropped = -1;
+    /** Composing text has been sent to the host and not cleared yet. */
+    private boolean preeditSent;
+    /** The committed text sent last: shown again when the host says it had nowhere to put it. */
+    private String lastSent = "";
+
+    /** Composing text goes into the host's application: it takes it, and has a field (not a password one). */
+    private boolean inline() {
+        long[] s = input == 0 ? null : Native.inputState(input);
+        boolean takes = s != null && s.length > 7 && s[7] != 0;
+        return takes && hostTakesText && fieldState == 1;
+    }
+
+    /** Clears composing text still shown in the host's application. */
+    private void clearInlinePreedit() {
+        if (preeditSent && input != 0) {
+            Native.inputPreedit(input, "", 0, 0);
+        }
+        preeditSent = false;
+    }
+
+    @Override
+    public void textInput(int state, int serial, int dropped) {
+        runOnUiThread(() -> {
+            if (!resumed) {
+                return;
+            }
+            android.view.inputmethod.InputMethodManager imm =
+                    (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            boolean wasPassword = fieldState == 2;
+            // Another field has the keyboard over there: what is being composed here is dropped.
+            if (fieldSerial >= 0 && serial != fieldSerial && view.composing()) {
+                clearInlinePreedit();
+                view.cancelComposing(imm);
+            }
+            fieldState = state;
+            fieldSerial = serial;
+            // A password field: the input method is told so (no composing, nothing learnt).
+            if ((state == 2) != wasPassword) {
+                view.setPassword(state == 2);
+                if (view.typing() && imm != null) {
+                    imm.restartInput(view);
+                }
+            }
+            if (fieldDropped >= 0 && dropped != fieldDropped && !lastSent.isEmpty()) {
+                // The host had nowhere to put the last text: it is shown here for the person.
+                composingLine.setText(getString(R.string.text_dropped, lastSent));
+                composingLine.setVisibility(View.VISIBLE);
+                composingLine.postDelayed(() -> composingLine.setVisibility(View.GONE), 10000);
+            }
+            fieldDropped = dropped;
+        });
+    }
+
     /** The input's agent said, when its conversation was last opened, that it takes committed text. */
     private boolean hostTakesText;
     /** The input's cuts when the note about scroll kinds was last written (-1: never). */
@@ -183,13 +240,24 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             public void text(String text) {
                 // Only to an agent that said it takes committed text (ADR 0007): one that does
                 // not could not read the message, keys and all. Otherwise it stays here.
+                clearInlinePreedit();
                 if (input != 0 && hostTakesText) {
                     Native.inputText(input, text);
+                    lastSent = text;
                 }
             }
 
             @Override
-            public void composing(String text) {
+            public void composing(String text, int cursor) {
+                // Inside the host's application when it has a field and takes composing text
+                // (as the Air's viewer does); otherwise on the panel's strip only.
+                if (!text.isEmpty() && inline()) {
+                    Native.inputPreedit(input, text, cursor, cursor);
+                    preeditSent = true;
+                    composingLine.setVisibility(View.GONE);
+                    return;
+                }
+                clearInlinePreedit();
                 composingLine.setText(text);
                 composingLine.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
             }
@@ -285,6 +353,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private void setTyping(boolean on) {
         android.view.inputmethod.InputMethodManager imm =
                 (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (!on) {
+            clearInlinePreedit();
+        }
         view.setTyping(on);
         typingToggle.setText(getString(on ? R.string.typing_on : R.string.typing_off));
         composingLine.setVisibility(View.GONE);
@@ -601,6 +672,17 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         return h != Math.rint(h) || v != Math.rint(v);
     }
 
+    /**
+     * A click while something is being composed: it is taken as it stands first, so that it
+     * does not land in the field clicked into (as on the Mac).
+     */
+    private void commitBeforeClick(MotionEvent e) {
+        int a = e.getActionMasked();
+        if ((a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_BUTTON_PRESS) && view.typing() && view.composing()) {
+            view.commitComposing((android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE));
+        }
+    }
+
     /** Picture pixels per view pixel, across and down (1 before there is a picture). */
     private float pictureScaleX() {
         int vw = view.getWidth();
@@ -688,6 +770,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 place(e);
                 return true;
             case MotionEvent.ACTION_BUTTON_PRESS:
+                commitBeforeClick(e);
             case MotionEvent.ACTION_BUTTON_RELEASE:
                 if (place(e)) {
                     buttonsOf(e);
@@ -729,6 +812,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
 
     private boolean touch(MotionEvent e) {
         view.requestFocus();
+        commitBeforeClick(e);
         noteKind("touch", e);
         // The puck's touchpad: a two-finger swipe is a scroll; a three-or-more-finger swipe is left to the system.
         int c = e.getClassification();

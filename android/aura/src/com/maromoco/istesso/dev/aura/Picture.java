@@ -41,6 +41,8 @@ final class Picture {
          */
         void reconnecting(int why, long waitMs, int attempt);
         void decoder(String name, boolean lowLatency);
+        /** TRIAL ONLY: the host's text input field: state, its serial, pieces of text it dropped. */
+        void textInput(int state, int serial, int dropped);
         void over(String why);
     }
 
@@ -429,6 +431,13 @@ final class Picture {
                     waitForKey = true;
                     connected = false;
                     waitingSince = System.nanoTime();
+                    break;
+                }
+                case Native.NEXT_TEXT_INPUT: {
+                    int[] field = Native.watchTextInput(watch);
+                    if (field != null) {
+                        told.textInput(field[0], field[1], field[2]);
+                    }
                     break;
                 }
                 case Native.NEXT_TOO_BIG:
