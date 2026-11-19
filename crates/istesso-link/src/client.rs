@@ -16,7 +16,7 @@ use crate::{Error, Result};
 pub enum InputAnswer {
     /// Input is taken. `alive`: and empty messages are answered, so that
     /// [`Client::heard_alive`] has something to hear.
-    Open { alive: bool },
+    Open { alive: bool, text: bool },
     /// It is not, and this is why: callers decide by the code.
     Refused { code: ErrorCode, message: String },
 }
@@ -159,7 +159,7 @@ impl Client {
         self.channel.send(&bytes)?;
         let answer = self.channel.recv()?;
         match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
-            Response::InputOpen { alive } => Ok(InputAnswer::Open { alive }),
+            Response::InputOpen { alive, text } => Ok(InputAnswer::Open { alive, text }),
             Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
             _ => Err(Error::Malformed),
         }

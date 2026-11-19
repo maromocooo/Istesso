@@ -231,6 +231,37 @@ final class Transport {
             _ = istesso_media_host_set_cursor(host, &cursor)
         }
     }
+
+    /// The cursor as an image the size it has in the picture (`pixelsPerPoint`: picture pixels for
+    /// one point of the host's screen), so that the viewer, which scales it as it scales the
+    /// picture, shows it as large as the host's screen looks inside its window.
+    /// Says nothing when the image is the one told last (`told`: a hash of what was told).
+    func setCursor(_ cursor: NSCursor, pixelsPerPoint k: Double, told: inout Int?) -> Bool {
+        let image = cursor.image
+        let width = max(1, Int((image.size.width * k).rounded())), height = max(1, Int((image.size.height * k).rounded()))
+        guard width <= 256, height <= 256,
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        image.draw(in: NSRect(x: 0, y: 0, width: width, height: height))
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = context.data else { return false }
+        let pixels = UnsafeRawPointer(data).assumingMemoryBound(to: UInt8.self)
+        let hot = cursor.hotSpot
+        var hasher = Hasher()
+        hasher.combine(Data(bytes: pixels, count: width * height * 4))
+        hasher.combine(width); hasher.combine(Int(hot.x * k)); hasher.combine(Int(hot.y * k))
+        let hash = hasher.finalize()
+        if told == hash { return true }
+        told = hash
+        var made = IstessoMediaCursor(shape: 2, width: UInt32(width), height: UInt32(height),
+                                      hotspot_x: UInt32(min(Double(width - 1), max(0, hot.x * k))),
+                                      hotspot_y: UInt32(min(Double(height - 1), max(0, hot.y * k))), scale: 1,
+                                      pixels: pixels, pixels_len: width * height * 4, name: nil)
+        return istesso_media_host_set_cursor(host, &made) == 0
+    }
 }
 
 // MARK: - The encoder
@@ -702,8 +733,9 @@ struct WindowInfo {
 }
 
 /// The windows on the screen, front to back.
-func windowList(onScreenOnly: Bool = true) -> [WindowInfo] {
-    let options: CGWindowListOption = onScreenOnly ? [.optionOnScreenOnly, .excludeDesktopElements] : [.optionAll, .excludeDesktopElements]
+func windowList(onScreenOnly: Bool = true, desktop: Bool = false) -> [WindowInfo] {
+    var options: CGWindowListOption = onScreenOnly ? [.optionOnScreenOnly] : [.optionAll]
+    if !desktop { options.insert(.excludeDesktopElements) }
     guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
     return list.compactMap { entry in
         guard let number = entry[kCGWindowNumber as String] as? Int,
@@ -737,6 +769,40 @@ func applicationURL(_ name: String) -> URL? {
 
 // MARK: - Input
 
+/// Whether the login session's screen is locked now (unreadable counts as locked).
+func screenLocked() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
+    return (session["CGSSessionScreenIsLocked"] as? Bool) ?? false
+}
+
+/// Makes an application the one in front, and the window at `bounds` its front window, through
+/// Accessibility (ADR 0017: bringing the application's window to the front). An accessory
+/// program's own NSRunningApplication.activate() is only a request that macOS may decline.
+func bringToFront(_ pid: pid_t, bounds: CGRect?) {
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    if let bounds {
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+           let windows = value as? [AXUIElement] {
+            for window in windows {
+                var position: CFTypeRef?, extent: CFTypeRef?
+                AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &position)
+                AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &extent)
+                var p = CGPoint.zero, s = CGSize.zero
+                if let position { AXValueGetValue(position as! AXValue, .cgPoint, &p) }
+                if let extent { AXValueGetValue(extent as! AXValue, .cgSize, &s) }
+                if abs(p.x - bounds.minX) < 2 && abs(p.y - bounds.minY) < 2 && abs(s.width - bounds.width) < 2 && abs(s.height - bounds.height) < 2 {
+                    AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                    AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+                    break
+                }
+            }
+        }
+    }
+    NSRunningApplication(processIdentifier: pid)?.activate()
+}
+
 /// Turns the other device's input into events for the Mac and posts them to one process.
 final class Injector {
     /// Where the picture lies on the screen: picture pixels to global points.
@@ -748,11 +814,50 @@ final class Injector {
     var mayPost = false
     var log: (String) -> Void = { _ in }
 
+    /// How pointer events are made and posted (`--click-form`, or the word `click-form N`):
+    /// 1, 2, 3: to the window's process only (m4-plan.md 5c); 4: through the session, the Mac's
+    /// own pointer moves with it (for comparing; never while the screen is locked).
+    var clickForm = settings.clickForm
+    private var pressPosted = false
+
+    /// The process of the window that is on top at a point of the screen, whatever its layer.
+    private func topWindowPid(at point: CGPoint) -> pid_t? {
+        windowList().first { $0.bounds.contains(point) && $0.alpha > 0.01 }?.pid
+    }
     private let source = CGEventSource(stateID: .privateState)
+
+    /// Posts a pointer event: to the process, or with form 4 through the session (refused while
+    /// the screen is locked: ADR 0017, "守ること" 3).
+    private func deliver(_ event: CGEvent, to pid: pid_t) {
+        if clickForm == 4 {
+            guard !screenLocked() else { return count("dropped_locked_session_tap") }
+            let type = event.type
+            let isUp = [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(type)
+            let isMove = type == .mouseMoved
+            if isUp {
+                // The release of a press that was posted is always posted, so that no button stays
+                // down; one whose press was not posted is not posted either.
+                guard pressPosted else { return count("dropped_not_on_top") }
+                pressPosted = false
+            } else if !isMove {
+                // Through the session, the event goes to whatever is on top at that point: only
+                // when that is a window of the very process it is meant for (the owner's rule).
+                guard topWindowPid(at: event.location) == pid else {
+                    if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) { pressPosted = false }
+                    return count("dropped_not_on_top")
+                }
+                if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) { pressPosted = true }
+            }
+            event.post(tap: .cgSessionEventTap)
+        } else {
+            event.postToPid(pid)
+        }
+    }
     private var flags: CGEventFlags = []
     private var keysDown: Set<UInt32> = []
     private var buttonsDown: Set<UInt32> = []
     private var point = CGPoint.zero
+    var pointerPlace: CGPoint { point }
     private var clicks = 0
     private var lastClick: (time: TimeInterval, point: CGPoint, button: UInt32)?
     private(set) var counts: [String: Int] = [:]
@@ -763,6 +868,11 @@ final class Injector {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return count("unreadable") }
         if settings.inputDry || !mayPost {
+            if settings.inputDry, kind == "text", let text = object["text"] as? String {
+                // For checks: how many characters, in which order of pieces; never what.
+                counts["dry_text_characters", default: 0] += text.count
+                log("{\"kind\":\"text_in\",\"t_ns\":\(nowNs()),\"characters\":\(text.count),\"bytes\":\(text.utf8.count)}")
+            }
             return count(settings.inputDry ? "dry_\(kind)" : "dropped_no_permission")
         }
         switch kind {
@@ -826,7 +936,7 @@ final class Injector {
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: place, mouseButton: button) else { return }
         withHeld(event)
         aim(event, at: window)
-        event.postToPid(pid)
+        deliver(event, to: pid)
         count("move")
     }
 
@@ -858,7 +968,7 @@ final class Injector {
         default: nsType = pressed ? .leftMouseDown : .leftMouseUp; cgType = pressed ? .leftMouseDown : .leftMouseUp; cgButton = .left
         }
         var event: CGEvent?
-        if settings.clickForm == 3 {
+        if clickForm >= 3 {
             // Core Graphics alone, the window named in its fields.
             event = CGEvent(mouseEventSource: source, mouseType: cgType, mouseCursorPosition: point, mouseButton: cgButton)
             event?.setIntegerValueField(.mouseEventClickState, value: Int64(clicks))
@@ -872,11 +982,11 @@ final class Injector {
                                           timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: Int(window.id), context: nil,
                                           eventNumber: 0, clickCount: clicks, pressure: pressed ? 1 : 0)
             event = made?.cgEvent
-            if settings.clickForm == 2 { event?.location = point }
+            if clickForm == 2 { event?.location = point }
         }
         guard let event else { return count("unmade_click") }
         withHeld(event)
-        event.postToPid(pid)
+        deliver(event, to: pid)
         count("button")
     }
 
@@ -888,7 +998,7 @@ final class Injector {
         event.location = point
         withHeld(event)
         aim(event, at: window)
-        event.postToPid(pid)
+        deliver(event, to: pid)
         count("scroll")
     }
 
@@ -997,6 +1107,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             frameLog.write("{\"kind\":\"settings\",\"t_ns\":\(nowNs()),\"size\":\"\(width)x\(height)\",\"fps\":\(settings.fps),\"bitrate_kbit\":\(settings.bitrateKbit),\"chroma\":\"\(settings.chroma)\",\"keep_awake\":\(settings.keepAwake),\"min_qp\":\(settings.minQP),\"source\":\"\(settings.generated ? "generated" : "screencapturekit")\",\"transport\":\"channel\",\"encoder\":\"videotoolbox\"}")
         }
         startTimers()
+        watchCursor()
         startInput()
         startControl()
         watchSignal()
@@ -1046,8 +1157,13 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var pointerPid: pid_t?
 
     func topWindow(at point: CGPoint) -> WindowInfo? {
-        let found = windowList().first { window in
+        var found = windowList().first { window in
             window.bounds.contains(point) && window.alpha > 0.05 && window.layer >= 0 && window.layer < 1000 && window.layer != 20
+        }
+        if found == nil {
+            // The desktop: its icons are the Finder's.
+            let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first?.processIdentifier
+            found = windowList(desktop: true).first { $0.pid == finder && $0.bounds.contains(point) }
         }
         if case .display = settings.target {
             pointerPid = found?.pid
@@ -1368,6 +1484,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     return say("refused", [("word", "resume"), ("reason", why)])
                 }
             }
+        case "click-form":
+            // For comparing the ways of posting pointer events while a person tries them.
+            if words.count == 2, let form = Int(words[1]), (1...4).contains(form) {
+                injector.clickForm = form
+                say("click-form", [("form", form)])
+            }
         case "admit":
             if words.count == 3 {
                 let ok = transport.admit(words[1], words[2])
@@ -1435,7 +1557,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         if !waiting.isEmpty { return waiting.append(data) }
         if needsFront(data), let running = frontCandidate(data),
            running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
-            running.activate()
+            // The window under the pointer for a press, else the application's shown window.
+            let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
+            let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
+            bringToFront(running.processIdentifier, bounds: bounds)
             waiting = [data]
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
                 let events = self.waiting
@@ -1496,6 +1621,22 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         timers.append(timer)
     }
     var heldForSignal = false
+
+    /// The Mac's cursor, as large as the host's screen looks in the viewer's window, and of the
+    /// shape it has now (an I-beam over text, for one); looked at ten times a second.
+    func watchCursor() {
+        guard !settings.generated else { return }
+        var told: Int?
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 0.2, repeating: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.transport != nil else { return }
+            let cursor = NSCursor.currentSystem ?? NSCursor.arrow
+            _ = self.transport.setCursor(cursor, pixelsPerPoint: 1 / self.injector.scale, told: &told)
+        }
+        timer.resume()
+        timers.append(timer)
+    }
     var resumeAfterSignal = false
 
     func startTimers() {
