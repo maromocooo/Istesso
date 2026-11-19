@@ -15,7 +15,7 @@ use crate::testing::{manifest, TempDir};
 const SOON: Duration = Duration::from_secs(5);
 
 /// A host whose agent may open shells for the device, or not.
-struct ShellPair {
+pub(crate) struct ShellPair {
     host: TempDir,
     device: TempDir,
     addr: SocketAddr,
@@ -24,6 +24,12 @@ struct ShellPair {
 
 impl ShellPair {
     fn new(tag: &str, allow: bool) -> Self {
+        let (pair, agent) = Self::bind(tag, allow);
+        std::thread::spawn(move || agent.run());
+        pair
+    }
+
+    pub(crate) fn bind(tag: &str, allow: bool) -> (Self, crate::Agent) {
         let (host, device) = (TempDir::new(tag), TempDir::new(tag));
         let identities =
             [&host, &device].map(|dir| Identity::load_or_create(&dir.paths().identity()).unwrap());
@@ -68,16 +74,18 @@ impl ShellPair {
         )
         .unwrap();
         let addr = agent.local_addr().unwrap();
-        std::thread::spawn(move || agent.run());
-        ShellPair {
-            host,
-            device,
-            addr,
-            log,
-        }
+        (
+            ShellPair {
+                host,
+                device,
+                addr,
+                log,
+            },
+            agent,
+        )
     }
 
-    fn connect(&self) -> Client {
+    pub(crate) fn connect(&self) -> Client {
         let paths = self.device.paths();
         let identity = Identity::load_or_create(&paths.identity()).unwrap();
         let keys = LocalKeys::new(&identity).unwrap();
@@ -97,7 +105,7 @@ impl ShellPair {
         Terminal::new(client)
     }
 
-    fn log(&self) -> Vec<String> {
+    pub(crate) fn log(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
     }
 
@@ -126,7 +134,7 @@ impl ShellPair {
     }
 }
 
-fn request(cols: u16, rows: u16) -> ShellRequest {
+pub(crate) fn request(cols: u16, rows: u16) -> ShellRequest {
     ShellRequest {
         cols,
         rows,

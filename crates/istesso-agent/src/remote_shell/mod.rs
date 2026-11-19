@@ -84,4 +84,4 @@ impl ShellPolicy {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

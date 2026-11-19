@@ -715,8 +715,9 @@ impl Shared {
                 // The device was not told that a shell runs: the conversation is
                 // over, and a shell started for it is hung up (when dropped).
                 #[cfg(unix)]
-                {
-                    shell = None;
+                if let Some((_, _, Some(workspace))) = shell.take() {
+                    workspace.0.end();
+                    self.workspaces.remove(&workspace.0);
                 }
                 break;
             }
@@ -1375,6 +1376,38 @@ mod tests {
         let mut peers = PeerStore::open(paths.peers()).unwrap();
         peers.add(peer.clone()).unwrap();
         assert!(!may_still_control(&paths, &peer));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_shell_open_answer_removes_its_workspace() {
+        use crate::remote_shell::tests::{request, ShellPair};
+        use std::net::Shutdown;
+        use std::sync::mpsc;
+
+        let (pair, agent) = ShellPair::bind("sh-forward-no-answer", true);
+        let workspaces = agent.shared.workspaces.clone();
+        let (send, accepted) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = agent.listener.accept().unwrap();
+            send.send(stream.try_clone().unwrap()).unwrap();
+            agent.shared.handle(stream);
+        });
+        let mut client = pair.connect();
+        // The handshake succeeded. The host can read shell_open but cannot answer it.
+        accepted.recv().unwrap().shutdown(Shutdown::Write).unwrap();
+        assert!(client
+            .open_shell(istesso_link::ShellRequest {
+                forward: true,
+                ..request(80, 24)
+            })
+            .is_err());
+        drop(client);
+        server.join().unwrap();
+        let log = pair.log();
+        assert!(log.iter().any(|line| line.starts_with("opened a shell")));
+        assert!(!log.iter().any(|line| line.contains("is over")));
+        assert!(workspaces.is_empty());
     }
 
     #[cfg(unix)]

@@ -447,6 +447,11 @@ pub struct Workspaces {
 }
 
 impl Workspaces {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.open.lock().unwrap().is_empty()
+    }
+
     pub fn add(&self, workspace: Arc<Workspace>) {
         self.open
             .lock()
