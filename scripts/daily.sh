@@ -106,6 +106,10 @@
 #                       it off. Trial only: with a floor the pipeline is started through
 #                       scripts/daily-pipeline.py, which gives the encoder the floor without changing
 #                       scripts/m1-step3-host.py; with 0 the start is the old one
+#   DAILY_FLOW=0        for AURA, the picture is encoded without waiting for AURA's connection
+#                       and at the bit rate it started with, as before (default 1: a frame is
+#                       encoded only when the one before it has been taken, so that nothing queues
+#                       up, and the bit rate follows the link; scripts/daily_flow.py)
 #   DAILY_AURA_CONFIG   the trial identity of the host that AURA is paired with (only read;
 #                       default ~/.cache/istesso-aura-trial/config on the host)
 #   DAILY_BLENDER_CONFIG
@@ -535,7 +539,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -751,6 +755,11 @@ signal_busy && { echo "host: a latency measurement is running: nothing is starte
 [ -e "$plugin/libgstwaylanddisplaysrc.so" ] || { echo "host: the compositor plugin is not in $plugin (scripts/daily.sh setup)"; exit 1; }
 [ -x "$src/target/release/istesso" ] && [ -e "$src/target/release/libistesso_media.so" ] || { echo "host: the trial's copy is not built in $src (scripts/daily.sh setup)"; exit 1; }
 [ -z "$MIN_QP" ] || [ -f "$src/scripts/daily-pipeline.py" ] || { echo "fail the trial's copy on the host has no scripts/daily-pipeline.py yet (scripts/daily.sh setup)"; exit 1; }
+# For AURA the picture never queues up (docs/trial-daily.md, "AURA：遅れをためない"), unless DAILY_FLOW=0.
+flow=""
+[ "$FOR" = aura ] && [ "$FLOW" != 0 ] && flow="--flow"
+[ -z "$flow" ] || [ -f "$src/scripts/daily_flow.py" ] || { echo "fail the trial's copy on the host has no scripts/daily_flow.py yet (scripts/daily.sh setup)"; exit 1; }
+wrapper="${MIN_QP:+--min-qp $MIN_QP}${flow:+ $flow}"
 config=""
 [ -n "$HOST_CONFIG" ] && config=$(eval echo "$HOST_CONFIG")
 # For AURA (--for aura): the application's own AURA slot (picture 4793N, input 4794N), 4:2:0 at 72
@@ -988,10 +997,11 @@ echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/pipeline.sid
 # The words for the pipeline are written into this pipe; it is held open so that it never ends.
 exec 3<>$run/control
-exec python3 -u ${MIN_QP:+$src/scripts/daily-pipeline.py --min-qp $MIN_QP }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
+exec python3 -u ${wrapper:+$src/scripts/daily-pipeline.py $wrapper }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
     [ -n "$MIN_QP" ] && echo "host: $NAME's encoder gets the quality floor min-qp $MIN_QP (trial only)"
+    [ -n "$flow" ] && echo "host: $NAME's picture waits for AURA's connection before it is encoded, and its bit rate follows the link (trial only; DAILY_FLOW=0 switches it off)"
     # Through bash, whatever the login shell (tmux starts the command with it), and how it ended is kept.
     tmux new-session -d -s "daily-$NAME-pipe" "bash -c '$run/pipeline.sh > $run/pipeline.log 2>&1; echo \$? > $run/pipeline.exit'" 9>&-
     sock=""
