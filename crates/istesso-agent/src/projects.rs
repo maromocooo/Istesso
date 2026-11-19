@@ -7,6 +7,7 @@ use std::fs;
 use std::hash::BuildHasher;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use istesso_proto::Project;
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,7 @@ pub fn list_with_skipped(paths: &Paths) -> Result<ProjectList, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(list),
         Err(_) => return Err("cannot read the local project register".into()),
     };
+    let mut found = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             list.skipped += 1;
@@ -126,10 +128,23 @@ pub fn list_with_skipped(paths: &Paths) -> Result<ProjectList, String> {
                 continue;
             }
         };
-        if let Some(project) = read_project(paths, &path, &data) {
-            list.projects.push(project);
+        if let Some(record) = read_record(paths, &path, &data) {
+            let scan = kinds::start(record.folder.clone());
+            found.push((record, scan));
         } else {
             list.skipped += 1;
+        }
+    }
+    // Every folder is being looked at by now: the answer waits once at most.
+    let deadline = Instant::now() + kinds::TIMEOUT;
+    for (record, scan) in found {
+        match scan.and_then(|scan| kinds::wait(&scan, deadline)) {
+            Some(kinds) => list.projects.push(Project {
+                kinds,
+                name: record.name,
+                id: record.id,
+            }),
+            None => list.skipped += 1,
         }
     }
     list.projects
@@ -137,18 +152,11 @@ pub fn list_with_skipped(paths: &Paths) -> Result<ProjectList, String> {
     Ok(list)
 }
 
-fn read_project(paths: &Paths, path: &Path, data: &[u8]) -> Option<Project> {
+fn read_record(paths: &Paths, path: &Path, data: &[u8]) -> Option<Registration> {
     let record: Registration = serde_json::from_slice(data).ok()?;
-    if entry_path(paths, &record.name).ok()? != path
-        || !record.folder.is_absolute()
-        || record.id.len() != 32
-        || !record.id.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    Some(Project {
-        kinds: kinds::read(record.folder)?,
-        name: record.name,
-        id: record.id,
-    })
+    let sound = entry_path(paths, &record.name).ok()? == path
+        && record.folder.is_absolute()
+        && record.id.len() == 32
+        && record.id.bytes().all(|b| b.is_ascii_hexdigit());
+    sound.then_some(record)
 }

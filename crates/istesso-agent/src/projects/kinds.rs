@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use istesso_proto::ProjectKind;
 
-const TIMEOUT: Duration = Duration::from_millis(200);
+pub(super) const TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
-struct Scan {
+pub(super) struct Scan {
     result: Mutex<Option<io::Result<Vec<ProjectKind>>>>,
     ready: Condvar,
 }
@@ -19,42 +19,54 @@ struct Scan {
 // worker until the filesystem call returns.
 static ACTIVE: LazyLock<Mutex<BTreeMap<PathBuf, Arc<Scan>>>> = LazyLock::new(Mutex::default);
 
-pub(super) fn read(folder: PathBuf) -> Option<Vec<ProjectKind>> {
-    read_with(folder, scan)
+/// Starts looking at `folder` on a worker of its own. All folders of one
+/// listing are started before any is waited for, so that several blocked
+/// mounts cost one wait, not one each.
+pub(super) fn start(folder: PathBuf) -> Option<Arc<Scan>> {
+    start_with(folder, scan)
 }
 
+fn start_with(
+    folder: PathBuf,
+    inspect: impl FnOnce(&Path) -> io::Result<Vec<ProjectKind>> + Send + 'static,
+) -> Option<Arc<Scan>> {
+    let mut active = ACTIVE.lock().unwrap();
+    if let Some(scan) = active.get(&folder) {
+        return Some(Arc::clone(scan));
+    }
+    let scan = Arc::new(Scan::default());
+    let worker = Arc::clone(&scan);
+    let key = folder.clone();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let result = inspect(&folder);
+            let mut active = ACTIVE.lock().unwrap();
+            active.remove(&folder);
+            *worker.result.lock().unwrap() = Some(result);
+            worker.ready.notify_all();
+        })
+        .ok()?;
+    active.insert(key, Arc::clone(&scan));
+    Some(scan)
+}
+
+/// What the scan found, if it is done by `deadline`.
+pub(super) fn wait(scan: &Scan, deadline: Instant) -> Option<Vec<ProjectKind>> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    let (result, _) = scan
+        .ready
+        .wait_timeout_while(scan.result.lock().unwrap(), left, |value| value.is_none())
+        .unwrap();
+    result.as_ref()?.as_ref().ok().cloned()
+}
+
+#[cfg(test)]
 fn read_with(
     folder: PathBuf,
     inspect: impl FnOnce(&Path) -> io::Result<Vec<ProjectKind>> + Send + 'static,
 ) -> Option<Vec<ProjectKind>> {
-    let pending = {
-        let mut active = ACTIVE.lock().unwrap();
-        if let Some(scan) = active.get(&folder) {
-            Arc::clone(scan)
-        } else {
-            let scan = Arc::new(Scan::default());
-            let worker = Arc::clone(&scan);
-            let key = folder.clone();
-            std::thread::Builder::new()
-                .spawn(move || {
-                    let result = inspect(&folder);
-                    let mut active = ACTIVE.lock().unwrap();
-                    active.remove(&folder);
-                    *worker.result.lock().unwrap() = Some(result);
-                    worker.ready.notify_all();
-                })
-                .ok()?;
-            active.insert(key, Arc::clone(&scan));
-            scan
-        }
-    };
-    let (result, _) = pending
-        .ready
-        .wait_timeout_while(pending.result.lock().unwrap(), TIMEOUT, |value| {
-            value.is_none()
-        })
-        .unwrap();
-    result.as_ref()?.as_ref().ok().cloned()
+    let scan = start_with(folder, inspect)?;
+    wait(&scan, Instant::now() + TIMEOUT)
 }
 
 fn scan(folder: &Path) -> io::Result<Vec<ProjectKind>> {
@@ -111,5 +123,30 @@ mod tests {
         let rescan = || read_with(folder.clone(), |_| Ok(vec![ProjectKind::Apple]));
         assert!(rescan().is_some());
         assert_eq!(rescan(), Some(vec![ProjectKind::Apple]));
+    }
+
+    #[test]
+    fn several_stalled_folders_share_one_wait() {
+        let mut releases = Vec::new();
+        let mut scans = Vec::new();
+        for i in 0..3 {
+            let (release, blocked) = mpsc::channel::<()>();
+            let folder = PathBuf::from(format!("synthetic-stalled-folder-{i}"));
+            scans.push(
+                start_with(folder, move |_| {
+                    let _ = blocked.recv_timeout(Duration::from_secs(5));
+                    Ok(vec![ProjectKind::Rust])
+                })
+                .unwrap(),
+            );
+            releases.push(release);
+        }
+        let started = Instant::now();
+        let deadline = started + TIMEOUT;
+        for scan in &scans {
+            assert!(wait(scan, deadline).is_none());
+        }
+        assert!(started.elapsed() < TIMEOUT * 2);
+        drop(releases);
     }
 }
