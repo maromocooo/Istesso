@@ -36,6 +36,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect devices connected to this machine
+    Devices {
+        #[command(subcommand)]
+        action: DevicesAction,
+    },
     /// Work with the application catalogue
     Apps {
         #[command(subcommand)]
@@ -96,6 +101,16 @@ enum Command {
     Input {
         #[command(subcommand)]
         action: InputAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevicesAction {
+    /// List local devices, their ports and how they can be used
+    List {
+        /// Print the inventory as JSON with machine-readable classifications
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -377,6 +392,65 @@ enum PeersAction {
         /// `10.8.0.3:47801`
         address: String,
     },
+    /// Allow a paired device to do one more thing on this machine
+    ///
+    /// A newly paired device may look at this machine and control it.
+    /// Installing applications, attaching USB devices and receiving this
+    /// machine's sound each have to be allowed here, on the machine that
+    /// grants them.
+    Allow {
+        /// Id or name of the paired device
+        selector: String,
+        #[arg(value_enum)]
+        permission: PermissionArg,
+    },
+    /// Take one right away from a paired device
+    Deny {
+        /// Id or name of the paired device
+        selector: String,
+        #[arg(value_enum)]
+        permission: PermissionArg,
+    },
+}
+
+/// What a paired device can be allowed to do, as typed on the command line.
+#[derive(Clone, Copy, ValueEnum)]
+enum PermissionArg {
+    /// See windows and listings
+    View,
+    /// Send keyboard and pointer input
+    Control,
+    /// Install or remove applications
+    #[value(name = "install_apps", alias = "install-apps")]
+    InstallApps,
+    /// Attach USB devices
+    Usb,
+    /// Receive this machine's sound
+    Audio,
+}
+
+impl From<PermissionArg> for istesso_pair::Permission {
+    fn from(permission: PermissionArg) -> Self {
+        match permission {
+            PermissionArg::View => istesso_pair::Permission::View,
+            PermissionArg::Control => istesso_pair::Permission::Control,
+            PermissionArg::InstallApps => istesso_pair::Permission::InstallApps,
+            PermissionArg::Usb => istesso_pair::Permission::Usb,
+            PermissionArg::Audio => istesso_pair::Permission::Audio,
+        }
+    }
+}
+
+/// The rights of a paired device as one line of text, or `nothing`.
+fn permission_names(permissions: &[istesso_pair::Permission]) -> String {
+    if permissions.is_empty() {
+        return "nothing".to_string();
+    }
+    permissions
+        .iter()
+        .map(|permission| permission.name())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn main() -> ExitCode {
@@ -399,6 +473,22 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_json(&manifest)
             } else {
                 print!("{}", render_manifest(&manifest));
+                Ok(())
+            }
+        }
+        Command::Devices {
+            action: DevicesAction::List { json },
+        } => {
+            let devices = istesso_devices::inventory::local()?;
+            if json {
+                print_json(&devices)
+            } else {
+                if devices.is_empty() {
+                    println!("No local devices found.");
+                }
+                for device in devices {
+                    println!("{device}");
+                }
                 Ok(())
             }
         }
@@ -749,6 +839,13 @@ fn relay_input(
             clipboard_dropped = line.clipboard_dropped();
             eprintln!(
                 "note: {clipboard_dropped} copy or paste request(s) were not sent: the device does not take them"
+            );
+        }
+        if line.text_dropped() != text_dropped {
+            text_dropped = line.text_dropped();
+            // How many, never what.
+            eprintln!(
+                "note: {text_dropped} piece(s) of committed text were not sent: the device does not take text"
             );
         }
         if line.text_dropped() != text_dropped {
@@ -1209,6 +1306,9 @@ fn run_pair(action: PairAction) -> Result<(), String> {
             name,
         } => {
             let identity = load_identity()?;
+            // Opened before the wait so that a damaged list is reported before
+            // anyone types the code. `add` reads the file again under its lock,
+            // so changes made with `istesso peers` while this waits are kept.
             let mut peers = open_peers()?;
             let name = name.unwrap_or_else(istesso_doctor::hostname);
             let listener = TcpListener::bind(("0.0.0.0", port))
@@ -1251,6 +1351,7 @@ fn run_pair(action: PairAction) -> Result<(), String> {
             name,
         } => {
             let identity = load_identity()?;
+            // As above: `add` reads the file again before it writes.
             let mut peers = open_peers()?;
             let name = name.unwrap_or_else(istesso_doctor::hostname);
             let code = PairCode::parse(&code).map_err(|e| e.to_string())?;
@@ -1348,7 +1449,12 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
                 println!("No paired devices yet. Start with `istesso pair host` on one device.");
             }
             for peer in peers.peers() {
-                println!("{:<24} {}", peer.name, peer.id);
+                println!(
+                    "{:<24} {}  {}",
+                    peer.name,
+                    peer.id,
+                    permission_names(&peer.permissions)
+                );
             }
             Ok(())
         }
@@ -1382,7 +1488,38 @@ fn run_peers(action: PeersAction) -> Result<(), String> {
             println!("{} will be tried at {address} first.", peer.name);
             Ok(())
         }
+        PeersAction::Allow {
+            selector,
+            permission,
+        } => set_permission(&selector, permission.into(), true),
+        PeersAction::Deny {
+            selector,
+            permission,
+        } => set_permission(&selector, permission.into(), false),
     }
+}
+
+/// Grants or withdraws one right of a paired device and says what the device
+/// may do from now on. Only this machine's record changes; nothing is sent to
+/// the device.
+fn set_permission(
+    selector: &str,
+    permission: istesso_pair::Permission,
+    allowed: bool,
+) -> Result<(), String> {
+    let mut peers = open_peers()?;
+    let peer = peers
+        .set_permission(selector, permission, allowed)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no paired device matches '{selector}'"))?;
+    println!(
+        "{} ({}) may now: {}",
+        peer.name,
+        peer.id,
+        permission_names(&peer.permissions)
+    );
+    println!("This applies from the device's next connection at the latest.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2084,6 +2221,38 @@ mod tests {
         // Added latency of one window alone says nothing about the pass line.
         assert!(parse(&["--local-app", "local.jsonl"]).is_err());
         assert!(parse(&["--relayed-app", "host.jsonl"]).is_err());
+    }
+
+    #[test]
+    fn permissions_are_named_as_they_are_stored() {
+        use istesso_pair::Permission;
+        assert_eq!(permission_names(&[]), "nothing");
+        assert_eq!(
+            permission_names(&[Permission::View, Permission::Audio]),
+            "view, audio"
+        );
+        // Every name the command line takes leads to the permission that is
+        // stored under that name.
+        for arg in PermissionArg::value_variants() {
+            let name = arg.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(Permission::from(*arg).name(), name);
+        }
+        // Both spellings of the one name that has two words are understood.
+        for spelling in ["install_apps", "install-apps"] {
+            let cli = Cli::try_parse_from(["istesso", "peers", "allow", "studio", spelling]);
+            assert!(matches!(
+                cli.map(|cli| cli.command),
+                Ok(Command::Peers {
+                    action: PeersAction::Allow {
+                        permission: PermissionArg::InstallApps,
+                        ..
+                    }
+                })
+            ));
+        }
+        assert!(
+            Cli::try_parse_from(["istesso", "peers", "allow", "studio", "everything"]).is_err()
+        );
     }
 
     #[test]
