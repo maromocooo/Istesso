@@ -16,9 +16,15 @@
 //!   made with the `login-keychain` feature: the key and the list are two
 //!   items of the login keychain, made with the system's default rule (the
 //!   program that made an item reads it without a question; any other
-//!   program makes the system ask the person). A key and a list found in the
-//!   files of an earlier build are moved in and the files removed; the key
-//!   is the same, so pairings stay.
+//!   program makes the system ask the person). **Nothing is ever taken in
+//!   from a file**: a key file or a list file is something any program of
+//!   the same user can put there, at the first start or after the items
+//!   were removed, and taking it in would make that program's key this
+//!   device's key and its list the devices this one trusts. A file at the
+//!   place of the file form stops this form ([`Error::LeftInAFile`]) until
+//!   the person has removed it; a device that changes form gets a new key
+//!   and is paired again. What this form still does not guard is said by
+//!   [`Keeping::open_to_the_same_user`].
 //!
 //! The form is decided when the program is built, never by an argument, an
 //! environment variable or a file: a program that holds rights takes nothing
@@ -87,7 +93,8 @@ impl Keeping {
     /// The form this build keeps the account's own key and list in: the
     /// login keychain in a macOS build made with `login-keychain`, the two
     /// files otherwise. `identity` and `peers` are where the file form keeps
-    /// them; a build that keeps them elsewhere moves in what it finds there.
+    /// them; a build that keeps them elsewhere never reads what lies there
+    /// and refuses to go on while something does.
     pub fn of_this_build(identity: impl Into<PathBuf>, peers: impl Into<PathBuf>) -> Self {
         let files = Keeping::in_files(identity, peers);
         #[cfg(all(feature = "login-keychain", target_os = "macos"))]
@@ -126,15 +133,23 @@ impl Keeping {
     }
 
     /// What this form does not guard against, in one sentence for the
-    /// person; `None` for a form that asks the person before another program
-    /// reads the key.
+    /// person. No form there is today guards everything, so every form has
+    /// one.
     pub fn open_to_the_same_user(&self) -> Option<&'static str> {
         match self.form() {
             Form::Files => Some(
                 "this build keeps the device key and the list of paired devices in files \
                  that every program of the same user can read and change",
             ),
-            Form::LoginKeychain => None,
+            // Reading is asked about by the system. Making the items first,
+            // changing them and removing them is not known to be: the
+            // program does not look at who made an item.
+            Form::LoginKeychain => Some(
+                "this build keeps the device key and the list of paired devices in the \
+                 login keychain: another program of the same user is asked about before \
+                 it reads them, but may still be able to put its own there first, change \
+                 them or remove them",
+            ),
         }
     }
 
@@ -169,9 +184,9 @@ impl Keeping {
         })
     }
 
-    /// The key kept in `vault`. When nothing is kept there yet, the key an
-    /// earlier build left in its file is moved in; without a file, one is
-    /// made if `make` says so.
+    /// The key kept in `vault`. When nothing is kept there, one is made if
+    /// `make` says so. A key in a file is never taken in, whoever put it
+    /// there: its being there is an error.
     fn identity_in(&self, vault: &dyn Vault, make: bool) -> Result<Option<Identity>> {
         let kept = |bytes: Vec<u8>| {
             std::str::from_utf8(&bytes)
@@ -179,14 +194,14 @@ impl Keeping {
                 .and_then(Identity::from_seed_hex)
                 .ok_or_else(|| Error::Corrupt("the kept device key is damaged".into()))
         };
+        not_left_in_a_file(&self.identity, "a device key")?;
         if let Some(bytes) = vault.get(Item::Key)? {
             return kept(bytes).map(Some);
         }
-        if !make && !self.identity.exists() {
+        if !make {
             return Ok(None);
         }
-        // Moved in or made by one process at a time; another may have been
-        // first.
+        // Made by one process at a time; another may have been first.
         if let Some(parent) = self.identity.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -194,23 +209,34 @@ impl Keeping {
         if let Some(bytes) = vault.get(Item::Key)? {
             return kept(bytes).map(Some);
         }
-        let (identity, from_file) = match Identity::read_file(&self.identity)? {
-            Some(identity) => (identity, true),
-            None if make => (Identity::generate(), false),
-            None => return Ok(None),
-        };
+        let identity = Identity::generate();
         let seed = identity.seed_hex();
         vault.set(Item::Key, seed.as_bytes())?;
-        // The file goes only once the key can be read back.
+        // A key that cannot be read back would be gone with this process,
+        // and every pairing made with it.
         if vault.get(Item::Key)?.as_deref() != Some(seed.as_bytes()) {
             return Err(Error::Corrupt(
-                "the device key did not arrive where it is kept; nothing was removed".into(),
+                "the device key did not arrive where it is kept".into(),
             ));
         }
-        if from_file {
-            std::fs::remove_file(&self.identity)?;
-        }
         Ok(Some(identity))
+    }
+}
+
+/// Refuses to go on while `file` is there, in a form that does not keep
+/// `what` in files. Anything at that name counts, also a link or a
+/// directory: nothing there is ever opened.
+pub(crate) fn not_left_in_a_file(file: &Path, what: &str) -> Result<()> {
+    match std::fs::symlink_metadata(file) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(Error::LeftInAFile(format!(
+            "{what} lies in the file {}, where this build does not keep it. It is not read \
+             and not used: a file can be put there by any program of the same user. Remove \
+             the file to go on; a device that had its key there gets a new one and is \
+             paired again",
+            file.display()
+        ))),
     }
 }
 
@@ -437,7 +463,9 @@ mod tests {
         let vault = Arc::new(Memory::default());
         let keeping = dir.in_vault(&vault);
         assert_eq!(keeping.form(), Form::LoginKeychain);
-        assert!(keeping.open_to_the_same_user().is_none());
+        // This form has limits of its own, and says them.
+        let said = keeping.open_to_the_same_user().unwrap();
+        assert!(said.contains("put its own there first"), "{said}");
         assert!(keeping.identity_if_any().unwrap().is_none());
         assert!(vault.get(Item::Key).unwrap().is_none());
 
@@ -449,26 +477,91 @@ mod tests {
         assert_eq!(made.public_key(), found.public_key());
     }
 
+    /// What the automatic move of an earlier draft did: whoever could put a
+    /// key file there (any program of the same user) chose this device's
+    /// key. Now nothing is taken in, at the first start or later.
     #[test]
-    fn the_key_of_an_earlier_build_is_moved_in_and_its_file_removed() {
-        let dir = Dir::new("vault-move");
-        let before = Keeping::in_dir(&dir.0).identity().unwrap();
+    fn a_key_in_a_file_is_never_taken_in_and_stops_the_form() {
+        let dir = Dir::new("vault-file-key");
+        let planted = Keeping::in_dir(&dir.0).identity().unwrap();
         assert!(dir.key().exists());
 
+        // First start of this form, nothing kept yet.
         let vault = Arc::new(Memory::default());
-        let moved = dir.in_vault(&vault).identity_if_any().unwrap().unwrap();
-        assert_eq!(moved.public_key(), before.public_key(), "pairings stay");
-        assert!(!dir.key().exists(), "the file is gone");
-        // Once moved, a file put there again is not looked at.
+        for asked in [
+            dir.in_vault(&vault).identity().map(Some),
+            dir.in_vault(&vault).identity_if_any(),
+        ] {
+            let Err(Error::LeftInAFile(said)) = asked else {
+                panic!("a key in a file was not refused");
+            };
+            assert!(said.contains("identity.key"), "{said}");
+        }
+        assert!(vault.get(Item::Key).unwrap().is_none(), "nothing moved in");
+        assert!(dir.key().exists(), "and nothing removed");
+
+        // The person removes the file: the device gets a key of its own.
+        std::fs::remove_file(dir.key()).unwrap();
+        let own = dir.in_vault(&vault).identity().unwrap();
+        assert_ne!(own.public_key(), planted.public_key());
+        assert!(!dir.key().exists());
+
+        // A file that appears later is refused as well, and the kept key
+        // stays what it was.
         std::fs::write(dir.key(), Identity::from_seed([9; 32]).seed_hex()).unwrap();
+        assert!(matches!(
+            dir.in_vault(&vault).identity(),
+            Err(Error::LeftInAFile(_))
+        ));
+        std::fs::remove_file(dir.key()).unwrap();
         let still = dir.in_vault(&vault).identity().unwrap();
-        assert_eq!(still.public_key(), before.public_key());
+        assert_eq!(still.public_key(), own.public_key());
+    }
+
+    /// The kept key was removed (by whatever could) and a key file put in
+    /// its place: the file's key does not become the device's.
+    #[test]
+    fn a_key_file_planted_after_the_kept_key_was_removed_is_not_taken_in() {
+        let dir = Dir::new("vault-removed-key");
+        let vault = Arc::new(Memory::default());
+        let own = dir.in_vault(&vault).identity().unwrap();
+        vault.items.lock().unwrap().remove(&Item::Key);
+        let planted = Identity::from_seed([9; 32]);
+        std::fs::write(dir.key(), planted.seed_hex()).unwrap();
+
+        assert!(matches!(
+            dir.in_vault(&vault).identity(),
+            Err(Error::LeftInAFile(_))
+        ));
+        assert!(matches!(
+            dir.in_vault(&vault).identity_if_any(),
+            Err(Error::LeftInAFile(_))
+        ));
+        assert!(vault.get(Item::Key).unwrap().is_none());
+        // Without the file the device starts anew: paired with nobody, and
+        // with neither the removed key nor the planted one.
+        std::fs::remove_file(dir.key()).unwrap();
+        let anew = dir.in_vault(&vault).identity().unwrap();
+        assert_ne!(anew.public_key(), planted.public_key());
+        assert_ne!(anew.public_key(), own.public_key());
+    }
+
+    /// A link at the name is refused like a file, and never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_where_the_key_file_would_be_is_refused_too() {
+        let dir = Dir::new("vault-link-key");
+        std::os::unix::fs::symlink(dir.0.join("nowhere"), dir.key()).unwrap();
+        let vault = Arc::new(Memory::default());
+        assert!(matches!(
+            dir.in_vault(&vault).identity(),
+            Err(Error::LeftInAFile(_))
+        ));
     }
 
     #[test]
-    fn a_vault_that_keeps_nothing_costs_no_key() {
+    fn a_vault_that_keeps_nothing_is_said_and_no_key_is_used() {
         let dir = Dir::new("vault-forgets");
-        let before = Keeping::in_dir(&dir.0).identity().unwrap();
         let vault = Arc::new(Memory {
             forgets: true,
             ..Memory::default()
@@ -477,8 +570,7 @@ mod tests {
             dir.in_vault(&vault).identity(),
             Err(Error::Corrupt(_))
         ));
-        let after = Keeping::in_dir(&dir.0).identity_if_any().unwrap().unwrap();
-        assert_eq!(after.public_key(), before.public_key(), "the file stayed");
+        assert!(!dir.key().exists(), "and no file is written instead");
     }
 
     #[test]
@@ -514,37 +606,85 @@ mod tests {
         assert_eq!(keeping.peers().unwrap().peers().len(), 1);
     }
 
+    /// What the automatic move of an earlier draft did: whoever could put a
+    /// list there (any program of the same user) decided which devices this
+    /// one trusts. Now nothing is taken in, at the first start or later.
     #[test]
-    fn the_list_of_an_earlier_build_is_moved_in_and_its_file_removed() {
-        let dir = Dir::new("vault-list-move");
+    fn a_list_in_a_file_is_never_taken_in_and_stops_the_form() {
+        let dir = Dir::new("vault-file-list");
         let files = Keeping::in_dir(&dir.0);
-        files.peers().unwrap().add(peer("desk", 1)).unwrap();
+        files.peers().unwrap().add(peer("stranger", 7)).unwrap();
         assert!(dir.list().exists());
 
+        // First start of this form, nothing kept yet.
         let vault = Arc::new(Memory::default());
         let keeping = dir.in_vault(&vault);
-        let moved = keeping.peers().unwrap();
-        assert_eq!(moved.peers().len(), 1);
-        assert_eq!(moved.peers()[0].name, "desk");
-        assert!(!dir.list().exists());
+        let Err(Error::LeftInAFile(said)) = keeping.peers() else {
+            panic!("a list in a file was not refused");
+        };
+        assert!(said.contains("peers.json"), "{said}");
+        assert!(
+            vault.get(Item::Peers).unwrap().is_none(),
+            "nothing moved in"
+        );
+        assert!(dir.list().exists(), "and nothing removed");
 
-        // A list put back into the file afterwards adds nobody.
-        files.peers().unwrap().add(peer("stranger", 7)).unwrap();
+        // The person removes the file: the list is empty, and the device is
+        // paired anew.
+        std::fs::remove_file(dir.list()).unwrap();
         let mut store = keeping.peers().unwrap();
-        assert_eq!(store.peers().len(), 1);
-        store.add(peer("laptop", 2)).unwrap();
-        let names: Vec<_> = store.peers().iter().map(|p| p.name.clone()).collect();
-        assert_eq!(names, ["desk", "laptop"]);
+        assert!(store.peers().is_empty());
+        store.add(peer("desk", 1)).unwrap();
+
+        // A list that appears in the file later adds nobody: reading is
+        // refused, and so is every change through a handle opened before.
+        files.peers().unwrap().add(peer("stranger", 7)).unwrap();
+        assert!(matches!(keeping.peers(), Err(Error::LeftInAFile(_))));
+        assert!(matches!(
+            store.add(peer("laptop", 2)),
+            Err(Error::LeftInAFile(_))
+        ));
+        std::fs::remove_file(dir.list()).unwrap();
+        let names: Vec<_> = keeping
+            .peers()
+            .unwrap()
+            .peers()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(names, ["desk"]);
+    }
+
+    /// The kept list was removed (by whatever could) and a list put into
+    /// the file: the devices in it are not trusted.
+    #[test]
+    fn a_list_planted_after_the_kept_list_was_removed_is_not_taken_in() {
+        let dir = Dir::new("vault-removed-list");
+        let vault = Arc::new(Memory::default());
+        let keeping = dir.in_vault(&vault);
+        keeping.peers().unwrap().add(peer("desk", 1)).unwrap();
+        vault.items.lock().unwrap().remove(&Item::Peers);
+        Keeping::in_dir(&dir.0)
+            .peers()
+            .unwrap()
+            .add(peer("stranger", 7))
+            .unwrap();
+
+        assert!(matches!(keeping.peers(), Err(Error::LeftInAFile(_))));
+        assert!(vault.get(Item::Peers).unwrap().is_none());
+        // Without the file: nobody is trusted, rather than somebody's list.
+        std::fs::remove_file(dir.list()).unwrap();
+        assert!(keeping.peers().unwrap().peers().is_empty());
     }
 
     #[test]
-    fn a_list_that_cannot_be_read_is_not_moved_in() {
+    fn a_list_that_cannot_be_read_is_not_looked_at_either() {
         let dir = Dir::new("vault-list-damaged");
         std::fs::write(dir.list(), "{").unwrap();
         let vault = Arc::new(Memory::default());
         assert!(matches!(
             dir.in_vault(&vault).peers(),
-            Err(Error::Corrupt(_))
+            Err(Error::LeftInAFile(_))
         ));
         assert!(vault.get(Item::Peers).unwrap().is_none());
         assert!(dir.list().exists());

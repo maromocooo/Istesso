@@ -73,8 +73,7 @@ fn warn_once() {
 
 /// What this build does not guard the device key and the list of paired
 /// devices against, in one line for the person (`istesso doctor`, and the
-/// agent when it starts); `None` in a build that keeps them where other
-/// programs of the same user are not let in unasked.
+/// agent when it starts). Every form there is today has such a line.
 pub fn keeping_notice() -> Option<String> {
     Paths::from_env()
         .keeping()
@@ -659,7 +658,10 @@ mod tests {
             // Where the files are is not said: the line goes into logs.
             assert!(!note.contains('/'), "{note}");
         } else {
-            assert!(note.is_none());
+            let note = note.unwrap();
+            assert!(note.contains("login keychain"), "{note}");
+            assert!(note.contains("may still be able to"), "{note}");
+            assert!(!note.contains('/'), "{note}");
         }
     }
 

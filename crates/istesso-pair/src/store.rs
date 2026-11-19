@@ -117,8 +117,9 @@ pub struct PeerStore {
 pub(crate) enum Place {
     /// The JSON file at this path.
     File(PathBuf),
-    /// One item of `vault`. `file` is where the file form kept the list: a
-    /// list found there is moved in, and the store's lock stays next to it.
+    /// One item of `vault`. `file` is where the file form kept the list:
+    /// nothing there is ever read, a list found there stops the store, and
+    /// the store's lock stays next to it.
     Vault {
         vault: std::sync::Arc<dyn Vault>,
         file: PathBuf,
@@ -133,42 +134,19 @@ impl Place {
         }
     }
 
-    /// The list as it is kept now. `locked` says that the caller holds the
-    /// store's lock.
-    fn read(&self, locked: bool) -> Result<Vec<Peer>> {
+    /// The list as it is kept now.
+    fn read(&self) -> Result<Vec<Peer>> {
         match self {
             Place::File(path) => read_peers(path),
             Place::Vault { vault, file } => {
-                if let Some(kept) = vault.get(Item::Peers)? {
-                    return parse_peers(&kept, &"the kept list of paired devices");
-                }
-                // Nothing kept yet. A list an earlier build left in its file
-                // is moved in, by one process at a time.
-                if !file.exists() {
-                    return Ok(Vec::new());
-                }
-                let _lock = if locked {
-                    None
-                } else {
-                    Some(StoreLock::take(file)?)
-                };
-                if let Some(kept) = vault.get(Item::Peers)? {
-                    return parse_peers(&kept, &"the kept list of paired devices");
-                }
-                let peers = read_peers(file)?;
-                let json = encode_peers(&peers)?;
-                vault.set(Item::Peers, &json)?;
-                // The file goes only once the list can be read back.
-                if vault.get(Item::Peers)?.as_deref() != Some(json.as_slice()) {
-                    return Err(Error::Corrupt(
-                        "the list of paired devices did not arrive where it is kept; \
-                         the file was left in place"
-                            .into(),
-                    ));
-                }
-                match std::fs::remove_file(file) {
-                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
-                    _ => Ok(peers),
+                // Never taken in from a file, at the first start or later:
+                // any program of the same user can put a list there, and
+                // the devices in it would be trusted. Its being there is an
+                // error until the person has removed it.
+                crate::keeping::not_left_in_a_file(file, "a list of paired devices")?;
+                match vault.get(Item::Peers)? {
+                    Some(kept) => parse_peers(&kept, &"the kept list of paired devices"),
+                    None => Ok(Vec::new()),
                 }
             }
         }
@@ -193,7 +171,7 @@ impl PeerStore {
     }
 
     pub(crate) fn open_in(place: Place) -> Result<Self> {
-        let peers = place.read(false)?;
+        let peers = place.read()?;
         Ok(PeerStore { place, peers })
     }
 
@@ -228,7 +206,7 @@ impl PeerStore {
             std::fs::create_dir_all(parent)?;
         }
         let _lock = StoreLock::take(self.place.file())?;
-        let mut peers = self.place.read(true)?;
+        let mut peers = self.place.read()?;
         let (result, changed) = apply(&mut peers)?;
         if changed {
             self.place.write(&peers)?;

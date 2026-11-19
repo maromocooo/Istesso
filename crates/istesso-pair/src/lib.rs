@@ -53,6 +53,11 @@ pub enum Error {
     Timeout,
     #[error("stored data is corrupt: {0}")]
     Corrupt(String),
+    /// A key or a list of paired devices lies where this build does not
+    /// keep them: it is not used, and nothing goes on until the person has
+    /// taken it away.
+    #[error("{0}")]
+    LeftInAFile(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
