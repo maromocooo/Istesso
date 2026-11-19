@@ -359,11 +359,11 @@ else
 fi
 # Handoff on the host: read only; said when it is on (the owner turned it off on 2026-11-19).
 handoff=\$(defaults -currentHost read com.apple.coreservices.useractivityd ActivityAdvertisingAllowed 2>/dev/null)
-case "\$handoff" in
-    0) ;;
-    1) echo "host: note: Handoff is on on the Mac host again (copy and paste could reach other devices of the account)" ;;
-    *) echo "host: note: whether Handoff is on cannot be read" ;;
-esac
+if [ "\$handoff" = 1 ]; then
+    echo "host: note: Handoff is on on the Mac host again (copy and paste could reach other devices of the account)"
+elif [ "\$handoff" != 0 ]; then
+    echo "host: note: whether Handoff is on cannot be read"
+fi
 echo "slot \$slot"
 echo "size \$(sed -n 's/.*"istesso":"ready".*"size":"\([0-9]*x[0-9]*\)".*/\1/p' "\$run/host.log" | tail -1)"
 echo "peer \$(ISTESSO_CONFIG_DIR=\$config "\$D/bin/istesso" id 2>/dev/null | awk '/^Fingerprint/ {print \$2}')"
