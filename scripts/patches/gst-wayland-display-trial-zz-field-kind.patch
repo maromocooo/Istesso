@@ -1,0 +1,661 @@
+The kind of the field with the keyboard is known only once its client has said it (Istesso's
+ADR 0015, "文字の入力の欄"; ADR 0007, "変換中の文字"). Trial only.
+
+Seen on the host (Chrome 145 with the trial's switches and environment, its Wayland messages
+written out): when the focus moves to a field, by a click or by Tab, Chrome sends `disable`,
+`commit`, `enable`, `commit` and nothing else, whatever the field is. It holds back the content
+type, the cursor rectangle and the surrounding text until the compositor has acknowledged that
+commit with `done`, which this compositor (it has no input method) sent only with text. So an
+enabled text input that had said nothing was taken for a normal field: Chrome's password field was
+told to the device as a field like any other (state 1), the first composing text went into it,
+and only that made Chrome say "password" (after a click; after Tab often not even then).
+Firefox and the Text Editor (GTK 3 and 4) say the content type together with `enable`.
+
+- A text input that is enabled and has not said a content type since is a field of unknown
+  kind. It is told to the device as a password field (state 2: no new value, nothing changes
+  on the wire), takes no composing text, and a copy from it is refused, until its client says
+  what it is.
+- The client is asked: (1) the commit that enabled it is acknowledged with `done` (nothing
+  goes before it, so it changes nothing in the field); Chrome then says its content type,
+  rectangle and surrounding text at once. (2) If it answers without a content type (Chrome
+  after Tab, now and then: the rectangle alone), or not within 40 ms, its text input is told
+  that it left the surface and entered it again, once; the keyboard is not touched, and the
+  page sees neither a blur nor a focus (seen). It enables itself again, is acknowledged again,
+  and says the content type (seen, 8 of 8). (3) If it still says none, it is left at that: a
+  client that has said a content type at some time stays a password field for the device; one
+  that has never said any gets the protocol's default, a normal field.
+- While the client is being asked, nothing is told; what comes of it is told at once. Seen with
+  Chrome, 201 moves by click and Tab: the right state 4 ms after the move in the middle, 9 ms at
+  the longest (step 2 was needed 8 times, step 3 never).
+- A client that says the content type with `enable` is never asked, and nothing changes for it.
+- The field's serial goes up with every enabling of a text input that was not enabled before
+  (not for the answer to this side's own leave and enter): a client with one text input for
+  all its fields (Chrome, Firefox) disables and enables it when the focus moves among them,
+  faster than "not in a field" is told in between, so the serial stayed the same and the
+  device went on composing into the next field. Firefox says `enable` once more for the field
+  it is in, with its next commit, in the middle of composing (seen): that is the same field.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of every other patch in this directory, in the order of
+their names (its name sorts last on purpose). FOR TRIALS AND EVERYDAY USE ONLY; not for main
+before a review (it touches the input path).
+
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index 004e5df..3cba85c 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -91,6 +91,9 @@ struct State {
+     stalling: Option<Vec<std::os::fd::OwnedFd>>,
+     keys: Vec<(u32, bool)>,
+     text_input_manager: Option<ZwpTextInputManagerV3>,
++    /// How often a text input was told `done`, and that it left.
++    text_dones: u32,
++    text_leaves: u32,
+ }
+ 
+ /// The kinds a data offer said it has.
+@@ -228,7 +231,23 @@ delegate_noop!(State: ignore xdg_activation_v1::XdgActivationV1);
+ delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
+ delegate_noop!(State: ignore wl_data_device_manager::WlDataDeviceManager);
+ delegate_noop!(State: ignore ZwpTextInputManagerV3);
+-delegate_noop!(State: ignore zwp_text_input_v3::ZwpTextInputV3);
++
++impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for State {
++    fn event(
++        state: &mut Self,
++        _: &zwp_text_input_v3::ZwpTextInputV3,
++        event: zwp_text_input_v3::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        match event {
++            zwp_text_input_v3::Event::Done { .. } => state.text_dones += 1,
++            zwp_text_input_v3::Event::Leave { .. } => state.text_leaves += 1,
++            _ => {}
++        }
++    }
++}
+ 
+ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
+     fn event(
+@@ -363,6 +382,8 @@ impl WaylandClient {
+             stalling: None,
+             keys: Vec::new(),
+             text_input_manager: None,
++            text_dones: 0,
++            text_leaves: 0,
+         };
+ 
+         WaylandClient {
+@@ -469,6 +490,29 @@ impl WaylandClient {
+         std::mem::take(&mut self.state.keys)
+     }
+ 
++    /// A text input of this client, with nothing said yet.
++    pub fn text_input(&mut self) -> zwp_text_input_v3::ZwpTextInputV3 {
++        self.state
++            .text_input_manager
++            .as_ref()
++            .unwrap()
++            .get_text_input(self.state.seat.as_ref().unwrap(), &self.qh, ())
++    }
++
++    /// Says a field's content type (not committed yet).
++    pub fn say_content_type(
++        &self,
++        input: &zwp_text_input_v3::ZwpTextInputV3,
++        purpose: zwp_text_input_v3::ContentPurpose,
++    ) {
++        input.set_content_type(zwp_text_input_v3::ContentHint::empty(), purpose);
++    }
++
++    /// How often this client's text inputs were told `done`, and that they left, so far.
++    pub fn text_input_events(&self) -> (u32, u32) {
++        (self.state.text_dones, self.state.text_leaves)
++    }
++
+     /// Enables a text input for a password field, as a toolkit does.
+     pub fn enable_password_field(&mut self) {
+         let input = self
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index ee1c00d..8e839c6 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -7,6 +7,7 @@ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
+ mod test_trial_clipboard;
++mod test_trial_field_kind;
+ mod test_trial_scroll;
+ mod test_trial_windows;
+ mod test_windows;
+diff --git a/wayland-display-core/src/tests/test_trial_field_kind.rs b/wayland-display-core/src/tests/test_trial_field_kind.rs
+new file mode 100644
+index 0000000..4996add
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_trial_field_kind.rs
+@@ -0,0 +1,172 @@
++//! Trial only (Istesso's ADR 0015, "文字の入力の欄"): the kind of the field with the keyboard is
++//! known only once its client has said a content type. Until then the field is taken for a
++//! secret one: a client may say it late, or only when asked (Chrome 145, seen on the host).
++
++use crate::tests::fixture::Fixture;
++use smithay::backend::input::ButtonState;
++use smithay::utils::Point;
++use std::time::Duration;
++use test_log::test;
++use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ContentPurpose;
++
++/// A compositor with a window of the client that has the keyboard.
++fn typed_into() -> Fixture {
++    let mut f = Fixture::new();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    f.server.pointer_button(0, 0x110, ButtonState::Released);
++    f.round_trip();
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    f
++}
++
++/// Lets the compositor's waits run out (each is 40 ms).
++fn wait(f: &mut Fixture) {
++    for _ in 0..12 {
++        std::thread::sleep(Duration::from_millis(5));
++        f.update_server();
++        f.update_client();
++    }
++}
++
++#[test]
++fn a_field_that_says_its_type_with_enable_is_never_asked() {
++    let mut f = typed_into();
++    let input = f.client.text_input();
++    input.enable();
++    f.client.say_content_type(&input, ContentPurpose::Normal);
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.server.text_input_field_for_tests(), (1, false));
++    assert_eq!(f.client.text_input_events(), (0, 0));
++
++    input.disable();
++    input.commit();
++    input.enable();
++    f.client.say_content_type(&input, ContentPurpose::Password);
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.server.text_input_field_for_tests(), (2, false));
++    wait(&mut f);
++    assert_eq!(f.client.text_input_events(), (0, 0));
++}
++
++#[test]
++fn a_field_enabled_without_a_type_is_asked_and_is_secret_until_it_says_one() {
++    let mut f = typed_into();
++    let input = f.client.text_input();
++    input.enable();
++    input.commit();
++    f.round_trip();
++    // Its commit was acknowledged (one `done`, nothing else), and until it answers the field is
++    // a secret one (which takes no composing text: the test below).
++    assert_eq!(f.client.text_input_events(), (1, 0));
++    assert_eq!(f.server.text_input_field_for_tests(), (2, true));
++
++    // It answers with its content type, as Chrome does after a click: a normal field.
++    f.client.say_content_type(&input, ContentPurpose::Normal);
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.server.text_input_field_for_tests(), (1, false));
++    f.server.preedit_text("かな", 6, 6);
++    f.round_trip();
++    // The composing text went (its `done` is the second).
++    assert_eq!(f.client.text_input_events(), (2, 0));
++}
++
++#[test]
++fn a_field_that_answers_without_a_type_is_told_it_left_and_entered_and_asked_again() {
++    let mut f = typed_into();
++    let input = f.client.text_input();
++    // The client is one that says content types.
++    input.enable();
++    f.client.say_content_type(&input, ContentPurpose::Normal);
++    input.commit();
++    f.round_trip();
++    let first = f.server.text_input_identity_for_tests();
++
++    // Another field, as Chrome moves to it by Tab: disabled, enabled, nothing said.
++    input.disable();
++    input.commit();
++    input.enable();
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.client.text_input_events(), (1, 0));
++    let second = f.server.text_input_identity_for_tests();
++    assert_ne!(first, second, "another enabling is another field");
++    // It answers the acknowledgement with the cursor's rectangle alone.
++    input.set_cursor_rectangle(10, 20, 0, 30);
++    input.commit();
++    f.round_trip();
++    // So it was told that it left and entered again (the first enter was at the start).
++    assert_eq!(f.client.text_input_events(), (1, 1));
++    assert_eq!(f.server.text_input_field_for_tests(), (3, false));
++    // It enables itself again and is acknowledged again; now it says what the field is.
++    input.disable();
++    input.commit();
++    input.enable();
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.client.text_input_events(), (2, 1));
++    assert_eq!(f.server.text_input_field_for_tests(), (2, true));
++    assert_eq!(
++        f.server.text_input_identity_for_tests(),
++        second,
++        "the answer to this side's leave and enter is the same field"
++    );
++    f.client.say_content_type(&input, ContentPurpose::Password);
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.server.text_input_field_for_tests(), (2, false));
++}
++
++#[test]
++fn a_client_that_says_types_and_says_none_now_stays_secret() {
++    let mut f = typed_into();
++    let input = f.client.text_input();
++    input.enable();
++    f.client.say_content_type(&input, ContentPurpose::Normal);
++    input.commit();
++    input.disable();
++    input.commit();
++    input.enable();
++    input.commit();
++    f.round_trip();
++    // It does not answer: after the wait it is told it left and entered again.
++    wait(&mut f);
++    assert_eq!(f.client.text_input_events(), (1, 1));
++    input.enable();
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.client.text_input_events(), (2, 1));
++    // It does not answer again: everything was tried, and the field stays a secret one.
++    wait(&mut f);
++    assert_eq!(f.client.text_input_events(), (2, 1));
++    assert_eq!(f.server.text_input_field_for_tests(), (2, false));
++    f.server.preedit_text("かな", 6, 6);
++    f.round_trip();
++    assert_eq!(f.client.text_input_events(), (2, 1));
++}
++
++#[test]
++fn a_client_that_never_says_a_type_gets_a_normal_field_once_everything_was_tried() {
++    let mut f = typed_into();
++    let input = f.client.text_input();
++    input.enable();
++    input.commit();
++    f.round_trip();
++    assert_eq!(f.server.text_input_field_for_tests(), (2, true));
++    wait(&mut f);
++    assert_eq!(f.client.text_input_events(), (1, 1));
++    input.enable();
++    input.commit();
++    f.round_trip();
++    wait(&mut f);
++    // The protocol's default: a normal field, which takes composing text.
++    assert_eq!(f.server.text_input_field_for_tests(), (1, false));
++    f.server.preedit_text("かな", 6, 6);
++    f.round_trip();
++    assert_eq!(f.client.text_input_events(), (3, 1));
++}
+diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
+index 08f76f5..f825bd9 100644
+--- a/wayland-display-core/src/wayland/handlers/text_input.rs
++++ b/wayland-display-core/src/wayland/handlers/text_input.rs
+@@ -95,6 +95,8 @@ pub struct TextInputs {
+     focus: Option<WlSurface>,
+     /// The surfaces that were told the keyboard again (below): each one once, never again.
+     retold: Vec<WlSurface>,
++    /// Counts the steps of asking a field's kind, so that only the last wait acts.
++    kind_generation: u64,
+ }
+ 
+ struct Instance {
+@@ -120,8 +122,49 @@ struct Instance {
+     /// preedit's report and the clipboard's refusal both go by it.)
+     rect: Option<(i32, i32, i32, i32)>,
+     pending_rect: Option<(i32, i32, i32, i32)>,
++    /// Whether the client has said a content type since it enabled this text input. Until it
++    /// has, the kind of the field is not known, and the field is taken for a secret one: a
++    /// client may say it late or not at all (Chrome 145, seen on the host: nothing but
++    /// `enable` and `commit` when the focus moves, whatever the field is).
++    declared: bool,
++    /// It said one since its last `commit` (and since any `enable` in between).
++    pending_declared: bool,
++    /// Whether it has ever said one. A client that never does gets the protocol's default (a
++    /// normal field) once everything below was tried.
++    declares: bool,
++    /// How far the asking has come for this enabling: 0 not asked, 1 its commit was
++    /// acknowledged (`done`).
++    asked: u8,
++    /// This enabling answers this side's own leave and enter (the second step of the asking).
++    reentered: bool,
++    /// Everything was tried for this enabling.
++    gave_up: bool,
++    /// When this side told it that it left and entered again, to make it say its state afresh.
++    reentry_at: Option<std::time::Instant>,
++    /// Counts the enablings that are not answers to this side's leave and enter: each one is
++    /// another field (or the same one again), and part of the field's identity.
++    episode: u32,
+ }
+ 
++impl Instance {
++    /// The kind of its field is still being found out.
++    fn finding_out(&self) -> bool {
++        self.enabled && !self.declared && !self.gave_up
++    }
++
++    /// The kind of its field is not known: taken for a secret one. Not so for a client that
++    /// never says a content type at all, once everything was tried (the protocol's default).
++    fn unsure(&self) -> bool {
++        self.enabled && !self.declared && !(self.gave_up && !self.declares)
++    }
++}
++
++/// How long a client has to answer when it is asked the kind of its field (below), before the
++/// next step is taken.
++const KIND_WAIT: std::time::Duration = std::time::Duration::from_millis(40);
++/// How long after this side's leave and enter an enabling counts as the answer to it.
++const REENTRY_ANSWER: std::time::Duration = std::time::Duration::from_millis(250);
++
+ /// Told whenever the field with the keyboard changes: 0 none, 1 a field, 2 a password field;
+ /// and the text cursor's rectangle in the output (x, y, width, height). Trial only.
+ /// The last number is the field's serial: one more (mod 256) whenever another field has the
+@@ -131,6 +174,13 @@ struct Instance {
+ /// input enabled and not ASCII), so that the device can keep them for the person.
+ pub type TextInputSink = Box<dyn Fn(u32, i32, i32, u32, u32, u32, u32) + Send>;
+ 
++/// Which field has the keyboard: the surface, and its enabled text input with the number of
++/// its enabling (None in second place: the surface's client has a text input there, none
++/// enabled). Another enabling of the same text input is another field: a client with one text
++/// input for all its fields disables and enables it when the focus moves among them (Chrome
++/// and Firefox, seen), often faster than "not in a field" is told between.
++type FieldIdentity = (ObjectId, Option<(ObjectId, u32)>);
++
+ /// Tells a sink about the field with the keyboard, only when that changed.
+ #[derive(Default)]
+ pub struct TextInputReport {
+@@ -138,7 +188,7 @@ pub struct TextInputReport {
+     last: Option<(u32, i32, i32, u32, u32, u32)>,
+     /// Which field it was (the surface with the keyboard and its enabled text input), and its
+     /// serial.
+-    identity: Option<(ObjectId, Option<ObjectId>)>,
++    identity: Option<FieldIdentity>,
+     serial: u8,
+     /// A "not in a field" (3) waits to be told until it has held for THREE_HOLDS: between two
+     /// fields a client says it briefly (Tab, Control+L, a click), and the device would send
+@@ -160,7 +210,7 @@ impl TextInputReport {
+         self.last = None;
+     }
+ 
+-    fn tell(&mut self, now: (u32, i32, i32, u32, u32), identity: Option<(ObjectId, Option<ObjectId>)>) {
++    fn tell(&mut self, now: (u32, i32, i32, u32, u32), identity: Option<FieldIdentity>) {
+         if identity != self.identity {
+             self.identity = identity;
+             self.serial = self.serial.wrapping_add(1);
+@@ -211,6 +261,14 @@ impl TextInputs {
+             entered: None,
+             rect: None,
+             pending_rect: None,
++            declared: false,
++            pending_declared: false,
++            declares: false,
++            asked: 0,
++            reentered: false,
++            gave_up: false,
++            reentry_at: None,
++            episode: 0,
+         };
+         if let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) {
+             if same_client(&instance.object.id(), &focus.id()) {
+@@ -247,6 +305,9 @@ impl TextInputs {
+             instance.pending = None;
+             instance.secret = false;
+             instance.pending_secret = None;
++            instance.declared = false;
++            instance.pending_declared = false;
++            instance.reentry_at = None;
+         }
+         self.focus = surface;
+         if let Some(focus) = &self.focus {
+@@ -273,6 +334,16 @@ impl TextInputs {
+             .then_some(focus)
+     }
+ 
++    /// Whether the kind of the field with the keyboard is still being found out.
++    fn finding_out(&self) -> bool {
++        let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
++            return false;
++        };
++        self.instances
++            .iter()
++            .any(|i| i.finding_out() && i.entered.as_ref() == Some(focus))
++    }
++
+     /// The client of the surface with the keyboard.
+     pub(crate) fn focus_client(&self) -> Option<ClientId> {
+         self.focus.as_ref().filter(|s| s.is_alive()).and_then(|s| s.client()).map(|c| c.id())
+@@ -290,14 +361,14 @@ impl TextInputs {
+ 
+     /// Which field has the keyboard: the surface, and its enabled text input (None in second
+     /// place: the surface's client has a text input there, none enabled).
+-    fn field_identity(&self) -> Option<(ObjectId, Option<ObjectId>)> {
++    fn field_identity(&self) -> Option<FieldIdentity> {
+         let focus = self.focus.as_ref().filter(|s| s.is_alive())?;
+         if let Some(i) = self
+             .instances
+             .iter()
+             .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
+         {
+-            return Some((focus.id(), Some(i.object.id())));
++            return Some((focus.id(), Some((i.object.id(), i.episode))));
+         }
+         self.instances
+             .iter()
+@@ -316,7 +387,8 @@ impl TextInputs {
+             .iter()
+             .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
+         {
+-            Some(i) => (if i.secret { 2 } else { 1 }, i.rect),
++            // A field whose kind is not known is told as a secret one (see `Instance::unsure`).
++            Some(i) => (if i.secret || i.unsure() { 2 } else { 1 }, i.rect),
+             // 3: the client has a text input there and none is enabled: the keyboard is not in
+             // a text field (the device sends plain keys); 0: it has none (nothing is known).
+             None if self.instances.iter().any(|i| i.entered.as_ref() == Some(focus)) => (3, None),
+@@ -339,7 +411,8 @@ impl TextInputs {
+         };
+         // Never into a password field, whatever the device thought the field was (its notice
+         // of the field may still be on its way). Clearing is still done.
+-        if instance.secret && !text.is_empty() {
++        // Nor into one whose kind is not known yet.
++        if (instance.secret || instance.unsure()) && !text.is_empty() {
+             return false;
+         }
+         let text = (!text.is_empty()).then(|| text.to_string());
+@@ -356,7 +429,7 @@ impl TextInputs {
+         };
+         self.instances
+             .iter()
+-            .any(|i| i.enabled && i.secret && i.entered.as_ref() == Some(focus))
++            .any(|i| i.enabled && (i.secret || i.unsure()) && i.entered.as_ref() == Some(focus))
+     }
+ 
+     /// Hands `text` to the enabled text input of the client that has the keyboard. False when
+@@ -405,6 +478,81 @@ impl State {
+         );
+     }
+ 
++    /// Finds out the kind of the field with the keyboard when its client enabled its text input
++    /// and has not said a content type (`answered`: it has just committed; otherwise a wait
++    /// ran out). Seen on the host with Chrome 145: it sends only `enable` and `commit` when the
++    /// focus moves to a field, and holds the rest back (content type, cursor rectangle,
++    /// surrounding text) until this side has acknowledged that commit; and after a move by Tab
++    /// it then often says the rectangle alone, the content type only after its text input was
++    /// told that it left and entered again. So:
++    ///
++    /// 1. its commit is acknowledged (`done` with nothing before it, which changes nothing);
++    /// 2. if it answers without a content type, or not within KIND_WAIT, its text input is
++    ///    told that it left the surface and entered it again, once (the keyboard is not
++    ///    touched: the page sees neither a blur nor a focus, seen), and the commit by which it
++    ///    enables itself again is acknowledged as in 1;
++    /// 3. if it still has not said one, it is left at that: the field stays a secret one for
++    ///    the device, unless the client has never said a content type at all (then it is a
++    ///    normal field, the protocol's default).
++    ///
++    /// A client that says the content type with `enable` (GTK 3 and 4, seen) is never asked.
++    pub(crate) fn text_input_kind_step(&mut self, answered: bool) {
++        let Some(focus) = self.text_inputs.focus.clone().filter(|s| s.is_alive()) else {
++            return;
++        };
++        let Some(i) = self
++            .text_inputs
++            .instances
++            .iter_mut()
++            .find(|i| i.finding_out() && i.entered.as_ref() == Some(&focus))
++        else {
++            return;
++        };
++        if i.asked == 0 {
++            i.asked = 1;
++            i.object.done(i.commits);
++        } else if !i.reentered {
++            let _ = answered;
++            i.object.leave(&focus);
++            i.object.enter(&focus);
++            // Until it enables itself again (it took the leave as the end of this enabling).
++            i.enabled = false;
++            i.pending = None;
++            i.reentry_at = Some(std::time::Instant::now());
++            tracing::info!("text input: no content type said: told it left and entered again");
++        } else {
++            i.gave_up = true;
++            tracing::info!(
++                declares = i.declares,
++                "text input: no content type said after everything was tried"
++            );
++            return;
++        }
++        self.text_inputs.kind_generation += 1;
++        let generation = self.text_inputs.kind_generation;
++        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++        let _ = self.handle.insert_source(Timer::from_duration(KIND_WAIT), move |_, _, state| {
++            if state.text_inputs.kind_generation == generation {
++                state.text_input_kind_step(false);
++                state.tell_text_input();
++            }
++            TimeoutAction::Drop
++        });
++    }
++
++    /// For the tests: the state of the field with the keyboard as the device would be told
++    /// it, and whether its kind is still being found out.
++    #[cfg(test)]
++    pub(crate) fn text_input_field_for_tests(&self) -> (u32, bool) {
++        (self.text_inputs.field().0, self.text_inputs.finding_out())
++    }
++
++    /// For the tests: which field has the keyboard.
++    #[cfg(test)]
++    pub(crate) fn text_input_identity_for_tests(&self) -> Option<FieldIdentity> {
++        self.text_inputs.field_identity()
++    }
++
+     /// The keyboard moved: nothing waits for the client that had it any more. What waited goes
+     /// on the next turn of the loop (not from inside the keyboard's own handling).
+     pub(crate) fn text_order_focus_moved(&mut self) {
+@@ -434,6 +582,12 @@ impl State {
+                 }
+             }
+         }
++        // While the kind of the field is being found out (KIND_WAIT twice at most), nothing is
++        // told: what comes of it is told at once, by the commit that says it or by the wait
++        // that ran out.
++        if self.text_inputs.finding_out() {
++            return;
++        }
+         let identity = self.text_inputs.field_identity();
+         if told.0 == 3 && self.text_input_report.last.map(|l| l.0) != Some(3) {
+             if !self.text_input_report.three_pending {
+@@ -635,6 +789,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                     // Enabling starts the state again: the content type is told after it.
+                     instance.pending_secret = Some(false);
+                     instance.pending_purpose = Some("normal");
++                    // What the client says after this counts; what it said before does not.
++                    instance.pending_declared = false;
+                 }
+             }
+             zwp_text_input_v3::Request::Disable => {
+@@ -649,12 +805,31 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                 if let Some(instance) = state.text_inputs.instance(resource) {
+                     instance.commits = instance.commits.wrapping_add(1);
+                     if let Some(enable) = instance.pending.take() {
++                        let was_enabled = instance.enabled;
+                         // Only a text input that was told it entered a surface may be enabled.
+                         instance.enabled = enable && instance.entered.is_some();
+                         if enable {
+-                            // Enabling starts afresh.
+-                            instance.rect = None;
++                            // Enabling starts afresh: the kind of the field is not known until
++                            // the client says a content type.
+                             instance.secret = false;
++                            instance.declared = false;
++                            instance.asked = 0;
++                            instance.gave_up = false;
++                            // Whether it answers this side's own leave and enter: then it is
++                            // the same field as before, with the text cursor where it was.
++                            instance.reentered = instance
++                                .reentry_at
++                                .take()
++                                .is_some_and(|at| at.elapsed() < REENTRY_ANSWER);
++                            if !instance.reentered {
++                                instance.rect = None;
++                            }
++                            // Another field only when it was not enabled before: Firefox
++                            // (GTK 3) says `enable` once more for the field it is in, with
++                            // its next commit, in the middle of composing (seen).
++                            if !instance.reentered && !was_enabled {
++                                instance.episode = instance.episode.wrapping_add(1);
++                            }
+                         }
+                     }
+                     if let Some(rect) = instance.pending_rect.take() {
+@@ -664,6 +839,10 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                     if let Some(secret) = instance.pending_secret.take() {
+                         instance.secret = secret;
+                     }
++                    if std::mem::take(&mut instance.pending_declared) {
++                        instance.declared = true;
++                        instance.declares = true;
++                    }
+                     if let Some(purpose) = instance.pending_purpose.take() {
+                         instance.purpose = purpose;
+                     }
+@@ -678,6 +857,10 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                         );
+                     }
+                 }
++                // A field whose kind the client has not said is asked for it.
++                if focused {
++                    state.text_input_kind_step(true);
++                }
+                 // The device is told about the field as the client has it now.
+                 state.tell_text_input();
+                 // Then what waited for this goes, with the field as it is now (its `done`
+@@ -714,6 +897,7 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                 };
+                 if let Some(instance) = state.text_inputs.instance(resource) {
+                     instance.pending_secret = Some(secret_purpose || secret_hint);
++                    instance.pending_declared = true;
+                     instance.pending_purpose = Some(match purpose {
+                         WEnum::Value(ContentPurpose::Normal) => "normal",
+                         WEnum::Value(ContentPurpose::Password) => "password",
