@@ -9,8 +9,9 @@
 //   - the application's other windows are noticed: by the window list every 200 ms (lookAtApp) and
 //     at once when Accessibility says a window was made. Counted are windows of its process on
 //     the screen, at layer 0, larger than 40x40 points, that Accessibility calls a window (a sheet
-//     stays in its parent's picture), and never one the application had before the start
-//     (another document of the owner's);
+//     stays in its parent's picture), and never one the application had when its first window
+//     was first shown or that came within 1.5 s after (another document of the owner's, a
+//     window restored at launch: WindowBaseline);
 //   - each gets a stream of its own (at most three besides the first: four to an application,
 //     ADR 0027 2.2): a listener on a port of its own (any free one), an encoder of its own, and a
 //     capture of the display it is on, of the application's windows except the first window and
@@ -50,15 +51,38 @@ func samePlace(_ a: CGRect, _ b: CGRect) -> Bool {
     abs(a.minX - b.minX) < 2 && abs(a.minY - b.minY) < 2 && abs(a.width - b.width) < 2 && abs(a.height - b.height) < 2
 }
 
+/// The windows that are never another window to stream: every window the application has when its
+/// first window is first shown, and every one that comes within the next 1.5 s (windows restored
+/// at launch, an application's own windows of its start). Recorded with --windows only, in every
+/// form (a document, a new window, the application as it is). Until it is recorded, nothing is
+/// another window.
+struct WindowBaseline {
+    private(set) var known: Set<CGWindowID>?
+    private var until: TimeInterval = 0
+    static let grace: TimeInterval = 1.5
+    /// A look at the application: `all` its windows now, `firstShown` whether its first window is
+    /// chosen, `now` uptime.
+    mutating func look(all: [CGWindowID], firstShown: Bool, now: TimeInterval) {
+        guard firstShown else { return }
+        if known == nil {
+            known = Set(all)
+            until = now + Self.grace
+        } else if now < until {
+            known?.formUnion(all)
+        }
+    }
+}
+
 /// The application's other windows, front to back: see the top of this file. `all` is the
 /// application's windows in the window list, `first` the window that is shown, `before` the
-/// windows it had before the start, `ax` what Accessibility listed last.
+/// windows that are never another window (WindowBaseline; nil: not recorded yet, so none is),
+/// `ax` what Accessibility listed last.
 func extraCandidates(all: [WindowInfo], first: CGWindowID?, before: Set<CGWindowID>?, ax: [AXWindowInfo]) -> [ExtraCandidate] {
-    guard let first else { return [] }
+    guard let first, let before else { return [] }
     let dialogs = [kAXDialogSubrole, kAXSystemDialogSubrole, kAXFloatingWindowSubrole].map { $0 as String }
     return all.compactMap { w in
         guard w.id != first, w.layer == 0, w.onScreen, w.alpha > 0.05, w.bounds.width > 40, w.bounds.height > 40,
-              !(before?.contains(w.id) ?? false),
+              !before.contains(w.id),
               let match = ax.first(where: { samePlace($0.bounds, w.bounds) }), match.role == kAXWindowRole as String else { return nil }
         return ExtraCandidate(id: w.id, bounds: w.bounds, title: match.title, modal: dialogs.contains(match.subrole))
     }
@@ -240,6 +264,8 @@ final class ExtraWindows {
     /// The window keys go to, when it is not the first (a focus with its number).
     var focus: UInt32?
     var viewerAwaySince: TimeInterval?
+    /// The windows that are never another window (--windows; recorded by lookAtApp).
+    var baseline = WindowBaseline()
     /// The stand-in's windows (--generated), there from `pretendFrom` (uptime) on: three seconds
     /// after the viewer said it, so that they open while the first window's stream runs steadily.
     var pretend: [ExtraCandidate] = []
@@ -296,7 +322,8 @@ extension DailyHost {
             guard let pid = app?.processIdentifier, windowId != nil, !screenLocked() else { return }
             lookout.refresh(pid)
             let all = windowList(onScreenOnly: false).filter { $0.pid == pid }
-            candidates = extraCandidates(all: all, first: windowId, before: windowsAtOpen, ax: lookout.windows)
+            let before = extras.baseline.known.map { $0.union(windowsAtOpen ?? []) }
+            candidates = extraCandidates(all: all, first: windowId, before: before, ax: lookout.windows)
         }
         candidates.sort { extras.numbers.number(for: $0.id) < extras.numbers.number(for: $1.id) }
         let streaming = Set(extras.streams.values.map(\.windowId))
@@ -550,8 +577,22 @@ func windowsSelfTest() -> Int {
     let found = extraCandidates(all: [first, second, sheet, menu, owners, hidden, dialog], first: 10, before: [14], ax: ax)
     check(found.map(\.id) == [11, 16], "a second window and a dialog; not the first, a sheet, a menu, a hidden one, nor one from before the start")
     check(found.first?.title == "Untitled 2" && found.first?.modal == false && found.last?.modal == true, "titles and dialogs from Accessibility")
-    check(extraCandidates(all: [first, second], first: nil, before: nil, ax: ax).isEmpty, "nothing before a first window is shown")
-    check(extraCandidates(all: [first, second], first: 10, before: nil, ax: []).isEmpty, "nothing that Accessibility has not listed yet")
+    check(extraCandidates(all: [first, second], first: nil, before: [], ax: ax).isEmpty, "nothing before a first window is shown")
+    check(extraCandidates(all: [first, second], first: 10, before: [], ax: []).isEmpty, "nothing that Accessibility has not listed yet")
+    // Review 1: no baseline recorded, no other window (the owner's open documents of an application
+    // opened as it is); windows there at the first look or within 1.5 s are never other windows.
+    check(extraCandidates(all: [first, second, owners], first: 10, before: nil, ax: ax).isEmpty, "without a baseline, nothing is another window")
+    var baseline = WindowBaseline()
+    baseline.look(all: [10, 14], firstShown: false, now: 100)
+    check(baseline.known == nil, "the baseline waits for the first window")
+    baseline.look(all: [10, 14], firstShown: true, now: 101)
+    baseline.look(all: [10, 14, 17], firstShown: true, now: 102)  // restored at launch, 1 s later
+    baseline.look(all: [10, 14, 17, 11], firstShown: true, now: 103)  // Command-N, 2 s later
+    check(baseline.known == [10, 14, 17], "windows of the first 1.5 s are the baseline; a later one is not")
+    let restored = WindowInfo(id: 17, pid: 100, layer: 0, bounds: CGRect(x: 500, y: 500, width: 300, height: 300), alpha: 1, onScreen: true)
+    let restoredAX = AXWindowInfo(bounds: restored.bounds, role: kAXWindowRole as String, subrole: kAXStandardWindowSubrole as String)
+    check(extraCandidates(all: [first, second, owners, restored], first: 10, before: baseline.known, ax: ax + [restoredAX]).map(\.id) == [11],
+          "only the window made after the baseline is another window")
 
     let numbers = WindowNumbers()
     check(numbers.number(for: 11) == 2 && numbers.number(for: 16) == 3 && numbers.number(for: 11) == 2, "numbers from 2, kept")

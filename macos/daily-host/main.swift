@@ -3130,6 +3130,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         // Keep the window shown so far while it is there; else the largest one.
         let chosen = shown.first { $0.id == windowId } ?? shown.max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
         guard let chosen else { return }
+        if settings.windows {
+            // The windows that are never another window to stream (windows.swift, WindowBaseline).
+            let every = windowList(onScreenOnly: false).filter { $0.pid == app.processIdentifier }.map(\.id)
+            extras.baseline.look(all: every, firstShown: true, now: ProcessInfo.processInfo.systemUptime)
+        }
         if transport == nil {
             let density = densityAt(chosen.bounds)
             let w = min(3840, Int(chosen.bounds.width * density)) & ~1, h = min(2160, Int(chosen.bounds.height * density)) & ~1
