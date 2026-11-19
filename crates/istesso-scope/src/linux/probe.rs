@@ -312,3 +312,21 @@ pub fn mptcp(addr: &str) -> i32 {
         })(),
     )
 }
+
+/// Asks for a socket of this family, type and protocol, and closes it. Run it only inside the
+/// enclosure for a family whose module is not loaded: outside, the kernel would load it.
+pub fn socket(family: i32, ty: i32, protocol: i32) -> i32 {
+    outcome(
+        &format!("socket {family} {ty} {protocol}"),
+        (|| {
+            // SAFETY: plain socket call; the descriptor is closed at once.
+            let fd = unsafe { libc::socket(family, ty, protocol) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: our own descriptor.
+            unsafe { libc::close(fd) };
+            Ok(String::new())
+        })(),
+    )
+}

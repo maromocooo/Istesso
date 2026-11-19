@@ -156,38 +156,61 @@ impl Wants {
 // ---------------------------------------------------------------------------------------------
 // Grants: what "widen and keep" leaves for the next start.
 
-/// One remembered widening.
+/// One remembered widening. A file grant and a folder grant are told apart, so that a file
+/// kept as a grant and replaced by a folder since does not give the folder's whole tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Grant {
-    Read(PathBuf),
-    Write(PathBuf),
+    ReadFile(PathBuf),
+    ReadFolder(PathBuf),
+    WriteFile(PathBuf),
+    WriteFolder(PathBuf),
     Connect(SocketAddr),
 }
 
 impl Grant {
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Grant::ReadFile(p)
+            | Grant::ReadFolder(p)
+            | Grant::WriteFile(p)
+            | Grant::WriteFolder(p) => Some(p),
+            Grant::Connect(_) => None,
+        }
+    }
+
+    pub fn is_folder(&self) -> bool {
+        matches!(self, Grant::ReadFolder(_) | Grant::WriteFolder(_))
+    }
+
+    pub fn is_write(&self) -> bool {
+        matches!(self, Grant::WriteFile(_) | Grant::WriteFolder(_))
+    }
+
     /// The grant's line, or `None` when the path could not be read back exactly: not UTF-8, or
     /// holding a character that is not [`showable`] (a line break, a carriage return, a bidi
     /// control).
     pub fn line(&self) -> Option<String> {
-        let (kind, p) = match self {
-            Grant::Read(p) => ("read", p),
-            Grant::Write(p) => ("write", p),
+        let (kind, what, p) = match self {
+            Grant::ReadFile(p) => ("read", "file", p),
+            Grant::ReadFolder(p) => ("read", "folder", p),
+            Grant::WriteFile(p) => ("write", "file", p),
+            Grant::WriteFolder(p) => ("write", "folder", p),
             Grant::Connect(a) => return Some(format!("connect {a}")),
         };
         let text = p.to_str()?;
-        (showable(text) && is_plain_absolute(p)).then(|| format!("{kind} {text}"))
+        (showable(text) && is_plain_absolute(p)).then(|| format!("{kind} {what} {text}"))
     }
 }
 
 const GRANTS_HEADER: &str =
     "# istesso-scope grants: added by the owner's \"widen and keep\" answers, read at each start\n";
 
-/// Reads a grants file. Lines end with `\n` alone and are `read <absolute path>`,
-/// `write <absolute path>` or `connect <address:port>`, with one space after the kind; the path
-/// is the rest of the line, byte for byte. `#` starts a comment line. Anything else is an
-/// error, so a damaged file stops the start instead of granting something nobody meant: a
-/// carriage return or any other control character, and anything [`showable`] refuses, is never
-/// stripped or skipped.
+/// Reads a grants file. Lines end with `\n` alone and are `read file <absolute path>`,
+/// `read folder <path>`, `write file <path>`, `write folder <path>` or
+/// `connect <address:port>`, with one space between the parts; the path is the rest of the
+/// line, byte for byte. `#` starts a comment line. Anything else is an error, so a damaged file
+/// stops the start instead of granting something nobody meant: a carriage return or any other
+/// control character, and anything [`showable`] refuses, is never stripped or skipped.
 pub fn parse_grants(text: &str) -> Result<Vec<Grant>, String> {
     let mut out = Vec::new();
     for (n, line) in text.split('\n').enumerate() {
@@ -201,14 +224,19 @@ pub fn parse_grants(text: &str) -> Result<Vec<Grant>, String> {
         let (kind, rest) = line.split_once(' ').ok_or_else(|| bad("no value"))?;
         let grant = match kind {
             "read" | "write" => {
-                let p = PathBuf::from(rest);
+                let (what, path) = rest
+                    .split_once(' ')
+                    .ok_or_else(|| bad("no `file` or `folder`"))?;
+                let p = PathBuf::from(path);
                 if !p.is_absolute() || !is_plain_absolute(&p) {
                     return Err(bad("the path must be absolute, without `.` or `..`"));
                 }
-                if kind == "read" {
-                    Grant::Read(p)
-                } else {
-                    Grant::Write(p)
+                match (kind, what) {
+                    ("read", "file") => Grant::ReadFile(p),
+                    ("read", "folder") => Grant::ReadFolder(p),
+                    ("write", "file") => Grant::WriteFile(p),
+                    ("write", "folder") => Grant::WriteFolder(p),
+                    _ => return Err(bad("neither `file` nor `folder`")),
                 }
             }
             "connect" => Grant::Connect(
@@ -236,13 +264,53 @@ fn is_plain_absolute(p: &Path) -> bool {
     !rest.is_empty() && rest.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
-/// Appends a grant (creates the file, readable only by its owner, when it is missing).
-pub fn append_grant(file: &Path, grant: &Grant) -> io::Result<()> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+/// Opens the grants file without following a link in its place, and checks that it is a plain
+/// file of this user that nobody else can write. `Ok(None)`: there is none yet.
+fn open_grants(file: &Path, append: bool) -> io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    if append {
+        options.create(true).append(true).mode(0o600);
+    } else {
+        options.read(true);
+    }
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let f = match options.open(file) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !append => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(io::Error::other(format!(
+                "{} is a link; a grants file must be a plain file",
+                file.display()
+            )))
+        }
         Err(e) => return Err(e),
     };
+    let m = f.metadata()?;
+    // SAFETY: geteuid cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !m.is_file() || m.uid() != me || m.mode() & 0o022 != 0 {
+        return Err(io::Error::other(format!(
+            "{} must be a plain file of this user that no one else can write",
+            file.display()
+        )));
+    }
+    Ok(Some(f))
+}
+
+/// The text of the grants file (empty when there is none), checked as [`open_grants`] says.
+pub fn read_grants(file: &Path) -> io::Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Some(mut f) = open_grants(file, false)? {
+        f.read_to_string(&mut text)?;
+    }
+    Ok(text)
+}
+
+/// Appends a grant (creates the file, readable only by its owner, when it is missing).
+pub fn append_grant(file: &Path, grant: &Grant) -> io::Result<()> {
+    let text = read_grants(file)?;
     let existing = parse_grants(&text).map_err(io::Error::other)?;
     if existing.contains(grant) {
         return Ok(());
@@ -256,14 +324,9 @@ pub fn append_grant(file: &Path, grant: &Grant) -> io::Result<()> {
     if parse_grants(&line).ok().as_deref() != Some(std::slice::from_ref(grant)) {
         return Err(io::Error::other("the grant would not read back the same"));
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut f = options.open(file)?;
+    let Some(mut f) = open_grants(file, true)? else {
+        return Err(io::Error::other("the grants file could not be made"));
+    };
     if text.is_empty() {
         f.write_all(GRANTS_HEADER.as_bytes())?;
     }
@@ -383,12 +446,17 @@ impl Asker {
         expected: Option<&str>,
         wait: Duration,
     ) -> Result<Asker, String> {
-        if listen.ip().is_unspecified() {
+        let mapped_any = match listen.ip() {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4.is_unspecified()),
+            std::net::IpAddr::V4(_) => false,
+        };
+        if listen.ip().is_unspecified() || mapped_any {
             return Err(format!(
                 "{listen} would listen on every address; give loopback or one address of this machine"
             ));
         }
-        let keys = load_keys(keys_dir)?;
+        let keys = std::sync::Arc::new(load_keys(keys_dir)?);
+        let expected = expected.map(str::to_string);
         let listener = TcpListener::bind(listen).map_err(|e| format!("listen {listen}: {e}"))?;
         listener
             .set_nonblocking(true)
@@ -398,45 +466,72 @@ impl Asker {
             "istesso-scope: waiting up to {} s for the answering device on {listen}",
             wait.as_secs()
         );
+        // Each handshake runs on a thread of its own, so a connection that stalls (a stranger,
+        // a slow one) does not keep the device from being heard.
+        const MAX_HANDSHAKES: usize = 8;
+        type Done = Result<(Channel<TcpStream>, String), String>;
+        let (tx, rx) = std::sync::mpsc::channel::<Done>();
+        let mut in_flight = 0usize;
         loop {
+            while let Ok(done) = rx.try_recv() {
+                in_flight -= 1;
+                match done {
+                    Ok((channel, device)) => {
+                        eprintln!(
+                            "istesso-scope: the answering device is {}",
+                            shown(&device, 64)
+                        );
+                        return Ok(Asker {
+                            channel,
+                            device,
+                            broken: false,
+                        });
+                    }
+                    Err(e) => eprintln!("istesso-scope: {e}"),
+                }
+            }
             match listener.accept() {
                 Ok((stream, from)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let mut found: Option<String> = None;
-                    let result = Channel::respond_within(
-                        stream,
-                        &keys.local,
-                        Duration::from_secs(10),
-                        Duration::from_secs(60),
-                        |key| match keys.peers.find_by_key(key) {
-                            Some(p) if expected.is_none_or(|e| e == p.name || e == p.id) => {
-                                found = Some(p.name.clone());
-                                true
-                            }
-                            _ => false,
-                        },
-                    );
-                    match (result, found) {
-                        (Ok(channel), Some(device)) => {
-                            eprintln!("istesso-scope: the answering device is {device}");
-                            return Ok(Asker {
-                                channel,
-                                device,
-                                broken: false,
-                            });
-                        }
-                        (Err(e), _) => eprintln!(
-                            "istesso-scope: turned away a connection from {}: {e}",
-                            from.ip()
-                        ),
-                        (Ok(_), None) => {}
+                    if in_flight >= MAX_HANDSHAKES {
+                        continue; // dropped: too many at once
                     }
+                    in_flight += 1;
+                    let (keys, expected, tx) = (keys.clone(), expected.clone(), tx.clone());
+                    std::thread::spawn(move || {
+                        let _ = stream.set_nonblocking(false);
+                        let mut found: Option<String> = None;
+                        let result = Channel::respond_within(
+                            stream,
+                            &keys.local,
+                            Duration::from_secs(10),
+                            Duration::from_secs(60),
+                            |key| match keys.peers.find_by_key(key) {
+                                Some(p)
+                                    if expected
+                                        .as_deref()
+                                        .is_none_or(|e| e == p.name || e == p.id) =>
+                                {
+                                    found = Some(p.name.clone());
+                                    true
+                                }
+                                _ => false,
+                            },
+                        );
+                        let done = match (result, found) {
+                            (Ok(channel), Some(device)) => Ok((channel, device)),
+                            (Err(e), _) => {
+                                Err(format!("turned away a connection from {}: {e}", from.ip()))
+                            }
+                            (Ok(_), None) => Err("turned away a connection".to_string()),
+                        };
+                        let _ = tx.send(done);
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
                         return Err("no answering device connected in time".into());
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => return Err(format!("accept: {e}")),
             }
@@ -512,10 +607,83 @@ impl Asker {
 // ---------------------------------------------------------------------------------------------
 // The device's end: a test form in a terminal.
 
+/// What the person types at the test form's prompt.
+pub trait PromptInput {
+    /// Drops what was typed before the question was shown (typed ahead, or left over), so that
+    /// a keystroke meant for something else does not answer it.
+    fn drain(&mut self) {}
+    /// One line; `None` at the end of the input.
+    fn line(&mut self) -> Option<String>;
+}
+
+/// Lines from any reader (tests). Nothing is dropped.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct Lines<R: BufRead>(pub R);
+
+impl<R: BufRead> PromptInput for Lines<R> {
+    fn line(&mut self) -> Option<String> {
+        let mut s = String::new();
+        (self.0.read_line(&mut s).ok()? > 0).then_some(s)
+    }
+}
+
+/// A terminal, read without a buffer of our own, so that [`PromptInput::drain`] can drop
+/// everything typed before the question.
+pub struct Terminal {
+    pub fd: std::os::fd::RawFd,
+}
+
+impl Terminal {
+    pub fn stdin() -> Terminal {
+        Terminal { fd: 0 }
+    }
+
+    fn ready(&self) -> bool {
+        let mut p = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, no waiting.
+        unsafe { libc::poll(&mut p, 1, 0) == 1 && p.revents & libc::POLLIN != 0 }
+    }
+
+    fn read_some(&mut self, buf: &mut [u8]) -> usize {
+        // SAFETY: reads at most buf.len() bytes into buf.
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+        n.max(0) as usize
+    }
+}
+
+impl PromptInput for Terminal {
+    fn drain(&mut self) {
+        let mut buf = [0u8; 256];
+        while self.ready() {
+            if self.read_some(&mut buf) == 0 {
+                break;
+            }
+        }
+    }
+
+    fn line(&mut self) -> Option<String> {
+        let mut out = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            if self.read_some(&mut b) == 0 {
+                return (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned());
+            }
+            out.push(b[0]);
+            if b[0] == b'\n' {
+                return Some(String::from_utf8_lossy(&out).into_owned());
+            }
+        }
+    }
+}
+
 /// Where the answers come from.
-pub enum Answers<R: BufRead> {
+pub enum Answers<P: PromptInput> {
     /// Typed by a person at the prompt.
-    Prompt(R),
+    Prompt(P),
     /// A fixed list, one per question, in order (test harness). When it runs out: refuse.
     Script(Vec<Choice>),
 }
@@ -558,13 +726,59 @@ pub fn printable(text: &str) -> String {
         .collect()
 }
 
+/// Runs of two or more spaces as `[N spaces]`: padding cannot push text onto a line of its own.
+fn collapse_spaces(text: &str) -> String {
+    let mut out = String::new();
+    let mut run = 0usize;
+    let flush = |out: &mut String, run: usize| match run {
+        0 => {}
+        1 => out.push(' '),
+        n => out.push_str(&format!(" [{n} spaces] ")),
+    };
+    for c in text.chars() {
+        if c == ' ' {
+            run += 1;
+            continue;
+        }
+        flush(&mut out, run);
+        run = 0;
+        out.push(c);
+    }
+    flush(&mut out, run);
+    out
+}
+
+/// At most about `max` characters: the start and the end, and how much was left out between.
+pub fn shorten(text: &str, max: usize) -> String {
+    let n = text.chars().count();
+    if n <= max {
+        return text.to_string();
+    }
+    let half = max / 2;
+    let head: String = text.chars().take(half).collect();
+    let tail: String = text.chars().skip(n - half).collect();
+    format!("{head}...[{} characters left out]...{tail}", n - 2 * half)
+}
+
+/// Text chosen by the confined program, as the launcher sends it: runs of spaces collapsed, at
+/// most about `max` characters (the device escapes it again when it shows it).
+pub fn clip(text: &str, max: usize) -> String {
+    shorten(&collapse_spaces(text), max)
+}
+
+/// Text chosen by the confined program as the form and the launcher's log show it: escaped
+/// ([`printable`]), runs of spaces collapsed, at most about `max` characters.
+pub fn shown(text: &str, max: usize) -> String {
+    shorten(&collapse_spaces(&printable(text)), max)
+}
+
 /// Shows one question as the test form does.
 pub fn render(q: &Question, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "--- question {} ---", q.id)?;
     writeln!(
         out,
         "program:  {} (pid {}; the name is the program's own claim)",
-        printable(&q.program),
+        shown(&q.program, 64),
         q.pid
     )?;
     match &q.wants {
@@ -579,19 +793,23 @@ pub fn render(q: &Question, out: &mut impl Write) -> io::Result<()> {
                 out,
                 "wants to: {} the {what} {}",
                 access.name(),
-                printable(path)
+                shown(path, 300)
             )?;
             if let Some(a) = asked_as {
-                writeln!(out, "asked as: {}", printable(a))?;
+                writeln!(out, "asked as: {}", shown(a, 200))?;
             }
         }
-        Wants::Connect { address } => writeln!(out, "wants to: connect to {}", printable(address))?,
+        Wants::Connect { address } => writeln!(out, "wants to: connect to {}", shown(address, 80))?,
     }
-    writeln!(out, "  [1] allow once (this operation only)")?;
+    writeln!(
+        out,
+        "  [1] allow once (this one open or connection; the program keeps what it got, and \
+         programs it starts can inherit it)"
+    )?;
     writeln!(
         out,
         "  [2] widen for this run: {}",
-        printable(&q.wants.widen_target())
+        shown(&q.wants.widen_target(), 400)
     )?;
     writeln!(
         out,
@@ -604,11 +822,11 @@ pub fn render(q: &Question, out: &mut impl Write) -> io::Result<()> {
 /// Connects to the launcher at `addr` (retrying until `retry` has passed), then answers its
 /// questions until the command ends. Returns the command's exit status, or an error when the
 /// conversation ended without one.
-pub fn answer<R: BufRead>(
+pub fn answer<P: PromptInput>(
     addr: SocketAddr,
     keys_dir: &Path,
     retry: Duration,
-    mut answers: Answers<R>,
+    mut answers: Answers<P>,
     out: &mut impl Write,
 ) -> Result<i32, String> {
     let keys = load_keys(keys_dir)?;
@@ -641,7 +859,7 @@ pub fn answer<R: BufRead>(
     writeln!(
         out,
         "connected to {} over the Istesso link",
-        printable(&host)
+        shown(&host, 64)
     )
     .ok();
     let mut script_pos = 0usize;
@@ -660,8 +878,8 @@ pub fn answer<R: BufRead>(
                 writeln!(
                     out,
                     "run: level {level}, project {}, command {}; a question not answered in {ask_timeout_secs} s is refused",
-                    printable(&project),
-                    printable(&command.join(" "))
+                    shown(&project, 300),
+                    shown(&command.join(" "), 300)
                 )
                 .ok();
             }
@@ -673,17 +891,19 @@ pub fn answer<R: BufRead>(
                         script_pos += 1;
                         c
                     }
-                    Answers::Prompt(input) => loop {
-                        write!(out, "answer [1-4]: ").ok();
-                        out.flush().ok();
-                        let mut line = String::new();
-                        if input.read_line(&mut line).unwrap_or(0) == 0 {
-                            break Choice::Refuse;
+                    Answers::Prompt(input) => {
+                        input.drain();
+                        loop {
+                            write!(out, "answer [1-4]: ").ok();
+                            out.flush().ok();
+                            let Some(line) = input.line() else {
+                                break Choice::Refuse;
+                            };
+                            if let Some(c) = Choice::parse(&line) {
+                                break c;
+                            }
                         }
-                        if let Some(c) = Choice::parse(&line) {
-                            break c;
-                        }
-                    },
+                    }
                 };
                 writeln!(out, "answer:   {}", choice.name()).ok();
                 let reply = serde_json::to_vec(&DeviceSays::Answer { id: q.id, choice })
@@ -691,7 +911,7 @@ pub fn answer<R: BufRead>(
                 channel.send(&reply).map_err(|e| format!("link: {e}"))?;
             }
             HostSays::Outcome { id, outcome } => {
-                writeln!(out, "outcome {id}: {}", printable(&outcome)).ok();
+                writeln!(out, "outcome {id}: {}", shown(&outcome, 200)).ok();
             }
             HostSays::Done { exit } => {
                 writeln!(out, "the command ended with status {exit}").ok();
@@ -749,13 +969,14 @@ mod tests {
 
     #[test]
     fn grants_round_trip_and_refuse_anything_unclear() {
-        let text = "# comment\nread /work/a.txt\nwrite /work/out\nconnect 127.0.0.1:26888\n\n";
+        let text =
+            "# comment\nread file /work/a.txt\nwrite folder /work/out\nconnect 127.0.0.1:26888\n\n";
         let g = parse_grants(text).unwrap();
         assert_eq!(
             g,
             vec![
-                Grant::Read(PathBuf::from("/work/a.txt")),
-                Grant::Write(PathBuf::from("/work/out")),
+                Grant::ReadFile(PathBuf::from("/work/a.txt")),
+                Grant::WriteFolder(PathBuf::from("/work/out")),
                 Grant::Connect("127.0.0.1:26888".parse().unwrap()),
             ]
         );
@@ -764,22 +985,24 @@ mod tests {
         }
         // A path with spaces is the rest of the line, as it is.
         assert_eq!(
-            parse_grants("read /w/a b \n").unwrap(),
-            vec![Grant::Read(PathBuf::from("/w/a b "))]
+            parse_grants("read file /w/a b \n").unwrap(),
+            vec![Grant::ReadFile(PathBuf::from("/w/a b "))]
         );
         // A carriage return is refused, never stripped (it would name another file).
-        assert!(parse_grants("read /w/a\r\n").is_err());
-        assert!(parse_grants("read /w/a\r").is_err());
-        assert!(parse_grants("read /w/\u{202e}txt.a\n").is_err());
-        assert!(parse_grants("read /w/a\u{200b}\n").is_err());
-        assert!(parse_grants("read /w/a\tb\n").is_err());
-        assert!(parse_grants("read  /w/a").is_err());
-        assert!(parse_grants("read relative/x").is_err());
-        assert!(parse_grants("read /work/../etc/shadow").is_err());
-        assert!(parse_grants("read /work/./x").is_err());
-        assert!(parse_grants("read /work//x").is_err());
-        assert!(parse_grants("read /work/x/").is_err());
-        assert!(parse_grants("read /").is_err());
+        assert!(parse_grants("read file /w/a\r\n").is_err());
+        assert!(parse_grants("read file /w/a\r").is_err());
+        assert!(parse_grants("read file /w/\u{202e}txt.a\n").is_err());
+        assert!(parse_grants("read file /w/a\u{200b}\n").is_err());
+        assert!(parse_grants("read file /w/a\tb\n").is_err());
+        assert!(parse_grants("read file  /w/a").is_err());
+        assert!(parse_grants("read /w/a").is_err());
+        assert!(parse_grants("read thing /w/a").is_err());
+        assert!(parse_grants("read file relative/x").is_err());
+        assert!(parse_grants("read file /work/../etc/shadow").is_err());
+        assert!(parse_grants("read file /work/./x").is_err());
+        assert!(parse_grants("read file /work//x").is_err());
+        assert!(parse_grants("read file /work/x/").is_err());
+        assert!(parse_grants("read file /").is_err());
         assert!(parse_grants("execute /bin/sh").is_err());
         assert!(parse_grants("connect example").is_err());
         assert!(parse_grants("read").is_err());
@@ -814,18 +1037,18 @@ mod tests {
             "/w/a\u{a0}b",
             "/w/../etc",
         ] {
-            assert_eq!(Grant::Write(PathBuf::from(bad)).line(), None, "{bad:?}");
+            assert_eq!(Grant::WriteFile(PathBuf::from(bad)).line(), None, "{bad:?}");
         }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             let not_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/w/\xff"));
-            assert_eq!(Grant::Read(not_utf8).line(), None);
+            assert_eq!(Grant::ReadFile(not_utf8).line(), None);
         }
         let d = temp_dir("bad-grants");
         let f = d.join("grants");
         let _ = std::fs::remove_file(&f);
-        assert!(append_grant(&f, &Grant::Write(PathBuf::from("/w/b.txt\r"))).is_err());
+        assert!(append_grant(&f, &Grant::WriteFile(PathBuf::from("/w/b.txt\r"))).is_err());
         assert!(!f.exists(), "nothing is written for a refused grant");
         let _ = std::fs::remove_dir(&d);
     }
@@ -871,14 +1094,27 @@ mod tests {
         let d = temp_dir("grants");
         let f = d.join("grants");
         let _ = std::fs::remove_file(&f);
-        let g = Grant::Write(PathBuf::from("/work/out/b.txt"));
+        let g = Grant::WriteFile(PathBuf::from("/work/out/b.txt"));
         append_grant(&f, &g).unwrap();
         append_grant(&f, &g).unwrap();
         append_grant(&f, &Grant::Connect("127.0.0.1:26888".parse().unwrap())).unwrap();
         let back = parse_grants(&std::fs::read_to_string(&f).unwrap()).unwrap();
         assert_eq!(back.len(), 2);
         assert_eq!(back[0], g);
+        // A link in the grants file's place, and a file others can write, are refused.
+        let real = d.join("real");
+        std::fs::write(&real, "").unwrap();
         std::fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink(&real, &f).unwrap();
+        assert!(read_grants(&f).is_err());
+        assert!(append_grant(&f, &g).is_err());
+        std::fs::remove_file(&f).unwrap();
+        std::fs::write(&f, "").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o622)).unwrap();
+        assert!(read_grants(&f).is_err());
+        std::fs::remove_file(&f).unwrap();
+        std::fs::remove_file(&real).unwrap();
         std::fs::remove_dir(&d).unwrap();
     }
 
@@ -928,8 +1164,11 @@ mod tests {
         });
         let mut out = Vec::new();
         // Three answers, then the list runs out: the fourth is refused.
-        let script =
-            Answers::<io::Empty>::Script(vec![Choice::Once, Choice::WidenKeep, Choice::Refuse]);
+        let script = Answers::<Lines<io::Empty>>::Script(vec![
+            Choice::Once,
+            Choice::WidenKeep,
+            Choice::Refuse,
+        ]);
         let code = answer(addr, &device_dir, Duration::from_secs(20), script, &mut out).unwrap();
         assert_eq!(code, 0);
         let got = host.join().unwrap();
@@ -956,7 +1195,7 @@ mod tests {
 
     #[test]
     fn the_launcher_never_listens_on_every_address() {
-        for addr in ["0.0.0.0:26881", "[::]:26881"] {
+        for addr in ["0.0.0.0:26881", "[::]:26881", "[::ffff:0.0.0.0]:26881"] {
             let e = Asker::wait_for_device(
                 addr.parse().unwrap(),
                 Path::new("/nonexistent"),
@@ -967,6 +1206,42 @@ mod tests {
             .unwrap();
             assert!(e.contains("every address"), "{e}");
         }
+    }
+
+    /// Keys typed before the question are dropped; the answer is what comes after.
+    #[test]
+    fn typed_ahead_input_is_dropped_before_a_question() {
+        let mut fds = [0i32; 2];
+        // SAFETY: a pipe into a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let write = |b: &[u8]| {
+            // SAFETY: writes the bytes of a local slice.
+            unsafe { libc::write(w, b.as_ptr().cast(), b.len()) };
+        };
+        write(b"1\n1\n");
+        let mut t = Terminal { fd: r };
+        t.drain();
+        write(b"4\n");
+        assert_eq!(t.line().as_deref(), Some("4\n"));
+        // SAFETY: closing our own pipe.
+        unsafe {
+            libc::close(w);
+            libc::close(r);
+        }
+    }
+
+    #[test]
+    fn long_and_padded_names_are_shortened() {
+        let padded = format!("/w/a{}[4] refuse", " ".repeat(300));
+        let s = shown(&padded, 200);
+        assert!(s.contains("[300 spaces]"), "{s}");
+        assert!(!s.contains("  "), "{s}");
+        let long = "x".repeat(1000);
+        let s = shown(&long, 200);
+        assert!(s.chars().count() < 260, "{s}");
+        assert!(s.contains("[800 characters left out]"), "{s}");
+        assert_eq!(shown("/w/a b", 200), "/w/a b");
     }
 
     /// A person who types slowly at the prompt.
@@ -1021,10 +1296,10 @@ mod tests {
             asker.send(&HostSays::Done { exit: 0 });
             (first, second)
         });
-        let input = io::BufReader::new(Slow {
+        let input = Lines(io::BufReader::new(Slow {
             text: b"1\n4\n",
             slept: false,
-        });
+        }));
         let mut out = Vec::new();
         answer(
             addr,
@@ -1075,7 +1350,7 @@ mod tests {
             addr,
             &stranger_dir,
             Duration::from_secs(20),
-            Answers::<io::Empty>::Script(vec![]),
+            Answers::<Lines<io::Empty>>::Script(vec![]),
             &mut out,
         );
         assert!(
@@ -1086,7 +1361,7 @@ mod tests {
             addr,
             &device_dir,
             Duration::from_secs(20),
-            Answers::<io::Empty>::Script(vec![]),
+            Answers::<Lines<io::Empty>>::Script(vec![]),
             &mut out,
         )
         .unwrap();

@@ -206,6 +206,13 @@ enum ProbeCmd {
     },
     /// Asks for an io_uring instance.
     IoUring,
+    /// Asks for a socket (family, type and protocol as numbers). Only inside the enclosure for
+    /// a family whose kernel module is not loaded.
+    Socket {
+        family: i32,
+        ty: i32,
+        protocol: i32,
+    },
     /// Connects with MPTCP (IPv4 address:port).
     Mptcp {
         addr: String,
@@ -295,7 +302,7 @@ fn answer(
             }
             ask::Answers::Script(choices)
         }
-        None => ask::Answers::Prompt(std::io::stdin().lock()),
+        None => ask::Answers::Prompt(ask::Terminal::stdin()),
     };
     let mut out = std::io::stdout();
     match ask::answer(
@@ -483,10 +490,13 @@ fn run(args: &ScopeArgs, hold: HoldArgs, listen_anywhere: bool, command: &[Strin
             return 125;
         }
     };
-    if let Err(e) = check_private_places(&plan, &hold) {
-        eprintln!("istesso-scope: {e}");
-        return 125;
-    }
+    let private = match check_private_places(&plan, &hold) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("istesso-scope: {e}");
+            return 125;
+        }
+    };
     let outside: Vec<(String, String)> = std::env::vars().collect();
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
@@ -596,6 +606,7 @@ fn run(args: &ScopeArgs, hold: HoldArgs, listen_anywhere: bool, command: &[Strin
             kept_connects,
             loopback,
             run_info,
+            private,
         };
         return linux::hold::run(&plan, built.ruleset, cmd, opts);
     }
@@ -635,33 +646,45 @@ fn apply_grants(
     let Some(file) = &hold.grants else {
         return Ok(Vec::new());
     };
-    let text = match std::fs::read_to_string(file) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("{}: {e}", file.display())),
-    };
+    let text = ask::read_grants(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut connects = Vec::new();
     for g in ask::parse_grants(&text)? {
-        match g {
-            ask::Grant::Read(p) | ask::Grant::Write(p) if !p.exists() => {
-                if say {
-                    eprintln!("istesso-scope: kept grant for missing path {}", p.display());
+        let ask::Grant::Connect(a) = g else {
+            let p = g.path().map(Path::to_path_buf).unwrap_or_default();
+            let skip = |why: &str| {
+                eprintln!(
+                    "istesso-scope: kept grant for {} skipped: {why}",
+                    ask::shown(&p.display().to_string(), 300)
+                )
+            };
+            match std::fs::symlink_metadata(&p) {
+                Err(_) => {
+                    if say {
+                        skip("missing");
+                    }
+                    continue;
                 }
+                Ok(m) if m.is_dir() != g.is_folder() => {
+                    skip("it was kept as a file and is a folder now, or the other way round");
+                    continue;
+                }
+                Ok(_) => {}
             }
             // The rule would be put on whatever the path leads to now: a link put in its place
             // since (or in a folder above) would move the grant elsewhere.
-            ask::Grant::Read(p) | ask::Grant::Write(p)
-                if std::fs::canonicalize(&p).ok().as_deref() != Some(p.as_path()) =>
-            {
-                eprintln!(
-                    "istesso-scope: kept grant for {} skipped: the path leads elsewhere now",
-                    p.display()
-                );
+            if std::fs::canonicalize(&p).ok().as_deref() != Some(p.as_path()) {
+                skip("the path leads elsewhere now");
+                continue;
             }
-            ask::Grant::Read(p) => plan.add_rule(p, policy::Access::Read),
-            ask::Grant::Write(p) => plan.add_rule(p, policy::Access::Write),
-            ask::Grant::Connect(a) => connects.push(a),
-        }
+            let access = if g.is_write() {
+                policy::Access::Write
+            } else {
+                policy::Access::Read
+            };
+            plan.add_rule(p, access);
+            continue;
+        };
+        connects.push(a);
     }
     if say && !text.is_empty() {
         eprintln!("istesso-scope: read the kept grants in {}", file.display());
@@ -670,11 +693,14 @@ fn apply_grants(
 }
 
 /// The link keys must stay unreadable and the grants file unwritable for the confined command,
-/// or it could answer its own questions or widen its own scope.
+/// or it could answer its own questions or widen its own scope. Returns both places, for the
+/// supervisor, which refuses them without a question too.
 #[cfg(target_os = "linux")]
-fn check_private_places(plan: &Plan, hold: &HoldArgs) -> Result<(), String> {
+fn check_private_places(plan: &Plan, hold: &HoldArgs) -> Result<Vec<PathBuf>, String> {
+    let mut private = Vec::new();
     if let Some(keys) = &hold.link_keys {
         let keys = absolute(keys)?;
+        private.push(keys.clone());
         if plan.covers(&keys, false) || plan.covers(&keys.join("identity"), false) {
             return Err(format!(
                 "the confined command could read the link keys in {}; keep them outside its rules",
@@ -695,8 +721,9 @@ fn check_private_places(plan: &Plan, hold: &HoldArgs) -> Result<(), String> {
                 parent.display()
             ));
         }
+        private.push(parent.join(name));
     }
-    Ok(())
+    Ok(private)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -725,6 +752,11 @@ fn probe(what: ProbeCmd) -> i32 {
         } => p::serve_tcp(port, seconds, &reply),
         ProbeCmd::BindAny { port, v6 } => p::bind_any(port, v6),
         ProbeCmd::IoUring => p::io_uring(),
+        ProbeCmd::Socket {
+            family,
+            ty,
+            protocol,
+        } => p::socket(family, ty, protocol),
         ProbeCmd::Mptcp { addr } => p::mptcp(&addr),
         ProbeCmd::ServeAbstract {
             name,

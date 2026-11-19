@@ -18,8 +18,10 @@ istesso-link.workspace = true
 istesso-pair.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The grants file (O_NOFOLLOW, the owner's id) and the test form's prompt (poll), on every
+# system; the Landlock calls on Linux. MIT OR Apache-2.0.
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Landlock system calls (ADR 0026, docs/research/agent-scope-proto.md). MIT OR Apache-2.0.
 landlock = "0.4.7"
-libc = "0.2"

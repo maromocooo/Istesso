@@ -91,11 +91,21 @@ impl Drop for Fixture {
             "outside/grants",
             "outside/x.txt",
             "outside/cr.txt\r",
+            "outside/keep/grants",
+            "outside/excl.txt",
             "outside/\u{202e}txt.exe",
         ] {
             let _ = std::fs::remove_file(self.p(f));
         }
-        for d in ["state/home", "state/tmp", "state", "project", "outside", ""] {
+        for d in [
+            "state/home",
+            "state/tmp",
+            "state",
+            "project",
+            "outside/keep",
+            "outside",
+            "",
+        ] {
             let _ = std::fs::remove_dir(self.p(d));
         }
     }
@@ -242,7 +252,7 @@ fn a_kept_widening_is_a_kernel_rule_at_the_next_start() {
     );
     assert!(ok, "{text}");
     let kept = std::fs::read_to_string(&grants).unwrap();
-    assert!(kept.contains(&format!("read {outside}")), "{kept}");
+    assert!(kept.contains(&format!("read file {outside}")), "{kept}");
     // Next start: no stand-in (it would refuse), and nothing is asked.
     let (ok, text) = f.probe(
         "1",
@@ -269,6 +279,16 @@ fn a_kept_widening_is_a_kernel_rule_at_the_next_start() {
     assert!(!ok, "{text}");
     assert!(text.contains("leads elsewhere now"), "{text}");
     std::fs::remove_file(&outside).unwrap();
+    // A folder in place of the kept file: the file grant does not become a rule for the folder.
+    std::fs::create_dir(&outside).unwrap();
+    let (ok, text) = f.probe(
+        "1",
+        &["--listen-anywhere", "--grants", &grants],
+        &["read", &f.p("outside/x.txt").display().to_string()],
+    );
+    assert!(text.contains("is a folder now"), "{text}");
+    let _ = ok;
+    std::fs::remove_dir(&outside).unwrap();
     std::fs::rename(f.p("outside/x.txt"), &outside).unwrap();
     // A grants file the command could write is refused.
     let inside_grants = f.p("project/grants").display().to_string();
@@ -409,6 +429,207 @@ fn io_uring_and_mptcp_are_refused_with_or_without_the_supervisor() {
     // Level 4 is not confined.
     let (ok, text) = f.probe("4", &[], &["io-uring"]);
     assert!(ok, "{text}");
+}
+
+fn python() -> bool {
+    Path::new("/usr/bin/python3").exists()
+}
+
+/// A timer in the held program (every 0.3 s) while the owner takes 2 s to answer: one question,
+/// and the open returns, instead of a new question at each signal (WAIT_KILLABLE_RECV).
+#[test]
+fn a_signal_during_a_question_does_not_restart_it() {
+    if !supported() || !cfg!(target_arch = "x86_64") || !python() {
+        return;
+    }
+    let f = Fixture::new();
+    let outside = f.p("outside/secret.txt").display().to_string();
+    let script = format!(
+        "import signal, time\n\
+         signal.signal(signal.SIGALRM, lambda *a: None)\n\
+         signal.setitimer(signal.ITIMER_REAL, 0.3, 0.3)\n\
+         t = time.monotonic()\n\
+         open({outside:?}).read()\n\
+         print(f'opened after {{time.monotonic() - t:.1f}} s')\n"
+    );
+    let out = f.run(
+        "1",
+        &["--hold-files", "--ask-cmd", "sleep 2; exit 0"],
+        &["/usr/bin/python3", "-c", &script],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("opened after"), "{text}");
+    assert!(text.contains("; 1 asked"), "{text}");
+}
+
+/// The grants file is never opened for the command, not with an answer, not under a folder
+/// widened for the run; and a folder above it is not kept as a grant.
+#[test]
+fn the_grants_file_is_never_given_to_the_command() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.p("outside/keep")).unwrap();
+    let grants = f.p("outside/keep/grants").display().to_string();
+    let keep_dir = f.p("outside/keep").display().to_string();
+    // Asked about and allowed for everything else: the grants file is refused without asking.
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 0", "--grants", &grants],
+        &["write", &grants],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("refused without asking"), "{text}");
+    assert!(text.contains(" 0 asked"), "{text}");
+    // Widen the folder above it for the run, then write the grants file: refused.
+    let script = format!("ls {keep_dir} >/dev/null && {EXE} probe write {grants}");
+    let out = f.run(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 10", "--grants", &grants],
+        &["/bin/sh", "-c", &script],
+    );
+    let text =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("refused without asking"), "{text}");
+    // Keep the folder above it: not kept.
+    let out = f.run(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 11", "--grants", &grants],
+        &["/bin/ls", &keep_dir],
+    );
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(text.contains("not kept"), "{text}");
+    let kept = std::fs::read_to_string(&grants).unwrap_or_default();
+    assert!(!kept.contains("folder"), "{kept}");
+}
+
+/// A widening is recorded only for an open that worked: an O_CREAT|O_EXCL open of an existing
+/// file fails, and the next open of that file is asked about again.
+#[test]
+fn a_failed_open_leaves_no_widening() {
+    if !supported() || !cfg!(target_arch = "x86_64") || !python() {
+        return;
+    }
+    let f = Fixture::new();
+    let excl = f.p("outside/excl.txt");
+    std::fs::write(&excl, "x").unwrap();
+    let path = excl.display().to_string();
+    let script = format!(
+        "import os\n\
+         try:\n    os.open({path:?}, os.O_CREAT | os.O_EXCL | os.O_WRONLY)\n\
+         except FileExistsError:\n    print('exists')\n\
+         print(open({path:?}).read())\n"
+    );
+    let out = f.run(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 10"],
+        &["/usr/bin/python3", "-c", &script],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("exists"), "{text}");
+    assert!(text.contains("; 2 asked"), "{text}");
+    assert!(text.contains("1 failed"), "{text}");
+    assert!(text.contains("0 done by an earlier widening"), "{text}");
+}
+
+/// The socket allow-list, inside the enclosure only (outside, asking for an SMC or VSOCK
+/// socket could load a kernel module).
+#[test]
+fn sockets_outside_the_allow_list_are_refused() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    for extra in [&["--listen-anywhere"][..], &["--hold-files"][..]] {
+        for (family, ty, proto, errno) in [
+            ("43", "1", "0", "os error 97"),   // AF_SMC: EAFNOSUPPORT
+            ("40", "1", "0", "os error 97"),   // AF_VSOCK
+            ("2", "1", "262", "os error 93"),  // MPTCP: EPROTONOSUPPORT
+            ("10", "1", "132", "os error 93"), // SCTP stream
+            ("2", "5", "0", "os error 93"),    // SEQPACKET
+        ] {
+            let (ok, text) = f.probe("1", extra, &["socket", family, ty, proto]);
+            assert!(!ok, "{text}");
+            assert!(text.contains(errno), "{text}");
+        }
+        for (family, ty, proto) in [
+            ("2", "1", "0"),
+            ("10", "1", "6"),
+            ("2", "2", "0"),
+            ("1", "1", "0"),
+        ] {
+            let (ok, text) = f.probe("1", extra, &["socket", family, ty, proto]);
+            assert!(ok, "{text}");
+        }
+    }
+}
+
+/// A name padded with spaces is shortened in the launcher's log as on the form.
+#[test]
+fn a_padded_name_is_collapsed() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let link = f.p(&format!("project/a{}b", " ".repeat(200)));
+    std::os::unix::fs::symlink(f.p("outside/secret.txt"), &link).unwrap();
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 1"],
+        &["read", &link.display().to_string()],
+    );
+    std::fs::remove_file(&link).unwrap();
+    assert!(!ok, "{text}");
+    assert!(text.contains("[200 spaces]"), "{text}");
+}
+
+/// A non-blocking connect, then a second connect on the same socket to learn how it went: one
+/// question.
+#[test]
+fn a_second_connect_on_an_approved_socket_is_not_asked_again() {
+    if !supported() || !cfg!(target_arch = "x86_64") || !python() {
+        return;
+    }
+    let f = Fixture::new();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = other.local_addr().unwrap().port();
+    let script = format!(
+        "import socket, select\n\
+         s = socket.socket()\n\
+         s.setblocking(False)\n\
+         print('first', s.connect_ex(('127.0.0.1', {port})))\n\
+         select.select([], [s], [], 5)\n\
+         print('second', s.connect_ex(('127.0.0.1', {port})))\n"
+    );
+    let out = f.run(
+        "1",
+        &["--hold-connect", "--ask-cmd", "exit 0"],
+        &["/usr/bin/python3", "-c", &script],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("; 1 asked"), "{text}");
+    // 106: EISCONN, or 0: the second call reports success.
+    assert!(
+        text.contains("second 106") || text.contains("second 0"),
+        "{text}"
+    );
 }
 
 #[test]

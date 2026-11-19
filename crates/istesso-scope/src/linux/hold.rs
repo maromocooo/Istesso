@@ -87,6 +87,9 @@ pub struct Options {
     pub loopback: bool,
     /// Told to the answering device before the command starts.
     pub run_info: Option<HostSays>,
+    /// Places the command never gets, not even with an answer (the grants file, the link keys):
+    /// an open of one of them, or of anything under them, is refused without a question.
+    pub private: Vec<PathBuf>,
 }
 
 /// The system calls sent to the supervisor and those answered `ENOSYS`.
@@ -120,8 +123,8 @@ const ALWAYS_ENOSYS: [libc::c_long; 4] = [
     libc::SYS_open_by_handle_at,
 ];
 
-/// `IPPROTO_MPTCP` (linux/in.h).
-const IPPROTO_MPTCP: u32 = 262;
+/// The socket type without `SOCK_NONBLOCK` and `SOCK_CLOEXEC` (linux/net.h).
+const SOCK_TYPE_MASK: u32 = 0xf;
 
 /// `MSG_FASTOPEN` (linux/socket.h).
 const MSG_FASTOPEN: u32 = 0x2000_0000;
@@ -139,16 +142,21 @@ const fn arg_low(i: u32) -> u32 {
 ///
 /// - `sendto`, `sendmsg` and `sendmmsg` with `MSG_FASTOPEN` get `EOPNOTSUPP`. TCP Fast Open makes
 ///   the connection inside the send, and a port refused to `connect` was reached that way.
-/// - `socket` with `IPPROTO_MPTCP` gets `EPROTONOSUPPORT`. Landlock's rule covers TCP sockets
-///   only, and an MPTCP socket reached a refused TCP port (MPTCP falls back to plain TCP).
+/// - `socket` takes an allow-list: UNIX, INET, INET6 and NETLINK sockets (anything else:
+///   `EAFNOSUPPORT`), and an INET or INET6 stream socket only with protocol 0 or TCP, no
+///   SEQPACKET (`EPROTONOSUPPORT`). Landlock's rule covers TCP sockets only: an MPTCP socket
+///   reached a refused TCP port (MPTCP falls back to plain TCP), and SMC (`AF_SMC`) may do the
+///   same (not tried: it would load kernel modules). The filter answers before the kernel
+///   looks for a module.
 ///
 /// And the calls of `ALWAYS_ENOSYS` get `ENOSYS`.
 pub fn filter(opts: &Options) -> Vec<libc::sock_filter> {
     use libc::{
-        BPF_ABS, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W,
-        ENOSYS, EOPNOTSUPP, EPROTONOSUPPORT, SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO,
-        SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_USER_NOTIF,
+        BPF_ABS, BPF_ALU, BPF_AND, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JMP, BPF_JSET, BPF_K, BPF_LD,
+        BPF_RET, BPF_W, EAFNOSUPPORT, ENOSYS, EOPNOTSUPP, EPROTONOSUPPORT, SECCOMP_RET_ALLOW,
+        SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_USER_NOTIF,
     };
+    let ret_errno = |e: i32| stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | e as u32);
     let eq = BPF_JMP | BPF_JEQ | BPF_K;
     let ld = BPF_LD | BPF_W | BPF_ABS;
     let (notify, enosys) = calls(opts);
@@ -171,13 +179,25 @@ pub fn filter(opts: &Options) -> Vec<libc::sock_filter> {
         /* 12 */ jump(BPF_JMP | BPF_JSET | BPF_K, MSG_FASTOPEN, 0, 1),
         /* 13 */ stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EOPNOTSUPP as u32),
         /* 14 */ stmt(ld, 0), // seccomp_data.nr again
-        // MPTCP: the protocol is the 3rd argument of socket.
+        // socket(family, type, protocol): the allow-list.
         /* 15 */
-        jump(eq, libc::SYS_socket as u32, 0, 3),
-        /* 16 */ stmt(ld, arg_low(2)),
-        /* 17 */ jump(eq, IPPROTO_MPTCP, 0, 1),
-        /* 18 */ stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPROTONOSUPPORT as u32),
-        /* 19 */ stmt(ld, 0), // seccomp_data.nr again
+        jump(eq, libc::SYS_socket as u32, 0, 14),
+        /* 16 */ stmt(ld, arg_low(0)),
+        /* 17 */ jump(eq, libc::AF_UNIX as u32, 12, 0),
+        /* 18 */ jump(eq, libc::AF_NETLINK as u32, 11, 0),
+        /* 19 */ jump(eq, libc::AF_INET as u32, 2, 0),
+        /* 20 */ jump(eq, libc::AF_INET6 as u32, 1, 0),
+        /* 21 */ ret_errno(EAFNOSUPPORT),
+        /* 22 */ stmt(ld, arg_low(1)),
+        /* 23 */
+        stmt(BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK), // without NONBLOCK, CLOEXEC
+        /* 24 */ jump(eq, libc::SOCK_STREAM as u32, 1, 0),
+        /* 25 */ jump(eq, libc::SOCK_SEQPACKET as u32, 3, 4),
+        /* 26 */ stmt(ld, arg_low(2)),
+        /* 27 */ jump(eq, 0, 2, 0),
+        /* 28 */ jump(eq, libc::IPPROTO_TCP as u32, 1, 0),
+        /* 29 */ ret_errno(EPROTONOSUPPORT),
+        /* 30 */ stmt(ld, 0), // seccomp_data.nr again
     ];
     let checks = notify.len() + enosys.len();
     let allow = f.len() + checks;
@@ -210,6 +230,7 @@ pub fn install_plain() -> io::Result<()> {
         kept_connects: Vec::new(),
         loopback: false,
         run_info: None,
+        private: Vec::new(),
     });
     let prog = libc::sock_fprog {
         len: program.len() as u16,
@@ -252,10 +273,13 @@ fn install(filter: &mut [libc::sock_filter]) -> io::Result<RawFd> {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(last_error());
         }
+        // WAIT_KILLABLE_RECV: once the supervisor has the question, only a fatal signal ends the
+        // wait. Without it, a timer or SIGCHLD in the held process restarts the call under a new
+        // id; the answer then lands on a dead id while the approved operation is still done.
         let fd = libc::syscall(
             libc::SYS_seccomp,
             libc::SECCOMP_SET_MODE_FILTER,
-            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER | libc::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
             &prog as *const libc::sock_fprog,
         );
         if fd < 0 {
@@ -332,6 +356,8 @@ struct Stats {
     by_widening: u64,
     refused: u64,
     no_answer: u64,
+    private: u64,
+    failed: u64,
     busy: Duration,
 }
 
@@ -432,6 +458,8 @@ pub fn run(plan: &Plan, ruleset: RulesetCreated, mut cmd: Command, mut opts: Opt
         timeout: opts.ask_timeout,
         grants: opts.grants.take(),
         kept_connects: std::mem::take(&mut opts.kept_connects),
+        private: std::mem::take(&mut opts.private),
+        approved_sockets: Vec::new(),
         widened_files: Vec::new(),
         widened_connects: Vec::new(),
         next_id: 0,
@@ -472,7 +500,8 @@ pub fn run(plan: &Plan, ruleset: RulesetCreated, mut cmd: Command, mut opts: Opt
     eprintln!(
         "istesso-scope: hold: {} opens and {} connects seen, {} left to the kernel; {} asked \
          ({} once, {} widened for the run, {} widened and kept, {} refused, {} without an \
-         answer); {} done by an earlier widening; supervisor busy {} ms",
+         answer, {} failed); {} done by an earlier widening; {} refused without asking (private); \
+         supervisor busy {} ms",
         stats.opens,
         stats.connects,
         stats.to_kernel,
@@ -482,7 +511,9 @@ pub fn run(plan: &Plan, ruleset: RulesetCreated, mut cmd: Command, mut opts: Opt
         a.widened_keep,
         a.refused,
         a.no_answer,
+        a.failed,
         a.by_widening,
+        a.private,
         stats.busy.as_millis()
     );
     code
@@ -699,6 +730,11 @@ struct AskState {
     timeout: Duration,
     grants: Option<PathBuf>,
     kept_connects: Vec<SocketAddr>,
+    private: Vec<PathBuf>,
+    /// Sockets (inode numbers) connected on a process's behalf, with the address: a second
+    /// connect on the same socket to the same address (a non-blocking one, asking how it went)
+    /// is not asked again.
+    approved_sockets: Vec<(u64, SocketAddr)>,
     /// Files and folders widened during this run, with whether writing is included.
     widened_files: Vec<(PathBuf, bool)>,
     widened_connects: Vec<SocketAddr>,
@@ -725,6 +761,15 @@ impl AskState {
                 flags,
                 mode,
             } => {
+                if self.private.iter().any(|p| real.starts_with(p)) {
+                    self.stats.private += 1;
+                    eprintln!(
+                        "istesso-scope: refused without asking: pid {pid} opens {} (kept from the \
+                         command: the grants file or the link keys)",
+                        shown_path(&real.display().to_string())
+                    );
+                    return respond(self.notify_fd, id, -libc::EACCES, 0);
+                }
                 if self
                     .widened_files
                     .iter()
@@ -744,7 +789,7 @@ impl AskState {
                 };
                 let wants = Wants::Open {
                     path: real.display().to_string(),
-                    asked_as: asked_as.map(|p| p.display().to_string()),
+                    asked_as: asked_as.map(|p| ask::clip(&p.display().to_string(), 200)),
                     access,
                     folder,
                 };
@@ -754,17 +799,31 @@ impl AskState {
                 if choice == Choice::Refuse {
                     return self.refuse(id, false);
                 }
-                let kept = self.widen(choice, || {
-                    if write {
-                        Grant::Write(real.clone())
-                    } else {
-                        Grant::Read(real.clone())
-                    }
-                });
-                if choice != Choice::Once {
-                    self.widened_files.push((real.clone(), write));
+                // The held process may be gone (only a fatal signal ends the wait): then nothing
+                // is done for it, so an approved O_TRUNC does not truncate for nobody.
+                if !still_valid(self.notify_fd, id) {
+                    return self.outcome("not done: the program is gone".to_string());
                 }
                 let result = self.open_for(id, &real, flags, mode);
+                // A widening is recorded, and kept, only for an open that worked.
+                let kept = match result {
+                    Ok(()) => {
+                        if choice != Choice::Once {
+                            self.widened_files.push((real.clone(), write));
+                        }
+                        let grant = match (write, folder) {
+                            (true, false) => Grant::WriteFile(real.clone()),
+                            (true, true) => Grant::WriteFolder(real.clone()),
+                            (false, false) => Grant::ReadFile(real.clone()),
+                            (false, true) => Grant::ReadFolder(real.clone()),
+                        };
+                        self.widen(choice, grant)
+                    }
+                    Err(_) => {
+                        self.stats.failed += 1;
+                        false
+                    }
+                };
                 self.tell(result, choice, kept);
             }
             Held::Connect {
@@ -778,14 +837,26 @@ impl AskState {
                     Ok(s) => s,
                     Err(_) => return let_kernel_decide(self.notify_fd, id),
                 };
+                // The descriptor was taken from the process that is still held in this call
+                // (not from another one that got its number since).
+                if !still_valid(self.notify_fd, id) {
+                    return;
+                }
                 // Landlock limits TCP only (ABI 7); other sockets are the kernel's to decide.
                 if sock_opt(&sock, libc::SO_TYPE) != Some(libc::SOCK_STREAM)
                     || sock_opt(&sock, libc::SO_PROTOCOL) != Some(libc::IPPROTO_TCP)
                 {
                     return let_kernel_decide(self.notify_fd, id);
                 }
-                if self.kept_connects.contains(&addr) || self.widened_connects.contains(&addr) {
-                    self.stats.by_widening += 1;
+                let ino = sock_ino(&sock);
+                let again = ino.is_some_and(|i| self.approved_sockets.contains(&(i, addr)));
+                if again
+                    || self.kept_connects.contains(&addr)
+                    || self.widened_connects.contains(&addr)
+                {
+                    if !again {
+                        self.stats.by_widening += 1;
+                    }
                     self.connect_for(id, sock, raw);
                     return;
                 }
@@ -798,9 +869,17 @@ impl AskState {
                 if choice == Choice::Refuse {
                     return self.refuse(id, false);
                 }
-                let kept = self.widen(choice, || Grant::Connect(addr));
+                if !still_valid(self.notify_fd, id) {
+                    return self.outcome("not done: the program is gone".to_string());
+                }
+                // The address was approved, whatever the connection then does (it is made on a
+                // thread of its own): the widening is recorded now.
+                let kept = self.widen(choice, Grant::Connect(addr));
                 if choice != Choice::Once {
                     self.widened_connects.push(addr);
+                }
+                if let Some(i) = ino {
+                    self.approved_sockets.push((i, addr));
                 }
                 self.connect_for(id, sock, raw);
                 self.tell(Ok(()), choice, kept);
@@ -845,8 +924,9 @@ impl AskState {
         choice
     }
 
-    /// Records a widening; for "keep", writes the grant. Returns whether it was kept.
-    fn widen(&mut self, choice: Choice, grant: impl FnOnce() -> Grant) -> bool {
+    /// Records a widening; for "keep", writes the grant. Returns whether it was kept. A grant
+    /// whose rule would reach a private place (a folder above the grants file) is not kept.
+    fn widen(&mut self, choice: Choice, grant: Grant) -> bool {
         match choice {
             Choice::Once => self.stats.once += 1,
             Choice::WidenRun => self.stats.widened_run += 1,
@@ -855,7 +935,17 @@ impl AskState {
                 let Some(file) = &self.grants else {
                     return false;
                 };
-                let g = grant();
+                if let Some(p) = grant.path() {
+                    if self.private.iter().any(|q| q.starts_with(p)) {
+                        eprintln!(
+                            "istesso-scope: not kept: a rule for {} would reach the grants file \
+                             or the link keys",
+                            shown_path(&p.display().to_string())
+                        );
+                        return false;
+                    }
+                }
+                let g = grant;
                 match ask::append_grant(file, &g) {
                     Ok(()) => return true,
                     Err(e) => eprintln!("istesso-scope: could not keep the grant: {e}"),
@@ -969,6 +1059,11 @@ impl AskState {
     }
 }
 
+/// A path for the launcher's own log: escaped and shortened as on the form.
+fn shown_path(text: &str) -> String {
+    ask::shown(text, 300)
+}
+
 fn describe_wants(w: &Wants) -> String {
     match w {
         Wants::Open {
@@ -977,11 +1072,23 @@ fn describe_wants(w: &Wants) -> String {
             access,
             ..
         } => match asked_as {
-            Some(a) => format!("opens {path} ({}; asked as {a})", access.name()),
-            None => format!("opens {path} ({})", access.name()),
+            Some(a) => format!(
+                "opens {} ({}; asked as {})",
+                shown_path(path),
+                access.name(),
+                ask::shown(a, 200)
+            ),
+            None => format!("opens {} ({})", shown_path(path), access.name()),
         },
-        Wants::Connect { address } => format!("connects to {address}"),
+        Wants::Connect { address } => format!("connects to {}", ask::shown(address, 80)),
     }
+}
+
+/// The inode number of a socket (the same socket under any descriptor number).
+fn sock_ino(sock: &OwnedFd) -> Option<u64> {
+    // SAFETY: fstat into a zeroed struct.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(sock.as_raw_fd(), &mut st) } == 0).then_some(st.st_ino)
 }
 
 fn sock_opt(sock: &OwnedFd, opt: libc::c_int) -> Option<libc::c_int> {
@@ -1004,11 +1111,11 @@ fn sock_opt(sock: &OwnedFd, opt: libc::c_int) -> Option<libc::c_int> {
 /// put in its place after the owner saw the path fails the open (ELOOP).
 fn open_no_links(path: &Path, flags: i32, mode: libc::mode_t) -> Result<OwnedFd, i32> {
     let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
-    let creates = flags & (libc::O_CREAT | libc::O_TMPFILE) != 0;
+    let creates = flags & libc::O_CREAT != 0 || flags & libc::O_TMPFILE == libc::O_TMPFILE;
     // SAFETY: a plain struct of integers; zero is a valid value for each.
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = (flags | libc::O_CLOEXEC) as u32 as u64;
-    how.mode = if creates { mode as u64 } else { 0 };
+    how.mode = if creates { (mode & 0o7777) as u64 } else { 0 };
     how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
     // SAFETY: openat2 with a valid path and a correctly sized `open_how`.
     let r = unsafe {
@@ -1279,6 +1386,10 @@ mod tests {
                     };
                     pc += 1 + if hit { ins.jt } else { ins.jf } as usize;
                 }
+                c if c == libc::BPF_ALU && code & 0xf0 == libc::BPF_AND => {
+                    acc &= ins.k;
+                    pc += 1;
+                }
                 c if c == libc::BPF_RET => return ins.k,
                 _ => panic!("unexpected instruction at {pc}"),
             }
@@ -1336,47 +1447,46 @@ mod tests {
     }
 
     #[test]
-    fn mptcp_sockets_are_refused_by_every_filter() {
-        let refuse = libc::SECCOMP_RET_ERRNO | libc::EPROTONOSUPPORT as u32;
+    fn sockets_follow_the_allow_list_in_every_filter() {
+        let no_family = libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32;
+        let no_proto = libc::SECCOMP_RET_ERRNO | libc::EPROTONOSUPPORT as u32;
         let allow = libc::SECCOMP_RET_ALLOW;
-        let (inet, inet6, stream) = (
-            libc::AF_INET as u64,
-            libc::AF_INET6 as u64,
-            libc::SOCK_STREAM as u64,
-        );
+        const IPPROTO_MPTCP: u64 = 262;
+        const AF_SMC: u64 = 43;
+        let fam = |f: i32| f as u64;
+        let stream = libc::SOCK_STREAM as u64;
+        let flags = (libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64;
         for o in [opts(false, false, false), opts(true, true, true)] {
             let f = filter(&o);
-            let mp = IPPROTO_MPTCP as u64;
-            assert_eq!(
-                verdict_args(&f, libc::SYS_socket, [inet, stream, mp, 0, 0, 0]),
-                refuse
-            );
-            assert_eq!(
-                verdict_args(&f, libc::SYS_socket, [inet6, stream, mp, 0, 0, 0]),
-                refuse
-            );
-            // TCP (by number and by default), UDP and UNIX sockets pass.
-            let tcp = libc::IPPROTO_TCP as u64;
-            assert_eq!(
-                verdict_args(&f, libc::SYS_socket, [inet, stream, tcp, 0, 0, 0]),
-                allow
-            );
-            assert_eq!(
-                verdict_args(&f, libc::SYS_socket, [inet, stream, 0, 0, 0, 0]),
-                allow
-            );
-            let udp = libc::SOCK_DGRAM as u64;
-            assert_eq!(
-                verdict_args(&f, libc::SYS_socket, [inet, udp, 0, 0, 0, 0]),
-                allow
-            );
-            let unix = libc::AF_UNIX as u64;
-            assert_eq!(
-                verdict_args(&f, libc::SYS_socket, [unix, stream, 0, 0, 0, 0]),
-                allow
-            );
+            let v = |family: u64, ty: u64, proto: u64| {
+                verdict_args(&f, libc::SYS_socket, [family, ty, proto, 0, 0, 0])
+            };
+            for inet in [fam(libc::AF_INET), fam(libc::AF_INET6)] {
+                assert_eq!(v(inet, stream, 0), allow);
+                assert_eq!(v(inet, stream | flags, libc::IPPROTO_TCP as u64), allow);
+                assert_eq!(v(inet, stream, IPPROTO_MPTCP), no_proto);
+                assert_eq!(v(inet, stream | flags, IPPROTO_MPTCP), no_proto);
+                assert_eq!(v(inet, stream, libc::IPPROTO_SCTP as u64), no_proto);
+                assert_eq!(v(inet, libc::SOCK_SEQPACKET as u64, 0), no_proto);
+                assert_eq!(v(inet, libc::SOCK_DGRAM as u64 | flags, 0), allow);
+                assert_eq!(
+                    v(inet, libc::SOCK_DGRAM as u64, libc::IPPROTO_UDP as u64),
+                    allow
+                );
+            }
+            assert_eq!(v(fam(libc::AF_UNIX), stream | flags, 0), allow);
+            assert_eq!(v(fam(libc::AF_NETLINK), libc::SOCK_RAW as u64, 0), allow);
+            for other in [
+                AF_SMC,
+                fam(libc::AF_VSOCK),
+                fam(libc::AF_PACKET),
+                fam(libc::AF_ALG),
+            ] {
+                assert_eq!(v(other, stream, 0), no_family, "family {other}");
+            }
             // The checks after the block still see the call number.
             assert_eq!(verdict(&f, libc::SYS_read), allow);
+            assert_eq!(verdict(&f, libc::SYS_socketpair), allow);
         }
     }
 
@@ -1391,6 +1501,7 @@ mod tests {
             kept_connects: Vec::new(),
             loopback,
             run_info: None,
+            private: Vec::new(),
         }
     }
 
