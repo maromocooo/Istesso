@@ -26,8 +26,9 @@
 //     application to close that window only (its close button, by Accessibility: a question in a
 //     sheet stays and is shown in that window's picture);
 //   - everything here ends, and the list is emptied, when the picture stops (pause, detach, the
-//     lock, the measuring signal, a new size of the first window) or the viewer has been away
-//     for three seconds. A viewer that comes back says it again.
+//     lock, the measuring signal), when the first window's stream is made anew (a new size),
+//     when who may look changes (admit), or when the viewer has been away for three seconds. A
+//     viewer that comes back says it again, and is told the list on its new stream.
 // Titles are only put into the list: never written to a log or to standard output.
 //
 // With --generated --windows --generated-windows N (1-3): N still windows of the stand-in, for
@@ -186,6 +187,11 @@ func closeChoice(frames: [CGRect], want: CGRect, keep: [CGRect]) -> Int? {
     let matches = frames.indices.filter { samePlace(frames[$0], want) }
     return matches.count == 1 ? matches[0] : nil
 }
+
+/// What ends the other windows' streams besides a stop of the picture: who may look changes
+/// (admit), the picture is paused or detached, the first window's stream is made anew (resize).
+/// They are made again, for whoever is admitted then, when the viewer says it again.
+func windowsEnd(after event: String) -> Bool { ["admit", "pause", "detach", "resize"].contains(event) }
 
 /// Which window keys go to (see ExtraWindows.focus).
 enum KeyFocus: Equatable {
@@ -730,6 +736,9 @@ func windowsSelfTest() -> Int {
     check(closeChoice(frames: [w1, w1], want: w1, keep: [CGRect(x: 5, y: 5, width: 10, height: 10)]) == nil, "two windows at one place: refused")
     check(closeChoice(frames: [w1, w2], want: w1, keep: [w1]) == nil, "the first window's place: refused")
     check(closeChoice(frames: [w1], want: w2, keep: [w1]) == nil, "no window at the place: nothing")
+    // Reviews 5 and 6: a new admit, a pause or detach, a new size of the first stream end them all.
+    check(["admit", "pause", "detach", "resize"].allSatisfy(windowsEnd(after:)) && !windowsEnd(after: "resume") && !windowsEnd(after: "click-form"),
+          "who may look, a stop or a new first stream ends the other windows' streams")
     // Review 9: without --windows Accessibility is asked nothing more than before.
     check(!axAsksTitle(windows: false) && axAsksTitle(windows: true), "a window's title is read only with --windows")
     return failed

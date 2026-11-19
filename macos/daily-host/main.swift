@@ -3469,6 +3469,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             return wordsDuringRestart.append(line)
         }
         let words = line.split(separator: " ").map(String.init)
+        // Fail closed: the other windows' streams were made for whoever was admitted, and are shown
+        // to nobody else (windows.swift; nothing without --windows).
+        if let first = words.first, windowsEnd(after: first) { windowsReset("said: \(first)") }
         switch words.first {
         case "pause":
             // An explicit pause wins over the lock's own: an unlock does not undo it.
@@ -4016,6 +4019,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// the same port; the picture comes back as it was (running or not).
     var restarts = 0
     func restartStream(width w: Int, height h: Int, windowSize: CGSize) {
+        // The other windows' streams end with the first one's (windows.swift; nothing without --windows).
+        if windowsEnd(after: "resize") { windowsReset("the first window's picture has another size") }
         restarting = true
         restarts += 1
         let old = transport!
@@ -4046,6 +4051,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     self.width = w
                     self.height = h
                     self.transport = made
+                    self.extras.told = nil  // the list of other windows is told to the new stream again
                 if let field = self.lastField { made.setTextInput(field) }
                     made.ownCursor()
                     self.pump = Pump(transport: made, width: w, height: h)
