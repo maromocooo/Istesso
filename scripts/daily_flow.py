@@ -120,7 +120,14 @@ class Flow:
         self.pipeline = None
         self.quiet = 0
         self.stopped = False
+        # The counters are added to from the compositor's thread, the encoder's and the one that
+        # writes the line a second.
+        self.lock = threading.Lock()
         self.zero()
+
+    def add(self, name, n=1):
+        with self.lock:
+            self.c[name] += n
 
     def zero(self):
         self.c = collections.Counter()
@@ -159,21 +166,21 @@ class Flow:
     def before_encoder(self, on_compositor_thread=True):
         """For every frame on its way into the encoder. Returns how long it waited, in seconds."""
         began = self.clock()
-        self.c["frames"] += 1
+        self.add("frames")
         waited = 0.0
         if on_compositor_thread:
             now = began
             while not self.room(now):
                 waited = (now - began) / 1e9
                 if waited >= WAIT_MAX:
-                    self.c["forced"] += 1
+                    self.add("forced")
                     break
                 self.sleep(0.0005)
                 now = self.clock()
             waited = (now - began) / 1e9
         if waited >= WAIT_COUNTS:
-            self.c["waited"] += 1
-        self.c["wait_us"] += int(waited * 1e6)
+            self.add("waited")
+        self.add("wait_us", int(waited * 1e6))
         self.wait_ms_max = max(self.wait_ms_max, waited * 1e3)
         self.in_encoder.append(self.clock())
         return waited
@@ -183,24 +190,25 @@ class Flow:
             self.in_encoder.popleft()
         except IndexError:
             pass  # given up on already (room), or the frame handed in on the way back
-        self.c["encoded"] += 1
-        self.c["bytes"] += size
-        self.c["keys"] += 1 if key else 0
+        with self.lock:
+            self.c["encoded"] += 1
+            self.c["bytes"] += size
+            self.c["keys"] += 1 if key else 0
 
     def handed(self, viewers, queued):
         """What the library made of a frame (IstessoMediaSent)."""
         if self.sockets and viewers == 0:
             # A viewer is connected and was not sent this frame: it waits for a key frame, or the
             # library skipped it. With the gate this stays 0 apart from a viewer's first frames.
-            self.c["lib_not_sent"] += 1
+            self.add("lib_not_sent")
         if queued:
-            self.c["lib_queued"] += 1
+            self.add("lib_queued")
 
     def follow(self):
         """Once a second: the new bit rate, from what this second was like. Returns it."""
         if not self.adapt:
             return self.kbit
-        if self.c["forced"] > 0 and self.c["encoded"] <= self.c["forced"]:
+        if self.c["forced"] > 0 and self.c["frames"] <= self.c["forced"]:
             # Every frame of this second waited the longest: the link carried nothing (a blip, a
             # sleeping device), which says nothing about how much it carries when it carries.
             # The bit rate stays. A link that carries a little (some frames went without the
@@ -308,7 +316,8 @@ class Flow:
             if self.sockets or idle % 10 == 1:
                 print(self.line(now - last), file=self.out, flush=True)
             last = now
-            self.zero()
+            with self.lock:
+                self.zero()
 
 
 class SendCounter:
