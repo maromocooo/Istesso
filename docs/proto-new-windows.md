@@ -71,38 +71,77 @@ ADR 0027 の【問い 窓9】のおすすめ（知らせは (a)、流れは (c)�
 
 ## 5. Studio での確かめ（持ち主の手。まだしていない）
 
-Studio では、この試作を動かしていない。動かすには、Istesso Dev Daily Host を、**いつもの場所で、同じ証明書のまま、入れ替える**必要がある（新しい場所から `open` すると、Studio の画面に、画面収録の確認が出る）。入れ替えは、調整役と持ち主が決める。
+Studio では、この試作を動かしていない。動かすには、Istesso Dev Daily Host を、**いつもの場所（Studio の `~/.cache/istesso-daily-mac`）で、同じ証明書のまま、入れ替える**（新しい場所から `open` すると、Studio の画面に、画面収録の確認が出る。stream-rules の 11-19 23:1x の追加）。入れ替えるかどうか、いつかは、調整役と持ち主が決める。
 
-入れ替えたあとも、`--windows` を付けなければ、ホストはいまと同じにふるまう（読んだ：`windows.swift` のどの道も、`settings.windows` で閉じている）。
+入れ替えたあとも、`--windows` を付けなければ、ホストはいまと同じにふるまう（読んだ：`windows.swift` のどの道も `settings.windows` で閉じている。別の目の確かめで「切り替えが切なら同じ」と確かめられた）。だから、入れ替えたまま、ふだんの試用（`DAILY_WINDOWS` なし）を続けてよい。
 
-### 前に
+### 用意したもの（Air の上。まだ Studio には写していない）
 
-1. この試作のブランチを、調整役が見る（入力の道に触れる変更なので、別の目の確かめが要る）。
-2. Air で：`scripts/daily-mac.sh setup`（このブランチ。署名つきで作り、Studio のいつもの場所へ写す。ホストとエージェントが入れ替わる）。
-3. Air のビューアー：このブランチの `macos/gst-viewer/build/gst-viewer` を `DAILY_VIEWER` で指す（シェルから起動。束は作らない）。
-4. 計測の合図が、2 台とも `free` であること。
+このブランチの作業ツリーの `macos/daily-host/build/staged-2c27b8f/`（git の外。`STAGED.txt` に同じことを書いた）：
 
-### 手順（持ち主の手。1 回 10 分ほど）
+| もの | 中身 |
+|---|---|
+| `Istesso Dev Daily Host.app` | コミット 2c27b8f（m4-host-inline 0b8e825 を取り込んだもの。Studio がいま動かしている 542ad7c を含む）から作り、`~/.config/istesso/sign.env` の開発用の証明書で署名。`daily-mac.sh setup` が前に作った束と、同じ証明書であることを確かめた。CDHash `babffe2b7c41c2e6dbc75d12fb9173b55b78a9d6` |
+| `bin/istesso` | 同じコミットのエージェントとリレー（`windows` を通す） |
+| `gst-viewer` | 同じコミットの Air のビューアー（シェルから起動する。束は作らない） |
+
+### 入れ替え（調整役。Air から。持ち主が決めてから）
+
+1. 計測の合図が 2 台とも `free`。Studio で、試用のホストが動いていない（`scripts/daily-mac.sh stop`）。
+2. このブランチの作業ツリーで（`S` は用意したフォルダー）：
+
+   ```sh
+   S=macos/daily-host/build/staged-2c27b8f
+   H=${ISTESSO_MAC_HOST:-istesso-studio}
+   # 束とエージェントを、いつもの場所で入れ替える。前のものは replaced/ に、時刻の名前で残す（消さない）
+   tar -C "$S" -cf - "Istesso Dev Daily Host.app" | ssh "$H" 'D="$HOME/.cache/istesso-daily-mac"; t=$(date +%Y%m%d-%H%M%S); mkdir -p "$D/replaced" && mv "$D/Istesso Dev Daily Host.app" "$D/replaced/$t-Istesso Dev Daily Host.app" && cp -p "$D/bin/istesso" "$D/replaced/$t-istesso" && tar -C "$D" -xf - && echo "replaced: $t"'
+   ssh "$H" 'D="$HOME/.cache/istesso-daily-mac"; cat > "$D/bin/istesso.new" && chmod 755 "$D/bin/istesso.new" && mv "$D/bin/istesso.new" "$D/bin/istesso"' < "$S/bin/istesso"
+   # 写したものが、用意したものと同じか（CDHash が babffe2b… であること）
+   ssh "$H" 'codesign -dvvv "$HOME/.cache/istesso-daily-mac/Istesso Dev Daily Host.app" 2>&1 | grep ^CDHash'
+   ```
+
+   出た時刻（`replaced: …`）を、戻すときのために書き留める。
+
+### 手順（持ち主の手。Air で。1 回 10 分ほど）
+
+Air の Terminal で、このブランチの作業ツリーにいるとする（リレーは `target/release/istesso`、このブランチのもの）。
+
+```sh
+DAILY_WINDOWS=1 DAILY_FRAME_LOGS=1 DAILY_VIEWER="$PWD/macos/daily-host/build/staged-2c27b8f/gst-viewer" scripts/daily-mac.sh open TextEdit
+```
 
 | # | すること | 見るもの | ADR 0027 の確かめ |
 |---|---|---|---|
-| S1 | `DAILY_WINDOWS=1 DAILY_VIEWER=… scripts/daily-mac.sh open TextEdit` | いまと同じに、試用の書類が 1 枚出る | — |
-| S2 | Air の TextEdit の窓で ⌘N | Air に、新しい窓が出る（題名「名称未設定 2」のような）。Dock のタイルは 1 つのまま。⌘\` で 2 枚を行き来できる | 4 |
-| S3 | 2 枚目に「abc」と「にほんご」を打つ。1 枚目に戻って「xyz」 | 打った文字は、前に出した窓にだけ入る | 5 |
-| S4 | 2 枚目で ⌘W、または赤いボタン | TextEdit が「保存しますか」のシートを出す。それが 2 枚目の窓の絵の中に出て、押せる（「保存しない」） | 6、7 |
-| S5 | S4 のあと | 2 枚目が Air からも消える。1 枚目は、そのまま動く | 6 |
-| S6 | ⌘N を 4 回 | 3 枚目までは別の窓。4 枚目からは、1 枚目の絵の中（いまの形）。ホストの出力に `window-fallback` | 2.2 |
-| S7 | 2 枚目を開いて止めたまま、1 枚目で打つ | 1 枚目に、切れ目もつなぎ直しもない（ビューアーのログの `stream` の行が増えない） | 9 |
+| S1 | 上のコマンド | いまと同じに、試用の書類が 1 枚、Air に出る | — |
+| S2 | Air の TextEdit の窓で ⌘N | Air に、新しい窓が出て、打ち込む窓になる（題名「名称未設定」のような）。Dock のタイルは 1 つのまま。⌘\` で 2 枚を行き来できる。⌘N の直後に打った文字は、落ちて知らせが出ることがある（新しい窓が出るまでの守り） | 4 |
+| S3 | 2 枚目に「abc」と「にほんご」を打つ。1 枚目をクリックして「xyz」 | 打った文字は、前に出した窓にだけ入る | 5 |
+| S4 | 2 枚目で ⌘W（または赤いボタン） | TextEdit の「保存しますか」のシートが、2 枚目の窓の絵の中に出て、押せる。「保存しない」 | 6、7 |
+| S5 | S4 のあと | 2 枚目が Air からも消える。1 枚目は、そのまま打てる | 6 |
+| S6 | 1 枚目で ⌘N を 4 回 | 3 枚目までは別の窓。4 枚目は、1 枚目の絵の中（いまの形）。終わったら、足された書類を ⌘W と「保存しない」で閉じる | 2.2 |
+| S7 | ⌘N で 2 枚目を開き、触らずに置いたまま、1 枚目で 30 秒ほど打つ | 1 枚目に、切れ目もつなぎ直しもない | 9 |
 
-### 記録するもの
+うまく行かないとき（窓が出ない、文字が違う窓に入る、など）は、そこでやめて、`scripts/daily-mac.sh stop`。
 
-- ホストのフレームのログ（`DAILY_FRAME_LOGS=1`）の `{"kind":"window",...}`（noticed、streaming、watched、gone、fallback）と、ビューアーのログの `{"kind":"window",...}`（listed、connected、first_picture、closed）。2 台の時計は比べないので、「窓が出るまで」（測るもの 1）は、ホストの中（noticed → watched）と、ビューアーの中（listed → first_picture）を、別々に。
-- ホストのログの `second` の行：最初の窓の `encode_median_ms` を、2 枚目なし、2 枚目が止まっている、で比べる（測るもの 2）。2 枚目の行は `"window":2` 付き。
-- 題名は、どのログにも出ない。確かめる。
+### 記録するもの（調整役。持ち主の手は要らない）
+
+- Studio：`~/.cache/istesso-daily-mac/run/TextEdit/` の `host.log`（`windows`、`windows-listed`、`window-close`、`window-fallback` の行）と、フレームのログ `frames-*.jsonl` の `{"kind":"window",...}`（noticed、streaming、watched、gone、fallback）、`second` の行（最初の窓の `encode_median_ms`。2 枚目は `"window":2` 付き。測るもの 2）。
+- Air：`~/Library/Caches/istesso-daily-mac/TextEdit/` の `frames-*.jsonl` の `{"kind":"window",...}`（listed、connected、first_picture、over、closed）と、`stream` の行（S7 で増えないこと）、`viewer.log`。
+- 2 台の時計は比べない。「窓が出るまで」（測るもの 1）は、ホストの中（noticed → watched）と、ビューアーの中（listed → first_picture）を、別々に。
+- 題名が、どのログにも出ないこと（`grep` で確かめる）。
 
 ### 終わったら
 
-`scripts/daily-mac.sh close TextEdit`（試用の書類を閉じる。2 枚目からの書類は「保存しない」で閉じる）。
+`scripts/daily-mac.sh close TextEdit`（試用の書類を閉じる。足された書類は、S4、S6 で閉じてある）。
+
+### 戻す（調整役。必要になったとき）
+
+入れ替えたまま、`DAILY_WINDOWS` なしで、ふだんの試用を続けてよい（切り替えが切なら、いまと同じ）。前の束に戻すときは、`scripts/daily-mac.sh stop` のあと、入れ替えで書き留めた時刻 `T` で：
+
+```sh
+ssh "$H" 'D="$HOME/.cache/istesso-daily-mac"; T=20261120-XXXXXX; u=$(date +%Y%m%d-%H%M%S); mv "$D/Istesso Dev Daily Host.app" "$D/replaced/$u-proto-new-windows-Istesso Dev Daily Host.app" && mv "$D/replaced/$T-Istesso Dev Daily Host.app" "$D/Istesso Dev Daily Host.app" && cp -p "$D/replaced/$T-istesso" "$D/bin/istesso" && codesign -dvvv "$D/Istesso Dev Daily Host.app" 2>&1 | grep ^CDHash'
+```
+
+前の束は、同じ場所、同じ証明書に戻るので、画面収録の確認は出ない（いつもの場所での置き換え）。
 
 ## 6. 結果（Air の上、2026-11-19 23:50〜11-20 00:10）
 
