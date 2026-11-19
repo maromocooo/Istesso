@@ -18,7 +18,7 @@ use istesso_pair::{Peer, PeerStore};
 
 pub mod client;
 pub mod host;
-mod sys;
+pub(crate) mod sys;
 
 /// How often the device says "still here".
 pub const ALIVE_EVERY: Duration = Duration::from_secs(10);
@@ -30,22 +30,34 @@ pub const MAX_ON_HOST: usize = 16;
 /// none may.
 #[derive(Debug, Clone, Default)]
 pub struct ShellPolicy {
-    /// Each device by its id and key, as they were when the agent started.
-    allowed: Vec<(String, String)>,
+    /// Each device by its id and key, as they were when the agent started,
+    /// and the name it had then (for saying which devices these are).
+    allowed: Vec<(String, String, String)>,
 }
 
 impl ShellPolicy {
-    /// Looks the devices up in the list of paired devices, by id or name
-    /// (as for `istesso peers`). A device that is not there is an error:
-    /// the person meant one and should hear that it is not paired.
-    pub fn resolve(peers: &PeerStore, selectors: &[String]) -> Result<Self, String> {
+    /// Looks the devices up in the list of paired devices, by their ids
+    /// (`istesso peers list` shows them). Names are not taken: a device
+    /// chooses its own name when it pairs, and a name says less than the key
+    /// it stands for. A device that is not there is an error: the person
+    /// meant one and should hear that it is not paired.
+    pub fn resolve(peers: &PeerStore, ids: &[String]) -> Result<Self, String> {
         let mut allowed = Vec::new();
-        for selector in selectors {
-            let peer = peers
-                .find(selector)
-                .map_err(|e| format!("--allow-shell {selector}: {e}"))?
-                .ok_or_else(|| format!("--allow-shell: no paired device matches '{selector}'"))?;
-            allowed.push((peer.id.clone(), peer.public_key.clone()));
+        for id in ids {
+            let peer = match peers.peers().iter().find(|peer| peer.id == *id) {
+                Some(peer) => peer,
+                None => {
+                    let by_name = peers.find(id).ok().flatten();
+                    return Err(match by_name {
+                        Some(peer) => format!(
+                            "--allow-shell takes the id of a paired device, not its name: {} has the id {}",
+                            peer.name, peer.id
+                        ),
+                        None => format!("--allow-shell: no paired device has the id '{id}'"),
+                    });
+                }
+            };
+            allowed.push((peer.id.clone(), peer.public_key.clone(), peer.name.clone()));
         }
         Ok(ShellPolicy { allowed })
     }
@@ -58,7 +70,16 @@ impl ShellPolicy {
     pub fn names(&self, peer: &Peer) -> bool {
         self.allowed
             .iter()
-            .any(|(id, key)| *id == peer.id && *key == peer.public_key)
+            .any(|(id, key, _)| *id == peer.id && *key == peer.public_key)
+    }
+
+    /// The devices that may open a shell, as "name (id)", for the person who
+    /// starts the agent to check.
+    pub fn devices(&self) -> Vec<String> {
+        self.allowed
+            .iter()
+            .map(|(id, _, name)| format!("{name} ({id})"))
+            .collect()
     }
 }
 

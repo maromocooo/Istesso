@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use istesso_link::shell::{ShellEnd, ShellFrame, MAX_DATA};
 use istesso_link::{Channel, ChannelWriter, ShellRequest};
 
-use super::sys::{self, Account, Ready};
+use super::sys::{self, Account};
 
 /// How long the device may say nothing before the shell is ended. It says
 /// "still here" every ten seconds ([`super::ALIVE_EVERY`]).
@@ -43,6 +43,16 @@ const HANG_UP_GRACE: Duration = Duration::from_secs(2);
 /// How often the threads that wait on the terminal look up whether they
 /// should stop.
 const TICK: Duration = Duration::from_millis(100);
+/// How long what the shell printed last may take to leave before the frame
+/// that says how it ended, and how long that frame may take. A device that
+/// does not read is not waited for longer.
+const LAST_WORDS: Duration = Duration::from_secs(1);
+/// What the device typed that the shell has not taken yet, at most. Up to
+/// this, the host goes on reading the device (and so hears it hang up, or
+/// say "still here") while a program in the shell does not read. Beyond it
+/// the host stops reading, and ends the shell when the shell has taken
+/// nothing for [`SILENCE`].
+pub const MAX_PENDING: usize = 1024 * 1024;
 
 /// The size of a terminal, kept within what a terminal can be.
 fn clamp(size: u16) -> u16 {
@@ -205,6 +215,7 @@ impl Shell {
     /// this process runs as. The error says why, in words fit for the
     /// device, and never quotes what the device sent.
     pub fn start(request: &ShellRequest, settings: &ShellSettings) -> Result<Shell, String> {
+        sys::refuse_root(sys::is_root())?;
         let account = sys::account()?;
         let folder = start_folder(request.project.as_deref(), &account.home)?;
         let (program, argv0) = match &settings.program {
@@ -223,6 +234,7 @@ impl Shell {
             .envs(env)
             .current_dir(&folder);
 
+        let below = sys::descriptors_to_look_at();
         let started = Instant::now();
         let (child, master) = {
             let _starting = sys::STARTING.lock().unwrap_or_else(|e| e.into_inner());
@@ -236,10 +248,13 @@ impl Shell {
             };
             command.stdin(stdin).stdout(stdout).stderr(stderr);
             // SAFETY: runs in the child between fork and exec, and calls only
-            // `signal`, `setsid` and `ioctl`, which are safe there. The standard
-            // input is the terminal by then.
+            // `fcntl`, `close`, `signal`, `setsid` and `ioctl`, which are safe
+            // there. The standard input is the terminal by then.
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
+                    // Nothing of the agent's goes along: a descriptor some
+                    // library opened without close-on-exec is closed here.
+                    sys::close_inherited(below);
                     // Every signal does what it does by default, as after a login:
                     // an agent started in the background of a script has Control-C
                     // and Control-\ ignored, and a shell keeps for its programs
@@ -316,11 +331,17 @@ impl Shell {
             .set_read_timeout(Some(SILENCE))
             .and_then(|_| stream.set_write_timeout(Some(SILENCE)));
         let (events_in, events) = mpsc::channel::<Event>();
-        let Ok((reader, writer)) = channel.split() else {
+        // A handle on the connection that ends it from here, whatever the other
+        // threads are waiting for.
+        let socket = stream.try_clone();
+        let (Ok(socket), Ok((mut reader, writer))) = (socket, channel.split()) else {
             child_exit_watch(child, events_in);
             hang_up(master, &events);
             return counts.served(Ending::DeviceGone, self.started);
         };
+        // A frame from the device is never larger than this; a larger one is
+        // refused before it is taken in.
+        reader.set_max_message(1 + istesso_link::shell::MAX_DATA_ACCEPTED);
         let writer = Arc::new(Mutex::new(writer));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -373,20 +394,36 @@ impl Shell {
 
         // Nothing more goes to the terminal or comes from it.
         stop.store(true, Ordering::SeqCst);
-        if let Some(printing) = printing {
-            let _ = printing.join();
-        }
+        // The device is told how the shell ended, after what the shell printed
+        // last, when that can be done soon. A device that does not read is not
+        // waited for: its connection is shut, which also ends a write that is
+        // waiting for it.
         let last = match ending {
             Ending::Shell(end) => Some(ShellFrame::Exit(end)),
             Ending::Revoked => Some(ShellFrame::Exit(ShellEnd::Revoked)),
             Ending::DeviceGone => None,
         };
-        {
-            let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(last) = last {
-                let _ = writer.send(&last.encode());
+        if let Some(last) = last {
+            // After the shell ended, its last output is worth a moment. After the
+            // right was taken away, nothing is: only what the thread that prints
+            // needs to notice that it should stop.
+            let patience = match ending {
+                Ending::Shell(_) => LAST_WORDS,
+                _ => 2 * TICK,
+            };
+            let printed = printing
+                .as_ref()
+                .is_none_or(|printing| finished_within(printing, patience));
+            if printed {
+                if let Some(mut writer) = locked_within(&writer, LAST_WORDS) {
+                    let _ = socket.set_write_timeout(Some(LAST_WORDS));
+                    let _ = writer.send(&last.encode());
+                }
             }
-            writer.shut_down();
+        }
+        let _ = socket.shutdown(std::net::Shutdown::Both);
+        if let Some(printing) = printing {
+            let _ = printing.join();
         }
         if let Some(typing) = typing {
             let _ = typing.join();
@@ -416,6 +453,37 @@ impl Drop for Shell {
                 let _ = child.kill();
                 let _ = child.wait();
             });
+        }
+    }
+}
+
+/// Waits until `thread` has finished, for `limit` at most.
+fn finished_within<T>(thread: &std::thread::JoinHandle<T>, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+/// The writer, when it is free within `limit`: a thread that is waiting in a
+/// write to a device that does not read holds it.
+fn locked_within(
+    writer: &Mutex<ChannelWriter>,
+    limit: Duration,
+) -> Option<std::sync::MutexGuard<'_, ChannelWriter>> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match writer.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
         }
     }
 }
@@ -483,9 +551,9 @@ fn pass_output(
 ) {
     let mut buffer = vec![0u8; MAX_DATA];
     while !stop.load(Ordering::SeqCst) {
-        match sys::wait_for(master.as_raw_fd(), Ready::Read, TICK) {
-            Ok(false) => continue,
-            Ok(true) => {}
+        match sys::wait(Some(master.as_raw_fd()), None, TICK) {
+            Ok((false, _)) => continue,
+            Ok((true, _)) => {}
             Err(_) => break,
         }
         match sys::read(master.as_raw_fd(), &mut buffer) {
@@ -517,6 +585,13 @@ fn pass_output(
 }
 
 /// What the device sends, to the shell.
+///
+/// The device is read whenever something arrives, also while a program in
+/// the shell does not read its input: what was typed waits here
+/// ([`MAX_PENDING`] at most) and goes to the terminal as the program takes
+/// it. So a device that hangs up, or says nothing for [`SILENCE`], is heard
+/// even then. When more than that waits, the device is no longer read, and
+/// the shell is ended once it has taken nothing for [`SILENCE`].
 fn pass_input(
     mut reader: istesso_link::ChannelReader,
     master: OwnedFd,
@@ -525,7 +600,43 @@ fn pass_input(
     counts: Arc<Counts>,
     events: mpsc::Sender<Event>,
 ) {
-    while let Ok(message) = reader.recv() {
+    let socket = reader.stream().as_raw_fd();
+    let terminal = master.as_raw_fd();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut heard = Instant::now();
+    let mut taken = Instant::now();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let full = pending.len() >= MAX_PENDING;
+        if full && taken.elapsed() >= SILENCE {
+            // The shell has taken nothing for a minute, and the device has more
+            // to give it than is kept: the device is not read, and so cannot be
+            // heard to go. The shell is ended rather than kept without end.
+            break;
+        }
+        if !full && heard.elapsed() >= SILENCE {
+            break;
+        }
+        let (readable, writable) = match sys::wait(
+            (!full).then_some(socket),
+            (!pending.is_empty()).then_some(terminal),
+            TICK,
+        ) {
+            Ok(ready) => ready,
+            Err(_) => break,
+        };
+        if writable {
+            to_terminal(terminal, &mut pending, &mut taken);
+        }
+        if !readable {
+            continue;
+        }
+        // A frame that has begun to arrive is whole within the connection's
+        // timeout, or the connection is over.
+        let Ok(message) = reader.recv() else { break };
+        heard = Instant::now();
         let Ok(frame) = ShellFrame::decode(&message) else {
             break;
         };
@@ -535,11 +646,16 @@ fn pass_input(
                     .bytes_in
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 counts.frames_in.fetch_add(1, Ordering::Relaxed);
-                write_to_terminal(&master, &bytes, &stop);
+                if pending.is_empty() {
+                    taken = Instant::now();
+                }
+                pending.extend_from_slice(&bytes);
+                // At once, not after the next wait: what is typed is not held up.
+                to_terminal(terminal, &mut pending, &mut taken);
             }
             ShellFrame::Resize { cols, rows } => {
                 counts.resizes.fetch_add(1, Ordering::Relaxed);
-                let _ = sys::set_size(master.as_raw_fd(), clamp(cols), clamp(rows));
+                let _ = sys::set_size(terminal, clamp(cols), clamp(rows));
             }
             ShellFrame::Alive => {
                 let answered = writer
@@ -553,28 +669,26 @@ fn pass_input(
             // Only the host ends a shell; frames of a later version are skipped.
             ShellFrame::Exit(_) | ShellFrame::Unknown(_) => {}
         }
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
     }
     let _ = events.send(Event::DeviceGone);
 }
 
-/// Writes all of `bytes` to the terminal, waiting while the shell does not
-/// read, until told to stop. A terminal that is gone takes nothing.
-fn write_to_terminal(master: &OwnedFd, mut bytes: &[u8], stop: &AtomicBool) {
-    while !bytes.is_empty() && !stop.load(Ordering::SeqCst) {
-        match sys::write(master.as_raw_fd(), bytes) {
-            Ok(n) => bytes = &bytes[n..],
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) =>
-            {
-                let _ = sys::wait_for(master.as_raw_fd(), Ready::Write, TICK);
+/// Gives the terminal as much of `pending` as it takes now, without waiting.
+/// A terminal that is gone takes nothing more, and what waits is dropped.
+fn to_terminal(terminal: std::os::fd::RawFd, pending: &mut Vec<u8>, taken: &mut Instant) {
+    while !pending.is_empty() {
+        match sys::write(terminal, pending) {
+            Ok(0) => return,
+            Ok(n) => {
+                pending.drain(..n);
+                *taken = Instant::now();
             }
-            Err(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(_) => {
+                pending.clear();
+                return;
+            }
         }
     }
 }

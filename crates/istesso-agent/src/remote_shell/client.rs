@@ -110,6 +110,9 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
             return 255;
         }
     };
+    // A frame from the host is never larger than this; a larger one is refused
+    // before it is taken in.
+    reader.set_max_message(1 + istesso_link::shell::MAX_DATA_ACCEPTED);
     let writer = Arc::new(Mutex::new(writer));
 
     // Signals are taken by one thread of their own, from here on: the window
@@ -120,12 +123,21 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
         libc::SIGTERM,
         libc::SIGINT,
         libc::SIGQUIT,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGALRM,
     ]);
     if terminal {
         if let Err(err) = sys::RawMode::enter(STDIN) {
             say(&format!("cannot pass keys on as they are typed: {err}"));
             return 255;
         }
+        // However this program ends, the terminal is put back as it was.
+        let before = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            sys::RawMode::restore(STDIN);
+            before(info);
+        }));
     }
     {
         let writer = writer.clone();
@@ -259,7 +271,13 @@ fn watch_signals(signals: libc::sigset_t, writer: Arc<Mutex<ChannelWriter>>) {
             }
             // The connection closes with this program; the writing half is not
             // waited for, as it may be in the middle of a slow write.
-            signal @ (libc::SIGHUP | libc::SIGTERM | libc::SIGINT | libc::SIGQUIT) => {
+            signal @ (libc::SIGHUP
+            | libc::SIGTERM
+            | libc::SIGINT
+            | libc::SIGQUIT
+            | libc::SIGUSR1
+            | libc::SIGUSR2
+            | libc::SIGALRM) => {
                 finish((128 + signal) as u8, None);
             }
             _ => {}

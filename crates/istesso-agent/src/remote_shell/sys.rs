@@ -60,9 +60,49 @@ pub fn account() -> Result<Account, String> {
     }
 }
 
+/// Whether this process runs as root (its effective user).
+pub fn is_root() -> bool {
+    // SAFETY: a query; nothing is written.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Refuses to go on as root: a device that may have a shell would then have
+/// the whole machine.
+pub fn refuse_root(root: bool) -> Result<(), String> {
+    if root {
+        Err("shells are never opened by an agent that runs as root".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// The highest descriptor number a new program could have been handed, kept
+/// within reason, for [`close_inherited`].
+pub fn descriptors_to_look_at() -> libc::c_int {
+    // SAFETY: a query; nothing is written.
+    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    limit.clamp(256, 65536) as libc::c_int
+}
+
+/// Closes every descriptor from 3 below `below` that would survive `exec`,
+/// in a child between fork and exec. Those marked close-on-exec are left to
+/// `exec` (the standard library reports a failed `exec` through one).
+/// Calls only `fcntl` and `close`, which are safe there.
+///
+/// # Safety
+/// Only between fork and exec, in the child.
+pub unsafe fn close_inherited(below: libc::c_int) {
+    for fd in 3..below {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            libc::close(fd);
+        }
+    }
+}
+
 /// Opening a pseudo-terminal and starting the program on it happen under
-/// this lock, so that no other shell starting at the same moment can be
-/// handed this one's terminal before it is marked close-on-exec.
+/// this lock: `ptsname` answers in a buffer of its own, which another
+/// thread opening a terminal at the same moment would overwrite.
 pub static STARTING: Mutex<()> = Mutex::new(());
 
 fn winsize(cols: u16, rows: u16) -> libc::winsize {
@@ -74,43 +114,41 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
     }
 }
 
-/// A new pseudo-terminal of the given size: its two ends, both marked
-/// close-on-exec. Call with [`STARTING`] held.
+/// A new pseudo-terminal of the given size: its two ends, both opened
+/// close-on-exec from the start, so that no program another thread starts
+/// at the same moment is handed them. Call with [`STARTING`] held.
 pub fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let mut size = winsize(cols, rows);
-    // SAFETY: `openpty` writes two descriptors into `master` and `slave` and
-    // reads `size`; the name and terminal settings are left out.
-    let status = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut::<libc::termios>(),
-            std::ptr::addr_of_mut!(size),
-        )
-    };
-    if status != 0 {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: opens a device by a constant name; the descriptor is owned below.
+    let master = unsafe { libc::open(c"/dev/ptmx".as_ptr(), flags) };
+    if master < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: both descriptors were just opened for this process and are
-    // owned by nothing else.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    close_on_exec(&master)?;
-    close_on_exec(&slave)?;
-    Ok((master, slave))
-}
-
-fn close_on_exec(fd: &OwnedFd) -> io::Result<()> {
-    // SAFETY: plain flag changes on a descriptor this process owns.
-    unsafe {
-        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
-        if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+    // SAFETY: just opened for this process and owned by nothing else.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    // SAFETY: `grantpt`, `unlockpt` and `ptsname` take the descriptor of the
+    // terminal's master end. The name `ptsname` returns lives in a buffer of
+    // its own until the next call, which [`STARTING`] keeps away; it is
+    // copied at once.
+    let name = unsafe {
+        if libc::grantpt(master.as_raw_fd()) != 0 || libc::unlockpt(master.as_raw_fd()) != 0 {
             return Err(io::Error::last_os_error());
         }
+        let name = libc::ptsname(master.as_raw_fd());
+        if name.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        CStr::from_ptr(name).to_owned()
+    };
+    // SAFETY: opens the terminal's other end by the name just read.
+    let slave = unsafe { libc::open(name.as_ptr(), flags) };
+    if slave < 0 {
+        return Err(io::Error::last_os_error());
     }
-    Ok(())
+    // SAFETY: just opened for this process and owned by nothing else.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    set_size(master.as_raw_fd(), cols, rows)?;
+    Ok((master, slave))
 }
 
 /// Makes reads and writes on `fd` return at once when they cannot go on.
@@ -150,42 +188,54 @@ pub fn is_terminal(fd: RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
-/// Which way to wait in [`wait_for`].
-#[derive(Clone, Copy)]
-pub enum Ready {
-    Read,
-    Write,
-}
-
-/// Waits until `fd` can be read or written, for `timeout` at most. `false`
-/// when the time ran out. `select` rather than `poll`: macOS does not
+/// Waits until `read` can be read or `write` can be written, for `timeout`
+/// at most, and says which. `select` rather than `poll`: macOS does not
 /// promise `poll` on terminal devices.
-pub fn wait_for(fd: RawFd, ready: Ready, timeout: Duration) -> io::Result<bool> {
-    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
-        return Err(io::Error::from_raw_os_error(libc::EBADF));
+pub fn wait(
+    read: Option<RawFd>,
+    write: Option<RawFd>,
+    timeout: Duration,
+) -> io::Result<(bool, bool)> {
+    for fd in read.iter().chain(write.iter()) {
+        if *fd < 0 || *fd as usize >= libc::FD_SETSIZE {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
     }
     let mut time = libc::timeval {
         tv_sec: timeout.as_secs() as libc::time_t,
         tv_usec: timeout.subsec_micros() as libc::suseconds_t,
     };
-    // SAFETY: the set is initialised by FD_ZERO before use, `fd` is below
-    // FD_SETSIZE (checked above), and every pointer is to a local that
-    // lives for the call.
+    let highest = read.into_iter().chain(write).max().unwrap_or(-1);
+    // SAFETY: the sets are initialised by FD_ZERO before use, every
+    // descriptor in them is below FD_SETSIZE (checked above), and every
+    // pointer is to a local that lives for the call.
     unsafe {
-        let mut set: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut set);
-        libc::FD_SET(fd, &mut set);
-        let (reads, writes) = match ready {
-            Ready::Read => (&mut set as *mut libc::fd_set, std::ptr::null_mut()),
-            Ready::Write => (std::ptr::null_mut(), &mut set as *mut libc::fd_set),
-        };
-        match libc::select(fd + 1, reads, writes, std::ptr::null_mut(), &mut time) {
-            n if n > 0 => Ok(true),
-            0 => Ok(false),
+        let mut reads: libc::fd_set = std::mem::zeroed();
+        let mut writes: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut reads);
+        libc::FD_ZERO(&mut writes);
+        if let Some(fd) = read {
+            libc::FD_SET(fd, &mut reads);
+        }
+        if let Some(fd) = write {
+            libc::FD_SET(fd, &mut writes);
+        }
+        match libc::select(
+            highest + 1,
+            &mut reads,
+            &mut writes,
+            std::ptr::null_mut(),
+            &mut time,
+        ) {
+            n if n > 0 => Ok((
+                read.is_some_and(|fd| libc::FD_ISSET(fd, &reads)),
+                write.is_some_and(|fd| libc::FD_ISSET(fd, &writes)),
+            )),
+            0 => Ok((false, false)),
             _ => {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
-                    Ok(false)
+                    Ok((false, false))
                 } else {
                     Err(err)
                 }

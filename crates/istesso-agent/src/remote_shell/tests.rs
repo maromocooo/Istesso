@@ -40,6 +40,14 @@ impl ShellPair {
                 .unwrap();
         }
         crate::cache::remember_local_manifest(&host.paths(), &manifest("a host"));
+        // The host names the device by its id, as `--allow-shell` takes it.
+        let laptop = PeerStore::open(host.paths().peers())
+            .unwrap()
+            .find("a laptop")
+            .unwrap()
+            .unwrap()
+            .id
+            .clone();
         let log = Arc::new(Mutex::new(Vec::new()));
         let lines = log.clone();
         let options = crate::AgentOptions {
@@ -47,11 +55,7 @@ impl ShellPair {
             port: 0,
             discovery: false,
             refresh_peers: None,
-            shell_for: if allow {
-                vec!["a laptop".to_string()]
-            } else {
-                Vec::new()
-            },
+            shell_for: if allow { vec![laptop] } else { Vec::new() },
             shell_program: Some("/bin/sh".into()),
             ..crate::AgentOptions::default()
         };
@@ -462,4 +466,116 @@ fn a_device_that_sends_an_oversized_frame_is_cut_off() {
     terminal.writer.as_mut().unwrap().send(&huge).unwrap();
     assert!(process_is_gone(pid), "the shell is still running");
     assert!(pair.over().contains("the device went away"));
+}
+
+/// The review's first case: a program in the shell does not read, the device
+/// pastes into it and goes away. The host must hear it go, end the shell and
+/// free its place, not wait on the terminal without end.
+#[test]
+fn a_device_that_pastes_into_a_program_that_does_not_read_and_goes_is_heard_to_go() {
+    let pair = ShellPair::new("sh-stall", true);
+    let mut terminal = pair.open(request(80, 24));
+    let pid = pair.shell_pid();
+    terminal.type_in("sleep 600\n");
+    std::thread::sleep(Duration::from_millis(500));
+    let line = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n".repeat(512); // 16 KiB
+    for _ in 0..12 {
+        terminal.send(ShellFrame::Data(line.clone()));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let gone = Instant::now();
+    terminal.hang_up();
+    let over = pair.over();
+    assert!(over.contains("the device went away"), "{over}");
+    assert!(
+        gone.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        gone.elapsed()
+    );
+    assert!(process_is_gone(pid), "the shell is still running");
+    // All of the paste reached the host, although the program took none of it.
+    assert!(
+        over.contains("196608 bytes in 13 frames") || over.contains("196618 bytes in 13 frames"),
+        "{over}"
+    );
+}
+
+/// The review's second case: the device stops reading while the shell
+/// prints, and then loses its right. The shell must end within about a
+/// second, not when a write to the device gives up.
+#[test]
+fn losing_the_right_ends_the_shell_soon_even_when_the_device_does_not_read() {
+    let pair = ShellPair::new("sh-revoke-deaf", true);
+    let (client, answer) = pair.ask(request(80, 24));
+    assert_eq!(answer, ShellAnswer::Open);
+    // Never read from here on: what the shell prints piles up on the way.
+    let mut channel = client.into_channel();
+    let pid = pair.shell_pid();
+    channel.send(&ShellFrame::data(b"yes\n")).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let began = Instant::now();
+    PeerStore::open(pair.host.paths().peers())
+        .unwrap()
+        .set_permission("a laptop", Permission::Control, false)
+        .unwrap();
+    let over = pair.over();
+    assert!(over.contains("lost its right"), "{over}");
+    // Looked up again within a second, and then not held up by the device.
+    assert!(
+        began.elapsed() < Duration::from_millis(2000),
+        "{:?}",
+        began.elapsed()
+    );
+    assert!(process_is_gone(pid), "the shell is still running");
+    drop(channel);
+}
+
+#[test]
+fn the_host_names_devices_by_id_and_never_opens_shells_as_root() {
+    let pair = ShellPair::new("sh-ids", false);
+    let peers = PeerStore::open(pair.host.paths().peers()).unwrap();
+    let laptop = peers.find("a laptop").unwrap().unwrap().clone();
+    // A name is not taken; the error says which id to give.
+    let by_name = crate::remote_shell::ShellPolicy::resolve(&peers, &["a laptop".to_string()]);
+    let err = by_name.unwrap_err();
+    assert!(err.contains(&laptop.id), "{err}");
+    assert!(crate::remote_shell::ShellPolicy::resolve(&peers, &["0000-0000".to_string()]).is_err());
+    let policy =
+        crate::remote_shell::ShellPolicy::resolve(&peers, std::slice::from_ref(&laptop.id))
+            .unwrap();
+    assert!(policy.names(&laptop));
+    assert_eq!(policy.devices(), [format!("a laptop ({})", laptop.id)]);
+    // Root is refused before anything else.
+    assert!(crate::remote_shell::sys::refuse_root(true).is_err());
+    assert!(crate::remote_shell::sys::refuse_root(false).is_ok());
+}
+
+#[test]
+fn the_shell_gets_none_of_the_agents_other_descriptors() {
+    // A descriptor this process holds without close-on-exec, as a library might.
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` writes two descriptors; one is copied to a fixed number
+    // without close-on-exec, and all are closed at the end.
+    unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        assert_eq!(libc::dup2(fds[0], 987), 987);
+    }
+    let pair = ShellPair::new("sh-fds", true);
+    let mut terminal = pair.open(request(80, 24));
+    terminal.type_in("test -e /dev/fd/987 && echo LE''AKED || echo NOT-LE''AKED\n");
+    let shown = terminal.shows("LEAKED");
+    // SAFETY: closes what this test opened.
+    unsafe {
+        libc::close(987);
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    assert!(shown, "{}", terminal.printed());
+    assert!(
+        terminal.printed().contains("NOT-LEAKED"),
+        "{}",
+        terminal.printed()
+    );
+    terminal.type_in("exit\n");
+    assert_eq!(terminal.ended(), Some(ShellEnd::Code(0)));
 }

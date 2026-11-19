@@ -150,6 +150,7 @@ impl Agent {
         let shell_policy = if options.shell_for.is_empty() {
             crate::remote_shell::ShellPolicy::default()
         } else {
+            crate::remote_shell::sys::refuse_root(crate::remote_shell::sys::is_root())?;
             let peers = PeerStore::open(paths.peers()).map_err(|e| e.to_string())?;
             crate::remote_shell::ShellPolicy::resolve(&peers, &options.shell_for)?
         };
@@ -191,6 +192,14 @@ impl Agent {
     /// Fingerprint of this device's identity key.
     pub fn fingerprint(&self) -> &str {
         &self.shared.fingerprint
+    }
+
+    /// The devices that may open a shell here, as "name (id)".
+    pub fn shell_devices(&self) -> Vec<String> {
+        #[cfg(unix)]
+        return self.shared.shell_policy.devices();
+        #[cfg(not(unix))]
+        Vec::new()
     }
 
     /// Serves paired devices until the process ends.
@@ -544,6 +553,12 @@ impl Shared {
                 _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
             if session.respond(&response).is_err() {
+                // The device was not told that a shell runs: the conversation is
+                // over, and a shell started for it is hung up (when dropped).
+                #[cfg(unix)]
+                {
+                    shell = None;
+                }
                 break;
             }
             #[cfg(unix)]
