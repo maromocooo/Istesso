@@ -1792,28 +1792,45 @@ static NSCursor *empty_cursor(void) {
 - (void)otherMouseDown:(NSEvent *)event { [self button:0x112 pressed:YES event:event]; }
 - (void)otherMouseUp:(NSEvent *)event { [self button:0x112 pressed:NO event:event]; }
 
+static void send_scroll(void *context, const char *message) {
+    (void)context;
+    send_input("%s", message);
+}
+
 - (void)scrollWheel:(NSEvent *)event {
     if (picture_stale) {
-        // Scrolling a picture that is not there moves something nobody sees.
+        // Scrolling a picture that is not there moves something nobody sees. An end held back
+        // is dropped too: the compositor stops a scroll whose end never comes by itself.
         _scroll = (ScrollState){0};
         return;
     }
-    // A wheel goes as notches, a trackpad as pixels of the picture with the stage of the gesture
-    // and of the inertia after it (scroll.h; ADR 0007, "スクロールの種類と段階"), so that the
-    // content moves under the fingers as far as it would in a window of this Mac.
+    // A wheel goes as notches (its whole lines), a trackpad as pixels of the picture with the
+    // stage of the gesture and of the inertia after it (scroll.h; ADR 0007, "スクロールの種類と
+    // 段階"), so that the content moves under the fingers as far as it would in a window here.
     NSSize size = self.bounds.size;
+    CGEventRef cg = event.CGEvent;
     ScrollIn in = {
         .precise = event.hasPreciseScrollingDeltas,
         .dx = event.scrollingDeltaX,
         .dy = event.scrollingDeltaY,
+        .has_lines = cg != NULL,
+        .lines_x = cg ? (long)CGEventGetIntegerValueField(cg, kCGScrollWheelEventDeltaAxis2) : 0,
+        .lines_y = cg ? (long)CGEventGetIntegerValueField(cg, kCGScrollWheelEventDeltaAxis1) : 0,
         .phase = (unsigned)event.phase,
         .momentum = (unsigned)event.momentumPhase,
         .scale_x = size.width > 0 && picture_width > 0 ? picture_width / size.width : 1.0,
         .scale_y = size.height > 0 && picture_height > 0 ? picture_height / size.height : 1.0,
     };
-    char message[256];
-    if (scroll_message(&_scroll, &in, message, sizeof message) > 0) {
-        send_input("%s", message);
+    scroll_event(&_scroll, &in, event.timestamp * 1000.0, send_scroll, NULL);
+    if (_scroll.held) {
+        // The end of the gesture waits here for macOS's inertia; it goes without it once the
+        // wait is over (a later event that comes first sends it instead).
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((SCROLL_MOMENTUM_WAIT_MS + 1) * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+                           if (!picture_stale) {
+                               scroll_due(&self->_scroll, NSProcessInfo.processInfo.systemUptime * 1000.0, send_scroll, NULL);
+                           }
+                       });
     }
 }
 

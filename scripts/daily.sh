@@ -106,6 +106,13 @@
 #   DAILY_MAC_CONFIG, DAILY_HOST_CONFIG
 #                       identity and paired devices of a pair made for the check (the istesso-media
 #                       example `picture pair`): this Mac's own and the host's own are not used
+#   DAILY_SCROLL_MOMENTUM=app
+#                       for an application opened now: the trial compositor drops the inertia
+#                       macOS adds after a trackpad's fingers leave, and stops the scroll as they
+#                       leave, so that the application makes its own (as with a touchpad of the
+#                       desk). Not said: the Mac's inertia is passed on, as in a local application
+#                       of the Mac. To compare, close the application and open it again with or
+#                       without it
 #   DAILY_MIN_QP=N      the quality floor for the encoder of an application started now (min-qp-i,
 #                       -p and -b all N, 1-51; also `open ... --min-qp N`): 18 when not said, so
 #                       that a picture that stands still is encoded in very few bytes; 0 switches
@@ -135,7 +142,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-scroll-wip/gwd-scroll1/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-scroll-wip/gwd-scroll3/target/release'}
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 state="$HOME/Library/Caches/istesso-daily"
@@ -550,7 +557,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SCROLL_MOMENTUM=$([ "${DAILY_SCROLL_MOMENTUM:-}" = app ] && echo app) SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -1006,6 +1013,9 @@ PY2
     cat > "$run/pipeline.sh" <<SCRIPT
 #!/bin/bash
 export GST_PLUGIN_PATH=$plugin GST_REGISTRY=$run/gst-registry.bin XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
+# Whose inertia a trackpad's scroll gets (docs/adr/0007-control-channel.md): the Mac's, or with
+# DAILY_SCROLL_MOMENTUM=app the application's own.
+${SCROLL_MOMENTUM:+export ISTESSO_SCROLL_MOMENTUM=$SCROLL_MOMENTUM}
 # The keys arrive as places on the keyboard; this says what is printed on them.
 export XKB_DEFAULT_LAYOUT=$LAYOUT
 echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid

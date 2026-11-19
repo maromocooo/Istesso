@@ -19,13 +19,17 @@ class PointerScroll(unittest.TestCase):
         self.assertIsNone(pointer_scroll({"kind": "scroll", "dx": 0, "dy": 15, "source": "tilt"}))
         self.assertIsNone(pointer_scroll({"kind": "key", "code": 30, "pressed": True}))
         self.assertIsNone(pointer_scroll([]))
+        # A source without its amounts goes as the old form too.
+        self.assertIsNone(pointer_scroll({"kind": "scroll", "dx": 0, "dy": 15, "source": "wheel"}))
+        self.assertIsNone(pointer_scroll({"kind": "scroll", "dx": 0, "dy": 15, "source": "finger", "v120": [0, 120]}))
 
     def test_a_wheel_goes_as_notches(self):
         found = pointer_scroll({"kind": "scroll", "dx": 0, "dy": 15, "source": "wheel", "v120": [0, 120]})
         self.assertEqual(
             found,
             [("source", "string", "wheel"), ("x", "double", 0.0), ("y", "double", 0.0), ("v120-x", "int", 0),
-             ("v120-y", "int", 120), ("phase", "string", "none"), ("momentum", "string", "none")],
+             ("v120-y", "int", 120), ("phase", "string", "none"), ("momentum", "string", "none"),
+             ("momentum-follows", "boolean", False)],
         )
 
     def test_fingers_go_as_pixels_with_their_stages(self):
@@ -33,6 +37,8 @@ class PointerScroll(unittest.TestCase):
         self.assertEqual((found["x"], found["y"], found["v120-y"], found["phase"], found["momentum"]), (0.0, 24.5, 0, "changed", "none"))
         found = fields(pointer_scroll({"kind": "scroll", "dx": 0, "dy": 0, "source": "finger", "pixels": [0, 0], "momentum": "ended"}))
         self.assertEqual((found["phase"], found["momentum"]), ("none", "ended"))
+        found = fields(pointer_scroll({"kind": "scroll", "dx": 0, "dy": 0, "source": "finger", "pixels": [0, 0], "phase": "ended", "momentum_follows": True}))
+        self.assertEqual((found["phase"], found["momentum-follows"]), ("ended", True))
         # A stage of a newer version moves and ends nothing.
         found = fields(pointer_scroll({"kind": "scroll", "dx": 0, "dy": 0, "source": "finger", "pixels": [1, 0], "phase": "may_begin"}))
         self.assertEqual(found["phase"], "changed")

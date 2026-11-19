@@ -510,8 +510,13 @@ impl Shared {
                                 let _ = session.set_wait(INPUT_SILENCE);
                             }
                             asked.push("input");
-                            // This agent takes committed text (InputEvent::Text).
-                            Response::InputOpen { alive, text: true }
+                            // This agent takes committed text (InputEvent::Text), and
+                            // scrolls with their kind and stages.
+                            Response::InputOpen {
+                                alive,
+                                text: true,
+                                scroll: istesso_proto::SCROLL_LEVEL,
+                            }
                         }
                         Err(_) => Response::error(
                             ErrorCode::Internal,
@@ -758,7 +763,8 @@ mod tests {
                 asking.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             asking.send_input(&[]).unwrap();
@@ -817,6 +823,7 @@ mod tests {
                 pixels: Some([0.0, y]),
                 phase,
                 momentum: None,
+                momentum_follows: false,
             };
             let wheel = |v120: i32| InputEvent::Scroll {
                 dx: 0,
@@ -826,6 +833,7 @@ mod tests {
                 pixels: None,
                 phase: None,
                 momentum: None,
+                momentum_follows: false,
             };
             client
                 .send_input(&[
@@ -885,7 +893,8 @@ mod tests {
                 first.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
@@ -899,7 +908,8 @@ mod tests {
                 second.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             second.send_input(&[key(29, true)]).unwrap();
@@ -940,7 +950,8 @@ mod tests {
                 client.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             // What was down comes up, and the conversation carries on.

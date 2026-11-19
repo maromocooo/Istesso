@@ -251,6 +251,10 @@ def main():
                     gvalue = GObject.Value(GObject.TYPE_INT)
                     gvalue.set_int(field)
                     structure.set_value(name, gvalue)
+                elif kind == "boolean":
+                    gvalue = GObject.Value(GObject.TYPE_BOOLEAN)
+                    gvalue.set_boolean(field)
+                    structure.set_value(name, gvalue)
                 else:
                     structure.set_value(name, field)
             pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
@@ -259,6 +263,21 @@ def main():
 
         handlers.append(scroll_handler)
         print("daily: scrolls of the wheel and of fingers go to the compositor by their kind (trial only)", file=sys.stderr, flush=True)
+    else:
+        # A compositor without PointerScroll: a scroll that moves nothing in the old form (the
+        # stages of a gesture of a newer viewer) would only be an empty frame of a wheel there.
+        told = {"once": False}
+
+        def still_scroll(value):
+            if value.get("kind") != "scroll":
+                return False
+            if "source" in value and not told["once"]:
+                # Once, in a plain line, instead of the scrolls being less without a word.
+                told["once"] = True
+                print("daily: this compositor does not take: scroll kinds (started without --scroll: no trial-y-scroll); scrolls go as dx and dy only", file=sys.stderr, flush=True)
+            return value.get("dx") == 0 and value.get("dy") == 0
+
+        handlers.append(still_scroll)
 
     if handlers:
         take(handlers)
