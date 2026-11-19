@@ -33,6 +33,15 @@ int main(void) {
         CHECK(clipboard_key(8, @"c", 0) == 0);
         CHECK(clipboard_key(0, @"a", command) == 0);
 
+        // In a password field of the host (state 2) a copy or a cut is refused here; a paste is
+        // not, and nothing is refused in another field or without one.
+        CHECK(clipboard_refused_here('c', 2));
+        CHECK(clipboard_refused_here('x', 2));
+        CHECK(!clipboard_refused_here('v', 2));
+        CHECK(!clipboard_refused_here('c', 1));
+        CHECK(!clipboard_refused_here('x', 0));
+        CHECK(!clipboard_refused_here(0, 2));
+
         // What a paste takes from the pasteboard.
         NSArray *plain = @[@"public.utf8-plain-text"];
         CHECK(clipboard_paste_kind(plain, @"two\nlines\tand tabs\r\n") == PASTE_WITH_TEXT);

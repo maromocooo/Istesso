@@ -567,11 +567,8 @@ impl std::fmt::Debug for InputEvent {
                 .field("id", id)
                 .field("text", &text.as_ref().map(|_| ".."))
                 .finish(),
-            InputEvent::Preedit { cursor, .. } => f
-                .debug_struct("Preedit")
-                .field("text", &"..")
-                .field("cursor", cursor)
-                .finish(),
+            // The cursor's offsets would give the text's length in bytes: not shown either.
+            InputEvent::Preedit { .. } => f.write_str("Preedit { .. }"),
         }
     }
 }
@@ -975,6 +972,21 @@ mod tests {
         assert!(!preedit_is_acceptable("にほん", [6, 3]));
         assert!(!preedit_is_acceptable("にほん", [0, 10]));
         assert!(!preedit_is_acceptable("a\tb", [0, 0]));
+    }
+
+    #[test]
+    fn debug_of_composing_text_shows_neither_the_text_nor_its_length() {
+        use super::InputEvent;
+        let preedit = InputEvent::Preedit {
+            text: "ひみつのあいことば".into(),
+            cursor: [3, 27],
+        };
+        let shown = format!("{preedit:?}");
+        assert_eq!(shown, "Preedit { .. }");
+        assert!(!shown.contains("ひみつ"));
+        assert!(!shown.contains("27"));
+        let shown = format!("{:?}", [preedit]);
+        assert!(!shown.contains("ひみつ") && !shown.contains("27"));
     }
 
     use super::*;

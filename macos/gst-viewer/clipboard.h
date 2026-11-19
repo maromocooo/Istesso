@@ -33,6 +33,13 @@ static inline char clipboard_key(unsigned short key_code, NSString *letters, NSE
     }
 }
 
+// Whether a copy or a cut ('c', 'x') is refused here, before anything is sent: the host said that
+// a password field has the keyboard (its text input field's state 2). The host refuses it too
+// (ADR 0022); this is the second wall, and the notice is the same. A paste is not refused here.
+static inline BOOL clipboard_refused_here(char which, unsigned int field_state) {
+    return (which == 'c' || which == 'x') && field_state == 2;
+}
+
 // The markers by which an application says that what it put on the pasteboard is secret, or is
 // not for keeping (nspasteboard.org).
 static inline BOOL clipboard_type_is_secret(NSString *type) {

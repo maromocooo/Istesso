@@ -20,7 +20,7 @@
 
 ### 文字のコピーと貼り付け（2026-11-19、[ADR 0022](adr/0022-clipboard-text.md)）
 
-- Air の窓で ⌘C、⌘X、⌘V を押したときだけ、ホストのアプリとのあいだで文字（64 KiB まで）を運ぶ。ホストのアプリがパスワードの欄なら運ばない。Air で秘密の印が付いたものは貼らない。窓の題に、短く理由が出る（2 秒）。
+- Air の窓で ⌘C、⌘X、⌘V を押したときだけ、ホストのアプリとのあいだで文字（64 KiB まで）を運ぶ。ホストのアプリがパスワードの欄なら運ばない。ホストが「パスワードの欄がキーボードを持っている」（欄の状態 2）と言っているあいだは、ビューアー自身も ⌘C と ⌘X を断り、何も送らない（二重の壁。同じ知らせを出す。貼り付けは断らない）。Air で秘密の印が付いたものは貼らない。窓の題に、短く理由が出る（2 秒）。
 - ブランチ `trial-daily-clipboard`。ビューアーは `ISTESSO_CLIPBOARD=1`、中継は相手が受けると言ったときだけ送る、試用のエージェントは `--clipboard`、パイプラインは `daily-pipeline.py --clipboard`、コンポジターは `trial-y-clipboard` の入ったもの（クリップボードの流れの `gwd-trial29`。統合した試用版の既定は、3 つを 1 つにした `gwd-trial32`）。どれかが古いと、⌘C と ⌘V は、これまでどおりのキーになる（ホストの中だけのコピー）。
 - まだ、実機の 2 台では動かしていない（ADR 0022 の「動かして確かめること」）。Mac のホスト（Studio）は、`m4-daily-host` の流れが、同じ手元の口で作る。
 - Mac のホストの流れ（`m4-daily-host`）の `scripts/daily-mac.sh` は、ここにはマージしていない。それが使うビューアーの設定（`ISTESSO_CHANNEL`、`ISTESSO_CHANNEL_PEER`、`ISTESSO_END_WITH_WINDOW`、`ISTESSO_COMMAND_KEY`、`ISTESSO_PID_FILE`、`ISTESSO_TITLE_FILE`、`ISTESSO_NO_WINDOW`）と、中継の `--keep-trying` は、統合したものにもそのままある。つなぎ直しと文字入力は、それぞれ `ISTESSO_DAILY_RECONNECT` と `ISTESSO_TEXT_INPUT` を付けたときだけ働くので、`daily-mac.sh` から起動したときの振る舞いは前のまま（読んで確かめた。`daily-mac.sh` は動かしていない）。

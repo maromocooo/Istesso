@@ -183,6 +183,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <time.h>
 #include "istesso_media.h"
@@ -988,7 +989,9 @@ static void watch_relay_state(const char *socket_path) {
             // said by a relay of the everyday trial's reconnecting kind only.
             long pid = relay_state_field(content, "pid", 0);
             long count = relay_state_field(content, "input", -1);
-            if (pid > 0 && count >= 0 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
+            // A process number is a positive int: anything else (a negative one, or one past
+            // INT_MAX that the cast would turn into a group or every process) is not looked at.
+            if (pid > 0 && pid <= INT_MAX && count >= 0 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
                 now = count;
                 text = relay_state_field(content, "text", 0) == 1;
                 clipboard = relay_state_field(content, "clipboard", 0) == 1;
@@ -1971,6 +1974,12 @@ static NSCursor *empty_cursor(void) {
     [self send:changes count:keys_fall_in_line(&_keys, NSEvent.modifierFlags, daily_reconnect, changes)];
 }
 
+// The state of the host's text input field that has the keyboard, as the host last said (0: none
+// said). Only the text input view hears it.
+- (unsigned int)fieldState {
+    return 0;
+}
+
 - (void)keyDown:(NSEvent *)event {
     // Copy, cut and paste with the host (ADR 0022): the key itself does not go; the host presses
     // its own. Once for each press: a repeat, and the release, do not go either.
@@ -1982,7 +1991,12 @@ static NSCursor *empty_cursor(void) {
             }
             [_taken addIndex:event.keyCode];
             if (!event.isARepeat && !picture_stale) {
-                clipboard_ask(which);
+                if (clipboard_refused_here(which, [self fieldState])) {
+                    // A password field over there: not asked at all, with the host's own notice.
+                    clipboard_show(clipboard_note("refused", "password_field", which == 'x'));
+                } else {
+                    clipboard_ask(which);
+                }
             }
             return;
         }
@@ -2213,6 +2227,10 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
 // A password field of the host (field state 2): plain keys only, as on this Mac, without the
 // input method (Latin input sources only), no composing text and no strip; Secure Event Input
 // while this window takes keys.
+- (unsigned int)fieldState {
+    return _field.state;
+}
+
 - (void)updatePasswordField {
     BOOL password = _field.state == 2;
     self.inputContext.allowedInputSourceLocales = password ? @[ NSAllRomanInputSourcesLocaleIdentifier ] : nil;
