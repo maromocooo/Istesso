@@ -313,7 +313,7 @@ final class Transport {
         var made: OpaquePointer?
         startStream(admitting: admitting, offered: offered,
                     listenClosed: { made = istesso_media_host_listen_closed(settings.configDir, bind, &info); return made != nil },
-                    offerNot: { _ = istesso_media_host_offer(made, 0) },
+                    offerNot: { istesso_media_host_offer(made, 0) },
                     admitPaired: { _ = istesso_media_host_admit_paired(made) },
                     admitOnly: { id, key in _ = istesso_media_host_admit(made, id, key) })
         guard let made else {
