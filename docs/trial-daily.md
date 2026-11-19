@@ -52,7 +52,7 @@ scripts/daily.sh setup [--host mac]
 - `stop`：Ubuntu のホストのアプリを、いままでどおり閉じ、そのあと `daily-mac.sh stop`（Mac のホストのプログラム、エージェント、ここの窓と中継、見張りを止め、アプリの窓を元の画面に戻して、仮想ディスプレーを消す。Mac Studio のアプリそのものは開いたまま。`close APP` は、アプリを閉じ、窓が閉じたと確かめてから、その文書を消す。`daily-mac.sh` の決め）。
 - Ubuntu のホストだけのもの（`--document`、`--min-qp`）は、`--host mac` では断る。
 - `DAILY_DRY_RUN=1`：`daily-mac.sh` に渡すものを、渡さずに書くだけ（Ubuntu の側は、いつもどおり動く）。
-- 確かめ（窓を出さずに、Mac Studio には何もせずに）：`daily-mac.sh` の代わりの小さなスクリプトで、`open TextEdit --host mac [--for aura --size 1600x1000]`、`close … [--for aura]`（`aura-TextEdit` として渡る）、`setup --host mac`、`list`、`stop` が、その言葉のまま渡り、鍵の記述子を持っていないことを見た。`--min-qp` と `--host studio` は断った。Ubuntu の既定の道（`open editor`、`--host ubuntu`、`list`、`close`）は前のまま。本物の `daily-mac.sh` での `list` は、この Mac の ssh の名前 `istesso-mac` が引けず、その一行を `mac` の行として出して、すぐ終わった（Mac のホストへの ssh は、Mac のホストの流れの設定による）。
+- 確かめ（窓を出さずに、Mac Studio には何もせずに）：`daily-mac.sh` の代わりの小さなスクリプトで、`open TextEdit --host mac [--for aura --size 1600x1000]`、`close … [--for aura]`（`aura-TextEdit` として渡る）、`setup --host mac`、`list`、`stop` が、その言葉のまま渡り、鍵の記述子を持っていないことを見た。`--min-qp` と `--host studio` は断った。Ubuntu の既定の道（`open editor`、`--host ubuntu`、`list`、`close`）は前のまま。Mac のホストの ssh の名前は `istesso-studio`（持ち主が開いている `ssh studio` のタブに相乗りする別名。`ISTESSO_MAC_HOST` で替えられる）。つながらないときは、`list` は `mac` の行に「Studio につながっていません（ssh studio のタブを開いてください）」と出し、ほかのコマンドも同じ一行を出して、すぐ終わる（つながらない名前で確かめた）。
 
 ## いまの部品で、何が足りなかったか
 
