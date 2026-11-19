@@ -34,6 +34,12 @@ use std::process::Command;
 
 /// A connected pair of datagram sockets that have no name: one end for this
 /// program, one for the program it is about to start.
+///
+/// Make the pair before this program has threads that start other programs.
+/// On macOS the system cannot make a pair that is closed on starting a
+/// program in one step: the mark is set by a second call, right after the
+/// pair is made. A program that another thread starts in between is born
+/// with both ends. Linux makes the pair with the mark already set.
 pub fn pair() -> io::Result<(UnixDatagram, UnixDatagram)> {
     UnixDatagram::pair()
 }
@@ -108,8 +114,21 @@ pub unsafe fn inherited(number: RawFd) -> io::Result<UnixDatagram> {
     if kind != libc::SOCK_DGRAM {
         return Err(refuse("is not a datagram socket"));
     }
-    // Both fail for a socket that is not of the local kind; the second fails
-    // for one that is not connected.
+    // Of the local kind: asked for itself, not left to what the checks of
+    // the names below happen to refuse.
+    // SAFETY: zeroed storage is a valid address to be filled in, and
+    // `length` is its size.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `storage` and `length` are valid for the call and describe
+    // each other.
+    let answered =
+        unsafe { libc::getsockname(number, std::ptr::addr_of_mut!(storage).cast(), &mut length) };
+    let has_family = length as usize >= std::mem::size_of::<libc::sa_family_t>();
+    if answered == -1 || !has_family || libc::c_int::from(storage.ss_family) != libc::AF_UNIX {
+        return Err(refuse("is not a local socket"));
+    }
+    // The second fails for a socket that is not connected.
     let here = socket
         .local_addr()
         .map_err(|_| refuse("is not a local socket"))?;
@@ -142,19 +161,38 @@ pub unsafe fn inherited(number: RawFd) -> io::Result<UnixDatagram> {
 /// and none of anyone else's. The process no longer leaves a memory image
 /// when it fails, and tools of the same user no longer see its open files.
 ///
-/// Elsewhere nothing is done and `false` is returned. On macOS the guard of
-/// this kind belongs to how the program is signed (the hardened runtime,
-/// without the right to be debugged), not to a call the program can make.
-pub fn keep_others_out_of_this_process() -> bool {
+/// Not closed by this, on Linux either: the time from the start of the
+/// program to this call (a few milliseconds, in which whoever may attach to
+/// the process still can); the program at the other end of a pair, which
+/// has to call this itself; and a process that only uses this library and
+/// never calls it.
+///
+/// `Ok(true)`: done. `Ok(false)`: this system offers no such call, and
+/// nothing was done; on macOS the guard of this kind belongs to how the
+/// program is signed (the hardened runtime, without the right to be
+/// debugged), not to a call the program can make. `Err`: the system offers
+/// it and refused; the process is as open as before, and whoever relies on
+/// its being closed must not go on.
+pub fn keep_others_out_of_this_process() -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: a call without pointers; the arguments are those the
         // system documents.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) == 0 }
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // Asked back: the mark is what the rest relies on.
+        // SAFETY: as above.
+        if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(io::Error::other(
+                "the system did not keep the mark that closes this process",
+            ));
+        }
+        Ok(true)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        false
+        Ok(false)
     }
 }
 
@@ -242,16 +280,17 @@ mod tests {
     }
 
     /// Not a test of its own: the body of the process the next test starts.
-    /// Closes itself to other programs, says so, and stays until its
+    /// Closes itself to other programs if the variable says "1" (and does
+    /// not if it says anything else), says which, and stays until its
     /// standard input is closed.
     #[test]
     #[ignore = "started by the test below, with a variable set"]
     fn a_process_that_closes_itself() {
-        if std::env::var_os("ISTESSO_TEST_CLOSES_ITSELF").is_none() {
+        let Ok(closes) = std::env::var("ISTESSO_TEST_CLOSES_ITSELF") else {
             return;
-        }
+        };
         use std::io::{Read, Write};
-        let closed = keep_others_out_of_this_process();
+        let closed = closes == "1" && keep_others_out_of_this_process().unwrap();
         println!("closed={closed}");
         std::io::stdout().flush().unwrap();
         let mut rest = Vec::new();
@@ -275,12 +314,15 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
-            if closes {
-                command.env("ISTESSO_TEST_CLOSES_ITSELF", "1");
-            } else {
-                command.env_remove("ISTESSO_TEST_CLOSES_ITSELF");
-            }
+            command.env("ISTESSO_TEST_CLOSES_ITSELF", if closes { "1" } else { "0" });
             command.spawn().unwrap()
+        };
+        // Reads what the process says until it has said `word`: from then on
+        // it stays as it is until its standard input is closed.
+        let says = |child: &mut std::process::Child, word: &str| {
+            BufReader::new(child.stdout.take().unwrap())
+                .lines()
+                .any(|line| line.unwrap().contains(word))
         };
         let looked_into = |pid: u32| {
             (
@@ -293,23 +335,16 @@ mod tests {
         // A process that does not close itself can be looked into: the
         // comparison that makes the refusal below mean something.
         let mut open = started(false);
-        let mut lines = BufReader::new(open.stdout.take().unwrap()).lines();
-        // Wait until it runs the test harness (its first line of output).
-        let _ = lines.next();
+        assert!(says(&mut open, "closed=false"));
         assert_eq!(looked_into(open.id()), (true, true, true));
         drop(open.stdin.take());
         let _ = open.wait();
 
         let mut closed = started(true);
-        let lines = BufReader::new(closed.stdout.take().unwrap()).lines();
-        let mut said = false;
-        for line in lines {
-            if line.unwrap().contains("closed=true") {
-                said = true;
-                break;
-            }
-        }
-        assert!(said, "the process did not say that it closed itself");
+        assert!(
+            says(&mut closed, "closed=true"),
+            "the process did not say that it closed itself"
+        );
         assert_eq!(looked_into(closed.id()), (false, false, false));
         drop(closed.stdin.take());
         let _ = closed.wait();
@@ -318,7 +353,7 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn nothing_is_claimed_where_nothing_is_done() {
-        assert!(!keep_others_out_of_this_process());
+        assert!(!keep_others_out_of_this_process().unwrap());
     }
 
     /// Not a test of its own: the body of the process the next test starts.

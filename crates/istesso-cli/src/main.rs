@@ -480,12 +480,16 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Doctor { json } => {
             if let Some(warning) = istesso_agent::paths::development_build() {
-                eprintln!("{warning}");
+                note(&warning);
             }
-            // What this build does not guard; on standard error, so that the
-            // JSON stays what paired devices are sent.
-            if let Some(note) = istesso_agent::paths::keeping_notice() {
-                eprintln!("{note}");
+            // What this build does not guard, for a person who reads the
+            // report. With --json nothing is added, on either output: the
+            // JSON is what paired devices are sent, and programs that read
+            // it (often with both outputs joined) get what they got before.
+            if !json {
+                if let Some(line) = istesso_agent::paths::keeping_notice() {
+                    note(&line);
+                }
             }
             let manifest = istesso_doctor::detect();
             // Other commands and the agent reuse this inspection for a while.
@@ -663,14 +667,29 @@ fn born_with_input(number: i32) -> Result<std::os::unix::net::UnixDatagram, Stri
     let end = unsafe { istesso_agent::endpoint::inherited(number) }
         .map_err(|e| format!("cannot take input there: {e}"))?;
     // The end is worth what the process is: no other program of the same
-    // user gets to look into this one, where the system offers that.
-    if !istesso_agent::endpoint::keep_others_out_of_this_process() {
-        eprintln!(
+    // user gets to look into this one, where the system offers that. Where
+    // it offers it and refuses, the end is not used.
+    match istesso_agent::endpoint::keep_others_out_of_this_process() {
+        Ok(true) => {}
+        Ok(false) => note(
             "note: on this system a program is kept from looking into this one only by how \
-             it is signed"
-        );
+             it is signed",
+        ),
+        Err(e) => {
+            return Err(format!(
+                "cannot close this process to other programs of the same user: {e}"
+            ))
+        }
     }
     Ok(end)
+}
+
+/// One line for the person on standard error. Whether it could be written
+/// decides nothing: a program whose standard error is closed, or is a pipe
+/// nobody reads to the end, goes on without it.
+fn note(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 #[cfg(not(unix))]
@@ -708,7 +727,15 @@ fn relay_input(
     };
     // The program that holds the other end of the pair. When it is gone the
     // system gives this one another parent, and nothing can arrive any more.
+    // A parent that is the system's first process from the start means that
+    // it was gone before this program could look.
     let started_by = std::os::unix::process::parent_id();
+    let on_a_pair = born_with.is_some();
+    let starter_gone =
+        move || on_a_pair && (started_by == 1 || std::os::unix::process::parent_id() != started_by);
+    if starter_gone() {
+        return Err("the program that started this one is gone already".to_string());
+    }
     let passing = match timings {
         Some(path) => Some(
             istesso_agent::PassLog::create(path)
@@ -734,6 +761,10 @@ fn relay_input(
     let began = std::time::Instant::now();
     let mut said = false;
     let client = loop {
+        // Not kept trying for a program that is no longer there.
+        if starter_gone() {
+            return Err("the program that started this one is gone".to_string());
+        }
         match connect(Duration::from_secs(3)) {
             Ok(client) => break client,
             Err(why) if began.elapsed() < keep_trying => {
@@ -773,9 +804,10 @@ fn relay_input(
                 "Input written to {} goes to the paired device.",
                 socket.display()
             );
-            eprintln!(
+            // One line, and never a reason to stop.
+            note(
                 "note: any program of this account can write to a socket with a name or take \
-                 its place (a pair without a name: --input-fd)"
+                 its place (a pair without a name: --input-fd)",
             );
             listener
         }
@@ -848,8 +880,8 @@ fn relay_input(
         }
     };
     loop {
-        if socket.is_none() && std::os::unix::process::parent_id() != started_by {
-            eprintln!("note: the program that started this one is gone; ending");
+        if starter_gone() {
+            note("note: the program that started this one is gone; ending");
             return Ok(());
         }
         let mut events = Vec::new();
@@ -1493,8 +1525,24 @@ fn set_permission(
 
 fn run_agent(options: AgentOptions) -> Result<(), String> {
     let paths = Paths::from_env();
-    if let Some(note) = istesso_agent::paths::keeping_notice() {
-        eprintln!("{note}");
+    // What this build does not guard, in one line, and never a reason not
+    // to start.
+    #[cfg(unix)]
+    let at_a_name = options.input_end.is_none();
+    #[cfg(not(unix))]
+    let at_a_name = false;
+    let mut open_to = istesso_agent::paths::keeping_notice();
+    if at_a_name {
+        let named = "input from paired devices is handed over at a socket with a name, which \
+                     any program of this account can write to or take the place of \
+                     (a pair without a name: --input-fd)";
+        open_to = Some(match open_to {
+            Some(line) => format!("{line}; {named}"),
+            None => format!("note: {named}"),
+        });
+    }
+    if let Some(line) = open_to {
+        note(&line);
     }
     // Everything that takes time happens before the port is opened: from
     // that moment on callers expect a prompt reaction.
@@ -1502,7 +1550,9 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     let addresses = istesso_doctor::lan_addresses();
     let paired = open_peers()?.peers().len();
 
-    let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
+    // What the agent has to say never stops it: its standard error may be a
+    // pipe nobody reads any more.
+    let agent = Agent::bind(paths, &options, Arc::new(|line: String| note(&line)))?;
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
     println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");

@@ -230,12 +230,15 @@ pub(crate) fn not_left_in_a_file(file: &Path, what: &str) -> Result<()> {
     match std::fs::symlink_metadata(file) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
+        // The name only: the line goes into logs, and the folder says whose
+        // account this is.
         Ok(_) => Err(Error::LeftInAFile(format!(
-            "{what} lies in the file {}, where this build does not keep it. It is not read \
-             and not used: a file can be put there by any program of the same user. Remove \
-             the file to go on; a device that had its key there gets a new one and is \
-             paired again",
-            file.display()
+            "{what} lies in a file ({}) in the place where earlier builds kept it; this \
+             build does not keep it there. It is not read and not used: a file can be put \
+             there by any program of the same user. Remove the file to go on; a device \
+             that had its key there gets a new one and is paired again",
+            file.file_name()
+                .map_or_else(|| "?".into(), |name| name.to_string_lossy())
         ))),
     }
 }
@@ -286,6 +289,13 @@ mod login_keychain {
         }
     }
 
+    // Not closed here (docs/adr/0006-pairing.md, "この形で守れないこと"): the
+    // items are looked for in the keychains of the account's search list, in
+    // its order, not in the login keychain alone. A program of the same user
+    // can put a keychain of its own ahead in that list. Naming the login
+    // keychain needs another, older family of calls; that change is made
+    // together with the first run on a keychain the owner allows, not
+    // before it could be run.
     impl Vault for LoginKeychain {
         fn get(&self, item: Item) -> Result<Option<Vec<u8>>> {
             match get_generic_password(self.service, account(item)) {
@@ -495,7 +505,9 @@ mod tests {
             let Err(Error::LeftInAFile(said)) = asked else {
                 panic!("a key in a file was not refused");
             };
-            assert!(said.contains("identity.key"), "{said}");
+            assert!(said.contains("(identity.key)"), "{said}");
+            // The folder is not said: the line goes into logs.
+            assert!(!said.contains(dir.0.to_str().unwrap()), "{said}");
         }
         assert!(vault.get(Item::Key).unwrap().is_none(), "nothing moved in");
         assert!(dir.key().exists(), "and nothing removed");

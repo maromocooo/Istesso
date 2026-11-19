@@ -66,6 +66,13 @@ pub struct AgentOptions {
     /// that shows an application were started one by the other and share
     /// the pair ([`crate::endpoint`]). Nothing can connect to it or take
     /// its place. `None`, the default, hands input over at the name.
+    ///
+    /// The end is worth what the process that holds it is. Nothing here
+    /// closes this process to other programs of the same user: whoever
+    /// gives an end calls
+    /// [`crate::endpoint::keep_others_out_of_this_process`] itself, at its
+    /// start (`istesso agent --input-fd` does), and so does the program
+    /// that holds the other end.
     #[cfg(unix)]
     pub input_end: Option<Arc<std::os::unix::net::UnixDatagram>>,
     /// For measuring: write down when input was passed on, and never what it
@@ -105,8 +112,6 @@ struct Shared {
     verbose: bool,
     /// Where input is handed over on this machine.
     input: InputPlace,
-    /// That input is handed over at a name has been said.
-    said_named: std::sync::atomic::AtomicBool,
     /// The conversation each device sends its input on, by the device's id:
     /// one for each device. A device that opens another ends the one before.
     inputs: Mutex<HashMap<String, InputHold>>,
@@ -166,7 +171,6 @@ impl Agent {
                 connections: AtomicUsize::new(0),
                 verbose: options.verbose,
                 input,
-                said_named: std::sync::atomic::AtomicBool::new(false),
                 inputs: Mutex::new(HashMap::new()),
                 passing,
                 log,
@@ -508,18 +512,6 @@ impl Shared {
                 }
                 Request::InputOpen { alive } => match InputSink::open(&self.input) {
                     Ok(sink) => {
-                        // Said once, and plainly: a name guards against other
-                        // accounts only.
-                        if matches!(self.input, InputPlace::Named(_))
-                            && !self.said_named.swap(true, Ordering::SeqCst)
-                        {
-                            (self.log)(
-                                "note: input from paired devices is handed over at a socket \
-                                 with a name: any program of this account can write to it or \
-                                 take its place (a pair without a name: --input-fd)"
-                                    .to_string(),
-                            );
-                        }
                         // One conversation carries a device's input. An earlier one (cut
                         // off somewhere on the way, perhaps, without either end having
                         // been told) is over now, and what it had down comes up before

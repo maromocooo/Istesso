@@ -45,24 +45,82 @@ fn istesso() -> Command {
     Command::new(env!("CARGO_BIN_EXE_istesso"))
 }
 
+/// What a command that has to be refused said, and how it ended. Run by a
+/// development build only, in a folder of the test's own: should the
+/// refusal ever fail, the command goes on with a key and a list of the
+/// test's, on this machine only, and never with this account's. It is given
+/// a moment and then ended, so that a command that was not refused does not
+/// stay.
+fn refused(dir: &TestDir, mut command: Command) -> Option<(bool, String)> {
+    use std::io::Read;
+
+    if !DEV_PATHS {
+        eprintln!("left out: only a development build runs in folders of its own");
+        return None;
+    }
+    let mut child = command
+        .env("ISTESSO_CONFIG_DIR", &dir.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let began = Instant::now();
+    let ended = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if began.elapsed() > Duration::from_secs(10) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut said = String::new();
+    if ended.is_none() {
+        // Ours, by the handle it was started with.
+        let _ = child.kill();
+        let _ = child.wait();
+    } else {
+        let _ = child.stderr.take().unwrap().read_to_string(&mut said);
+    }
+    Some((ended.is_some_and(|status| !status.success()), said))
+}
+
 #[test]
 fn a_number_nothing_was_handed_over_at_is_refused_before_anything_else() {
-    for command in [
+    let dir = TestDir::new("refused");
+    let port = a_port(3).to_string();
+    for arguments in [
         vec!["input", "relay", "--to", "nobody", "--input-fd", "987"],
-        vec!["agent", "--no-discovery", "--input-fd", "987"],
+        vec![
+            "agent",
+            "--no-discovery",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--input-fd",
+            "987",
+        ],
         // Never the standard descriptors.
         vec!["input", "relay", "--to", "nobody", "--input-fd", "0"],
     ] {
-        let result = istesso().args(&command).output().unwrap();
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(!result.status.success(), "{command:?}");
-        assert!(stderr.contains("cannot take input there"), "{stderr}");
+        let mut command = istesso();
+        command.args(&arguments);
+        let Some((refused, said)) = refused(&dir, command) else {
+            return;
+        };
+        assert!(refused, "{arguments:?}");
+        assert!(said.contains("cannot take input there"), "{said}");
     }
+    // Refused before the key: none was made.
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
 }
 
 #[test]
 fn a_socket_with_a_name_is_not_taken_as_an_end() {
     let dir = TestDir::new("named");
+    let config = TestDir::new("named-config");
     let name = dir.0.join("n.sock");
     let _listens = std::os::unix::net::UnixDatagram::bind(&name).unwrap();
     // Connected to a name: whoever takes the name's place would be written
@@ -71,26 +129,116 @@ fn a_socket_with_a_name_is_not_taken_as_an_end() {
     to_a_name.connect(&name).unwrap();
     let mut command = istesso();
     let number = hand_to_child(&mut command, to_a_name);
-    let result = command
+    command
         .args(["input", "relay", "--to", "nobody", "--input-fd"])
-        .arg(number.to_string())
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(!result.status.success());
-    assert!(stderr.contains("has a name"), "{stderr}");
+        .arg(number.to_string());
+    let Some((refused, said)) = refused(&config, command) else {
+        return;
+    };
+    assert!(refused);
+    assert!(said.contains("has a name"), "{said}");
+    assert_eq!(std::fs::read_dir(&config.0).unwrap().count(), 0);
 }
 
 #[test]
 fn a_name_and_an_end_are_not_given_together() {
-    let result = istesso()
+    let config = TestDir::new("both-config");
+    let mut command = istesso();
+    command
         .args(["input", "relay", "--to", "nobody", "--input-fd", "5"])
-        .args(["--socket", "/nonexistent/in.sock"])
-        .output()
+        .args(["--socket", "/nonexistent/in.sock"]);
+    let Some((refused, said)) = refused(&config, command) else {
+        return;
+    };
+    assert!(refused);
+    assert!(said.contains("cannot be used with"), "{said}");
+}
+
+/// What a build does not guard is said to a person, in one line, and is
+/// never in the way of a program: `doctor --json` says nothing more than it
+/// did, and an agent starts although nobody reads what it says.
+#[test]
+fn the_notes_are_for_people_and_never_in_the_way() {
+    use std::io::Read;
+
+    if !DEV_PATHS {
+        eprintln!("left out: only a development build runs in folders of its own");
+        return;
+    }
+    let dir = TestDir::new("notes");
+    let doctor = |arguments: &[&str]| {
+        let result = istesso()
+            .args(arguments)
+            .env("ISTESSO_CONFIG_DIR", &dir.0)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        (
+            String::from_utf8_lossy(&result.stdout).into_owned(),
+            String::from_utf8_lossy(&result.stderr).into_owned(),
+        )
+    };
+    let (json, said) = doctor(&["doctor", "--json"]);
+    assert!(!said.contains("keeps the device key"), "{said}");
+    assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    let (_, said) = doctor(&["doctor"]);
+    assert_eq!(said.matches("keeps the device key").count(), 1, "{said}");
+
+    // An agent whose standard error is a pipe that was closed at the other
+    // end: it starts, and answers on its port.
+    let port = a_port(4);
+    let mut agent = istesso()
+        .args(["agent", "--no-discovery", "--bind", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .env("ISTESSO_CONFIG_DIR", &dir.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(!result.status.success());
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(stderr.contains("cannot be used with"), "{stderr}");
+    drop(agent.stderr.take());
+    let mut agent = Started(agent);
+    let began = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            agent.0.try_wait().unwrap().is_none(),
+            "the agent ended instead of starting"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "no agent answers"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(agent.0.try_wait().unwrap().is_none());
+
+    // With standard error read: one line at the start, and no more.
+    drop(agent);
+    let mut agent = istesso()
+        .args(["agent", "--no-discovery", "--bind", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .env("ISTESSO_CONFIG_DIR", &dir.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let began = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "no agent answers"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let mut said = String::new();
+    let _ = agent.stderr.take().unwrap().read_to_string(&mut said);
+    let notes: Vec<&str> = said.lines().filter(|l| l.starts_with("note: ")).collect();
+    assert_eq!(notes.len(), 1, "{said}");
+    assert!(notes[0].contains("keeps the device key"), "{said}");
+    assert!(notes[0].contains("a socket with a name"), "{said}");
 }
 
 /// A port for an agent of the test's own, on this machine only: one nothing
@@ -297,6 +445,74 @@ fn a_socket_with_a_name_is_for_its_owner_only_and_says_what_it_is() {
     assert_eq!(&buffer[..length], pressed);
 }
 
+/// Also while it is still trying to reach the device: nobody answers at the
+/// address, the relay is told to keep trying for a minute, and the program
+/// that started it goes away after a moment.
+#[test]
+fn the_relay_stops_trying_when_the_program_that_started_it_is_gone() {
+    if !DEV_PATHS {
+        eprintln!("left out: only a development build runs in folders of its own");
+        return;
+    }
+    let (host, device) = (TestDir::new("host-trying"), TestDir::new("device-trying"));
+    paired(&host.0, &device.0);
+    // Nothing listens at this port.
+    let port = a_port(5);
+    let (_window, relays) = pair().unwrap();
+    let mut shell = Command::new("/bin/sh");
+    let number = hand_to_child(&mut shell, relays);
+    let output = shell
+        .arg("-c")
+        .arg(
+            "\"$ISTESSO\" input relay --to 'a host' --keep-trying 60 --address \"$ADDRESS\" \
+             --input-fd \"$NUMBER\" >/dev/null 2>&1 & echo $!; sleep 2",
+        )
+        .env("ISTESSO", env!("CARGO_BIN_EXE_istesso"))
+        .env("ADDRESS", format!("127.0.0.1:{port}"))
+        .env("NUMBER", number.to_string())
+        .env("ISTESSO_CONFIG_DIR", &device.0)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    drop(shell);
+    let relay: u32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    let _left = Left(relay);
+    let began = Instant::now();
+    while is_there(relay) {
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "the relay kept trying for a program that was gone"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A process this test had started through a shell: should it stay, it is
+/// ended by its recorded number when the test is over.
+struct Left(u32);
+
+impl Drop for Left {
+    fn drop(&mut self) {
+        let _ = Command::new("/bin/kill")
+            .arg(self.0.to_string())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// `kill -0` asks whether the process is there without doing anything to it.
+fn is_there(process: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &process.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
 /// The relay ends when the program that holds the other end is gone, instead
 /// of keeping a conversation with the device that nothing can feed.
 #[test]
@@ -348,29 +564,9 @@ fn the_relay_ends_with_the_program_that_started_it() {
         .trim()
         .parse()
         .unwrap();
-    // Should the relay stay, it is ended by its recorded number when the
-    // test is over.
-    struct Left(u32);
-    impl Drop for Left {
-        fn drop(&mut self) {
-            let _ = Command::new("/bin/kill")
-                .arg(self.0.to_string())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
     let _left = Left(relay);
-    // `kill -0` asks whether the process is there without doing anything to it.
-    let there = || {
-        Command::new("/bin/kill")
-            .args(["-0", &relay.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    };
     let began = Instant::now();
-    while there() {
+    while is_there(relay) {
         assert!(
             began.elapsed() < Duration::from_secs(30),
             "the relay outlived the program that started it"

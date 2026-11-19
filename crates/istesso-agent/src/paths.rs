@@ -66,7 +66,10 @@ fn warn_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         if let Some(warning) = development_build() {
-            eprintln!("{warning}");
+            // Never a reason to stop: standard error may be a pipe nobody
+            // reads any more.
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{warning}");
         }
     });
 }

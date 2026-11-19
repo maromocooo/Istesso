@@ -38,7 +38,8 @@
 //! ```
 //!
 //! The device's own identity and list of paired devices are used unless
-//! --config says otherwise. Nothing here prints an address or a key.
+//! --config says otherwise, which only a development build (`dev-paths`)
+//! accepts. Nothing here prints an address or a key.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::ToSocketAddrs;
@@ -69,10 +70,19 @@ impl Args {
         Some(self.0.remove(at))
     }
 
-    fn paths(&mut self) -> Paths {
+    /// As the library does (`ffi.rs`): only a development build
+    /// (`dev-paths`) takes its key and its paired devices from a directory
+    /// that whoever starts it names. Any other build uses the device's own,
+    /// and refuses the option rather than ignoring it.
+    fn paths(&mut self) -> Result<Paths, Failure> {
         match self.option("--config") {
-            Some(dir) => Paths::at(PathBuf::from(dir)),
-            None => Paths::from_env(),
+            Some(dir) if istesso_agent::paths::DEV_PATHS => Ok(Paths::at(PathBuf::from(dir))),
+            Some(_) => Err(
+                "this build keeps its identity and its paired devices where \
+                            istesso does: --config needs a build with the dev-paths feature"
+                    .into(),
+            ),
+            None => Ok(Paths::from_env()),
         }
     }
 }
@@ -103,7 +113,7 @@ fn spread(what: &str, mut nanos: Vec<u64>) {
 }
 
 fn watch(mut args: Args) -> Result<(), Failure> {
-    let paths = args.paths();
+    let paths = args.paths()?;
     let peer = args.option("--peer");
     let seconds: f64 = args.option("--seconds").map_or(Ok(10.0), |s| s.parse())?;
     let ask_every: Option<f64> = args.option("--ask-every").map(|s| s.parse()).transpose()?;
@@ -215,7 +225,7 @@ fn watch(mut args: Args) -> Result<(), Failure> {
 }
 
 fn replay(mut args: Args) -> Result<(), Failure> {
-    let paths = args.paths();
+    let paths = args.paths()?;
     let bind = args
         .option("--bind")
         .ok_or("where to listen? --bind ADDR:PORT")?;
@@ -320,7 +330,7 @@ fn pair(args: Args) -> Result<(), Failure> {
 }
 
 fn stay(mut args: Args) -> Result<(), Failure> {
-    let paths = args.paths();
+    let paths = args.paths()?;
     let peer = args.option("--peer");
     let seconds: f64 = args.option("--seconds").map_or(Ok(20.0), |s| s.parse())?;
     let addr = args
