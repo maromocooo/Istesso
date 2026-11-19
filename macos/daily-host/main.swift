@@ -1848,6 +1848,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let panelShown = services + [-1] + appPanels().map { Int($0.id) }.sorted()
         followSize(chosen)
         if restarting { return }
+        // Locked: nothing of the application is shown (the lock's privacy). The program is ready,
+        // the other side says that the Mac is locked, and the picture begins once it is unlocked.
+        if screenLocked() {
+            if transport != nil && !started { started(nil) }
+            return
+        }
         if chosen.bounds != windowBounds || panelShown != self.panelShown {
             self.panelShown = panelShown
             windowBounds = chosen.bounds
@@ -2296,6 +2302,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var awake: IOPMAssertionID = 0
     var lastViewed: TimeInterval = 0
     var wasLocked: Bool?
+    var pausedForLock = false
     func keepAwakeAndTellLock() {
         let now = ProcessInfo.processInfo.systemUptime
         let viewed = transport != nil && transport.viewers > 0
@@ -2319,6 +2326,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         if locked != wasLocked {
             wasLocked = locked
             say(locked ? "locked" : "unlocked")
+            // Nothing of the application while locked; back as it was once unlocked.
+            if locked && picture == "running" && transport != nil {
+                pausedForLock = true
+                word("pause")
+            } else if !locked && pausedForLock {
+                pausedForLock = false
+                if app != nil { windowBounds = .zero }
+                word("resume")
+            }
         }
     }
 

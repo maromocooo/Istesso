@@ -2,3 +2,4 @@
 // statically) and the clock it reads its times from.
 #include "istesso_media.h"
 #include <time.h>
+#include "virtual-display.h"
