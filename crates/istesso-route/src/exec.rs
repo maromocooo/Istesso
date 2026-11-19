@@ -65,7 +65,26 @@ pub fn carry_out(
 
 /// Runs tasks on this machine: no shell, in the project's root, with the
 /// standard streams passed through.
-pub struct Local;
+///
+/// `program`: the path to start in place of the task's first word. A
+/// program the task names by a relative path is started by the real path
+/// that was checked (`find::check_program`), never by the name again, so
+/// that a link on the way cannot be swapped between the check and the
+/// start. A script reached through a link therefore sees its real place in
+/// `$0`.
+#[derive(Debug, Default)]
+pub struct Local {
+    pub program: Option<PathBuf>,
+}
+
+impl Local {
+    /// Starts `program` (a checked real path) with the task's arguments.
+    pub fn with_program(program: PathBuf) -> Local {
+        Local {
+            program: Some(program),
+        }
+    }
+}
 
 /// The program to start: a relative path with a `/` in it is read from the
 /// project's root; a bare name is looked up on `PATH`.
@@ -84,7 +103,11 @@ impl Executor for Local {
             return Err(ExecError::Elsewhere);
         }
         let (program, args) = task.command.split_first().ok_or(ExecError::NoCommand)?;
-        let status = Command::new(program_path(program, root))
+        let start = self
+            .program
+            .clone()
+            .unwrap_or_else(|| program_path(program, root));
+        let status = Command::new(start)
             .args(args)
             .current_dir(root)
             .status()
@@ -170,7 +193,7 @@ mod tests {
     fn another_machine_is_never_run_on() {
         let mut elsewhere = here();
         elsewhere.local = false;
-        let err = Local
+        let err = Local::default()
             .run(
                 &elsewhere,
                 &task(&["/bin/sh", "-c", "exit 0"]),
@@ -183,7 +206,9 @@ mod tests {
     #[test]
     fn a_task_without_a_command_is_not_run() {
         assert_eq!(
-            Local.run(&here(), &task(&[]), Path::new("/")).unwrap_err(),
+            Local::default()
+                .run(&here(), &task(&[]), Path::new("/"))
+                .unwrap_err(),
             ExecError::NoCommand
         );
     }
@@ -191,7 +216,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_exit_code_is_passed_through() {
-        let code = Local
+        let code = Local::default()
             .run(&here(), &task(&["/bin/sh", "-c", "exit 7"]), Path::new("/"))
             .unwrap();
         assert_eq!(code, 7);
@@ -199,7 +224,7 @@ mod tests {
 
     #[test]
     fn a_missing_program_is_reported() {
-        let err = Local
+        let err = Local::default()
             .run(&here(), &task(&["./does-not-exist"]), &std::env::temp_dir())
             .unwrap_err();
         assert!(matches!(err, ExecError::Start { .. }));
@@ -228,5 +253,19 @@ mod tests {
         let err = carry_out(&mut fake, &here(), &task(&[]), Path::new("/r")).unwrap_err();
         assert_eq!(err, ExecError::NoCommand);
         assert!(fake.ran.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_checked_path_is_started_in_place_of_the_name() {
+        // The task names something that does not exist; the given path runs.
+        let code = Local::with_program(PathBuf::from("/bin/sh"))
+            .run(
+                &here(),
+                &task(&["./not-this", "-c", "exit 5"]),
+                Path::new("/"),
+            )
+            .unwrap();
+        assert_eq!(code, 5);
     }
 }

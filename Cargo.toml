@@ -18,6 +18,7 @@ istesso-pair = { path = "crates/istesso-pair" }
 istesso-link = { path = "crates/istesso-link" }
 istesso-agent = { path = "crates/istesso-agent" }
 istesso-measure = { path = "crates/istesso-measure" }
+istesso-devices = { path = "crates/istesso-devices", default-features = false }
 istesso-device-api = { path = "crates/istesso-device-api" }
 istesso-device-adapters = { path = "crates/istesso-device-adapters" }
 
@@ -59,3 +60,23 @@ proc-macro2 = "1"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Tests seal megabytes of frames. Unoptimised, the cipher alone keeps a processor busy for tens of
+# milliseconds a frame, and tests that run side by side then take the processors from each
+# other: bounds by the clock fail although nothing waits (docs/measurements/2026-11-17-tests-
+# that-fail-now-and-then.md). The cipher and what it is built on are compiled optimised in the
+# development and test profiles; everything of this project's own stays as the profile says.
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.universal-hash]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.aead]
+opt-level = 3
+[profile.dev.package.snow]
+opt-level = 3

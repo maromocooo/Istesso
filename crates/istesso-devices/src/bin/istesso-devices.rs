@@ -34,7 +34,8 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("error: {error}");
+            // The message may quote the system or the device.
+            eprintln!("error: {}", istesso_devices::text::printable(&error));
             ExitCode::FAILURE
         }
     }
@@ -148,7 +149,10 @@ mod real {
             if !matches!(event, Event::Shape(_)) {
                 count += 1;
             }
-            println!("  {}", event_text(&event));
+            println!(
+                "  {}",
+                istesso_devices::text::printable(&event_text(&event))
+            );
         }
         count
     }
@@ -272,7 +276,10 @@ mod real {
                 session.recording()
             );
             std::fs::write(&path, text).map_err(|error| format!("writing {path}: {error}"))?;
-            println!("recording written to {path}");
+            println!(
+                "recording written to {}",
+                istesso_devices::text::printable(&path)
+            );
         }
         Ok(ExitCode::SUCCESS)
     }

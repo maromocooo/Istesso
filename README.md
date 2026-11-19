@@ -13,8 +13,10 @@
 | `istesso pair host` / `istesso pair join` | 短いコードで2台を安全にペアリングする |
 | `istesso agent` | ペアリング済みの端末からの問い合わせに答える。各 PC で動かしておく |
 | `istesso hosts` | この PC とペアリング済みの全端末について、状態・役割・負荷・空きメモリを一覧する |
+| `istesso devices list` | この PC の機器を、挿してある場所、種類、使い方とともに一覧する。`--json` で JSON 形式になる |
 | `istesso apps list` | この PC のアプリを一覧する。`--all` を付けると全端末を合わせ、アプリごとに1行へまとめる。応答しない端末にしかないアプリには `!` が付く |
 | `istesso peers list` / `remove` / `address` | 信頼している端末の一覧、失効、到達先アドレスの手動指定 |
+| `istesso peers allow` / `deny` | 端末ごとの権限（閲覧、操作、インストール、USB、音）を与える、取り消す。新しくペアリングした端末は、閲覧と操作だけを持つ |
 | `istesso apps export` / `istesso apps merge` | 一覧をファイルで持ち寄って統合する（ネットワークを使わない方法） |
 | `istesso id` | この端末の名前と鍵の指紋、設定とキャッシュの場所 |
 

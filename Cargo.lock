@@ -902,6 +902,7 @@ dependencies = [
  "clap",
  "istesso-agent",
  "istesso-catalog",
+ "istesso-devices",
  "istesso-doctor",
  "istesso-link",
  "istesso-measure",
@@ -931,7 +932,10 @@ dependencies = [
  "image",
  "istesso-device-adapters",
  "istesso-device-api",
+ "plist",
  "proc-macro2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1006,6 +1010,7 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "hkdf",
+ "libc",
  "rand_core",
  "serde",
  "serde_json",

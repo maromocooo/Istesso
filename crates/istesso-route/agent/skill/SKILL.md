@@ -51,7 +51,7 @@ Read the exit code first; the text says the same in words.
 | 70 | No machine meets the task's needs. | Tell the person what each machine lacks. |
 | 71 | Machines meet the needs, but none of them answers. | Tell the person which machine is needed and whether it can be woken. Do not run the task anywhere else. |
 | 72 | A deploy task has no single place: none was chosen, or the chosen one cannot be used any more. | Show the person the machines that were listed, and the reason if there is one. Do not choose yourself. When the person has answered, run `istesso-route choose <task> <machine>` with their answer. |
-| 73 | A file cannot be read, there is no such task, or the task is of another kind. | Read the message; fix the command or tell the person. |
+| 73 | A file cannot be read, there is no such task, the task is of another kind, or the task file or the program it names by a relative path is not to be trusted (others could have written it). | Read the message; fix the command or tell the person. |
 | 74 | The task states needs this version cannot decide on. | Tell the person; do not run the task anyway. |
 | 75 | The place is another machine; nothing was run. | Running on other machines is not built yet. Tell the person which machine the task goes to. |
 | 127 | The task's program could not be started. | Tell the person; the task's `command` may be wrong. |

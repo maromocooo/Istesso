@@ -4,13 +4,25 @@
 // here is a key's number on macOS and the event's modifier flags, what comes out are Linux key
 // numbers going down and up (linux/input-event-codes.h), as istesso_proto::InputEvent carries them.
 //
-// Two things make this more than a table:
+// Some things make this more than a table:
 // - macOS reports a modifier key by an event of its own when a person presses it. A program that
 //   sends keys (a Stream Deck's hotkey button, a macro tool) often sends none: the key just comes
 //   with the modifier's flag set. A modifier the flags name and nobody pressed is therefore lent
 //   to the key: pressed before it and let go after it.
 // - While Command is held macOS does not say when another key comes up again, so such a key is
 //   pressed and let go at once.
+// - Which of the two keys of a modifier is down comes in bits of their own. An event that has the
+//   modifier's flag and neither of those bits still means the modifier is down: it goes over as
+//   its left key.
+// - Every key, modifier, button and scroll that is sent first brings the modifiers over there in
+//   line with the event's flags: one that is down over there and not held any more comes up; for a
+//   modifier's own event, a button or a scroll, one that is held and not down over there goes down
+//   (its left key; lent around the button or scroll when the window is not the one typed into).
+//   A pointer's move only lets go (keys_releases()). An event of a modifier that was lost (it went
+//   to another application, say) is made good by the next one of these.
+// - When the window stops being the one typed into, every key down over there comes up
+//   (keys_let_go()); when it is that window again, the modifiers held at that moment go down
+//   (keys_fall_in_line()).
 //
 // And one thing is here because it is about the same keys: what is passed on while the picture is
 // not the other side's picture of this moment (its connection was cut and is being made again).
@@ -38,8 +50,9 @@
 #define KEYS_DEVICE_RIGHT_OPTION 0x0040UL
 #define KEYS_DEVICE_RIGHT_CONTROL 0x2000UL
 
-// The most changes one event can cause: four lent modifiers down and up, and the key down and up.
-#define KEYS_MOST 10
+// The most changes one event can cause: eight modifier keys brought in line, four lent modifiers
+// down and up, and the key down and up.
+#define KEYS_MOST 18
 
 typedef struct {
     unsigned code; // Linux's number for the key
@@ -97,40 +110,68 @@ static inline size_t keys_set(Keys *keys, unsigned code, bool pressed, KeyChange
     return count + 1;
 }
 
-// A key went down while the event's flags say which modifiers are held. `out` has room for
-// KEYS_MOST changes; returns how many there are.
-static inline size_t keys_key_down(Keys *keys, unsigned short key, unsigned long flags, bool repeat, KeyChange *out) {
-    // The modifiers the flags name, as their left and right keys on the other side.
-    const struct {
-        unsigned long flag;
-        unsigned left, right;
-    } modifiers[4] = {
-        {KEYS_FLAG_SHIFT, 42, 54},
-        {KEYS_FLAG_CONTROL, 29, 97},
-        {KEYS_FLAG_OPTION, 56, 100},
-        {KEYS_FLAG_COMMAND, keys->command_is_control ? 29U : 125U, keys->command_is_control ? 97U : 126U},
-    };
-    size_t count = 0;
-    unsigned code = keys_code(keys, key);
-    if (code == 0) {
-        return 0;
-    }
+// The modifiers as the other side has them, Shift, Control, Alt and Super, each with its left and
+// right key, and whether the event's `flags` say that it is held. When Command goes over as
+// Control the two are one modifier over there, held when either is.
+typedef struct {
+    bool held;
+    unsigned left, right;
+} KeysModifier;
+
+static inline void keys_modifiers(const Keys *keys, unsigned long flags, KeysModifier out[4]) {
     bool command = (flags & KEYS_FLAG_COMMAND) != 0;
-    if (repeat && !command) {
-        // The application on the other side repeats a held key itself.
-        return 0;
-    }
-    unsigned lent[4] = {0, 0, 0, 0};
+    out[0] = (KeysModifier){(flags & KEYS_FLAG_SHIFT) != 0, 42, 54};
+    out[1] = (KeysModifier){(flags & KEYS_FLAG_CONTROL) != 0 || (command && keys->command_is_control), 29, 97};
+    out[2] = (KeysModifier){(flags & KEYS_FLAG_OPTION) != 0, 56, 100};
+    out[3] = (KeysModifier){command && !keys->command_is_control, 125, 126};
+}
+
+// Brings the modifiers over there in line with the event's `flags`, all but the one whose left key
+// is `skip`: one that is down over there and not held comes up (whichever of its keys is down);
+// with `press`, one that is held and has neither key down over there goes down by its left key.
+// Only what is news is sent: nothing comes up over there that was not noted as down here. Adds
+// to `out` from `count` (at most 8 changes) and returns the new count.
+static inline size_t keys_line_up(Keys *keys, unsigned long flags, bool press, unsigned skip, KeyChange *out,
+                                  size_t count) {
+    KeysModifier modifiers[4];
+    keys_modifiers(keys, flags, modifiers);
     for (int i = 0; i < 4; i++) {
-        if ((flags & modifiers[i].flag) && !keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
+        if (modifiers[i].left == skip) {
+            continue;
+        }
+        if (!modifiers[i].held) {
+            count = keys_set(keys, modifiers[i].left, false, out, count);
+            count = keys_set(keys, modifiers[i].right, false, out, count);
+        } else if (press && !keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
+            count = keys_set(keys, modifiers[i].left, true, out, count);
+        }
+    }
+    return count;
+}
+
+// Only the modifiers that are down over there and not held any more come up (whichever of their
+// keys is down). Nothing goes down. Adds to `out` from `count` (at most 8 changes).
+static inline size_t keys_releases(Keys *keys, unsigned long flags, KeyChange *out) {
+    return keys_line_up(keys, flags, false, 0, out, 0);
+}
+
+// Lends the modifiers that `flags` hold and that have neither key down over there: their left keys
+// go down, and are noted in `lent` (4 places) to be given back by keys_give_back().
+static inline size_t keys_lend(Keys *keys, unsigned long flags, unsigned lent[4], KeyChange *out, size_t count) {
+    KeysModifier modifiers[4];
+    keys_modifiers(keys, flags, modifiers);
+    for (int i = 0; i < 4; i++) {
+        lent[i] = 0;
+        if (modifiers[i].held && !keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
             lent[i] = modifiers[i].left;
             count = keys_set(keys, lent[i], true, out, count);
         }
     }
-    count = keys_set(keys, code, true, out, count);
-    if (command) {
-        count = keys_set(keys, code, false, out, count);
-    }
+    return count;
+}
+
+// The lent modifiers come up again, in the reverse order.
+static inline size_t keys_give_back(Keys *keys, const unsigned lent[4], KeyChange *out, size_t count) {
     for (int i = 3; i >= 0; i--) {
         if (lent[i] != 0) {
             count = keys_set(keys, lent[i], false, out, count);
@@ -139,35 +180,133 @@ static inline size_t keys_key_down(Keys *keys, unsigned short key, unsigned long
     return count;
 }
 
-// A key came up.
-static inline size_t keys_key_up(Keys *keys, unsigned short key, KeyChange *out) {
-    return keys_set(keys, keys_code(keys, key), false, out, 0);
+// A key went down while the event's flags say which modifiers are held. `out` has room for
+// KEYS_MOST changes; returns how many there are. A modifier that is down over there and not held
+// any more comes up first; one that is held and not down over there is lent to the key.
+static inline size_t keys_key_down(Keys *keys, unsigned short key, unsigned long flags, bool repeat, KeyChange *out) {
+    size_t count = keys_releases(keys, flags, out);
+    unsigned code = keys_code(keys, key);
+    if (code == 0) {
+        return count;
+    }
+    bool command = (flags & KEYS_FLAG_COMMAND) != 0;
+    if (repeat && !command) {
+        // The application on the other side repeats a held key itself.
+        return count;
+    }
+    unsigned lent[4];
+    count = keys_lend(keys, flags, lent, out, count);
+    count = keys_set(keys, code, true, out, count);
+    if (command) {
+        count = keys_set(keys, code, false, out, count);
+    }
+    return keys_give_back(keys, lent, out, count);
 }
 
-// A modifier key, or Caps Lock, changed: macOS says which key and what is held now.
+// Whether the key itself went down among what a key press caused: a press to count as one.
+// Modifiers that came up or were lent around it do not count by themselves.
+static inline bool keys_presses_key(const Keys *keys, unsigned short key, const KeyChange *out, size_t count) {
+    unsigned code = keys_code(keys, key);
+    for (size_t i = 0; i < count; i++) {
+        if (code != 0 && out[i].code == code && out[i].pressed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Around a button or a scroll. The modifiers over there are brought in line with the event's
+// flags. One that is down over there and not held comes up before. One that is held and not down
+// over there:
+// - when this window is the one typed into (`typed_into`: the key window of the active
+//   application), goes down before and stays down: its release comes to this window;
+// - when it is not (macOS sends scrolls, and clicks that also activate, to the window under the
+//   pointer), is lent: down before, up after, because its release would go to another
+//   application and nothing would bring it up over there.
+// With `held_back` (the picture is being reconnected) nothing goes down: only releases.
+// The changes to send before the button or scroll are the first `*before` of `out`; the rest are
+// sent after it. Returns how many there are in all (at most 16).
+static inline size_t keys_around_pointer(Keys *keys, unsigned long flags, bool typed_into, bool held_back, KeyChange *out,
+                                         size_t *before) {
+    size_t count = keys_releases(keys, flags, out);
+    if (held_back) {
+        *before = count;
+        return count;
+    }
+    if (typed_into) {
+        count = keys_line_up(keys, flags, true, 0, out, count);
+        *before = count;
+        return count;
+    }
+    unsigned lent[4];
+    count = keys_lend(keys, flags, lent, out, count);
+    *before = count;
+    return keys_give_back(keys, lent, out, count);
+}
+
+// A key came up. A modifier that is down over there and not held any more comes up first.
+static inline size_t keys_key_up(Keys *keys, unsigned short key, unsigned long flags, KeyChange *out) {
+    size_t count = keys_releases(keys, flags, out);
+    return keys_set(keys, keys_code(keys, key), false, out, count);
+}
+
+// A modifier key, or Caps Lock, changed: macOS says which key and what is held now. The other
+// modifiers are brought in line with the flags first.
 static inline size_t keys_flags_changed(Keys *keys, unsigned short key, unsigned long flags, KeyChange *out) {
-    unsigned long bit = 0;
+    unsigned long bit = 0, both = 0;
+    int which = -1; // which of keys_modifiers() the key is
     switch (key) {
-        case 0x38: bit = KEYS_DEVICE_LEFT_SHIFT; break;
-        case 0x3C: bit = KEYS_DEVICE_RIGHT_SHIFT; break;
-        case 0x3B: bit = KEYS_DEVICE_LEFT_CONTROL; break;
-        case 0x3E: bit = KEYS_DEVICE_RIGHT_CONTROL; break;
-        case 0x3A: bit = KEYS_DEVICE_LEFT_OPTION; break;
-        case 0x3D: bit = KEYS_DEVICE_RIGHT_OPTION; break;
-        case 0x37: bit = KEYS_DEVICE_LEFT_COMMAND; break;
-        case 0x36: bit = KEYS_DEVICE_RIGHT_COMMAND; break;
+        case 0x38: bit = KEYS_DEVICE_LEFT_SHIFT; which = 0; break;
+        case 0x3C: bit = KEYS_DEVICE_RIGHT_SHIFT; which = 0; break;
+        case 0x3B: bit = KEYS_DEVICE_LEFT_CONTROL; which = 1; break;
+        case 0x3E: bit = KEYS_DEVICE_RIGHT_CONTROL; which = 1; break;
+        case 0x3A: bit = KEYS_DEVICE_LEFT_OPTION; which = 2; break;
+        case 0x3D: bit = KEYS_DEVICE_RIGHT_OPTION; which = 2; break;
+        case 0x37: bit = KEYS_DEVICE_LEFT_COMMAND; which = keys->command_is_control ? 1 : 3; break;
+        case 0x36: bit = KEYS_DEVICE_RIGHT_COMMAND; which = keys->command_is_control ? 1 : 3; break;
+        default: break;
+    }
+    switch (key) {
+        case 0x38: case 0x3C: both = KEYS_DEVICE_LEFT_SHIFT | KEYS_DEVICE_RIGHT_SHIFT; break;
+        case 0x3B: case 0x3E: both = KEYS_DEVICE_LEFT_CONTROL | KEYS_DEVICE_RIGHT_CONTROL; break;
+        case 0x3A: case 0x3D: both = KEYS_DEVICE_LEFT_OPTION | KEYS_DEVICE_RIGHT_OPTION; break;
+        case 0x37: case 0x36: both = KEYS_DEVICE_LEFT_COMMAND | KEYS_DEVICE_RIGHT_COMMAND; break;
         default: break;
     }
     unsigned code = keys_code(keys, key);
-    if (bit != 0) {
-        return keys_set(keys, code, (flags & bit) != 0, out, 0);
+    if (which < 0) {
+        size_t count = keys_line_up(keys, flags, true, 0, out, 0);
+        if (key == 0x39) {
+            // Caps Lock reports each switch once.
+            count = keys_set(keys, code, true, out, count);
+            count = keys_set(keys, code, false, out, count);
+        }
+        return count;
     }
-    if (key == 0x39) {
-        // Caps Lock reports each switch once.
-        size_t count = keys_set(keys, code, true, out, 0);
-        return keys_set(keys, code, false, out, count);
+    KeysModifier modifiers[4];
+    keys_modifiers(keys, flags, modifiers);
+    KeysModifier modifier = modifiers[which];
+    size_t count = keys_line_up(keys, flags, true, modifier.left, out, 0);
+    if ((flags & both) != 0) {
+        // The bits say which of the two keys is down.
+        bool pressed = (flags & bit) != 0;
+        unsigned other = code == modifier.left ? modifier.right : modifier.left;
+        if (!pressed && modifier.held && !keys->down[other]) {
+            // The flags still have the modifier held (by the other key of it, or by Control when
+            // Command goes over as Control) and nothing else of it is down over there: it stays.
+            return count;
+        }
+        return keys_set(keys, code, pressed, out, count);
     }
-    return 0;
+    // Neither bit: the flag alone says whether the modifier is held, and it is the left key.
+    if (modifier.held) {
+        if (!keys->down[modifier.left] && !keys->down[modifier.right]) {
+            count = keys_set(keys, modifier.left, true, out, count);
+        }
+        return count;
+    }
+    count = keys_set(keys, modifier.left, false, out, count);
+    return keys_set(keys, modifier.right, false, out, count);
 }
 
 // The picture is not the other side's of this moment: of the `count` changes an event caused,
@@ -198,31 +337,13 @@ static inline size_t keys_hold_back(Keys *keys, KeyChange *out, size_t count, bo
     return left;
 }
 
-// The picture is back. The modifiers on the other side are brought in line with the ones held on
-// this keyboard now (`flags` as an event has them): one that is held and is not down over there
-// goes down, one that is down over there and is not held comes up. Other keys are left as they
-// are: pressing a letter again would type it. `out` has room for 8 changes.
+// The modifiers on the other side are brought in line with the ones held on this keyboard now
+// (`flags` as an event has them): one that is held and is not down over there goes down (its left
+// key), one that is down over there and is not held comes up. Other keys are left as they are:
+// pressing a letter again would type it. Called when the picture is back and when the window is
+// the one typed into again, both only while it is the one typed into. `out` has room for 8 changes.
 static inline size_t keys_fall_in_line(Keys *keys, unsigned long flags, KeyChange *out) {
-    bool command = (flags & KEYS_FLAG_COMMAND) != 0;
-    const struct {
-        bool held;
-        unsigned left, right;
-    } modifiers[4] = {
-        {(flags & KEYS_FLAG_SHIFT) != 0, 42, 54},
-        {(flags & KEYS_FLAG_CONTROL) != 0 || (command && keys->command_is_control), 29, 97},
-        {(flags & KEYS_FLAG_OPTION) != 0, 56, 100},
-        {command && !keys->command_is_control, 125, 126},
-    };
-    size_t count = 0;
-    for (int i = 0; i < 4; i++) {
-        if (!modifiers[i].held) {
-            count = keys_set(keys, modifiers[i].left, false, out, count);
-            count = keys_set(keys, modifiers[i].right, false, out, count);
-        } else if (!keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
-            count = keys_set(keys, modifiers[i].left, true, out, count);
-        }
-    }
-    return count;
+    return keys_line_up(keys, flags, true, 0, out, 0);
 }
 
 // The window is no longer the one that is typed into: no key stays down on the other side.
