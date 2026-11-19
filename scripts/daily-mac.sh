@@ -197,7 +197,7 @@ do_open() {
     local target_args size_arg="--size $size"
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$app")"; fi
     # The whole display keeps its own shape unless a size was asked for.
-    [ -n "$display" ] && [ -z "$size_given" ] && size_arg=""
+    [ -z "$size_given" ] && [ "$for_whom" != aura ] && size_arg=""
     # A new, empty document of the trial's own (EXT: its kind, e.g. txt), so that the application
     # opens with it and not with a panel or one of the owner's documents.
     local document_arg=""
@@ -289,7 +289,7 @@ HOST
     local shown
     shown=$(printf '%s\n' "$answer" | sed -n 's/^size //p' | tail -1)
     # The window here has the picture's shape, at most 1720 points wide.
-    if [ -n "$display" ] && [ -z "$size_given" ] && [[ "$shown" =~ ^[0-9]+x[0-9]+$ ]]; then
+    if [ -z "$size_given" ] && [[ "$shown" =~ ^[0-9]+x[0-9]+$ ]]; then
         local pw=${shown%x*} ph=${shown#*x}
         if [ "$pw" -gt 1720 ]; then size="1720x$((ph * 1720 / pw))"; else size=$shown; fi
     fi
@@ -326,7 +326,9 @@ open_here() {
     local title
     title="$(cat "$mine/app" 2>/dev/null) (Mac host)"
     printf '%s\n\n' "$title" > "$mine/title"
-    local settings=(ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
+    # The viewer composes Japanese itself and sends committed text (ADR 0007) when the relay says
+    # the host takes it; and connects again by itself after a cut.
+    local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
     local arguments=("$x" "$y" "$width" "$height" "$title" - "$frames" 0 "$mine/in.sock")

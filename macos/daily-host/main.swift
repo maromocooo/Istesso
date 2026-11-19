@@ -126,6 +126,7 @@ func readSettings() -> Settings {
 }
 
 if CommandLine.arguments.dropFirst().first == "--self-test" { selfTest() }
+if CommandLine.arguments.dropFirst().first == "--close-document" { closeDocument(Array(CommandLine.arguments.dropFirst(2))) }
 let settings = readSettings()
 
 // MARK: - Saying things
@@ -869,6 +870,49 @@ func sessionStep(type: CGEventType, at point: CGPoint, onTarget: Bool, pressWind
     }
 }
 
+/// `--close-document PID PATH`: closes the one window of the application PID that shows the trial's
+/// own document PATH, by pressing its close button through Accessibility; no other window and no
+/// other document is touched. Says what became of it (one line of JSON) and ends. Never says the
+/// document's contents or any window's title.
+func closeDocument(_ arguments: [String]) -> Never {
+    guard arguments.count == 2, let pid = pid_t(arguments[0]) else {
+        print("{\"closed\":false,\"why\":\"usage: --close-document PID PATH\"}")
+        exit(2)
+    }
+    let wanted = URL(fileURLWithPath: (arguments[1] as NSString).expandingTildeInPath).standardizedFileURL
+    let app = AXUIElementCreateApplication(pid)
+    var value: CFTypeRef?
+    guard AXIsProcessTrusted(), AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+          let windows = value as? [AXUIElement] else {
+        print("{\"closed\":false,\"why\":\"the application's windows cannot be read\"}")
+        exit(1)
+    }
+    for window in windows {
+        var document: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXDocumentAttribute as CFString, &document) == .success,
+              let text = document as? String, let url = URL(string: text)?.standardizedFileURL,
+              url.path == wanted.path else { continue }
+        var button: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &button) == .success,
+              let button, AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString) == .success else {
+            print("{\"closed\":false,\"why\":\"its close button could not be pressed\"}")
+            exit(1)
+        }
+        Thread.sleep(forTimeInterval: 1.0)
+        var sheets: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &sheets)
+        let asking = (sheets as? [AXUIElement] ?? []).contains { child in
+            var role: CFTypeRef?
+            AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role)
+            return role as? String == kAXSheetRole as String
+        }
+        print(asking ? "{\"closed\":false,\"why\":\"the application asks in a sheet (left as it is)\"}" : "{\"closed\":true}")
+        exit(asking ? 1 : 0)
+    }
+    print("{\"closed\":false,\"why\":\"no window shows that document\"}")
+    exit(1)
+}
+
 /// `--self-test`: the rule of the session form, without any window or permission.
 func selfTest() -> Never {
     let win = CGRect(x: 100, y: 100, width: 200, height: 100)
@@ -1365,7 +1409,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             say("refused", [("word", "start"), ("reason", "no application called \(name) was found")])
             return quit(1)
         }
-        guard listen(width: settings.size?.0 ?? 1720, height: settings.size?.1 ?? 720) else { return }
+        // The picture's size: as asked (and the window is made that size), or else the window's
+        // own size in its screen's pixels, found when it is first seen (one picture pixel for one
+        // pixel of the screen: no scaling, and the viewer's window has the window's shape).
+        if let size = settings.size {
+            guard listen(width: size.0, height: size.1) else { return }
+        }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
@@ -1457,10 +1506,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         // Keep the window shown so far while it is there; else the largest one.
         let chosen = shown.first { $0.id == windowId } ?? shown.max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
         guard let chosen else { return }
+        if transport == nil {
+            let density = pixelsPerPoint(CGMainDisplayID())
+            let w = min(3840, Int(chosen.bounds.width * density)) & ~1, h = min(2160, Int(chosen.bounds.height * density)) & ~1
+            guard listen(width: max(64, w), height: max(64, h)) else { return }
+        }
         if chosen.id != windowId {
             windowId = chosen.id
             windowBounds = .zero
-            if settings.fitWindow { fit(chosen) }
+            if settings.fitWindow && settings.size != nil { fit(chosen) }
         }
         // A panel of the system's for the application came or went: placed again, with it.
         // Every window of the service on the screen, and which are allowed: any change places the
