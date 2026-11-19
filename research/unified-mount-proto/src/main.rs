@@ -21,7 +21,8 @@ mod nfs_side;
 use istesso_agent::mount::client::Remote;
 use istesso_agent::Paths;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::Ordering;
@@ -115,11 +116,27 @@ fn private_dir(dir: &Path) -> Result<(), String> {
 }
 
 /// The empty folder to mount at: <base>/<device>/<folder-id>, with the two above it private.
+/// The path is the real one (no links in it), as the mount table has it. A mount left there
+/// by an earlier run that was killed is taken off first; the mount point itself is not
+/// looked at before that (a mount whose server is gone may not answer).
 fn mount_point(base: &Path, device: &str, folder: &str) -> Result<PathBuf, String> {
     private_dir(base)?;
     let machine = base.join(folder_name(device));
     private_dir(&machine)?;
+    let machine = std::fs::canonicalize(&machine).map_err(|e| e.to_string())?;
     let point = machine.join(folder);
+    if is_mounted(&point) {
+        eprintln!(
+            "mount: a mount was left at {}; taking it off",
+            point.display()
+        );
+        if !unmount(&point) {
+            return Err(format!(
+                "{} is still mounted and could not be unmounted",
+                point.display()
+            ));
+        }
+    }
     if std::fs::symlink_metadata(&point).is_err() {
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -143,26 +160,78 @@ fn mount_point(base: &Path, device: &str, folder: &str) -> Result<PathBuf, Strin
     Ok(point)
 }
 
-/// Whether something other than the folder above it is mounted at `point`.
+/// Whether the kernel's mount table has something mounted at `point` (a real path). Read
+/// without asking any file server (`MNT_NOWAIT`), so a mount whose server is gone, or
+/// answers every question with an error, is still seen. In doubt (the table cannot be
+/// read): mounted, so that the program does not leave a mount behind.
 fn is_mounted(point: &Path) -> bool {
-    match (
-        std::fs::metadata(point),
-        point.parent().map(std::fs::metadata),
-    ) {
-        (Ok(here), Some(Ok(above))) => here.dev() != above.dev(),
-        _ => false,
+    let want = point.as_os_str().as_bytes();
+    for _ in 0..3 {
+        // SAFETY: with a null buffer, getfsstat only counts.
+        let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        if count < 0 {
+            return true;
+        }
+        let room = count as usize + 8;
+        // SAFETY: statfs is plain data; all zeroes is a valid value.
+        let mut table: Vec<libc::statfs> = vec![unsafe { std::mem::zeroed() }; room];
+        let bytes = (room * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+        // SAFETY: the buffer holds `room` entries of `bytes` bytes in all.
+        let filled = unsafe { libc::getfsstat(table.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+        if filled < 0 {
+            return true;
+        }
+        if filled as usize >= room {
+            // The table grew while it was read: read it again.
+            continue;
+        }
+        return table[..filled as usize].iter().any(|entry| {
+            // SAFETY: f_mntonname is a NUL-terminated string inside the entry.
+            unsafe { std::ffi::CStr::from_ptr(entry.f_mntonname.as_ptr()) }.to_bytes() == want
+        });
     }
+    true
 }
 
+/// Takes the mount at `point` off, by force when it is busy. True when nothing is mounted
+/// there any more.
 fn unmount(point: &Path) -> bool {
-    let run = |force: bool| {
+    for force in [false, true] {
+        if !is_mounted(point) {
+            return true;
+        }
         let mut command = Command::new("/sbin/umount");
         if force {
             command.arg("-f");
         }
-        command.arg(point).status().is_ok_and(|s| s.success())
-    };
-    !is_mounted(point) || run(false) || run(true)
+        let _ = command.arg(point).status();
+    }
+    !is_mounted(point)
+}
+
+/// Unmounts, trying again every second for as long as it takes: the program never ends
+/// while the folder is mounted, so that its loopback port cannot be taken by another
+/// process that the kernel would then ask for this folder's files.
+async fn unmount_until_gone(point: &Path) {
+    let mut tries = 0u64;
+    loop {
+        let at = point.to_path_buf();
+        if tokio::task::spawn_blocking(move || unmount(&at))
+            .await
+            .unwrap_or(false)
+        {
+            eprintln!("unmounted {}", point.display());
+            return;
+        }
+        if tries.is_multiple_of(10) {
+            eprintln!(
+                "could not unmount {} yet; trying again every second (the program stays until it is)",
+                point.display()
+            );
+        }
+        tries += 1;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn run_mount(options: Options) -> ExitCode {
@@ -206,6 +275,16 @@ fn run_mount(options: Options) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // A panic must not leave the mount behind: take it off while the server still answers
+    // (its threads run on while the panicking one unwinds). A panic in one question's task
+    // takes the mount off too; the program then sees it gone and ends.
+    let hook_point = point.clone();
+    let earlier = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        earlier(info);
+        let _ = unmount(&hook_point);
+    }));
 
     let remote = Arc::new(remote);
     let gate = Arc::new(nfs_side::Gate::default());
@@ -256,6 +335,9 @@ fn run_mount(options: Options) -> ExitCode {
                     "mount: mount_nfs failed ({other:?}); {} later mount request(s) were refused; stopping",
                     gate.refused_mounts.load(Ordering::Relaxed)
                 );
+                if is_mounted(&point) {
+                    unmount_until_gone(&point).await;
+                }
                 return ExitCode::FAILURE;
             }
         }
@@ -269,31 +351,37 @@ fn run_mount(options: Options) -> ExitCode {
             open_after.as_secs_f64(),
         );
 
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("signal");
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut signals = [
+            SignalKind::interrupt(),
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+            SignalKind::quit(),
+        ]
+        .map(|kind| signal(kind).expect("signal"));
+        let [interrupt, terminate, hangup, quit] = &mut signals;
         let mut every = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
-                _ = term.recv() => break,
+                _ = interrupt.recv() => break,
+                _ = terminate.recv() => break,
+                _ = hangup.recv() => break,
+                _ = quit.recv() => break,
                 _ = every.tick() => {
-                    if !is_mounted(&point) {
+                    let at = point.clone();
+                    let mounted = tokio::task::spawn_blocking(move || is_mounted(&at))
+                        .await
+                        .unwrap_or(true);
+                    if !mounted {
                         eprintln!("the folder was unmounted from outside");
                         break;
                     }
                 }
             }
         }
-        // Unmount while the server still answers; a server that is gone would make unmount wait.
-        let at = point.clone();
-        let ok = tokio::task::spawn_blocking(move || unmount(&at))
-            .await
-            .unwrap_or(false);
-        eprintln!(
-            "{} {}",
-            if ok { "unmounted" } else { "could not unmount" },
-            point.display()
-        );
+        // Unmount while the server still answers; the port stays this program's until the
+        // mount is gone.
+        unmount_until_gone(&point).await;
         ExitCode::SUCCESS
     });
     remote.close();

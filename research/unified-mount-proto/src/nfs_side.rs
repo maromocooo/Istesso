@@ -164,6 +164,20 @@ impl Handles {
     }
 }
 
+/// Whether an entry the host listed in the folder `dir` can be shown here: a name of one
+/// entry (no `/`, no NUL, not `.` or `..`, at most 255 bytes) and an id that is not 0 (taken
+/// by the NFS library) and not the folder's root or the folder itself.
+fn valid_entry(entry: &Entry, dir: u64) -> bool {
+    istesso_link::mount::valid_name(&entry.name) && valid_child(entry.id, dir)
+}
+
+fn valid_child(id: u64, dir: u64) -> bool {
+    id != 0 && id != ROOT_ID && id != dir
+}
+
+/// The longest link text taken from the host (`PATH_MAX`).
+const MAX_LINK: usize = 1024;
+
 pub struct RemoteFs {
     remote: Arc<Remote>,
     gate: Arc<Gate>,
@@ -211,22 +225,32 @@ impl RemoteFs {
                 return Ok(entries.clone());
             }
         }
-        let mut entries = Vec::new();
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut names = std::collections::HashSet::new();
+        let mut start = 0u32;
         loop {
-            let start = u32::try_from(entries.len()).map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
             match self.ask(Question::ReadDir { id, start })? {
                 (
                     Answer::Entries {
                         entries: page,
                         more,
+                        next,
                     },
                     _,
                 ) => {
-                    let empty = page.is_empty();
-                    entries.extend(page);
-                    if !more || empty || entries.len() >= MAX_LISTED {
+                    let shown = page.len() as u32;
+                    // What the host says becomes names and file ids in this machine's
+                    // kernel: only entries that can be one are taken.
+                    for entry in page {
+                        if valid_entry(&entry, id) && names.insert(entry.name.clone()) {
+                            entries.push(entry);
+                        }
+                    }
+                    let next = next.unwrap_or(start.saturating_add(shown));
+                    if !more || next <= start || entries.len() >= MAX_LISTED {
                         break;
                     }
+                    start = next;
                 }
                 _ => return Err(nfsstat3::NFS3ERR_SERVERFAULT),
             }
@@ -281,9 +305,12 @@ impl NFSFileSystem for RemoteFs {
         if name == b"." {
             return Ok(dirid);
         }
+        if !istesso_link::mount::valid_name(&name) {
+            return Err(nfsstat3::NFS3ERR_INVAL);
+        }
         match self.ask(Question::Lookup { dir: dirid, name })? {
-            (Answer::Found { id, .. }, _) => Ok(id),
-            _ => Err(nfsstat3::NFS3ERR_SERVERFAULT),
+            (Answer::Found { id, .. }, _) if valid_child(id, dirid) => Ok(id),
+            _ => Err(nfsstat3::NFS3ERR_IO),
         }
     }
 
@@ -306,8 +333,9 @@ impl NFSFileSystem for RemoteFs {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         self.gate.check()?;
         match self.ask(Question::Read { id, offset, count })? {
-            (Answer::Data { eof }, data) => Ok((data, eof)),
-            _ => Err(nfsstat3::NFS3ERR_SERVERFAULT),
+            // Never more than was asked for.
+            (Answer::Data { eof }, data) if data.len() <= count as usize => Ok((data, eof)),
+            _ => Err(nfsstat3::NFS3ERR_IO),
         }
     }
 
@@ -389,8 +417,12 @@ impl NFSFileSystem for RemoteFs {
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
         self.gate.check()?;
         match self.ask(Question::ReadLink { id })? {
-            (Answer::Link { target }, _) => Ok(nfsstring(target)),
-            _ => Err(nfsstat3::NFS3ERR_SERVERFAULT),
+            (Answer::Link { target }, _)
+                if !target.is_empty() && target.len() <= MAX_LINK && !target.contains(&0) =>
+            {
+                Ok(nfsstring(target))
+            }
+            _ => Err(nfsstat3::NFS3ERR_IO),
         }
     }
 }
@@ -442,6 +474,39 @@ mod tests {
         let mut swapped = 2u64.to_le_bytes().to_vec();
         swapped.extend_from_slice(&root[8..]);
         assert_eq!(handles.id(&swapped), None);
+    }
+
+    #[test]
+    fn only_entries_that_can_be_names_and_ids_here_are_taken() {
+        let attr = Attr {
+            kind: Kind::File,
+            mode: 0o644,
+            nlink: 1,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
+        };
+        let entry = |id: u64, name: &[u8]| Entry {
+            id,
+            name: name.to_vec(),
+            attr,
+        };
+        assert!(valid_entry(&entry(5, b"main.rs"), 2));
+        for (id, name) in [
+            (5, &b"a/b"[..]),
+            (5, b".."),
+            (5, b"."),
+            (5, b""),
+            (5, b"a\0b"),
+            (0, b"zero"),
+            (ROOT_ID, b"root"),
+            (2, b"itself"),
+        ] {
+            assert!(!valid_entry(&entry(id, name), 2), "{id} {name:?}");
+        }
+        assert!(!valid_entry(&entry(5, &[b'a'; 256]), 2));
     }
 
     #[test]
