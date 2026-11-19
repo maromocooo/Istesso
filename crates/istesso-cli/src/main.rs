@@ -68,6 +68,11 @@ enum Command {
         /// others there (for networks you do not trust)
         #[arg(long)]
         no_discovery: bool,
+        /// Do not ask the paired devices now and then what they have (for
+        /// an agent of its own next to the usual one, with devices of its
+        /// own, that must not knock on their usual agents)
+        #[arg(long)]
+        no_refresh: bool,
         /// Report every conversation with a paired device
         #[arg(short, long)]
         verbose: bool,
@@ -538,6 +543,7 @@ fn run(cli: Cli) -> Result<(), String> {
             port,
             bind,
             no_discovery,
+            no_refresh,
             verbose,
             input_timings,
             allow_shell,
@@ -545,6 +551,11 @@ fn run(cli: Cli) -> Result<(), String> {
             bind,
             port,
             discovery: !no_discovery,
+            refresh_peers: if no_refresh {
+                None
+            } else {
+                AgentOptions::default().refresh_peers
+            },
             verbose,
             input_timings,
             shell_for: allow_shell,
