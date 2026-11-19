@@ -272,11 +272,13 @@ impl InputSink {
 
     /// Passes events on, and notes which keys and buttons are down because
     /// of them. Nothing is passed on once the conversation is over.
-    fn pass(&self, events: &[InputEvent]) {
+    /// Says how many pieces of committed text were dropped for not being within the limits.
+    fn pass(&self, events: &[InputEvent]) -> usize {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         if held.over {
-            return;
+            return 0;
         }
+        let mut dropped = 0;
         for event in events {
             match event {
                 InputEvent::Key {
@@ -308,12 +310,14 @@ impl InputSink {
                 // within the limits is dropped here; the text is never logged.
                 InputEvent::Text { text } => {
                     if !istesso_proto::text_is_acceptable(text) {
+                        dropped += 1;
                         continue;
                     }
                 }
             }
             self.send(event);
         }
+        dropped
     }
 
     /// The conversation is over, however it ended: every key and button it
@@ -426,7 +430,14 @@ impl Shared {
                             break;
                         }
                     }
-                    sink.pass(&events);
+                    let dropped = sink.pass(&events);
+                    if dropped > 0 {
+                        // How many, never what.
+                        (self.log)(format!(
+                            "dropped {dropped} piece(s) of committed text from {}: not within the limits",
+                            session.peer().name
+                        ));
+                    }
                     // The empty message that only says "still here" passes nothing on.
                     if let (Some(passing), false) = (&self.passing, events.is_empty()) {
                         passing.passed(in_hand, events.len());

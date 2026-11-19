@@ -1665,6 +1665,24 @@ static NSCursor *empty_cursor(void) {
 @interface TextInputView : InputView <NSTextInputClient>
 @end
 
+// Commits that could not be passed on whole (the rest of each was not sent).
+static unsigned long text_lost_count;
+
+// One datagram of a commit. The socket is non-blocking and holds only a few kilobytes on macOS: a
+// full one is tried again for up to 50 ms (the relay reads it at once), then given up.
+static BOOL send_text_datagram(const char *packet, size_t length) {
+    for (int attempt = 0; attempt < 50; attempt++) {
+        if (sendto(input_socket, packet, length, 0, (const struct sockaddr *)&input_to, sizeof input_to) == (ssize_t)length) {
+            return YES;
+        }
+        if (errno != ENOBUFS && errno != EAGAIN) {
+            return NO;
+        }
+        usleep(1000);
+    }
+    return NO;
+}
+
 @implementation TextInputView {
     NSString *_marked;
     NSRange _selection;
@@ -1673,13 +1691,33 @@ static NSCursor *empty_cursor(void) {
     BOOL _startedWithMark, _passKey, _discardingMark;
 }
 
-- (void)letGo {
+// What is being composed is thrown away: it never goes to the other side.
+- (void)discardComposition {
     _interpretedEvent = nil;
     _discardingMark = YES;
     [self.inputContext discardMarkedText];
     [self unmarkText];
     _discardingMark = NO;
+}
+
+- (void)letGo {
+    [self discardComposition];
     [super letGo];
+}
+
+// A click may put the cursor into another field over there: the composition is not carried into
+// it.
+- (void)mouseDown:(NSEvent *)event {
+    [self discardComposition];
+    [super mouseDown:event];
+}
+- (void)rightMouseDown:(NSEvent *)event {
+    [self discardComposition];
+    [super rightMouseDown:event];
+}
+- (void)otherMouseDown:(NSEvent *)event {
+    [self discardComposition];
+    [super otherMouseDown:event];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -1777,11 +1815,12 @@ static NSString *plain_text(id value) {
         held_back_count += text.length > 0;
         return;
     }
-    if (input_socket >= 0) {
-        text_input_packets(text, ^(const char *packet, size_t length) {
+    if (input_socket >= 0 && !text_input_packets(text, ^BOOL(const char *packet, size_t length) {
             note_press();
-            sendto(input_socket, packet, length, 0, (const struct sockaddr *)&input_to, sizeof input_to);
-        });
+            return send_text_datagram(packet, length);
+        })) {
+        text_lost_count++;
+        fprintf(stderr, "viewer: a commit could not be passed on whole, and the rest of it was not sent (%lu so far; the text is never shown)\n", text_lost_count);
     }
 }
 
