@@ -13,6 +13,8 @@
 # translation is out of date without it; 2 when a marker is missing or malformed, a file named in the
 # language line is missing (or one is there that the line does not name), or a translation that says
 # it is current does not have the shape of the English; 64 on wrong use. One line per translation.
+# Before the first translation, README.md has no language line and there is no README.<language>.md:
+# that is 0, with nothing to check.
 #
 # The head of a translation (README.md itself starts with the language line):
 #
@@ -53,8 +55,17 @@ english_blob=$(git hash-object README.md) || exit 2
 
 # The language line of README.md names every language and its file, in order. Its own entry is the
 # bold one, and its file is README.md.
+# Without a language line there must be no translations yet: the line goes in together with them,
+# so that no link points at a file that is not there.
 english_line=$(grep -m1 -E "$langline_re" README.md)
-[ -n "$english_line" ] || { echo "broken: README.md has no language line" >&2; exit 2; }
+if [ -z "$english_line" ]; then
+    [ "$mode" = stamp ] && { echo "README.md has no language line, so there is nothing to stamp" >&2; exit 64; }
+    found=""
+    for f in README.*.md; do [ -f "$f" ] && found="$found $f"; done
+    if [ -n "$found" ]; then echo "broken: README.md has no language line, but there are translations:$found"; exit 2; fi
+    echo "no translations yet (README.md has no language line and there is no README.<language>.md)"
+    exit 0
+fi
 names=(); files=()
 rest=$english_line
 while [ -n "$rest" ]; do

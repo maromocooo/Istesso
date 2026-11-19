@@ -144,4 +144,14 @@ expect 2 stamp-refused --stamp README.pr.md
 [[ $(git hash-object README.pr.md) == "$before" ]] && echo 'PASS refused-stamp-leaves-file' || { echo 'FAIL refused-stamp-leaves-file'; failed=1; }
 ls README.pr.md.stamp.* > /dev/null 2>&1 && { echo 'FAIL refused-stamp-leaves-no-temporary-file'; failed=1; } || echo 'PASS refused-stamp-leaves-no-temporary-file'
 
+# Before the first translation: no language line in README.md, and no translation files.
+fresh
+rm -f README.tt.md README.pr.md
+sed -i.bak 1d README.md && rm README.md.bak
+expect 0 no-line-no-translations
+expect 0 no-line-mark-stale --mark-stale
+expect 64 no-line-stamp --stamp README.tt.md
+write_translation README.tt.md "$tt_line" 2026-01-03 ""
+expect 2 no-line-but-a-translation
+
 exit "$failed"

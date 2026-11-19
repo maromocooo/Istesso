@@ -27,6 +27,8 @@ jobs:
         run: bash scripts/tests/check-private-test.sh
       - name: Test the translation checker
         run: bash scripts/tests/check-translations-test.sh
+      - name: Check that no translation of the README is silently out of date
+        run: bash scripts/check-translations.sh
       - name: Check that the measurement scripts parse
         run: python3 -m py_compile scripts/*.py
       - name: Build the screen probe
