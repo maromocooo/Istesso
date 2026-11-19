@@ -54,6 +54,11 @@ const CONNECT_WITHIN: Duration = Duration::from_secs(3);
 /// before the port is taken for free.
 const PROBE_WITHIN: Duration = Duration::from_millis(200);
 
+/// Requests to open a page taken in [`ASKING_WINDOW`]; more are not
+/// opened.
+const MAX_ASKS: usize = 5;
+const ASKING_WINDOW: Duration = Duration::from_secs(5);
+
 /// What the person said about forwarding when the shell was opened.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
@@ -118,6 +123,9 @@ struct State {
     told_elsewhere: BTreeSet<u16>,
     opened: u64,
     not_opened: u64,
+    /// When pages were asked for lately ([`MAX_ASKS`] in [`ASKING_WINDOW`]).
+    asked: std::collections::VecDeque<std::time::Instant>,
+    told_too_many: bool,
 }
 
 struct Inner {
@@ -328,6 +336,28 @@ impl Forwarder {
     pub fn open_url(&self, text: &str) {
         let inner = &self.inner;
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        // At most a few in a short time, whatever the host lets through.
+        let now = std::time::Instant::now();
+        while state
+            .asked
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= ASKING_WINDOW)
+        {
+            state.asked.pop_front();
+        }
+        if state.asked.len() >= MAX_ASKS {
+            state.not_opened += 1;
+            if !state.told_too_many {
+                state.told_too_many = true;
+                (inner.notice)(&format!(
+                    "{} asks to open pages too often; not opened",
+                    inner.device
+                ));
+            }
+            return;
+        }
+        state.asked.push_back(now);
+        state.told_too_many = false;
         let address = match url::parse(text) {
             Ok(address) => address,
             Err(why) => {
@@ -352,6 +382,16 @@ impl Forwarder {
                     return;
                 }
             }
+        } else if address.is_local() {
+            // This machine's own services, or its network's: never for a host
+            // that asks, also with `--open-urls all`.
+            state.not_opened += 1;
+            (inner.notice)(&format!(
+                "{} asked to open a page at {}, an address of this machine or of a local network; not opened",
+                inner.device,
+                address.origin()
+            ));
+            return;
         } else if inner.settings.open_outside {
             (address.as_given(), 0)
         } else {
@@ -953,6 +993,75 @@ mod tests {
             lasted >= HEAD_WITHIN / 2 && lasted < HEAD_WITHIN * 3,
             "{lasted:?}"
         );
+        drop(forwarder);
+        std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pages_of_local_addresses_are_never_opened_and_requests_are_limited() {
+        let device = crate::testing::TempDir::new("fwd-pages");
+        let opened = device.path().join("opened.txt");
+        let opener = device.path().join("opener.sh");
+        std::fs::write(
+            &opener,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n",
+                opened.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let notices = Arc::new(Mutex::new(Vec::<String>::new()));
+        let heard = notices.clone();
+        let forwarder = Forwarder::new(
+            &device.paths(),
+            "a host",
+            "an id",
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Settings {
+                enabled: true,
+                open_outside: true,
+                opener: Some(opener),
+                ..Settings::default()
+            },
+            Arc::new(move |line: &str| heard.lock().unwrap().push(line.to_string())),
+        )
+        .unwrap();
+        // Even when every outside page may be opened: none of these.
+        for local in [
+            "http://127.0.0.2:8000/",
+            "http://[::ffff:127.0.0.1]:8000/",
+            "http://[::]:8000/",
+            "http://192.168.0.1/", // check-private: ok (invented: local addresses are refused)
+        ] {
+            forwarder.open_url(local);
+        }
+        forwarder.open_url("https://example.org/a");
+        // The sixth request in a short time is not opened.
+        forwarder.open_url("https://example.org/b");
+        let began = std::time::Instant::now();
+        while std::fs::read_to_string(&opened)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            assert!(began.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            std::fs::read_to_string(&opened).unwrap(),
+            "https://example.org/a\n"
+        );
+        let said = notices.lock().unwrap().join("\n");
+        assert_eq!(
+            said.matches("an address of this machine or of a local network")
+                .count(),
+            4
+        );
+        assert!(said.contains("asks to open pages too often"));
         drop(forwarder);
         std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();
     }

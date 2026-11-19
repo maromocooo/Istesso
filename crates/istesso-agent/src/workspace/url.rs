@@ -65,13 +65,10 @@ pub fn parse(text: &str) -> Result<WebAddress, Refusal> {
         "https" => true,
         _ => return Err(Refusal::NotWeb),
     };
-    // Visible ASCII only: no spaces, no control characters, no letters a
-    // terminal or a program could read differently; no backslash, which
-    // some programs take for a slash.
-    if !text
-        .bytes()
-        .all(|b| (0x21..=0x7e).contains(&b) && b != b'\\')
-    {
+    // The characters of RFC 3986 only: no spaces, no control characters, no
+    // letters a terminal or a program could read differently; no backslash,
+    // which some programs take for a slash, and none of `"<>^`{|}`.
+    if !text.bytes().all(allowed_in_an_address) {
         return Err(Refusal::Malformed);
     }
     let end = after.find(['/', '?', '#']).unwrap_or(after.len());
@@ -110,6 +107,12 @@ pub fn parse(text: &str) -> Result<WebAddress, Refusal> {
     })
 }
 
+/// The characters RFC 3986 allows in an address: unreserved, reserved and
+/// `%`.
+fn allowed_in_an_address(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&byte)
+}
+
 fn host_name(name: &str) -> Result<Host, Refusal> {
     if name.is_empty()
         || name.len() > 253
@@ -117,6 +120,7 @@ fn host_name(name: &str) -> Result<Host, Refusal> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
         || name.starts_with('.')
+        || name.ends_with('.')
         || name.contains("..")
     {
         return Err(Refusal::Malformed);
@@ -125,6 +129,17 @@ fn host_name(name: &str) -> Result<Host, Refusal> {
     // (not `127.1`, which some programs read as 127.0.0.1).
     if name.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
         return name.parse().map(Host::V4).map_err(|_| Refusal::Malformed);
+    }
+    // A browser reads a name whose last part is a number (`0x7f.1`,
+    // `example.1`) as an IPv4 address, written in a way this does not
+    // read: refused.
+    let last = name.rsplit('.').next().unwrap_or(name);
+    let hex = last
+        .strip_prefix("0x")
+        .or_else(|| last.strip_prefix("0X"))
+        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
+    if hex || last.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Refusal::Malformed);
     }
     Ok(Host::Name(name.to_ascii_lowercase()))
 }
@@ -141,6 +156,36 @@ impl WebAddress {
             Host::Name(name) => name == "localhost",
             Host::V4(address) => *address == Ipv4Addr::LOCALHOST || address.is_unspecified(),
             Host::V6(address) => address.is_loopback(),
+        }
+    }
+
+    /// Whether it points at this machine or at a local network, however it
+    /// is written: a loopback, private, link-local, shared or unspecified
+    /// address, a name under `localhost` or `local`, or a name without a
+    /// dot (a name of the local network). The browser's machine never opens
+    /// such an address for a host that asks: it would reach that machine's
+    /// own services or its network, not the page of a workspace.
+    pub fn is_local(&self) -> bool {
+        match &self.host {
+            Host::Name(name) => {
+                !name.contains('.')
+                    || [".localhost", ".local", ".home.arpa", ".internal", ".lan"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+            }
+            Host::V4(address) => v4_is_local(*address),
+            Host::V6(address) => match address.to_ipv4_mapped() {
+                Some(v4) => v4_is_local(v4),
+                None => {
+                    let first = address.segments()[0];
+                    address.is_loopback()
+                        || address.is_unspecified()
+                        || address.is_multicast()
+                        // Unique local (fc00::/7) and link-local (fe80::/10).
+                        || first & 0xfe00 == 0xfc00
+                        || first & 0xffc0 == 0xfe80
+                }
+            },
         }
     }
 
@@ -181,6 +226,19 @@ impl WebAddress {
     pub fn as_given(&self) -> String {
         format!("{}{}", self.origin(), self.rest)
     }
+}
+
+fn v4_is_local(address: Ipv4Addr) -> bool {
+    let [a, b, ..] = address.octets();
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_multicast()
+        || a == 0
+        // Shared address space (100.64.0.0/10). check-private: ok (a range)
+        || (a == 100 && (64..128).contains(&b))
 }
 
 #[cfg(test)]
@@ -273,6 +331,68 @@ mod tests {
             "https://localhost:3000@evil.example/", // check-private: ok (invented, as above)
         ] {
             assert_eq!(parse(text), Err(Refusal::Credentials), "{text}");
+        }
+    }
+
+    #[test]
+    fn numbers_written_as_names_and_names_with_a_final_dot_are_refused() {
+        for text in [
+            "http://0x7f.1/",
+            "http://0x7F000001/",
+            "http://2130706433/",
+            "http://example.1/",
+            "http://0177.0.0.1/",
+            "http://localhost./",
+            "http://example.org./",
+        ] {
+            assert_eq!(parse(text), Err(Refusal::Malformed), "{text}");
+        }
+        // Characters outside RFC 3986.
+        for text in [
+            "http://example.org/a\"b",
+            "http://example.org/<script>",
+            "http://example.org/a^b",
+            "http://example.org/a`b",
+            "http://example.org/{x}",
+            "http://example.org/a|b",
+        ] {
+            assert_eq!(parse(text), Err(Refusal::Malformed), "{text}");
+        }
+        assert!(parse("http://example.org/a-b_c.d~e/?f=g&h=%20#i").is_ok());
+    }
+
+    #[test]
+    fn addresses_of_this_machine_or_a_local_network_are_local_however_written() {
+        for text in [
+            "http://127.0.0.2/",
+            "http://127.0.0.1:8000/",
+            "http://0.0.0.0/",
+            "http://10.1.2.3/", // check-private: ok (invented: local addresses are refused)
+            "http://172.16.0.1/", // check-private: ok (invented: local addresses are refused)
+            "http://192.168.0.1/", // check-private: ok (invented: local addresses are refused)
+            "http://169.254.169.254/latest/meta-data/", // check-private: ok (invented: local addresses are refused)
+            "http://100.64.0.1/", // check-private: ok (invented: local addresses are refused)
+            "http://[::1]/",
+            "http://[::]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:192.168.0.1]/", // check-private: ok (invented: local addresses are refused)
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+            "http://localhost/",
+            "http://app.localhost/",
+            "http://printer.local/",
+            "http://router/",
+            "http://nas.home.arpa/",
+        ] {
+            assert!(parse(text).unwrap().is_local(), "{text}");
+        }
+        for text in [
+            "https://example.org/",
+            "http://192.0.2.10/",
+            "http://[2001:db8::1]/",
+            "https://docs.example.com:8443/x",
+        ] {
+            assert!(!parse(text).unwrap().is_local(), "{text}");
         }
     }
 
