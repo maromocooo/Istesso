@@ -882,6 +882,7 @@ dependencies = [
  "istesso-link",
  "istesso-pair",
  "istesso-proto",
+ "libc",
  "mdns-sd",
  "serde",
  "serde_json",

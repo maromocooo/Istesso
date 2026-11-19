@@ -4,7 +4,9 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use istesso_pair::{Peer, PeerStore};
-use istesso_proto::{AppEntry, HostManifest, HostStatus, InputEvent};
+use istesso_proto::{
+    AppEntry, ClipboardResult, ClipboardWhy, HostManifest, HostStatus, InputEvent, SecretText,
+};
 
 use crate::channel::{Channel, LocalKeys};
 use crate::message::{ErrorCode, Request, Response};
@@ -16,9 +18,33 @@ use crate::{Error, Result};
 pub enum InputAnswer {
     /// Input is taken. `alive`: and empty messages are answered, so that
     /// [`Client::heard_alive`] has something to hear.
-    Open { alive: bool, text: bool, scroll: u8 },
+    Open {
+        alive: bool,
+        text: bool,
+        scroll: u8,
+        clipboard: bool,
+    },
     /// It is not, and this is why: callers decide by the code.
     Refused { code: ErrorCode, message: String },
+}
+
+/// What the other device said on an input conversation since it was last asked
+/// ([`Client::heard`]).
+#[derive(Debug, Default)]
+pub struct Heard {
+    /// It said "still here", or answered a copy or a paste.
+    pub alive: bool,
+    /// Its answers to copy and paste, in the order they came.
+    pub clipboard: Vec<ClipboardAnswer>,
+}
+
+/// What became of one copy or paste (trial only, docs/adr/0022-clipboard-text.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardAnswer {
+    pub id: u32,
+    pub result: ClipboardResult,
+    pub text: Option<SecretText>,
+    pub why: Option<ClipboardWhy>,
 }
 
 /// An open conversation with one paired device.
@@ -163,10 +189,12 @@ impl Client {
                 alive,
                 text,
                 scroll,
+                clipboard,
             } => Ok(InputAnswer::Open {
                 alive,
                 text,
                 scroll,
+                clipboard,
             }),
             Response::Error { code, message } => Ok(InputAnswer::Refused { code, message }),
             _ => Err(Error::Malformed),
@@ -177,13 +205,33 @@ impl Client {
     /// asked. Takes what has arrived and waits for nothing: sending input
     /// is never held up by it. An error means that the connection is over.
     pub fn heard_alive(&mut self) -> Result<bool> {
-        let mut heard = false;
+        Ok(self.heard()?.alive)
+    }
+
+    /// As [`Client::heard_alive`], and hands over the answers to copy and paste that came
+    /// (trial only). An answer to a copy or a paste says "still here" as well.
+    pub fn heard(&mut self) -> Result<Heard> {
+        let mut heard = Heard::default();
         while self.something_has_arrived()? {
             // The rest of a message that has begun to arrive is there within the
             // connection's own timeout, or the connection is gone.
             let answer = self.channel.recv()?;
             match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
-                Response::InputAlive => heard = true,
+                Response::InputAlive => heard.alive = true,
+                Response::Clipboard {
+                    id,
+                    result,
+                    text,
+                    why,
+                } => {
+                    heard.alive = true;
+                    heard.clipboard.push(ClipboardAnswer {
+                        id,
+                        result,
+                        text,
+                        why,
+                    });
+                }
                 Response::Error { code, message } => {
                     return Err(Error::Remote(format!("{message} ({code:?})")))
                 }

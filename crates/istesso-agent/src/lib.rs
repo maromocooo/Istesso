@@ -10,6 +10,8 @@
 //!   [`paths`] says where files live.
 
 pub mod cache;
+#[cfg(unix)]
+pub mod clipboard;
 pub mod discovery;
 pub mod passing;
 pub mod paths;
@@ -125,6 +127,16 @@ pub(crate) mod testing {
         }
 
         pub fn with_pipeline_restarts(tag: &str, follow_input_restarts: bool) -> Self {
+            Self::build(tag, follow_input_restarts, false)
+        }
+
+        /// With copy and paste (trial only): the agent listens for answers in the host's folder,
+        /// next to the input socket, where a stand-in for the compositor may listen too.
+        pub fn with_clipboard(tag: &str) -> Self {
+            Self::build(tag, false, true)
+        }
+
+        fn build(tag: &str, follow_input_restarts: bool, clipboard: bool) -> Self {
             use istesso_pair::{Hello, Identity, Peer, PeerStore};
             let (host, device) = (TempDir::new(tag), TempDir::new(tag));
             let identities = [&host, &device]
@@ -153,6 +165,7 @@ pub(crate) mod testing {
                 refresh_peers: None,
                 input_socket: Some(socket),
                 follow_input_restarts,
+                clipboard,
                 ..crate::AgentOptions::default()
             };
             let agent =

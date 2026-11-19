@@ -71,6 +71,10 @@ enum Command {
         /// file can be read by its owner only
         #[arg(long, value_name = "PATH")]
         input_timings: Option<PathBuf>,
+        /// Daily trial: copy and paste of text with the program behind the input socket,
+        /// when it answers (docs/adr/0022-clipboard-text.md). Never logs what was copied
+        #[arg(long)]
+        clipboard: bool,
     },
     /// Show this machine and every paired device: state, role table, load
     Hosts {
@@ -407,6 +411,7 @@ fn run(cli: Cli) -> Result<(), String> {
             no_discovery,
             verbose,
             input_timings,
+            clipboard,
         } => run_agent(AgentOptions {
             bind,
             port,
@@ -414,6 +419,7 @@ fn run(cli: Cli) -> Result<(), String> {
             follow_input_restarts: std::env::var_os("ISTESSO_DAILY_RECONNECT").is_some(),
             verbose,
             input_timings,
+            clipboard,
             ..AgentOptions::default()
         }),
         Command::Hosts { json, timeout } => run_hosts(json, timeout),
@@ -551,8 +557,9 @@ fn relay_input(
     // output, in the log of times if there is one, and in a small file next to the socket
     // for the program that shows the window.
     let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
-    // "text": whether the device takes committed text (1) or not (0), for the window.
-    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool| {
+    // "text": whether the device takes committed text (1) or not (0), for the window;
+    // "clipboard": the same for copy and paste (trial only, ADR 0022).
+    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool, clipboard: bool| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -577,9 +584,10 @@ fn relay_input(
             String::new()
         };
         let line = format!(
-            "{{\"pid\":{},\"input\":{cuts},\"text\":{}{status}}}\n",
+            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{}{status}}}\n",
             std::process::id(),
-            u8::from(text)
+            u8::from(text),
+            u8::from(clipboard)
         );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
@@ -614,13 +622,21 @@ fn relay_input(
     }
     let listener = UnixDatagram::bind(socket)
         .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
+    // A paste of 64 KiB is a datagram of up to 128 KiB (trial only, ADR 0022).
+    istesso_agent::clipboard::set_buffers(&listener, istesso_agent::clipboard::SOCKET_BUFFER);
+    // Answers to copy and paste go back to the socket the request came from, and only to one
+    // of this user's own (trial only, ADR 0022), with the window's nonce: see `Askers`.
+    let answering =
+        UnixDatagram::unbound().map_err(|e| format!("cannot open a socket for answers: {e}"))?;
+    istesso_agent::clipboard::set_buffers(&answering, istesso_agent::clipboard::SOCKET_BUFFER);
+    let askers = std::cell::RefCell::new(Askers::default());
     let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
     let opened = |line: &InputLine| {
         println!(
             "Input written to {} goes to the paired device.",
             socket.display()
         );
-        tell("open", 0, None, line.takes_text());
+        tell("open", 0, None, line.takes_text(), line.takes_clipboard());
         if !line.is_answered() {
             eprintln!(
                 "note: the device is of a version that does not answer \"still here\"; a connection \
@@ -629,30 +645,39 @@ fn relay_input(
         }
     };
     if daily {
-        tell("waiting", 0, None, false);
+        tell("waiting", 0, None, false, false);
     } else {
         opened(&line);
     }
     // How many pieces of committed text were not sent so far (said when it grows).
     let mut text_dropped = 0;
+    // The same for copy and paste.
+    let mut clipboard_dropped = 0;
 
-    let mut buffer = [0u8; 2048];
-    let take = |events: &mut Vec<InputEvent>, datagram: &[u8]| {
-        let Ok(event) = serde_json::from_slice::<InputEvent>(datagram) else {
-            return;
-        };
-        // Of pointer positions in a row only the last one matters.
-        match (events.last_mut(), &event) {
-            (Some(last @ InputEvent::PointerAt { .. }), InputEvent::PointerAt { .. }) => {
-                *last = event;
+    let mut buffer = vec![0u8; 192 * 1024];
+    let take =
+        |events: &mut Vec<InputEvent>, datagram: &[u8], from: &std::os::unix::net::SocketAddr| {
+            let Ok(event) = serde_json::from_slice::<InputEvent>(datagram) else {
+                return;
+            };
+            // A copy or a paste goes only with somewhere of this user's own for its answer.
+            if let InputEvent::Copy { id, .. } | InputEvent::Paste { id, .. } = &event {
+                if !askers.borrow_mut().note(*id, datagram, from) {
+                    return;
+                }
             }
-            _ => events.push(event),
-        }
-    };
+            // Of pointer positions in a row only the last one matters.
+            match (events.last_mut(), &event) {
+                (Some(last @ InputEvent::PointerAt { .. }), InputEvent::PointerAt { .. }) => {
+                    *last = event;
+                }
+                _ => events.push(event),
+            }
+        };
     // Called with the socket nonblocking, including just after the handshake.
     let drain = |events: &mut Vec<InputEvent>, buffer: &mut [u8]| loop {
-        match listener.recv(buffer) {
-            Ok(length) => take(events, &buffer[..length]),
+        match listener.recv_from(buffer) {
+            Ok((length, from)) => take(events, &buffer[..length], &from),
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
@@ -663,7 +688,7 @@ fn relay_input(
         // after in between (saying "still here", hearing the answers, opening it again
         // when it was cut).
         let wait = if line.is_open() {
-            LISTEN_EVERY
+            line.listen_in().min(LISTEN_EVERY)
         } else if daily {
             line.retry_in(std::time::Instant::now())
         } else {
@@ -671,8 +696,8 @@ fn relay_input(
         };
         if !wait.is_zero() {
             listener.set_read_timeout(Some(wait)).map_err(failed)?;
-            match listener.recv(&mut buffer) {
-                Ok(length) => take(&mut events, &buffer[..length]),
+            match listener.recv_from(&mut buffer) {
+                Ok((length, from)) => take(&mut events, &buffer[..length], &from),
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(e) => return Err(failed(e)),
             }
@@ -703,6 +728,29 @@ fn relay_input(
                 })?;
         }
         listener.set_nonblocking(false).map_err(failed)?;
+        for answer in line.take_clipboard_answers() {
+            // To the socket that asked, with its nonce; what it carries is never written here.
+            let Some((nonce, to)) = askers.borrow_mut().answer_to(answer.id) else {
+                continue;
+            };
+            let value = serde_json::json!({
+                "kind": "clipboard",
+                "id": answer.id,
+                "nonce": nonce,
+                "result": answer.result,
+                "text": answer.text,
+                "why": answer.why,
+            });
+            if let (Ok(bytes), true) = (serde_json::to_vec(&value), is_own_socket(&to)) {
+                let _ = answering.send_to(&bytes, &to);
+            }
+        }
+        if line.clipboard_dropped() != clipboard_dropped {
+            clipboard_dropped = line.clipboard_dropped();
+            eprintln!(
+                "note: {clipboard_dropped} copy or paste request(s) were not sent: the device does not take them"
+            );
+        }
         if line.text_dropped() != text_dropped {
             text_dropped = line.text_dropped();
             // How many, never what.
@@ -713,7 +761,13 @@ fn relay_input(
         match happened {
             Some(Happened::Cut) => {
                 eprintln!("note: the conversation with the device was cut; opening it again");
-                tell("cut", line.cuts(), None, line.takes_text());
+                tell(
+                    "cut",
+                    line.cuts(),
+                    None,
+                    line.takes_text(),
+                    line.takes_clipboard(),
+                );
             }
             Some(Happened::Back { .. }) if daily && line.cuts() == 0 => opened(&line),
             Some(Happened::Back { after }) => {
@@ -721,11 +775,80 @@ fn relay_input(
                     "note: the conversation with the device is back after {:.2} s",
                     after.as_secs_f64()
                 );
-                tell("back", line.cuts(), Some(after), line.takes_text());
+                tell(
+                    "back",
+                    line.cuts(),
+                    Some(after),
+                    line.takes_text(),
+                    line.takes_clipboard(),
+                );
             }
             None => {}
         }
     }
+}
+
+/// The copies and pastes the relay has sent and not answered yet, and where each answer goes
+/// (trial only, docs/adr/0022-clipboard-text.md). The window sends each request from a socket
+/// of its own and with a nonce of 128 random bits; the answer goes only to that socket, only if
+/// it is one of this user's, and with that nonce, which the window checks.
+#[cfg(unix)]
+#[derive(Default)]
+struct Askers {
+    waiting: std::collections::HashMap<u32, (String, std::path::PathBuf, std::time::Instant)>,
+}
+
+#[cfg(unix)]
+impl Askers {
+    /// Notes where the answer to the request in `datagram` goes. `false`: it is not sent at all
+    /// (no nonce, or not from a socket of this user's own).
+    fn note(&mut self, id: u32, datagram: &[u8], from: &std::os::unix::net::SocketAddr) -> bool {
+        let nonce = serde_json::from_slice::<serde_json::Value>(datagram)
+            .ok()
+            .and_then(|value| value.get("nonce")?.as_str().map(str::to_string))
+            .filter(|nonce| nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+        let (Some(nonce), Some(path)) = (nonce, from.as_pathname()) else {
+            return false;
+        };
+        if !is_own_socket(path) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        self.waiting.retain(|_, (_, _, until)| *until > now);
+        self.waiting.insert(
+            id,
+            (
+                nonce,
+                path.to_path_buf(),
+                now + istesso_agent::relay::CLIPBOARD_WITHIN,
+            ),
+        );
+        true
+    }
+
+    /// The nonce and the socket for the answer to `id`, once.
+    fn answer_to(&mut self, id: u32) -> Option<(String, std::path::PathBuf)> {
+        let (nonce, path, until) = self.waiting.remove(&id)?;
+        (until > std::time::Instant::now()).then_some((nonce, path))
+    }
+}
+
+/// Whether `path` is a socket that belongs to the user this program runs as (not a link).
+#[cfg(unix)]
+fn is_own_socket(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == own_uid())
+}
+
+/// The user this program runs as.
+#[cfg(unix)]
+fn own_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { getuid() }
 }
 
 #[cfg(not(unix))]
@@ -1852,6 +1975,48 @@ fn render_probe(summary: &ProbeSummary, seed: u64) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_is_answered_only_to_an_own_socket_with_its_nonce() {
+        use std::os::unix::net::UnixDatagram;
+        let dir = std::env::temp_dir().join(format!("istesso-askers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let window = UnixDatagram::bind(dir.join("w.sock")).unwrap();
+        let relay = UnixDatagram::bind(dir.join("r.sock")).unwrap();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let request = format!(r#"{{"kind":"copy","id":4,"nonce":"{nonce}"}}"#);
+        window
+            .send_to(request.as_bytes(), dir.join("r.sock"))
+            .unwrap();
+        let mut buffer = [0u8; 256];
+        let (length, from) = relay.recv_from(&mut buffer).unwrap();
+        let mut askers = Askers::default();
+        assert!(askers.note(4, &buffer[..length], &from));
+        assert_eq!(
+            askers.answer_to(4),
+            Some((nonce.to_string(), dir.join("w.sock")))
+        );
+        // Once only.
+        assert_eq!(askers.answer_to(4), None);
+        // Without a nonce, or from a socket without a name, nothing is noted.
+        window
+            .send_to(br#"{"kind":"copy","id":5}"#, dir.join("r.sock"))
+            .unwrap();
+        let (length, from) = relay.recv_from(&mut buffer).unwrap();
+        assert!(!askers.note(5, &buffer[..length], &from));
+        let nameless = UnixDatagram::unbound().unwrap();
+        nameless
+            .send_to(request.as_bytes(), dir.join("r.sock"))
+            .unwrap();
+        let (length, from) = relay.recv_from(&mut buffer).unwrap();
+        assert!(!askers.note(4, &buffer[..length], &from));
+        // Only a socket counts as somewhere to answer to.
+        std::fs::write(dir.join("plain"), b"").unwrap();
+        assert!(is_own_socket(&dir.join("w.sock")));
+        assert!(!is_own_socket(&dir.join("plain")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cli_definition_is_consistent() {

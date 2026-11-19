@@ -3,7 +3,7 @@
 not have (docs/trial-daily.md, "静止画の質の下限", "日本語の入力" and "AURA：遅れをためない"). Trial
 only: started by scripts/daily.sh, and never by a measurement.
 
-    daily-pipeline.py [--min-qp N] [--text] [--scroll] [--flow [--no-adapt]] HOST_SCRIPT [its arguments...]
+    daily-pipeline.py [--min-qp N] [--text] [--scroll] [--clipboard] [--flow [--no-adapt]] HOST_SCRIPT [its arguments...]
     daily-pipeline.py [--min-qp N] [--flow [--no-adapt]] --check
                                              print the encoder part as it would be, and end
 
@@ -27,6 +27,13 @@ axis events of that source. Taken out of what the host script reads in the same 
 sent in order on the same main loop. A scroll of the old form goes on to the host script as before.
 Only for a compositor that knows PointerScroll: another one drops the event (scripts/daily.sh
 says --scroll only when the plugin's list of patches has that patch).
+--clipboard: copy and paste of text (docs/adr/0022-clipboard-text.md). The compositor is told the
+folder of the input socket (ISTESSO_CLIPBOARD_DIR), where it opens its own clipboard socket: the
+text of a paste goes there from `istesso agent` directly, never through this program. What comes
+on the input socket are the ordering marks only ("clipboard_copy", "clipboard_paste": a nonce, and
+whether it is a cut or has text), which are given to the compositor as the custom upstream events
+ClipboardCopy (nonce, cut) and ClipboardPaste (nonce, with-text), in their place among the keys.
+The nonce is used once and is never printed here.
 
 --flow (for AURA): a frame goes into the encoder only when the viewer's connection has taken the
 one before it, so that nothing queues up on a link slower than the bit rate, and the bit rate
@@ -103,6 +110,23 @@ def take_text(hand_over):
     return handler
 
 
+def clipboard_mark(value, Gst):
+    """The custom upstream event for an ordering mark of copy or paste, or None for one that is
+    not well formed. It carries no text."""
+    nonce = value.get("nonce")
+    if not (isinstance(nonce, str) and len(nonce) == 32 and all(c in "0123456789abcdef" for c in nonce)):
+        return None
+    if value.get("kind") == "clipboard_copy":
+        structure = Gst.Structure.new_empty("ClipboardCopy")
+        structure.set_value("nonce", nonce)
+        structure.set_value("cut", bool(value.get("cut")))
+    else:
+        structure = Gst.Structure.new_empty("ClipboardPaste")
+        structure.set_value("nonce", nonce)
+        structure.set_value("with-text", bool(value.get("with_text")))
+    return Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure)
+
+
 def option(arguments, name, default):
     """The value after `name` among the host script's arguments, as argparse would take it."""
     for at, word in enumerate(arguments):
@@ -116,7 +140,7 @@ def option(arguments, name, default):
 def main():
     arguments = sys.argv[1:]
     qp = None
-    text = scroll = flow = adapt = False
+    text = scroll = clipboard = flow = adapt = False
     while arguments and arguments[0].startswith("--") and arguments[0] != "--check":
         word = arguments.pop(0)
         if word == "--min-qp" and arguments:
@@ -130,13 +154,15 @@ def main():
             text = True
         elif word == "--scroll":
             scroll = True
+        elif word == "--clipboard":
+            clipboard = True
         elif word == "--flow":
             flow = adapt = True
         elif word == "--no-adapt":
             adapt = False
         else:
             raise SystemExit(__doc__.split("\n\n")[1])
-    if not arguments or (qp is None and not text and not scroll and not flow):
+    if not arguments or (qp is None and not text and not scroll and not clipboard and not flow):
         raise SystemExit(__doc__.split("\n\n")[1])
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
@@ -214,6 +240,29 @@ def main():
         return None
 
     handlers = []
+    if clipboard:
+        socket = option(rest, "--input-socket", None)
+        if socket is None:
+            raise SystemExit("daily-pipeline: --clipboard needs the host script's --input-socket")
+        # Read by the trial compositor (gwd-trial28 and later) when it starts.
+        os.environ["ISTESSO_CLIPBOARD_DIR"] = os.path.dirname(os.path.abspath(socket))
+        marks = {"dropped": 0}
+
+        def clipboard_handler(value):
+            if value.get("kind") not in ("clipboard_copy", "clipboard_paste"):
+                return False
+            pad = compositor_pad()
+            event = clipboard_mark(value, Gst) if pad is not None else None
+            if event is None:
+                marks["dropped"] += 1
+                print(f"daily: copy or paste mark dropped ({marks['dropped']} so far)", file=sys.stderr, flush=True)
+                return True
+            pad.send_event(event)
+            return True
+
+        handlers.append(clipboard_handler)
+        print("daily: copy and paste marks go to the compositor (trial only)", file=sys.stderr, flush=True)
+
     if text:
         dropped = {"count": 0}
 

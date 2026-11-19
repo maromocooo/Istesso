@@ -16,3 +16,9 @@ istesso-catalog.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mdns-sd.workspace = true
+
+# The buffers of the local sockets that carry copied and pasted text (trial only, ADR 0022): a
+# datagram of 128 KiB does not fit the defaults on macOS. Not through the workspace table, for the
+# same reason as in istesso-media.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

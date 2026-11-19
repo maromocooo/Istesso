@@ -15,6 +15,8 @@ mkdir -p build
 cc -Wall -Wextra -o build/keys-test keys-test.c && build/keys-test
 # And how committed text is cut into input events (the everyday trial's Japanese input).
 clang -fobjc-arc -Wall -Wextra -o build/text-input-test text-input-test.m -framework Foundation && build/text-input-test
+# And which keys copy and paste with the host, and what a paste takes (the everyday trial, ADR 0022).
+clang -fobjc-arc -Wall -Wextra -o build/clipboard-test clipboard-test.m -framework AppKit && build/clipboard-test
 # And how the everyday trial's window and its picture are sized against each other.
 cc -Wall -Wextra -o build/window-size-test window-size-test.c -lm && build/window-size-test
 # And what goes to the other side for a scroll of the wheel or the trackpad.
