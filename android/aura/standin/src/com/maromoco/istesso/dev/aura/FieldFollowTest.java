@@ -7,6 +7,30 @@ public final class FieldFollowTest {
     static int failed;
     static int count;
 
+    static void changeAt(boolean want, int state, long startToNotice, String what) {
+        count++;
+        if (FieldFollow.holdOnFieldChange(true, false, state, startToNotice) != want) {
+            failed++;
+            System.out.println("FAIL " + what);
+        }
+    }
+
+    static void pieces(java.util.List<String> want, String text, String what) {
+        count++;
+        if (!FieldFollow.pieces(text).equals(want)) {
+            failed++;
+            System.out.println("FAIL " + what + ": " + FieldFollow.pieces(text).size() + " pieces");
+        }
+    }
+
+    static void unplacedCase(java.util.List<String> want, java.util.List<FieldFollow.Piece> sent, int n, long now, String what) {
+        count++;
+        if (!FieldFollow.unplaced(sent, n, now).equals(want)) {
+            failed++;
+            System.out.println("FAIL " + what);
+        }
+    }
+
     static void change(boolean want, boolean composing, boolean shown, int state, String what) {
         count++;
         if (FieldFollow.holdOnFieldChange(composing, shown, state) != want) {
@@ -91,6 +115,22 @@ public final class FieldFollowTest {
         place(false, true, 0, true, "kept text, nothing known: waits");
         place(false, true, 1, false, "kept text, the host takes no text: waits");
         place(false, false, 1, true, "nothing kept: nothing to put");
+        changeAt(true, 1, 500_000_000L, "a composition well before the change: kept");
+        changeAt(false, 1, 50_000_000L, "a composition just before the notice (it may be in the new password field): not kept");
+        pieces(java.util.List.of("abc"), "abc", "one piece");
+        pieces(java.util.List.of("abc", "def"), "abc\ndef\t", "newline and tab are keys, not pieces");
+        pieces(java.util.List.of(), "\n", "a bare newline is no piece");
+        pieces(java.util.List.of("あ".repeat(256), "あ".repeat(44)), "あ".repeat(300), "256 characters a piece");
+        java.util.List<FieldFollow.Piece> sent = new java.util.ArrayList<>();
+        long t = 10_000_000_000L;
+        sent.add(new FieldFollow.Piece("一", t - 5_000_000_000L, true));
+        sent.add(new FieldFollow.Piece("二", t - 2_000_000_000L, true));
+        sent.add(new FieldFollow.Piece("三", t - 1_000_000_000L, true));
+        sent.add(new FieldFollow.Piece("秘", t - 500_000_000L, false));
+        unplacedCase(java.util.List.of(), sent, 1, t, "the last piece was not keepable: nothing kept");
+        unplacedCase(java.util.List.of("三"), sent, 2, t, "two dropped: the last two, the keepable one only");
+        unplacedCase(java.util.List.of("二", "三"), sent, 3, t, "three dropped: only those of the last 3 s");
+        unplacedCase(java.util.List.of(), sent, 0, t, "nothing dropped: nothing kept");
         System.out.println(failed == 0 ? "FieldFollow: all " + count + " cases pass" : "FieldFollow: " + failed + " of " + count + " failed");
         System.exit(failed == 0 ? 0 : 1);
     }

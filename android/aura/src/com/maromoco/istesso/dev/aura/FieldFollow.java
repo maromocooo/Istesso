@@ -47,6 +47,95 @@ final class FieldFollow {
         return composing && !preeditShownInHost && keepable(composeState);
     }
 
+    /**
+     * How long before a notice of a field change a composition may have begun in the new field,
+     * the host's notice not having arrived yet: its state is not known, so it is never kept.
+     */
+    static final long UNSURE_NS = 200_000_000L;
+
+    /**
+     * The same, with the time from the composition's start to the notice: a composition that
+     * began less than UNSURE_NS before it may have begun in the new field (a password field,
+     * perhaps) and is never kept.
+     */
+    static boolean holdOnFieldChange(boolean composing, boolean preeditShownInHost, int composeState,
+            long startToNoticeNs) {
+        return holdOnFieldChange(composing, preeditShownInHost, composeState) && startToNoticeNs >= UNSURE_NS;
+    }
+
+    /** One piece of committed text as it went to the host, and whether it may be kept. */
+    static final class Piece {
+        final String text;
+        final long atNs;
+        final boolean keepable;
+
+        Piece(String text, long atNs, boolean keepable) {
+            this.text = text;
+            this.atNs = atNs;
+            this.keepable = keepable;
+        }
+    }
+
+    /**
+     * Committed text as the input library sends it (istesso-client's text_events): the text
+     * pieces, newline and tab apart (they go as keys, never as text, and are not returned),
+     * other control characters left out, pieces of at most 256 characters and 1024 bytes. The
+     * host counts the pieces it could not place, so this says how many a commit was.
+     */
+    static java.util.List<String> pieces(String text) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        StringBuilder piece = new StringBuilder();
+        int chars = 0;
+        int bytes = 0;
+        for (int i = 0; i < text.length(); ) {
+            int c = text.codePointAt(i);
+            i += Character.charCount(c);
+            if (c == '\n' || c == '\r' || c == '\t') {
+                if (piece.length() > 0) {
+                    out.add(piece.toString());
+                    piece.setLength(0);
+                    chars = 0;
+                    bytes = 0;
+                }
+                continue;
+            }
+            if (Character.isISOControl(c)) {
+                continue;
+            }
+            int size = new String(Character.toChars(c)).getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            if (chars + 1 > 256 || bytes + size > 1024) {
+                out.add(piece.toString());
+                piece.setLength(0);
+                chars = 0;
+                bytes = 0;
+            }
+            piece.appendCodePoint(c);
+            chars++;
+            bytes += size;
+        }
+        if (piece.length() > 0) {
+            out.add(piece.toString());
+        }
+        return out;
+    }
+
+    /**
+     * The host's count of pieces it could not place went up by `count`: the pieces it means are
+     * taken to be the last `count` sent (the host places them in the order they come), and of
+     * those, the ones sent within the last 3 s that may be kept. Never a bare newline (no piece is).
+     */
+    static java.util.List<String> unplaced(java.util.List<Piece> sent, int count, long nowNs) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        int from = Math.max(0, sent.size() - Math.max(0, count));
+        for (int i = from; i < sent.size(); i++) {
+            Piece p = sent.get(i);
+            if (p.keepable && nowNs - p.atNs < 3_000_000_000L && !p.text.isEmpty()) {
+                out.add(p.text);
+            }
+        }
+        return out;
+    }
+
     enum Commit {
         /** To the host now. */
         SEND,

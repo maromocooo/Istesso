@@ -46,8 +46,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
      * The committed text sent last, and when: shown again when the host says, within 3 s, that
      * it had nowhere to put it. Never kept for a password field; let go once shown.
      */
-    private String lastSent;
-    private long lastSentNs;
+    /** The pieces of committed text sent lately, for knowing which ones the host could not place. */
+    private final java.util.ArrayList<FieldFollow.Piece> sentPieces = new java.util.ArrayList<>();
+    /** When the current composition began (System.nanoTime), for FieldFollow.UNSURE_NS. */
+    private long composeStartNs;
 
     /** Composing text goes into the host's application: it takes it, and has a field (not a password one). */
     private boolean inline() {
@@ -82,7 +84,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             // it is kept on the panel; shown inside the host's application, the application
             // commits it into the old field itself, and it is let go here (not typed twice).
             if ((otherSerial || toPassword) && view.composing()) {
-                boolean keep = FieldFollow.holdOnFieldChange(true, preeditSent, composeState);
+                boolean keep = FieldFollow.holdOnFieldChange(true, preeditSent, composeState,
+                        System.nanoTime() - composeStartNs);
                 clearInlinePreedit();
                 String taken = view.takeComposing(imm);
                 committedComposeState = -1; // taken, not committed
@@ -104,10 +107,11 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             // The host had nowhere to put the text just sent (its count went up within 3 s of
             // the commit; a count that went back, as after a restart of the host, says nothing).
             // It goes onto the bar of kept text, from where it can be put into the next field.
-            if (fieldDropped >= 0 && dropped > fieldDropped && lastSent != null
-                    && System.nanoTime() - lastSentNs < 3_000_000_000L) {
-                hold(lastSent);
-                lastSent = null;
+            if (fieldDropped >= 0 && dropped > fieldDropped) {
+                for (String piece : FieldFollow.unplaced(sentPieces, dropped - fieldDropped, System.nanoTime())) {
+                    hold(piece);
+                }
+                sentPieces.clear(); // each piece is kept at most once
             }
             fieldDropped = dropped;
             // After the password block: a password field's input is restarted before the keyboard
@@ -274,8 +278,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 switch (FieldFollow.onCommit(open, hostTakesText, typedIn)) {
                     case SEND:
                         Native.inputText(input, text);
-                        lastSent = FieldFollow.keepUnplaced(typedIn) ? text : null;
-                        lastSentNs = System.nanoTime();
+                        noteSent(text, FieldFollow.keepUnplaced(typedIn));
                         break;
                     case HOLD:
                         // The input is connecting again: the input library would drop it.
@@ -293,6 +296,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 // The field the composition began in decides whether it may ever be kept.
                 if (!text.isEmpty() && composeState < 0) {
                     composeState = fieldState;
+                    composeStartNs = System.nanoTime();
                 } else if (text.isEmpty() && composeState >= 0) {
                     committedComposeState = composeState;
                     composeState = -1;
@@ -483,6 +487,17 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     /** The same, for the composition that has just ended in a commit (-1: none). */
     private int committedComposeState = -1;
 
+    /** Notes the pieces of text just sent (the last few seconds' only), for unplaced(). */
+    private void noteSent(String text, boolean keepable) {
+        long now = System.nanoTime();
+        for (String piece : FieldFollow.pieces(text)) {
+            sentPieces.add(new FieldFollow.Piece(piece, now, keepable));
+        }
+        while (!sentPieces.isEmpty() && now - sentPieces.get(0).atNs >= 3_000_000_000L) {
+            sentPieces.remove(0);
+        }
+    }
+
     /** Whether the input's conversation is open now (text sent otherwise would be dropped). */
     private boolean inputOpen() {
         long[] st = input == 0 ? null : Native.inputState(input);
@@ -522,8 +537,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         }
         clearInlinePreedit();
         Native.inputText(input, heldText);
-        lastSent = heldText;
-        lastSentNs = System.nanoTime();
+        noteSent(heldText, true);
         heldText = null;
         showHeld();
     }
