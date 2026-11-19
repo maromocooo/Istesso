@@ -221,6 +221,8 @@ final class Transport {
         host = made
     }
     var viewers: Int { Int(istesso_media_host_viewers(host)) }
+    /// Ends every stream and stops listening (nobody may use it afterwards).
+    func close() { istesso_media_host_close(host) }
     func keyFrameWanted() -> Bool { istesso_media_host_key_frame_wanted(host) != 0 }
     func offer(_ on: Bool) { istesso_media_host_offer(host, on ? 1 : 0) }
     func admit(_ id: String?, _ key: String?) -> Bool { istesso_media_host_admit(host, id, key) == 0 }
@@ -1480,6 +1482,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         transport = made
         transport.ownCursor()
         pump = Pump(transport: transport, width: width, height: height)
+        pictureWindowSize = nil
         if frameLog.on {
             frameLog.write("{\"kind\":\"settings\",\"t_ns\":\(nowNs()),\"size\":\"\(width)x\(height)\",\"fps\":\(settings.fps),\"bitrate_kbit\":\(settings.bitrateKbit),\"chroma\":\"\(settings.chroma)\",\"keep_awake\":\(settings.keepAwake),\"min_qp\":\(settings.minQP),\"source\":\"\(settings.generated ? "generated" : "screencapturekit")\",\"transport\":\"channel\",\"encoder\":\"videotoolbox\"}")
         }
@@ -1675,6 +1678,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         // capture again.
         let services = windowList().filter { isPanelService($0.pid) }.map { Int($0.id) }.sorted()
         let panelShown = services + [-1] + appPanels().map { Int($0.id) }.sorted()
+        followSize(chosen)
+        if restarting { return }
         if chosen.bounds != windowBounds || panelShown != self.panelShown {
             self.panelShown = panelShown
             windowBounds = chosen.bounds
@@ -2169,7 +2174,75 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             }
         }
         second.resume()
-        timers += [tick, second]
+        pumpTimers = [tick, second]
+    }
+    var pumpTimers: [DispatchSourceTimer] = []
+
+    // ---- A new size: the application's window was resized ----
+
+    /// The window's size (points) the picture was made for, in the form that follows the window.
+    var pictureWindowSize: CGSize?
+    var resizeSeen: (size: CGSize, at: TimeInterval)?
+    var restarting = false
+
+    /// Looked at with every look at the application: a window that has had another size for
+    /// 150 ms gets a stream of that size (the viewer connects again, and is told the new size).
+    func followSize(_ window: WindowInfo) {
+        guard settings.size == nil, transport != nil, !restarting else { return }
+        let size = window.bounds.size
+        guard let made = pictureWindowSize else { pictureWindowSize = size; return }
+        if abs(made.width - size.width) < 2 && abs(made.height - size.height) < 2 { resizeSeen = nil; return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let seen = resizeSeen, abs(seen.size.width - size.width) < 2, abs(seen.size.height - size.height) < 2 else {
+            resizeSeen = (size, now)
+            return
+        }
+        guard now - seen.at >= 0.15 else { return }
+        resizeSeen = nil
+        let density = pixelsPerPoint(CGMainDisplayID())
+        let w = max(64, min(3840, Int(size.width * density)) & ~1), h = max(64, min(2160, Int(size.height * density)) & ~1)
+        restartStream(width: w, height: h, windowSize: size)
+    }
+
+    /// Stops the picture, gives the encoder back, ends the stream, and starts one of the new size on
+    /// the same port; the picture comes back as it was (running or not).
+    func restartStream(width w: Int, height h: Int, windowSize: CGSize) {
+        restarting = true
+        let wasRunning = picture == "running"
+        let old = transport!
+        let oldPump = pump!
+        for timer in pumpTimers { timer.cancel() }
+        pumpTimers = []
+        let capture = self.capture
+        self.capture = nil
+        let afterCapture = {
+            oldPump.queue.async {
+                oldPump.close()
+                // The encoder's last callbacks have long finished after 0.2 s; only then is the old
+                // stream ended (nobody may use it afterwards) and its port taken again.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    old.close()
+                    guard let made = Transport(settings: settings, width: w, height: h) else {
+                        say("refused", [("word", "resize"), ("reason", "cannot listen again for paired devices")])
+                        return self.quit(1)
+                    }
+                    self.width = w
+                    self.height = h
+                    self.transport = made
+                    made.ownCursor()
+                    if !self.offered { made.offer(false) }
+                    self.pump = Pump(transport: made, width: w, height: h)
+                    self.pictureWindowSize = windowSize
+                    self.startTimers()
+                    if frameLog.on { frameLog.write("{\"kind\":\"resized\",\"t_ns\":\(nowNs()),\"size\":\"\(w)x\(h)\"}") }
+                    say("resized", [("size", "\(w)x\(h)")])
+                    self.windowBounds = .zero  // placed again for the new size
+                    self.restarting = false
+                    if wasRunning { self.openPicture { why in if let why { note("after the resize: \(why)") } } }
+                }
+            }
+        }
+        if let capture { capture.stop(done: afterCapture) } else { afterCapture() }
     }
 }
 
