@@ -1,0 +1,478 @@
+{
+ "SPAudioDataType": [
+  {
+   "_items": [
+    {
+     "_name": "Example Product 1",
+     "coreaudio_device_manufacturer": "Example Maker 1",
+     "coreaudio_device_output": 8,
+     "coreaudio_device_srate": 48000,
+     "coreaudio_device_transport": "coreaudio_device_type_displayport",
+     "coreaudio_output_source": "spaudio_default"
+    },
+    {
+     "_name": "Example Product 2",
+     "coreaudio_device_manufacturer": "Example Maker 2",
+     "coreaudio_device_output": 2,
+     "coreaudio_device_srate": 48000,
+     "coreaudio_device_transport": "coreaudio_device_type_usb",
+     "coreaudio_output_source": "spaudio_default"
+    },
+    {
+     "_name": "Example Product 2",
+     "coreaudio_device_input": 1,
+     "coreaudio_device_manufacturer": "Example Maker 2",
+     "coreaudio_device_srate": 48000,
+     "coreaudio_device_transport": "coreaudio_device_type_usb",
+     "coreaudio_input_source": "spaudio_default"
+    },
+    {
+     "_name": "Example Product 3",
+     "coreaudio_device_input": 1,
+     "coreaudio_device_manufacturer": "Example Maker 3",
+     "coreaudio_device_srate": 48000,
+     "coreaudio_device_transport": "coreaudio_device_type_unknown",
+     "coreaudio_input_source": "spaudio_default"
+    },
+    {
+     "_name": "Example Product 4",
+     "coreaudio_default_audio_input_device": "spaudio_yes",
+     "coreaudio_device_input": 1,
+     "coreaudio_device_manufacturer": "Example Maker 3",
+     "coreaudio_device_srate": 48000,
+     "coreaudio_device_transport": "coreaudio_device_type_builtin",
+     "coreaudio_input_source": "MacBook Airのマイク"
+    },
+    {
+     "_name": "Example Product 5",
+     "_properties": "coreaudio_default_audio_system_device",
+     "coreaudio_default_audio_output_device": "spaudio_yes",
+     "coreaudio_default_audio_system_device": "spaudio_yes",
+     "coreaudio_device_manufacturer": "Example Maker 3",
+     "coreaudio_device_output": 2,
+     "coreaudio_device_srate": 48000,
+     "coreaudio_device_transport": "coreaudio_device_type_builtin",
+     "coreaudio_output_source": "MacBook Airのスピーカー"
+    },
+    {
+     "_name": "Example Product 6",
+     "coreaudio_device_input": 14,
+     "coreaudio_device_manufacturer": "Example Maker 4",
+     "coreaudio_device_output": 14,
+     "coreaudio_device_srate": 44100,
+     "coreaudio_device_transport": "coreaudio_device_type_usb",
+     "coreaudio_input_source": "spaudio_default",
+     "coreaudio_output_source": "spaudio_default"
+    }
+   ],
+   "_name": "coreaudio_device"
+  }
+ ],
+ "SPBluetoothDataType": [
+  {
+   "controller_properties": {
+    "controller_address": "02:00:00:00:00:01",
+    "controller_chipset": "XXX_4567X9",
+    "controller_discoverable": "attrib_off",
+    "controller_firmwareVersion": "1.0.0.900",
+    "controller_productID": "Example Value 1",
+    "controller_state": "attrib_on",
+    "controller_supportedServices": "0xeeeea5 < HFP AVRCP A2DP HID Braille LEA AACP GATT SerialPort >",
+    "controller_transport": "PCIe",
+    "controller_vendorID": "Example Value 2"
+   },
+   "device_connected": [
+    {
+     "Example Device 1": {
+      "device_address": "02:00:00:00:00:02",
+      "device_firmwareVersion": "1.0.1",
+      "device_minorType": "Magic Trackpad",
+      "device_productID": "Example Value 3",
+      "device_services": "0xeeeea6 < HID ACL >",
+      "device_vendorID": "Example Value 4"
+     }
+    }
+   ],
+   "device_not_connected": [
+    {
+     "Example Device 2": {
+      "device_address": "02:00:00:00:00:03"
+     }
+    },
+    {
+     "Example Device 3": {
+      "device_address": "02:00:00:00:00:04",
+      "device_firmwareVersion": "1.0.2",
+      "device_minorType": "Headset",
+      "device_productID": "Example Value 5",
+      "device_rssi": "-50",
+      "device_vendorID": "Example Value 6"
+     }
+    },
+    {
+     "Example Device 4": {
+      "device_address": "02:00:00:00:00:05",
+      "device_firmwareVersion": "1.0.3",
+      "device_minorType": "Speaker",
+      "device_productID": "Example Value 7",
+      "device_vendorID": "Example Value 8"
+     }
+    },
+    {
+     "Example Device 5": {
+      "device_address": "02:00:00:00:00:06",
+      "device_rssi": "-50"
+     }
+    },
+    {
+     "Example Device 6": {
+      "device_address": "02:00:00:00:00:07"
+     }
+    },
+    {
+     "Example Device 7": {
+      "device_address": "02:00:00:00:00:08",
+      "device_rssi": "-50"
+     }
+    },
+    {
+     "Example Device 8": {
+      "device_address": "02:00:00:00:00:09",
+      "device_firmwareVersion": "1.0.4",
+      "device_minorType": "Headphones",
+      "device_productID": "Example Value 9",
+      "device_vendorID": "Example Value 4"
+     }
+    },
+    {
+     "Example Device 9": {
+      "device_address": "02:00:00:00:00:0A",
+      "device_firmwareVersion": "1.0.4",
+      "device_productID": "Example Value 10",
+      "device_vendorID": "Example Value 4"
+     }
+    },
+    {
+     "Example Device 10": {
+      "device_address": "02:00:00:00:00:0B",
+      "device_batteryLevelCase": "50%",
+      "device_batteryLevelLeft": "50%",
+      "device_batteryLevelRight": "50%",
+      "device_caseVersion": "5X78",
+      "device_firmwareVersion": "5X78",
+      "device_minorType": "Headphones",
+      "device_productID": "Example Value 11",
+      "device_serialNumber": "SERIAL-1",
+      "device_serialNumberLeft": "SERIAL-2",
+      "device_serialNumberRight": "SERIAL-3",
+      "device_vendorID": "Example Value 4"
+     }
+    }
+   ]
+  }
+ ],
+ "SPCameraDataType": [
+  {
+   "_name": "Example Toy's Camera",
+   "spcamera_model-id": "Example Model 1",
+   "spcamera_unique-id": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+   "_name": "Example Product 8",
+   "spcamera_model-id": "Example Model 2",
+   "spcamera_unique-id": "00000000-0000-4000-8000-000000000002"
+  },
+  {
+   "_name": "Example Product 9",
+   "spcamera_model-id": "Example Model 3",
+   "spcamera_unique-id": "00000000-0000-4000-8000-000000000003"
+  }
+ ],
+ "SPUSBHostDataType": [
+  {
+   "_items": [
+    {
+     "_items": [
+      {
+       "_items": [
+        {
+         "_items": [
+          {
+           "_items": [
+            {
+             "_name": "Example Product 10",
+             "USBDeviceKeyLinkSpeed": "5 Gb/s",
+             "USBDeviceKeyPowerAllocation": "Example Value 12",
+             "USBDeviceKeyProductID": "0xff00",
+             "USBDeviceKeyProductVersion": "0x0100",
+             "USBDeviceKeySerialNumber": "Not Provided",
+             "USBDeviceKeyVendorID": "0xffff",
+             "USBDeviceKeyVendorName": "Example Maker 5",
+             "USBKeyHardwareType": "Removable",
+             "USBKeyLocationID": "0x80243240"
+            }
+           ],
+           "_name": "Example Product 10",
+           "USBDeviceKeyLinkSpeed": "5 Gb/s",
+           "USBDeviceKeyProductID": "0xff00",
+           "USBDeviceKeyProductVersion": "0x0100",
+           "USBDeviceKeySerialNumber": "Not Provided",
+           "USBDeviceKeyVendorID": "0xffff",
+           "USBDeviceKeyVendorName": "Example Maker 5",
+           "USBKeyHardwareType": "Removable",
+           "USBKeyLocationID": "0x80243200"
+          }
+         ],
+         "_name": "Example Product 11",
+         "USBDeviceKeyLinkSpeed": "5 Gb/s",
+         "USBDeviceKeyProductID": "0xfeff",
+         "USBDeviceKeyProductVersion": "0x0101",
+         "USBDeviceKeySerialNumber": "Not Provided",
+         "USBDeviceKeyVendorID": "0xfffe",
+         "USBDeviceKeyVendorName": "Example Maker 2",
+         "USBKeyHardwareType": "Removable",
+         "USBKeyLocationID": "0x80243000"
+        }
+       ],
+       "_name": "Example Product 11",
+       "USBDeviceKeyLinkSpeed": "5 Gb/s",
+       "USBDeviceKeyProductID": "0xfeff",
+       "USBDeviceKeyProductVersion": "0x0101",
+       "USBDeviceKeySerialNumber": "Not Provided",
+       "USBDeviceKeyVendorID": "0xfffe",
+       "USBDeviceKeyVendorName": "Example Maker 2",
+       "USBKeyHardwareType": "Removable",
+       "USBKeyLocationID": "0x80240000"
+      }
+     ],
+     "_name": "Example Product 10",
+     "USBDeviceKeyLinkSpeed": "5 Gb/s",
+     "USBDeviceKeyProductID": "0xff00",
+     "USBDeviceKeyProductVersion": "0x0100",
+     "USBDeviceKeySerialNumber": "Not Provided",
+     "USBDeviceKeyVendorID": "0xffff",
+     "USBDeviceKeyVendorName": "Example Maker 5",
+     "USBKeyHardwareType": "Removable",
+     "USBKeyLocationID": "0x80200000"
+    },
+    {
+     "_items": [
+      {
+       "_name": "Example Product 12",
+       "USBDeviceKeyLinkSpeed": "12 Mb/s",
+       "USBDeviceKeyProductID": "0xfefe",
+       "USBDeviceKeyProductVersion": "0x0102",
+       "USBDeviceKeySerialNumber": "SERIAL-4",
+       "USBDeviceKeyVendorID": "0xfffd",
+       "USBDeviceKeyVendorName": "Example Maker 6",
+       "USBKeyHardwareType": "Removable",
+       "USBKeyLocationID": "0x80110000"
+      },
+      {
+       "_items": [
+        {
+         "_items": [
+          {
+           "_name": "Example Product 13",
+           "USBDeviceKeyLinkSpeed": "12 Mb/s",
+           "USBDeviceKeyProductID": "0xfefd",
+           "USBDeviceKeyProductVersion": "0x0103",
+           "USBDeviceKeySerialNumber": "Not Provided",
+           "USBDeviceKeyVendorID": "0xfffc",
+           "USBDeviceKeyVendorName": "Example Maker 7",
+           "USBKeyHardwareType": "Removable",
+           "USBKeyLocationID": "0x80141100"
+          },
+          {
+           "_name": "Example Product 14",
+           "USBDeviceKeyLinkSpeed": "12 Mb/s",
+           "USBDeviceKeyPowerAllocation": "Example Value 13",
+           "USBDeviceKeyProductID": "0xfefc",
+           "USBDeviceKeyProductVersion": "0x0104",
+           "USBDeviceKeySerialNumber": "SERIAL-5",
+           "USBDeviceKeyVendorID": "0xfffb",
+           "USBDeviceKeyVendorName": "Example Maker 8",
+           "USBKeyHardwareType": "Removable",
+           "USBKeyLocationID": "0x80141200"
+          }
+         ],
+         "_name": "Example Product 15",
+         "USBDeviceKeyLinkSpeed": "12 Mb/s",
+         "USBDeviceKeyProductID": "0xfefb",
+         "USBDeviceKeyProductVersion": "0x0105",
+         "USBDeviceKeySerialNumber": "Not Provided",
+         "USBDeviceKeyVendorID": "0xfffa",
+         "USBDeviceKeyVendorName": "Example Maker 7",
+         "USBKeyHardwareType": "Removable",
+         "USBKeyLocationID": "0x80141000"
+        },
+        {
+         "_name": "Example Product 2",
+         "USBDeviceKeyLinkSpeed": "12 Mb/s",
+         "USBDeviceKeyProductID": "0xfefa",
+         "USBDeviceKeyProductVersion": "0x0106",
+         "USBDeviceKeySerialNumber": "SERIAL-6",
+         "USBDeviceKeyVendorID": "0xfff9",
+         "USBDeviceKeyVendorName": "Example Maker 2",
+         "USBKeyHardwareType": "Removable",
+         "USBKeyLocationID": "0x80142000"
+        },
+        {
+         "_items": [
+          {
+           "_name": "Example Product 16",
+           "USBDeviceKeyLinkSpeed": "12 Mb/s",
+           "USBDeviceKeyProductID": "0xfef9",
+           "USBDeviceKeyProductVersion": "0x0107",
+           "USBDeviceKeySerialNumber": "SERIAL-7",
+           "USBDeviceKeyVendorID": "0xfff8",
+           "USBDeviceKeyVendorName": "Example Maker 9",
+           "USBKeyHardwareType": "Removable",
+           "USBKeyLocationID": "0x80143400"
+          },
+          {
+           "_items": [
+            {
+             "_name": "Example Product 17",
+             "USBDeviceKeyLinkSpeed": "480 Mb/s",
+             "USBDeviceKeyPowerAllocation": "Example Value 14",
+             "USBDeviceKeyProductID": "0xfef8",
+             "USBDeviceKeyProductVersion": "0x0108",
+             "USBDeviceKeySerialNumber": "SERIAL-8",
+             "USBDeviceKeyVendorID": "0xfff7",
+             "USBDeviceKeyVendorName": "Example Maker 10",
+             "USBKeyHardwareType": "Removable",
+             "USBKeyLocationID": "0x80143210"
+            },
+            {
+             "_name": "Example Product 18",
+             "USBDeviceKeyLinkSpeed": "480 Mb/s",
+             "USBDeviceKeyPowerAllocation": "Example Value 14",
+             "USBDeviceKeyProductID": "0xfef7",
+             "USBDeviceKeyProductVersion": "0x0100",
+             "USBDeviceKeySerialNumber": "Not Provided",
+             "USBDeviceKeyVendorID": "0xffff",
+             "USBDeviceKeyVendorName": "Example Maker 5",
+             "USBKeyHardwareType": "Removable",
+             "USBKeyLocationID": "0x80143240"
+            }
+           ],
+           "_name": "Example Product 18",
+           "USBDeviceKeyLinkSpeed": "480 Mb/s",
+           "USBDeviceKeyProductID": "0xfef7",
+           "USBDeviceKeyProductVersion": "0x0100",
+           "USBDeviceKeySerialNumber": "Not Provided",
+           "USBDeviceKeyVendorID": "0xffff",
+           "USBDeviceKeyVendorName": "Example Maker 5",
+           "USBKeyHardwareType": "Removable",
+           "USBKeyLocationID": "0x80143200"
+          },
+          {
+           "_name": "Example Product 6",
+           "USBDeviceKeyLinkSpeed": "480 Mb/s",
+           "USBDeviceKeyProductID": "0xfef6",
+           "USBDeviceKeyProductVersion": "0x0109",
+           "USBDeviceKeySerialNumber": "SERIAL-9",
+           "USBDeviceKeyVendorID": "0xfff6",
+           "USBDeviceKeyVendorName": "Example Maker 11",
+           "USBKeyHardwareType": "Removable",
+           "USBKeyLocationID": "0x80143100"
+          }
+         ],
+         "_name": "Example Product 18",
+         "USBDeviceKeyLinkSpeed": "480 Mb/s",
+         "USBDeviceKeyProductID": "0xfef5",
+         "USBDeviceKeyProductVersion": "0x0101",
+         "USBDeviceKeySerialNumber": "Not Provided",
+         "USBDeviceKeyVendorID": "0xfffe",
+         "USBDeviceKeyVendorName": "Example Maker 2",
+         "USBKeyHardwareType": "Removable",
+         "USBKeyLocationID": "0x80143000"
+        }
+       ],
+       "_name": "Example Product 18",
+       "USBDeviceKeyLinkSpeed": "480 Mb/s",
+       "USBDeviceKeyProductID": "0xfef5",
+       "USBDeviceKeyProductVersion": "0x0101",
+       "USBDeviceKeySerialNumber": "Not Provided",
+       "USBDeviceKeyVendorID": "0xfffe",
+       "USBDeviceKeyVendorName": "Example Maker 2",
+       "USBKeyHardwareType": "Removable",
+       "USBKeyLocationID": "0x80140000"
+      }
+     ],
+     "_name": "Example Product 18",
+     "USBDeviceKeyLinkSpeed": "480 Mb/s",
+     "USBDeviceKeyProductID": "0xfef7",
+     "USBDeviceKeyProductVersion": "0x0100",
+     "USBDeviceKeySerialNumber": "Not Provided",
+     "USBDeviceKeyVendorID": "0xffff",
+     "USBDeviceKeyVendorName": "Example Maker 5",
+     "USBKeyHardwareType": "Removable",
+     "USBKeyLocationID": "0x80100000"
+    }
+   ],
+   "_name": "Example Product 19",
+   "Driver": "AppleT8132USBXHCI",
+   "USBKeyHardwareType": "Built-in",
+   "USBKeyLocationID": "0x80000000"
+  },
+  {
+   "_items": [
+    {
+     "_items": [
+      {
+       "_name": "Example Product 20",
+       "USBDeviceKeyLinkSpeed": "5 Gb/s",
+       "USBDeviceKeyPowerAllocation": "Example Value 15",
+       "USBDeviceKeyProductID": "0xfef4",
+       "USBDeviceKeyProductVersion": "0x010a",
+       "USBDeviceKeySerialNumber": "SERIAL-10",
+       "USBDeviceKeyVendorID": "0xfff5",
+       "USBDeviceKeyVendorName": "Example Maker 12",
+       "USBKeyHardwareType": "Removable",
+       "USBKeyLocationID": "0x81230000"
+      }
+     ],
+     "_name": "Example Product 21",
+     "USBDeviceKeyLinkSpeed": "5 Gb/s",
+     "USBDeviceKeyProductID": "0xfef3",
+     "USBDeviceKeyProductVersion": "0x010b",
+     "USBDeviceKeySerialNumber": "SERIAL-11",
+     "USBDeviceKeyVendorID": "0xfff4",
+     "USBDeviceKeyVendorName": "Example Maker 13",
+     "USBKeyHardwareType": "Removable",
+     "USBKeyLocationID": "0x81200000"
+    },
+    {
+     "_items": [
+      {
+       "_name": "Example Product 22",
+       "USBDeviceKeyLinkSpeed": "480 Mb/s",
+       "USBDeviceKeyProductID": "0xfef2",
+       "USBDeviceKeyProductVersion": "0x0109",
+       "USBDeviceKeySerialNumber": "SERIAL-12",
+       "USBDeviceKeyVendorID": "0xfffd",
+       "USBDeviceKeyVendorName": "Example Maker 14",
+       "USBKeyHardwareType": "Non-removable",
+       "USBKeyLocationID": "0x81150000"
+      }
+     ],
+     "_name": "Example Product 23",
+     "USBDeviceKeyLinkSpeed": "480 Mb/s",
+     "USBDeviceKeyProductID": "0xfef1",
+     "USBDeviceKeyProductVersion": "0x010b",
+     "USBDeviceKeySerialNumber": "SERIAL-11",
+     "USBDeviceKeyVendorID": "0xfff4",
+     "USBDeviceKeyVendorName": "Example Maker 13",
+     "USBKeyHardwareType": "Removable",
+     "USBKeyLocationID": "0x81100000"
+    }
+   ],
+   "_name": "Example Product 19",
+   "Driver": "AppleT8132USBXHCI",
+   "USBKeyHardwareType": "Built-in",
+   "USBKeyLocationID": "0x81000000"
+  }
+ ]
+}

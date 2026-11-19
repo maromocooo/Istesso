@@ -42,7 +42,9 @@
 #   ISTESSO_HOST_PLUGIN   directory of the built compositor plugin on the host
 #                         (default: ~/.cache/istesso-m1-wip/gwd/repo-commit3/target/release, which has
 #                         the first patch; with TRY=channel: ~/.cache/istesso-media-wip/gwd-cursor/target/release,
-#                         which has all four)
+#                         which has all four). For everyday use, the build with the trial patches too:
+#                         `scripts/build-compositor.sh DIR --trial` on the host, then
+#                         DIR/target/release here (docs/m3-compositor-windows.md). Never in a measurement
 #   SIZE                  picture and window, in pixels (default: 1720x720)
 #   POSITION              top left corner of the window as X,Y in points from the top left of the main
 #                         display (default: the middle of the external display, or of the only one)
