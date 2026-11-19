@@ -32,6 +32,8 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
     "$repo/target/release/libistesso_media.a" -liconv \
     -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
     -framework AppKit -framework ApplicationServices
+# The rule of the session form, tested without any window or permission.
+"$bundle/Contents/MacOS/istesso-daily-host" --self-test >&2
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

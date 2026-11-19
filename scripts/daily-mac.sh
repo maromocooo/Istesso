@@ -44,10 +44,10 @@
 #   DAILY_VIEWER         a viewer program to start from the shell instead (no bundle)
 #   DAILY_NO_WINDOW=1    for checks: the viewer decodes but shows no window
 #   DAILY_FRAME_LOGS=1   frame logs on both sides
-#   DAILY_CLICK_FORM     how pointer events are posted on the host (default 4: through the session,
-#                        the host's own pointer moves, and only onto the application's own window;
-#                        1-3: to the application's process only, which other processes ignore for
-#                        clicks; docs/m4-daily-host.md)
+#   DAILY_CLICK_FORM     how pointer events are posted on the host. 1 (default): to the application's
+#                        process only; keys and text arrive, clicks do not (seen on the Studio).
+#                        4: through the session, the host's own pointer moves; presses and scrolls
+#                        only onto the application's own window (docs/m4-daily-host.md)
 #   DAILY_HOST_EXTRA     more arguments for the host program, for checks (e.g. --generated --input-dry)
 #   DAILY_HOST_DIRECT=1  for checks with a stand-in host only: start the host program's executable
 #                        itself instead of through `open` (it then has no permission of its own)
@@ -232,7 +232,7 @@ else
     [ -p "\$run/control" ] || mkfifo "\$run/control"
     : > "\$run/host.log"; : > "\$run/host.err"; rm -f "\$run/host.number"
     set -- $target_args --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        $size_arg --fps $fps --click-form ${DAILY_CLICK_FORM:-4} --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg --fps $fps --click-form ${DAILY_CLICK_FORM:-1} --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else

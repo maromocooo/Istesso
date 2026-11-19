@@ -123,6 +123,7 @@ func readSettings() -> Settings {
     return s
 }
 
+if CommandLine.arguments.dropFirst().first == "--self-test" { selfTest() }
 let settings = readSettings()
 
 // MARK: - Saying things
@@ -769,6 +770,66 @@ func applicationURL(_ name: String) -> URL? {
 
 // MARK: - Input
 
+/// What to do with one pointer event of the session form (form 4).
+enum SessionStep: Equatable {
+    enum Remember: Equatable { case press(CGRect), release, nothing }
+    /// Post it through the session, at this place.
+    case post(CGPoint, Remember)
+    /// Post it to the application's process only (the Mac's pointer does not move).
+    case toProcess
+    case drop
+}
+
+func clamp(_ point: CGPoint, into rect: CGRect) -> CGPoint {
+    CGPoint(x: min(max(point.x, rect.minX + 1), rect.maxX - 1), y: min(max(point.y, rect.minY + 1), rect.maxY - 1))
+}
+
+/// The rule of the session form. `onTarget`: the window on top at the point is the application's
+/// own. `pressWindow`: the bounds of the application's window this button was pressed in through
+/// the session, if it was. A press or a scroll goes through only onto the application; a move only
+/// over it (else to the process); a drag and a release only after a posted press, kept inside the
+/// window of the press.
+func sessionStep(type: CGEventType, at point: CGPoint, onTarget: Bool, pressWindow: CGRect?, window: CGRect) -> SessionStep {
+    switch type {
+    case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+        return onTarget && pressWindow == nil ? .post(point, .press(window)) : .drop
+    case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+        guard let pressWindow else { return .drop }
+        return .post(clamp(point, into: pressWindow), .release)
+    case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+        guard let pressWindow else { return .toProcess }
+        return .post(clamp(point, into: pressWindow), .nothing)
+    case .mouseMoved:
+        return onTarget ? .post(point, .nothing) : .toProcess
+    case .scrollWheel:
+        return onTarget ? .post(point, .nothing) : .drop
+    default:
+        return .toProcess
+    }
+}
+
+/// `--self-test`: the rule of the session form, without any window or permission.
+func selfTest() -> Never {
+    let win = CGRect(x: 100, y: 100, width: 200, height: 100)
+    let inside = CGPoint(x: 150, y: 150), outside = CGPoint(x: 500, y: 500)
+    var failed = 0
+    func check(_ got: SessionStep, _ want: SessionStep, _ what: String) {
+        if got != want { failed += 1; print("FAIL \(what): \(got) != \(want)") } else { print("ok   \(what)") }
+    }
+    check(sessionStep(type: .leftMouseDown, at: inside, onTarget: true, pressWindow: nil, window: win), .post(inside, .press(win)), "press onto the app")
+    check(sessionStep(type: .leftMouseDown, at: inside, onTarget: false, pressWindow: nil, window: win), .drop, "press onto another window is dropped")
+    check(sessionStep(type: .leftMouseUp, at: inside, onTarget: true, pressWindow: nil, window: win), .drop, "release without a posted press is dropped")
+    check(sessionStep(type: .leftMouseUp, at: outside, onTarget: false, pressWindow: win, window: win), .post(CGPoint(x: 299, y: 199), .release), "release outside is kept inside the press window")
+    check(sessionStep(type: .leftMouseDragged, at: outside, onTarget: false, pressWindow: win, window: win), .post(CGPoint(x: 299, y: 199), .nothing), "drag outside is kept inside")
+    check(sessionStep(type: .leftMouseDragged, at: inside, onTarget: true, pressWindow: nil, window: win), .toProcess, "drag without a posted press goes to the process")
+    check(sessionStep(type: .mouseMoved, at: outside, onTarget: false, pressWindow: nil, window: win), .toProcess, "move over another window goes to the process")
+    check(sessionStep(type: .mouseMoved, at: inside, onTarget: true, pressWindow: nil, window: win), .post(inside, .nothing), "move over the app")
+    check(sessionStep(type: .scrollWheel, at: outside, onTarget: false, pressWindow: nil, window: win), .drop, "scroll over another window is dropped")
+    check(sessionStep(type: .leftMouseDown, at: inside, onTarget: true, pressWindow: win, window: win), .drop, "a second press of a held button is dropped")
+    print(failed == 0 ? "all passed" : "\(failed) failed")
+    exit(failed == 0 ? 0 : 1)
+}
+
 /// Whether the login session's screen is locked now (unreadable counts as locked).
 func screenLocked() -> Bool {
     guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
@@ -818,40 +879,79 @@ final class Injector {
     /// 1, 2, 3: to the window's process only (m4-plan.md 5c); 4: through the session, the Mac's
     /// own pointer moves with it (for comparing; never while the screen is locked).
     var clickForm = settings.clickForm
-    private var pressPosted = false
 
     /// The process of the window that is on top at a point of the screen, whatever its layer.
     private func topWindowPid(at point: CGPoint) -> pid_t? {
-        windowList().first { $0.bounds.contains(point) && $0.alpha > 0.01 }?.pid
+        windowList().first { $0.bounds.contains(point) && $0.alpha > 0.01 && !isDockCover($0) }?.pid
+    }
+
+    /// The Dock's window that covers a whole display at the Dock's layer (20), seen on top of every
+    /// application window on the Mac mini and the Mac Studio. It does not take clicks: with it on
+    /// top, clicks through the session reached the counting window below it (2026-11-19, Studio).
+    /// Only that exact window is passed over; any other window on top stops the click.
+    private func isDockCover(_ window: WindowInfo) -> Bool {
+        guard window.layer == 20,
+              NSRunningApplication(processIdentifier: window.pid)?.bundleIdentifier == "com.apple.dock" else { return false }
+        var count: UInt32 = 0
+        var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+        CGGetActiveDisplayList(16, &displays, &count)
+        return displays.prefix(Int(count)).contains { CGDisplayBounds($0) == window.bounds }
     }
     private let source = CGEventSource(stateID: .privateState)
 
+    /// Presses posted through the session that have not been released yet: the button, and the
+    /// bounds of the application's window it was pressed in.
+    private var sessionPresses: [UInt32: CGRect] = [:]
+
     /// Posts a pointer event: to the process, or with form 4 through the session (refused while
-    /// the screen is locked: ADR 0017, "守ること" 3).
-    private func deliver(_ event: CGEvent, to pid: pid_t) {
-        if clickForm == 4 {
-            guard !screenLocked() else { return count("dropped_locked_session_tap") }
-            let type = event.type
-            let isUp = [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(type)
-            let isMove = type == .mouseMoved
-            if isUp {
-                // The release of a press that was posted is always posted, so that no button stays
-                // down; one whose press was not posted is not posted either.
-                guard pressPosted else { return count("dropped_not_on_top") }
-                pressPosted = false
-            } else if !isMove {
-                // Through the session, the event goes to whatever is on top at that point: only
-                // when that is a window of the very process it is meant for (the owner's rule).
-                guard topWindowPid(at: event.location) == pid else {
-                    if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) { pressPosted = false }
-                    return count("dropped_not_on_top")
-                }
-                if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) { pressPosted = true }
+    /// the screen is locked: ADR 0017, "守ること" 3), as `sessionStep` decides.
+    private func deliver(_ event: CGEvent, to pid: pid_t, window: WindowInfo) {
+        guard clickForm == 4 else { return event.postToPid(pid) }
+        if screenLocked() {
+            releaseSessionPresses()
+            return count("dropped_locked_session_tap")
+        }
+        let button = UInt32(event.getIntegerValueField(.mouseEventButtonNumber))
+        let onTarget = topWindowPid(at: event.location) == pid
+        switch sessionStep(type: event.type, at: event.location, onTarget: onTarget,
+                           pressWindow: sessionPresses[button], window: window.bounds) {
+        case let .post(place, remember):
+            event.location = place
+            switch remember {
+            case let .press(bounds): sessionPresses[button] = bounds
+            case .release: sessionPresses[button] = nil
+            case .nothing: break
             }
             event.post(tap: .cgSessionEventTap)
-        } else {
+        case .toProcess:
             event.postToPid(pid)
+        case .drop:
+            if !onTarget, let top = windowList().first(where: { $0.bounds.contains(event.location) && $0.alpha > 0.01 && !isDockCover($0) }) {
+                // Which window was in the way: its layer, its owner's bundle id, its size. No titles.
+                let owner = NSRunningApplication(processIdentifier: top.pid)?.bundleIdentifier ?? "pid-\(top.pid)"
+                log("{\"kind\":\"not_on_top\",\"t_ns\":\(nowNs()),\"layer\":\(top.layer),\"owner\":\"\(owner)\",\"alpha\":\(String(format: "%.2f", top.alpha)),\"size\":\"\(Int(top.bounds.width))x\(Int(top.bounds.height))\"}")
+            }
+            count("dropped_not_on_top")
         }
+    }
+
+    /// Releases every press posted through the session, inside the window it was made in. Also
+    /// while the screen is locked: a button must never stay down in the session.
+    func releaseSessionPresses() {
+        for (button, bounds) in sessionPresses {
+            let type: CGEventType = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
+            let place = clamp(point, into: bounds)
+            if let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: place,
+                                   mouseButton: CGMouseButton(rawValue: button) ?? .left) {
+                event.post(tap: .cgSessionEventTap)
+            }
+        }
+        sessionPresses.removeAll()
+    }
+
+    func setClickForm(_ form: Int) {
+        if clickForm == 4 && form != 4 { releaseSessionPresses() }
+        clickForm = form
     }
     private var flags: CGEventFlags = []
     private var keysDown: Set<UInt32> = []
@@ -936,7 +1036,7 @@ final class Injector {
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: place, mouseButton: button) else { return }
         withHeld(event)
         aim(event, at: window)
-        deliver(event, to: pid)
+        deliver(event, to: pid, window: window)
         count("move")
     }
 
@@ -986,7 +1086,7 @@ final class Injector {
         }
         guard let event else { return count("unmade_click") }
         withHeld(event)
-        deliver(event, to: pid)
+        deliver(event, to: pid, window: window)
         count("button")
     }
 
@@ -998,7 +1098,7 @@ final class Injector {
         event.location = point
         withHeld(event)
         aim(event, at: window)
-        deliver(event, to: pid)
+        deliver(event, to: pid, window: window)
         count("scroll")
     }
 
@@ -1036,6 +1136,7 @@ final class Injector {
 
     /// Lets go of every key and button still held, as the other side would (detach, a stop).
     func releaseAll() {
+        releaseSessionPresses()
         guard mayPost, !settings.inputDry else { keysDown.removeAll(); buttonsDown.removeAll(); flags = []; return }
         for code in keysDown { key(code, false) }
         for code in buttonsDown { button(code, false) }
@@ -1487,7 +1588,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         case "click-form":
             // For comparing the ways of posting pointer events while a person tries them.
             if words.count == 2, let form = Int(words[1]), (1...4).contains(form) {
-                injector.clickForm = form
+                injector.setClickForm(form)
                 say("click-form", [("form", form)])
             }
         case "admit":
