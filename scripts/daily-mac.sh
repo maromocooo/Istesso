@@ -44,6 +44,7 @@
 #   DAILY_VIEWER         a viewer program to start from the shell instead (no bundle)
 #   DAILY_NO_WINDOW=1    for checks: the viewer decodes but shows no window
 #   DAILY_FRAME_LOGS=1   frame logs on both sides
+#   DAILY_VIRTUAL_SIZE   the virtual display's size in points instead of this Mac's screen (WxH)
 #   DAILY_VIRTUAL=0      the application's window stays on the host's own screen (default: a virtual
 #                        display of this Mac's screen's size at 2x, 120 Hz, while the window is shown)
 #   DAILY_CLICK_FORM     how pointer events are posted on the host. 4 (default for an application):
@@ -227,7 +228,7 @@ do_open() {
     local virtual_arg=""
     if [ -z "$display" ] && [ "$for_whom" != aura ] && [ "${DAILY_VIRTUAL:-1}" != 0 ]; then
         local here_size
-        here_size=$(osascript -l JavaScript -e 'ObjC.import("AppKit"); var f=$.NSScreen.mainScreen.frame; Math.round(f.size.width)+"x"+Math.round(f.size.height)' 2>/dev/null)
+        here_size=${DAILY_VIRTUAL_SIZE:-$(osascript -l JavaScript -e 'ObjC.import("AppKit"); var f=$.NSScreen.mainScreen.frame; Math.round(f.size.width)+"x"+Math.round(f.size.height)' 2>/dev/null)}
         [[ "$here_size" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] && virtual_arg="--virtual-display $here_size@120"
     fi
     local target_args size_arg="--size $size"
