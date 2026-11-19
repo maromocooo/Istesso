@@ -1,4 +1,5 @@
 // Each bundle is built with one literal URL. Finder arguments are ignored.
+#include <stdlib.h>
 #include <unistd.h>
 
 #ifndef SHORTCUT_TEST
@@ -6,6 +7,7 @@
 #endif
 
 int main(void) {
+    if (unsetenv("DAILY_OWNER") || unsetenv("DAILY_OPEN_HANDLER")) return 1;
     execl(SHORTCUT_OPENER, "open", SHORTCUT_URL, (char *)0);
     return 1;
 }

@@ -55,7 +55,7 @@ class ShortcutsTest(unittest.TestCase):
 
     def test_all_shims(self):
         self.assertEqual(self.config["checkout"], str(sc.ROOT))
-        declared = json.loads((self.bundles / "apps.json").read_text())
+        declared = json.loads((self.bundles / "apps.json").read_text())["apps"]
         self.assertEqual({app for host, app, _ in declared if host == "ubuntu"},
                          {"editor", "blender", "chrome", "firefox"})
         self.assertIn(["mac", "TextEdit", "TextEdit (Studio)"], declared)
@@ -78,7 +78,8 @@ class ShortcutsTest(unittest.TestCase):
 
     def test_mac_and_ubuntu_shim_environment(self):
         opener = self.checkout / "open"
-        opener.write_text('#!/bin/sh\nexec "$TEST_HANDLER" "$TEST_ROUTES" "$@"\n')
+        opener.write_text('#!/bin/sh\n[ -z "${DAILY_OWNER+x}${DAILY_OPEN_HANDLER+x}" ] || exit 1\n'
+                          'exec "$TEST_HANDLER" "$TEST_ROUTES" "$@"\n')
         opener.chmod(0o700)
 
         def headless_bundle(folder, title, source, flags, extra, routes=None):
@@ -98,8 +99,36 @@ class ShortcutsTest(unittest.TestCase):
             with self.subTest(title=title):
                 subprocess.run([self.checkout / title], env=env, check=True)
                 self.assert_recorded("open", app, "--host", host)
-                expected = ["1", "1"] if host == "mac" else ["unset", "unset"]
-                self.assertEqual((self.checkout / "flags").read_text().splitlines(), expected)
+                flags = self.checkout / "flags"
+                self.assertEqual(flags.read_text().splitlines(), ["unset", "unset"])
+                # A URL can also arrive without going through a shim.
+                with patch.dict(os.environ, DAILY_OWNER="1", DAILY_OPEN_HANDLER="1"):
+                    self.assert_dispatch(f"{sc.SCHEME}://open/{quote(app, safe='')}?host={host}",
+                                         "open", app, "--host", host)
+                self.assertEqual(flags.read_text().splitlines(), ["unset", "unset"])
+
+    def test_owner_apps_refused_at_build_and_dispatch(self):
+        apps = self.checkout / "mac-apps.txt"
+        for app in ("Safari", "Notes", "Finder", "Preview", "Dia", "desktop", "SAFARI.app"):
+            with self.subTest(app=app):
+                apps.write_text("TextEdit\n" + app + "\n")
+                with self.assertRaises(ValueError):
+                    sc.app_list("", apps)
+                # Exercise the handler's own check against a route from an older build.
+                url = f"{sc.SCHEME}://open/{app}?host=mac"
+                args = ["open", app, "--host", "mac"]
+                routes = {url: args, url + "&for=aura": args + ["--for", "aura"]}
+                sc.write_plist(self.routes, dict(checkout=str(self.checkout), routes=routes))
+                for link in routes:
+                    self.assertNotEqual(self.dispatch(link).returncode, 0)
+                    self.assertFalse(self.record.exists())
+
+    def test_repeated_refusals_log_once(self):
+        url = f"{sc.SCHEME}://open/desktop?host=mac"
+        result = subprocess.run([self.runner, self.routes, url, url, url], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr.count("This shortcut is not on the trial's app list."), 1)
+        self.assertFalse(self.record.exists())
 
     def test_refused_urls_never_call_daily(self):
         for tail in ("editor", "../editor?host=ubuntu", "editor?host=mac", "TextEdit?host=ubuntu",
@@ -151,6 +180,55 @@ class ShortcutsTest(unittest.TestCase):
         sc.write_plist(self.routes, bundle.call_args.args[-1])
         self.assert_dispatch("istesso-dev-open://open/Text%20Editor%20%28Trial%29?host=mac",
                              "open", "Text Editor (Trial)", "--host", "mac")
+
+    def test_remove_unregisters_old_owner_bundle_before_deleting(self):
+        title = "Safari (Studio)"
+        bundle = self.checkout / (title + ".app")
+        (bundle / "Contents").mkdir(parents=True)
+        sc.write_plist(bundle / "Contents/Info.plist", dict(CFBundleIdentifier=sc.bundle_id(title)))
+        sc.save_names(self.checkout, {title})
+        names = sc.installed_names(self.checkout)
+        with patch.object(subprocess, "run", side_effect=subprocess.CalledProcessError(1, "lsregister")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                sc.remove(self.checkout, names, {title})
+        self.assertTrue(bundle.exists())
+        self.assertEqual(sc.installed_names(self.checkout), {title})
+
+        def unregister(command, **options):
+            self.assertEqual(command, [sc.LSREGISTER, "-u", bundle])
+            self.assertTrue(options["check"])
+            self.assertTrue(bundle.exists())
+
+        with patch.object(subprocess, "run", side_effect=unregister) as run:
+            sc.remove(self.checkout, names, {title})
+        run.assert_called_once()
+        self.assertFalse(bundle.exists())
+        self.assertFalse((self.checkout / sc.MANIFEST).exists())
+
+    def test_old_build_requires_rebuild(self):
+        stage = self.checkout / "stage"
+        (stage / "bundles").mkdir(parents=True)
+        ubuntu = "editor\tText Editor"
+        rows = sc.app_list(ubuntu, sc.SOURCE / "mac-apps.txt")
+        (stage / "bundles/apps.json").write_text(json.dumps(rows))
+        with patch.object(sc, "STAGE", stage), patch.object(sc, "DEST", self.checkout / "dest"):
+            with patch.object(sc, "install") as install, self.assertRaisesRegex(ValueError, "build first"):
+                sc.run("install", "", ubuntu)
+            install.assert_not_called()
+
+    def test_icon_size_and_signature_checked_before_conversion(self):
+        signature = b"\x89PNG\r\n\x1a\n"
+        for prefix, size, allowed in ((signature, 8 << 20, True), (signature, (8 << 20) + 1, False),
+                                      (signature[:-1], 7, False), (b"not a PNG", 9, False)):
+            with self.subTest(size=size):
+                def fetch(out, *_):
+                    with out.open("wb") as file:
+                        file.write(prefix)
+                        file.truncate(size)
+
+                with patch.object(sc, "fetch_icon", fetch), patch.object(sc, "convert_icon", side_effect=OSError) as convert:
+                    sc.add_icon(self.checkout, "editor", "", self.checkout)
+                self.assertEqual(convert.call_count, int(allowed))
 
     def test_icon_and_generic_fallback(self):
         title = "Firefox (Ubuntu)"

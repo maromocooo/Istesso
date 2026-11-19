@@ -6,6 +6,7 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 import plistlib
+import resource
 import shutil
 import subprocess
 import sys
@@ -21,17 +22,28 @@ HANDLER = "Istesso Dev Open"
 PREFIX = "com.maromoco.istesso-dev."
 SCHEME = "istesso-dev-open"
 MANIFEST = ".daily-shortcuts.json"
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+              "LaunchServices.framework/Support/lsregister")
+OWNER_ONLY = {"safari", "notes", "finder", "preview", "dia", "desktop"}
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_ICON_BYTES = 8 << 20
+
+
+def valid_bundle_component(name):
+    return (name and name.isprintable() and name == name.strip()
+            and not name.startswith(("-", ".")) and not any(c in name for c in "/:\\"))
 
 
 def valid_app_name(name):
-    return (name and name.isprintable() and name == name.strip()
-            and not name.startswith(("-", ".")) and not any(c in name for c in "/:\\"))
+    return valid_bundle_component(name) and name.lower().removesuffix(".app") not in OWNER_ONLY
 
 
 def app_list(ubuntu, mac_list):
     rows = []
     for line in ubuntu.splitlines():
         app, title = line.split("\t")
+        if not valid_app_name(app):
+            raise ValueError("invalid Ubuntu shortcut app name")
         rows.append(("ubuntu", app, title + " (Ubuntu)"))
     for app in mac_list.read_text().splitlines():
         if app and not app.startswith("#"):
@@ -47,7 +59,8 @@ def bundle_id(title):
     if title == HANDLER:
         return PREFIX + "open"
     app, _, suffix = title.rpartition(" (")
-    if suffix not in ("Ubuntu)", "Studio)") or not valid_app_name(app):
+    # Older manifests can contain owner-only apps. Keep their IDs usable for removal.
+    if suffix not in ("Ubuntu)", "Studio)") or not valid_bundle_component(app):
         raise ValueError("invalid shortcut bundle name")
     return PREFIX + "shortcut." + hashlib.sha256(title.encode()).hexdigest()[:24]
 
@@ -105,10 +118,15 @@ def convert_icon(png, work):
 
 
 def fetch_icon(png, app, host):
+    def limit_download():
+        # Keep one extra byte so even a sender that ignores a short write is rejected.
+        limit = MAX_ICON_BYTES + 1
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+
     with png.open("wb") as out, (SOURCE / "host-icon.py").open("rb") as script:
         subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host,
                         "python3", "-I", "-", app], stdin=script, stdout=out,
-                       stderr=subprocess.DEVNULL, check=True, timeout=12)
+                       stderr=subprocess.DEVNULL, check=True, timeout=12, preexec_fn=limit_download)
 
 
 def add_icon(bundle, app, host, work):
@@ -116,8 +134,12 @@ def add_icon(bundle, app, host, work):
     png = work / "original.png"
     try:
         fetch_icon(png, app, host)
+        with png.open("rb") as source:
+            if (os.fstat(source.fileno()).st_size > MAX_ICON_BYTES
+                    or source.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE):
+                raise ValueError("invalid shortcut icon")
         icon = convert_icon(png, work)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         print(f"Using the generic icon for {app}.")
         return
     contents = bundle / "Contents"
@@ -166,6 +188,8 @@ def remove(dest, names, obsolete):
         check_owned(dest, title, names)
         bundle = dest / (title + ".app")
         if bundle.exists():
+            subprocess.run([LSREGISTER, "-u", bundle], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             shutil.rmtree(bundle)
         names.remove(title)
         save_names(dest, names)
@@ -242,7 +266,7 @@ def run(action, host, ubuntu):
             with tempfile.TemporaryDirectory(dir=STAGE) as tmp:
                 next_build = Path(tmp) / "bundles"
                 build(next_build, rows, ROOT)
-                (next_build / "apps.json").write_text(json.dumps(rows))
+                (next_build / "apps.json").write_text(json.dumps({"version": 2, "apps": rows}))
                 tool = next_build / "bundle-tool"
                 subprocess.run(["clang", "-Wall", "-Wextra", "-Werror", SOURCE / "bundle-tool.m",
                                 "-fobjc-arc", "-framework", "CoreServices", "-framework", "Foundation",
@@ -253,7 +277,8 @@ def run(action, host, ubuntu):
                     next_build.rename(current)
             print("Built trial shortcuts in build/shortcuts/bundles.")
         elif action == "install":
-            if not current.exists() or json.loads((current / "apps.json").read_text()) != [list(row) for row in rows]:
+            expected = {"version": 2, "apps": [list(row) for row in rows]}
+            if not current.exists() or json.loads((current / "apps.json").read_text()) != expected:
                 raise ValueError("run scripts/daily.sh shortcuts build first")
             DEST.mkdir(parents=True, exist_ok=True)
             with locked_destination(DEST):
