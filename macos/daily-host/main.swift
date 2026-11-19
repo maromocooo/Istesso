@@ -104,6 +104,11 @@ struct Settings {
     var newWindow = false
     /// Copy and paste of text with the trial agent (ADR 0022); off unless asked for.
     var clipboard = false
+    /// Composing text inline in the application through Istesso Dev Input (ADR 0023, inline.swift);
+    /// off unless asked for (--inline, or ISTESSO_DAILY_INLINE=1): the viewer keeps its strip.
+    var inline = ProcessInfo.processInfo.environment["ISTESSO_DAILY_INLINE"] == "1"
+    /// How long this Mac's own keyboard must be idle before Istesso's source is selected again.
+    var inlineIdle = 3.0
 }
 
 func usage() -> Never {
@@ -113,6 +118,7 @@ func usage() -> Never {
            [--bitrate KBIT] [--keep-awake FPS] [--min-qp N] [--input-socket PATH] [--input-dry]
            [--control FIFO] [--log FILE|-] [--no-fit-window] [--click-form 1|2|3] [--generated]
            [--pid-file FILE] [--signal FILE] [--system-prompt-owner BUNDLE_ID]...
+           [--inline [--inline-local-idle SECONDS]]
 
     """.utf8))
     exit(2)
@@ -176,6 +182,8 @@ func readSettings() -> Settings {
         case "--virtual-slot": s.virtualSlot = max(1, min(3, number()))
         case "--new-window": s.newWindow = true
         case "--clipboard": s.clipboard = true
+        case "--inline": s.inline = true
+        case "--inline-local-idle": s.inlineIdle = Double(max(1, min(60, number())))
         default: usage()
         }
     }
@@ -429,6 +437,11 @@ final class Transport {
             }
             return result == 0 ? sent : nil
         } ?? nil
+    }
+    /// Kind 5, the text input field (trial only; only with --inline).
+    func setTextInput(_ field: FieldReport) {
+        var made = IstessoMediaTextInput(state: field.state, x: field.x, y: field.y, width: field.width, height: field.height, serial: field.serial)
+        _ = guarded.use { istesso_media_host_set_text_input(native, &made) }
     }
     /// The viewers draw the Mac's own cursor where their pointer is: the picture has none, and the
     /// host's pointer does not move (input goes to the application's process, not to the screen).
@@ -1915,6 +1928,7 @@ func selfTest() -> Never {
     _ = guardedFlag.use { ran += 100 }
     guardedFlag.close { ran += 1000 }
     checkPanel(ran == 11, true, "a closed stream takes no more calls, and is closed once")
+    failed += inlineSelfTest()
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
 }
@@ -2135,6 +2149,11 @@ final class Injector {
     private var held: [Data] = []
     private var heldPresses: Set<UInt32> = []
     var onHoldFull: () -> Void = {}
+    /// With --inline only (inline.swift): composing text, committed text and key presses go to the
+    /// inline composition first. Without, `preedit` is unknown here and text goes as before.
+    var onPreedit: ((String, [Int]) -> Void)?
+    var onText: ((String) -> Bool)?
+    var onKeyPressed: (() -> Void)?
     func beginHold() { holdingForChord = true }
     func endHold(flush: Bool) {
         holdingForChord = false
@@ -2319,7 +2338,19 @@ final class Injector {
             scroll(plan)
         case "text":
             guard let text = object["text"] as? String else { return count("unreadable") }
-            type(text)
+            if let onText {
+                guard Wire.acceptable(text, allowEmpty: false) else { return count("text_dropped") }
+                guard target() != nil else { return count("dropped_no_target") }
+                guard keysAllowed() else { return count("dropped_not_in_front") }
+                if onText(text) { count("text_inline") }
+            } else {
+                type(text)
+            }
+        case "preedit" where onPreedit != nil:
+            guard let text = object["text"] as? String, let cursor = (object["cursor"] as? [NSNumber])?.map(\.intValue) else { return count("unreadable") }
+            guard target() != nil, keysAllowed() else { return count("preedit_not_in_front") }
+            onPreedit?(text, cursor)
+            count("preedit")
         case "focus":
             count("focus")
             onFocus()
@@ -2341,6 +2372,7 @@ final class Injector {
             return count("dropped_not_in_front")
         }
         if pressed && keysDroppedSaid { keysDroppedSaid = false; onKeysDropped(false) }
+        if pressed { onKeyPressed?() }
         guard let virtual = virtualKeys[code] else { return count("unknown_key") }
         if pressed { keysDown.insert(code) } else { keysDown.remove(code) }
         if modifierFlag(code) != nil { modifierSince[code] = pressed ? (modifierSince[code] ?? ProcessInfo.processInfo.systemUptime) : nil }
@@ -2466,7 +2498,7 @@ final class Injector {
     /// Committed text from the other device's input method (ADR 0007, "確定した文字"): at most 256
     /// characters and 1024 bytes, none of them a control character; else the event is dropped
     /// whole. Never written anywhere: only how many.
-    private func type(_ text: String) {
+    func type(_ text: String) {
         let scalars = text.unicodeScalars
         guard !text.isEmpty, scalars.count <= 256, text.utf8.count <= 1024,
               !scalars.contains(where: { $0.value < 0x20 || (0x7f...0x9f).contains($0.value) }) else {
@@ -2559,6 +2591,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var timers: [DispatchSourceTimer] = []
     var promptMonitor: SystemPromptMonitor?
     var mayCapture = false
+    /// The inline composition (--inline only), and the kind 5 said last (told again to a new stream).
+    var inline: InlineHost?
+    var lastField: FieldReport?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let path = settings.pidFile {
@@ -2608,6 +2643,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
 
     func quit(_ code: Int32) {
+        inline?.shutdown()
         promptMonitor?.stop()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(code) }
     }
@@ -2624,6 +2660,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         }
         transport = made
         transport.ownCursor()
+        if let lastField { transport.setTextInput(lastField) }
         pump = Pump(transport: transport, width: width, height: height)
         pictureWindowSize = nil
         if frameLog.on {
@@ -2773,6 +2810,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.injector.windowAt = { [weak self] point in self?.appWindow(at: point) }
                 self.watchFocus(running.processIdentifier)
                 self.watchApp()
+                self.startInline(running)
             }
         }
         if let document = settings.document {
@@ -3422,8 +3460,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     }
 
     /// One event in its turn: a mark of copy or paste to the clipboard's part, anything else to the
-    /// injector.
+    /// injector. After a commit through the input source, everything waits (in order) until it is
+    /// inserted (inline.swift; 50 ms at most).
     func dispatch(_ data: Data) {
+        if let inline, inline.composer.holding, inline.held.count < 256 { return inline.held.append(data) }
         if settings.clipboard, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let kind = object["kind"] as? String, kind == "clipboard_copy" || kind == "clipboard_paste",
            let nonce = object["nonce"] as? String {
@@ -3449,6 +3489,71 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             return clipboard.paste(nonce: nonce, withText: withText)
         }
         injector.handle(data)
+    }
+
+    // ---- Composing text inline (--inline only; inline.swift) ----
+
+    func startInline(_ running: NSRunningApplication) {
+        guard settings.inline else {
+            // Off. Only if an earlier run with --inline ended without putting the source back (its
+            // file is still there) is that source put back now; otherwise nothing is touched.
+            if let path = Wire.socketPath(slot: settings.virtualSlot) {
+                let folder = (path as NSString).deletingLastPathComponent
+                if access((folder as NSString).appendingPathComponent("previous-source"), F_OK) == 0,
+                   let restored = SourceSwitch(folder: folder, slot: settings.virtualSlot, system: TISInputSources()).recoverAtStart() {
+                    note("inline is off; a source left by an earlier run, restored: \(restored ? "yes" : "no")")
+                }
+            }
+            return
+        }
+        guard let bundle = running.bundleIdentifier, let made = InlineHost(app: bundle, slot: settings.virtualSlot, idle: settings.inlineIdle) else {
+            return note("inline: no bundle identifier or no socket path: the strip only")
+        }
+        made.composer.deliverText = { [weak self] text in self?.injector.type(text) }
+        made.composer.setField = { [weak self] field in
+            self?.lastField = field
+            self?.transport?.setTextInput(field)
+            if frameLog.on { frameLog.write("{\"kind\":\"field\",\"t_ns\":\(nowNs()),\"state\":\(field.state),\"serial\":\(field.serial)}") }
+        }
+        made.composer.releaseHold = { [weak self] in self?.flushHeld() }
+        made.composer.densityAtWindow = { [weak self] in densityAt(self?.windowBounds ?? .zero) }
+        guard made.start() else { return note("inline: the slot's socket could not be made: the strip only") }
+        injector.onPreedit = { made.composer.preedit($0, cursor: $1) }
+        injector.onText = { made.composer.commit($0) }
+        injector.onKeyPressed = { made.composer.keyPressed() }
+        inline = made
+        note("inline: on, slot \(settings.virtualSlot)")
+        var ticks = 0
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 0.1, repeating: .milliseconds(10))
+        timer.setEventHandler { [weak self] in
+            guard let self, let inline = self.inline else { return }
+            ticks += 1
+            if ticks % 10 != 0 { if inline.composer.holding { inline.composer.tick() }; return }
+            let composer = inline.composer
+            composer.shownWindow = self.windowBounds
+            composer.origin = self.injector.origin
+            composer.pointsPerPixel = self.injector.scale
+            composer.picture = CGSize(width: self.width, height: self.height)
+            let connected = self.transport != nil && self.transport.viewers > 0 && self.picture == "running" && !self.detached && !self.heldForSignal
+            inline.tick(connected: connected, locked: screenLocked(), pid: self.app?.processIdentifier)
+            if ticks % 100 == 0, frameLog.on, !composer.counts.isEmpty {
+                let counts = composer.counts.map { "\"\($0.key)\":\($0.value)" }.joined(separator: ",")
+                frameLog.write("{\"kind\":\"inline\",\"t_ns\":\(nowNs()),\(counts)}")
+            }
+        }
+        timer.resume()
+        timers.append(timer)
+    }
+
+    /// What waited for an "inserted", in order, until something waits again.
+    func flushHeld() {
+        guard let inline else { return }
+        while !inline.held.isEmpty && !inline.composer.holding {
+            let event = inline.held.removeFirst()
+            guard !detached, picture == "running" else { continue }
+            dispatch(event)
+        }
     }
 
     private func isKeyOrText(_ data: Data) -> Bool {
@@ -3735,6 +3840,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     self.width = w
                     self.height = h
                     self.transport = made
+                if let field = self.lastField { made.setTextInput(field) }
                     made.ownCursor()
                     self.pump = Pump(transport: made, width: w, height: h)
                     self.pictureWindowSize = windowSize
@@ -3773,6 +3879,8 @@ for name in [SIGTERM, SIGINT] {
     let source = DispatchSource.makeSignalSource(signal: name, queue: .main)
     source.setEventHandler {
         daily.injector.releaseAll()
+        // Istesso's input source is let go of before anything else (the Mac's own keyboard).
+        daily.inline?.shutdown()
         // A stop: the windows go back where they were and the virtual display away, then the end.
         if daily.virtualScreen != nil {
             daily.moveWindowsBack()

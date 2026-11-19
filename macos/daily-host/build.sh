@@ -26,12 +26,12 @@ bundle="$output/Istesso Dev Daily Host.app"
 
 (cd "$repo" && cargo build --release -p istesso-media >&2)
 mkdir -p "$bundle/Contents/MacOS"
-swiftc -O -swift-version 5 -target arm64-apple-macos14.2 \
+swiftc -O -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.2 \
     -import-objc-header "$here/bridge.h" -I "$repo/crates/istesso-media/include" \
-    -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" "$here/clipboard.swift" \
+    -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" "$here/clipboard.swift" "$here/inline.swift" "$here/../input-method/wire.swift" \
     "$repo/target/release/libistesso_media.a" -liconv \
     -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-    -framework AppKit -framework ApplicationServices
+    -framework AppKit -framework ApplicationServices -framework Carbon -framework Security
 # The rule of the session form, tested without any window or permission.
 "$bundle/Contents/MacOS/istesso-daily-host" --self-test >&2
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
