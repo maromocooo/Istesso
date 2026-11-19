@@ -93,7 +93,7 @@ host_address() {
     ssh -G "$host_name" 2>/dev/null | awk '/^hostname / {print $2}'
 }
 # A name for the run folders: letters, digits, dots and dashes of the application's name.
-run_name() { printf '%s' "$(basename "$1" .app)" | tr -c 'A-Za-z0-9.-' '-'; }
+run_name() { printf '%s' "$(basename "$1" .app)" | tr -c 'A-Za-z0-9-' '-'; }
 
 # What the host runs: the same small functions there, then the command given.
 host_functions() {

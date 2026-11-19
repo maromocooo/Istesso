@@ -984,14 +984,40 @@ func selfTest() -> Never {
     _ = slow.windows
     slow.refresh(1)
     checkPanel(ProcessInfo.processInfo.systemUptime - began < 0.05, true, "a slow Accessibility lookup never holds the input up")
+    // The injector itself, with stand-ins for the window list, the lock and the posting.
     let appWin = WindowInfo(id: 7, pid: 100, layer: 0, bounds: win, alpha: 1, onScreen: true)
     let other = WindowInfo(id: 8, pid: 200, layer: 0, bounds: win, alpha: 1, onScreen: true)
-    let mine: (WindowInfo) -> Bool = { $0.pid == 100 }
-    checkPanel(pressOnTarget(fresh: [appWin], at: inside, allowed: mine), true, "a press onto the application's window")
-    checkPanel(pressOnTarget(fresh: [other, appWin], at: inside, allowed: mine), false, "a window that came in front since the last look is not pressed through")
-    checkPanel(pressOnTarget(fresh: [], at: inside, allowed: mine), false, "a window that closed since the last look is not pressed")
     let moved = WindowInfo(id: 7, pid: 100, layer: 0, bounds: win.offsetBy(dx: 500, dy: 0), alpha: 1, onScreen: true)
-    checkPanel(pressOnTarget(fresh: [moved], at: inside, allowed: mine), false, "a window that moved away since the last look is not pressed")
+    func clicks(list: [WindowInfo], lockAfterPress: Bool = false) -> Int {
+        let injector = Injector()
+        var shown = list
+        var locked = false
+        var posted = 0
+        injector.mayPost = true
+        injector.clickForm = 4
+        injector.listNow = { shown }
+        injector.lockedNow = { locked }
+        injector.inRange = { _, top in top?.pid == 100 }
+        injector.windowAt = { point in shown.first { $0.pid == 100 && $0.bounds.contains(point) } }
+        injector.postSession = { event in
+            if [.leftMouseDown, .leftMouseUp].contains(event.type) { posted += 1 }
+        }
+        injector.postProcess = { _, _ in }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        // The list seen when the pointer came there: the application's window.
+        shown = [appWin]
+        send(["kind": "pointer_at", "x": 150, "y": 150])
+        shown = list  // what it is right at the press
+        send(["kind": "button", "code": 0x110, "pressed": true])
+        if lockAfterPress { locked = true }
+        send(["kind": "button", "code": 0x110, "pressed": false])
+        return posted
+    }
+    checkPanel(clicks(list: [appWin]) == 2, true, "injector: a press and release onto the application's window go through")
+    checkPanel(clicks(list: [other, appWin]) == 0, true, "injector: a window that came in front since the last look is not pressed through")
+    checkPanel(clicks(list: []) == 0, true, "injector: a window that closed since the last look is not pressed")
+    checkPanel(clicks(list: [moved]) == 0, true, "injector: a window that moved away since the last look is not pressed")
+    checkPanel(clicks(list: [appWin], lockAfterPress: true) == 2, true, "injector: a press made before the lock is released in it")
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
 }
@@ -1027,14 +1053,6 @@ final class Lookout {
 
     /// Runs one Accessibility action away from the input; returns at once.
     func act(_ work: @escaping () -> Void) { queue.async(execute: work) }
-}
-
-/// Whether a press at a point may go through: decided on a window list read right before the press
-/// (WindowServer answers it; no application is waited for), not on one kept from before. A window
-/// that moved or closed since is not pressed.
-func pressOnTarget(fresh: [WindowInfo], at point: CGPoint, allowed: (WindowInfo) -> Bool) -> Bool {
-    guard let top = fresh.first(where: { $0.bounds.contains(point) && $0.alpha > 0.01 }) else { return false }
-    return allowed(top)
 }
 
 /// Whether an input event may pass while the screen is locked or the session is not on the
@@ -1105,10 +1123,18 @@ final class Injector {
     /// this process is in it, and whether keys may be sent now. Set by the host for its mode.
     var inRange: (CGPoint, WindowInfo?) -> Bool = { _, _ in false }
     var keysAllowed: () -> Bool = { false }
+    /// What the injector looks at and where it posts; replaced by stand-ins in --self-test, so that
+    /// the tests go through the same path as the input does.
+    var listNow: () -> [WindowInfo] = { windowList() }
+    var lockedNow: () -> Bool = screenLocked
+    var postSession: (CGEvent) -> Void = { $0.post(tap: .cgSessionEventTap) }
+    var postProcess: (CGEvent, pid_t) -> Void = { $0.postToPid($1) }
+    /// When each modifier key went down (uptime).
+    private var modifierSince: [UInt32: TimeInterval] = [:]
 
     /// The process of the window that is on top at a point of the screen, whatever its layer.
     private func topWindow(at point: CGPoint) -> WindowInfo? {
-        windowList().first { $0.bounds.contains(point) && $0.alpha > 0.01 && !isDockCover($0) }
+        listNow().first { $0.bounds.contains(point) && $0.alpha > 0.01 && !isDockCover($0) }
     }
 
     /// The Dock's window that covers a whole display at the Dock's layer (20), seen on top of every
@@ -1132,8 +1158,8 @@ final class Injector {
     /// Posts a pointer event: to the process, or with form 4 through the session (refused while
     /// the screen is locked: ADR 0017, "守ること" 3), as `sessionStep` decides.
     private func deliver(_ event: CGEvent, to pid: pid_t, window: WindowInfo) {
-        guard clickForm == 4 else { return event.postToPid(pid) }
-        if screenLocked() {
+        guard clickForm == 4 else { return postProcess(event, pid) }
+        if lockedNow() {
             releaseSessionPresses()
             return count("dropped_locked_session_tap")
         }
@@ -1148,9 +1174,9 @@ final class Injector {
             case .release: sessionPresses[button] = nil
             case .nothing: break
             }
-            event.post(tap: .cgSessionEventTap)
+            postSession(event)
         case .toProcess:
-            event.postToPid(pid)
+            postProcess(event, pid)
         case .drop:
             count("dropped_not_on_top")
         }
@@ -1164,7 +1190,7 @@ final class Injector {
             let place = clamp(point, into: bounds)
             if let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: place,
                                    mouseButton: CGMouseButton(rawValue: button) ?? .left) {
-                event.post(tap: .cgSessionEventTap)
+                postSession(event)
             }
         }
         sessionPresses.removeAll()
@@ -1210,7 +1236,7 @@ final class Injector {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return count("unreadable") }
         lastInput = ProcessInfo.processInfo.systemUptime
-        if !settings.inputDry && screenLocked() {
+        if !settings.inputDry && lockedNow() {
             // Locked, or not on the console: nothing but the release of what is down here, in every
             // form (ADR 0017, "守ること" 3).
             let pressed = object["pressed"] as? Bool
@@ -1253,6 +1279,7 @@ final class Injector {
         guard keysAllowed() || (!pressed && keysDown.contains(code)) else { return count("dropped_not_in_front") }
         guard let virtual = virtualKeys[code] else { return count("unknown_key") }
         if pressed { keysDown.insert(code) } else { keysDown.remove(code) }
+        if modifierFlag(code) != nil { modifierSince[code] = pressed ? (modifierSince[code] ?? ProcessInfo.processInfo.systemUptime) : nil }
         flags = modifierFlags(of: keysDown)
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: virtual, keyDown: pressed) else { return }
         withHeld(event)
@@ -1260,7 +1287,7 @@ final class Injector {
         // anything on the way: it is made one here.
         if modifierFlag(code) != nil { event.type = .flagsChanged }
         if pressed { log("{\"kind\":\"key_in\",\"t_ns\":\(nowNs())}") }
-        event.postToPid(pid)
+        postProcess(event, pid)
         count("key")
     }
 
@@ -1374,7 +1401,7 @@ final class Injector {
                 guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
                 event.flags = []
                 event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
-                event.postToPid(pid)
+                postProcess(event, pid)
             }
             chunk.removeAll()
         }
@@ -1389,6 +1416,17 @@ final class Injector {
     }
 
     /// Lets go of every key and button still held, as the other side would (detach, a stop).
+    /// A modifier key down for longer than this is let go, however busy the typing (its release
+    /// may have been lost, and every letter would carry it: ⌘Q, ⌘W). The events carry no state of
+    /// the other side's modifiers to check against.
+    func releaseStaleModifiers(olderThan seconds: TimeInterval) {
+        let now = ProcessInfo.processInfo.systemUptime
+        for (code, since) in modifierSince where now - since > seconds && keysDown.contains(code) {
+            key(code, false)
+            count("modifier_let_go")
+        }
+    }
+
     func releaseAll() {
         releaseSessionPresses()
         guard mayPost, !settings.inputDry else { keysDown.removeAll(); buttonsDown.removeAll(); flags = []; return }
@@ -1442,6 +1480,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         watchdog.schedule(deadline: .now() + 1, repeating: .seconds(1))
         watchdog.setEventHandler { [weak self] in
             self?.keepAwakeAndTellLock()
+            self?.injector.releaseStaleModifiers(olderThan: 8)
             guard let self, self.injector.holding,
                   ProcessInfo.processInfo.systemUptime - self.injector.lastInput > 8 else { return }
             note("input held for 8 s without anything new: everything is let go")
@@ -2041,7 +2080,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var waiting: [Data] = []
     func take(_ data: Data) {
         if !waiting.isEmpty { return waiting.append(data) }
-        if needsFront(data), let running = frontCandidate(data),
+        if needsFront(data), !screenLocked(), let running = frontCandidate(data),
            running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
             // The window under the pointer for a press, else the application's shown window.
             let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
