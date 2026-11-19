@@ -1112,8 +1112,12 @@ final class VirtualScreen {
     var id: CGDirectDisplayID? { display?.displayID }
     var frame: CGRect? { id.map(CGDisplayBounds) }
 
+    /// Whether this macOS has the (private, weakly imported) classes at all.
+    static var available: Bool { NSClassFromString("CGVirtualDisplay") != nil && NSClassFromString("CGVirtualDisplayDescriptor") != nil }
+
     /// Makes it; `done` gets its frame (global points) once it is among the screens, or nil.
     func make(done: @escaping (CGRect?) -> Void) {
+        guard VirtualScreen.available else { return done(nil) }
         let descriptor = CGVirtualDisplayDescriptor()
         descriptor.name = "Istesso trial (Dev)"
         descriptor.maxPixelsWide = UInt32(size.width * 2)
@@ -1178,6 +1182,7 @@ final class VirtualScreen {
 func runVirtualDisplayCheck(_ arguments: [String]) -> Never {
     let parts = (arguments.first ?? "1720x720@120").split(whereSeparator: { $0 == "x" || $0 == "@" }).compactMap { Double($0) }
     guard parts.count == 3 else { print("{\"vd\":\"usage: --vd-check WxH@HZ\"}"); exit(2) }
+    guard VirtualScreen.available else { print("{\"vd\":\"this macOS has no virtual display classes\"}"); exit(1) }
     let check = VirtualDisplayCheck(width: Int(parts[0]), height: Int(parts[1]), hertz: parts[2])
     let application = NSApplication.shared
     application.setActivationPolicy(.accessory)
@@ -1588,6 +1593,21 @@ func selfTest() -> Never {
     checkPanel(fitInto(CGRect(x: 10, y: 0, width: 5000, height: 400), visibleMain) == CGRect(x: 0, y: 25, width: 3440, height: 400), true, "back: too large is made as large as fits")
     checkPanel(onSomeDisplay(CGRect(x: 100, y: 100, width: 50, height: 50), displays: [mainDisplay]), true, "back: an original place still on a display is kept")
     checkPanel(!onSomeDisplay(CGRect(x: 4000, y: 100, width: 50, height: 50), displays: [mainDisplay]), true, "back: an original place on no display is not kept")
+    do {
+        // After a Command chord, nothing goes until the next lookup has landed.
+        let chord = Lookout()
+        chord.focusedLookup = { _ in shownWin }
+        chord.refreshFocused(1)
+        chord.queue.sync {}
+        let before = keysMayGo(appInFront: true, focused: chord.focused, shown: shownWin)
+        chord.invalidateFocused()
+        let during = keysMayGo(appInFront: true, focused: chord.focused, shown: shownWin)
+        chord.refreshFocused(1)
+        chord.queue.sync {}
+        let after = keysMayGo(appInFront: true, focused: chord.focused, shown: shownWin)
+        checkPanel(before && !during && after, true, "keys: stopped after a Command chord until the key window is known again")
+    }
+    checkPanel(!keysMayGo(appInFront: true, focused: shownWin, shown: shownWin, shownIsFront: false), true, "keys: a window at the same place in front of the shown one does not pass")
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -1634,6 +1654,9 @@ final class Lookout {
     /// The place of the application's focused window (the one keys go to), as last looked up.
     private var focusedCache: CGRect?
     var focusedLookup: (pid_t) -> CGRect? = axFocusedWindowBounds
+    /// Not known any more (a Command chord may have opened or switched a window): no key goes
+    /// until the next lookup has landed.
+    func invalidateFocused() { lock.lock(); focusedCache = nil; lock.unlock() }
     var focused: CGRect? { lock.lock(); defer { lock.unlock() }; return focusedCache }
     /// Looks up the focused window again, away from the input; `then` runs on the main queue.
     func refreshFocused(_ pid: pid_t, then: (() -> Void)? = nil) {
@@ -1664,8 +1687,8 @@ func axFocusedWindowBounds(_ pid: pid_t) -> CGRect? {
 /// Whether keys may go to the application now: it is in front, and the window keys go to (its
 /// focused window, by Accessibility) is the very window that is shown, by its place and size in
 /// the window list. Otherwise typed text would land in a window nobody sees.
-func keysMayGo(appInFront: Bool, focused: CGRect?, shown: CGRect) -> Bool {
-    guard appInFront, let focused, shown != .zero else { return false }
+func keysMayGo(appInFront: Bool, focused: CGRect?, shown: CGRect, shownIsFront: Bool = true) -> Bool {
+    guard appInFront, shownIsFront, let focused, shown != .zero else { return false }
     return abs(focused.minX - shown.minX) < 2 && abs(focused.minY - shown.minY) < 2
         && abs(focused.width - shown.width) < 2 && abs(focused.height - shown.height) < 2
 }
@@ -1756,6 +1779,8 @@ final class Injector {
     var onResize: (Int, Int) -> Void = { _, _ in }
     /// A key was not taken because the application was not in front (said once until one is).
     var onKeysDropped: (Bool) -> Void = { _ in }
+    /// A key went down with Command held (a chord that may change windows).
+    var onCommandChord: () -> Void = {}
     private var keysDroppedSaid = false
     /// What the injector looks at and where it posts; replaced by stand-ins in --self-test, so that
     /// the tests go through the same path as the input does.
@@ -1936,6 +1961,7 @@ final class Injector {
         if modifierFlag(code) != nil { event.type = .flagsChanged }
         if pressed { log("{\"kind\":\"key_in\",\"t_ns\":\(nowNs())}") }
         postProcess(event, pid)
+        if pressed && modifierFlag(code) == nil && flags.contains(.maskCommand) { onCommandChord() }
         count("key")
     }
 
@@ -2284,9 +2310,19 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 }
                 self.injector.keysAllowed = { [weak self] in
                     guard let self else { return false }
-                    return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.windowBounds)
+                    // The shown window must also be the application's front window in the window list (a
+                    // window opened at exactly the same place does not pass for it).
+                    let pid = self.app?.processIdentifier
+                    let front = windowList().first { $0.pid == pid && $0.layer == 0 && $0.onScreen }?.id
+                    return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.windowBounds,
+                                     shownIsFront: front != nil && front == self.windowId)
                 }
                 self.injector.onFocus = { [weak self] in self?.raiseShownWindow() }
+                self.injector.onCommandChord = { [weak self] in
+                    guard let self, let pid = self.app?.processIdentifier else { return }
+                    self.lookout.invalidateFocused()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.lookout.refreshFocused(pid) }
+                }
                 self.injector.onResize = { [weak self] w, h in self?.resizeAsked(width: w, height: h) }
                 self.injector.onKeysDropped = { dropped in say(dropped ? "keys-dropped" : "keys-taken") }
                 self.injector.windowAt = { [weak self] point in self?.appWindow(at: point) }
@@ -3010,17 +3046,22 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.moveShownWindow(to: frame)
             }
         } else if let screen = virtualScreen, !viewed, now - lastViewed > settings.virtualKeep {
-            moveWindowsBack()
-            screen.remove()
+            // The windows first (the moves are queued for Accessibility), the display after them.
             virtualScreen = nil
-            say("virtual", [("state", "removed")])
+            moveWindowsBack(on: screen)
+            lookout.queue.async {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    screen.remove()
+                    say("virtual", [("state", "removed")])
+                }
+            }
         }
     }
 
     /// The shown window onto the virtual display (its top left, as large as fits); its place
     /// before is kept.
     func moveShownWindow(to frame: CGRect) {
-        guard let pid = app?.processIdentifier, let id = windowId else { return }
+        guard let pid = app?.processIdentifier, let id = windowId, windowBounds != .zero else { return }
         let before = windowBounds
         if movedFrom[id] == nil { movedFrom[id] = before }
         let target = fitInto(CGRect(x: frame.minX, y: frame.minY + 30, width: before.width, height: before.height),
@@ -3030,13 +3071,14 @@ final class DailyHost: NSObject, NSApplicationDelegate {
 
     /// Every moved window back to where it was; a place that is on no display now is fitted into
     /// the visible area of the main display.
-    func moveWindowsBack() {
+    func moveWindowsBack(on screen: VirtualScreen? = nil) {
         guard let pid = app?.processIdentifier else { return }
+        let screen = screen ?? virtualScreen
         let current = windowList(onScreenOnly: false).filter { $0.pid == pid }
         var count: UInt32 = 0
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
         CGGetActiveDisplayList(16, &ids, &count)
-        let virtualId = virtualScreen?.id
+        let virtualId = screen?.id
         let displays = ids.prefix(Int(count)).filter { $0 != virtualId }.map(CGDisplayBounds)
         let main = NSScreen.screens.first
         let mainTop = main?.frame.maxY ?? 0
