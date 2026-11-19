@@ -37,6 +37,9 @@
 //                              program started through `open`, which does not say it
 //   ISTESSO_PRETEND_RESIZE=WxH for checks with ISTESSO_DAILY_RECONNECT: four seconds after the start,
 //                              as if the person had resized the window by hand to WxH points
+//   ISTESSO_TITLE_COUNTS=1     with ISTESSO_DAILY_RECONNECT: the title always shows the counts of the
+//                              connections cut (for checks); otherwise only the name, and a line while
+//                              a connection is being made again
 //   ISTESSO_TITLE_FILE=PATH    the signal USR1 sets the window's title to the first line of PATH
 //   ISTESSO_CLIPBOARD=1        the everyday trial's copy and paste of text (ADR 0022): Command-C,
 //                              Command-X and Command-V in the window copy from, cut from and paste
@@ -799,6 +802,8 @@ static void picture_was_cut(guint64 t) {
     });
 }
 
+static void show_counts(void);
+
 // The first picture after a cut is on the screen.
 static void picture_is_back(void) {
     BOOL first = waiting_for_first_picture;
@@ -811,6 +816,7 @@ static void picture_is_back(void) {
     BOOL was_marked = picture_stale;
     picture_stale = NO;
     set_dim(NO);
+    show_counts();
     log_held_back(was_marked);
     if (was_marked && [cursor_view respondsToSelector:@selector(fallInLine)]) {
         [cursor_view fallInLine];
@@ -880,6 +886,10 @@ static long input_cuts = -1;
 static BOOL input_reconnecting = NO;
 static NSWindow *counted_window = nil;
 static NSString *counted_title = nil;
+// The everyday trial's windows show their application's name only, and a short line while
+// something happens (a connection is being made again); with ISTESSO_TITLE_COUNTS=1 (for checks)
+// the counts of the connections cut, always.
+static BOOL title_counts = NO;
 // A short line about copy and paste, shown in the title for two seconds (ADR 0022).
 static NSString *clipboard_shown = nil;
 
@@ -895,7 +905,18 @@ static void show_counts(void) {
     if (counted_window == nil) {
         return;
     }
-    if (daily_reconnect) {
+    if (daily_reconnect && !title_counts) {
+        NSString *note = clipboard_shown ? [@" — " stringByAppendingString:clipboard_shown] : @"";
+        NSString *happening = nil;
+        if (picture_stale) {
+            happening = @"映像をつなぎ直しています…";
+        } else if (input_reconnecting) {
+            happening = input_cuts == 0 ? @"入力をつないでいます…" : @"入力をつなぎ直しています…";
+        }
+        counted_window.title = happening != nil
+            ? [NSString stringWithFormat:@"%@ — %@%@", counted_title, happening, note]
+            : [counted_title stringByAppendingString:note];
+    } else if (daily_reconnect) {
         NSString *input = input_cuts < 0 ? @"入力は未集計" : [NSString stringWithFormat:@"入力 %ld 回", input_cuts];
         if (input_reconnecting) {
             input = [input stringByAppendingString:input_cuts == 0 ? @"（入力をつないでいます…）" : @"（入力をつなぎ直しています…）"];
@@ -1404,9 +1425,10 @@ static void *channel_thread(void *unused) {
             log_reconnections("cut");
             guint64 t = cut_at;
             dispatch_async(dispatch_get_main_queue(), ^{
-                show_counts();
                 update_text_input_field((IstessoMediaTextInput){0});
                 picture_was_cut(t);
+                // After the picture is marked as being made again: the title says so.
+                show_counts();
             });
         } else if (got == 4) {
             IstessoMediaWatchState state;
@@ -2979,6 +3001,8 @@ int main(int argc, char *argv[]) {
             });
             dispatch_resume(front);
         }
+        const char *counts = getenv("ISTESSO_TITLE_COUNTS");
+        title_counts = counts != NULL && strcmp(counts, "1") == 0;
         const char *title_file = getenv("ISTESSO_TITLE_FILE");
         if (title_file != NULL) {
             // The everyday trial: the title says when a window of the application is calling.

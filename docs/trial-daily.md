@@ -324,11 +324,14 @@ scripts/daily.sh note "気づいたこと"
 - コピーと貼り付けの直し（窓の口を、道と NUL の長さで作る。中継が NUL のあとを捨てる）と、数だけの記録は、17:54 の setup にもう入っている。
 - 持ち主が手で開く近道（Safari、Notes、Finder、Preview、Dia）を作れる（ADR 0024）。
 - ポートの選び（上の A か B）。
+- 窓の題は、アプリの名前だけ（2026-11-19、持ち主の決め）。つなぎ直しているあいだだけ「映像をつなぎ直しています…」「入力をつなぎ直しています…」が付き、コピーと貼り付けの短い知らせ（2 秒）と、見張りの知らせ（呼んでいる、など）は、これまでどおり。切れた回数をいつも出すのは、確かめのときの `DAILY_TITLE_COUNTS=1`。
+- Spotlight と Alfred に近道が出る：`shortcuts install` は、近道を、できた時から `.app` の名前で（Spotlight が見ない隠しフォルダーの中で）作ってから置き、置いた場所で Spotlight に読ませる（`mdimport`）。`.staged` の名前のフォルダーから名前を変えただけのものは、Spotlight の中でアプリにならず、Alfred にも出なかった。`bundle --finish` も、ビューアーの包みを Spotlight に読ませる。LaunchServices の登録は、近道ごとに 1 つ（最後の場所）だった（読んで確かめた）。
+- 帯に戻す切り替え：`DAILY_PREEDIT=strip`（変換中の文字を窓の帯に）、`DAILY_OUTSIDE_FIELD=ime`（欄の外のキーも、この Mac の入力方式を通す、前の形）。`ISTESSO_PREEDIT=strip`、`ISTESSO_OUTSIDE_FIELD=ime` を前に付けても同じ。`open` で起動する窓は、シェルの環境を受け継がないので、`daily.sh` が渡す（`scripts/daily.sh viewer-switches` で、渡すものが見える）。
 - 持ち主の順：
   1. ポートを選ぶ：A ならホストで上の 1 行。B なら Air で `scripts/daily.sh ports low`。
   2. Air で `scripts/daily.sh stop` → `scripts/daily.sh setup` → ビューアーの窓が 1 つも開いていないことを確かめて `scripts/daily.sh bundle --finish`。
   3. Dia の近道を使うなら：`~/.config/istesso/daily-shortcuts-owner-apps.txt` を自分で作り、`Dia` と 1 行書く。
-  4. 計測が走っていないときに `scripts/daily.sh shortcuts build` → `scripts/daily.sh shortcuts install`（登録で、Air の LAN のつなぎが一時的に切れる）。最初に近道から開いたとき、「ローカルネットワーク」の問いが出たら `Istesso Dev Open` に許す。
+  4. 計測が走っていないときに `scripts/daily.sh shortcuts build` → `scripts/daily.sh shortcuts install`（入れ直しで、Spotlight と Alfred にも出る。Alfred は `reload` と打つ）（登録で、Air の LAN のつなぎが一時的に切れる）。最初に近道から開いたとき、「ローカルネットワーク」の問いが出たら `Istesso Dev Open` に許す。
   5. いつもどおり `open`（または近道）で開く。
   6. Mac Studio の Dia を、試用版の起動口から開くとき（持ち主だけ）：`DAILY_OWNER=1 DAILY_CLIPBOARD=1 scripts/daily.sh open dia --host mac`。`daily.sh` は、言葉と、`DAILY_OWNER`、`DAILY_CLIPBOARD`、`DAILY_OPEN_HANDLER`（持ち主の近道が付けるもの）を、そのまま `daily-mac.sh` に渡す（付けていないものは付けない。鍵の記述子は渡さない。`scripts/daily_mac_pass_test.py` で確かめる）。`daily-mac.sh` の側の門は、M4 の流れ（`m4-daily-host`）が入れる。
 

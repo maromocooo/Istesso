@@ -451,5 +451,55 @@ class ShortcutsTest(unittest.TestCase):
                                  0 if path == inside else 1)
 
 
+class InstallsApplicationsFromTheFirstMoment(unittest.TestCase):
+    """install() places each shortcut by renaming a copy that has its .app name from the start,
+    in a hidden folder, registers it at its final place and asks Spotlight to import it there.
+    Nothing is registered or imported for real here: the bundle tool and Spotlight are recorded."""
+
+    def test_copies_are_applications_and_spotlight_is_asked_at_the_final_place(self):
+        sc.check_measurement()
+        with tempfile.TemporaryDirectory(dir=sc.STAGE) as tmp:
+            stage, dest = Path(tmp) / "stage", Path(tmp) / "dest"
+            stage.mkdir()
+            dest.mkdir()
+            rows = [("ubuntu", "editor", "Text Editor (Ubuntu)"), ("mac", "TextEdit", "TextEdit (Studio)")]
+            for title in [title for _, _, title in rows] + [sc.HANDLER]:
+                contents = stage / (title + ".staged") / "Contents"
+                contents.mkdir(parents=True)
+                sc.write_plist(contents / "Info.plist", dict(CFBundleIdentifier=sc.bundle_id(title)))
+            copied, ran, imported = [], [], []
+            real_copytree = shutil.copytree
+
+            def copytree(source, target, *args, **kwargs):
+                copied.append(Path(target))
+                return real_copytree(source, target, *args, **kwargs)
+
+            def convert_icon(tool, png, work, machine, label):
+                # The bundle tool is not run here (subprocess.run only records); stand in for its ICNS.
+                icon = work / "Shortcut.icns"
+                icon.write_bytes(b"icns")
+                return icon
+
+            with patch.object(shutil, "copytree", copytree), \
+                 patch.object(sc, "LABEL_FILE", Path(tmp) / "no-labels"), \
+                 patch.object(sc, "convert_icon", convert_icon), \
+                 patch.object(subprocess, "run", lambda argv, **_: (ran.append([str(a) for a in argv]),
+                                                                   subprocess.CompletedProcess(argv, 0, "free\n", ""))[1]), \
+                 patch.object(sc, "fetch_icon", side_effect=OSError), \
+                 patch.object(sc, "spotlight_import", imported.append):
+                sc.install(stage, dest, rows, "")
+            titles = [title for _, _, title in rows] + [sc.HANDLER]
+            # copytree calls itself for the folders inside; the copies themselves are in the hidden folder.
+            top = [c for c in copied if c.parent.name.startswith(".pending-")]
+            self.assertEqual(sorted(c.name for c in top), sorted(title + ".app" for title in [t for _, _, t in rows] + [sc.HANDLER]))
+            self.assertFalse(any(c.suffix == ".staged" for c in copied))
+            for title in titles:
+                bundle = dest / (title + ".app")
+                self.assertTrue((bundle / "Contents/Info.plist").exists())
+                self.assertIn([str(stage / "bundle-tool"), "register", str(bundle)], ran)
+            self.assertEqual(sorted(imported), sorted(dest / (title + ".app") for title in titles))
+            self.assertEqual([p.name for p in dest.iterdir() if p.name.startswith(".pending-")], [])
+
+
 if __name__ == "__main__":
     unittest.main()
