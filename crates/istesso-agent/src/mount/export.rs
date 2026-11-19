@@ -21,6 +21,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use istesso_link::mount::{
     valid_name, Answer, Attr, Entry, Failure, Kind, Question, MAX_ENTRIES, MAX_READ, ROOT_ID,
@@ -221,11 +222,13 @@ fn open_dir_for_rules(
     Ok(Some(cur))
 }
 
-/// A rules file below `root`: `None` when it is not there, or is a link or
-/// not a regular file (Git does not follow a linked `.gitignore`); the
-/// contents when it can be read whole; unreadable otherwise (no permission,
-/// larger than [`MAX_RULES_FILE`], an error while reading). The caller hides
-/// what unreadable rules would have decided.
+/// A rules file below `root`: `None` when it is not there; the contents when
+/// it is a regular file that can be read whole; unreadable otherwise (a link,
+/// anything that is not a regular file, no permission, larger than
+/// [`MAX_RULES_FILE`], an error while reading). The caller hides what
+/// unreadable rules would have decided. Git does not read a linked
+/// `.gitignore` at all and shows what it would have hidden; in doubt, this
+/// hides (the owner's rule).
 fn read_rules(
     root: &OwnedFd,
     dev: u64,
@@ -241,7 +244,7 @@ fn read_rules(
         Err(_) => return Err(Unreadable),
     };
     if !is_type(&seen, libc::S_IFREG) {
-        return Ok(None);
+        return Err(Unreadable);
     }
     if dev_of(&seen) != dev || seen.st_size as u64 > MAX_RULES_FILE as u64 {
         return Err(Unreadable);
@@ -368,6 +371,17 @@ impl Export {
         let mut listed = read_names(dir).map_err(io_failure)?;
         listed.sort();
         let listed = Arc::new(listed);
+        // A folder changed within the last second may change again without its
+        // times moving (file systems whose clock ticks coarsely): such a listing
+        // is used once and not kept.
+        let changed = std::time::UNIX_EPOCH
+            + Duration::new(now.2.max(0) as u64, now.3.clamp(0, 999_999_999) as u32);
+        if std::time::SystemTime::now()
+            .duration_since(changed)
+            .map_or(true, |age| age < Duration::from_secs(1))
+        {
+            return Ok(listed);
+        }
         if self.listings.len() >= MAX_LISTINGS {
             self.listings.clear();
         }

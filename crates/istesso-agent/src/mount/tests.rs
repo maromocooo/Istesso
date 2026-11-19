@@ -948,7 +948,7 @@ fn a_device_that_does_not_read_its_answers_is_let_go() {
             break;
         }
     }
-    let bound = super::host::SEND_WITHIN + Duration::from_secs(5);
+    let bound = super::host::send_within(MAX_READ as usize) + Duration::from_secs(5);
     while !pair
         .log()
         .iter()
@@ -962,4 +962,79 @@ fn a_device_that_does_not_read_its_answers_is_let_go() {
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(channel);
+}
+
+#[test]
+fn an_answer_may_take_longer_the_larger_it_is() {
+    use super::host::{send_within, SEND_PER_MIB, SEND_WITHIN};
+    assert_eq!(send_within(0), SEND_WITHIN);
+    assert_eq!(send_within(1 << 20), SEND_WITHIN + SEND_PER_MIB);
+    assert!(send_within(MAX_READ as usize) >= Duration::from_secs(13));
+}
+
+/// A linked .gitignore (or .git/info/exclude) is not read, as Git does not;
+/// unlike Git, what it would have hidden is hidden (in doubt, hide).
+#[test]
+fn a_linked_rules_file_hides_what_it_would_have_decided() {
+    let base = TempDir::new("mount-linked-rules");
+    let root = base.path().join("project");
+    fs::create_dir_all(root.join("linked")).unwrap();
+    fs::create_dir_all(root.join("plain")).unwrap();
+    fs::write(base.path().join("rules"), b".env\n").unwrap();
+    symlink(base.path().join("rules"), root.join("linked/.gitignore")).unwrap();
+    fs::write(root.join("linked/.env"), b"TOKEN=not-a-real-one\n").unwrap();
+    fs::write(root.join("linked/notes.txt"), b"notes").unwrap();
+    fs::write(root.join("plain/notes.txt"), b"notes").unwrap();
+    let mut export = Export::open(&root, false, None).unwrap();
+    for hidden in ["linked/.env", "linked/notes.txt", "linked/.gitignore"] {
+        assert_eq!(
+            lookup_path(&mut export, hidden),
+            Err(Failure::NoEnt),
+            "{hidden}"
+        );
+    }
+    assert!(lookup_path(&mut export, "linked").is_ok());
+    assert!(lookup_path(&mut export, "plain/notes.txt").is_ok());
+
+    // A linked .git/info/exclude hides every entry.
+    let other = base.path().join("other");
+    fs::create_dir_all(other.join(".git/info")).unwrap();
+    symlink(base.path().join("rules"), other.join(".git/info/exclude")).unwrap();
+    fs::write(other.join("README.md"), b"read me").unwrap();
+    let mut export = Export::open(&other, false, None).unwrap();
+    assert_eq!(lookup_path(&mut export, "README.md"), Err(Failure::NoEnt));
+}
+
+/// A frame larger than any question ends the conversation before it is
+/// queued or read as JSON.
+#[test]
+fn a_frame_larger_than_a_question_ends_the_conversation() {
+    let base = TempDir::new("mount-large-frame");
+    let (root, _) = project(base.path());
+    let pair = MountPair::new(
+        "mount-large-frame",
+        Setup {
+            folder: &root,
+            allow_device: true,
+            show_ignored: false,
+        },
+    );
+    let mut client = pair.connect();
+    assert!(matches!(
+        client.open_mount("proj").unwrap(),
+        MountAnswer::Open { .. }
+    ));
+    let mut channel = client.into_channel();
+    channel
+        .send(&vec![b' '; istesso_link::mount::MAX_QUESTION + 1])
+        .unwrap();
+    let began = Instant::now();
+    while !pair
+        .log()
+        .iter()
+        .any(|line| line.contains("not a question"))
+    {
+        assert!(began.elapsed() < SOON, "{:?}", pair.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

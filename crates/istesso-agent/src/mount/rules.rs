@@ -20,12 +20,12 @@
 //! does not let it out. `.git` is hidden in any spelling. The caller asks
 //! only about names as they are stored on disk ([`super::export`]).
 //!
-//! A rules file that is not there means no rules (and so does a link or a
-//! file that is not a regular one, which Git does not read either). A rules
-//! file that is there but cannot be read whole (no permission, too large,
-//! an error while reading) hides everything it would have decided: the
-//! entries below its folder, or, for `.git/info/exclude` and the global
-//! file, every entry.
+//! A rules file that is not there means no rules. One that is there but
+//! cannot be read whole (a link, anything but a regular file, no permission,
+//! too large, an error while reading) hides everything it would have
+//! decided: the entries below its folder, or, for `.git/info/exclude` and
+//! the global file, every entry. (Git ignores a linked `.gitignore` and so
+//! shows what it would have hidden; in doubt, this hides.)
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
