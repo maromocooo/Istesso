@@ -21,8 +21,11 @@
 #   scripts/daily-mac.sh open desktop    the whole display, for installing (the owner's only; clicks
 #                                        through the session, keys to the application in front)
 #   scripts/daily-mac.sh list           what is open
-#   scripts/daily-mac.sh close APP      ask APP to quit (as its Quit menu does: unsaved work asks and
-#                                        stays), then stop its host side and its window here
+#   scripts/daily-mac.sh close APP      a new document of the trial's (TextEdit): close only its
+#                                        window, and delete the document once the window is gone;
+#                                        any other APP (Dia, ...): ask it to quit (as its Quit menu
+#                                        does: unsaved work asks and stays); to keep it open, use stop.
+#                                        Then stop its host side and its window here
 #   scripts/daily-mac.sh hide APP       close its window here only; the host stops its picture and the
 #                                        application goes on (the window's red button does the same)
 #   scripts/daily-mac.sh stop           stop everything of this trial on both Macs; the applications
@@ -46,7 +49,10 @@
 #   DAILY_VIEWER         a viewer program to start from the shell instead (no bundle)
 #   DAILY_NO_WINDOW=1    for checks: the viewer decodes but shows no window
 #   DAILY_FRAME_LOGS=1   frame logs on both sides
-#   DAILY_CLIPBOARD=1    copy and paste of text with the host (ADR 0022; the agent with --clipboard)
+#   DAILY_CLIPBOARD=0    no copy and paste of text (on by default for an application's windows;
+#                        ADR 0022); streams' own test opens pass it unless they test copy and paste
+#   DAILY_STREAM=NAME    a stream's test open: its new documents are named stream-NAME-... in
+#                        documents/streams/ (the owner's are owner-... in documents/owner/)
 #   DAILY_INLINE=1       composing text inside the host's application through the trial input source
 #                        Istesso Dev Input (ADR 0023; the host with --inline). Off: the viewer's strip
 #   DAILY_VIRTUAL_SIZE   the virtual display's size in points instead of this Mac's screen (WxH)
@@ -69,7 +75,7 @@ host_dir=${DAILY_MAC_DIR:-'~/.cache/istesso-daily-mac'}
 [[ "${DAILY_HOST_EXTRA:-}" =~ ^[A-Za-z0-9\ ._/-]*$ ]] || { echo "error: DAILY_HOST_EXTRA holds only words of letters, digits, . _ / -"; exit 2; }
 [ -z "${DAILY_CLICK_FORM:-}" ] || [[ "$DAILY_CLICK_FORM" =~ ^[1-4]$ ]] || { echo "error: DAILY_CLICK_FORM is 1, 2, 3 or 4"; exit 2; }
 state=${DAILY_MAC_STATE:-"$HOME/Library/Caches/istesso-daily-mac"}
-istesso="$repo/target/release/istesso"
+istesso=${DAILY_ISTESSO_BIN:-"$repo/target/release/istesso"}
 bundle_name="Istesso Dev Daily Host.app"
 viewer_bundle=${DAILY_VIEWER_BUNDLE:-"$HOME/Applications/Istesso Dev/Istesso Dev Daily Viewer.app"}
 mkdir -p "$state"
@@ -312,11 +318,13 @@ do_open() {
         here_size=${DAILY_VIRTUAL_SIZE:-$(osascript -l JavaScript -e 'ObjC.import("AppKit"); var f=$.NSScreen.mainScreen.frame; Math.round(f.size.width)+"x"+Math.round(f.size.height)' 2>/dev/null)}
         [[ "$here_size" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] && virtual_arg="--virtual-display $here_size@120"
     fi
-    # Copy and paste of text (ADR 0022, trial only): only with DAILY_CLIPBOARD=1 for now.
-    local clipboard_agent="" clipboard_host=""
-    # The application form only: not the whole display, not AURA, not a generated picture.
-    if [ "${DAILY_CLIPBOARD:-}" = 1 ] && [ "$for_whom" != aura ] && [ -z "$display" ] && [[ "${DAILY_HOST_EXTRA:-}" != *--generated* ]]; then
-        clipboard_agent="--clipboard"; clipboard_host="--clipboard"
+    # Copy and paste of text (ADR 0022, trial only): on by default for the application form (the
+    # owner's decision, 2026-11-19), off with DAILY_CLIPBOARD=0; never for the whole display,
+    # AURA or a generated picture. Streams' own test opens pass DAILY_CLIPBOARD=0 unless they
+    # test copy and paste.
+    local clipboard_agent="" clipboard_host="" clipboard_on=0
+    if [ "${DAILY_CLIPBOARD:-1}" != 0 ] && [ "$for_whom" != aura ] && [ -z "$display" ] && [[ "${DAILY_HOST_EXTRA:-}" != *--generated* ]]; then
+        clipboard_agent="--clipboard"; clipboard_host="--clipboard"; clipboard_on=1
     fi
     # Composing text inline (ADR 0023, trial only): only with DAILY_INLINE=1, the application form only.
     local inline_host=""
@@ -330,7 +338,14 @@ do_open() {
     [ -z "$size_given" ] && [ "$for_whom" != aura ] && size_arg=""
     # A new, empty document of the trial's own (EXT: its kind, e.g. txt), so that the application
     # opens with it and not with a panel or one of the owner's documents.
-    local document_arg=""
+    # Who opens it is in the document's name and folder, so that the owner's test documents and
+    # the streams' never mix: the owner's in documents/owner/, a stream's (DAILY_STREAM=<its
+    # name>) in documents/streams/.
+    local document_arg="" document_who="owner" document_dir="owner"
+    if [ -n "${DAILY_STREAM:-}" ]; then
+        [[ "$DAILY_STREAM" =~ ^[a-z0-9-]{1,32}$ ]] || { echo "error: DAILY_STREAM is a stream's short name (letters, digits, dashes)"; exit 2; }
+        document_who="stream-$DAILY_STREAM"; document_dir="streams"
+    fi
     if [ -n "$new_document" ]; then
         [[ "$new_document" =~ ^[a-z0-9]+$ ]] || { echo "error: --new-document takes a file kind such as txt"; exit 2; }
         document_arg=$new_document
@@ -384,12 +399,13 @@ else
     : > "\$run/host.log"; : > "\$run/host.err"; : > "\$run/host.number"
     document=""
     if [ -n "$document_arg" ]; then
-        mkdir -p "\$D/documents"
-        document=\$D/documents/\$NAME-\$(date +%Y%m%d-%H%M%S).$document_arg
+        mkdir -p "\$D/documents/$document_dir"
+        document=\$D/documents/$document_dir/$document_who-$(run_name "$app" | tr 'A-Z' 'a-z')-\$(date +%Y%m%d-%H%M%S).$document_arg
         : > "\$document"
         printf '%s\n' "\$document" > "\$run/document"
     fi
-    set -- "\$@" $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
+    # A new document never comes with the application's old windows (restored at its launch).
+    set -- "\$@" $target_args \${document:+--document "\$document" --no-restore} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
         $size_arg $virtual_arg $clipboard_host $inline_host --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
@@ -445,7 +461,7 @@ HOST
         echo "$name: for AURA on picture port $((base_pic + slot)), input port $((base_in + slot)) (4:2:0, $size, $fps a second)"
         return 0
     fi
-    echo "$app" > "$mine/app"; echo "$slot" > "$mine/slot"; echo "$size" > "$mine/size"; echo "$peer" > "$mine/peer"
+    echo "$app" > "$mine/app"; echo "$clipboard_on" > "$mine/clipboard"; echo "$slot" > "$mine/slot"; echo "$size" > "$mine/size"; echo "$peer" > "$mine/peer"
     open_here "$name"
     start_guard
 }
@@ -476,7 +492,7 @@ open_here() {
     # The viewer composes Japanese itself and sends committed text (ADR 0007) when the relay says
     # the host takes it; and connects again by itself after a cut.
     local clip_env=()
-    [ "${DAILY_CLIPBOARD:-}" = 1 ] && [ "$name" != display ] && clip_env=(ISTESSO_CLIPBOARD=1)
+    [ "$(cat "$mine/clipboard" 2>/dev/null)" = 1 ] && clip_env=(ISTESSO_CLIPBOARD=1)
     local settings=(${clip_env[@]+"${clip_env[@]}"} ISTESSO_DAILY_RECONNECT=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CHANNEL="$address:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1
         ISTESSO_COMMAND_KEY=super ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
     [ -n "${DAILY_NO_WINDOW:-}" ] && settings+=(ISTESSO_NO_WINDOW=1)
@@ -611,7 +627,7 @@ if [ -n "\$document" ] && still_runs "\$run/host.pid"; then
     sleep 0.5
     if [ -n "\$window" ] && ! "\$H" --windows "\$pid" | grep -q "^window \$window "; then
         case "\$document" in
-            "\$D"/documents/*-[0-9]*-[0-9]*.txt | "\$D"/documents/*-[0-9]*-[0-9]*.rtf) rm -f -- "\$document" && : > "\$run/document" && echo "host: \$NAME: the trial's document was closed, and then deleted" ;;
+            "\$D"/documents/owner/owner-*-[0-9]*-[0-9]*.txt | "\$D"/documents/owner/owner-*-[0-9]*-[0-9]*.rtf | "\$D"/documents/streams/stream-*-[0-9]*-[0-9]*.txt | "\$D"/documents/streams/stream-*-[0-9]*-[0-9]*.rtf) rm -f -- "\$document" && : > "\$run/document" && echo "host: \$NAME: the trial's document was closed, and then deleted" ;;
             *) echo "host: \$NAME: the document is not one of the trial's: kept" ;;
         esac
     else
