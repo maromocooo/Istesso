@@ -87,6 +87,21 @@ enum Command {
         /// control this machine. A prototype (ADR 0007, proposal)
         #[arg(long, value_name = "DEVICE")]
         allow_shell: Vec<String>,
+        /// Show this folder, read-only, to the devices named with
+        /// `--allow-mount`, under an id of your choice (a-z, 0-9 and -, up to
+        /// 32). Devices ask for the id, never for a path. Files Git ignores,
+        /// and `.git`, are not shown. Off unless given; may be given more than
+        /// once. A prototype (ADR 0007, proposal)
+        #[arg(long, value_name = "ID=FOLDER")]
+        mount_folder: Vec<String>,
+        /// Let this paired device (id or name) see the folders named with
+        /// `--mount-folder`. The device must also be allowed to control this
+        /// machine. May be given more than once
+        #[arg(long, value_name = "DEVICE")]
+        allow_mount: Vec<String>,
+        /// Also show what Git ignores, and `.git`, in the folder with this id
+        #[arg(long, value_name = "ID")]
+        mount_show_ignored: Vec<String>,
     },
     /// Open a shell on a paired device in this terminal, over Istesso's own
     /// encrypted channel. Any terminal application can run this instead of
@@ -547,6 +562,9 @@ fn run(cli: Cli) -> Result<(), String> {
             verbose,
             input_timings,
             allow_shell,
+            mount_folder,
+            allow_mount,
+            mount_show_ignored,
         } => run_agent(AgentOptions {
             bind,
             port,
@@ -559,6 +577,15 @@ fn run(cli: Cli) -> Result<(), String> {
             verbose,
             input_timings,
             shell_for: allow_shell,
+            #[cfg(unix)]
+            mount_global_rules: if mount_folder.is_empty() {
+                None
+            } else {
+                istesso_agent::mount::global_ignore_file()
+            },
+            mount_folders: mount_folder,
+            mount_for: allow_mount,
+            mount_show_ignored,
             ..AgentOptions::default()
         }),
         Command::Shell { .. } => Err("this machine cannot open shells on other devices".into()),
@@ -1417,6 +1444,13 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
     if shells > 0 {
         println!("Shells are open to {shells} paired device(s), as the user this agent runs as.");
+    }
+    if !options.mount_folders.is_empty() && !options.mount_for.is_empty() {
+        println!(
+            "{} folder(s) are shown read-only to {} paired device(s).",
+            options.mount_folders.len(),
+            options.mount_for.len()
+        );
     }
     let reachable: Vec<String> = addresses
         .iter()

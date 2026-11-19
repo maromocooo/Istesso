@@ -70,6 +70,18 @@ pub struct AgentOptions {
     /// The program to run as a shell instead of the user's login shell. For
     /// tests only, which must not run the login files of whoever runs them.
     pub shell_program: Option<std::path::PathBuf>,
+    /// Folders that paired devices may see, read-only, as `ID=FOLDER`
+    /// ([`crate::mount`]). Empty, the default: none.
+    pub mount_folders: Vec<String>,
+    /// The paired devices that may see them, by id or name. Empty, the
+    /// default: none may.
+    pub mount_for: Vec<String>,
+    /// The ids of folders that show what Git ignores, and `.git`, too.
+    pub mount_show_ignored: Vec<String>,
+    /// The user's global Git ignore file, applied to every shown folder.
+    /// `None`, the default, applies none; `istesso agent` passes the one Git
+    /// would use.
+    pub mount_global_rules: Option<std::path::PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -84,6 +96,10 @@ impl Default for AgentOptions {
             input_timings: None,
             shell_for: Vec::new(),
             shell_program: None,
+            mount_folders: Vec::new(),
+            mount_for: Vec::new(),
+            mount_show_ignored: Vec::new(),
+            mount_global_rules: None,
         }
     }
 }
@@ -117,6 +133,14 @@ struct Shared {
     /// Shells open now, by the id of the device they are open for.
     #[cfg(unix)]
     shells: Mutex<HashMap<String, usize>>,
+    /// Which folders are shown to which devices, and the global ignore file.
+    #[cfg(unix)]
+    mount_policy: crate::mount::MountPolicy,
+    #[cfg(unix)]
+    mount_global_rules: Option<std::path::PathBuf>,
+    /// Folders shown now, by the id of the device they are shown to.
+    #[cfg(unix)]
+    mounts: Mutex<HashMap<String, usize>>,
 }
 
 /// What is kept of a conversation that carries input, for ending it from
@@ -157,6 +181,25 @@ impl Agent {
         if !options.shell_for.is_empty() {
             return Err("this machine cannot open shells for other devices".into());
         }
+        #[cfg(unix)]
+        let mount_policy = if options.mount_folders.is_empty()
+            && options.mount_for.is_empty()
+            && options.mount_show_ignored.is_empty()
+        {
+            crate::mount::MountPolicy::default()
+        } else {
+            let peers = PeerStore::open(paths.peers()).map_err(|e| e.to_string())?;
+            crate::mount::MountPolicy::resolve(
+                &peers,
+                &options.mount_folders,
+                &options.mount_for,
+                &options.mount_show_ignored,
+            )?
+        };
+        #[cfg(not(unix))]
+        if !options.mount_folders.is_empty() || !options.mount_for.is_empty() {
+            return Err("this machine cannot show folders to other devices".into());
+        }
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -180,6 +223,12 @@ impl Agent {
                 },
                 #[cfg(unix)]
                 shells: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                mount_policy,
+                #[cfg(unix)]
+                mount_global_rules: options.mount_global_rules.clone(),
+                #[cfg(unix)]
+                mounts: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -413,6 +462,18 @@ impl Drop for ShellSlot<'_> {
     }
 }
 
+/// Whether the device may, at this moment, see shown folders here: the host
+/// named it, with the key it has now, and it is still paired and still
+/// allowed to control this host (read from the list on disk).
+#[cfg(unix)]
+fn may_see_folders(
+    paths: &Paths,
+    peer: &istesso_pair::Peer,
+    policy: &crate::mount::MountPolicy,
+) -> bool {
+    policy.names(peer) && may_still_control(paths, peer)
+}
+
 /// Whether the device is, at this moment, still paired and still allowed to
 /// control this host: read from the list on disk, not remembered from when
 /// the conversation began.
@@ -468,6 +529,10 @@ impl Shared {
         // it from then on, and nothing else.
         #[cfg(unix)]
         let mut shell: Option<(crate::remote_shell::host::Shell, ShellSlot<'_>)> = None;
+        // A folder that was opened on this conversation: the conversation carries
+        // its questions from then on, and nothing else.
+        #[cfg(unix)]
+        let mut shown: Option<(crate::mount::export::Export, ShellSlot<'_>, String)> = None;
         // The device asked to be answered when it says "still here".
         let mut answers_alive = false;
         let mut checked = Instant::now();
@@ -540,6 +605,17 @@ impl Shared {
                     }
                     Err(refused) => refused,
                 },
+                #[cfg(unix)]
+                Request::MountOpen(request) => match self.open_mount(&session, &request) {
+                    Ok((export, slot, root)) => {
+                        shown = Some((export, slot, request.folder.clone()));
+                        Response::MountOpen {
+                            root,
+                            max_read: istesso_link::mount::MAX_READ,
+                        }
+                    }
+                    Err(refused) => refused,
+                },
                 request if session.allows(Permission::View) => self.answer(&request, &mut asked),
                 _ => Response::error(ErrorCode::Forbidden, "this device may not look at the host"),
             };
@@ -547,7 +623,7 @@ impl Shared {
                 break;
             }
             #[cfg(unix)]
-            if shell.is_some() {
+            if shell.is_some() || shown.is_some() {
                 break;
             }
         }
@@ -563,6 +639,23 @@ impl Shared {
                 session.peer().name,
                 asked.join(", ")
             ));
+        }
+        #[cfg(unix)]
+        if let Some((export, _slot, folder)) = shown {
+            let peer = session.peer().clone();
+            let served = crate::mount::host::serve(export, session.into_channel(), || {
+                may_see_folders(&self.paths, &peer, &self.mount_policy)
+            });
+            // Counts and times only: never a path, a name or contents.
+            (self.log)(format!(
+                "stopped showing the folder {folder} to {} after {:.1} s: {}; {} questions, {} bytes read",
+                peer.name,
+                served.lasted.as_secs_f64(),
+                served.end,
+                served.questions,
+                served.bytes_read,
+            ));
+            return;
         }
         #[cfg(unix)]
         if let Some((shell, _slot)) = shell {
@@ -583,6 +676,90 @@ impl Shared {
                 served.frames_out,
                 served.resizes,
             ));
+        }
+    }
+
+    /// Opens the folder a device asked for, when it may see it, and counts
+    /// it. The refusal is the answer to send. A folder that was not named
+    /// and a device that was not named are refused alike, so that the answer
+    /// does not tell which folder ids exist.
+    #[cfg(unix)]
+    fn open_mount(
+        &self,
+        session: &Session,
+        request: &istesso_link::mount::MountRequest,
+    ) -> Result<
+        (
+            crate::mount::export::Export,
+            ShellSlot<'_>,
+            istesso_link::mount::Attr,
+        ),
+        Response,
+    > {
+        use crate::mount::{export::Export, MAX_ON_HOST, MAX_PER_DEVICE};
+        let peer = session.peer();
+        let folder = match self.mount_policy.folder(&request.folder) {
+            Some(folder) if self.mount_policy.names(peer) => folder,
+            _ => {
+                return Err(Response::error(
+                    ErrorCode::Forbidden,
+                    "this host does not show that folder to this device",
+                ))
+            }
+        };
+        if !may_still_control(&self.paths, peer) {
+            return Err(Response::error(
+                ErrorCode::Forbidden,
+                "this device may not control the host",
+            ));
+        }
+        let slot = {
+            let mut mounts = self.mounts.lock().unwrap_or_else(|e| e.into_inner());
+            let on_host: usize = mounts.values().sum();
+            let for_device = mounts.get(&peer.id).copied().unwrap_or(0);
+            if on_host >= MAX_ON_HOST || for_device >= MAX_PER_DEVICE {
+                return Err(Response::error(
+                    ErrorCode::Internal,
+                    "too many folders are shown on this host",
+                ));
+            }
+            *mounts.entry(peer.id.clone()).or_default() += 1;
+            // Counted like shells, in a count of its own.
+            ShellSlot {
+                shells: &self.mounts,
+                device: peer.id.clone(),
+            }
+        };
+        let opened = Export::open(
+            &folder.path,
+            folder.show_ignored,
+            self.mount_global_rules.as_deref(),
+        )
+        .and_then(|export| export.root_attr().map(|root| (export, root)));
+        match opened {
+            Ok((export, root)) => {
+                (self.log)(format!(
+                    "showing the folder {} to {}, read-only{}",
+                    folder.id,
+                    peer.name,
+                    if folder.show_ignored {
+                        ", with what Git ignores"
+                    } else {
+                        ""
+                    }
+                ));
+                Ok((export, slot, root))
+            }
+            Err(_) => {
+                (self.log)(format!(
+                    "could not open the folder {} for {}",
+                    folder.id, peer.name
+                ));
+                Err(Response::error(
+                    ErrorCode::Internal,
+                    "the host cannot open that folder",
+                ))
+            }
         }
     }
 
@@ -708,6 +885,10 @@ impl Shared {
             Request::ShellOpen(_) => Response::error(
                 ErrorCode::Unsupported,
                 "this machine cannot open shells for other devices",
+            ),
+            Request::MountOpen(_) => Response::error(
+                ErrorCode::Unsupported,
+                "this machine cannot show folders to other devices",
             ),
         }
     }

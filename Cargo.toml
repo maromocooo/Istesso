@@ -39,6 +39,10 @@ snow = { version = "0.10", default-features = false, features = ["use-curve25519
 if-addrs = "0.15"
 mdns-sd = { version = "0.21", default-features = false }
 unicode-width = "0.2"
+# Git's ignore rules for folders shown to other devices (istesso-agent, src/mount).
+# Kept below 0.4.31, whose releases (and those of globset from 0.4.20) need a
+# newer Rust than this workspace asks for.
+ignore = ">=0.4.23, <0.4.31"
 zeroize = "1"
 # Window and pixels for the test application (istesso-flash) only. X11 and Wayland are loaded at
 # run time, so building needs no system headers. No client-side decorations: inside the

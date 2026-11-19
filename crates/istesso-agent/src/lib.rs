@@ -10,9 +10,13 @@
 //!   [`paths`] says where files live.
 //! * [`remote_shell`] opens a shell on another machine over the same
 //!   channel, and answers a device that asks for one.
+//! * [`mount`] shows a folder of this machine to another, read-only, over
+//!   the same channel.
 
 pub mod cache;
 pub mod discovery;
+#[cfg(unix)]
+pub mod mount;
 pub mod passing;
 pub mod paths;
 pub mod relay;

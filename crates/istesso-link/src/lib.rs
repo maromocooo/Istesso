@@ -10,6 +10,7 @@
 //! * [`message`] defines what one device can ask of another.
 //! * [`client`] and [`server`] are the two ends of a conversation.
 //! * [`shell`] is what a conversation carries once it has become a shell.
+//! * [`mount`] is what it carries once it shows a folder, read-only.
 //!
 //! Addresses are never trusted. Whoever answers at an address has to pass the
 //! handshake, so a wrong or forged address (from discovery or from memory) can
@@ -21,11 +22,12 @@ pub mod channel;
 pub mod client;
 mod frame;
 pub mod message;
+pub mod mount;
 pub mod server;
 pub mod shell;
 
 pub use channel::{Channel, ChannelReader, ChannelWriter, LocalKeys};
-pub use client::{Client, InputAnswer, ShellAnswer};
+pub use client::{Client, InputAnswer, MountAnswer, ShellAnswer};
 pub use message::{ErrorCode, Request, Response, ShellRequest};
 pub use server::{HangUp, Session};
 

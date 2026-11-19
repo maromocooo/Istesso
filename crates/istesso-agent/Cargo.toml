@@ -21,3 +21,5 @@ mdns-sd.workspace = true
 # (src/remote_shell). Already in the tree through istesso-pair.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Git's ignore rules, for the folders shown to other devices (src/mount).
+ignore.workspace = true

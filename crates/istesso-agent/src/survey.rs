@@ -544,7 +544,8 @@ mod tests {
                         },
                         Request::InputOpen { .. }
                         | Request::Input { .. }
-                        | Request::ShellOpen(_) => continue,
+                        | Request::ShellOpen(_)
+                        | Request::MountOpen(_) => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;

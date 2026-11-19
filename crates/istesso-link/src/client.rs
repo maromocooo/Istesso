@@ -32,6 +32,20 @@ pub enum ShellAnswer {
     Refused { code: ErrorCode, message: String },
 }
 
+/// What the other device said to a request to see a folder
+/// ([`Client::open_mount`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountAnswer {
+    /// The folder is open. The conversation carries the questions and
+    /// answers of [`crate::mount`] from now on: [`Client::into_channel`].
+    Open {
+        root: crate::mount::Attr,
+        max_read: u32,
+    },
+    /// It is not, and this is why.
+    Refused { code: ErrorCode, message: String },
+}
+
 /// An open conversation with one paired device.
 pub struct Client {
     channel: Channel<TcpStream>,
@@ -212,8 +226,25 @@ impl Client {
         }
     }
 
+    /// Asks the other device to show one of its folders, read-only, by the
+    /// id its owner gave it. After [`MountAnswer::Open`] take the channel out
+    /// with [`Client::into_channel`].
+    pub fn open_mount(&mut self, folder: &str) -> Result<MountAnswer> {
+        let request = Request::MountOpen(crate::mount::MountRequest {
+            folder: folder.to_string(),
+        });
+        let bytes = serde_json::to_vec(&request).map_err(|_| Error::Malformed)?;
+        self.channel.send(&bytes)?;
+        let answer = self.channel.recv()?;
+        match serde_json::from_slice(&answer).map_err(|_| Error::Malformed)? {
+            Response::MountOpen { root, max_read } => Ok(MountAnswer::Open { root, max_read }),
+            Response::Error { code, message } => Ok(MountAnswer::Refused { code, message }),
+            _ => Err(Error::Malformed),
+        }
+    }
+
     /// The channel underneath, for a conversation that has become something
-    /// other than requests and answers (a shell).
+    /// other than requests and answers (a shell, a folder).
     pub fn into_channel(self) -> Channel<TcpStream> {
         self.channel
     }
