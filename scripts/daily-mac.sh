@@ -99,6 +99,8 @@ run_name() { printf '%s' "$(basename "$1" .app)" | tr -c 'A-Za-z0-9.-' '-'; }
 host_functions() {
     cat <<'HOST'
 set -u
+# DIR arrives as written, ~/name (quoted, so that no shell expands it on the way).
+case "$DIR" in "~/"*) ;; *) echo "fail the trial's folder on the host is not a ~/ name"; exit 1 ;; esac
 D="$HOME/${DIR#\~/}"
 mkdir -p "$D/run"
 write_down() { echo "$2 $(ps -o lstart= -p "$2" 2>/dev/null)" > "$1"; }
@@ -131,7 +133,7 @@ count_said() { said "$1" | grep -c "\"istesso\":\"$2\""; }
 HOST
 }
 on_host() { # COMMANDS on standard input
-    { host_functions; cat; } | ssh -o BatchMode=yes -o ConnectTimeout=8 "$host_name" "DIR=$host_dir bash -s"
+    { host_functions; cat; } | ssh -o BatchMode=yes -o ConnectTimeout=8 "$host_name" "DIR='$host_dir' bash -s"
 }
 
 # ---- Setting up ----
