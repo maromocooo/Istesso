@@ -416,7 +416,7 @@ pub enum InputMode {
 /// (`linux/input-event-codes.h`), whatever the sender runs on: a key is its
 /// place on the keyboard, not the letter printed on it, and the device that
 /// runs the application decides what the key means there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputEvent {
     /// A key went down or came up.
@@ -429,6 +429,26 @@ pub enum InputEvent {
     /// The wheel was turned or two fingers moved: how far the content
     /// should move, in pixels, to the right and down.
     Scroll { dx: i32, dy: i32 },
+    /// Text that the sender's own input method has committed (trial only,
+    /// docs/adr/0007-control-channel.md, "確定した文字"): for the client that
+    /// has the keyboard. Never logged. See [`text_is_acceptable`] for the
+    /// limits; a receiver drops a piece that is not within them.
+    Text { text: String },
+}
+
+/// The most characters of one piece of committed text ([`InputEvent::Text`]).
+pub const TEXT_MOST_CHARS: usize = 256;
+/// The most bytes (UTF-8) of one piece of committed text.
+pub const TEXT_MOST_BYTES: usize = 1024;
+
+/// Whether a piece of committed text is within the limits: not empty, at
+/// most [`TEXT_MOST_CHARS`] characters and [`TEXT_MOST_BYTES`] bytes, and no
+/// control characters (newline and tab go as keys).
+pub fn text_is_acceptable(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= TEXT_MOST_BYTES
+        && text.chars().count() <= TEXT_MOST_CHARS
+        && !text.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -457,6 +477,24 @@ mod tests {
             assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), event);
         }
         assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
+    }
+
+    #[test]
+    fn committed_text_is_a_small_tagged_object_within_limits() {
+        use super::{text_is_acceptable, InputEvent};
+        let text = InputEvent::Text {
+            text: "日本語".into(),
+        };
+        let json = serde_json::to_string(&text).unwrap();
+        assert_eq!(json, r#"{"kind":"text","text":"日本語"}"#);
+        assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), text);
+        assert!(text_is_acceptable("日本語"));
+        assert!(text_is_acceptable(&"あ".repeat(256)));
+        assert!(!text_is_acceptable(&"あ".repeat(257)));
+        assert!(!text_is_acceptable(&"a".repeat(1025)));
+        assert!(!text_is_acceptable(""));
+        assert!(!text_is_acceptable("a\nb"));
+        assert!(!text_is_acceptable("a\u{85}"));
     }
 
     use super::*;

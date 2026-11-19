@@ -65,6 +65,12 @@ final class Native {
 
     static native void inputSend(long input, int[] events, int count);
 
+    /**
+     * TRIAL ONLY: text the input method (the XR keyboard) has committed, in order with the events:
+     * cut into pieces of at most 256 characters and 1024 bytes, newline and tab as keys. Never logged.
+     */
+    static native void inputText(long input, String text);
+
     /** {cuts, open, answered, over, failure}. */
     static native long[] inputState(long input);
 

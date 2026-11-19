@@ -35,7 +35,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     /** The host application this panel shows. */
     private HostApp app;
     private Fitted frame;
-    private SurfaceView view;
+    private TypingSurface view;
+    /** What the input method is composing, shown over the picture; never sent. */
+    private TextView composingLine;
+    private android.widget.Button typingToggle;
     private TextView status;
     private String decoderLine = "";
     private String inputLine = "";
@@ -166,7 +169,25 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
 
         frame = new Fitted(this);
         frame.setBackgroundColor(Color.BLACK);
-        view = new SurfaceView(this);
+        view = new TypingSurface(this, new TypingSurface.Typed() {
+            @Override
+            public void text(String text) {
+                if (input != 0) {
+                    Native.inputText(input, text);
+                }
+            }
+
+            @Override
+            public void composing(String text) {
+                composingLine.setText(text);
+                composingLine.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
+            }
+
+            @Override
+            public void key(KeyEvent event) {
+                dispatchKeyEvent(event);
+            }
+        });
         view.getHolder().addCallback(this);
         view.setFocusable(true);
         view.setFocusableInTouchMode(true);
@@ -198,6 +219,28 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         });
         root.addView(middleToggle, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START));
+        // Typing with the system's input method (the XR keyboard): Japanese is converted here and
+        // only the committed text goes to the host (TRIAL ONLY, ADR 0007 "確定した文字").
+        typingToggle = new android.widget.Button(this);
+        typingToggle.setAllCaps(false);
+        typingToggle.setTextSize(12);
+        typingToggle.setAlpha(0.7f);
+        typingToggle.setText(getString(R.string.typing_off));
+        typingToggle.setOnClickListener(v -> setTyping(!view.typing()));
+        FrameLayout.LayoutParams typingAt = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
+        typingAt.bottomMargin = (int) (48 * getResources().getDisplayMetrics().density);
+        root.addView(typingToggle, typingAt);
+        composingLine = new TextView(this);
+        composingLine.setTextColor(Color.WHITE);
+        composingLine.setBackgroundColor(0xC0202060);
+        composingLine.setTextSize(20);
+        composingLine.setPadding(16, 8, 16, 8);
+        composingLine.setVisibility(View.GONE);
+        composingLine.setClickable(false);
+        composingLine.setFocusable(false);
+        root.addView(composingLine, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
         status.setClickable(false);
         status.setFocusable(false);
         root.addView(status, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -209,6 +252,25 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (wifi != null) {
             wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "istesso-aura");
             wifiLock.setReferenceCounted(false);
+        }
+    }
+
+    /** Typing with the system's input method on or off; the keyboard is shown or hidden with it. */
+    private void setTyping(boolean on) {
+        android.view.inputmethod.InputMethodManager imm =
+                (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        view.setTyping(on);
+        typingToggle.setText(getString(on ? R.string.typing_on : R.string.typing_off));
+        composingLine.setVisibility(View.GONE);
+        if (imm == null) {
+            return;
+        }
+        view.requestFocus();
+        imm.restartInput(view);
+        if (on) {
+            imm.showSoftInput(view, 0);
+        } else {
+            imm.hideSoftInputFromWindow(view.getWindowToken(), 0);
         }
     }
 
@@ -235,6 +297,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     @Override
     protected void onPause() {
         resumed = false;
+        if (view.typing()) {
+            setTyping(false);
+        }
         stopPicture();
         if (input != 0) {
             Native.inputClose(input);

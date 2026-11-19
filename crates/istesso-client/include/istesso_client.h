@@ -94,6 +94,13 @@ IstessoInput *istesso_input_open(const char *config_dir, const char *peer, const
  */
 void istesso_input_send(const IstessoInput *input, const IstessoInputEvent *events, size_t count);
 
+/*
+ * TRIAL ONLY: text the device's own input method has committed (UTF-8, len bytes), handed over in
+ * order with the events: pieces of at most 256 characters and 1024 bytes, a newline as the Enter
+ * key and a tab as the Tab key, other control characters left out. Never logged.
+ */
+void istesso_input_send_text(const IstessoInput *input, const uint8_t *text, size_t len);
+
 /* How it stands. From any thread. 0, or -1. */
 int32_t istesso_input_state(const IstessoInput *input, IstessoInputState *state);
 

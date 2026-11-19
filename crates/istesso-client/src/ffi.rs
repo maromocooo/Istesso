@@ -181,6 +181,29 @@ pub unsafe extern "C" fn istesso_input_open(
     }
 }
 
+/// Committed text from the device's input method (trial only): handed over, in order with
+/// the events, as `crate::input::text_events` cuts it. `text` is UTF-8 of `len` bytes; text
+/// that is not UTF-8 is left out whole. Never logged.
+///
+/// # Safety
+/// `input` came from `istesso_input_open` and has not been closed; `text` points to `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_input_send_text(
+    input: *const IstessoInput,
+    text: *const u8,
+    len: usize,
+) {
+    // SAFETY: the caller's promise.
+    let (Some(input), false) = (unsafe { input.as_ref() }, text.is_null()) else {
+        return;
+    };
+    // SAFETY: `len` bytes by the caller's promise.
+    let bytes = unsafe { std::slice::from_raw_parts(text, len) };
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        input.input.send(crate::input::text_events(text));
+    }
+}
+
 /// # Safety
 /// `input` came from `istesso_input_open` and has not been closed; `events`
 /// points to `count` events.

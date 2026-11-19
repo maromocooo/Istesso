@@ -798,7 +798,10 @@ mod tests {
             pressed: false,
         };
         write(&up);
-        assert_eq!(taken.recv_timeout(Duration::from_secs(2)).unwrap(), [up]);
+        assert_eq!(
+            taken.recv_timeout(Duration::from_secs(2)).unwrap(),
+            std::slice::from_ref(&up)
+        );
         // Closed: nothing listens, and the socket is gone.
         let socket = keys.socket().to_owned();
         drop(keys);

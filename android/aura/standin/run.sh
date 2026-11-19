@@ -6,6 +6,8 @@
 # panel would say (connecting, cut, connecting again and why) and one line a second.
 #
 #   android/aura/standin/run.sh CONFIG_DIR HOST:PORT PEER_ID_FILE SECONDS
+#   android/aura/standin/run.sh CONFIG_DIR HOST:INPUT_PORT PEER_ID_FILE text
+#                                    the input's connection, and made-up committed text
 #
 # CONFIG_DIR: a test device's identity and paired devices (`picture pair`), never this Mac's own;
 # PEER_ID_FILE: a file that holds the paired host's id. Nothing here prints a key or an address.

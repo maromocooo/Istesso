@@ -228,6 +228,66 @@ impl Drop for Input {
 
 /// Adds an event to those that leave together. Of pointer positions in a
 /// row only the last one matters.
+/// Linux key codes of the keys committed text stands in for (input-event-codes.h).
+const KEY_TAB: u32 = 15;
+const KEY_ENTER: u32 = 28;
+
+/// Committed text from the device's own input method as the events that carry it (trial only,
+/// docs/adr/0007-control-channel.md, "確定した文字"): pieces of at most
+/// [`istesso_proto::TEXT_MOST_CHARS`] characters and [`istesso_proto::TEXT_MOST_BYTES`] bytes, cut
+/// between characters; a newline (or carriage return) as the Enter key and a tab as the Tab key,
+/// pressed and let go; other control characters left out. Never logged.
+pub fn text_events(text: &str) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    let mut piece = String::new();
+    let mut chars = 0;
+    let flush = |piece: &mut String, chars: &mut usize, events: &mut Vec<InputEvent>| {
+        if !piece.is_empty() {
+            events.push(InputEvent::Text {
+                text: std::mem::take(piece),
+            });
+        }
+        *chars = 0;
+    };
+    let mut last_was_cr = false;
+    for c in text.chars() {
+        let key = match c {
+            '\n' if last_was_cr => {
+                last_was_cr = false;
+                continue; // "\r\n" is one Enter
+            }
+            '\r' | '\n' => Some(KEY_ENTER),
+            '\t' => Some(KEY_TAB),
+            _ => None,
+        };
+        last_was_cr = c == '\r';
+        if let Some(code) = key {
+            flush(&mut piece, &mut chars, &mut events);
+            events.push(InputEvent::Key {
+                code,
+                pressed: true,
+            });
+            events.push(InputEvent::Key {
+                code,
+                pressed: false,
+            });
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if chars + 1 > istesso_proto::TEXT_MOST_CHARS
+            || piece.len() + c.len_utf8() > istesso_proto::TEXT_MOST_BYTES
+        {
+            flush(&mut piece, &mut chars, &mut events);
+        }
+        piece.push(c);
+        chars += 1;
+    }
+    flush(&mut piece, &mut chars, &mut events);
+    events
+}
+
 pub(crate) fn take(events: &mut Vec<InputEvent>, event: InputEvent) {
     match (events.last_mut(), &event) {
         (Some(last @ InputEvent::PointerAt { .. }), InputEvent::PointerAt { .. }) => *last = event,
@@ -515,4 +575,55 @@ pub(crate) fn ask_to_be_interactive() -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     false
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    fn text(t: &str) -> InputEvent {
+        InputEvent::Text { text: t.into() }
+    }
+
+    fn key(code: u32, pressed: bool) -> InputEvent {
+        InputEvent::Key { code, pressed }
+    }
+
+    #[test]
+    fn committed_text_is_cut_into_pieces_within_the_limits() {
+        assert_eq!(text_events("日本語"), [text("日本語")]);
+        let long = "あ".repeat(300);
+        let pieces = text_events(&long);
+        assert_eq!(pieces, [text(&"あ".repeat(256)), text(&"あ".repeat(44))]);
+        // Four bytes a character: the byte limit comes first.
+        let wide = "😀".repeat(300);
+        for piece in text_events(&wide) {
+            let InputEvent::Text { text } = piece else {
+                panic!()
+            };
+            assert!(istesso_proto::text_is_acceptable(&text));
+            assert_eq!(text.len(), 1024.min(text.len()));
+        }
+        assert!(text_events("").is_empty());
+    }
+
+    #[test]
+    fn newline_and_tab_go_as_keys_and_other_control_characters_not_at_all() {
+        assert_eq!(
+            text_events("a\tb\r\nc\u{7}"),
+            [
+                text("a"),
+                key(KEY_TAB, true),
+                key(KEY_TAB, false),
+                text("b"),
+                key(KEY_ENTER, true),
+                key(KEY_ENTER, false),
+                text("c")
+            ]
+        );
+        assert_eq!(
+            text_events("\n"),
+            [key(KEY_ENTER, true), key(KEY_ENTER, false)]
+        );
+    }
 }

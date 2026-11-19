@@ -28,6 +28,8 @@
     <string name="input_open">入力：つながっています</string>
     <string name="input_waiting">入力：つないでいます</string>
     <string name="input_over">入力：受け付けられません</string>
+    <string name="typing_off">文字：切</string>
+    <string name="typing_on">文字：入（キーボードで打つ。確定した文字を送る）</string>
     <string name="middle_off">中ボタン：切</string>
     <string name="middle_on">中ボタン：入（左が中になる）</string>
     <string name="apps_title">ホストのアプリ（1 つにつき 1 枚のパネル。開いているものは前に出る。ホストで AURA 向けに開いたアプリを選ぶ。同時に 3 つまで）</string>

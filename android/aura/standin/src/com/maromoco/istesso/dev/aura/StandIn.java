@@ -11,6 +11,10 @@ public final class StandIn implements Picture.Told {
     public void decoder(String name, boolean low) {}
     public void over(String why) { System.out.println(t() + " panel: over: " + why); }
     public static void main(String[] a) throws Exception {
+        if (a.length >= 4 && a[3].equals("text")) {
+            text(a[0], a[1], a[2]);
+            return;
+        }
         Picture p = new Picture(a[0], a[1], a[2], null, new StandIn());
         p.start();
         int seconds = Integer.parseInt(a[3]);
@@ -20,6 +24,33 @@ public final class StandIn implements Picture.Told {
             System.out.println(t() + " stats " + line.replaceAll(" oneway.*?queued=", " queued=").replaceAll(" in_decoder.*?cuts=", " cuts=") + " keys_queued=" + android.media.MediaCodec.queuedKeys);
         }
         p.stop();
+        System.exit(0);
+    }
+
+    /**
+     * The input's connection as the panel opens it, and committed text as TypingSurface hands it
+     * over (made-up test text, never typed by a person): a key, text, a newline and a tab inside
+     * text, and text longer than one piece.
+     */
+    static void text(String dir, String address, String peer) throws Exception {
+        long input = Native.inputOpen(dir, peer, address);
+        for (int i = 0; i < 50 && input != 0; i++) {
+            long[] s = Native.inputState(input);
+            if (s != null && s[1] != 0) {
+                break;
+            }
+            Thread.sleep(100);
+        }
+        long[] s = Native.inputState(input);
+        System.out.println(t() + " input open=" + (s == null ? "?" : s[1]));
+        Native.inputSend(input, new int[] {Native.INPUT_KEY, 30, 1, Native.INPUT_KEY, 30, 0}, 2);
+        Native.inputText(input, "日本語テスト");
+        Native.inputText(input, "abc\ndef\t");
+        Native.inputText(input, "あ".repeat(300));
+        Native.inputText(input, "😀漢字");
+        Thread.sleep(1000);
+        Native.inputClose(input);
+        System.out.println(t() + " sent");
         System.exit(0);
     }
 }

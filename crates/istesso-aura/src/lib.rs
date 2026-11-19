@@ -159,6 +159,7 @@ extern "C" {
         context: *mut c_void,
     ) -> *mut c_void;
     fn istesso_input_send(input: *const c_void, events: *const InputEvent, count: usize);
+    fn istesso_input_send_text(input: *const c_void, text: *const u8, len: usize);
     fn istesso_input_state(input: *const c_void, state: *mut InputState) -> i32;
     fn istesso_input_close(input: *mut c_void);
     fn istesso_client_last_error() -> *const c_char;
@@ -780,6 +781,38 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputSen
         get(env, events, 0, wanted as jsize, flat.as_mut_ptr());
         let list = events_from(&flat);
         istesso_input_send(input as *const c_void, list.as_ptr(), list.len());
+    }
+}
+
+/// `void inputText(long input, String text)`: text the system's input method (the XR keyboard)
+/// has committed, handed over in order with the events (TRIAL ONLY, ADR 0007 "確定した文字"):
+/// cut into pieces within the limits, newline and tab as keys. Read as UTF-16, so that characters
+/// outside the basic plane arrive whole. Never logged.
+///
+/// # Safety
+/// Called by the Java virtual machine; `input` came from inputOpen and is not closed.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputText(
+    env: *mut JNIEnv,
+    _class: jclass,
+    input: jlong,
+    text: jstring,
+) {
+    if input == 0 || text.is_null() {
+        return;
+    }
+    // SAFETY: the virtual machine's promises.
+    unsafe {
+        let (Some(length), Some(region)) = ((**env).GetStringLength, (**env).GetStringRegion)
+        else {
+            return;
+        };
+        let n = length(env, text).max(0) as usize;
+        let mut units = vec![0u16; n];
+        region(env, text, 0, n as jsize, units.as_mut_ptr());
+        let text = String::from_utf16_lossy(&units);
+        istesso_input_send_text(input as *const c_void, text.as_ptr(), text.len());
     }
 }
 
