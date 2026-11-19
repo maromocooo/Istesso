@@ -72,6 +72,9 @@ pub struct State {
     /// While there is no conversation: in what way the latest attempt to
     /// reach the host failed.
     pub failure: Option<Failure>,
+    /// The host said, when the conversation was last opened, that it takes
+    /// committed text (trial only); committed text is sent only then.
+    pub text: bool,
 }
 
 struct Batch {
@@ -443,6 +446,7 @@ fn run(
             match opened {
                 Ok(opened) => {
                     let answered = opened.is_answered();
+                    let text = opened.takes_text();
                     line = Some(opened);
                     // What was handed over while the conversation was being opened was
                     // typed before there was one: it is gone like everything before it,
@@ -469,6 +473,7 @@ fn run(
                         state.open = true;
                         state.answered = answered;
                         state.failure = None;
+                        state.text = text;
                     });
                     if let Some(passing) = passing {
                         passing.reconnection("open", 0);
@@ -540,10 +545,12 @@ fn run(
                 tell(&Told::Cut, cuts);
             }
             Some(Happened::Back { after }) => {
+                let text = open_line.takes_text();
                 set(&|state| {
                     state.open = is_open;
                     state.answered = answered;
                     state.failure = None;
+                    state.text = text;
                 });
                 if let Some(passing) = passing {
                     passing.reconnection("back", cuts);

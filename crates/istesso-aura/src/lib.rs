@@ -115,7 +115,7 @@ struct InputState {
     over: u32,
     interactive: u32,
     failure: u32,
-    reserved: u32,
+    text: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MediaStreamInfo>() == 24);
@@ -826,7 +826,7 @@ fn events_from(flat: &[i32]) -> Vec<InputEvent> {
         .collect()
 }
 
-/// `long[] inputState(long input)`: {cuts, open, answered, over, failure}. From any thread.
+/// `long[] inputState(long input)`: {cuts, open, answered, over, failure, text}. From any thread.
 ///
 /// # Safety
 /// Called by the Java virtual machine; `input` came from inputOpen and is not closed.
@@ -851,6 +851,7 @@ pub unsafe extern "system" fn Java_com_maromoco_istesso_dev_aura_Native_inputSta
                 state.answered as i64,
                 state.over as i64,
                 state.failure as i64,
+                state.text as i64,
             ],
         )
     }

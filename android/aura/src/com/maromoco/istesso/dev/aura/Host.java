@@ -11,23 +11,15 @@ final class Host {
     /** The key in the settings and in a panel's identity. */
     final String key;
     final int labelRes;
-    /**
-     * Whether the host's trial agent takes committed text ({"kind":"text"}). One that does not
-     * refuses the whole message, keys included, and the input connects again: the switch for
-     * typing is not shown on its panels.
-     */
-    final boolean takesText;
-
-    private Host(String key, int labelRes, boolean takesText) {
+    private Host(String key, int labelRes) {
         this.key = key;
         this.labelRes = labelRes;
-        this.takesText = takesText;
     }
 
     /** The Linux host (scripts/daily.sh open NAME --for aura). Its settings are the ones from before. */
-    static final Host UBUNTU = new Host("ubuntu", R.string.host_ubuntu, true);
+    static final Host UBUNTU = new Host("ubuntu", R.string.host_ubuntu);
     /** The Mac host (scripts/daily-mac.sh open APP --for aura --slot N). */
-    static final Host MAC = new Host("mac", R.string.host_mac, false); // until the Studio's trial agent takes text (m4-daily-host)
+    static final Host MAC = new Host("mac", R.string.host_mac);
 
     static final Host[] ALL = {UBUNTU, MAC};
 

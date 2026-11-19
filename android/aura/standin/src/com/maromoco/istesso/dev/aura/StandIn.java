@@ -42,7 +42,7 @@ public final class StandIn implements Picture.Told {
             Thread.sleep(100);
         }
         long[] s = Native.inputState(input);
-        System.out.println(t() + " input open=" + (s == null ? "?" : s[1]));
+        System.out.println(t() + " input open=" + (s == null ? "?" : s[1]) + " text=" + (s == null || s.length < 6 ? "?" : s[5]));
         Native.inputSend(input, new int[] {Native.INPUT_KEY, 30, 1, Native.INPUT_KEY, 30, 0}, 2);
         Native.inputText(input, "日本語テスト");
         Native.inputText(input, "abc\ndef\t");

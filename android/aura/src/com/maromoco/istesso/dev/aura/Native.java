@@ -71,7 +71,7 @@ final class Native {
      */
     static native void inputText(long input, String text);
 
-    /** {cuts, open, answered, over, failure}. */
+    /** {cuts, open, answered, over, failure, text}; text 1 when the host said it takes committed text. */
     static native long[] inputState(long input);
 
     static native void inputClose(long input);

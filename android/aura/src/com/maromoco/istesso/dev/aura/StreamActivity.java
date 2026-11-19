@@ -36,6 +36,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
     private HostApp app;
     private Fitted frame;
     private TypingSurface view;
+    /** The input's agent said, when its conversation was last opened, that it takes committed text. */
+    private boolean hostTakesText;
+    /** Whether that has been heard yet (an input conversation was open). */
+    private boolean hostTextKnown;
     /** What the input method is composing, shown over the picture; never sent. */
     private TextView composingLine;
     private android.widget.Button typingToggle;
@@ -175,7 +179,9 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         view = new TypingSurface(this, new TypingSurface.Typed() {
             @Override
             public void text(String text) {
-                if (input != 0) {
+                // Only to an agent that said it takes committed text (ADR 0007): one that does
+                // not could not read the message, keys and all. Otherwise it stays here.
+                if (input != 0 && hostTakesText) {
                     Native.inputText(input, text);
                 }
             }
@@ -233,9 +239,8 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         FrameLayout.LayoutParams typingAt = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START);
         typingAt.bottomMargin = (int) (48 * getResources().getDisplayMetrics().density);
-        if (app.host.takesText) {
-            root.addView(typingToggle, typingAt);
-        }
+        root.addView(typingToggle, typingAt);
+        showTypingToggle();
         composingLine = new TextView(this);
         composingLine.setTextColor(Color.WHITE);
         composingLine.setBackgroundColor(0xC0202060);
@@ -257,6 +262,20 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
         if (wifi != null) {
             wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "istesso-aura");
             wifiLock.setReferenceCounted(false);
+        }
+    }
+
+    /**
+     * The switch for typing: usable only once the input's connection is open and its agent said
+     * that it takes committed text; otherwise shown, not usable, with the reason.
+     */
+    private void showTypingToggle() {
+        boolean usable = hostTextKnown && hostTakesText;
+        typingToggle.setEnabled(usable);
+        if (!usable) {
+            typingToggle.setText(getString(hostTextKnown ? R.string.typing_unsupported : R.string.typing_off));
+        } else if (!view.typing()) {
+            typingToggle.setText(getString(R.string.typing_off));
         }
     }
 
@@ -458,6 +477,18 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             inputLine = getString(R.string.input_over) + (why == null || why.isEmpty() ? "" : "：" + why);
         } else if (s != null) {
             inputLine = s[1] != 0 ? getString(R.string.input_open) : getString(R.string.input_waiting);
+            if (s[1] != 0) {
+                boolean takes = s.length > 5 && s[5] != 0;
+                if (takes != hostTakesText) {
+                    hostTakesText = takes;
+                    if (!takes && view.typing()) {
+                        setTyping(false);
+                    }
+                    showTypingToggle();
+                }
+                hostTextKnown = true;
+                showTypingToggle();
+            }
         }
         show();
     }

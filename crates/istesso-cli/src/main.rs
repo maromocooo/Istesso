@@ -638,7 +638,8 @@ fn relay_input(
     // output, in the log of times if there is one, and in a small file next to the socket
     // for the program that shows the window.
     let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
-    let tell = |event: &str, cuts: u64, after: Option<Duration>| {
+    // "text": whether the device takes committed text (1) or not (0), for the window.
+    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -654,12 +655,17 @@ fn relay_input(
         // Written beside and moved over, so that nobody reads half of it. Whoever reads
         // it checks that the process named in it still runs.
         let beside = state.with_extension("state.new");
-        let line = format!("{{\"pid\":{},\"input\":{cuts}}}\n", std::process::id());
+        let line = format!(
+            "{{\"pid\":{},\"input\":{cuts},\"text\":{}}}\n",
+            std::process::id(),
+            u8::from(text)
+        );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
         }
     };
-    tell("open", 0, None);
+    tell("open", 0, None, line.takes_text());
+    let mut text_dropped = 0;
     if !line.is_answered() {
         eprintln!(
             "note: the device is of a version that does not answer \"still here\"; a connection \
@@ -719,17 +725,24 @@ fn relay_input(
                 format!("the device does not take input from here any more: {why}")
             })?;
         }
+        if line.text_dropped() != text_dropped {
+            text_dropped = line.text_dropped();
+            // How many, never what.
+            eprintln!(
+                "note: {text_dropped} piece(s) of committed text were not sent: the device does not take text"
+            );
+        }
         match happened {
             Some(Happened::Cut) => {
                 eprintln!("note: the conversation with the device was cut; opening it again");
-                tell("cut", line.cuts(), None);
+                tell("cut", line.cuts(), None, line.takes_text());
             }
             Some(Happened::Back { after }) => {
                 eprintln!(
                     "note: the conversation with the device is back after {:.2} s",
                     after.as_secs_f64()
                 );
-                tell("back", line.cuts(), Some(after));
+                tell("back", line.cuts(), Some(after), line.takes_text());
             }
             None => {}
         }

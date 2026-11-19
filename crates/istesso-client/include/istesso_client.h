@@ -45,7 +45,7 @@ typedef struct IstessoInputState {
     uint32_t failure;     /* while there is no conversation: in what way the latest attempt to
                            * reach the host failed, one of ISTESSO_MEDIA_FAILURE_* (istesso_media.h);
                            * 0 otherwise */
-    uint32_t reserved;
+    uint32_t text;        /* TRIAL ONLY: 1 when the host said it takes committed text; text is sent only then */
 } IstessoInputState;
 
 /* What happened to the conversation: the `event` of IstessoInputTold. */

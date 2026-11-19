@@ -57,10 +57,15 @@ pub enum Response {
         status: HostStatus,
     },
     /// Input is taken from now on. With `alive`: and an empty
-    /// [`Request::Input`] is answered from now on, as was asked.
+    /// [`Request::Input`] is answered from now on, as was asked. With
+    /// `text`: committed text (`InputEvent::Text`) is taken too; a device
+    /// that does not say so must not be sent any, as it cannot read a
+    /// message with it (docs/adr/0007-control-channel.md, "確定した文字").
     InputOpen {
         #[serde(default, skip_serializing_if = "is_false")]
         alive: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        text: bool,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
@@ -159,7 +164,11 @@ mod tests {
         // Not asked for, the messages are what they always were.
         let plain = r#"{"type":"input_open"}"#;
         assert_eq!(
-            serde_json::to_string(&Response::InputOpen { alive: false }).unwrap(),
+            serde_json::to_string(&Response::InputOpen {
+                alive: false,
+                text: false
+            })
+            .unwrap(),
             plain
         );
         assert_eq!(
@@ -168,7 +177,10 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Response>(plain).unwrap(),
-            Response::InputOpen { alive: false }
+            Response::InputOpen {
+                alive: false,
+                text: false
+            }
         );
         // Asked for, and agreed to.
         let asking = r#"{"type":"input_open","alive":true}"#;
@@ -178,7 +190,18 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Response>(asking).unwrap(),
-            Response::InputOpen { alive: true }
+            Response::InputOpen {
+                alive: true,
+                text: false
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"type":"input_open","alive":true,"text":true}"#)
+                .unwrap(),
+            Response::InputOpen {
+                alive: true,
+                text: true
+            }
         );
         // An earlier version reads both as what it knows, and its own answer says
         // nothing about it: that is "no".
@@ -189,7 +212,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Response>(&serde_json::to_string(&Earlier::InputOpen).unwrap())
                 .unwrap(),
-            Response::InputOpen { alive: false }
+            Response::InputOpen {
+                alive: false,
+                text: false
+            }
         );
         assert_eq!(
             serde_json::to_string(&Response::InputAlive).unwrap(),

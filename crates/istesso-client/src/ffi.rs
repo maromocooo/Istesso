@@ -42,7 +42,8 @@ pub struct IstessoInputState {
     /// While there is no conversation: in what way the latest attempt to
     /// reach the host failed, one of `ISTESSO_MEDIA_FAILURE_*`; 0 otherwise.
     pub failure: u32,
-    pub reserved: u32,
+    /// 1 when the host said it takes committed text (trial only); text is sent only then.
+    pub text: u32,
 }
 
 /// Called on the input's thread for what happens to the conversation:
@@ -263,6 +264,7 @@ pub unsafe extern "C" fn istesso_input_state(
         over,
         interactive,
         failure,
+        text,
     } = input.input.state();
     // SAFETY: not null, and room for the result by the caller's promise.
     unsafe {
@@ -277,7 +279,7 @@ pub unsafe extern "C" fn istesso_input_state(
                 Some(false) => 2,
             },
             failure: failure.map_or(0, |failure| failure as u32),
-            reserved: 0,
+            text: u32::from(text),
         }
     };
     0
