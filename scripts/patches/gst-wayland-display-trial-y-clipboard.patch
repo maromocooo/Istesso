@@ -1,0 +1,1764 @@
+Copy and paste of text with the device a person types on (Istesso's ADR 0022; trial only). Off
+unless the environment names ISTESSO_CLIPBOARD_DIR, the folder of the session's local sockets
+(the one that holds input.sock, open to its owner only). There the compositor binds the datagram
+socket clipboard.sock: the agent sends "hello" (answered with the same nonce, so that the agent
+knows copy and paste are taken) and the text of a paste ("paste_text"), before the mark that
+orders it. The marks come on the path of the keys as the custom upstream events ClipboardCopy
+(nonce, cut) and ClipboardPaste (nonce, with-text), and carry no text. Answers go as datagrams to
+clipboard-answer.sock (bound by the agent): text, pasted, none, refused (password_field,
+secret_marker), too_large, not_text.
+
+A copy presses Control-C (Control-X to cut; Control only when it is not held already) for the
+client that has the keyboard, unless that client's enabled text input says its field is for a
+password or a PIN (then nothing is pressed); it takes the clipboard selection that the same
+client sets next, refuses one offered with x-kde-passwordManagerHint unread, and reads it in a
+loop source with a deadline of 0.5 s from the key and at most 64 KiB and a byte, so that a slow
+client never stops the compositor. A paste holds the input that follows its mark (keys, pointer,
+committed text, further marks) until its text is there, at most 0.2 s, then makes the
+compositor the owner of the selection with it and presses Control-V; a paste without text first
+withdraws the compositor's own earlier selection. The primary selection is never read or set.
+The text, its size and the nonces are never logged (the element's debug line of an event no
+longer prints TextCommit and the clipboard's marks), only how many of each answer there were.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
+gst-wayland-display-cursor-messages.patch, gst-wayland-display-windows.patch,
+gst-wayland-display-dialogs.patch, gst-wayland-display-trial-windows.patch and
+gst-wayland-display-trial-x-text-input.patch in this directory, in that order (its name sorts
+after them on purpose). The lines of context are from that project and from those patches.
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 8d36da5..a8fd314 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -140,7 +140,17 @@ trait EventHandler {
+ 
+ impl EventHandler for WaylandDisplaySrc {
+     fn handle_event(&self, event: &Event) -> bool {
+-        tracing::debug!("Received event: {:?}", event);
++        // Trial only: what is typed, and the clipboard's marks, are not written out (ADR 0007
++        // and 0022 of Istesso): only that one came.
++        let quiet = matches!(event.view(), gst::EventView::CustomUpstream(e)
++            if e.structure().is_some_and(|s| {
++                s.has_name("TextCommit") || s.has_name("ClipboardCopy") || s.has_name("ClipboardPaste")
++            }));
++        if quiet {
++            tracing::debug!("Received a trial input event");
++        } else {
++            tracing::debug!("Received event: {:?}", event);
++        }
+ 
+         match event.view() {
+             gst::EventView::CustomUpstream(e) => {
+@@ -220,6 +230,21 @@ impl EventHandler for WaylandDisplaySrc {
+                         },
+                     ));
+ 
++                    return true;
++                } else if structure.has_name("ClipboardCopy") {
++                    // Trial only (ADR 0022): a mark among the keys; no text in it.
++                    if let Ok(nonce) = structure.get::<String>("nonce") {
++                        let cut = structure.get::<bool>("cut").unwrap_or(false);
++                        let _ = self.command_tx.send(Command::ClipboardCopy { nonce, cut });
++                    }
++                    return true;
++                } else if structure.has_name("ClipboardPaste") {
++                    if let Ok(nonce) = structure.get::<String>("nonce") {
++                        let with_text = structure.get::<bool>("with-text").unwrap_or(false);
++                        let _ = self
++                            .command_tx
++                            .send(Command::ClipboardPaste { nonce, with_text });
++                    }
+                     return true;
+                 } else if structure.has_name("TextCommit") {
+                     // Trial only: committed text (never logged).
+diff --git a/wayland-display-core/src/comp/clipboard.rs b/wayland-display-core/src/comp/clipboard.rs
+new file mode 100644
+index 0000000..5011f04
+--- /dev/null
++++ b/wayland-display-core/src/comp/clipboard.rs
+@@ -0,0 +1,832 @@
++//! Trial only: copy and paste of text between the device a person types on and the client that
++//! has the keyboard (Istesso's ADR 0022). Off unless `ISTESSO_CLIPBOARD_DIR` names the folder of
++//! the session's local sockets (the one that holds `input.sock`, open to its owner only).
++//!
++//! * The agent sends datagrams to `clipboard.sock` there (bound here): `hello` (answered at
++//!   once, so that the agent knows that copy and paste are taken) and the text of a paste,
++//!   before the mark that orders it.
++//! * The marks come on the path of the keys, as the upstream events `ClipboardCopy` and
++//!   `ClipboardPaste`, so that a copy or a paste takes its place among the keys. They carry no
++//!   text.
++//! * Answers go as datagrams to `clipboard-answer.sock` there (bound by the agent).
++//!
++//! A copy presses Control-C (Control-X to cut) for the client that has the keyboard and takes
++//! the selection that client sets next, read with a deadline and never by stopping the loop. A
++//! paste holds the input that follows its mark until its text is there, makes the compositor
++//! the owner of the selection with that text, and presses Control-V. Only the clipboard: the
++//! primary selection is never read or set. The text, its size and the nonces are never logged:
++//! only how many of each answer there were.
++
++use std::collections::VecDeque;
++use std::os::fd::{AsFd, OwnedFd};
++use std::os::unix::net::UnixDatagram;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use smithay::backend::input::KeyState;
++use smithay::reexports::calloop::{
++    Interest, Mode, PostAction, RegistrationToken,
++    generic::Generic,
++    timer::{TimeoutAction, Timer},
++};
++use smithay::reexports::rustix;
++use smithay::reexports::wayland_server::backend::ClientId;
++use smithay::wayland::selection::SelectionSource;
++use smithay::wayland::selection::data_device::{
++    clear_data_device_selection, current_data_device_selection_userdata,
++    request_data_device_client_selection, set_data_device_selection,
++};
++
++use super::{Command, State, client_of_focus};
++
++/// The most bytes (UTF-8) of text a copy or a paste carries (ADR 0022).
++pub const MOST_BYTES: usize = 65536;
++/// How long a copy waits for the selection, from pressing the key to the last byte read.
++pub const COPY_WITHIN: Duration = Duration::from_millis(500);
++/// How long a paste holds the input after it for its text to arrive.
++pub const HOLD_AT_MOST: Duration = Duration::from_millis(200);
++/// How long the text of a paste is kept for its mark.
++const TEXT_KEPT_FOR: Duration = Duration::from_secs(2);
++/// How many texts of pastes are kept at once.
++const TEXTS_KEPT: usize = 4;
++/// How long a client may take to read the selection the compositor offers.
++const SERVE_WITHIN: Duration = Duration::from_secs(2);
++/// The sockets' buffers: a datagram carries up to twice the text (JSON escapes).
++const SOCKET_BUFFER: usize = 256 * 1024;
++const RECEIVE_AT_MOST: usize = 192 * 1024;
++
++const KEY_LEFTCTRL: u32 = 29;
++const KEY_X: u32 = 45;
++const KEY_C: u32 = 46;
++const KEY_V: u32 = 47;
++
++/// The kinds of text a copy takes, in order of preference, and what a paste offers.
++const TEXT_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
++const OFFERED_TYPES: [&str; 5] = [
++    "text/plain;charset=utf-8",
++    "UTF8_STRING",
++    "text/plain",
++    "TEXT",
++    "STRING",
++];
++/// What a password manager puts on a selection that is a secret (KDE's convention).
++const SECRET_TYPE: &str = "x-kde-passwordManagerHint";
++
++/// What became of a copy or a paste.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Outcome {
++    Text,
++    Pasted,
++    Nothing,
++    Refused(Why),
++    TooLarge,
++    NotText,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Why {
++    PasswordField,
++    SecretMarker,
++}
++
++impl Outcome {
++    fn word(self) -> &'static str {
++        match self {
++            Outcome::Text => "text",
++            Outcome::Pasted => "pasted",
++            Outcome::Nothing => "none",
++            Outcome::Refused(_) => "refused",
++            Outcome::TooLarge => "too_large",
++            Outcome::NotText => "not_text",
++        }
++    }
++}
++
++/// Whether `bytes` may be carried as text: within the limit, UTF-8, not empty, and without
++/// control characters other than tab, line feed and carriage return.
++pub fn judge(bytes: &[u8]) -> Result<&str, Outcome> {
++    if bytes.len() > MOST_BYTES {
++        return Err(Outcome::TooLarge);
++    }
++    let text = std::str::from_utf8(bytes).map_err(|_| Outcome::NotText)?;
++    let allowed = |c: char| !c.is_control() || matches!(c, '\t' | '\n' | '\r');
++    if text.is_empty() || !text.chars().all(allowed) {
++        return Err(Outcome::NotText);
++    }
++    Ok(text)
++}
++
++/// The selection the compositor owns: the text of the last paste.
++pub type Offered = Arc<String>;
++
++struct PendingCopy {
++    nonce: String,
++    client: Option<ClientId>,
++    deadline: Instant,
++    /// What has been read of the selection, once it is being read.
++    read: Option<Vec<u8>>,
++    reading: Option<RegistrationToken>,
++    number: u64,
++}
++
++struct Hold {
++    nonce: String,
++    number: u64,
++}
++
++/// The input commands that wait while a paste waits for its text.
++pub(crate) fn is_input(command: &Command) -> bool {
++    matches!(
++        command,
++        Command::KeyboardInput(..)
++            | Command::PointerMotion(_)
++            | Command::PointerMotionAbsolute(_)
++            | Command::PointerButton(..)
++            | Command::PointerAxis(..)
++            | Command::TextCommit(_)
++            | Command::ClipboardCopy { .. }
++            | Command::ClipboardPaste { .. }
++    )
++}
++
++#[derive(Default)]
++pub struct Clipboard {
++    on: bool,
++    answers: Option<PathBuf>,
++    sender: Option<UnixDatagram>,
++    texts: Vec<(String, String, Instant)>,
++    copy: Option<PendingCopy>,
++    hold: Option<Hold>,
++    pub(crate) held: VecDeque<Command>,
++    next: u64,
++    counts: std::collections::BTreeMap<&'static str, u64>,
++}
++
++impl Clipboard {
++    pub fn holding(&self) -> bool {
++        self.hold.is_some()
++    }
++
++    fn number(&mut self) -> u64 {
++        self.next += 1;
++        self.next
++    }
++
++    fn take_text(&mut self, nonce: &str) -> Option<String> {
++        let now = Instant::now();
++        self.texts
++            .retain(|(_, _, at)| now.saturating_duration_since(*at) < TEXT_KEPT_FOR);
++        let place = self.texts.iter().position(|(n, _, _)| n == nonce)?;
++        Some(self.texts.remove(place).1)
++    }
++
++    fn send(&mut self, line: &str) {
++        let (Some(sender), Some(to)) = (&self.sender, &self.answers) else {
++            return;
++        };
++        if sender.send_to(line.as_bytes(), to).is_err() {
++            *self.counts.entry("not delivered").or_default() += 1;
++        }
++    }
++
++    fn answer(&mut self, nonce: &str, outcome: Outcome, text: Option<&str>) {
++        let mut line = format!(
++            r#"{{"kind":"answer","nonce":{},"result":"{}""#,
++            quote(nonce),
++            outcome.word()
++        );
++        if let (Outcome::Text, Some(text)) = (outcome, text) {
++            line.push_str(&format!(r#","text":{}"#, quote(text)));
++        }
++        if let Outcome::Refused(why) = outcome {
++            line.push_str(match why {
++                Why::PasswordField => r#","why":"password_field""#,
++                Why::SecretMarker => r#","why":"secret_marker""#,
++            });
++        }
++        line.push('}');
++        self.send(&line);
++        let count = self.counts.entry(outcome.word()).or_default();
++        *count += 1;
++        // How many, never what (nor how long, nor the nonce).
++        tracing::info!(so_far = *count, "clipboard: answered {}", outcome.word());
++    }
++}
++
++impl State {
++    /// Turns copy and paste on, with the local sockets in `dir` (see the module's text).
++    pub fn enable_clipboard(&mut self, dir: &Path) -> std::io::Result<()> {
++        use std::os::unix::fs::PermissionsExt;
++        let path = dir.join("clipboard.sock");
++        match std::fs::remove_file(&path) {
++            Ok(()) => {}
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++            Err(e) => return Err(e),
++        }
++        let socket = UnixDatagram::bind(&path)?;
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++        socket.set_nonblocking(true)?;
++        let _ = rustix::net::sockopt::set_socket_recv_buffer_size(&socket, SOCKET_BUFFER);
++        let sender = UnixDatagram::unbound()?;
++        sender.set_nonblocking(true)?;
++        let _ = rustix::net::sockopt::set_socket_send_buffer_size(&sender, SOCKET_BUFFER);
++        self.handle
++            .insert_source(
++                Generic::new(socket, Interest::READ, Mode::Level),
++                |_, socket, state| {
++                    let mut buffer = vec![0u8; RECEIVE_AT_MOST];
++                    loop {
++                        match socket.recv(&mut buffer) {
++                            Ok(length) => state.clipboard_datagram(&buffer[..length]),
++                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
++                            Err(_) => break,
++                        }
++                    }
++                    Ok(PostAction::Continue)
++                },
++            )
++            .map_err(|e| std::io::Error::other(e.to_string()))?;
++        self.clipboard.on = true;
++        self.clipboard.answers = Some(dir.join("clipboard-answer.sock"));
++        self.clipboard.sender = Some(sender);
++        tracing::info!("clipboard: copy and paste are taken (trial)");
++        Ok(())
++    }
++
++    /// A datagram from the agent on `clipboard.sock`.
++    fn clipboard_datagram(&mut self, bytes: &[u8]) {
++        let Some(fields) = parse_flat(bytes) else {
++            return;
++        };
++        let get = |key: &str| {
++            fields
++                .iter()
++                .find(|(k, _)| k == key)
++                .and_then(|(_, v)| match v {
++                    Value::Text(s) => Some(s.clone()),
++                    _ => None,
++                })
++        };
++        let (Some(kind), Some(nonce)) = (get("kind"), get("nonce")) else {
++            return;
++        };
++        match kind.as_str() {
++            "hello" => self
++                .clipboard
++                .send(&format!(r#"{{"kind":"hello","nonce":{}}}"#, quote(&nonce))),
++            "paste_text" => {
++                let Some(text) = get("text") else { return };
++                let clipboard = &mut self.clipboard;
++                if clipboard.texts.len() >= TEXTS_KEPT {
++                    clipboard.texts.remove(0);
++                }
++                clipboard.texts.push((nonce.clone(), text, Instant::now()));
++                // A paste that holds the input for this text goes on now.
++                if clipboard.hold.as_ref().is_some_and(|h| h.nonce == nonce) {
++                    self.clipboard.hold = None;
++                    self.paste_now(&nonce);
++                    self.release_held();
++                }
++            }
++            _ => {}
++        }
++    }
++
++    /// Takes an input command, or holds it while a paste waits for its text. Commands that are
++    /// not input come back.
++    pub(crate) fn take_input(&mut self, command: Command) -> Option<Command> {
++        if !is_input(&command) {
++            return Some(command);
++        }
++        if self.clipboard.holding() {
++            self.clipboard.held.push_back(command);
++            return None;
++        }
++        self.apply_input(command);
++        None
++    }
++
++    /// Passes on what was held, in order, until a paste in it holds again.
++    fn release_held(&mut self) {
++        while !self.clipboard.holding() {
++            let Some(command) = self.clipboard.held.pop_front() else {
++                break;
++            };
++            self.apply_input(command);
++        }
++    }
++
++    fn apply_input(&mut self, command: Command) {
++        use smithay::backend::input::AxisSource;
++        let time: Duration = self.clock.now().into();
++        match command {
++            Command::KeyboardInput(scancode, key_state) => {
++                let keycode = self.scancode_to_keycode(scancode);
++                self.keyboard_input(time.as_millis() as u32, keycode, key_state);
++            }
++            Command::PointerMotion(position) => {
++                self.pointer_motion(
++                    time.as_millis() as u32,
++                    time.as_nanos() as u64,
++                    position,
++                    position,
++                );
++                super::pointer_moved(self);
++            }
++            Command::PointerMotionAbsolute(position) => {
++                self.pointer_motion_absolute(time.as_millis() as u32, position);
++                super::pointer_moved(self);
++            }
++            Command::PointerButton(btn_code, btn_state) => {
++                self.pointer_button(time.as_millis() as u32, btn_code, btn_state);
++            }
++            Command::PointerAxis(horizontal_amount, vertical_amount) => {
++                self.pointer_axis(
++                    time.as_millis() as u32,
++                    AxisSource::Wheel,
++                    horizontal_amount * 3.0 / 120.0,
++                    vertical_amount * 3.0 / 120.0,
++                    Some(horizontal_amount),
++                    Some(vertical_amount),
++                );
++            }
++            Command::TextCommit(text) => self.commit_text(&text),
++            Command::ClipboardCopy { nonce, cut } => self.clipboard_copy(nonce, cut),
++            Command::ClipboardPaste { nonce, with_text } => self.clipboard_paste(nonce, with_text),
++            _ => {}
++        }
++    }
++
++    /// Presses `key` with Control for the client that has the keyboard, and lets go of both:
++    /// Control only when it is not held already (a Command key arrives as Control).
++    fn press_with_control(&mut self, key: u32) {
++        let keyboard = self.seat.get_keyboard().unwrap();
++        let held = keyboard.modifier_state().ctrl;
++        let time = Duration::from(self.clock.now()).as_millis() as u32;
++        let control = self.scancode_to_keycode(KEY_LEFTCTRL);
++        let key = self.scancode_to_keycode(key);
++        if !held {
++            self.keyboard_input(time, control, KeyState::Pressed);
++        }
++        self.keyboard_input(time, key, KeyState::Pressed);
++        self.keyboard_input(time, key, KeyState::Released);
++        if !held {
++            self.keyboard_input(time, control, KeyState::Released);
++        }
++    }
++
++    fn focused_client(&self) -> Option<ClientId> {
++        let keyboard = self.seat.get_keyboard().unwrap();
++        client_of_focus(keyboard.current_focus().as_ref())
++    }
++
++    fn clipboard_copy(&mut self, nonce: String, cut: bool) {
++        if !self.clipboard.on {
++            return;
++        }
++        // One copy at a time: one that is still waiting has nothing.
++        if let Some(earlier) = self.clipboard.copy.take() {
++            if let Some(token) = earlier.reading {
++                self.handle.remove(token);
++            }
++            self.clipboard
++                .answer(&earlier.nonce, Outcome::Nothing, None);
++        }
++        let Some(client) = self.focused_client() else {
++            self.clipboard.answer(&nonce, Outcome::Nothing, None);
++            return;
++        };
++        if self.text_inputs.focused_is_secret() {
++            // Nothing is pressed.
++            self.clipboard
++                .answer(&nonce, Outcome::Refused(Why::PasswordField), None);
++            return;
++        }
++        let number = self.clipboard.number();
++        self.clipboard.copy = Some(PendingCopy {
++            nonce,
++            client: Some(client),
++            deadline: Instant::now() + COPY_WITHIN,
++            read: None,
++            reading: None,
++            number,
++        });
++        self.press_with_control(if cut { KEY_X } else { KEY_C });
++        let _ = self
++            .handle
++            .insert_source(Timer::from_duration(COPY_WITHIN), move |_, _, state| {
++                state.copy_over(number, None);
++                TimeoutAction::Drop
++            });
++    }
++
++    /// The copy numbered `number` is over: with what was read (`None`: nothing in time).
++    fn copy_over(&mut self, number: u64, outcome: Option<Result<String, Outcome>>) {
++        if self.clipboard.copy.as_ref().map(|c| c.number) != Some(number) {
++            return;
++        }
++        let copy = self.clipboard.copy.take().unwrap();
++        if let Some(token) = copy.reading {
++            self.handle.remove(token);
++        }
++        match outcome {
++            Some(Ok(text)) => self
++                .clipboard
++                .answer(&copy.nonce, Outcome::Text, Some(&text)),
++            Some(Err(outcome)) => self.clipboard.answer(&copy.nonce, outcome, None),
++            None => self.clipboard.answer(&copy.nonce, Outcome::Nothing, None),
++        }
++    }
++
++    /// A client set the clipboard's selection (Smithay lets only the client with the keyboard).
++    pub(crate) fn clipboard_selection_set(&mut self, source: Option<&SelectionSource>) {
++        let Some(source) = source else { return };
++        let focused = self.focused_client();
++        let Some(copy) = self.clipboard.copy.as_mut() else {
++            return;
++        };
++        if copy.read.is_some() || focused.is_none() || copy.client != focused {
++            return;
++        }
++        let number = copy.number;
++        let types = source.mime_types();
++        if types.iter().any(|t| t == SECRET_TYPE) {
++            self.copy_over(number, Some(Err(Outcome::Refused(Why::SecretMarker))));
++            return;
++        }
++        let Some(kind) = TEXT_TYPES
++            .iter()
++            .find(|t| types.iter().any(|have| have == *t))
++            .map(|t| t.to_string())
++        else {
++            self.copy_over(number, Some(Err(Outcome::Nothing)));
++            return;
++        };
++        copy.read = Some(Vec::new());
++        // The selection is the seat's only after this callback: it is asked for at once after.
++        self.handle
++            .insert_idle(move |state| state.read_copied(number, kind));
++    }
++
++    fn read_copied(&mut self, number: u64, kind: String) {
++        use rustix::fs::{OFlags, fcntl_setfl};
++        use rustix::pipe::{PipeFlags, pipe_with};
++        if self.clipboard.copy.as_ref().map(|c| c.number) != Some(number) {
++            return;
++        }
++        let Ok((reader, writer)) = pipe_with(PipeFlags::CLOEXEC) else {
++            self.copy_over(number, Some(Err(Outcome::Nothing)));
++            return;
++        };
++        // Only this end: the other is the client's.
++        if fcntl_setfl(&reader, OFlags::NONBLOCK).is_err() {
++            self.copy_over(number, Some(Err(Outcome::Nothing)));
++            return;
++        }
++        let seat = self.seat.clone();
++        if request_data_device_client_selection(&seat, kind, writer).is_err() {
++            self.copy_over(number, Some(Err(Outcome::Nothing)));
++            return;
++        }
++        let token = self.handle.insert_source(
++            Generic::new(reader, Interest::READ, Mode::Level),
++            move |_, reader, state| Ok(state.copied_readable(number, reader.as_fd())),
++        );
++        match token {
++            Ok(token) => {
++                if let Some(copy) = self.clipboard.copy.as_mut() {
++                    copy.reading = Some(token);
++                }
++            }
++            Err(_) => self.copy_over(number, Some(Err(Outcome::Nothing))),
++        }
++    }
++
++    fn copied_readable(&mut self, number: u64, reader: std::os::fd::BorrowedFd<'_>) -> PostAction {
++        let mut chunk = [0u8; 16384];
++        loop {
++            let Some(copy) = self.clipboard.copy.as_mut().filter(|c| c.number == number) else {
++                return PostAction::Remove;
++            };
++            if Instant::now() >= copy.deadline {
++                copy.reading = None;
++                self.copy_over(number, None);
++                return PostAction::Remove;
++            }
++            match rustix::io::read(reader, &mut chunk) {
++                Ok(0) => {
++                    copy.reading = None;
++                    let read = copy.read.take().unwrap_or_default();
++                    let outcome = judge(&read).map(str::to_string);
++                    self.copy_over(number, Some(outcome));
++                    return PostAction::Remove;
++                }
++                Ok(n) => {
++                    let read = copy.read.get_or_insert_with(Vec::new);
++                    read.extend_from_slice(&chunk[..n]);
++                    if read.len() > MOST_BYTES {
++                        copy.reading = None;
++                        self.copy_over(number, Some(Err(Outcome::TooLarge)));
++                        return PostAction::Remove;
++                    }
++                }
++                Err(rustix::io::Errno::AGAIN) => return PostAction::Continue,
++                Err(rustix::io::Errno::INTR) => {}
++                Err(_) => {
++                    copy.reading = None;
++                    self.copy_over(number, Some(Err(Outcome::Nothing)));
++                    return PostAction::Remove;
++                }
++            }
++        }
++    }
++
++    fn clipboard_paste(&mut self, nonce: String, with_text: bool) {
++        if !self.clipboard.on {
++            return;
++        }
++        if !with_text {
++            // The text of an earlier paste is not pasted again: only what the client has.
++            let seat = self.seat.clone();
++            let ours = current_data_device_selection_userdata(&seat).is_some();
++            if ours {
++                clear_data_device_selection(&self.dh, &seat);
++            }
++            if self.focused_client().is_none() {
++                self.clipboard.answer(&nonce, Outcome::Nothing, None);
++                return;
++            }
++            self.press_with_control(KEY_V);
++            self.clipboard.answer(&nonce, Outcome::Pasted, None);
++            return;
++        }
++        if self.clipboard.texts.iter().any(|(n, _, _)| *n == nonce) {
++            self.paste_now(&nonce);
++            return;
++        }
++        // The text is on its way: what comes after waits for it.
++        let number = self.clipboard.number();
++        self.clipboard.hold = Some(Hold {
++            nonce: nonce.clone(),
++            number,
++        });
++        let _ =
++            self.handle
++                .insert_source(Timer::from_duration(HOLD_AT_MOST), move |_, _, state| {
++                    if state
++                        .clipboard
++                        .hold
++                        .as_ref()
++                        .is_some_and(|h| h.number == number)
++                    {
++                        state.clipboard.hold = None;
++                        state.clipboard.answer(&nonce, Outcome::Nothing, None);
++                        state.release_held();
++                    }
++                    TimeoutAction::Drop
++                });
++    }
++
++    fn paste_now(&mut self, nonce: &str) {
++        let Some(text) = self.clipboard.take_text(nonce) else {
++            self.clipboard.answer(nonce, Outcome::Nothing, None);
++            return;
++        };
++        if let Err(outcome) = judge(text.as_bytes()) {
++            self.clipboard.answer(nonce, outcome, None);
++            return;
++        }
++        if self.focused_client().is_none() {
++            self.clipboard.answer(nonce, Outcome::Nothing, None);
++            return;
++        }
++        let seat = self.seat.clone();
++        set_data_device_selection(
++            &self.dh,
++            &seat,
++            OFFERED_TYPES.iter().map(|t| t.to_string()).collect(),
++            Some(Arc::new(text)),
++        );
++        self.press_with_control(KEY_V);
++        self.clipboard.answer(nonce, Outcome::Pasted, None);
++    }
++
++    /// A client reads the selection the compositor owns: the text is written without waiting
++    /// for the client, and given up after [`SERVE_WITHIN`].
++    pub(crate) fn serve_selection(&mut self, fd: OwnedFd, text: &Offered) {
++        use rustix::fs::{OFlags, fcntl_setfl};
++        if fcntl_setfl(&fd, OFlags::NONBLOCK).is_err() {
++            return;
++        }
++        let text = text.clone();
++        let mut written = 0usize;
++        let started = Instant::now();
++        let token = self.handle.insert_source(
++            Generic::new(fd, Interest::WRITE, Mode::Level),
++            move |_, fd, _| {
++                loop {
++                    if written >= text.len() || started.elapsed() >= SERVE_WITHIN {
++                        return Ok(PostAction::Remove);
++                    }
++                    match rustix::io::write(fd.as_fd(), &text.as_bytes()[written..]) {
++                        Ok(n) => written += n,
++                        Err(rustix::io::Errno::AGAIN) => return Ok(PostAction::Continue),
++                        Err(rustix::io::Errno::INTR) => {}
++                        Err(_) => return Ok(PostAction::Remove),
++                    }
++                }
++            },
++        );
++        if let Ok(token) = token {
++            let _ = self.handle.insert_source(
++                Timer::from_duration(SERVE_WITHIN),
++                move |_, _, state| {
++                    state.handle.remove(token);
++                    TimeoutAction::Drop
++                },
++            );
++        }
++    }
++}
++
++/// A JSON string, quoted and escaped.
++pub fn quote(text: &str) -> String {
++    let mut out = String::with_capacity(text.len() + 2);
++    out.push('"');
++    for c in text.chars() {
++        match c {
++            '"' => out.push_str("\\\""),
++            '\\' => out.push_str("\\\\"),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            c if (c as u32) < 0x20 || c == '\u{7f}' => {
++                out.push_str(&format!("\\u{:04x}", c as u32))
++            }
++            c => out.push(c),
++        }
++    }
++    out.push('"');
++    out
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum Value {
++    Text(String),
++    Bool(bool),
++    Other,
++}
++
++/// Reads one flat JSON object (strings, booleans; numbers and null are read and passed over;
++/// nested objects and arrays are not taken). `None` for anything else.
++pub fn parse_flat(bytes: &[u8]) -> Option<Vec<(String, Value)>> {
++    let text = std::str::from_utf8(bytes).ok()?;
++    let mut chars = text.chars().peekable();
++    let mut fields = Vec::new();
++    fn space(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
++        while chars.peek().is_some_and(|c| c.is_ascii_whitespace()) {
++            chars.next();
++        }
++    }
++    fn string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
++        if chars.next()? != '"' {
++            return None;
++        }
++        let mut out = String::new();
++        loop {
++            match chars.next()? {
++                '"' => return Some(out),
++                '\\' => match chars.next()? {
++                    '"' => out.push('"'),
++                    '\\' => out.push('\\'),
++                    '/' => out.push('/'),
++                    'b' => out.push('\u{8}'),
++                    'f' => out.push('\u{c}'),
++                    'n' => out.push('\n'),
++                    'r' => out.push('\r'),
++                    't' => out.push('\t'),
++                    'u' => {
++                        let hex = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
++                            let digits: String = (0..4).filter_map(|_| chars.next()).collect();
++                            (digits.len() == 4)
++                                .then(|| u32::from_str_radix(&digits, 16).ok())
++                                .flatten()
++                        };
++                        let first = hex(chars)?;
++                        let c = if (0xD800..0xDC00).contains(&first) {
++                            if chars.next()? != '\\' || chars.next()? != 'u' {
++                                return None;
++                            }
++                            let second = hex(chars)?;
++                            if !(0xDC00..0xE000).contains(&second) {
++                                return None;
++                            }
++                            char::from_u32(0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00))?
++                        } else {
++                            char::from_u32(first)?
++                        };
++                        out.push(c);
++                    }
++                    _ => return None,
++                },
++                c if (c as u32) < 0x20 => return None,
++                c => out.push(c),
++            }
++        }
++    }
++    space(&mut chars);
++    if chars.next()? != '{' {
++        return None;
++    }
++    space(&mut chars);
++    if chars.peek() == Some(&'}') {
++        chars.next();
++    } else {
++        loop {
++            space(&mut chars);
++            let key = string(&mut chars)?;
++            space(&mut chars);
++            if chars.next()? != ':' {
++                return None;
++            }
++            space(&mut chars);
++            let value = match *chars.peek()? {
++                '"' => Value::Text(string(&mut chars)?),
++                't' | 'f' | 'n' => {
++                    let word: String =
++                        std::iter::from_fn(|| chars.next_if(|c| c.is_ascii_alphabetic())).collect();
++                    match word.as_str() {
++                        "true" => Value::Bool(true),
++                        "false" => Value::Bool(false),
++                        "null" => Value::Other,
++                        _ => return None,
++                    }
++                }
++                c if c == '-' || c.is_ascii_digit() => {
++                    let _: String = std::iter::from_fn(|| {
++                        chars.next_if(|c| c.is_ascii_digit() || "+-.eE".contains(*c))
++                    })
++                    .collect();
++                    Value::Other
++                }
++                _ => return None,
++            };
++            fields.push((key, value));
++            space(&mut chars);
++            match chars.next()? {
++                ',' => continue,
++                '}' => break,
++                _ => return None,
++            }
++        }
++    }
++    space(&mut chars);
++    chars.next().is_none().then_some(fields)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn what_may_be_carried() {
++        assert_eq!(judge(b"two\tlines\r\nof text"), Ok("two\tlines\r\nof text"));
++        assert_eq!(judge("日本語".as_bytes()), Ok("日本語"));
++        assert_eq!(judge(b""), Err(Outcome::NotText));
++        assert_eq!(judge(b"a\x00b"), Err(Outcome::NotText));
++        assert_eq!(judge(b"a\x1bb"), Err(Outcome::NotText));
++        assert_eq!(judge("a\u{85}b".as_bytes()), Err(Outcome::NotText));
++        assert_eq!(judge(&[0xff, 0xfe]), Err(Outcome::NotText));
++        assert!(judge(&vec![b'a'; MOST_BYTES]).is_ok());
++        assert_eq!(judge(&vec![b'a'; MOST_BYTES + 1]), Err(Outcome::TooLarge));
++    }
++
++    #[test]
++    fn json_goes_there_and_back() {
++        let text = "a \"quoted\" \\ line\nwith\ttab, \u{1} and 日本 😀";
++        let line = format!(
++            r#"{{"kind":"paste_text","nonce":"ab12","text":{}}}"#,
++            quote(text)
++        );
++        let fields = parse_flat(line.as_bytes()).unwrap();
++        assert_eq!(fields[0], ("kind".into(), Value::Text("paste_text".into())));
++        assert_eq!(fields[2], ("text".into(), Value::Text(text.into())));
++        let surrogates =
++            parse_flat(br#"{"t":"\ud83d\ude00","b":true,"n":-1.5e3,"z":null}"#).unwrap();
++        assert_eq!(surrogates[0].1, Value::Text("😀".into()));
++        assert_eq!(surrogates[1].1, Value::Bool(true));
++        assert_eq!(surrogates[2].1, Value::Other);
++        for bad in [
++            &b"{"[..],
++            b"[]",
++            br#"{"a":}"#,
++            br#"{"a":"b"} x"#,
++            br#"{"a":{"b":1}}"#,
++            b"\xff",
++        ] {
++            assert_eq!(parse_flat(bad), None);
++        }
++        assert_eq!(parse_flat(b" { } "), Some(Vec::new()));
++    }
++}
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 6a3c352..d7eb3ca 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -1,7 +1,6 @@
+ use super::{Command, DrmFormat, GstVideoInfo};
+ use gst_video::VideoInfo;
+ use smithay::backend::allocator::format::FormatSet;
+-use smithay::backend::input::AxisSource;
+ use smithay::backend::input::TouchSlot;
+ use smithay::backend::renderer::ImportEgl;
+ use smithay::backend::renderer::gles::GlesRenderer;
+@@ -70,6 +69,7 @@ use std::{
+ };
+ use tracing::debug;
+ 
++pub(crate) mod clipboard;
+ pub(crate) mod cursor;
+ mod focus;
+ mod input;
+@@ -177,6 +177,8 @@ pub struct State {
+     pub(crate) activation_state: XdgActivationState,
+     /// Trial only: the clients' text inputs, for committed text.
+     pub(crate) text_inputs: crate::wayland::handlers::text_input::TextInputs,
++    /// Trial only: copy and paste with the device a person types on (off unless asked for).
++    pub(crate) clipboard: clipboard::Clipboard,
+     _text_input_global: smithay::reexports::wayland_server::backend::GlobalId,
+     /// The last key presses and button presses, for telling an activation token that comes
+     /// of one from one made at will.
+@@ -324,6 +326,7 @@ impl State {
+             viewporter_state,
+             activation_state,
+             text_inputs: Default::default(),
++            clipboard: Default::default(),
+             _text_input_global: text_input_global,
+             input_serials: windows::InputSerials::default(),
+             pointer_window_at: None,
+@@ -1093,6 +1096,12 @@ pub(crate) fn init(
+         &input_context,
+         event_loop.handle(),
+     );
++    // Trial only (Istesso's ADR 0022): copy and paste, with the local sockets in this folder.
++    if let Some(dir) = std::env::var_os("ISTESSO_CLIPBOARD_DIR").filter(|d| !d.is_empty()) {
++        if let Err(err) = state.enable_clipboard(std::path::Path::new(&dir)) {
++            tracing::warn!(%err, "clipboard: copy and paste are off");
++        }
++    }
+ 
+     // init event loop
+     state
+@@ -1105,6 +1114,15 @@ pub(crate) fn init(
+     state
+         .handle
+         .insert_source(command_src, move |event, _, state| {
++            // Input goes through here, so that it can wait while a paste waits for its text
++            // (trial only; nothing waits unless copy and paste are on).
++            let event = match event {
++                Event::Msg(command) => match state.take_input(command) {
++                    Some(command) => Event::Msg(command),
++                    None => return,
++                },
++                closed => closed,
++            };
+             match event {
+                 Event::Msg(Command::VideoInfo(video_info)) => {
+                     apply_video_info(state, video_info, &render_target, render_node.clone());
+@@ -1248,9 +1266,6 @@ pub(crate) fn init(
+                         };
+                     }
+                 }
+-                Event::Msg(Command::TextCommit(text)) => {
+-                    state.commit_text(&text);
+-                }
+                 Event::Msg(Command::CloseWindows) => {
+                     let asked = state.close_windows();
+                     tracing::info!(asked, "Asked the windows to close.");
+@@ -1286,41 +1301,6 @@ pub(crate) fn init(
+                     state.pacing.report();
+                     state.should_quit = true;
+                 }
+-                Event::Msg(Command::KeyboardInput(scancode, key_state)) => {
+-                    let time: Duration = state.clock.now().into();
+-                    let keycode = state.scancode_to_keycode(scancode);
+-                    state.keyboard_input(time.as_millis() as u32, keycode, key_state);
+-                }
+-                Event::Msg(Command::PointerMotion(position)) => {
+-                    let time: Duration = state.clock.now().into();
+-                    state.pointer_motion(
+-                        time.as_millis() as u32,
+-                        time.as_nanos() as u64,
+-                        position,
+-                        position,
+-                    );
+-                    pointer_moved(state);
+-                }
+-                Event::Msg(Command::PointerMotionAbsolute(position)) => {
+-                    let time: Duration = state.clock.now().into();
+-                    state.pointer_motion_absolute(time.as_millis() as u32, position);
+-                    pointer_moved(state);
+-                }
+-                Event::Msg(Command::PointerButton(btn_code, btn_state)) => {
+-                    let time: Duration = state.clock.now().into();
+-                    state.pointer_button(time.as_millis() as u32, btn_code, btn_state);
+-                }
+-                Event::Msg(Command::PointerAxis(horizontal_amount, vertical_amount)) => {
+-                    let time: Duration = state.clock.now().into();
+-                    state.pointer_axis(
+-                        time.as_millis() as u32,
+-                        AxisSource::Wheel,
+-                        horizontal_amount * 3.0 / 120.0,
+-                        vertical_amount * 3.0 / 120.0,
+-                        Some(horizontal_amount),
+-                        Some(vertical_amount),
+-                    );
+-                }
+                 Event::Msg(Command::GetSupportedDmaFormats(sender)) => {
+                     let formats = Bind::<Dmabuf>::supported_formats(&state.renderer);
+                     let supported_formats = match &state.output_buffer {
+@@ -1418,6 +1398,17 @@ pub(crate) fn init(
+                 Event::Msg(Command::TouchFrame) => {
+                     state.touch_frame();
+                 }
++                // Taken above (take_input).
++                Event::Msg(
++                    Command::KeyboardInput(..)
++                    | Command::PointerMotion(_)
++                    | Command::PointerMotionAbsolute(_)
++                    | Command::PointerButton(..)
++                    | Command::PointerAxis(..)
++                    | Command::TextCommit(_)
++                    | Command::ClipboardCopy { .. }
++                    | Command::ClipboardPaste { .. },
++                ) => {}
+             };
+         })
+         .unwrap();
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index 442eb42..4f0837b 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -63,6 +63,12 @@ pub enum Command {
+     /// Trial only: committed text for the client that has the keyboard (its text input, or
+     /// printable ASCII as keys).
+     TextCommit(String),
++    /// Trial only (ADR 0022): press Control-C (Control-X with `cut`) for the client that has
++    /// the keyboard and answer with the selection it sets. The nonce names the answer.
++    ClipboardCopy { nonce: String, cut: bool },
++    /// Trial only (ADR 0022): with `with_text`, make the text sent for this nonce the
++    /// selection and press Control-V; without, withdraw the compositor's own selection first.
++    ClipboardPaste { nonce: String, with_text: bool },
+     Quit,
+ }
+ 
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index 831b3c8..1c6d4fd 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -7,8 +7,14 @@ use wayland_backend::client::Backend;
+ use wayland_client::protocol::wl_callback::WlCallback;
+ use wayland_client::protocol::wl_display::WlDisplay;
+ use wayland_client::protocol::{wl_callback, wl_output, wl_pointer, wl_region};
++use wayland_client::protocol::{
++    wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
++};
++use wayland_protocols::wp::text_input::zv3::client::{
++    zwp_text_input_manager_v3::ZwpTextInputManagerV3, zwp_text_input_v3,
++};
+ use wayland_client::{
+-    Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop,
++    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
+     protocol::{
+         wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+         wl_surface,
+@@ -75,8 +81,19 @@ struct State {
+     /// The last activation token the compositor handed out.
+     activation_token: Option<String>,
+     popups: Vec<Popup>,
++    /// Copy and paste (trial): the data device, the selection as last offered, the text this
++    /// client offers, and the keys it was sent.
++    data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
++    data_device: Option<wl_data_device::WlDataDevice>,
++    selection: Option<wl_data_offer::WlDataOffer>,
++    offering: Option<String>,
++    keys: Vec<(u32, bool)>,
++    text_input_manager: Option<ZwpTextInputManagerV3>,
+ }
+ 
++/// The kinds a data offer said it has.
++type OfferKinds = Arc<std::sync::Mutex<Vec<String>>>;
++
+ /// A popup the client has opened (a menu): whether the compositor has dismissed it.
+ struct Popup {
+     surface: wl_surface::WlSurface,
+@@ -170,6 +187,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
+                             (),
+                         ));
+                 }
++                "wl_data_device_manager" => {
++                    state.data_device_manager = Some(registry.bind::<
++                        wl_data_device_manager::WlDataDeviceManager,
++                        _,
++                        _,
++                    >(name, version.min(3), qh, ()));
++                }
++                "zwp_text_input_manager_v3" => {
++                    state.text_input_manager =
++                        Some(registry.bind::<ZwpTextInputManagerV3, _, _>(name, 1, qh, ()));
++                }
+                 "wl_output" => {
+                     // The compositor only advertises wl_output after the first
+                     // VideoInfo has created it, so this branch may fire well after
+@@ -196,6 +224,65 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
+ delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
+ delegate_noop!(State: ignore xdg_activation_v1::XdgActivationV1);
+ delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
++delegate_noop!(State: ignore wl_data_device_manager::WlDataDeviceManager);
++delegate_noop!(State: ignore ZwpTextInputManagerV3);
++delegate_noop!(State: ignore zwp_text_input_v3::ZwpTextInputV3);
++
++impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
++    fn event(
++        state: &mut Self,
++        _: &wl_data_device::WlDataDevice,
++        event: wl_data_device::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let wl_data_device::Event::Selection { id } = event {
++            state.selection = id;
++        }
++    }
++
++    wayland_client::event_created_child!(State, wl_data_device::WlDataDevice, [
++        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, OfferKinds::default())
++    ]);
++}
++
++impl Dispatch<wl_data_offer::WlDataOffer, OfferKinds> for State {
++    fn event(
++        _: &mut Self,
++        _: &wl_data_offer::WlDataOffer,
++        event: wl_data_offer::Event,
++        kinds: &OfferKinds,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let wl_data_offer::Event::Offer { mime_type } = event {
++            kinds.lock().unwrap().push(mime_type);
++        }
++    }
++}
++
++impl Dispatch<wl_data_source::WlDataSource, ()> for State {
++    fn event(
++        state: &mut Self,
++        _: &wl_data_source::WlDataSource,
++        event: wl_data_source::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let wl_data_source::Event::Send { fd, .. } = event {
++            // In a thread of its own: the compositor reads while the test turns its loop, and a
++            // text larger than the pipe would otherwise block here.
++            use std::io::Write;
++            let mut file = File::from(fd);
++            let text = state.offering.clone().unwrap_or_default();
++            std::thread::spawn(move || {
++                let _ = file.write_all(text.as_bytes());
++            });
++        }
++    }
++}
+ 
+ impl Dispatch<xdg_popup::XdgPopup, usize> for State {
+     fn event(
+@@ -263,6 +350,12 @@ impl WaylandClient {
+             activation: None,
+             activation_token: None,
+             popups: Vec::new(),
++            data_device_manager: None,
++            data_device: None,
++            selection: None,
++            offering: None,
++            keys: Vec::new(),
++            text_input_manager: None,
+         };
+ 
+         WaylandClient {
+@@ -286,6 +379,81 @@ impl WaylandClient {
+         self.queue.dispatch_pending(&mut self.state).unwrap();
+     }
+ 
++    /// The data device of this client's seat (made the first time).
++    fn data_device(&mut self) -> wl_data_device::WlDataDevice {
++        if self.state.data_device.is_none() {
++            let device = self.state.data_device_manager.as_ref().unwrap().get_data_device(
++                self.state.seat.as_ref().unwrap(),
++                &self.qh,
++                (),
++            );
++            self.state.data_device = Some(device);
++        }
++        self.state.data_device.clone().unwrap()
++    }
++
++    /// Asks for the data device, so that the selection is offered to this client.
++    pub fn watch_selection(&mut self) {
++        self.data_device();
++    }
++
++    /// Sets the selection to `text`, offered as these kinds, as an application does on
++    /// Control-C. Serial: of the last key this client had.
++    pub fn set_selection(&mut self, text: &str, kinds: &[&str]) {
++        let device = self.data_device();
++        let source = self
++            .state
++            .data_device_manager
++            .as_ref()
++            .unwrap()
++            .create_data_source(&self.qh, ());
++        for kind in kinds {
++            source.offer(kind.to_string());
++        }
++        self.state.offering = Some(text.to_string());
++        device.set_selection(Some(&source), self.state.last_key_serial.unwrap_or(0));
++    }
++
++    /// The kinds of the selection as last offered to this client (`None`: there is none).
++    pub fn selection_kinds(&self) -> Option<Vec<String>> {
++        let offer = self.state.selection.as_ref()?;
++        Some(offer.data::<OfferKinds>()?.lock().unwrap().clone())
++    }
++
++    /// Asks for the selection in this kind: the end to read it from.
++    pub fn receive_selection(&mut self, kind: &str) -> std::io::PipeReader {
++        let (reader, writer) = std::io::pipe().unwrap();
++        self.state
++            .selection
++            .as_ref()
++            .unwrap()
++            .receive(kind.to_string(), writer.as_fd());
++        drop(writer);
++        self.conn.flush().unwrap();
++        reader
++    }
++
++    /// The keys this client was sent (Linux numbers, pressed or not), since the last time.
++    pub fn take_keys(&mut self) -> Vec<(u32, bool)> {
++        std::mem::take(&mut self.state.keys)
++    }
++
++    /// Enables a text input for a password field, as a toolkit does.
++    pub fn enable_password_field(&mut self) {
++        let input = self
++            .state
++            .text_input_manager
++            .as_ref()
++            .unwrap()
++            .get_text_input(self.state.seat.as_ref().unwrap(), &self.qh, ());
++        input.enable();
++        input.set_content_type(
++            zwp_text_input_v3::ContentHint::empty(),
++            zwp_text_input_v3::ContentPurpose::Password,
++        );
++        input.commit();
++    }
++
+     pub fn send_sync(&self) -> Arc<SyncData> {
+         let data = Arc::new(SyncData::default());
+         self.display.sync(&self.qh, data.clone());
+@@ -1140,7 +1308,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+         match event {
+             wl_keyboard::Event::Enter { surface, .. } => state.keyboard_in = Some(surface),
+             wl_keyboard::Event::Leave { .. } => state.keyboard_in = None,
+-            wl_keyboard::Event::Key { serial, .. } => state.last_key_serial = Some(serial),
++            wl_keyboard::Event::Key {
++                serial,
++                key,
++                state: key_state,
++                ..
++            } => {
++                state.last_key_serial = Some(serial);
++                let pressed = key_state == WEnum::Value(wl_keyboard::KeyState::Pressed);
++                state.keys.push((key, pressed));
++            }
+             _ => {}
+         }
+     }
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index ad5c069..cea3dd4 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -6,5 +6,6 @@ mod test_dialogs;
+ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
++mod test_trial_clipboard;
+ mod test_trial_windows;
+ mod test_windows;
+diff --git a/wayland-display-core/src/tests/test_trial_clipboard.rs b/wayland-display-core/src/tests/test_trial_clipboard.rs
+new file mode 100644
+index 0000000..f248213
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_trial_clipboard.rs
+@@ -0,0 +1,314 @@
++//! Trial only (Istesso's ADR 0022): copy and paste with the device a person types on. A real
++//! Wayland client has the keyboard; the agent's side is played by sockets of the test's own.
++
++use crate::Command;
++use crate::comp::clipboard::{Value, parse_flat, quote};
++use crate::tests::fixture::Fixture;
++use smithay::backend::input::{ButtonState, KeyState};
++use smithay::utils::Point;
++use std::io::Read;
++use std::os::unix::net::UnixDatagram;
++use std::time::{Duration, Instant};
++use test_log::test;
++
++const CONTROL: u32 = 29;
++const KEY_A: u32 = 30;
++const KEY_C: u32 = 46;
++const KEY_V: u32 = 47;
++const KEY_X: u32 = 45;
++
++/// A compositor with copy and paste on, a window of the client that has the keyboard, and the
++/// agent's ends: where answers come, and where text is sent.
++struct Agent {
++    f: Fixture,
++    answers: UnixDatagram,
++    to: std::path::PathBuf,
++    _dir: tempfile::TempDir,
++}
++
++fn agent() -> Agent {
++    let dir = tempfile::tempdir().unwrap();
++    let answers = UnixDatagram::bind(dir.path().join("clipboard-answer.sock")).unwrap();
++    answers.set_nonblocking(true).unwrap();
++    let mut f = Fixture::new();
++    f.server.enable_clipboard(dir.path()).unwrap();
++    f.create_window(320, 240);
++    f.server
++        .pointer_motion_absolute(0, Point::from((160.0, 120.0)));
++    f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    f.server.pointer_button(0, 0x110, ButtonState::Released);
++    f.round_trip();
++    assert_eq!(f.client.keyboard_window(), Some(0));
++    f.client.watch_selection();
++    f.round_trip();
++    f.client.take_keys();
++    Agent {
++        f,
++        answers,
++        to: dir.path().join("clipboard.sock"),
++        _dir: dir,
++    }
++}
++
++impl Agent {
++    fn send(&self, line: &str) {
++        UnixDatagram::unbound()
++            .unwrap()
++            .send_to(line.as_bytes(), &self.to)
++            .unwrap();
++    }
++
++    /// Turns the loop until an answer comes, for at most `within`.
++    fn answer(&mut self, within: Duration) -> Option<Vec<(String, Value)>> {
++        let until = Instant::now() + within;
++        let mut buffer = vec![0u8; 256 * 1024];
++        while Instant::now() < until {
++            self.f.update_server();
++            self.f.update_client();
++            if let Ok(n) = self.answers.recv(&mut buffer) {
++                return parse_flat(&buffer[..n]);
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        None
++    }
++
++    fn input(&mut self, command: Command) {
++        assert!(self.f.server.take_input(command).is_none());
++    }
++
++    fn turn(&mut self, times: usize) {
++        for _ in 0..times {
++            self.f.update_server();
++            self.f.update_client();
++            std::thread::sleep(Duration::from_millis(5));
++        }
++    }
++}
++
++fn field<'a>(answer: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
++    answer.iter().find(|(k, _)| k == key).map(|(_, v)| v)
++}
++
++fn text(s: &str) -> Value {
++    Value::Text(s.to_string())
++}
++
++fn copy(nonce: &str, cut: bool) -> Command {
++    Command::ClipboardCopy {
++        nonce: nonce.into(),
++        cut,
++    }
++}
++
++fn paste(nonce: &str, with_text: bool) -> Command {
++    Command::ClipboardPaste {
++        nonce: nonce.into(),
++        with_text,
++    }
++}
++
++/// Control and `key`, pressed and let go, and nothing else.
++fn pressed_with_control(key: u32) -> Vec<(u32, bool)> {
++    vec![(CONTROL, true), (key, true), (key, false), (CONTROL, false)]
++}
++
++#[test]
++fn hello_is_answered_with_its_nonce() {
++    let mut a = agent();
++    a.send(r#"{"kind":"hello","nonce":"00ff"}"#);
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "kind"), Some(&text("hello")));
++    assert_eq!(field(&answer, "nonce"), Some(&text("00ff")));
++}
++
++#[test]
++fn a_copy_presses_control_c_and_answers_with_the_selection_the_client_sets() {
++    let mut a = agent();
++    a.input(copy("n1", false));
++    a.turn(3);
++    assert_eq!(a.f.client.take_keys(), pressed_with_control(KEY_C));
++    let copied = "a line\nand 日本語\twith a tab";
++    a.f.client
++        .set_selection(copied, &["text/plain;charset=utf-8", "text/html"]);
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "nonce"), Some(&text("n1")));
++    assert_eq!(field(&answer, "result"), Some(&text("text")));
++    assert_eq!(field(&answer, "text"), Some(&text(copied)));
++}
++
++#[test]
++fn a_cut_presses_control_x_and_control_held_already_is_not_pressed_again() {
++    let mut a = agent();
++    // The Command key arrives as Control and is held.
++    a.input(Command::KeyboardInput(CONTROL, KeyState::Pressed));
++    a.input(copy("n2", true));
++    a.turn(3);
++    assert_eq!(
++        a.f.client.take_keys(),
++        vec![(CONTROL, true), (KEY_X, true), (KEY_X, false)]
++    );
++    a.f.client.set_selection("cut", &["UTF8_STRING"]);
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "text"), Some(&text("cut")));
++}
++
++#[test]
++fn a_selection_set_before_the_copy_is_not_taken() {
++    let mut a = agent();
++    a.f.client.set_selection("old", &["text/plain"]);
++    a.turn(3);
++    a.input(copy("n3", false));
++    let answer = a.answer(Duration::from_secs(2)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("none")));
++}
++
++#[test]
++fn a_copy_from_a_client_that_took_the_keyboard_meanwhile_is_not_taken() {
++    let mut a = agent();
++    let mut other = a.f.another_application();
++    a.input(copy("n4", false));
++    a.turn(2);
++    // Another application's window comes and takes the keyboard; it sets the selection.
++    other.create_window();
++    a.f.round_trip_with(&mut other);
++    other.setup_window(320, 240);
++    a.f.round_trip_with(&mut other);
++    a.f.round_trip_with(&mut other);
++    a.f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    a.f.server.pointer_button(0, 0x110, ButtonState::Released);
++    a.f.round_trip_with(&mut other);
++    other.watch_selection();
++    other.set_selection("theirs", &["text/plain"]);
++    a.f.round_trip_with(&mut other);
++    let answer = a.answer(Duration::from_secs(2)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("none")));
++}
++
++#[test]
++fn a_copy_from_a_password_field_is_refused_without_a_key() {
++    let mut a = agent();
++    a.f.client.enable_password_field();
++    a.f.round_trip();
++    a.input(copy("n5", false));
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("refused")));
++    assert_eq!(field(&answer, "why"), Some(&text("password_field")));
++    a.turn(3);
++    assert_eq!(a.f.client.take_keys(), Vec::new());
++}
++
++#[test]
++fn a_selection_marked_secret_is_refused_unread() {
++    let mut a = agent();
++    a.input(copy("n6", false));
++    a.turn(2);
++    a.f.client
++        .set_selection("hunter2", &["text/plain", "x-kde-passwordManagerHint"]);
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("refused")));
++    assert_eq!(field(&answer, "why"), Some(&text("secret_marker")));
++    assert_eq!(field(&answer, "text"), None);
++}
++
++#[test]
++fn a_copy_over_the_limit_or_not_text_is_not_carried() {
++    let mut a = agent();
++    a.input(copy("n7", false));
++    a.turn(2);
++    a.f.client
++        .set_selection(&"a".repeat(65537), &["text/plain"]);
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("too_large")));
++
++    a.input(copy("n8", false));
++    a.turn(2);
++    a.f.client.set_selection("bell\u{7}", &["text/plain"]);
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("not_text")));
++}
++
++#[test]
++fn a_paste_makes_the_text_the_selection_then_presses_control_v() {
++    let mut a = agent();
++    let pasted = "pasted \"text\"\nline two";
++    a.send(&format!(
++        r#"{{"kind":"paste_text","nonce":"p1","text":{}}}"#,
++        quote(pasted)
++    ));
++    a.turn(3);
++    a.input(paste("p1", true));
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("pasted")));
++    a.turn(3);
++    assert_eq!(a.f.client.take_keys(), pressed_with_control(KEY_V));
++    let kinds = a.f.client.selection_kinds().unwrap();
++    assert!(kinds.contains(&"text/plain;charset=utf-8".to_string()));
++    let mut reader = a.f.client.receive_selection("text/plain;charset=utf-8");
++    a.turn(5);
++    let mut read = String::new();
++    reader.read_to_string(&mut read).unwrap();
++    assert_eq!(read, pasted);
++}
++
++#[test]
++fn keys_after_a_paste_wait_for_its_text_and_come_after_control_v() {
++    let mut a = agent();
++    a.input(paste("p2", true));
++    a.input(Command::KeyboardInput(KEY_A, KeyState::Pressed));
++    a.input(Command::KeyboardInput(KEY_A, KeyState::Released));
++    a.turn(3);
++    assert_eq!(a.f.client.take_keys(), Vec::new());
++    a.send(r#"{"kind":"paste_text","nonce":"p2","text":"x"}"#);
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("pasted")));
++    a.turn(3);
++    let mut keys = pressed_with_control(KEY_V);
++    keys.extend([(KEY_A, true), (KEY_A, false)]);
++    assert_eq!(a.f.client.take_keys(), keys);
++}
++
++#[test]
++fn a_paste_whose_text_does_not_come_lets_the_keys_go_on() {
++    let mut a = agent();
++    a.input(paste("p3", true));
++    a.input(Command::KeyboardInput(KEY_A, KeyState::Pressed));
++    a.input(Command::KeyboardInput(KEY_A, KeyState::Released));
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("none")));
++    a.turn(3);
++    assert_eq!(a.f.client.take_keys(), vec![(KEY_A, true), (KEY_A, false)]);
++}
++
++#[test]
++fn a_paste_without_text_withdraws_the_earlier_text_then_presses_control_v() {
++    let mut a = agent();
++    a.send(r#"{"kind":"paste_text","nonce":"p4","text":"earlier"}"#);
++    a.turn(3);
++    a.input(paste("p4", true));
++    a.answer(Duration::from_secs(1)).unwrap();
++    a.turn(3);
++    assert!(a.f.client.selection_kinds().is_some());
++    a.f.client.take_keys();
++    a.input(paste("p5", false));
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("pasted")));
++    a.turn(3);
++    assert_eq!(a.f.client.selection_kinds(), None);
++    assert_eq!(a.f.client.take_keys(), pressed_with_control(KEY_V));
++}
++
++#[test]
++fn a_paste_over_the_limit_is_not_pasted() {
++    let mut a = agent();
++    a.send(&format!(
++        r#"{{"kind":"paste_text","nonce":"p6","text":{}}}"#,
++        quote(&"b".repeat(65537))
++    ));
++    a.turn(3);
++    a.input(paste("p6", true));
++    let answer = a.answer(Duration::from_secs(1)).unwrap();
++    assert_eq!(field(&answer, "result"), Some(&text("too_large")));
++    a.turn(3);
++    assert_eq!(a.f.client.take_keys(), Vec::new());
++}
+diff --git a/wayland-display-core/src/wayland/handlers/data_device.rs b/wayland-display-core/src/wayland/handlers/data_device.rs
+index a51dbf4..6e207fd 100644
+--- a/wayland-display-core/src/wayland/handlers/data_device.rs
++++ b/wayland-display-core/src/wayland/handlers/data_device.rs
+@@ -1,4 +1,7 @@
+-use smithay::wayland::selection::SelectionHandler;
++use std::os::fd::OwnedFd;
++
++use smithay::input::Seat;
++use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
+ use smithay::{
+     delegate_data_device,
+     wayland::selection::data_device::{
+@@ -13,7 +16,28 @@ impl ServerDndGrabHandler for State {}
+ impl ClientDndGrabHandler for State {}
+ 
+ impl SelectionHandler for State {
+-    type SelectionUserData = ();
++    /// The text the compositor offers after a paste (trial only, ADR 0022).
++    type SelectionUserData = Option<crate::comp::clipboard::Offered>;
++
++    fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, _: Seat<Self>) {
++        // The clipboard only: the primary selection is never read.
++        if ty == SelectionTarget::Clipboard {
++            self.clipboard_selection_set(source.as_ref());
++        }
++    }
++
++    fn send_selection(
++        &mut self,
++        ty: SelectionTarget,
++        _mime_type: String,
++        fd: OwnedFd,
++        _: Seat<Self>,
++        user_data: &Self::SelectionUserData,
++    ) {
++        if let (SelectionTarget::Clipboard, Some(text)) = (ty, user_data) {
++            self.serve_selection(fd, text);
++        }
++    }
+ }
+ 
+ impl DataDeviceHandler for State {
+diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
+index a5d91e4..c0a032e 100644
+--- a/wayland-display-core/src/wayland/handlers/text_input.rs
++++ b/wayland-display-core/src/wayland/handlers/text_input.rs
+@@ -104,6 +104,11 @@ struct Instance {
+     /// What the client asked for since its last `commit`.
+     pending: Option<bool>,
+     enabled: bool,
++    /// Whether the client said its field is for a password or a PIN (applied at `commit`, as
++    /// the protocol's state is), and what it said since its last `commit`. Trial only: a copy
++    /// from such a field is refused (ADR 0022).
++    secret: bool,
++    pending_secret: Option<bool>,
+     /// The surface it was told it entered, if any.
+     entered: Option<WlSurface>,
+ }
+@@ -123,6 +128,8 @@ impl TextInputs {
+             commits: 0,
+             pending: None,
+             enabled: false,
++            secret: false,
++            pending_secret: None,
+             entered: None,
+         };
+         if let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) {
+@@ -158,6 +165,8 @@ impl TextInputs {
+             // Until the client enables it again for the new surface.
+             instance.enabled = false;
+             instance.pending = None;
++            instance.secret = false;
++            instance.pending_secret = None;
+         }
+         self.focus = surface;
+         if let Some(focus) = &self.focus {
+@@ -184,6 +193,17 @@ impl TextInputs {
+             .then_some(focus)
+     }
+ 
++    /// Whether the client that has the keyboard has an enabled text input there that it said is
++    /// for a password or a PIN.
++    pub fn focused_is_secret(&self) -> bool {
++        let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
++            return false;
++        };
++        self.instances
++            .iter()
++            .any(|i| i.enabled && i.secret && i.entered.as_ref() == Some(focus))
++    }
++
+     /// Hands `text` to the enabled text input of the client that has the keyboard. False when
+     /// there is none.
+     pub fn commit(&mut self, text: &str) -> bool {
+@@ -349,6 +369,8 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+             zwp_text_input_v3::Request::Enable => {
+                 if let Some(instance) = state.text_inputs.instance(resource) {
+                     instance.pending = Some(true);
++                    // Enabling starts the state again: the content type is told after it.
++                    instance.pending_secret = Some(false);
+                 }
+             }
+             zwp_text_input_v3::Request::Disable => {
+@@ -363,12 +385,25 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+                         // Only a text input that was told it entered a surface may be enabled.
+                         instance.enabled = enable && instance.entered.is_some();
+                     }
++                    if let Some(secret) = instance.pending_secret.take() {
++                        instance.secret = secret;
++                    }
++                }
++            }
++            zwp_text_input_v3::Request::SetContentType { purpose, .. } => {
++                use smithay::reexports::wayland_server::WEnum;
++                use zwp_text_input_v3::ContentPurpose;
++                if let Some(instance) = state.text_inputs.instance(resource) {
++                    instance.pending_secret = Some(matches!(
++                        purpose,
++                        WEnum::Value(ContentPurpose::Password | ContentPurpose::Pin)
++                    ));
+                 }
+             }
+             zwp_text_input_v3::Request::Destroy => {
+                 state.text_inputs.remove(&resource.id());
+             }
+-            // Surrounding text, content type, cursor rectangle: nothing on this side uses them.
++            // Surrounding text, cursor rectangle: nothing on this side uses them.
+             _ => {}
+         }
+     }

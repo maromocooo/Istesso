@@ -386,3 +386,17 @@ AURA の試しで、動かない Blender の窓が、毎秒 36 枚、どれも 3
 ホストの `~/.cache/istesso-compositor-wip/`（この作業のフォルダー。要らなくなったら、フォルダーごと消せる）。`selftest/run.sh` が自己試験、`gwd-trial13` がいまの試用のビルド（`gwd-trial8` は上に出していた版）（`gwd-trial6` は持ち主の手の確かめに使った前の版、`gwd-trial7` はその次）、`gwd-prefix` が「使っている窓」を伝えない比べるための版、`gwd-measuring2` が判定のビルドを確かめたもの（`gwd-trial3` は前の版）。記録には、テスト用のキーしか入っていない。
 
 Firefox は、試し用のプロファイルの `xulstore.json`（窓の大きさの覚え）を、自分で書き換えた（中身は読んでいない）。次に起動したとき、Firefox が自分から最大化を頼むことがある。
+
+## 文字のコピーと貼り付け（試用だけ、`gwd-trial28`、2026-11-19）
+
+Istesso の ADR 0022（`trial-daily-clipboard` ブランチ）の、Ubuntu のコンポジターの側。7 つ目の試用の修正 `gst-wayland-display-trial-y-clipboard.patch`（名前の順で、trial-x-text-input のあと）。**計測するビルドには入れない。**
+
+- 環境変数 `ISTESSO_CLIPBOARD_DIR`（`input.sock` のあるフォルダー）があるときだけ働く。なければ、口を開かず、印も読み捨てる。
+- そのフォルダーに `clipboard.sock`（データグラム、0600）を開く。エージェントからの `hello`（同じ合い言葉で答える）と、貼り付けの文字 `paste_text` を受ける。答えは `clipboard-answer.sock` へ送る。
+- 順番の印は、キーと同じ道の上流のイベント `ClipboardCopy`（nonce、cut）と `ClipboardPaste`（nonce、with-text）。文字は載らない。要素のデバッグの行は、この 2 つと `TextCommit` の中身を書かなくした。
+- コピー：キーボードを持つクライアントの text-input-v3 の目的が password か pin なら、キーを押さずに `refused`。そうでなければ Control-C（cut なら Control-X。Control が押されていれば C だけ）を押し、同じクライアントが次に置いた選択を、ループの中で読む（キーから 0.5 秒、64 KiB と 1 バイトまで）。`x-kde-passwordManagerHint` があれば読まずに `refused`。
+- 貼り付け：印のあとの入力（キー、ポインター、確定した文字、次の印）を、文字が届くまで持つ（0.2 秒まで。過ぎたら `none` で、持っていたものを順に渡す）。届いたら、コンポジターが選択の持ち主になり、Control-V を押す。文字のない貼り付けは、先に、コンポジターが前に置いた選択を取り下げる。プライマリーの選択は、読みも置きもしない。
+- 文字、その大きさ、合い言葉は、ログに書かない。答えの種類ごとの数だけ。
+- `scripts/check-plugin.sh`：試用の修正だけが足すファイルに `wayland/handlers/text_input.rs` と `comp/clipboard.rs`、プラグインの中の文字列に `clipboard: answered` を足した。
+
+確かめたこと（ホスト、2026-11-19）：`scripts/build-compositor.sh <自分のフォルダー>/gwd-trial28 --trial --test` で、7 つの修正が当たり、テストは 127 本すべて通った（このうち 15 本が新しい。本物の Wayland クライアントで、`hello`、コピー、切り取り、前からある選択は取らない、ほかのアプリがキーボードを取ったら取らない、パスワードの欄、秘密の印、上限と制御文字、貼り付け、文字を待つあいだのキー、期限、文字のない貼り付けの取り下げ、上限を超えた貼り付け。ほかに、上限と JSON の 2 本）。クリップボードのテストだけを 3 回続けて流して、3 回とも通った。`check-plugin.sh` は 1（試用）。試用版には、まだ組み込んでいない。本物のアプリ（Firefox、Blender、Text Editor）では、まだ試していない。
