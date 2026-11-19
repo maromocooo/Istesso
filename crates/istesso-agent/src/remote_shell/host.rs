@@ -75,6 +75,10 @@ pub struct ShellSettings {
     /// socket), and the folder put first on its `PATH`.
     pub workspace_env: Vec<(String, String)>,
     pub workspace_bin: Option<PathBuf>,
+    /// Where the projects registered on this machine are looked up, for a
+    /// device that names one instead of a folder (`istesso projects add`).
+    /// Without it, only folders are taken.
+    pub projects: Option<crate::Paths>,
 }
 
 /// A shell that has started and has not been handed its conversation yet.
@@ -189,17 +193,36 @@ fn language(asked: Option<&str>, has: impl Fn(&str) -> bool) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The folder the shell starts in: the project the device named, or home.
-fn start_folder(project: Option<&str>, home: &Path) -> Result<PathBuf, String> {
+/// The folder the shell starts in: the folder the device named, the folder
+/// of the project it named, or home. A project's name never looks like a
+/// path (it starts with a letter or digit and has no `/`), and a relative
+/// path was never taken, so the two cannot be mistaken for each other.
+/// `registered` gives the folder of a project registered on this machine.
+fn start_folder(
+    project: Option<&str>,
+    home: &Path,
+    registered: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
     let folder = match project {
         None => return Ok(home.to_path_buf()),
         Some(path) if path.contains('\0') => return Err("that is not a folder name".into()),
         Some("~") => home.to_path_buf(),
         Some(path) if path.starts_with("~/") => home.join(&path[2..]),
         Some(path) if Path::new(path).is_absolute() => PathBuf::from(path),
+        Some(name) if crate::projects::validate_name(name).is_ok() => {
+            let Some(folder) = registered(name) else {
+                return Err("no project of that name is registered on the host".into());
+            };
+            if !folder.is_dir() {
+                return Err("the folder of that project is not on the host any more".into());
+            }
+            return Ok(folder);
+        }
         Some(_) => {
             return Err(
-                "the project folder must be an absolute path on the host or start with ~/".into(),
+                "the project folder must be an absolute path on the host or start with ~/, \
+                 or be the name of a project registered there"
+                    .into(),
             )
         }
     };
@@ -253,7 +276,12 @@ impl Shell {
     pub fn start(request: &ShellRequest, settings: &ShellSettings) -> Result<Shell, String> {
         sys::refuse_root(sys::is_root())?;
         let account = sys::account()?;
-        let folder = start_folder(request.project.as_deref(), &account.home)?;
+        let folder = start_folder(request.project.as_deref(), &account.home, |name| {
+            settings
+                .projects
+                .as_ref()
+                .and_then(|paths| crate::projects::folder(paths, name))
+        })?;
         let (program, argv0) = match &settings.program {
             Some(program) => (program.clone(), program_name(program)),
             None => (
@@ -919,13 +947,42 @@ mod tests {
     #[test]
     fn the_shell_starts_in_the_project_or_at_home() {
         let home = std::env::temp_dir();
-        assert_eq!(start_folder(None, &home).unwrap(), home);
-        assert_eq!(start_folder(Some("~"), &home).unwrap(), home);
-        assert_eq!(start_folder(Some("/"), &home).unwrap(), PathBuf::from("/"));
-        assert!(start_folder(Some("relative/folder"), &home).is_err());
-        assert!(start_folder(Some("/no/such/folder/here"), &home).is_err());
-        assert!(start_folder(Some("~/no-such-folder-here-either"), &home).is_err());
-        assert!(start_folder(Some("/tmp\u{0}x"), &home).is_err());
+        let none = |_: &str| None;
+        assert_eq!(start_folder(None, &home, none).unwrap(), home);
+        assert_eq!(start_folder(Some("~"), &home, none).unwrap(), home);
+        assert_eq!(
+            start_folder(Some("/"), &home, none).unwrap(),
+            PathBuf::from("/")
+        );
+        assert!(start_folder(Some("relative/folder"), &home, none).is_err());
+        assert!(start_folder(Some("/no/such/folder/here"), &home, none).is_err());
+        assert!(start_folder(Some("~/no-such-folder-here-either"), &home, none).is_err());
+        assert!(start_folder(Some("/tmp\u{0}x"), &home, none).is_err());
+    }
+
+    #[test]
+    fn a_project_is_named_by_a_word_and_never_by_a_path() {
+        let home = std::env::temp_dir();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let registered = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            match name {
+                "demo" => Some(home.clone()),
+                "gone" => Some(PathBuf::from("/no/such/folder/here")),
+                _ => None,
+            }
+        };
+        assert_eq!(start_folder(Some("demo"), &home, registered).unwrap(), home);
+        let unknown = start_folder(Some("other"), &home, registered).unwrap_err();
+        assert!(unknown.contains("no project of that name"), "{unknown}");
+        assert!(!unknown.contains("other"), "the name sent is not quoted");
+        assert!(start_folder(Some("gone"), &home, registered).is_err());
+        // What is not a project name is not looked up: a path with a slash,
+        // a hidden folder's name, `..`, an option.
+        for path in ["work/demo", ".demo", "..", "-demo", "two words"] {
+            assert!(start_folder(Some(path), &home, registered).is_err());
+        }
+        assert_eq!(*asked.borrow(), ["demo", "other", "gone"]);
     }
 
     #[test]

@@ -384,6 +384,43 @@ fn the_shell_starts_in_the_project_folder() {
 }
 
 #[test]
+fn the_shell_starts_in_a_project_named_by_the_device() {
+    let pair = ShellPair::new("sh-project-name", true);
+    let project = TempDir::new("named-project");
+    let folder = project.path().canonicalize().unwrap();
+    crate::projects::add(&pair.host.paths(), "Demo", &folder).unwrap();
+    // Any case, as `istesso projects` matches names.
+    let mut terminal = pair.open(ShellRequest {
+        project: Some("demo".into()),
+        ..request(80, 24)
+    });
+    terminal.type_in("pwd -P; exit\n");
+    assert_eq!(terminal.ended(), Some(ShellEnd::Code(0)));
+    assert!(
+        terminal.printed().contains(&folder.display().to_string()),
+        "{}",
+        terminal.printed()
+    );
+
+    // A name nobody registered here is refused, and not quoted back.
+    let (_client, answer) = pair.ask(ShellRequest {
+        project: Some("other-name".into()),
+        ..request(80, 24)
+    });
+    match answer {
+        ShellAnswer::Refused { message, .. } => {
+            assert!(message.contains("no project of that name"), "{message}");
+            assert!(!message.contains("other-name"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // What the log says is where, never which.
+    let log = pair.log().join("\n");
+    assert!(log.contains("in a project folder"), "{log}");
+    assert!(!log.contains("Demo") && !log.contains("demo"), "{log}");
+}
+
+#[test]
 fn a_device_the_host_did_not_name_gets_no_shell() {
     let pair = ShellPair::new("sh-off", false);
     let (_client, answer) = pair.ask(request(80, 24));

@@ -1,0 +1,55 @@
+#!/bin/sh
+# ish: a shell on the Ubuntu host over Istesso's own encrypted channel, not
+# ssh (prototype, branch proto-ish-projects). It uses a test identity of its
+# own; the Istesso settings and keys of this Mac are not used.
+#   ish              back in the folder (or project) used last (home the first time)
+#   ish NAME         in the folder of the project NAME, on the machine that
+#                    `istesso projects` says has it; remembered
+#   ish MACHINE:NAME the same, on that machine: for a name more than one
+#                    machine has (ish lists them and opens nothing)
+#   ish work/proj    in ~/work/proj on the host (or an absolute host path); remembered
+#   ish --home       at home on the host; forgets the remembered folder
+# A word with a `/` in it, or one that starts with `.`, is a folder; any other
+# word is a project's name (a name never has a `/` and never starts with `.`).
+# Whether a folder of that name exists is never looked at: the same word
+# always means the same thing. For the folder ~/proj, type `ish ~/proj` or
+# `ish proj/`.
+# A server started in the shell (by you or a coding agent) is forwarded to
+# this Mac: http://localhost:<its port> opens it here (a line `istesso: …`
+# says where, and says so when it listens on every network). A request
+# from the shell to open such a page (BROWSER, xdg-open) opens it in this
+# Mac's default browser; pages elsewhere are not opened.
+#   ish-forwards     list them; ish-forwards stop 8000, or stop --all
+# Leave with `exit` or Control-D, or close the window.
+# Fallback without forwarding: ish-shell-only (same options).
+# ISH_DIR: another test folder (with bin/istesso and config/), and ISH_DEVICE:
+# the host's name in it, for checks.
+D=${ISH_DIR:-"$HOME/Library/Application Support/istesso-dev-shell-test"}
+device=${ISH_DEVICE:-proto-host}
+# The host's address comes from the ssh settings (no network is used for it).
+addr=$(/usr/bin/ssh -G istesso-ubuntu 2>/dev/null | /usr/bin/awk '/^hostname /{print $2; exit}')
+if [ -z "$addr" ]; then
+    echo "ish: no address for istesso-ubuntu in the ssh settings" >&2
+    exit 255
+fi
+# The host's agent for this test listens on 26850 (ISH_PORT: another one, for checks).
+port=${ISH_PORT:-26850}
+run() {
+    ISTESSO_CONFIG_DIR="$D/config" exec "$D/bin/istesso" "$@"
+}
+case "${1:-}" in
+    "") set -- ;;
+    --home) set -- --home ;;
+    # A folder below this Mac's home, as the shell here wrote `~/…`: meant on the host.
+    "$HOME") set -- --project "~" ;;
+    "$HOME"/*) set -- --project "~${1#"$HOME"}" ;;
+    /*) set -- --project "$1" ;;
+    */* | .*) set -- --project "~/$1" ;;
+    *)
+        # A project's name. The project list asks every machine at the
+        # address remembered for it: the host's is remembered first.
+        ISTESSO_CONFIG_DIR="$D/config" "$D/bin/istesso" peers address "$device" "$addr:$port" >/dev/null || exit 255
+        run shell --project-name="$1"
+        ;;
+esac
+run shell "$device" --address "$addr:$port" "$@"

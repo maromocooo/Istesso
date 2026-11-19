@@ -257,6 +257,9 @@ impl Agent {
         } else {
             (None, None)
         };
+        // A device may name a project registered here instead of a folder.
+        #[cfg(unix)]
+        let projects = Some(paths.clone());
         Ok(Agent {
             listener,
             options: options.clone(),
@@ -283,6 +286,7 @@ impl Agent {
                         .map(|opener| opener.environment())
                         .unwrap_or_default(),
                     workspace_bin: opener.as_ref().and_then(|opener| opener.bin.clone()),
+                    projects,
                 },
                 #[cfg(unix)]
                 shells: Mutex::new(HashMap::new()),

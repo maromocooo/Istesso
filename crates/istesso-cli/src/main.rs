@@ -108,13 +108,25 @@ enum Command {
     /// there was no shell or the connection was lost. A prototype (ADR 0007,
     /// proposal); the device has to allow it (`istesso agent --allow-shell`)
     Shell {
-        /// Id or name of the paired device
-        device: String,
+        /// Id or name of the paired device (not with --project-name, which
+        /// finds the device)
+        #[arg(required_unless_present = "project_name")]
+        device: Option<String>,
         /// Start in this folder on the device: an absolute path there, or
         /// one that starts with `~/`. Remembered for the device: without
         /// this, the shell starts in the folder used last time
         #[arg(long, value_name = "DIR", conflicts_with = "home")]
         project: Option<String>,
+        /// Start in this project's folder, on the machine `istesso projects`
+        /// says has it. MACHINE:NAME chooses the machine when more than one
+        /// has a project of that name; nothing is guessed. Remembered for
+        /// that machine, as --project is
+        #[arg(
+            long,
+            value_name = "[MACHINE:]NAME",
+            conflicts_with_all = ["device", "project", "home", "address"]
+        )]
+        project_name: Option<String>,
         /// Start at home, and forget the folder remembered from last time
         #[arg(long)]
         home: bool,
@@ -660,6 +672,7 @@ fn main() -> ExitCode {
     if let Command::Shell {
         device,
         project,
+        project_name,
         home,
         address,
         no_forward,
@@ -667,6 +680,13 @@ fn main() -> ExitCode {
         open_urls,
     } = &cli.command
     {
+        let refuse = |message: &str| {
+            eprintln!("istesso shell: {message}");
+            ExitCode::from(255)
+        };
+        if let Some(Err(message)) = project.as_deref().map(projects::check_folder) {
+            return refuse(&message);
+        }
         let mut pins = Vec::new();
         let from_env = std::env::var("ISTESSO_FORWARD_PINS").unwrap_or_default();
         for pin in forward_pin
@@ -676,16 +696,25 @@ fn main() -> ExitCode {
         {
             match parse_pin(pin) {
                 Some(pin) => pins.push(pin),
-                None => {
-                    eprintln!("istesso shell: --forward-pin {pin}: give PORT or PORT:LOCAL");
-                    return ExitCode::from(255);
-                }
+                None => return refuse(&format!("--forward-pin {pin}: give PORT or PORT:LOCAL")),
             }
         }
+        // A project by its name: the project list says where it is.
+        let (device, address, project) = match project_name {
+            Some(asked) => match projects::shell_target(asked) {
+                Ok(target) => (target.id, target.address, Some(target.name)),
+                Err(message) => return refuse(&message),
+            },
+            None => (
+                device.clone().unwrap_or_default(),
+                address.clone(),
+                project.clone(),
+            ),
+        };
         let options = istesso_agent::remote_shell::client::Options {
-            device: device.clone(),
-            address: address.clone(),
-            project: project.clone(),
+            device,
+            address,
+            project,
             forward: istesso_agent::workspace::device::Settings {
                 enabled: !no_forward,
                 pins,

@@ -289,3 +289,226 @@ fn project_commands_accept_both_list_forms() {
         assert!(Cli::try_parse_from(std::iter::once("istesso").chain(args)).is_ok());
     }
 }
+
+fn with_projects(mut host: HostView, names: &[&str]) -> HostView {
+    host.manifest.as_mut().unwrap().projects = names
+        .iter()
+        .map(|name| Project {
+            id: format!("{}-{name}", host.id),
+            name: name.to_string(),
+            kinds: vec![ProjectKind::Unknown],
+        })
+        .collect();
+    host
+}
+
+// Invented display names, ids and an address from the documentation range.
+const A: &str = "Example A"; // check-private: ok (invented display name)
+const B: &str = "Example B"; // check-private: ok (invented display name)
+const C: &str = "Example C"; // check-private: ok (invented display name)
+const AT: &str = "192.0.2.10:26920";
+
+fn answering(name: &str, projects: &[&str]) -> HostView {
+    let mut host = with_projects(view(name, false, HostState::Awake), projects);
+    host.address = Some(AT.into());
+    host
+}
+
+#[test]
+fn a_project_name_opens_where_the_list_has_it() {
+    let hosts = [
+        with_projects(view(A, true, HostState::Awake), &["desk"]),
+        answering(B, &["Demo", "other"]),
+    ];
+    let expected = ShellTarget {
+        id: format!("id-{B}"),
+        name: "Demo".into(),
+        address: Some(AT.into()),
+    };
+    // Any case, as `istesso projects --name` matches; the machine by its
+    // name in any case, its id, or the beginning of its id.
+    for asked in [
+        "demo".to_string(),
+        "DEMO".into(),
+        format!("{B}:demo"),
+        format!("{}:demo", B.to_uppercase()),
+        format!("id-{B}:demo"),
+    ] {
+        assert_eq!(resolve(&hosts, &asked), Ok(expected.clone()), "{asked}");
+    }
+    let here = resolve(&hosts, "desk").unwrap_err();
+    assert!(here.contains("is on this machine"), "{here}");
+}
+
+#[test]
+fn a_name_on_two_machines_is_never_guessed() {
+    let mut silent = with_projects(view(C, false, HostState::Unknown), &["demo"]);
+    silent.address = None;
+    let hosts = [
+        with_projects(view(A, true, HostState::Awake), &["demo"]),
+        answering(B, &["Demo"]),
+        silent,
+    ];
+    let clash = resolve(&hosts, "demo").unwrap_err();
+    assert!(clash.contains("more than one machine"), "{clash}");
+    for line in [
+        format!("  {A}:demo\t(this machine)"),
+        format!("  {B}:Demo"),
+        format!("  {C}:demo\t(not answering now)"),
+    ] {
+        assert!(clash.lines().any(|l| l == line), "{line:?} in {clash}");
+    }
+    // The candidates are what can be typed: each one opens, or says why not.
+    assert_eq!(
+        resolve(&hosts, &format!("{B}:demo")).unwrap().id,
+        format!("id-{B}")
+    );
+    assert!(resolve(&hosts, &format!("{A}:demo"))
+        .unwrap_err()
+        .contains("is on this machine"));
+    assert!(resolve(&hosts, &format!("{C}:demo"))
+        .unwrap_err()
+        .contains("not answering"));
+
+    // Two machines of the same display name are told apart by their ids.
+    let mut twins = [answering(B, &["demo"]), answering(B, &["demo"])];
+    twins[1].id = "id-twin".into();
+    let clash = resolve(&twins, "demo").unwrap_err();
+    assert!(clash.contains(&format!("  id-{B}:demo")), "{clash}");
+    assert!(clash.contains("  id-twin:demo"), "{clash}");
+    let by_name = resolve(&twins, &format!("{B}:demo")).unwrap_err();
+    assert!(
+        by_name.contains("more than one machine is called"),
+        "{by_name}"
+    );
+    assert_eq!(resolve(&twins, "id-twin:demo").unwrap().id, "id-twin");
+    assert_eq!(resolve(&twins, "id-tw:demo").unwrap().id, "id-twin");
+}
+
+#[test]
+fn an_unreachable_machine_is_said_plainly() {
+    let hosts = [
+        view(A, true, HostState::Awake),
+        with_projects(view(B, false, HostState::Unknown), &["demo"]),
+    ];
+    assert_eq!(
+        resolve(&hosts, "demo").unwrap_err(),
+        format!(
+            "project demo is on {B}, which is not answering now \
+             (timed out waiting for the other device)"
+        )
+    );
+}
+
+#[test]
+fn an_unknown_name_says_so_and_lists_close_names() {
+    let mut never_seen = view(C, false, HostState::Unknown);
+    never_seen.manifest = None;
+    let hosts = [
+        with_projects(view(A, true, HostState::Awake), &["scratch"]),
+        answering(B, &["istesso", "istesso-web", "blender-scenes", "notes"]),
+        never_seen,
+    ];
+    let unknown = resolve(&hosts, "istessso").unwrap_err();
+    let mut lines = unknown.lines();
+    assert_eq!(
+        lines.next(),
+        Some("no machine has a project called istessso")
+    );
+    assert_eq!(lines.next(), Some("did you mean: istesso"));
+    assert_eq!(
+        lines.next(),
+        Some(format!("not known: the projects of {C} (not answering, and never seen)").as_str())
+    );
+    assert_eq!(
+        lines.next(),
+        Some("a folder, not a project? give its path, such as ~/istessso")
+    );
+    assert_eq!(lines.next(), None);
+    let scenes = resolve(&hosts, "scenes").unwrap_err();
+    assert!(scenes.contains("did you mean: blender-scenes"), "{scenes}");
+    let web = resolve(&hosts, "web").unwrap_err();
+    assert!(web.contains("did you mean: istesso-web"), "{web}");
+    let nothing = resolve(&hosts, "zzz").unwrap_err();
+    assert!(!nothing.contains("did you mean"), "{nothing}");
+
+    // Asked on one machine: what that machine has, and where else it is.
+    let there = resolve(&hosts, &format!("{B}:scratch")).unwrap_err();
+    assert!(
+        there.starts_with(&format!("{B} has no project called scratch; it is on: {A}")),
+        "{there}"
+    );
+    let nobody = resolve(&hosts, "Example Z:demo").unwrap_err(); // check-private: ok (invented)
+    assert!(nobody.contains("no machine is called"), "{nobody}");
+}
+
+#[test]
+fn a_project_name_is_never_a_path() {
+    // A word with a slash, or one that starts with a dot, is not a name: it
+    // is never looked up, and the message says so.
+    for asked in [
+        "work/demo",
+        "./demo",
+        ".hidden",
+        "..",
+        "-x",
+        "",
+        "two words",
+    ] {
+        let refused = split_asked(asked).unwrap_err();
+        assert!(refused.contains("is not a project name"), "{refused}");
+    }
+    assert!(split_asked("work/demo").unwrap_err().contains("a folder"));
+    assert!(split_asked(":demo")
+        .unwrap_err()
+        .contains("before the colon"));
+    assert_eq!(split_asked("demo").unwrap(), (None, "demo"));
+    assert_eq!(split_asked("a:b:demo").unwrap(), (Some("a:b"), "demo"));
+    // --project takes folders only, so that a word sent there is never taken
+    // for a project's name by a device that knows names.
+    for folder in ["~", "~/work/demo", "/srv/demo"] {
+        assert!(check_folder(folder).is_ok(), "{folder}");
+    }
+    for word in ["demo", "work/demo", "./demo", "~demo"] {
+        assert!(check_folder(word).is_err(), "{word}");
+    }
+}
+
+#[test]
+fn close_names_are_few_letters_apart_or_inside() {
+    let names = ["Demo", "demo2", "memo", "documents", "de", "DEMO"];
+    assert_eq!(
+        close_names("demo", names.into_iter()),
+        ["demo2", "memo", "de"]
+    );
+    assert_eq!(edit_distance("kitten", "sitting"), 3);
+    assert_eq!(edit_distance("", "abc"), 3);
+    // A swap of two letters next to each other is one slip, not two.
+    assert_eq!(edit_distance("alpah", "alpha"), 1);
+    assert_eq!(
+        close_names("alpah", ["alpha", "beta"].into_iter()),
+        ["alpha"]
+    );
+}
+
+#[test]
+fn shell_takes_a_device_or_a_project_name() {
+    use crate::Cli;
+    use clap::Parser;
+    let parses =
+        |args: &[&str]| Cli::try_parse_from(["istesso", "shell"].iter().chain(args.iter())).is_ok();
+    assert!(parses(&["dev"]));
+    assert!(parses(&["dev", "--project", "~/work"]));
+    assert!(parses(&["--project-name", "demo"]));
+    assert!(parses(&["--project-name", "machine:demo", "--no-forward"]));
+    assert!(!parses(&[]));
+    assert!(!parses(&["dev", "--project-name", "demo"]));
+    assert!(!parses(&[
+        "--project-name",
+        "demo",
+        "--address",
+        "192.0.2.1"
+    ]));
+    assert!(!parses(&["--project-name", "demo", "--home"]));
+    assert!(!parses(&["--project-name", "demo", "--project", "~/x"]));
+}
