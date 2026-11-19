@@ -2,9 +2,11 @@ Committed text for the client that has the keyboard (Istesso's ADR 0007, "確定
 ADR 0020, route d): the compositor offers zwp_text_input_v3 to its clients, without an input
 method, and the custom upstream event TextCommit (text=string) hands a piece of committed text to
 the enabled text input of the client that has the keyboard (commit_string, then done). The text
-inputs of a client are told they entered before its keyboard is. GTK 4.14 (the Text Editor)
-enables its text input only after the focus moved inside its window, not at the start (seen on
-the host; neither this order nor telling the window it is active again changed that). A client
+inputs of a client are told they entered before its keyboard is. When the text input of the
+window that got the keyboard has not enabled itself 0.3 s (and 1 s) later, that window is told
+again that it has the keyboard (wl_keyboard leave and enter to that surface only; the seat's focus
+does not change): the Text Editor (GTK 4.14), when it restores a page from its session, enables
+its text input only after such a second focus (seen on the host). A client
 without an enabled text input gets printable ASCII as key presses (US layout; on another layout
 only letters, digits and the space; Caps Lock is taken into account); anything else is dropped. The text is never logged, only
 how many characters went which way.
@@ -37,10 +39,10 @@ index 5dafbc7..8d36da5 100644
                  } else if structure.has_name("TouchDown") {
                      let x = structure.get::<f64>("x").expect("Should contain x");
 diff --git a/wayland-display-core/src/comp/focus.rs b/wayland-display-core/src/comp/focus.rs
-index f4bd241..0245bf7 100644
+index f4bd241..00b047e 100644
 --- a/wayland-display-core/src/comp/focus.rs
 +++ b/wayland-display-core/src/comp/focus.rs
-@@ -54,6 +54,15 @@ impl KeyboardTarget<State> for FocusTarget {
+@@ -54,6 +54,16 @@ impl KeyboardTarget<State> for FocusTarget {
          keys: Vec<KeysymHandle<'_>>,
          serial: Serial,
      ) {
@@ -53,6 +55,7 @@ index f4bd241..0245bf7 100644
 +            FocusTarget::Popup(p) => p.wl_surface().clone(),
 +        };
 +        data.text_inputs.focus_changed(Some(surface));
++        data.text_inputs_check_soon();
          match self {
              FocusTarget::Wayland(w) => match w.underlying_surface() {
                  WindowSurface::Wayland(w) => {
@@ -141,10 +144,10 @@ index b0ef369..8583d4b 100644
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
 new file mode 100644
-index 0000000..12c70f1
+index 0000000..d6dd56c
 --- /dev/null
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,394 @@
 +//! Trial only: committed text for the client that has the keyboard (Istesso's ADR 0007,
 +//! "確定した文字", and ADR 0020, route d). The device a person types on composes the text with
 +//! its own input method and sends only what was committed; here it is handed to the text input
@@ -315,6 +318,16 @@ index 0000000..12c70f1
 +        }
 +    }
 +
++    /// The surface with the keyboard, when a text input of its client entered it and has not
++    /// enabled itself (nor asked to).
++    fn not_enabled_focus(&self) -> Option<WlSurface> {
++        let focus = self.focus.clone().filter(|s| s.is_alive())?;
++        self.instances
++            .iter()
++            .any(|i| i.entered.as_ref() == Some(&focus) && !i.enabled && i.pending.is_none())
++            .then_some(focus)
++    }
++
 +    /// Hands `text` to the enabled text input of the client that has the keyboard. False when
 +    /// there is none.
 +    pub fn commit(&mut self, text: &str) -> bool {
@@ -335,6 +348,36 @@ index 0000000..12c70f1
 +}
 +
 +impl State {
++    /// After the keyboard moved to a window: if its text input has not enabled itself 0.3 s
++    /// (and again 1 s) later, the window is told once more that it has the keyboard (keyboard
++    /// leave, then enter, to that surface only; the seat's focus does not change). Seen on the
++    /// host: the Text Editor, when it restores a page from its session, enables its text input
++    /// only after its focus moves again.
++    pub fn text_inputs_check_soon(&mut self) {
++        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++        for wait in [300u64, 1000] {
++            let _ = self.handle.insert_source(
++                Timer::from_duration(std::time::Duration::from_millis(wait)),
++                |_, _, state| {
++                    state.tell_keyboard_again_for_text_input();
++                    TimeoutAction::Drop
++                },
++            );
++        }
++    }
++
++    fn tell_keyboard_again_for_text_input(&mut self) {
++        use smithay::input::keyboard::KeyboardTarget;
++        use smithay::utils::SERIAL_COUNTER;
++        let Some(surface) = self.text_inputs.not_enabled_focus() else {
++            return;
++        };
++        let seat = self.seat.clone();
++        KeyboardTarget::leave(&surface, &seat, self, SERIAL_COUNTER.next_serial());
++        KeyboardTarget::enter(&surface, &seat, self, Vec::new(), SERIAL_COUNTER.next_serial());
++        tracing::info!("text input not enabled: the keyboard was told to its window again");
++    }
++
 +    /// Committed text from the device (ADR 0007, "確定した文字"): to the enabled text input of
 +    /// the client that has the keyboard; otherwise printable ASCII as keys; otherwise dropped.
 +    pub fn commit_text(&mut self, text: &str) {
