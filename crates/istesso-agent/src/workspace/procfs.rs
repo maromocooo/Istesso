@@ -5,7 +5,7 @@
 //! looked into (proc_pid_fd(5)); nothing here needs more.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 /// Where the control groups are (cgroup v2).
@@ -19,8 +19,13 @@ const MAX_GROUPS: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listening {
     pub port: u16,
-    /// 4 when it can be reached at 127.0.0.1, 6 when only at ::1.
-    pub family: u8,
+    /// Where the host connects for it: the address it listens on when that
+    /// is a loopback address; 127.0.0.1 for every IPv4 address, ::1 for
+    /// every IPv6 address. Never another address than the socket's own.
+    pub to: SocketAddr,
+    /// The socket that is forwarded, by inode: the one that must still be
+    /// there, and the workspace's, when a connection is made.
+    pub inode: u64,
     /// One of the processes that hold the socket.
     pub pid: i32,
     /// It listens on every address, or on one of a network, as well: other
@@ -38,23 +43,63 @@ pub struct Found {
     pub elsewhere: Vec<u16>,
 }
 
-/// Where a listening socket can be reached from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reach {
-    /// The loopback only: 4 at 127.0.0.1, 6 at ::1 alone.
-    Loopback(u8),
-    /// Every address: the loopback (at 127.0.0.1) and every network.
-    Everywhere,
-    /// An address of one of the networks only.
-    Elsewhere,
-}
-
-/// One listening socket from `/proc/net/tcp{,6}`.
+/// One listening socket from `/proc/net/tcp{,6}`, with the address it is
+/// bound to as written there (an IPv4 address written the IPv6 way stays
+/// so).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Socket {
     pub inode: u64,
+    pub address: IpAddr,
     pub port: u16,
-    pub reach: Reach,
+}
+
+impl Socket {
+    /// The address the host connects to for this socket, when the loopback
+    /// reaches it.
+    fn to(&self) -> Option<SocketAddr> {
+        let address = match self.address {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            v4 => v4,
+        };
+        let to: IpAddr = match address {
+            IpAddr::V4(v4) if v4.is_loopback() => v4.into(),
+            IpAddr::V4(v4) if v4.is_unspecified() => Ipv4Addr::LOCALHOST.into(),
+            IpAddr::V6(v6) if v6.is_loopback() || v6.is_unspecified() => Ipv6Addr::LOCALHOST.into(),
+            _ => return None,
+        };
+        Some(SocketAddr::new(to, self.port))
+    }
+
+    /// Whether other machines reach it: bound to every address or to one of
+    /// a network.
+    fn exposed(&self) -> bool {
+        match self.address {
+            IpAddr::V4(v4) => !v4.is_loopback(),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => !v4.is_loopback(),
+                None => !v6.is_loopback(),
+            },
+        }
+    }
+
+    /// Which socket is forwarded when a port has several: the lower the
+    /// better. 127.0.0.1 itself first, then every IPv4 address, then other
+    /// loopback addresses, then ::1, then every IPv6 address.
+    fn preference(&self) -> u8 {
+        let Some(to) = self.to() else { return u8::MAX };
+        match (self.address, to.ip()) {
+            (IpAddr::V4(a), _) if a == Ipv4Addr::LOCALHOST => 0,
+            (IpAddr::V4(a), _) if a.is_unspecified() => 1,
+            (IpAddr::V4(_), _) => 2,
+            (IpAddr::V6(_), IpAddr::V4(t)) if t == Ipv4Addr::LOCALHOST => 3,
+            (IpAddr::V6(_), IpAddr::V4(_)) => 4,
+            (IpAddr::V6(a), _) if a.is_loopback() => 5,
+            _ => 6,
+        }
+    }
 }
 
 /// The process's session and parent, from `/proc/<pid>/stat`.
@@ -187,7 +232,7 @@ pub fn program_name(pid: i32) -> String {
 }
 
 /// The listening sockets in a `/proc/net/tcp` (`v6` false) or
-/// `/proc/net/tcp6` text, and where each can be reached from.
+/// `/proc/net/tcp6` text.
 pub(crate) fn parse_net_tcp(text: &str, v6: bool) -> Vec<Socket> {
     const LISTEN: &str = "0A";
     text.lines()
@@ -200,40 +245,32 @@ pub(crate) fn parse_net_tcp(text: &str, v6: bool) -> Vec<Socket> {
             let (address, port) = fields.get(1)?.split_once(':')?;
             let port = u16::from_str_radix(port, 16).ok()?;
             let inode: u64 = fields.get(9)?.parse().ok()?;
-            let reach = if v6 {
-                reach_v6(address)?
+            let address = if v6 {
+                IpAddr::V6(address_v6(address)?)
             } else {
-                reach_v4(address)?
+                IpAddr::V4(address_v4(address)?)
             };
-            (port != 0 && inode != 0).then_some(Socket { inode, port, reach })
+            (port != 0 && inode != 0).then_some(Socket {
+                inode,
+                address,
+                port,
+            })
         })
         .collect()
 }
 
 /// An IPv4 address as `/proc/net/tcp` prints it: the four bytes in the
 /// order they are in memory, as one number in hexadecimal.
-fn reach_v4(hex: &str) -> Option<Reach> {
+fn address_v4(hex: &str) -> Option<Ipv4Addr> {
     if hex.len() != 8 {
         return None;
     }
     let word = u32::from_str_radix(hex, 16).ok()?;
-    Some(reach_of_v4(Ipv4Addr::from(word.to_ne_bytes())))
+    Some(Ipv4Addr::from(word.to_ne_bytes()))
 }
 
-fn reach_of_v4(address: Ipv4Addr) -> Reach {
-    if address.is_loopback() {
-        Reach::Loopback(4)
-    } else if address.is_unspecified() {
-        Reach::Everywhere
-    } else {
-        Reach::Elsewhere
-    }
-}
-
-/// An IPv6 address as `/proc/net/tcp6` prints it: four such numbers. On
-/// `::1` alone it is reached at ::1; on every address, at 127.0.0.1 as
-/// well; an IPv4 address written the IPv6 way, as that address.
-fn reach_v6(hex: &str) -> Option<Reach> {
+/// An IPv6 address as `/proc/net/tcp6` prints it: four such numbers.
+fn address_v6(hex: &str) -> Option<Ipv6Addr> {
     if hex.len() != 32 {
         return None;
     }
@@ -242,32 +279,43 @@ fn reach_v6(hex: &str) -> Option<Reach> {
         let word = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok()?;
         chunk.copy_from_slice(&word.to_ne_bytes());
     }
-    let address = Ipv6Addr::from(bytes);
-    Some(if address.is_loopback() {
-        Reach::Loopback(6)
-    } else if address.is_unspecified() {
-        Reach::Everywhere
-    } else if let Some(v4) = address.to_ipv4_mapped() {
-        reach_of_v4(v4)
-    } else {
-        Reach::Elsewhere
-    })
+    Some(Ipv6Addr::from(bytes))
+}
+
+/// Every listening socket of this machine (of its network namespace).
+fn all_listening() -> Vec<Socket> {
+    let mut sockets = Vec::new();
+    for (file, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            sockets.extend(parse_net_tcp(&text, v6));
+        }
+    }
+    sockets
+}
+
+/// The listening sockets on `port`, whoever holds them.
+pub fn listening_on(port: u16) -> Vec<Socket> {
+    all_listening()
+        .into_iter()
+        .filter(|socket| socket.port == port)
+        .collect()
+}
+
+/// The sockets (by inode) that `members` hold.
+pub fn held_by(members: &HashSet<i32>) -> HashSet<u64> {
+    members.iter().flat_map(|&pid| socket_inodes(pid)).collect()
 }
 
 /// The ports that `members` listen on, each once, in order: those reached
-/// on the loopback (127.0.0.1 before ::1), and those that are not.
+/// on the loopback, and those that are not.
 pub fn listening(members: &HashSet<i32>) -> Found {
     if members.is_empty() {
         return Found::default();
     }
-    let mut sockets: HashMap<u64, Socket> = HashMap::new();
-    for (file, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
-        if let Ok(text) = std::fs::read_to_string(file) {
-            for socket in parse_net_tcp(&text, v6) {
-                sockets.insert(socket.inode, socket);
-            }
-        }
-    }
+    let sockets: HashMap<u64, Socket> = all_listening()
+        .into_iter()
+        .map(|socket| (socket.inode, socket))
+        .collect();
     let mut held: Vec<(i32, Socket)> = Vec::new();
     for &pid in members {
         for inode in socket_inodes(pid) {
@@ -279,43 +327,79 @@ pub fn listening(members: &HashSet<i32>) -> Found {
     combine(held)
 }
 
-/// One entry for each port, from the sockets the workspace holds.
+/// One entry for each port, from the sockets the workspace holds: the
+/// socket that is forwarded, where the host connects for it, and whether
+/// any of the port's sockets is reached from a network.
 pub(crate) fn combine(held: Vec<(i32, Socket)>) -> Found {
-    #[derive(Default)]
-    struct Seen {
-        at_v4: bool,
-        at_v6: bool,
-        exposed: bool,
-        pid: Option<i32>,
-    }
-    let mut ports: BTreeMap<u16, Seen> = BTreeMap::new();
+    let mut ports: BTreeMap<u16, Vec<(i32, Socket)>> = BTreeMap::new();
     for (pid, socket) in held {
-        let seen = ports.entry(socket.port).or_default();
-        match socket.reach {
-            Reach::Loopback(4) => seen.at_v4 = true,
-            Reach::Loopback(_) => seen.at_v6 = true,
-            Reach::Everywhere => {
-                seen.at_v4 = true;
-                seen.exposed = true;
-            }
-            Reach::Elsewhere => seen.exposed = true,
-        }
-        seen.pid = Some(seen.pid.map_or(pid, |known| known.min(pid)));
+        ports.entry(socket.port).or_default().push((pid, socket));
     }
     let mut found = Found::default();
-    for (port, seen) in ports {
-        if seen.at_v4 || seen.at_v6 {
-            found.ports.push(Listening {
+    for (port, sockets) in ports {
+        let exposed = sockets.iter().any(|(_, socket)| socket.exposed());
+        let best = sockets
+            .iter()
+            .filter(|(_, socket)| socket.to().is_some())
+            .min_by_key(|(pid, socket)| (socket.preference(), *pid));
+        match best {
+            Some((pid, socket)) => found.ports.push(Listening {
                 port,
-                family: if seen.at_v4 { 4 } else { 6 },
-                pid: seen.pid.unwrap_or(0),
-                exposed: seen.exposed,
-            });
-        } else {
-            found.elsewhere.push(port);
+                to: socket
+                    .to()
+                    .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+                inode: socket.inode,
+                pid: *pid,
+                exposed,
+            }),
+            None => found.elsewhere.push(port),
         }
     }
     found
+}
+
+/// The listening sockets that a connection to `to` reaches, among the
+/// listening sockets of its port (approximately as Linux chooses): those
+/// bound to that very address, or else those bound to every address. An
+/// IPv6 socket on every address may take IPv4 connections too, so it
+/// counts for both.
+pub(crate) fn winners(sockets: &[Socket], to: SocketAddr) -> Vec<u64> {
+    let on_port = sockets.iter().filter(|socket| socket.port == to.port());
+    let exact: Vec<u64> = on_port
+        .clone()
+        .filter(|socket| match (socket.address, to.ip()) {
+            (IpAddr::V6(bound), IpAddr::V4(wanted)) => bound.to_ipv4_mapped() == Some(wanted),
+            (bound, wanted) => bound == wanted,
+        })
+        .map(|socket| socket.inode)
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    on_port
+        .filter(|socket| match (socket.address, to.ip()) {
+            (IpAddr::V4(bound), IpAddr::V4(_)) => bound.is_unspecified(),
+            (IpAddr::V6(bound), IpAddr::V4(_)) => {
+                bound.is_unspecified() || bound.to_ipv4_mapped() == Some(Ipv4Addr::UNSPECIFIED)
+            }
+            (IpAddr::V6(bound), IpAddr::V6(_)) => bound.is_unspecified(),
+            (IpAddr::V4(_), IpAddr::V6(_)) => false,
+        })
+        .map(|socket| socket.inode)
+        .collect()
+}
+
+/// Whether a connection to `to` now reaches the socket `inode`, and only
+/// sockets that `held` (the workspace's) holds: nothing else on this
+/// machine, of this user or another, would take it instead.
+pub(crate) fn reaches_only(
+    sockets: &[Socket],
+    to: SocketAddr,
+    inode: u64,
+    held: &HashSet<u64>,
+) -> bool {
+    let winners = winners(sockets, to);
+    winners.contains(&inode) && winners.iter().all(|inode| held.contains(inode))
 }
 
 #[cfg(test)]
@@ -327,7 +411,7 @@ mod tests {
    1: 00000000:1F91 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1002 1 0000000000000000 100 0 0 10 0
    2: 0200000A:1F92 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1003 1 0000000000000000 100 0 0 10 0
    3: 0100007F:1F93 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 1004 1 0000000000000000 100 0 0 10 0
-   4: 0101007F:1F94 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1005 1 0000000000000000 100 0 0 10 0
+   4: 0200007F:1F94 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1005 1 0000000000000000 100 0 0 10 0
 ";
 
     const TCP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -337,68 +421,150 @@ mod tests {
    3: 000080FE000000000000000001000000:1FA3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 2004 1 0000000000000000 100 0 0 10 0
 ";
 
+    fn v4(text: &str) -> IpAddr {
+        IpAddr::V4(text.parse().unwrap())
+    }
+
+    fn v6(text: &str) -> IpAddr {
+        IpAddr::V6(text.parse().unwrap())
+    }
+
+    fn socket(inode: u64, address: IpAddr, port: u16) -> Socket {
+        Socket {
+            inode,
+            address,
+            port,
+        }
+    }
+
     #[test]
     #[cfg(target_endian = "little")]
-    fn listening_sockets_are_found_with_where_they_are_reached_from() {
-        let socket = |inode, port, reach| Socket { inode, port, reach };
+    fn listening_sockets_are_read_with_their_exact_address() {
         assert_eq!(
             parse_net_tcp(TCP, false),
             vec![
-                socket(1001, 8080, Reach::Loopback(4)),
-                socket(1002, 8081, Reach::Everywhere),
-                socket(1003, 8082, Reach::Elsewhere),
-                // 127.1.1.1 is a loopback address too. check-private: ok (a loopback address)
-                socket(1005, 8084, Reach::Loopback(4)),
+                socket(1001, v4("127.0.0.1"), 8080),
+                socket(1002, v4("0.0.0.0"), 8081),
+                socket(1003, v4("10.0.0.2"), 8082), // check-private: ok (invented)
+                socket(1005, v4("127.0.0.2"), 8084),
             ]
         );
         assert_eq!(
             parse_net_tcp(TCP6, true),
             vec![
-                socket(2001, 8096, Reach::Loopback(6)),
-                socket(2002, 8097, Reach::Everywhere),
-                socket(2003, 8098, Reach::Loopback(4)),
-                socket(2004, 8099, Reach::Elsewhere),
+                socket(2001, v6("::1"), 8096),
+                socket(2002, v6("::"), 8097),
+                socket(2003, v6("::ffff:127.0.0.1"), 8098),
+                socket(2004, v6("fe80::1"), 8099),
             ]
         );
     }
 
     #[test]
-    fn a_port_is_listed_once_and_said_to_be_exposed_when_a_network_reaches_it() {
-        let socket = |port, reach| Socket {
-            inode: 1,
-            port,
-            reach,
-        };
+    fn the_host_connects_to_the_address_the_socket_is_bound_to() {
+        let to = |address: IpAddr| socket(1, address, 5000).to();
+        let at = |text: &str| Some(text.parse::<SocketAddr>().unwrap());
+        assert_eq!(to(v4("127.0.0.1")), at("127.0.0.1:5000"));
+        // Another loopback address is that address, never 127.0.0.1, where
+        // some other program may listen.
+        assert_eq!(to(v4("127.0.0.2")), at("127.0.0.2:5000"));
+        assert_eq!(to(v4("0.0.0.0")), at("127.0.0.1:5000"));
+        assert_eq!(to(v6("::1")), at("[::1]:5000"));
+        // Every IPv6 address: ::1, which an IPv4 socket cannot hold.
+        assert_eq!(to(v6("::")), at("[::1]:5000"));
+        assert_eq!(to(v6("::ffff:127.0.0.3")), at("127.0.0.3:5000"));
+        assert_eq!(to(v6("::ffff:0.0.0.0")), at("127.0.0.1:5000"));
+        assert_eq!(to(v4("192.0.2.7")), None);
+        assert_eq!(to(v6("fe80::1")), None);
+    }
+
+    #[test]
+    fn a_port_is_listed_once_with_the_socket_it_is_forwarded_to() {
         let found = combine(vec![
             // `python3 -m http.server 8000`: every address.
-            (300, socket(8000, Reach::Everywhere)),
-            // A server on 127.0.0.1 and on ::1.
-            (201, socket(5173, Reach::Loopback(6))),
-            (200, socket(5173, Reach::Loopback(4))),
+            (300, socket(31, v4("0.0.0.0"), 8000)),
+            // A server on 127.0.0.1 and on ::1: 127.0.0.1.
+            (201, socket(22, v6("::1"), 5173)),
+            (200, socket(21, v4("127.0.0.1"), 5173)),
             // On ::1 alone.
-            (400, socket(4000, Reach::Loopback(6))),
+            (400, socket(41, v6("::1"), 4000)),
+            // On 127.0.0.2 alone.
+            (450, socket(45, v4("127.0.0.2"), 4500)),
+            // On every IPv6 address.
+            (460, socket(46, v6("::"), 4600)),
             // On the loopback and on one network's address.
-            (500, socket(3000, Reach::Loopback(4))),
-            (500, socket(3000, Reach::Elsewhere)),
+            (500, socket(51, v4("127.0.0.1"), 3000)),
+            (500, socket(52, v4("192.0.2.7"), 3000)),
             // On one network's address alone.
-            (600, socket(9000, Reach::Elsewhere)),
+            (600, socket(61, v4("192.0.2.7"), 9000)),
         ]);
-        let listening = |port, family, pid, exposed| Listening {
+        let listening = |port, to: &str, inode, pid, exposed| Listening {
             port,
-            family,
+            to: to.parse().unwrap(),
+            inode,
             pid,
             exposed,
         };
         assert_eq!(
             found.ports,
             vec![
-                listening(3000, 4, 500, true),
-                listening(4000, 6, 400, false),
-                listening(5173, 4, 200, false),
-                listening(8000, 4, 300, true),
+                listening(3000, "127.0.0.1:3000", 51, 500, true),
+                listening(4000, "[::1]:4000", 41, 400, false),
+                listening(4500, "127.0.0.2:4500", 45, 450, false),
+                listening(4600, "[::1]:4600", 46, 460, true),
+                listening(5173, "127.0.0.1:5173", 21, 200, false),
+                listening(8000, "127.0.0.1:8000", 31, 300, true),
             ]
         );
         assert_eq!(found.elsewhere, vec![9000]);
+    }
+
+    #[test]
+    fn a_connection_is_made_only_when_nothing_but_the_workspace_would_take_it() {
+        let ours = HashSet::from([1, 2]);
+        let to = |text: &str| text.parse::<SocketAddr>().unwrap();
+        // The workspace on every IPv4 address; nobody else on the port.
+        let alone = [socket(1, v4("0.0.0.0"), 80)];
+        assert!(reaches_only(&alone, to("127.0.0.1:80"), 1, &ours));
+        // Someone else on 127.0.0.1 itself would take the connection.
+        let taken = [socket(1, v4("0.0.0.0"), 80), socket(9, v4("127.0.0.1"), 80)];
+        assert!(!reaches_only(&taken, to("127.0.0.1:80"), 1, &ours));
+        assert_eq!(winners(&taken, to("127.0.0.1:80")), vec![9]);
+        // The workspace on 127.0.0.2, someone else on 127.0.0.1: the
+        // connection goes to 127.0.0.2, and only there.
+        let side = [
+            socket(1, v4("127.0.0.2"), 80),
+            socket(9, v4("127.0.0.1"), 80),
+        ];
+        assert!(reaches_only(&side, to("127.0.0.2:80"), 1, &ours));
+        // Every IPv6 address, someone else on ::1.
+        let v6_taken = [socket(1, v6("::"), 80), socket(9, v6("::1"), 80)];
+        assert!(!reaches_only(&v6_taken, to("[::1]:80"), 1, &ours));
+        // Another socket of the workspace on the same address (a group of
+        // sockets sharing the port) is fine; someone else's is not.
+        let shared = [
+            socket(1, v4("127.0.0.1"), 80),
+            socket(2, v4("127.0.0.1"), 80),
+        ];
+        assert!(reaches_only(&shared, to("127.0.0.1:80"), 1, &ours));
+        let mixed = [
+            socket(1, v4("127.0.0.1"), 80),
+            socket(9, v4("127.0.0.1"), 80),
+        ];
+        assert!(!reaches_only(&mixed, to("127.0.0.1:80"), 1, &ours));
+        // An IPv6 socket on every address may take IPv4 connections: when it
+        // is someone else's, the workspace's 0.0.0.0 is not trusted alone.
+        let dual = [socket(1, v4("0.0.0.0"), 80), socket(9, v6("::"), 80)];
+        assert!(!reaches_only(&dual, to("127.0.0.1:80"), 1, &ours));
+        // The socket is gone, or another took its place.
+        assert!(!reaches_only(&[], to("127.0.0.1:80"), 1, &ours));
+        let replaced = [socket(7, v4("0.0.0.0"), 80)];
+        assert!(!reaches_only(
+            &replaced,
+            to("127.0.0.1:80"),
+            1,
+            &HashSet::from([1, 7])
+        ));
     }
 
     #[test]
@@ -435,7 +601,7 @@ mod tests {
             found
                 .ports
                 .iter()
-                .any(|l| l.port == port && l.family == 4 && l.pid == me && !l.exposed),
+                .any(|l| l.port == port && l.to.is_ipv4() && l.pid == me && !l.exposed),
             "{found:?}"
         );
         drop(listener);

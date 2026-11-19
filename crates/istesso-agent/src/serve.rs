@@ -493,8 +493,7 @@ struct Workspace(Arc<crate::workspace::watch::Workspace>);
 #[cfg(unix)]
 struct Forwarded<'a> {
     stream: TcpStream,
-    workspace: Arc<crate::workspace::watch::Workspace>,
-    port: u16,
+    target: crate::workspace::watch::Target,
     _slot: ForwardSlot<'a>,
 }
 
@@ -681,13 +680,16 @@ impl Shared {
             let peer = session.peer().clone();
             let Forwarded {
                 stream,
-                workspace,
-                port,
+                target,
                 _slot,
             } = forwarded;
+            let port = target.port;
+            // It ends when the shell is over, when the socket it was made to
+            // stops listening (its id is no longer listed), or when the
+            // device loses its right.
             let carried =
                 crate::workspace::pump::carry(stream, session.into_channel(), b"", || {
-                    !workspace.is_over() && may_have_shell(&self.paths, &peer, &self.shell_policy)
+                    target.still_listed() && may_have_shell(&self.paths, &peer, &self.shell_policy)
                 });
             // Port numbers, counts and times only.
             (self.log)(format!(
@@ -695,7 +697,7 @@ impl Shared {
                 peer.name,
                 carried.lasted.as_secs_f64(),
                 if carried.stopped {
-                    " (the shell is over, or the device lost its right)"
+                    " (the shell or the port is gone, or the device lost its right)"
                 } else {
                     ""
                 },
@@ -841,8 +843,19 @@ impl Shared {
         {
             return Err(refused());
         }
-        let (workspace, target, port) =
-            self.workspaces.target(peer, forward).ok_or_else(refused)?;
+        let target = self.workspaces.target(peer, forward).ok_or_else(refused)?;
+        // The list is up to half a second old: what listens there now is
+        // looked at again, before connecting and after. A connection is made
+        // only when nothing but the workspace's socket would take it.
+        let moved = || {
+            Response::error(
+                ErrorCode::Internal,
+                "that port of the host is no longer the workspace's alone",
+            )
+        };
+        if !target.reaches_only_the_workspace() {
+            return Err(moved());
+        }
         if self.forwards_open.fetch_add(1, Ordering::SeqCst) >= MAX_FORWARDS {
             self.forwards_open.fetch_sub(1, Ordering::SeqCst);
             return Err(Response::error(
@@ -851,16 +864,20 @@ impl Shared {
             ));
         }
         let slot = ForwardSlot(&self.forwards_open);
-        let stream = TcpStream::connect_timeout(&target, Duration::from_secs(2)).map_err(|_| {
-            Response::error(
-                ErrorCode::Internal,
-                "nothing answers on that port of the host any more",
-            )
-        })?;
+        let stream =
+            TcpStream::connect_timeout(&target.to, Duration::from_secs(2)).map_err(|_| {
+                Response::error(
+                    ErrorCode::Internal,
+                    "nothing answers on that port of the host any more",
+                )
+            })?;
+        if !target.reaches_only_the_workspace() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(moved());
+        }
         Ok(Forwarded {
             stream,
-            workspace,
-            port,
+            target,
             _slot: slot,
         })
     }

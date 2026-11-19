@@ -18,7 +18,7 @@
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -70,12 +70,12 @@ pub struct Workspace {
     /// The scope's control group, once the shell is seen in it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     cgroup: Mutex<Option<PathBuf>>,
-    forwards: Mutex<Vec<ForwardedPort>>,
+    forwards: Mutex<Vec<Forward>>,
     /// The ports it listens on where they cannot be forwarded.
     elsewhere: Mutex<Vec<u16>>,
     /// The id each port has had in this workspace.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    ids: Mutex<HashMap<u16, String>>,
+    ids: Mutex<HashMap<(u16, u64), String>>,
     outlet: Mutex<Option<ShellOutlet>>,
     /// Asks the watching thread to look now; it answers when it has sent
     /// what it found.
@@ -127,20 +127,22 @@ impl Workspace {
             .clear();
     }
 
-    /// Where the port behind `id` is reached on this machine, and its
-    /// number.
-    fn target(&self, id: &str) -> Option<(SocketAddr, u16)> {
+    /// The forward listed as `id`, while the shell is open.
+    fn forward(&self, id: &str) -> Option<Forward> {
         if self.is_over() {
             return None;
         }
         let forwards = self.forwards.lock().unwrap_or_else(|e| e.into_inner());
-        let port = forwards.iter().find(|port| port.id == id)?;
-        let address: SocketAddr = if port.family == 6 {
-            (Ipv6Addr::LOCALHOST, port.port).into()
-        } else {
-            (Ipv4Addr::LOCALHOST, port.port).into()
-        };
-        Some((address, port.port))
+        forwards
+            .iter()
+            .find(|forward| forward.wire.id == id)
+            .cloned()
+    }
+
+    /// Whether `id` is still listed: the shell is open, and the socket it
+    /// stands for still listens.
+    pub fn lists(&self, id: &str) -> bool {
+        self.forward(id).is_some()
     }
 
     /// Whether a request to open a page may be passed on now: at most
@@ -226,35 +228,60 @@ impl Workspace {
         }
     }
 
-    /// The ports of the workspace now, with their ids, and those it
-    /// listens on only where they cannot be forwarded.
+    /// Whether a connection to `to` now reaches the socket `inode`, and
+    /// nothing but sockets of this workspace.
     #[cfg(target_os = "linux")]
-    fn find_ports(&self) -> (Vec<ForwardedPort>, Vec<u16>) {
+    fn reaches_only_itself(&self, to: SocketAddr, inode: u64) -> bool {
+        let sockets = super::procfs::listening_on(to.port());
+        let held = super::procfs::held_by(&self.members());
+        super::procfs::reaches_only(&sockets, to, inode, &held)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reaches_only_itself(&self, _to: SocketAddr, _inode: u64) -> bool {
+        false
+    }
+
+    /// The ports of the workspace now, with their ids, and those it
+    /// listens on only where they cannot be forwarded. A socket keeps its
+    /// id while it listens; another socket on the same port gets a new one.
+    #[cfg(target_os = "linux")]
+    fn find_ports(&self) -> (Vec<Forward>, Vec<u16>) {
         let found = super::procfs::listening(&self.members());
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
-        ids.retain(|port, _| found.ports.iter().any(|f| f.port == *port));
+        ids.retain(|(port, inode), _| {
+            found
+                .ports
+                .iter()
+                .any(|f| f.port == *port && f.inode == *inode)
+        });
         let ports = found
             .ports
             .into_iter()
             .take(MAX_PORTS)
             .filter_map(|listening| {
-                let id = match ids.get(&listening.port) {
+                let key = (listening.port, listening.inode);
+                let id = match ids.get(&key) {
                     Some(id) => id.clone(),
                     None => {
                         let id = super::random_id().ok()?;
-                        ids.insert(listening.port, id.clone());
+                        ids.insert(key, id.clone());
                         id
                     }
                 };
-                Some(ForwardedPort {
-                    id,
-                    port: listening.port,
-                    family: listening.family,
-                    process: printable(
-                        &super::procfs::program_name(listening.pid),
-                        MAX_PROCESS_NAME,
-                    ),
-                    exposed: listening.exposed,
+                Some(Forward {
+                    wire: ForwardedPort {
+                        id,
+                        port: listening.port,
+                        family: if listening.to.is_ipv4() { 4 } else { 6 },
+                        process: printable(
+                            &super::procfs::program_name(listening.pid),
+                            MAX_PROCESS_NAME,
+                        ),
+                        exposed: listening.exposed,
+                    },
+                    to: listening.to,
+                    inode: listening.inode,
                 })
             })
             .collect();
@@ -262,7 +289,7 @@ impl Workspace {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn find_ports(&self) -> (Vec<ForwardedPort>, Vec<u16>) {
+    fn find_ports(&self) -> (Vec<Forward>, Vec<u16>) {
         (Vec::new(), Vec::new())
     }
 
@@ -273,12 +300,12 @@ impl Workspace {
             return false;
         }
         let (found, elsewhere) = self.find_ports();
+        let wire: Vec<ForwardedPort> = found.iter().map(|forward| forward.wire.clone()).collect();
         let changed = {
             let mut forwards = self.forwards.lock().unwrap_or_else(|e| e.into_inner());
             let mut known = self.elsewhere.lock().unwrap_or_else(|e| e.into_inner());
-            let numbers = |ports: &[ForwardedPort]| -> Vec<String> {
+            let numbers = |ports: &mut dyn Iterator<Item = &ForwardedPort>| -> Vec<String> {
                 ports
-                    .iter()
                     .map(|port| {
                         if port.exposed {
                             format!("{} (on its networks too)", port.port)
@@ -288,7 +315,10 @@ impl Workspace {
                     })
                     .collect()
             };
-            let (before, after) = (numbers(&forwards), numbers(&found));
+            let (before, after) = (
+                numbers(&mut forwards.iter().map(|forward| &forward.wire)),
+                numbers(&mut wire.iter()),
+            );
             if before != after || *known != elsewhere {
                 // Port numbers only.
                 let mut said = if after.is_empty() {
@@ -312,7 +342,7 @@ impl Workspace {
                 ));
             }
             let changed = *forwards != found || *known != elsewhere;
-            *forwards = found.clone();
+            *forwards = found;
             *known = elsewhere.clone();
             changed
         };
@@ -321,7 +351,7 @@ impl Workspace {
                 watching: true,
                 reason: None,
                 how: self.how.word(),
-                ports: found,
+                ports: wire,
                 elsewhere,
             }));
         }
@@ -366,6 +396,42 @@ pub fn start(workspace: Arc<Workspace>, outlet: ShellOutlet, log: Log) {
     });
 }
 
+/// One forwarded port as the host keeps it: what the device is told, where
+/// the host connects, and the socket that must be there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Forward {
+    wire: ForwardedPort,
+    to: SocketAddr,
+    inode: u64,
+}
+
+/// Where a forwarded connection goes.
+pub struct Target {
+    pub workspace: Arc<Workspace>,
+    pub id: String,
+    /// The address the host connects to: the one the socket is bound to
+    /// (127.0.0.1 or ::1 for every address).
+    pub to: SocketAddr,
+    pub port: u16,
+    inode: u64,
+}
+
+impl Target {
+    /// Whether a connection to [`Target::to`] reaches the forwarded socket
+    /// now, and nothing but the workspace's sockets: no other program (of
+    /// this user or another) holds that address and port, or a more exact
+    /// one. Asked before and after connecting.
+    pub fn reaches_only_the_workspace(&self) -> bool {
+        self.workspace.reaches_only_itself(self.to, self.inode)
+    }
+
+    /// Whether the forward is still listed (the socket listens, the shell
+    /// is open). A forwarded connection ends when it is not.
+    pub fn still_listed(&self) -> bool {
+        self.workspace.lists(&self.id)
+    }
+}
+
 /// The workspaces of the shells open on this machine.
 #[derive(Default)]
 pub struct Workspaces {
@@ -389,16 +455,20 @@ impl Workspaces {
 
     /// The port behind `id`, when it is in the workspace of a shell that
     /// this device (with this key) has open. Nobody else's ids are found.
-    pub fn target(&self, device: &Peer, id: &str) -> Option<(Arc<Workspace>, SocketAddr, u16)> {
+    pub fn target(&self, device: &Peer, id: &str) -> Option<Target> {
         let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         open.iter()
             .filter(|workspace| {
                 workspace.device_id == device.id && workspace.device_key == device.public_key
             })
             .find_map(|workspace| {
-                workspace
-                    .target(id)
-                    .map(|(address, port)| (workspace.clone(), address, port))
+                workspace.forward(id).map(|forward| Target {
+                    workspace: workspace.clone(),
+                    id: id.to_string(),
+                    to: forward.to,
+                    port: forward.wire.port,
+                    inode: forward.inode,
+                })
             })
     }
 
@@ -457,33 +527,34 @@ mod tests {
         let (mine, other) = (peer("a laptop", [1; 32]), peer("a phone", [2; 32]));
         let workspace = Workspace::new(&mine, 4242, How::Session);
         let id = "0123456789abcdef0123456789abcdef";
-        *workspace.forwards.lock().unwrap() = vec![
-            ForwardedPort {
+        let forward = |id: &str, port, to: &str| Forward {
+            wire: ForwardedPort {
                 id: id.into(),
-                port: 26861,
-                family: 4,
+                port,
+                family: if to.starts_with('[') { 6 } else { 4 },
                 process: "python3".into(),
-                exposed: true,
-            },
-            ForwardedPort {
-                id: "fedcba9876543210fedcba9876543210".into(),
-                port: 26862,
-                family: 6,
-                process: "node".into(),
                 exposed: false,
             },
+            to: to.parse().unwrap(),
+            inode: u64::from(port),
+        };
+        *workspace.forwards.lock().unwrap() = vec![
+            forward(id, 26861, "127.0.0.2:26861"),
+            forward("fedcba9876543210fedcba9876543210", 26862, "[::1]:26862"),
         ];
         let open = Workspaces::default();
         open.add(workspace.clone());
 
-        let (found, address, port) = open.target(&mine, id).unwrap();
-        assert!(Arc::ptr_eq(&found, &workspace));
-        assert_eq!(address, "127.0.0.1:26861".parse::<SocketAddr>().unwrap());
-        assert_eq!(port, 26861);
-        let (_, address, _) = open
+        let target = open.target(&mine, id).unwrap();
+        assert!(Arc::ptr_eq(&target.workspace, &workspace));
+        // The address the socket is bound to, not 127.0.0.1.
+        assert_eq!(target.to, "127.0.0.2:26861".parse::<SocketAddr>().unwrap());
+        assert_eq!(target.port, 26861);
+        assert!(target.still_listed());
+        let other_port = open
             .target(&mine, "fedcba9876543210fedcba9876543210")
             .unwrap();
-        assert_eq!(address, "[::1]:26862".parse::<SocketAddr>().unwrap());
+        assert_eq!(other_port.to, "[::1]:26862".parse::<SocketAddr>().unwrap());
         // Another device, the same device with another key, an id that is
         // not listed: nothing.
         assert!(open.target(&other, id).is_none());
@@ -494,9 +565,15 @@ mod tests {
             .target(&mine, "00000000000000000000000000000000")
             .is_none());
 
+        // A port that stops listening is no longer listed: its connections end.
+        workspace.forwards.lock().unwrap().remove(1);
+        assert!(!other_port.still_listed());
+        assert!(target.still_listed());
+
         // Once the shell is over, its forwards are gone.
         workspace.end();
         assert!(open.target(&mine, id).is_none());
+        assert!(!target.still_listed());
         open.remove(&workspace);
         assert!(open.holding(4242).is_none());
     }
@@ -523,15 +600,25 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (found, _) = workspace.find_ports();
-        let entry = found.iter().find(|p| p.port == port).expect("not found");
+        let entry = found
+            .iter()
+            .map(|forward| &forward.wire)
+            .find(|p| p.port == port)
+            .expect("not found");
         assert!(!entry.exposed);
         assert!(istesso_link::forward::is_forward_id(&entry.id));
+        // Nothing else listens there: a connection would reach this socket.
+        let forward = found.iter().find(|f| f.wire.port == port).unwrap();
+        assert_eq!(forward.to, listener.local_addr().unwrap());
+        assert!(workspace.reaches_only_itself(forward.to, forward.inode));
+        assert!(!workspace.reaches_only_itself(forward.to, forward.inode + 1));
         // The same port keeps its id.
         assert_eq!(
             workspace
                 .find_ports()
                 .0
                 .iter()
+                .map(|forward| &forward.wire)
                 .find(|p| p.port == port)
                 .unwrap()
                 .id,

@@ -340,3 +340,105 @@ fn a_server_started_in_the_shell_is_reached_through_the_forward() {
     drop(forwarder);
     std::fs::remove_dir(crate::workspace::private_dir(&pair.device.paths()).unwrap()).unwrap();
 }
+
+/// Asks for the forward `id` and sends `request` on it; what comes back.
+#[cfg(target_os = "linux")]
+fn through_the_forward(pair: &Pair, id: &str, request: &[u8]) -> Result<Vec<u8>, String> {
+    use istesso_link::forward::ForwardFrame;
+    let mut client = pair.connect();
+    match client.open_forward(id).unwrap() {
+        ForwardAnswer::Open => {}
+        ForwardAnswer::Refused { message, .. } => return Err(message),
+    }
+    let mut channel = client.into_channel();
+    channel.send(&ForwardFrame::data(request)).unwrap();
+    channel.send(&ForwardFrame::End.encode()).unwrap();
+    let mut answer = Vec::new();
+    while let Ok(message) = channel.recv() {
+        match ForwardFrame::decode(&message).unwrap() {
+            ForwardFrame::Data(bytes) => answer.extend_from_slice(&bytes),
+            ForwardFrame::End => break,
+            ForwardFrame::Unknown(_) => {}
+        }
+    }
+    Ok(answer)
+}
+
+/// A server of the workspace on 127.0.0.2, and another program on
+/// 127.0.0.1 with the same port: the forward reaches the workspace's
+/// server, never the other program.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_forward_goes_to_the_address_the_server_listens_on() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no python3 here");
+        return;
+    }
+    let pair = Pair::new("fwd-exact");
+    let project = TempDir::new("fwd-exact-project");
+    std::fs::write(project.path().join("hello.txt"), "hello from the host\n").unwrap();
+    let mut shell = pair.open(true, Some(project.path()));
+    shell.type_in("exec python3 -m http.server --bind 127.0.0.2 0 >/dev/null 2>&1\n");
+    let list = shell.ports(|list| !list.ports.is_empty());
+    let (port, id) = (list.ports[0].port, list.ports[0].id.clone());
+    // Someone else on 127.0.0.1 with the same number.
+    let impostor = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for stream in impostor.incoming().flatten() {
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\nimpostor");
+        }
+    });
+    let answer = through_the_forward(&pair, &id, b"GET /hello.txt HTTP/1.0\r\n\r\n").unwrap();
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.contains("hello from the host"), "{answer}");
+    assert!(!answer.contains("impostor"));
+}
+
+/// A connection through a forward ends when the socket it was made to
+/// stops listening, although its own connection to the server stays open.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_forwarded_connection_ends_when_its_port_is_no_longer_listed() {
+    use istesso_link::forward::ForwardFrame;
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no python3 here");
+        return;
+    }
+    let pair = Pair::new("fwd-retired");
+    let mut shell = pair.open(true, None);
+    // Takes one connection, then (a moment later) stops listening and keeps
+    // that connection.
+    shell.type_in(
+        "exec python3 -c 'import socket,time; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(); c,_=s.accept(); time.sleep(1); s.close(); time.sleep(30)'\n",
+    );
+    let list = shell.ports(|list| !list.ports.is_empty());
+    let id = list.ports[0].id.clone();
+    let mut client = pair.connect();
+    assert_eq!(client.open_forward(&id).unwrap(), ForwardAnswer::Open);
+    let mut channel = client.into_channel();
+    shell.ports(|list| list.ports.is_empty());
+    let began = Instant::now();
+    while let Ok(Ok(ForwardFrame::Data(_) | ForwardFrame::Unknown(_))) =
+        channel.recv().map(|m| ForwardFrame::decode(&m))
+    {}
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        began.elapsed()
+    );
+    // The host says why, once its side is over too.
+    let said = |line: &String| line.contains("the shell or the port is gone");
+    while !pair.log().iter().any(said) {
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", pair.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
