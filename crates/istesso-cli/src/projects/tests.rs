@@ -136,8 +136,9 @@ fn kinds_follow_top_level_markers_and_keep_the_project_id() {
     fs::write(folder.join("Package.swift"), []).unwrap();
     fs::write(folder.join("package.json"), []).unwrap();
     assert_eq!(read().kinds, [ProjectKind::Node, ProjectKind::Apple]);
+    assert_eq!(read().id, first.id);
     fs::remove_dir_all(folder).unwrap();
-    assert_eq!(read(), first);
+    assert!(projects::list(&paths).unwrap().is_empty());
 }
 
 #[test]
@@ -201,7 +202,7 @@ fn silent_host_keeps_its_projects_and_reserves_their_names() {
             .insert(tool.into(), Some(ToolInfo::default()));
     }
     let hosts = [local, remote];
-    let rows = merged(&hosts);
+    let rows = merged(&hosts, None).unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows[0].reachable);
     assert_eq!(rows[0].development_machine, local_name);
@@ -209,7 +210,7 @@ fn silent_host_keeps_its_projects_and_reserves_their_names() {
     assert_eq!(
         serde_json::to_value(&rows[1]).unwrap(),
         serde_json::json!({
-            "id":"example-Scene","name":"Scene","development_machine":remote_name,"reachable":false,
+            "id":"example-Scene","name":"Scene","development_machine":remote_name,"reachable":false,"clash":false,
             "kinds":["blender"],"capabilities":{"gpu":true,"tools":["blender"]}
         })
     );
@@ -223,12 +224,61 @@ fn silent_host_keeps_its_projects_and_reserves_their_names() {
 }
 
 #[test]
+fn clashes_include_cached_rows_and_by_name_lookup_lists_all_owners() {
+    let a = "Example A"; // check-private: ok (invented display name)
+    let b = "Example B"; // check-private: ok (invented display name)
+    let c = "Example C"; // check-private: ok (invented display name)
+    let mut hosts = [
+        view(a, true, HostState::Awake),
+        view(b, false, HostState::Unknown),
+        view(c, false, HostState::Awake),
+    ];
+    for (host, name) in hosts.iter_mut().zip(["Demo", "DEMO", "demo"]) {
+        host.manifest.as_mut().unwrap().projects.push(Project {
+            id: name.into(),
+            name: name.into(),
+            kinds: vec![ProjectKind::Unknown],
+        });
+    }
+    hosts[0].manifest.as_mut().unwrap().projects.push(Project {
+        id: "only".into(),
+        name: "Only".into(),
+        kinds: vec![],
+    });
+    let rows = merged(&hosts, None).unwrap();
+    for (row, prefix) in rows.iter().zip(["? Demo", "  Only", "!? DEMO", "? demo"]) {
+        assert!(render(row).starts_with(prefix));
+        assert_eq!(
+            serde_json::to_value(row).unwrap()["clash"],
+            prefix.contains('?')
+        );
+    }
+    assert_eq!(merged(&hosts, Some("only")).unwrap().len(), 1);
+    assert!(merged(&hosts, Some("missing")).is_err());
+    assert_eq!(
+        merged(&hosts, Some("dEmO")).err().unwrap(),
+        format!("project dEmO is ambiguous on these machines: {a}, {b}, {c}")
+    );
+    assert_eq!(
+        check_remote_name("Demo", &hosts).unwrap_err(),
+        format!("project Demo is ambiguous on these machines: {b}, {c}")
+    );
+
+    hosts[1].name = a.into();
+    hosts[2].manifest = None;
+    assert!(merged(&hosts, Some("Demo")).is_err());
+    hosts[1].id = hosts[0].id.clone();
+    assert!(merged(&hosts, None).unwrap().iter().all(|row| !row.clash));
+}
+
+#[test]
 fn project_commands_accept_both_list_forms() {
     use crate::Cli;
     use clap::Parser;
     for args in [
         vec!["projects"],
         vec!["projects", "--json"],
+        vec!["projects", "--name", "demo", "--json"],
         vec!["projects", "list"],
         vec!["projects", "list", "--json"],
         vec!["projects", "add", "demo", "."],

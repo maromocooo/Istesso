@@ -50,6 +50,9 @@ enum Command {
     },
     /// List projects and their development machines, or manage local registrations
     Projects {
+        /// Show the project with this name across all machines
+        #[arg(long)]
+        name: Option<String>,
         /// Print the list as JSON
         #[arg(long, global = true)]
         json: bool,
@@ -498,7 +501,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         }
-        Command::Projects { action, json } => projects::run(action, json),
+        Command::Projects { action, name, json } => projects::run(action, name.as_deref(), json),
         Command::Apps { action } => run_apps(action),
         Command::Pair { action } => run_pair(action),
         Command::Peers { action } => run_peers(action),

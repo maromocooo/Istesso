@@ -644,6 +644,8 @@ mod tests {
         };
         assert!(published().is_empty());
         crate::projects::add(&paths, "demo", &paths.config).unwrap();
+        std::fs::write(paths.config.join("projects/project-broken.json"), b"{").unwrap();
+        assert_eq!(published().len(), 1);
         assert_eq!(published(), crate::projects::list(&paths).unwrap());
         crate::projects::remove(&paths, "demo").unwrap();
         assert!(published().is_empty());

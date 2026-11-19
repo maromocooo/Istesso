@@ -1,12 +1,14 @@
 //! The development machine owns the register. Only its public projection
 //! travels with the host manifest.
-use std::collections::{hash_map::RandomState, BTreeSet};
+mod kinds;
+
+use std::collections::hash_map::RandomState;
 use std::fs;
 use std::hash::BuildHasher;
-use std::io::{self, ErrorKind};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use istesso_proto::{Project, ProjectKind};
+use istesso_proto::Project;
 use serde::{Deserialize, Serialize};
 
 use crate::{cache::write_private, Paths};
@@ -43,31 +45,6 @@ fn entry_path(paths: &Paths, name: &str) -> Result<PathBuf, String> {
         .config
         .join("projects")
         .join(format!("project-{}.json", name.to_ascii_lowercase())))
-}
-
-fn kinds(folder: &Path) -> io::Result<Vec<ProjectKind>> {
-    let mut kinds = BTreeSet::new();
-    for entry in fs::read_dir(folder)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        let ty = entry.file_type()?;
-        let kind = match name {
-            "Cargo.toml" if ty.is_file() => ProjectKind::Rust,
-            "package.json" if ty.is_file() => ProjectKind::Node,
-            "Package.swift" if ty.is_file() => ProjectKind::Apple,
-            _ if name.ends_with(".xcodeproj") && ty.is_dir() => ProjectKind::Apple,
-            _ if name.ends_with(".blend") && ty.is_file() => ProjectKind::Blender,
-            _ => continue,
-        };
-        kinds.insert(kind);
-    }
-    if kinds.is_empty() {
-        kinds.insert(ProjectKind::Unknown);
-    }
-    Ok(kinds.into_iter().collect())
 }
 
 pub fn add(paths: &Paths, name: &str, folder: &Path) -> Result<(), String> {
@@ -111,32 +88,67 @@ pub fn remove(paths: &Paths, name: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Default)]
+pub struct ProjectList {
+    pub projects: Vec<Project>,
+    pub skipped: usize,
+}
+
 pub fn list(paths: &Paths) -> Result<Vec<Project>, String> {
-    const READ_ERROR: &str = "cannot read the local project register";
+    Ok(list_with_skipped(paths)?.projects)
+}
+
+pub fn list_with_skipped(paths: &Paths) -> Result<ProjectList, String> {
+    let mut list = ProjectList::default();
     let entries = match fs::read_dir(paths.config.join("projects")) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(READ_ERROR.into()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(list),
+        Err(_) => return Err("cannot read the local project register".into()),
     };
-    let mut projects = Vec::new();
     for entry in entries {
-        let path = entry.map_err(|_| READ_ERROR)?.path();
+        let Ok(entry) = entry else {
+            list.skipped += 1;
+            continue;
+        };
+        let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|ty| ty.is_file()) {
+            list.skipped += 1;
             continue;
         }
         let data = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == ErrorKind::NotFound => continue, // Removed during the listing.
-            Err(_) => return Err(READ_ERROR.into()),
+            Err(_) => {
+                list.skipped += 1;
+                continue;
+            }
         };
-        let record: Registration = serde_json::from_slice(&data).map_err(|_| READ_ERROR)?;
-        validate_name(&record.name)?;
-        projects.push(Project {
-            kinds: kinds(&record.folder).unwrap_or_else(|_| vec![ProjectKind::Unknown]),
-            name: record.name,
-            id: record.id,
-        });
+        if let Some(project) = read_project(paths, &path, &data) {
+            list.projects.push(project);
+        } else {
+            list.skipped += 1;
+        }
     }
-    projects.sort_by_cached_key(|p| p.name.to_ascii_lowercase());
-    Ok(projects)
+    list.projects
+        .sort_by_cached_key(|p| p.name.to_ascii_lowercase());
+    Ok(list)
+}
+
+fn read_project(paths: &Paths, path: &Path, data: &[u8]) -> Option<Project> {
+    let record: Registration = serde_json::from_slice(data).ok()?;
+    if entry_path(paths, &record.name).ok()? != path
+        || !record.folder.is_absolute()
+        || record.id.len() != 32
+        || !record.id.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(Project {
+        kinds: kinds::read(record.folder)?,
+        name: record.name,
+        id: record.id,
+    })
 }

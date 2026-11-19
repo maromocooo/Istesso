@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use clap::Subcommand;
@@ -29,6 +29,7 @@ struct ProjectRow<'a> {
     project: &'a Project,
     development_machine: &'a str,
     reachable: bool,
+    clash: bool,
     capabilities: Summary,
 }
 
@@ -67,36 +68,66 @@ impl Summary {
     }
 }
 
-fn merged(views: &[HostView]) -> Vec<ProjectRow<'_>> {
+// Use the paired identity to distinguish machines with the same display name.
+fn owners<'a>(
+    views: impl Iterator<Item = &'a HostView>,
+) -> BTreeMap<String, BTreeMap<&'a str, &'a str>> {
+    let mut names = BTreeMap::new();
+    for view in views {
+        if let Some(manifest) = &view.manifest {
+            for project in &manifest.projects {
+                names
+                    .entry(project.name.to_ascii_lowercase())
+                    .or_insert_with(BTreeMap::new)
+                    .insert(view.id.as_str(), view.name.as_str());
+            }
+        }
+    }
+    names
+}
+
+fn ambiguous(name: &str, machines: &BTreeMap<&str, &str>) -> String {
+    let names = machines.values().copied().collect::<Vec<_>>().join(", ");
+    format!("project {name} is ambiguous on these machines: {names}")
+}
+
+fn merged<'a>(views: &'a [HostView], name: Option<&str>) -> Result<Vec<ProjectRow<'a>>, String> {
+    let owners = owners(views.iter());
+    if let Some(name) = name {
+        match owners.get(&name.to_ascii_lowercase()) {
+            None => return Err(format!("project {name} was not found")),
+            Some(machines) if machines.len() > 1 => return Err(ambiguous(name, machines)),
+            _ => {}
+        }
+    }
     let mut rows = Vec::new();
     for view in views {
         if let Some(manifest) = &view.manifest {
             for project in &manifest.projects {
+                if name.is_some_and(|name| !name.eq_ignore_ascii_case(&project.name)) {
+                    continue;
+                }
                 rows.push(ProjectRow {
                     project,
                     development_machine: &view.name,
                     reachable: view.state == HostState::Awake,
+                    clash: owners[&project.name.to_ascii_lowercase()].len() > 1,
                     capabilities: Summary::for_project(project, manifest),
                 });
             }
         }
     }
-    rows
+    Ok(rows)
 }
 
 fn check_remote_name(name: &str, hosts: &[HostView]) -> Result<(), String> {
-    for host in hosts.iter().filter(|host| !host.local) {
-        if let Some(manifest) = &host.manifest {
-            if manifest
-                .projects
-                .iter()
-                .any(|p| p.name.eq_ignore_ascii_case(name))
-            {
-                return Err(format!(
-                    "project {name} is already registered on {}",
-                    host.name
-                ));
-            }
+    let owners = owners(hosts.iter().filter(|host| !host.local));
+    if let Some(machines) = owners.get(&name.to_ascii_lowercase()) {
+        if machines.len() > 1 {
+            return Err(ambiguous(name, machines));
+        }
+        if let Some(machine) = machines.values().next() {
+            return Err(format!("project {name} is already registered on {machine}"));
         }
     }
     Ok(())
@@ -112,7 +143,12 @@ fn kind_labels(project: &Project) -> String {
 }
 
 fn render(row: &ProjectRow<'_>) -> String {
-    let mark = if row.reachable { " " } else { "!" };
+    let mark = match (row.reachable, row.clash) {
+        (true, false) => " ",
+        (true, true) => "?",
+        (false, false) => "!",
+        (false, true) => "!?",
+    };
     let gpu = if row.capabilities.gpu { "yes" } else { "no" };
     let tools = row
         .capabilities
@@ -130,7 +166,10 @@ fn render(row: &ProjectRow<'_>) -> String {
     )
 }
 
-pub(super) fn run(action: Option<Action>, json: bool) -> Result<(), String> {
+pub(super) fn run(action: Option<Action>, name: Option<&str>, json: bool) -> Result<(), String> {
+    if action.is_some() && name.is_some() {
+        return Err("--name applies to the merged project list".into());
+    }
     let paths = Paths::from_env();
     let options = SurveyOptions::default();
     match action {
@@ -143,7 +182,16 @@ pub(super) fn run(action: Option<Action>, json: bool) -> Result<(), String> {
         }
         Some(Action::Remove { name }) => projects::remove(&paths, &name),
         Some(Action::List) => {
-            let registered = projects::list(&paths)?;
+            let list = projects::list_with_skipped(&paths)?;
+            if list.skipped > 0 {
+                let noun = if list.skipped == 1 {
+                    "project"
+                } else {
+                    "projects"
+                };
+                eprintln!("{} {noun} skipped", list.skipped);
+            }
+            let registered = list.projects;
             if json {
                 return super::print_json(&registered);
             }
@@ -155,7 +203,7 @@ pub(super) fn run(action: Option<Action>, json: bool) -> Result<(), String> {
         }
         None => {
             let hosts = survey(&paths, &options).map_err(|_| "cannot read the project list")?;
-            let rows = merged(&hosts);
+            let rows = merged(&hosts, name)?;
             if json {
                 return super::print_json(&rows);
             }
