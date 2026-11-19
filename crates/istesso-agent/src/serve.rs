@@ -331,6 +331,9 @@ impl InputSink {
     /// nothing more is passed on for it. Doing it twice does nothing more.
     fn let_go(&self) {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held.over {
+            return;
+        }
         held.over = true;
         for code in std::mem::take(&mut held.keys) {
             self.send(&InputEvent::Key {
@@ -344,6 +347,12 @@ impl InputSink {
                 pressed: false,
             });
         }
+        // And no composing text stays drawn in the application (the device's own clearing may
+        // have been lost with the conversation). A program that does not know it passes it over.
+        self.send(&InputEvent::Preedit {
+            text: String::new(),
+            cursor: [0, 0],
+        });
     }
 
     #[cfg(not(unix))]
@@ -709,6 +718,15 @@ mod tests {
             InputEvent::Button { code, pressed }
         }
 
+        /// What the agent hands over at the end of a conversation, after the keys and
+        /// buttons: no composing text stays in the application.
+        fn cleared() -> InputEvent {
+            InputEvent::Preedit {
+                text: String::new(),
+                cursor: [0, 0],
+            }
+        }
+
         /// Waits until the device has heard "still here", for a moment at most.
         fn hears_alive(client: &mut istesso_link::Client, within: Duration) -> bool {
             let began = Instant::now();
@@ -741,6 +759,7 @@ mod tests {
             assert_eq!(pair.handed_over(SOON), Some(key(30, false)));
             assert!(!hears_alive(&mut asking, A_MOMENT));
             drop(asking);
+            assert_eq!(pair.handed_over(SOON), Some(cleared()));
 
             // A device of the version before does not ask, and is not answered: nothing
             // piles up where nobody reads.
@@ -771,7 +790,7 @@ mod tests {
             drop(client);
             assert_eq!(
                 pair.all_handed_over(A_MOMENT),
-                [key(42, false), button(0x110, false)]
+                [key(42, false), button(0x110, false), cleared()]
             );
         }
 
@@ -799,7 +818,8 @@ mod tests {
             client.send_input(&[key(31, true), text("か")]).unwrap();
             assert_eq!(pair.all_handed_over(A_MOMENT).len(), 2);
             drop(client);
-            assert_eq!(pair.all_handed_over(A_MOMENT), [key(31, false)]);
+            // ... and composing text is cleared in the application.
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(31, false), cleared()]);
         }
 
         #[test]
@@ -832,7 +852,7 @@ mod tests {
             second.send_input(&[key(29, true)]).unwrap();
             assert_eq!(
                 pair.all_handed_over(A_MOMENT),
-                [key(29, false), key(30, false), key(29, true)]
+                [key(29, false), key(30, false), cleared(), key(29, true)]
             );
 
             // The first conversation is over: the device is told so at once, and what
@@ -853,7 +873,7 @@ mod tests {
             second.send_input(&[]).unwrap();
             assert!(hears_alive(&mut second, SOON));
             drop(second);
-            assert_eq!(pair.all_handed_over(A_MOMENT), [key(29, false)]);
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(29, false), cleared()]);
         }
 
         #[test]
@@ -926,7 +946,7 @@ mod tests {
                 let _ = client.send_input(&[]);
                 handed = pair.all_handed_over(Duration::from_millis(100));
             }
-            assert_eq!(handed, [key(30, false)]);
+            assert_eq!(handed, [key(30, false), cleared()]);
             // And it does not get in again.
             let mut again = pair.connect();
             assert!(matches!(

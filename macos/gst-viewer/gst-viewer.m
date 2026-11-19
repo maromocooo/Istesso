@@ -1808,18 +1808,33 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     secure_input(password && self.window.isKeyWindow && !picture_stale);
 }
 
-// A click may put the cursor into another field over there: the composition is not carried into
-// it.
-- (void)mouseDown:(NSEvent *)event {
+// A click commits what is being composed, once, into the field it was composed for (as a Mac
+// does), before the click itself goes: it may put the cursor into another field over there.
+- (void)commitComposition {
+    if (!self.hasMarkedText) {
+        return;
+    }
+    NSString *text = [_marked copy];
     [self discardComposition];
+    if (_field.state != 2 && host_takes_text && !picture_stale && input_socket >= 0) {
+        if (!text_input_packets(text, ^BOOL(const char *packet, size_t length) {
+                return send_text_datagram(packet, length);
+            })) {
+            text_lost_count++;
+            fprintf(stderr, "viewer: a commit could not be passed on whole, and the rest of it was not sent (%lu so far; the text is never shown)\n", text_lost_count);
+        }
+    }
+}
+- (void)mouseDown:(NSEvent *)event {
+    [self commitComposition];
     [super mouseDown:event];
 }
 - (void)rightMouseDown:(NSEvent *)event {
-    [self discardComposition];
+    [self commitComposition];
     [super rightMouseDown:event];
 }
 - (void)otherMouseDown:(NSEvent *)event {
-    [self discardComposition];
+    [self commitComposition];
     [super otherMouseDown:event];
 }
 
@@ -1914,9 +1929,11 @@ static NSString *plain_text(id value) {
 
 - (void)setTextInputField:(IstessoMediaTextInput)field {
     BOOL toPassword = field.state == 2 && _field.state != 2;
+    // Another field has the keyboard (the application moved it by itself, or it was enabled
+    // again): what was being composed ends here, on this Mac too, without being committed.
+    BOOL otherField = field.serial != _field.serial;
     _field = field;
-    if (toPassword && self.hasMarkedText) {
-        // What was being composed does not go into a password field.
+    if ((toPassword || otherField) && self.hasMarkedText) {
         [self discardComposition];
     }
     [self updatePasswordField];

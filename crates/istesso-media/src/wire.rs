@@ -53,7 +53,8 @@
 //! ```text
 //!   offset  bytes  content
 //!   0       1      state: 0 no field, 1 a field, 2 a password field
-//!   1       1      reserved, 0
+//!   1       1      the field's serial: one more (mod 256) whenever another field, or the
+//!                  same one enabled again, has the keyboard (an earlier version wrote 0)
 //!   2       2      length of this fixed part (16 in this version)
 //!   4       4      text cursor, x, in the picture's pixels (signed)
 //!   8       4      y
@@ -250,6 +251,9 @@ pub enum Kind {
 pub struct TextField {
     /// 0 no field, 1 a field, 2 a password field.
     pub state: u8,
+    /// One more (mod 256) whenever another field has the keyboard: the viewer ends its
+    /// composition when it changes.
+    pub serial: u8,
     pub x: i32,
     pub y: i32,
     pub width: u16,
@@ -521,7 +525,7 @@ pub fn encode_text_field(field: &TextField, seq: u64, out: &mut Vec<u8>) -> Resu
     }
     let mut body = Vec::with_capacity(TEXT_FIELD_FIXED_LEN);
     body.push(field.state);
-    body.push(0);
+    body.push(field.serial);
     body.extend_from_slice(&(TEXT_FIELD_FIXED_LEN as u16).to_le_bytes());
     body.extend_from_slice(&field.x.to_le_bytes());
     body.extend_from_slice(&field.y.to_le_bytes());
@@ -545,6 +549,7 @@ pub fn decode_text_field(body: &[u8]) -> Result<TextField, WireError> {
     let pair = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
     Ok(TextField {
         state: body[0],
+        serial: body[1],
         x: quad(4),
         y: quad(8),
         width: pair(12),
@@ -755,6 +760,7 @@ mod tests {
     fn a_text_field_comes_back_as_it_was_written_and_an_unknown_state_is_refused() {
         let field = TextField {
             state: 2,
+            serial: 201,
             x: -3,
             y: 191,
             width: 0,

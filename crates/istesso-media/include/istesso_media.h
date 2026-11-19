@@ -94,10 +94,12 @@ typedef struct IstessoMediaTextInput {
     int32_t y;
     uint32_t width;   /* 0 to 65535 */
     uint32_t height;
+    uint32_t serial;  /* 0 to 255: changes whenever another field, or the same one enabled again,
+                         has the keyboard; the client ends its composition then */
 } IstessoMediaTextInput;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(IstessoMediaTextInput) == 20, "IstessoMediaTextInput differs from src/ffi.rs");
+_Static_assert(sizeof(IstessoMediaTextInput) == 24, "IstessoMediaTextInput differs from src/ffi.rs");
 _Static_assert(sizeof(IstessoMediaStreamInfo) == 24, "IstessoMediaStreamInfo differs from src/ffi.rs");
 _Static_assert(sizeof(IstessoMediaSent) == 24, "IstessoMediaSent differs from src/ffi.rs");
 _Static_assert(sizeof(void *) != 8 || sizeof(IstessoMediaFrame) == 72, "IstessoMediaFrame differs from src/ffi.rs");
@@ -191,7 +193,7 @@ int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const Istess
  * Trial only: says what the text input field of the application with the keyboard is, as
  * istesso_media_host_set_cursor() says what the cursor is (the latest only, behind frames, to
  * viewers that may be sent the frames, and to one that connects later). Nothing is sent until
- * this is first called. 0, or -1 for a state above 2 or a side above 65535.
+ * this is first called. 0, or -1 for a state above 2, a side above 65535 or a serial above 255.
  */
 int32_t istesso_media_host_set_text_input(const IstessoMediaHost *host, const IstessoMediaTextInput *field);
 
