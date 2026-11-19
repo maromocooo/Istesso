@@ -23,7 +23,7 @@ use istesso_link::mount::{
     valid_name, Answer, Attr, Entry, Failure, Kind, Question, MAX_ENTRIES, MAX_READ, ROOT_ID,
 };
 
-use super::rules::{Rules, MAX_RULES_FILE};
+use super::rules::{Folding, Rules, MAX_RULES_FILE};
 use super::MAX_IDS;
 
 pub struct Export {
@@ -128,6 +128,27 @@ fn to_attr(st: &libc::stat) -> Attr {
     }
 }
 
+/// How the file system of the folder `root` compares names. On a Mac, as
+/// the volume says (`_PC_CASE_SENSITIVE`; unknown counts as folding, which
+/// hides more), and always in either Unicode form, as APFS does. Elsewhere,
+/// byte for byte.
+fn folding(root: &OwnedFd) -> Folding {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: valid descriptor; fpathconf only reads.
+        let sensitive = unsafe { libc::fpathconf(root.as_raw_fd(), libc::_PC_CASE_SENSITIVE) };
+        Folding {
+            case: sensitive != 1,
+            unicode: true,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = root;
+        Folding::default()
+    }
+}
+
 /// Opens a folder below `root`, one name at a time, refusing links.
 fn open_dir(root: &OwnedFd, names: &[Vec<u8>]) -> io::Result<OwnedFd> {
     let mut cur = openat(root, b".", libc::O_RDONLY | libc::O_DIRECTORY)?;
@@ -177,13 +198,14 @@ impl Export {
         let mut ids = HashMap::new();
         paths.insert(ROOT_ID, Vec::new());
         ids.insert(Vec::new(), ROOT_ID);
+        // SAFETY: fresh descriptor, owned by nobody else.
+        let root_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Export {
-            // SAFETY: fresh descriptor, owned by nobody else.
-            root: unsafe { OwnedFd::from_raw_fd(fd) },
             paths,
             ids,
             next_id: ROOT_ID + 1,
-            rules: Rules::new(show_ignored, global_rules),
+            rules: Rules::new(show_ignored, global_rules, folding(&root_fd)),
+            root: root_fd,
             bytes_read: 0,
         })
     }
@@ -254,6 +276,12 @@ impl Export {
                 }
                 let mut names = self.names(dir)?;
                 let dir_fd = open_dir(&self.root, &names).map_err(io_failure)?;
+                // Only a name as it is stored: on a volume that folds case or Unicode
+                // forms, another spelling would reach the same file without being the
+                // name the rules were asked about (`.GIT`, `.Env`, a decomposed name).
+                if !read_names(&dir_fd).map_err(io_failure)?.contains(&name) {
+                    return Err(Failure::NoEnt);
+                }
                 let st = lstat_at(&dir_fd, &name).map_err(io_failure)?;
                 names.push(name);
                 self.shown(&names, is_type(&st, libc::S_IFDIR))?;

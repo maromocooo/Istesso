@@ -43,6 +43,8 @@ unicode-width = "0.2"
 # Kept below 0.4.31, whose releases (and those of globset from 0.4.20) need a
 # newer Rust than this workspace asks for.
 ignore = ">=0.4.23, <0.4.31"
+# Names on a Mac are compared as Git compares them there (precomposed, NFC).
+unicode-normalization = "0.1"
 zeroize = "1"
 # Window and pixels for the test application (istesso-flash) only. X11 and Wayland are loaded at
 # run time, so building needs no system headers. No client-side decorations: inside the

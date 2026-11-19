@@ -562,3 +562,118 @@ fn the_parent_of_a_mount_point_must_be_private() {
     symlink(&dir, base.path().join("link")).unwrap();
     assert!(super::private_folder(&base.path().join("link")).is_err());
 }
+
+/// Whether the volume of `dir` tells upper from lower case. Linux file systems
+/// do (folders with case folding switched on aside).
+fn volume_tells_case_apart(dir: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid C string; pathconf only reads.
+        unsafe { libc::pathconf(c.as_ptr(), libc::_PC_CASE_SENSITIVE) == 1 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+        true
+    }
+}
+
+fn lookup_path(export: &mut Export, path: &str) -> Result<u64, Failure> {
+    let mut id = ROOT_ID;
+    for name in path.split('/') {
+        match export
+            .handle(Question::Lookup {
+                dir: id,
+                name: name.as_bytes().to_vec(),
+            })
+            .0
+        {
+            Answer::Found { id: found, .. } => id = found,
+            Answer::Failed { error } => return Err(error),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    Ok(id)
+}
+
+/// On the Mac's default volume `.GIT/config`, `.Env` or a decomposed name
+/// reach the hidden file; they must not get past the rules. The test means
+/// most there (the temporary folder of a Mac is on such a volume); on Linux
+/// the other spellings are simply other names that are not there.
+#[test]
+fn another_spelling_of_a_hidden_name_is_not_a_way_in() {
+    let base = TempDir::new("mount-spelling");
+    let root = base.path().join("project");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git/config"), b"[remote]\n").unwrap();
+    fs::write(root.join(".gitignore"), ".env\ncaf\u{e9}-key.txt\n").unwrap();
+    fs::write(root.join(".env"), b"TOKEN=not-a-real-one\n").unwrap();
+    fs::write(root.join("caf\u{e9}-key.txt"), b"key").unwrap();
+    fs::write(root.join("README.md"), b"read me\n").unwrap();
+    let folds_case = !volume_tells_case_apart(&root);
+    let mut export = Export::open(&root, false, None).unwrap();
+    for spelling in [
+        ".GIT",
+        ".Git",
+        ".GIT/config",
+        ".Git/config",
+        ".ENV",
+        ".Env",
+        "cafe\u{301}-key.txt",
+        "CAF\u{c9}-KEY.TXT",
+        "readme.md",
+    ] {
+        assert_eq!(
+            lookup_path(&mut export, spelling),
+            Err(Failure::NoEnt),
+            "{spelling:?} (volume folds case: {folds_case})"
+        );
+    }
+    // The stored spelling of a shown file works.
+    assert!(lookup_path(&mut export, "README.md").is_ok());
+    // And the stored spellings of the hidden ones stay hidden.
+    for stored in [".git", ".git/config", ".env", "caf\u{e9}-key.txt"] {
+        assert_eq!(
+            lookup_path(&mut export, stored),
+            Err(Failure::NoEnt),
+            "{stored:?}"
+        );
+    }
+}
+
+/// A file stored as `.ENV`, or with a decomposed name, is the file the rule
+/// names on the Mac (as Git sees it there), and is hidden; where names are
+/// compared byte for byte (Linux), it is another file, as for Git there.
+#[test]
+fn a_stored_name_is_compared_with_the_rules_as_the_volume_compares_it() {
+    let base = TempDir::new("mount-folding");
+    let root = base.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join(".gitignore"), ".env\ncaf\u{e9}-key.txt\n").unwrap();
+    fs::write(root.join(".ENV"), b"TOKEN=not-a-real-one\n").unwrap();
+    fs::write(root.join("cafe\u{301}-key.txt"), b"key").unwrap();
+    let folds_case = !volume_tells_case_apart(&root);
+    let mut export = Export::open(&root, false, None).unwrap();
+    let listed = match export
+        .handle(Question::ReadDir {
+            id: ROOT_ID,
+            start: 0,
+        })
+        .0
+    {
+        Answer::Entries { entries, .. } => entries
+            .into_iter()
+            .map(|e| String::from_utf8(e.name).unwrap())
+            .collect::<Vec<_>>(),
+        other => panic!("unexpected: {other:?}"),
+    };
+    let stored_upper = listed.iter().any(|name| name == ".ENV");
+    let stored_nfd = listed.iter().any(|name| name == "cafe\u{301}-key.txt");
+    if cfg!(target_os = "macos") {
+        assert_eq!(stored_upper, !folds_case, "{listed:?}");
+        assert!(!stored_nfd, "{listed:?}");
+    } else {
+        assert!(stored_upper && stored_nfd, "{listed:?}");
+    }
+}
