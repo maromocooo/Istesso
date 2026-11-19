@@ -1,0 +1,768 @@
+PROTOTYPE ONLY (ADR 0027 proposal, the one-day look of "new windows" on the Linux host,
+docs/measurements/2026-11-20-new-windows-ubuntu.md). Never in a build that a trial, the gate or a
+verdict uses; scripts/build-compositor.sh does not know it (it is in a folder of its own, and it
+is not a trial-*.patch).
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of the four measured patches in scripts/patches
+(render-on-commit, cursor-messages, windows, dialogs, in that order). The lines of context are
+from that project and from those patches.
+
+What it adds, and nothing more, to answer one question (does the first window's picture come
+later while a second window is rendered and encoded at the same time?):
+
+- The element `waylanddisplaysrc` takes `output` (0 unless set). An element with `output=1`
+  runs no compositor: it attaches to the one that an element with `output=0` runs in the same
+  process (found through a process-wide slot; it waits up to 10 s for it) and streams that
+  compositor's second output. Its caps, its CUDA buffer pool and its frames go to the
+  compositor as `VideoInfoFor(1, ..)`, `UpdateCUDABufferPoolFor(1, ..)` and
+  `BufferFor(1, ..)`. With `output=0` nothing changes.
+- The compositor (wayland-display-core/src/comp/second.rs): a second `wl_output`
+  ("HEADLESS-2") mapped far to the right of the first in the space, so the first output's
+  picture never holds anything of it; its own damage tracker and buffer (CUDA, DMABuf or
+  memory, as the first); rendered on the beat of its own frame rate on the same thread and
+  with the same GL context as the first output, without a cursor; its window is told to draw
+  after each of its frames.
+- The first toplevel without a parent that is configured while the first output already shows
+  a window goes to the second output, fullscreen at its size, and does not take the keyboard.
+  What it commits does not make the first output render or tell the first output's clients
+  anything. When it goes, the next such window takes its place.
+
+Not in it: pointer and keyboard for the second window, popups and dialogs on it, resizing,
+more than two outputs, a second output that comes and goes while the compositor runs. No
+tests of its own: the compositor's tests are run against it unchanged.
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index a5cb4ec..25bf5b0 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -29,11 +29,17 @@ use waylanddisplaycore::{
+     WaylandDisplay, channel, utils::device::PCIVendor,
+ };
+ 
++/// Prototype (Istesso, new windows on the Linux host): the commands of the compositor that an
++/// element with `output=0` runs in this process, for an element with `output=1` to attach to.
++static SHARED_COMPOSITOR: Mutex<Option<Sender<Command>>> = Mutex::new(None);
++
+ pub struct WaylandDisplaySrc {
+     state: Mutex<Option<State>>,
+     settings: Mutex<Settings>,
+     command_tx: Sender<Command>,
+     command_rx: Mutex<Option<Channel<Command>>>,
++    /// Prototype: where the commands of an attached element (`output=1`) go.
++    attached: Mutex<Option<Sender<Command>>>,
+ }
+ 
+ impl Default for WaylandDisplaySrc {
+@@ -44,6 +50,7 @@ impl Default for WaylandDisplaySrc {
+             settings: Mutex::new(Settings::default()),
+             command_tx,
+             command_rx: Mutex::new(Some(command_rx)),
++            attached: Mutex::new(None),
+         }
+     }
+ }
+@@ -56,6 +63,9 @@ pub struct Settings {
+     render_on_commit: bool,
+     cursor_messages: bool,
+     window_messages: bool,
++    /// Prototype: 0 runs a compositor; 1 attaches to the one in this process and takes its
++    /// second output.
++    output: u32,
+     #[cfg(feature = "cuda")]
+     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
+     #[cfg(feature = "cuda")]
+@@ -354,6 +364,14 @@ impl ObjectImpl for WaylandDisplaySrc {
+                     )
+                     .default_value(false)
+                     .build(),
++                glib::ParamSpecUInt::builder("output")
++                    .nick("Output (prototype)")
++                    .blurb(
++                        "Prototype: 0 runs a compositor; 1 attaches to the compositor that an element with output 0 runs in this process, and streams its second output, which shows the second window that has no parent",
++                    )
++                    .maximum(1)
++                    .default_value(0)
++                    .build(),
+                 glib::ParamSpecBoolean::builder("cursor-messages")
+                     .nick("Cursor messages")
+                     .blurb(
+@@ -437,6 +455,10 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 // Taken in by the compositor when it runs; it may be changed while it does.
+                 let _ = self.command_tx.send(Command::WindowSink(sink));
+             }
++            "output" => {
++                self.settings.lock().unwrap().output =
++                    value.get::<u32>().expect("Type checked upstream");
++            }
+             "cursor-messages" => {
+                 let enabled = value.get::<bool>().expect("Type checked upstream");
+                 self.settings.lock().unwrap().cursor_messages = enabled;
+@@ -486,6 +508,10 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 let settings = self.settings.lock().unwrap();
+                 settings.cursor_messages.to_value()
+             }
++            "output" => {
++                let settings = self.settings.lock().unwrap();
++                settings.output.to_value()
++            }
+             "window-messages" => {
+                 let settings = self.settings.lock().unwrap();
+                 settings.window_messages.to_value()
+@@ -806,11 +832,15 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+                 }
+ 
+                 // Send the pool to the compositor
+-                let _ = self
+-                    .command_tx
+-                    .send(Command::UpdateCUDABufferPool(Arc::new(Mutex::new(Some(
+-                        pool,
+-                    )))));
++                let pool = Arc::new(Mutex::new(Some(pool)));
++                match self.attached.lock().unwrap().clone() {
++                    Some(attached) => {
++                        let _ = attached.send(Command::UpdateCUDABufferPoolFor(1, pool));
++                    }
++                    None => {
++                        let _ = self.command_tx.send(Command::UpdateCUDABufferPool(pool));
++                    }
++                }
+             }
+             Err(err) => {
+                 tracing::warn!("Failed to create CUDA buffer pool: {}", err);
+@@ -865,7 +895,15 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+             }
+         };
+ 
+-        let _ = self.command_tx.send(Command::VideoInfo(video_info));
++        let attached = self.attached.lock().unwrap().clone();
++        match attached {
++            Some(attached) => {
++                let _ = attached.send(Command::VideoInfoFor(1, video_info));
++            }
++            None => {
++                let _ = self.command_tx.send(Command::VideoInfo(video_info));
++            }
++        }
+ 
+         self.parent_set_caps(caps)
+     }
+@@ -895,14 +933,41 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+         let subscriber = Registry::default().with(GstLayer);
+ 
+-        let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
++        let output = self.settings.lock().unwrap().output;
++        let attached = if output == 1 {
++            // Prototype: the element with output 0 may be started after this one.
++            let mut found = None;
++            for _ in 0..200 {
++                found = SHARED_COMPOSITOR.lock().unwrap().clone();
++                if found.is_some() {
++                    break;
++                }
++                std::thread::sleep(std::time::Duration::from_millis(50));
++            }
++            let Some(found) = found else {
++                return Err(gst::error_msg!(
++                    LibraryError::Failed,
++                    ("No compositor to attach to: an element with output=0 has to run in this process.")
++                ));
++            };
++            *self.attached.lock().unwrap() = Some(found.clone());
++            Some(found)
++        } else {
++            None
++        };
++
++        let display_result = match attached {
++            Some(attached) => Ok(WaylandDisplay::attach(attached, 1)),
++            None => tracing::subscriber::with_default(subscriber, || {
+             let mut command_rx = self.command_rx.lock().unwrap();
+             WaylandDisplay::new_with_channel(
+                 render_node.clone(),
+                 self.command_tx.clone(),
+                 command_rx.deref_mut().take().unwrap(),
+             )
+-        }) else {
++        }),
++        };
++        let Ok(mut display) = display_result else {
+             return Err(gst::error_msg!(
+                 LibraryError::Failed,
+                 (
+@@ -956,11 +1021,17 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+         }
+ 
+         *state = Some(State { display });
++        if output == 0 {
++            *SHARED_COMPOSITOR.lock().unwrap() = Some(self.command_tx.clone());
++        }
+ 
+         Ok(())
+     }
+ 
+     fn stop(&self) -> Result<(), gst::ErrorMessage> {
++        if self.settings.lock().unwrap().output == 0 {
++            *SHARED_COMPOSITOR.lock().unwrap() = None;
++        }
+         let mut state = self.state.lock().unwrap();
+         if let Some(state) = state.take() {
+             let subscriber = Registry::default().with(GstLayer);
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 68e95df..c7075a4 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -1,4 +1,5 @@
+ use super::{Command, DrmFormat, GstVideoInfo};
++use smithay::backend::SwapBuffersError;
+ use gst_video::VideoInfo;
+ use smithay::backend::allocator::format::FormatSet;
+ use smithay::backend::input::AxisSource;
+@@ -74,6 +75,7 @@ mod focus;
+ mod input;
+ pub(crate) mod pacing;
+ mod rendering;
++pub(crate) mod second;
+ pub(crate) mod windows;
+ 
+ pub use self::focus::*;
+@@ -153,6 +155,9 @@ pub struct State {
+     viewporter_state: ViewporterState,
+     cursor_event_count: i32,
+     pub single_pixel_buffer_state: SinglePixelBufferState,
++    /// Prototype: the second output and the window it shows ([`second`]); `None` unless a
++    /// second element has attached to this compositor.
++    pub(crate) second: Option<second::SecondOutput>,
+ }
+ 
+ impl State {
+@@ -276,6 +281,7 @@ impl State {
+             shm_state,
+             viewporter_state,
+             single_pixel_buffer_state,
++            second: None,
+         }
+     }
+ }
+@@ -811,6 +817,33 @@ pub(crate) fn init(
+                         };
+                     }
+                 }
++                Event::Msg(Command::VideoInfoFor(output, video_info)) => {
++                    if output == 1 {
++                        second::apply_video_info(
++                            state,
++                            video_info,
++                            &render_target,
++                            render_node.clone(),
++                        );
++                    } else {
++                        tracing::warn!(output, "Only a second output is known.");
++                    }
++                }
++                Event::Msg(Command::BufferFor(output, buffer_sender, _tracer)) => {
++                    if output == 1 {
++                        second::frame_asked(state, buffer_sender);
++                    } else {
++                        tracing::warn!(output, "Only a second output is known.");
++                        let _ = buffer_sender.send(Err(SwapBuffersError::ContextLost(
++                            "no such output".into(),
++                        )));
++                    }
++                }
++                #[cfg(feature = "cuda")]
++                Event::Msg(Command::UpdateCUDABufferPoolFor(output, pool)) => {
++                    tracing::info!(output, "Updating the CUDA buffer pool of an output");
++                    second::update_cuda_pool(state, output, pool);
++                }
+                 Event::Msg(Command::CloseWindows) => {
+                     let asked = state.close_windows();
+                     tracing::info!(asked, "Asked the windows to close.");
+diff --git a/wayland-display-core/src/comp/rendering.rs b/wayland-display-core/src/comp/rendering.rs
+index 22619ab..8fb7b17 100644
+--- a/wayland-display-core/src/comp/rendering.rs
++++ b/wayland-display-core/src/comp/rendering.rs
+@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
+ 
+ use super::State;
+ use crate::utils::allocator::GsBuffer;
+-use smithay::backend::renderer::gles::GlesError;
++use smithay::backend::renderer::gles::{GlesError, GlesRenderer};
+ use smithay::{
+     backend::renderer::{
+         ImportAll, ImportMem, Renderer,
+@@ -99,4 +99,38 @@ impl State {
+             }
+         }
+     }
++
++    /// Prototype: a frame of the second output ([`super::second`]), without a cursor.
++    pub(crate) fn create_second_frame(
++        &mut self,
++    ) -> Result<(gst::Buffer, RenderOutputResult), OutputDamageTrackerError<GlesError>> {
++        let elements: Vec<CursorElement<GlesRenderer>> = Vec::new();
++        let second = self.second.as_mut().expect("no second output");
++        let mut output_buffer = second.buffer.clone();
++        let mut target = output_buffer
++            .bind(&mut self.renderer)
++            .map_err(OutputDamageTrackerError::Rendering)?;
++        let render_output_result = render_output(
++            &second.output,
++            &mut self.renderer,
++            &mut target,
++            1.0,
++            0,
++            [&self.space],
++            &*elements,
++            &mut second.dtr,
++            [0.0, 0.0, 0.0, 1.0],
++        )?;
++        match second
++            .buffer
++            .clone()
++            .to_gs_buffer(&mut target, &mut self.renderer)
++        {
++            Ok(buffer) => Ok((buffer, render_output_result)),
++            Err(e) => {
++                tracing::warn!("Failed to convert buffer to gst buffer: {:?}", e);
++                Err(OutputDamageTrackerError::Rendering(GlesError::MappingError))
++            }
++        }
++    }
+ }
+diff --git a/wayland-display-core/src/comp/second.rs b/wayland-display-core/src/comp/second.rs
+new file mode 100644
+index 0000000..f5fa3e1
+--- /dev/null
++++ b/wayland-display-core/src/comp/second.rs
+@@ -0,0 +1,252 @@
++//! Prototype (Istesso, "new windows" on the Linux host, a one-day look): a second output that
++//! shows the second window, on a stream of its own.
++//!
++//! Only what it takes to answer one question: does the first window's picture come later when a
++//! second window is rendered and encoded at the same time, by the same compositor thread and
++//! GL context? So:
++//!
++//! * A second element of this plugin in the same process (property `output=1`) attaches to the
++//!   compositor of the first and asks for frames of output 1 here.
++//! * Output 1 lies far to the right of the first output in the space ([`SECOND_AT`]), so the
++//!   first output's picture never holds anything of it.
++//! * The first window without a parent that comes while the first output already shows a
++//!   window goes to output 1, sized to it, and does not take the keyboard. Later windows go
++//!   where they went before.
++//! * Output 1 is rendered on the beat of its frame rate (not on commit), and what its window
++//!   commits does not make the first output render or tell its clients anything.
++//! * Nothing else: no pointer, no popups, no dialogs, no resize, no second window that goes and
++//!   comes back.
++
++use std::sync::mpsc::SyncSender;
++#[cfg(feature = "cuda")]
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use gst_video::VideoInfo;
++use smithay::backend::SwapBuffersError;
++use smithay::backend::drm::DrmNode;
++use smithay::backend::renderer::damage::{Error as DTRError, OutputDamageTracker};
++use smithay::desktop::Window;
++use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
++use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
++use smithay::utils::{Logical, Point, Size};
++use smithay::wayland::compositor::get_parent;
++use smithay::wayland::seat::WaylandFocus;
++
++use super::State;
++use crate::utils::RenderTarget;
++use crate::utils::allocator::{GsBufferType, GsDmaBuf, GsGlesbuffer};
++#[cfg(feature = "cuda")]
++use crate::utils::allocator::{GsCUDABuf, cuda::CUDABufferPool};
++use crate::utils::video_info::GstVideoInfo;
++
++/// Where output 1 begins in the space: far to the right of any first output.
++pub(crate) const SECOND_AT: i32 = 1 << 14;
++
++pub(crate) struct SecondOutput {
++    pub(crate) output: Output,
++    pub(crate) dtr: OutputDamageTracker,
++    pub(crate) buffer: GsBufferType,
++    pub(crate) interval: Duration,
++    pub(crate) last_render: Option<Instant>,
++    /// The window it shows, from its first configure on.
++    pub(crate) window: Option<Window>,
++    pub(crate) frames: u64,
++}
++
++impl SecondOutput {
++    pub(crate) fn size(&self) -> Size<i32, Logical> {
++        self.output
++            .current_mode()
++            .map(|mode| mode.size.to_logical(1))
++            .unwrap_or_default()
++    }
++
++    pub(crate) fn location(&self) -> Point<i32, Logical> {
++        (SECOND_AT, 0).into()
++    }
++
++    /// Whether `surface`, or the surface it belongs to, is the window of this output.
++    pub(crate) fn shows(&self, surface: &WlSurface) -> bool {
++        let Some(window) = self.window.as_ref() else {
++            return false;
++        };
++        let mut root = surface.clone();
++        while let Some(parent) = get_parent(&root) {
++            root = parent;
++        }
++        window.wl_surface().is_some_and(|s| *s == root)
++    }
++
++    pub(crate) fn is(&self, window: &Window) -> bool {
++        self.window.as_ref() == Some(window)
++    }
++}
++
++pub(crate) fn apply_video_info(
++    state: &mut State,
++    video_info: GstVideoInfo,
++    render_target: &RenderTarget,
++    render_node: Option<DrmNode>,
++) {
++    if state.second.is_some() {
++        tracing::warn!("The second output is negotiated once only in this prototype.");
++        return;
++    }
++    let base_info: VideoInfo = video_info.clone().into();
++    let size: Size<i32, smithay::utils::Physical> =
++        (base_info.width() as i32, base_info.height() as i32).into();
++    let framerate = base_info.fps();
++    let interval = Duration::from_secs_f64(
++        framerate.denom().max(1) as f64 / framerate.numer().max(1) as f64,
++    );
++    let output = Output::new(
++        "HEADLESS-2".into(),
++        PhysicalProperties {
++            make: "Virtual".into(),
++            model: "Wolf".into(),
++            size: (0, 0).into(),
++            subpixel: Subpixel::Unknown,
++        },
++    );
++    output.create_global::<State>(&state.dh);
++    let mode = OutputMode {
++        size,
++        refresh: (1000.0 / interval.as_secs_f64()).round() as i32,
++    };
++    output.change_current_state(Some(mode), None, None, None);
++    output.set_preferred(mode);
++    state.space.map_output(&output, (SECOND_AT, 0));
++    let dtr = OutputDamageTracker::from_output(&output);
++
++    let buffer = match render_target {
++        RenderTarget::Hardware(_) => match video_info {
++            GstVideoInfo::RAW(base_info) => GsBufferType::RAW(
++                GsGlesbuffer::new(&mut state.renderer, base_info)
++                    .expect("Failed to create GsGlesbuffer"),
++            ),
++            GstVideoInfo::DMA(base_info) => GsBufferType::DMA(
++                GsDmaBuf::new(render_node.unwrap(), base_info).expect("Failed to create GsDmaBuf"),
++            ),
++            #[cfg(feature = "cuda")]
++            GstVideoInfo::CUDA(base_info) => {
++                let egl_display = state
++                    .renderer
++                    .egl_context()
++                    .display()
++                    .get_display_handle()
++                    .handle;
++                GsBufferType::CUDA(
++                    GsCUDABuf::new(
++                        render_node.unwrap(),
++                        base_info.cuda_context,
++                        base_info.video_info,
++                        Arc::new(Mutex::new(None)),
++                        &egl_display,
++                    )
++                    .expect("Failed to create GsCUDABuf"),
++                )
++            }
++        },
++        RenderTarget::Software => GsBufferType::RAW(
++            GsGlesbuffer::new(&mut state.renderer, base_info.clone())
++                .expect("Failed to create GsGlesbuffer"),
++        ),
++    };
++    tracing::info!(
++        width = size.w,
++        height = size.h,
++        "Second output ready (prototype)."
++    );
++    state.second = Some(SecondOutput {
++        output,
++        dtr,
++        buffer,
++        interval,
++        last_render: None,
++        window: None,
++        frames: 0,
++    });
++}
++
++#[cfg(feature = "cuda")]
++pub(crate) fn update_cuda_pool(
++    state: &mut State,
++    output: usize,
++    pool: Arc<Mutex<Option<CUDABufferPool>>>,
++) {
++    if output != 1 {
++        return;
++    }
++    if let Some(SecondOutput {
++        buffer: GsBufferType::CUDA(cuda_buf),
++        ..
++    }) = state.second.as_mut()
++    {
++        cuda_buf.buffer_pool = pool;
++    }
++}
++
++/// The second element asks for a frame: it is rendered one frame interval after the last one,
++/// or now if that has passed.
++pub(crate) fn frame_asked(
++    state: &mut State,
++    sender: SyncSender<Result<gst::Buffer, SwapBuffersError>>,
++) {
++    let Some(second) = state.second.as_ref() else {
++        let _ = sender.send(Err(SwapBuffersError::ContextLost(
++            "the second output has no video info".into(),
++        )));
++        return;
++    };
++    let wait = second
++        .last_render
++        .map(|last| second.interval.saturating_sub(last.elapsed()))
++        .unwrap_or(Duration::ZERO);
++    if wait.is_zero() {
++        render(state, sender);
++    } else if let Err(err) =
++        state
++            .handle
++            .insert_source(Timer::from_duration(wait), move |_, _, state| {
++                render(state, sender.clone());
++                TimeoutAction::Drop
++            })
++    {
++        tracing::error!(?err, "Event loop error.");
++        state.should_quit = true;
++    }
++}
++
++fn render(state: &mut State, sender: SyncSender<Result<gst::Buffer, SwapBuffersError>>) {
++    match state.create_second_frame() {
++        Ok((buffer, result)) => {
++            result
++                .sync
++                .wait()
++                .expect("Error during render_result.sync");
++            let _ = sender.send(Ok(buffer));
++            let now = state.clock.now();
++            if let Some(second) = state.second.as_mut() {
++                second.last_render = Some(Instant::now());
++                second.frames += 1;
++                if let Some(window) = second.window.as_ref() {
++                    let output = second.output.clone();
++                    window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
++                        Some(output.clone())
++                    });
++                }
++            }
++        }
++        Err(err) => {
++            tracing::error!(?err, "Rendering the second output failed.");
++            let _ = sender.send(Err(match err {
++                DTRError::OutputNoMode(_) => {
++                    SwapBuffersError::ContextLost("the second output has no mode".into())
++                }
++                DTRError::Rendering(err) => err.into(),
++            }));
++        }
++    }
++}
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index e307e15..544ccc4 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -60,6 +60,18 @@ pub enum Command {
+     /// Tell the sink how many windows the clients have, now and whenever that changes; with
+     /// `None`, nobody.
+     WindowSink(Option<WindowSink>),
++    /// Prototype (Istesso, new windows on the host): the video info of the second output, which
++    /// shows the second window that has no parent, on a stream of its own. Only output 1.
++    VideoInfoFor(usize, GstVideoInfo),
++    /// Prototype: a frame of the second output, rendered on the beat of its frame rate.
++    BufferFor(
++        usize,
++        SyncSender<Result<gst::Buffer, SwapBuffersError>>,
++        Option<Tracer>,
++    ),
++    /// Prototype: the CUDA buffer pool of the second output.
++    #[cfg(feature = "cuda")]
++    UpdateCUDABufferPoolFor(usize, Arc<Mutex<Option<CUDABufferPool>>>),
+     Quit,
+ }
+ 
+@@ -104,6 +116,9 @@ impl Drop for Trace {
+ pub struct WaylandDisplay {
+     thread_handle: Option<JoinHandle<()>>,
+     command_tx: Sender<Command>,
++    /// Prototype: 0 for the display that runs the compositor; 1 for one attached to the
++    /// compositor of another element in the same process, which takes the second output.
++    output: usize,
+ 
+     pub tracer: Option<Tracer>,
+     pub devices: MaybeRecv<Vec<CString>>,
+@@ -152,6 +167,7 @@ impl WaylandDisplay {
+         Ok(WaylandDisplay {
+             thread_handle: Some(thread_handle),
+             command_tx,
++            output: 0,
+             tracer: None,
+             devices: MaybeRecv::Rx(devices_rx),
+             envs: MaybeRecv::Rx(envs_rx),
+@@ -176,12 +192,26 @@ impl WaylandDisplay {
+         Ok(WaylandDisplay {
+             thread_handle: Some(thread_handle),
+             command_tx,
++            output: 0,
+             tracer: None,
+             devices: MaybeRecv::Rx(devices_rx),
+             envs: MaybeRecv::Rx(envs_rx),
+         })
+     }
+ 
++    /// Prototype: a display attached to a compositor that runs already (its commands go to
++    /// `command_tx`), for the second output. It runs no thread, and dropping it ends nothing.
++    pub fn attach(command_tx: Sender<Command>, output: usize) -> WaylandDisplay {
++        WaylandDisplay {
++            thread_handle: None,
++            command_tx,
++            output,
++            tracer: None,
++            devices: MaybeRecv::Value(Vec::new()),
++            envs: MaybeRecv::Value(Vec::new()),
++        }
++    }
++
+     pub fn devices(&mut self) -> impl Iterator<Item = &str> {
+         self.devices
+             .get()
+@@ -292,10 +322,12 @@ impl WaylandDisplay {
+ 
+     pub fn frame(&self) -> Result<gst::Buffer, gst::FlowError> {
+         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+-        if let Err(err) = self
+-            .command_tx
+-            .send(Command::Buffer(buffer_tx, self.tracer.clone()))
+-        {
++        let command = if self.output == 0 {
++            Command::Buffer(buffer_tx, self.tracer.clone())
++        } else {
++            Command::BufferFor(self.output, buffer_tx, self.tracer.clone())
++        };
++        if let Err(err) = self.command_tx.send(command) {
+             tracing::warn!(?err, "Failed to send buffer command.");
+             return Err(gst::FlowError::Eos);
+         }
+@@ -331,6 +363,10 @@ impl WaylandDisplay {
+ 
+ impl Drop for WaylandDisplay {
+     fn drop(&mut self) {
++        if self.thread_handle.is_none() {
++            // Attached (prototype): the compositor belongs to another element.
++            return;
++        }
+         if let Err(err) = self.command_tx.send(Command::Quit) {
+             tracing::warn!("Failed to send stop command: {}", err);
+             return;
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index 595d547..985c23e 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -40,7 +40,15 @@ impl CompositorHandler for State {
+             // The cursor has a new image.
+             self.tell_cursor();
+         }
+-        crate::comp::client_committed(self);
++        // Prototype: what the second output's window commits is that output's business; the
++        // first output neither renders for it nor tells its clients anything.
++        let on_second = self
++            .second
++            .as_ref()
++            .is_some_and(|second| second.shows(surface));
++        if !on_second {
++            crate::comp::client_committed(self);
++        }
+ 
+         if let Some(window) = self
+             .space
+@@ -82,7 +90,25 @@ impl CompositorHandler for State {
+             // how much room there is.
+             let is_child = toplevel.parent().is_some();
+             if !initial_configure_sent {
+-                if is_child {
++                // Prototype: the first window without a parent that comes while the first
++                // output shows a window already goes to the second output, if there is one.
++                let second_size = match self.second.as_mut() {
++                    Some(second)
++                        if !is_child
++                            && second.window.is_none()
++                            && self.space.elements().count() > 0 =>
++                    {
++                        second.window = Some(window.clone());
++                        Some(second.size())
++                    }
++                    _ => None,
++                };
++                if let Some(size) = second_size {
++                    toplevel.with_pending_state(|state| {
++                        state.size = Some(size);
++                        state.states.set(XdgState::Fullscreen);
++                    });
++                } else if is_child {
+                     let room = self
+                         .output
+                         .as_ref()
+@@ -124,6 +150,17 @@ impl CompositorHandler for State {
+                 // again, and one whose size is not known is neither drawn nor found by the
+                 // pointer.
+                 window.on_commit();
++                if let Some(at) = self
++                    .second
++                    .as_ref()
++                    .filter(|second| second.is(&window))
++                    .map(|second| second.location())
++                {
++                    // Prototype: on the second output, and the keyboard stays where it is.
++                    self.space.map_element(window.clone(), at, false);
++                    tracing::info!("A window on the second output (prototype).");
++                    return;
++                }
+                 let loc = self.place_window(&window);
+                 self.space.map_element(window.clone(), loc, true);
+                 self.seat.get_keyboard().unwrap().set_focus(
+diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
+index 4931ed6..8b5deb7 100644
+--- a/wayland-display-core/src/wayland/handlers/xdg.rs
++++ b/wayland-display-core/src/wayland/handlers/xdg.rs
+@@ -38,6 +38,10 @@ impl XdgShellHandler for State {
+             .find(|w| w.toplevel().is_some_and(|toplevel| *toplevel == surface))
+             .cloned();
+         if let Some(gone) = gone {
++            // Prototype: the second output's window is gone; nothing takes its place.
++            if let Some(second) = self.second.as_mut().filter(|second| second.is(&gone)) {
++                second.window = None;
++            }
+             self.space.unmap_elem(&gone);
+         }
+         self.keyboard_to_the_top_window();
