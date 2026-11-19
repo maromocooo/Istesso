@@ -1424,9 +1424,10 @@ static void *channel_thread(void *unused) {
             log_reconnections("cut");
             guint64 t = cut_at;
             dispatch_async(dispatch_get_main_queue(), ^{
-                show_counts();
                 update_text_input_field((IstessoMediaTextInput){0});
                 picture_was_cut(t);
+                // After the picture is marked as being made again: the title says so.
+                show_counts();
             });
         } else if (got == 4) {
             IstessoMediaWatchState state;
