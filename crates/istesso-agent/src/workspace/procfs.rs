@@ -132,6 +132,33 @@ pub(crate) fn parse_stat(stat: &str) -> Option<(i32, i32)> {
     Some((session, parent))
 }
 
+/// Whether the process `pid` is a command typed at the prompt of the shell
+/// `shell`, as far as the system tells: its parent is that shell, and it is
+/// in the terminal's foreground job. A program the shell's programs started
+/// (a coding agent's command, a script's) is not. This is for showing who
+/// asked, not a guard: any program of the user may start such a command.
+pub fn typed_at_the_prompt(pid: i32, shell: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_job(&stat))
+        .is_some_and(|(parent, group, foreground)| {
+            parent == shell && foreground > 0 && group == foreground
+        })
+}
+
+/// `(parent, process group, the terminal's foreground process group)` from
+/// the text of `/proc/<pid>/stat`, counted from the last `)` as in
+/// [`parse_stat`].
+pub(crate) fn parse_job(stat: &str) -> Option<(i32, i32, i32)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // state, ppid, pgrp, session, tty_nr, tpgid
+    let parent = fields.get(1)?.parse().ok()?;
+    let group = fields.get(2)?.parse().ok()?;
+    let foreground = fields.get(5)?.parse().ok()?;
+    Some((parent, group, foreground))
+}
+
 /// Every process number in `/proc`.
 fn all_pids() -> Vec<i32> {
     std::fs::read_dir("/proc")
@@ -591,6 +618,23 @@ mod tests {
         let stat = "4242 (a (strange) name) S 4200 4242 4100 34816 4242 4194560 0 0";
         assert_eq!(parse_stat(stat), Some((4100, 4200)));
         assert_eq!(parse_stat("garbage"), None);
+        assert_eq!(parse_job(stat), Some((4200, 4242, 4242)));
+        assert_eq!(parse_job("garbage"), None);
+    }
+
+    #[test]
+    fn only_a_command_of_the_shell_in_the_foreground_is_typed_at_its_prompt() {
+        let me = std::process::id() as i32;
+        let parent = parse_stat(&std::fs::read_to_string("/proc/self/stat").unwrap())
+            .unwrap()
+            .1;
+        // Not the parent of this test: never typed at its prompt.
+        assert!(!typed_at_the_prompt(me, me));
+        assert!(!typed_at_the_prompt(i32::MAX, parent));
+        let typed = typed_at_the_prompt(me, parent);
+        let (_, group, foreground) =
+            parse_job(&std::fs::read_to_string("/proc/self/stat").unwrap()).unwrap();
+        assert_eq!(typed, foreground > 0 && group == foreground);
     }
 
     #[test]

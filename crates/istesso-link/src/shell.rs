@@ -98,6 +98,11 @@ pub struct WindowOpen {
     /// makes it when the frame is read.
     #[serde(default)]
     pub title: String,
+    /// The request came from a program in the shell (a coding agent, a
+    /// script), not from a command typed at the shell's own prompt, as far
+    /// as the host can tell. For showing only: the device says so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub asked_by_program: bool,
 }
 
 /// How a shell ended.
@@ -262,6 +267,13 @@ mod tests {
                 picture: 26891,
                 input: 26892,
                 title: "Text Editor".into(),
+                asked_by_program: false,
+            }),
+            ShellFrame::OpenWindow(WindowOpen {
+                picture: 26891,
+                input: 26892,
+                title: "Text Editor".into(),
+                asked_by_program: true,
             }),
         ];
         for frame in frames {
@@ -332,14 +344,22 @@ mod tests {
 
     #[test]
     fn a_window_names_ports_and_a_title_only_and_the_title_is_made_harmless() {
-        let frame = ShellFrame::OpenWindow(WindowOpen {
+        let mut window = WindowOpen {
             picture: 1,
             input: 2,
             title: "x".into(),
-        })
-        .encode();
+            asked_by_program: false,
+        };
+        let frame = ShellFrame::OpenWindow(window.clone()).encode();
         assert_eq!(frame[0], 0x07);
+        // Typed at the prompt: the frame is as an earlier version sent it.
         assert_eq!(&frame[1..], br#"{"picture":1,"input":2,"title":"x"}"#);
+        window.asked_by_program = true;
+        let frame = ShellFrame::OpenWindow(window).encode();
+        assert_eq!(
+            &frame[1..],
+            br#"{"picture":1,"input":2,"title":"x","asked_by_program":true}"#
+        );
         // Escape sequences and long titles are not shown as they are.
         let mut raw = vec![0x07];
         raw.extend_from_slice(
@@ -371,7 +391,8 @@ mod tests {
         };
         assert!(matches!(
             with(br#"{"picture":5,"input":6}"#),
-            Ok(ShellFrame::OpenWindow(WindowOpen { title, .. })) if title.is_empty()
+            Ok(ShellFrame::OpenWindow(WindowOpen { title, asked_by_program: false, .. }))
+                if title.is_empty()
         ));
         assert!(matches!(
             with(br#"{"picture":5,"input":6,"size":[1,2]}"#),

@@ -5,7 +5,9 @@
 //!
 //! * Inside the workspace, `istesso-edit <file>` (this program under
 //!   another name) asks on the agent's socket for pages
-//!   ([`super::opener`]), with one line: `file <absolute place>`.
+//!   ([`super::opener`]), with one line: `file <absolute place>`. So does
+//!   `xdg-open` for a text file ([`super::opener::run_as`]); `EDITOR`,
+//!   `VISUAL` and other editors' names are not taken over (ADR 0007).
 //! * The agent takes it only from a process of the workspace of an open
 //!   shell whose device said that it shows windows, and only for a place
 //!   inside that shell's project folder, looked at one name at a time
@@ -16,7 +18,9 @@
 //!   ([`MainEditor::open`]).
 //! * The launcher says on which ports the window's picture and input wait,
 //!   and the device is told so on the shell's conversation
-//!   ([`istesso_link::shell::ShellFrame::OpenWindow`]).
+//!   ([`istesso_link::shell::ShellFrame::OpenWindow`]), with whether a
+//!   program in the shell asked rather than a command typed at its prompt
+//!   (for showing only: [`super::watch::Workspace::typed_at_the_prompt`]).
 //!
 //! The agent keeps the place and file name out of its request logs. The
 //! editor keeps its own session, recent files and drafts on the host.
@@ -490,12 +494,21 @@ pub fn run_as_edit(args: &[OsString]) -> u8 {
             }
         }
     };
-    let Some(place) = place.to_str().filter(|place| {
-        !place.is_empty() && place.len() <= MAX_PLACE && !place.chars().any(char::is_control)
-    }) else {
+    let Some(place) = place.to_str() else {
         say(&Refusal::Malformed.to_string());
         return 1;
     };
+    ask_for_file(place, &say)
+}
+
+/// Asks the agent to open the file at `place` (absolute) in the main
+/// editor, and says why when it is not opened. Returns the exit status.
+/// What `istesso-edit` and `xdg-open` (for a text file) do.
+pub fn ask_for_file(place: &str, say: &dyn Fn(&str)) -> u8 {
+    if place.is_empty() || place.len() > MAX_PLACE || place.chars().any(char::is_control) {
+        say(&Refusal::Malformed.to_string());
+        return 1;
+    }
     let Some(socket) = std::env::var_os(super::opener::SOCKET_VARIABLE).map(PathBuf::from) else {
         say("this is not a shell opened from another device with Istesso");
         return 1;

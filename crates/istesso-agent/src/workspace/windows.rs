@@ -12,6 +12,12 @@
 //! never as an argument: a title is the host's text, and a program may take
 //! an argument for an option. The frame names no address and no key, so the
 //! window is looked for on the host of the shell and nowhere else.
+//!
+//! When the host says that a program in the shell asked (a coding agent, a
+//! script: not a command typed at the shell's prompt), the person is told
+//! so in the notice line, the title begins with [`BY_PROGRAM`], and
+//! `ISTESSO_WINDOW_ASKED_BY` is `program` (`prompt` otherwise), so that the
+//! program that shows the window may keep it from taking the keys.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -31,6 +37,10 @@ const SHOWING_WINDOW: Duration = Duration::from_secs(5);
 pub const OPENER_VARIABLE: &str = "ISTESSO_WINDOW_OPENER";
 /// The variable that carries the window's title to that program.
 pub const TITLE_VARIABLE: &str = "ISTESSO_WINDOW_TITLE";
+/// The variable that tells that program who asked: `program` or `prompt`.
+pub const ASKED_BY_VARIABLE: &str = "ISTESSO_WINDOW_ASKED_BY";
+/// How the title of a window that a program asked for begins.
+pub const BY_PROGRAM: &str = "(from a program) ";
 
 /// Shows the windows that the host of one shell opened for it.
 pub struct Windows {
@@ -67,6 +77,14 @@ impl Windows {
     /// The host opened `window`: show it, or say why it is not shown.
     /// Returns whether the program that shows it was started.
     pub fn open(&self, window: &WindowOpen) -> bool {
+        let (title, who) = if window.asked_by_program {
+            (
+                istesso_link::shell::harmless_title(&format!("{BY_PROGRAM}{}", window.title)),
+                ", asked by a program in the shell (not typed at its prompt)",
+            )
+        } else {
+            (window.title.clone(), "")
+        };
         {
             let mut shown = self.shown.lock().unwrap_or_else(|e| e.into_inner());
             while shown
@@ -77,7 +95,7 @@ impl Windows {
             }
             if shown.len() >= MAX_SHOWN {
                 (self.notice)(&format!(
-                    "the host opened a window ({}), not shown: too many at once",
+                    "the host opened a window ({}){who}, not shown: too many at once",
                     window.title
                 ));
                 return false;
@@ -86,7 +104,7 @@ impl Windows {
         }
         let Some(program) = &self.program else {
             (self.notice)(&format!(
-                "the host opened a window ({}) whose picture waits on its port {}; set {OPENER_VARIABLE} to show it here",
+                "the host opened a window ({}){who} whose picture waits on its port {}; set {OPENER_VARIABLE} to show it here",
                 window.title, window.picture
             ));
             return false;
@@ -96,7 +114,15 @@ impl Windows {
             .arg(window.picture.to_string())
             .arg(window.input.to_string())
             .env("ISTESSO_CHANNEL_PEER", &self.host_id)
-            .env(TITLE_VARIABLE, &window.title)
+            .env(TITLE_VARIABLE, &title)
+            .env(
+                ASKED_BY_VARIABLE,
+                if window.asked_by_program {
+                    "program"
+                } else {
+                    "prompt"
+                },
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -104,7 +130,7 @@ impl Windows {
         match started {
             Ok(mut child) => {
                 (self.notice)(&format!(
-                    "the host opened a window ({}): shown here (picture from its port {})",
+                    "the host opened a window ({}){who}: shown here (picture from its port {})",
                     window.title, window.picture
                 ));
                 // Collected when it ends; without a thread to wait, it stays a
@@ -116,7 +142,7 @@ impl Windows {
             }
             Err(err) => {
                 (self.notice)(&format!(
-                    "the host opened a window ({}), not shown: its program did not start: {err}",
+                    "the host opened a window ({}){who}, not shown: its program did not start: {err}",
                     window.title
                 ));
                 false
@@ -146,6 +172,7 @@ mod tests {
             picture,
             input: picture + 1,
             title: "Text Editor".into(),
+            asked_by_program: false,
         }
     }
 
@@ -157,7 +184,7 @@ mod tests {
         std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" \"$ISTESSO_CHANNEL_PEER\" \"$ISTESSO_WINDOW_TITLE\" > '{}.new'\nmv '{0}.new' '{0}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" \"$ISTESSO_CHANNEL_PEER\" \"$ISTESSO_WINDOW_TITLE\" \"$ISTESSO_WINDOW_ASKED_BY\" > '{}.new'\nmv '{0}.new' '{0}'\n",
                 written.display()
             ),
         )
@@ -170,16 +197,40 @@ mod tests {
             "the-hosts-id",
             notice,
         );
+        let written_now = |before: Option<String>| {
+            let began = Instant::now();
+            loop {
+                if let Ok(now) = std::fs::read_to_string(&written) {
+                    if before.as_deref() != Some(now.as_str()) {
+                        return now;
+                    }
+                }
+                assert!(began.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
         assert!(windows.open(&window(26891)));
-        let began = Instant::now();
-        while !written.exists() && began.elapsed() < Duration::from_secs(5) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let first = written_now(None);
         assert_eq!(
-            std::fs::read_to_string(&written).unwrap(),
-            "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\nText Editor\n"
+            first,
+            "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\nText Editor\nprompt\n"
         );
         assert!(lines.lock().unwrap()[0].contains("shown here"));
+        assert!(!lines.lock().unwrap()[0].contains("program"));
+        // Asked by a program in the shell: said in the notice and the title.
+        assert!(windows.open(&WindowOpen {
+            asked_by_program: true,
+            ..window(26891)
+        }));
+        assert_eq!(
+            written_now(Some(first)),
+            "3\n127.0.0.1\n26891\n26892\nthe-hosts-id\n(from a program) Text Editor\nprogram\n"
+        );
+        let said = lines.lock().unwrap()[1].clone();
+        assert!(
+            said.contains("asked by a program in the shell (not typed at its prompt)"),
+            "{said}"
+        );
     }
 
     #[test]

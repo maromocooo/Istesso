@@ -553,7 +553,33 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
         WindowOpen {
             picture: 26891,
             input: 26892,
-            title: "Text Editor".into()
+            title: "Text Editor".into(),
+            asked_by_program: false,
+        }
+    );
+    // The same file asked for by a program in the shell (a script here), not
+    // typed at its prompt: the device is told so.
+    let script = tools.path().join("via-program.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "python3 '{}' \"$1\"\nstatus=$?\nexit $status\n",
+            ask.display()
+        ),
+    )
+    .unwrap();
+    shell.type_in(&format!(
+        "sh '{}' \"$PWD/notes.txt\" >> '{}'\n",
+        script.display(),
+        answers.display()
+    ));
+    assert_eq!(
+        shell.window(),
+        WindowOpen {
+            picture: 26891,
+            input: 26892,
+            title: "Text Editor".into(),
+            asked_by_program: true,
         }
     );
     shell.type_in(&asking(&format!("'{}'", secret.display())));
@@ -580,18 +606,18 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    let mut lines = lines_of(&answers, 4);
+    let mut lines = lines_of(&answers, 5);
     lines.extend(lines_of(&others, 1));
-    assert_eq!(lines[0], "ok");
-    assert!(lines[1].contains("only files inside the shell's project folder"));
-    assert!(lines[2].contains("symbolic link"));
-    assert!(lines[3].contains("without '..'"));
-    assert!(lines[4].contains("does not show windows"));
-    // The editor was started once, with the place the host built, in its
+    assert_eq!(lines[..2], ["ok", "ok"]);
+    assert!(lines[2].contains("only files inside the shell's project folder"));
+    assert!(lines[3].contains("symbolic link"));
+    assert!(lines[4].contains("without '..'"));
+    assert!(lines[5].contains("does not show windows"));
+    // The launcher was asked twice, with the place the host built, in its
     // environment.
     assert_eq!(
         std::fs::read_to_string(&launched).unwrap(),
-        format!("1|open|{}\n", folder.join("notes.txt").display())
+        format!("1|open|{}\n", folder.join("notes.txt").display()).repeat(2)
     );
     // When the shell that asked is over, its editor is ended.
     shell.type_in("exit\n");
@@ -613,6 +639,12 @@ fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_wind
     assert!(log
         .iter()
         .any(|line| line.contains("in the main editor") && line.contains("port 26891")));
+    assert!(log
+        .iter()
+        .any(|line| line.contains("(typed at the shell's prompt)")));
+    assert!(log
+        .iter()
+        .any(|line| line.contains("(asked by a program in the shell)")));
     for line in &log {
         for word in ["notes", "secret", "link.txt", "ed-project", "ed-outside"] {
             assert!(!line.contains(word), "{line}");

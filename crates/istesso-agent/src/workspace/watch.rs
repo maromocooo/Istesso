@@ -234,6 +234,22 @@ impl Workspace {
         }
     }
 
+    /// Whether the process `pid` (one of this workspace's) is a command
+    /// typed at the prompt of the shell itself, rather than one started by
+    /// a program in it (`procfs::typed_at_the_prompt`). Elsewhere
+    /// than on Linux the host cannot tell, and says no.
+    pub fn typed_at_the_prompt(&self, pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            super::procfs::typed_at_the_prompt(pid, self.shell)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
     /// Whether the process `pid` belongs to this workspace.
     pub fn holds(&self, pid: i32) -> bool {
         #[cfg(target_os = "linux")]
