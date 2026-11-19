@@ -10,7 +10,8 @@
 #   ish-mount --release <folder-id>  unmounts it unless something on this Mac
 #                                    uses it (status 3 then: it stays mounted)
 # Like `ish`, it uses a test identity of its own (ISH_DIR), and the host's
-# agent on 26850 (ISH_PORT).
+# agent on 26850 (ISH_PORT). The locks, process numbers and logs of the
+# mounts are in this user's temporary folder, or in ISH_MOUNT_STATE.
 D=${ISH_DIR:-"$HOME/Library/Application Support/istesso-dev-shell-test"}
 root=${ISTESSO_MOUNT_ROOT:-"$HOME/Istesso"}
 prog="$D/bin/unified-mount-proto"
@@ -21,7 +22,9 @@ usage() {
 case "${1:-}" in
     --release)
         [ $# -eq 2 ] || usage
-        exec "$prog" release "$2" --base "$root" --machine-folder ubuntu
+        set -- release "$2" --base "$root" --machine-folder ubuntu
+        if [ -n "${ISH_MOUNT_STATE:-}" ]; then set -- "$@" --state "$ISH_MOUNT_STATE"; fi
+        exec "$prog" "$@"
         ;;
     "" | -*) usage ;;
 esac
@@ -32,5 +35,6 @@ if [ -z "$addr" ]; then
     exit 1
 fi
 port=${ISH_PORT:-26850}
-ISTESSO_CONFIG_DIR="$D/config" exec "$prog" ensure proto-host "$1" --base "$root" \
-    --machine-folder ubuntu --address "$addr:$port"
+set -- ensure proto-host "$1" --base "$root" --machine-folder ubuntu --address "$addr:$port"
+if [ -n "${ISH_MOUNT_STATE:-}" ]; then set -- "$@" --state "$ISH_MOUNT_STATE"; fi
+ISTESSO_CONFIG_DIR="$D/config" exec "$prog" "$@"

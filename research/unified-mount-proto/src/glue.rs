@@ -227,22 +227,30 @@ fn wait_for_earlier(pid_file: &Path) {
 enum Logged {
     /// The folder is mounted and its contents are answered.
     Ready,
+    /// It was mounted, and the connection to the device is lost since: every read fails.
+    Lost,
     /// Not yet, and these are the reasons it gave for failing, if any.
     NotYet(Vec<String>),
 }
 
 fn read_log(text: &str) -> Logged {
     let mut reasons = Vec::new();
+    let mut ready = false;
     for line in text.lines() {
         // `mount` says this once the gate is open, after mount_nfs succeeded.
         if line.starts_with("mounted ") {
-            return Logged::Ready;
-        }
-        if let Some(reason) = line.strip_prefix("mount: ") {
+            ready = true;
+        } else if ready && line.starts_with("mount: lost the connection") {
+            return Logged::Lost;
+        } else if let Some(reason) = line.strip_prefix("mount: ") {
             reasons.push(reason.to_string());
         }
     }
-    Logged::NotYet(reasons)
+    if ready {
+        Logged::Ready
+    } else {
+        Logged::NotYet(reasons)
+    }
 }
 
 fn log_text(path: &Path) -> String {
@@ -303,13 +311,26 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
         existing_point(&options.base, &options.machine, &options.folder)
             .filter(|point| crate::is_mounted(point))
     };
-    if let Some(point) = mounted_at() {
-        return Ok(point);
-    }
     let pid_file = state.join(format!("{name}.pid"));
+    let log_path = state.join(format!("{name}.log"));
+    if let Some(point) = mounted_at() {
+        if read_log(&log_text(&log_path)) != Logged::Lost {
+            return Ok(point);
+        }
+        // Mounted, but every read fails since the connection was lost: mounted again, when
+        // nothing uses it.
+        match plain_unmount(&point) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                return Err(failed(
+                    "the connection to the machine was lost, and the folder is still in use on this Mac; close what uses it and go in again",
+                ))
+            }
+            Err(e) => return Err(failed(format!("cannot unmount {}: {e}", point.display()))),
+        }
+    }
     wait_for_earlier(&pid_file);
 
-    let log_path = state.join(format!("{name}.log"));
     let log = OpenOptions::new()
         .create(true)
         .write(true)
@@ -351,16 +372,25 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
         .spawn()
         .map_err(|e| failed(format!("cannot start the mount: {e}")))?;
     let pid = child.id() as i32;
-    let _ = std::fs::write(&pid_file, format!("{pid}\n"));
+    let _ = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&pid_file)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, format!("{pid}\n").as_bytes()));
 
     let until = Instant::now() + options.wait;
     loop {
-        if read_log(&log_text(&log_path)) == Logged::Ready {
+        let logged = read_log(&log_text(&log_path));
+        if logged == Logged::Ready {
             if let Some(point) = mounted_at() {
                 // The `mount` goes on by itself; it is not waited for.
                 return Ok(point);
             }
         }
+        let lost = logged == Logged::Lost;
         match child.try_wait() {
             Ok(Some(status)) => {
                 let _ = std::fs::remove_file(&pid_file);
@@ -375,7 +405,7 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
             Ok(None) => {}
             Err(e) => return Err(failed(format!("cannot follow the mount: {e}"))),
         }
-        if Instant::now() >= until {
+        if lost || Instant::now() >= until {
             // Its own handling of SIGTERM takes off whatever it mounted before it ends.
             // SAFETY: a signal to the process this function started, by its number.
             unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -383,9 +413,12 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
             while matches!(child.try_wait(), Ok(None)) && Instant::now() < stop {
                 std::thread::sleep(Duration::from_millis(50));
             }
+            if lost {
+                return Err(failed("the connection to the machine was lost at once"));
+            }
             let mut reasons = match read_log(&log_text(&log_path)) {
                 Logged::NotYet(reasons) => reasons,
-                Logged::Ready => Vec::new(),
+                Logged::Ready | Logged::Lost => Vec::new(),
             };
             reasons.push(format!(
                 "not mounted after {:.0} s; stopped trying",
@@ -601,6 +634,16 @@ mod tests {
         );
         // A line that only contains the words is not the line.
         assert_eq!(read_log("test: not mounted yet\n"), Logged::NotYet(vec![]));
+        // Lost after it was mounted: every read fails from then on.
+        assert_eq!(
+            read_log("mounted p of h read-only at /x after 0.1 s\nmount: lost the connection to h (closed); reads fail from now on, until this is stopped\n"),
+            Logged::Lost
+        );
+        // The same words before the mount are only a reason.
+        assert_eq!(
+            read_log("mount: lost the connection to h\n"),
+            Logged::NotYet(vec!["lost the connection to h".into()])
+        );
     }
 
     #[test]
