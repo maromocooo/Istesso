@@ -95,6 +95,9 @@
 #   LAYOUT              what is printed on the keys, as the host names it: us (default) or jp
 #   ISTESSO_COMMAND_KEY super to send the Command keys as Super instead of Control
 #   DAILY_DOCK_TILE     none: the windows get no Dock tile (for when the launcher has the one tile)
+#   DAILY_CLIPBOARD=0   the window does not take Command-C, X and V for copy and paste with this
+#                       Mac: they go to the application as Control-C, X and V (copies inside the
+#                       host only). For a window opened now; the default is copy and paste on
 #
 # For checks that put nothing on either screen (docs/trial-daily.md, "確かめたこと"); never needed
 # for everyday use:
@@ -1162,7 +1165,7 @@ remember_settings() { # FOLDER
     # that the guard has to start again is started without them, as a person may be typing by then.
     local setting
     for setting in DAILY_NO_WINDOW DAILY_FRAME_LOGS DAILY_MAC_CONFIG DAILY_HOST_CONFIG DAILY_BLENDER_CONFIG \
-        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY; do
+        DAILY_TEST_SIGNAL DAILY_DOCK_TILE ISTESSO_COMMAND_KEY DAILY_CLIPBOARD; do
         eval "echo \"export $setting=\$(quoted \"\${$setting:-}\")\""
     done > "$1/settings"
     echo "export SIZE=$(quoted "$size") LAYOUT=$(quoted "$layout")" >> "$1/settings"
@@ -1236,8 +1239,8 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         local x y frames=- n=$slot
         if [ -n "${POSITION:-}" ]; then x=${POSITION%,*}; y=${POSITION#*,}; else x=$((60 + 48 * n)); y=$((60 + 36 * n)); fi
         [ -n "${DAILY_FRAME_LOGS:-}" ] && frames="$mine/frames-$(date +%s).jsonl"
-        local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1 ISTESSO_CLIPBOARD=1
-            ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
+        local settings=(ISTESSO_DAILY_RECONNECT=1 ISTESSO_CHANNEL="$host_side:$((47910 + slot))" ISTESSO_CHANNEL_PEER="$peer" ISTESSO_END_WITH_WINDOW=1 ISTESSO_TEXT_INPUT=1
+            ISTESSO_CLIPBOARD="$([ "${DAILY_CLIPBOARD:-1}" = 0 ] && echo 0 || echo 1)" ISTESSO_PID_FILE="$mine/viewer.number" ISTESSO_TITLE_FILE="$mine/title" ${config_env[@]+"${config_env[@]}"})
         # The title the window has; the guard changes it while a window of the application is calling.
         printf '%s\n\n' "$(app_title "$name")" > "$mine/title"
         [ "${DAILY_DOCK_TILE:-}" = none ] && settings+=(ISTESSO_DOCK_TILE=none)

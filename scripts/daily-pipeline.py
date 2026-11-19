@@ -342,7 +342,7 @@ def main():
             raise SystemExit("daily-pipeline: --clipboard needs the host script's --input-socket")
         # Read by the trial compositor (gwd-trial28 and later) when it starts.
         os.environ["ISTESSO_CLIPBOARD_DIR"] = os.path.dirname(os.path.abspath(socket))
-        marks = {"dropped": 0}
+        marks = {"dropped": 0, "passed": 0}
 
         def clipboard_handler(value):
             if value.get("kind") not in ("clipboard_copy", "clipboard_paste"):
@@ -354,6 +354,9 @@ def main():
                 print(f"daily: copy or paste mark dropped ({marks['dropped']} so far)", file=sys.stderr, flush=True)
                 return True
             pad.send_event(event)
+            marks["passed"] += 1
+            # How many, never a nonce.
+            print(f"daily: copy and paste marks passed to the compositor: {marks['passed']}", file=sys.stderr, flush=True)
             return True
 
         handlers.append(clipboard_handler)

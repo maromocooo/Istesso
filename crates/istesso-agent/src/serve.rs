@@ -134,6 +134,22 @@ struct ClipboardCounts {
     asked: u64,
     copies: u64,
     answered: u64,
+    /// Answers that said nothing was copied or pasted (`none`).
+    nothing: u64,
+}
+
+impl ClipboardCounts {
+    /// One line whenever a count grows (trial only): how many, never what, how long, or the
+    /// nonces.
+    fn line(&self) -> String {
+        format!(
+            "clipboard so far: {} copy and {} paste asked, {} answered ({} of them none)",
+            self.copies,
+            self.asked - self.copies,
+            self.answered,
+            self.nothing
+        )
+    }
 }
 
 /// What is kept of a conversation that carries input, for ending it from
@@ -691,14 +707,15 @@ impl Shared {
                 None
             };
             counts.asked += 1;
+            if matches!(event, InputEvent::Copy { .. }) {
+                counts.copies += 1;
+            }
+            (self.log)(counts.line());
             match event {
-                InputEvent::Copy { id, cut } => {
-                    counts.copies += 1;
-                    match hub.copy(*id, *cut, answering) {
-                        Some(mark) => Some(mark),
-                        None => at_once(*id, istesso_proto::ClipboardResult::Nothing),
-                    }
-                }
+                InputEvent::Copy { id, cut } => match hub.copy(*id, *cut, answering) {
+                    Some(mark) => Some(mark),
+                    None => at_once(*id, istesso_proto::ClipboardResult::Nothing),
+                },
                 InputEvent::Paste { id, text } => match hub.paste(*id, text.as_ref(), answering) {
                     Ok(mark) => Some(mark),
                     Err(result) => at_once(*id, result),
@@ -731,6 +748,10 @@ impl Shared {
                 return false;
             }
             counts.answered += 1;
+            if answer.result == istesso_proto::ClipboardResult::Nothing {
+                counts.nothing += 1;
+            }
+            (self.log)(counts.line());
             let response = Response::Clipboard {
                 id: answer.id,
                 result: answer.result,

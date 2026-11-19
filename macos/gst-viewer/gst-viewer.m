@@ -1659,6 +1659,15 @@ static char clipboard_folder[PATH_MAX];
 static char clipboard_socket_path[sizeof ((struct sockaddr_un *)0)->sun_path];
 
 // Shows `note` in the title for two seconds; nil shows nothing.
+// Copy and paste of this window, in counts only (never what, never a nonce), on standard error
+// whenever one of them grows: asked of the host, answered, gone without an answer in time, and
+// not asked because it was refused here or before anything went (secret, too large, not text).
+static unsigned long clipboard_asked, clipboard_answers, clipboard_unanswered, clipboard_not_asked;
+static void clipboard_say(void) {
+    fprintf(stderr, "viewer: copy and paste: %lu asked, %lu answered, %lu without an answer, %lu not asked\n",
+            clipboard_asked, clipboard_answers, clipboard_unanswered, clipboard_not_asked);
+}
+
 static void clipboard_show(NSString *note) {
     if (note == nil) {
         return;
@@ -1705,6 +1714,10 @@ static void clipboard_ask(char which) {
     if (which == 'v') {
         NSString *text = nil;
         PasteKind kind = clipboard_read_paste(NSPasteboard.generalPasteboard, &text);
+        if (kind == PASTE_SECRET || kind == PASTE_TOO_LARGE || kind == PASTE_NOT_TEXT) {
+            clipboard_not_asked++;
+            clipboard_say();
+        }
         switch (kind) {
         case PASTE_SECRET: clipboard_show(clipboard_note("paste:secret", NULL, NO)); return;
         case PASTE_TOO_LARGE: clipboard_show(clipboard_note("paste:too_large", NULL, NO)); return;
@@ -1720,16 +1733,22 @@ static void clipboard_ask(char which) {
         }
     }
     NSData *datagram = [NSJSONSerialization dataWithJSONObject:request options:0 error:NULL];
+    clipboard_asked++;
     if (datagram == nil || !clipboard_send(datagram)) {
+        clipboard_unanswered++;
+        clipboard_say();
         clipboard_show(clipboard_note("timeout", NULL, NO));
         return;
     }
+    clipboard_say();
     clipboard_waiting = id;
     clipboard_cut = which == 'x';
     clipboard_pasting = which == 'v';
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(CLIPBOARD_WITHIN * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (clipboard_waiting == id) {
             clipboard_waiting = 0;
+            clipboard_unanswered++;
+            clipboard_say();
             clipboard_show(clipboard_note("timeout", NULL, NO));
         }
     });
@@ -1748,6 +1767,8 @@ static void clipboard_answered(NSDictionary *answer) {
         return;
     }
     clipboard_waiting = 0;
+    clipboard_answers++;
+    clipboard_say();
     if (![why isKindOfClass:NSString.class]) {
         why = nil;
     }
@@ -1780,7 +1801,11 @@ static BOOL clipboard_start(void) {
         rmdir(clipboard_folder);
         return NO;
     }
-    if (bind(input_socket, (const struct sockaddr *)&own, sizeof own) != 0) {
+    // The address's length is the path's own (SUN_LEN), not the whole structure's: macOS hands
+    // the address back to the receiver at the length it was bound with, and the relay could not
+    // find a path with NULs after it as a file (2026-11-19, the owner's first copy and paste).
+    own.sun_len = (unsigned char)SUN_LEN(&own);
+    if (bind(input_socket, (const struct sockaddr *)&own, (socklen_t)SUN_LEN(&own)) != 0) {
         rmdir(clipboard_folder);
         return NO;
     }
@@ -2050,6 +2075,8 @@ static NSCursor *empty_cursor(void) {
             if (!event.isARepeat && !picture_stale) {
                 if (clipboard_refused_here(which, [self fieldState])) {
                     // A password field over there: not asked at all, with the host's own notice.
+                    clipboard_not_asked++;
+                    clipboard_say();
                     clipboard_show(clipboard_note("refused", "password_field", which == 'x'));
                 } else {
                     clipboard_ask(which);
