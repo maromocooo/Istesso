@@ -200,12 +200,16 @@ final class SourceSwitch {
     func forgetRestored() { restoredTo = nil }
 }
 
-/// Whether a viewer counts as shown for the inline part: a new stream after a resize has no
-/// viewer for a moment, and that is not a disconnect (seen on the Studio, 2026-11-19 21:46: each
-/// resize put the source back and selected Istesso's again, and the input source was activated and
-/// deactivated with it). Only nobody for 1.5 s is.
+/// Whether a viewer counts as shown for the inline part. A new stream after a resize, and the
+/// start (the first resize, the virtual display made, the window moved), leave no viewer for a
+/// while: that is not a disconnect (seen on the Studio, 2026-11-19 21:46 and 21:57: each such gap
+/// put the source back and selected Istesso's again, longer than 1.5 s at the start, and the input
+/// source was activated and deactivated with it). The rule: nobody shown counts only after 10 s
+/// without a viewer. The owner loses nothing by it: their own keyboard takes their source back at
+/// once (local typing first), and a lock or a stop puts it back at once too.
+let inlineNobodyAfter = 10.0
 func inlineViewerShown(viewers: Int, restarting: Bool, sinceShown: Double) -> Bool {
-    viewers > 0 || restarting || sinceShown < 1.5
+    viewers > 0 || restarting || sinceShown < inlineNobodyAfter
 }
 
 /// Whether Istesso's source should be selected now (ADR 0023, 2.): while a viewer is shown the
@@ -407,13 +411,37 @@ final class InlineComposer {
     private var timedOut: [Int] = []
     private var compStartedAt: TimeInterval = -1
     private var lastViewerPress: TimeInterval = -1
+    /// When the host last posted a key (or text by the key path) to the application, and until
+    /// when a mark or a commit that came right after it waits.
+    private var keyPostedAt: TimeInterval = -1000
+    private var afterKeyUntil: TimeInterval?
+    /// A mark sent right after a posted key overtook it on the Studio (2026-11-19 21:47, twice:
+    /// "かな", Return, "です": the Return and "です" were lost). Keys go through the window server,
+    /// marks through the input source; nothing orders them. So a mark or a commit that comes within
+    /// this time of a posted key waits until it has passed (ADR 0023, 4., "キーのあとの変換").
+    static let afterKey = 0.05
     private(set) var counts: [String: Int] = [:]
     static let insertedWithin = 0.05
     static let notTextAfter = 0.1
 
     init(app: String) { self.app = app }
 
-    var holding: Bool { awaiting != nil }
+    var holding: Bool { awaiting != nil || afterKeyUntil != nil }
+
+    /// The host posted a key (or text by the key path) to the application.
+    func keyPosted() { keyPostedAt = now() }
+
+    /// Whether this event (composing text, or a commit) must wait because a key was posted just
+    /// before it while composing inline; the wait then begins (everything after it waits too).
+    func waitsAfterKey(kind: String, text: String?) -> Bool {
+        guard kind == "text" || (kind == "preedit" && !(text ?? "").isEmpty) else { return false }
+        guard engaged || comp != nil else { return false }
+        let until = keyPostedAt + Self.afterKey
+        guard now() < until else { return false }
+        afterKeyUntil = until
+        count("waited_after_key")
+        return true
+    }
     private func count(_ what: String) { counts[what, default: 0] += 1 }
 
     /// Inline now: the input source said "active" about the relayed application, Istesso's source
@@ -450,12 +478,14 @@ final class InlineComposer {
         linked = false
         active = false
         if comp != nil { comp = nil; stripComposition = true }
+        let wasHolding = holding
+        afterKeyUntil = nil
         if awaiting != nil {
             // Whether it went in cannot be known; it is not sent again (it would land twice).
             count("commit_unknown_at_cut")
             awaiting = nil
-            releaseHold()
         }
+        if wasHolding { releaseHold() }
         pending.removeAll()
         count("gone")
         recompute()
@@ -574,7 +604,7 @@ final class InlineComposer {
                 deliverText(text)
             }
             timedOut.removeAll { $0 == seq }
-            if awaiting?.seq == seq { awaiting = nil; releaseHold() }
+            if awaiting?.seq == seq { awaiting = nil; if afterKeyUntil == nil { releaseHold() } }
         case "caret":
             // Answered from the relayed application's active field (a rectangle or not), or
             // refused because it is not active.
@@ -720,12 +750,16 @@ final class InlineComposer {
 
     /// Called often (every 10 ms while something is held, every 100 ms otherwise).
     func tick() {
+        if let until = afterKeyUntil, now() >= until {
+            afterKeyUntil = nil
+            if awaiting == nil { releaseHold() }
+        }
         if let waiting = awaiting, now() > waiting.until {
             count("inserted_timeout")
             timedOut.append(waiting.seq)
             if timedOut.count > 64 { timedOut.removeFirst(timedOut.count - 64) }
             awaiting = nil
-            releaseHold()
+            if afterKeyUntil == nil { releaseHold() }
         }
         recompute()
     }
@@ -829,8 +863,25 @@ final class InlineHost {
 
     /// An event while a commit waits for "inserted": held in order (true), or, past the bound,
     /// dropped and counted (true as well: it never goes ahead of the queue).
+    /// Composing text or a commit right after a posted key waits a moment (a mark must not
+    /// overtake the key); keys and everything else go at once.
+    private func waitsAfterKey(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = object["kind"] as? String else { return false }
+        return composer.waitsAfterKey(kind: kind, text: object["text"] as? String)
+    }
+
+    /// The next held event that may go now (taken off the queue), or nil: something waits, or a
+    /// mark right after a key just let go of from this same queue must wait its moment too.
+    func nextToFlush() -> Data? {
+        guard !composer.holding, let first = held.first, !waitsAfterKey(first) else { return nil }
+        return held.removeFirst()
+    }
+
     func hold(_ data: Data) -> Bool {
-        guard composer.holding || !held.isEmpty else { return false }
+        if !composer.holding && held.isEmpty {
+            guard waitsAfterKey(data) else { return false }
+        }
         if held.count < Self.mostHeld { held.append(data) } else { heldDropped += 1 }
         return true
     }
@@ -982,8 +1033,9 @@ func inlineSelfTest() -> Int {
     check(!inlineSourceWanted(connected: true, locked: true, localIdle: 99, idle: 3), "not while the screen is locked")
     check(inlineViewerShown(viewers: 0, restarting: true, sinceShown: 0.2) && inlineViewerShown(viewers: 0, restarting: false, sinceShown: 1.0),
           "a new stream after a resize is not a disconnect")
-    check(!inlineViewerShown(viewers: 0, restarting: false, sinceShown: 1.6) && inlineViewerShown(viewers: 1, restarting: false, sinceShown: 99),
-          "nobody for 1.5 s is")
+    check(inlineViewerShown(viewers: 0, restarting: false, sinceShown: 5) && !inlineViewerShown(viewers: 0, restarting: false, sinceShown: 10.1)
+          && inlineViewerShown(viewers: 1, restarting: false, sinceShown: 99),
+          "a start's gap (seconds) is not a disconnect either; nobody for 10 s is")
     // 2x virtual display: the window at (1000, 200) points, the picture 2 pixels a point.
     let px = caretPixels(CGRect(x: 1010, y: 210, width: 0, height: 20), origin: CGPoint(x: 1000, y: 200), pointsPerPixel: 0.5,
                          picture: CGSize(width: 800, height: 600))
@@ -1274,6 +1326,30 @@ func inlineSelfTest() -> Int {
     composer.preedit("", cursor: [0, 0])
     _ = im.take()
 
+    // A mark or a commit right after a posted key waits 50 ms (it must not overtake the key);
+    // keys and other events do not wait; after the time, what waited goes on.
+    clock += 2
+    let releasedBefore = released
+    composer.keyPosted()
+    clock += 0.01
+    check(!composer.waitsAfterKey(kind: "key", text: nil) && !composer.waitsAfterKey(kind: "preedit", text: ""),
+          "after a key: another key, or an empty preedit, does not wait")
+    check(composer.waitsAfterKey(kind: "preedit", text: "で") && composer.holding, "after a key: a mark waits")
+    clock += 0.02
+    composer.tick()
+    check(composer.holding && released == releasedBefore, "and still 30 ms after the key")
+    clock += 0.03
+    composer.tick()
+    check(!composer.holding && released == releasedBefore + 1, "50 ms after the key it goes on")
+    composer.keyPosted()
+    clock += 0.06
+    check(!composer.waitsAfterKey(kind: "text", text: "で"), "a commit 60 ms after a key does not wait")
+    composer.keyPosted()
+    check(composer.waitsAfterKey(kind: "text", text: "で"), "a commit right after a key waits")
+    clock += 0.06
+    composer.tick()
+    check(!composer.holding, "and goes on")
+
     // An inline composition whose inline conditions go away mid-way (here the caret leaves the
     // window): cleared there before it goes on the strip, its commit typed once.
     clock += 2
@@ -1409,6 +1485,15 @@ func inlineHostSelfTest(folder: String) -> Int {
     pump(0.3) { composer.comp != nil && !composer.isPending(1_000_000) && { lock.lock(); defer { lock.unlock() }; return seen.contains("mark") }() }
     pump(0.05)
     check(composer.comp != nil, "a composition is shown")
+    // From the held queue too: a key let go of, then the mark behind it waits its moment.
+    func event(_ object: [String: Any]) -> Data { try! JSONSerialization.data(withJSONObject: object) }
+    host.held = [event(["kind": "key", "code": 28, "pressed": true]), event(["kind": "preedit", "text": "で", "cursor": [3, 3]])]
+    let firstOut = host.nextToFlush()
+    composer.keyPosted()  // as the injector does when it posts that key
+    check(firstOut != nil && host.nextToFlush() == nil && host.held.count == 1, "held: the key goes, the mark behind it waits")
+    usleep(60_000)
+    composer.tick()
+    check(host.nextToFlush() != nil && host.held.isEmpty, "held: and goes 50 ms after the key")
     host.tick(connected: false, locked: false, pid: nil)
     check(clearBeforeSelect == true && system.current == "test.ime#kana", "disconnected: cleared first, then the source before put back")
     // The owner's own choice.

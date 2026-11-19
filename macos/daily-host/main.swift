@@ -2180,6 +2180,9 @@ final class Injector {
     /// inline composition first. Without, `preedit` is unknown here and text goes as before.
     var onPreedit: ((String, [Int]) -> Void)?
     var onButtonPressed: (() -> Void)?
+    /// A key, or text by the key path, was posted to the application (inline: a mark waits a
+    /// moment after it).
+    var onKeyPosted: (() -> Void)?
     /// Where events let go of after a chord's hold go: the host's dispatch (set by the host).
     var redispatch: ((Data) -> Void)?
     var onText: ((String) -> Bool)?
@@ -2418,6 +2421,7 @@ final class Injector {
         // Never repeated by anyone: a posted key is one press, however long it is held.
         event.setIntegerValueField(.keyboardEventAutorepeat, value: 0)
         postProcess(event, pid)
+        onKeyPosted?()
         // How long each key was down between our own down and up (times only, never which key).
         let at = nowNs()
         if pressed { keyDownPostedAt[code] = at } else if let down = keyDownPostedAt.removeValue(forKey: code) {
@@ -2547,6 +2551,7 @@ final class Injector {
                 event.flags = []
                 event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
                 postProcess(event, pid)
+                onKeyPosted?()
             }
             chunk.removeAll()
         }
@@ -3576,6 +3581,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         injector.onText = { made.composer.commit($0) }
         injector.onKeyPressed = { made.composer.keyPressed() }
         injector.onButtonPressed = { made.viewerPressed() }
+        injector.onKeyPosted = { made.composer.keyPosted() }
         injector.redispatch = { [weak self] event in self?.dispatch(event) }
         made.pid = { [weak self] in self?.app?.processIdentifier }
         inline = made
@@ -3611,8 +3617,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// What waited for an "inserted", in order, until something waits again.
     func flushHeld() {
         guard let inline else { return }
-        while !inline.held.isEmpty && !inline.composer.holding {
-            let event = inline.held.removeFirst()
+        while let event = inline.nextToFlush() {
             guard !detached, picture == "running" else { continue }
             dispatchNow(event)
         }
