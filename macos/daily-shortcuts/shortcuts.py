@@ -19,6 +19,15 @@ SOURCE = Path(__file__).resolve().parent
 ROOT = SOURCE.parent.parent
 STAGE = ROOT / "build/shortcuts"
 DEST = Path.home() / "Applications/Istesso Dev"
+# A rehearsal: everything as in the real run (the same lists, the same signing, the same icons),
+# but into DAILY_SHORTCUTS_DEST, a folder of the rehearsal's own, and nothing is registered with
+# LaunchServices or imported into Spotlight, which are the person's own: the rehearsal's shortcuts
+# carry the same identifiers and the same URL scheme as the person's.
+REHEARSAL = os.environ.get("DAILY_SHORTCUTS_REHEARSAL") == "1"
+if REHEARSAL:
+    if not os.environ.get("DAILY_SHORTCUTS_DEST"):
+        sys.exit("A rehearsal needs DAILY_SHORTCUTS_DEST, a folder of its own.")
+    DEST = Path(os.environ["DAILY_SHORTCUTS_DEST"])
 HANDLER = "Istesso Dev Open"
 PREFIX = "com.maromoco.istesso-dev."
 SCHEME = "istesso-dev-open"
@@ -251,8 +260,9 @@ def remove(dest, names, obsolete):
         check_owned(dest, title, names)
         bundle = dest / (title + ".app")
         if bundle.exists():
-            subprocess.run([LSREGISTER, "-u", bundle], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not REHEARSAL:
+                subprocess.run([LSREGISTER, "-u", bundle], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             shutil.rmtree(bundle)
         names.remove(title)
         save_names(dest, names)
@@ -296,8 +306,11 @@ def install(stage, dest, rows, host):
                 bundle.touch()
             else:
                 new.rename(bundle)
-            subprocess.run([tool, "register", bundle], check=True)
-            spotlight_import(bundle)
+            if REHEARSAL:
+                print(f"rehearsal: {bundle.name} is in place; not registered, not imported")
+            else:
+                subprocess.run([tool, "register", bundle], check=True)
+                spotlight_import(bundle)
         remove(dest, names, names - wanted)
 
 

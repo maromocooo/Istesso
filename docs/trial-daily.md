@@ -337,6 +337,8 @@ scripts/daily.sh note "気づいたこと"
 
 ## Spotlight、Alfred、Dock から開く
 
+近道の入れ方の下見（エージェントの確かめ）：`DAILY_SHORTCUTS_REHEARSAL=1 DAILY_SHORTCUTS_DEST=<下見の自分のフォルダー> scripts/daily.sh shortcuts install`。本番と同じ一覧、同じ署名、同じアイコンの取り寄せで、そのフォルダーに置くだけ。LaunchServices への登録と Spotlight への読み込みはしない（持ち主の近道と同じ識別子と URL を持つため）。
+
 登録（`install`）と外すこと（`remove`）は、持ち主が手で確かめるときに、持ち主がします（「ローカルネットワーク」の問いも、そのとき）。エージェントは、`build` と試験（`macos/daily-shortcuts` で `python3 -m unittest`）だけをします（2026-11-19、統合のとき：12 件が通り、`~/Applications/Istesso Dev/` には何も足していない）。
 
 試験の動かし方：先に `scripts/daily.sh shortcuts build` を実行し（試験は、作った `bundle-tool` と包みを使います）、`cd macos/daily-shortcuts && python3 test_shortcuts.py` とします。`python3 -I` では、試験が `shortcuts` を読み込めません（`-I` は、スクリプトのフォルダーから読み込まないため）。
