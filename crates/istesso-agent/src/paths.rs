@@ -11,13 +11,65 @@
 //! program that holds this device's key, reaches other devices or is given
 //! permissions by the system must not be pointed at a peers list or a socket
 //! of somebody else's choosing (ADR 0021, "the same user's other programs").
-//! Development builds can move the directories with `ISTESSO_CONFIG_DIR` and
-//! `ISTESSO_CACHE_DIR` (the `dev-paths` feature); tests use [`Paths::at`].
+//! Development builds (the `dev-paths` feature) can move the directories
+//! with `ISTESSO_CONFIG_DIR` and `ISTESSO_CACHE_DIR`, and the runtime
+//! directory (where the input socket is) with `XDG_RUNTIME_DIR`; tests use
+//! [`Paths::at`]. Such a build says so on standard error, carries
+//! [`DEV_PATHS_MARKER`] for the signing step to refuse, and must never be
+//! given permissions or a real key. The trial ("daily") is the one accepted
+//! exception: it runs several identities side by side and builds with
+//! `dev-paths`, knowingly leaving its signed host open to being started with
+//! somebody else's directories.
 
 use std::path::{Path, PathBuf};
 
 /// Directory name used below the platform's standard locations.
 const APP_DIR: &str = "istesso";
+
+/// Whether this is a development build that takes its places from the
+/// environment (feature `dev-paths`).
+pub const DEV_PATHS: bool = cfg!(feature = "dev-paths");
+
+/// Text that a development build carries in its binary and a release build
+/// never does: the signing step refuses a binary that contains it
+/// (`scripts/refuse-dev-build.sh`).
+pub const DEV_PATHS_MARKER: &str = "ISTESSO-DEV-PATHS-BUILD";
+
+/// The marker, kept in the binary and exported (`nm` finds it).
+#[cfg(feature = "dev-paths")]
+#[used]
+#[no_mangle]
+pub static ISTESSO_DEV_PATHS_BUILD: [u8; 24] = *b"ISTESSO-DEV-PATHS-BUILD\0";
+
+/// The warning a development build gives (`istesso doctor`, and once per
+/// process on standard error); `None` in any other build. The marker is in
+/// the text only in development builds.
+pub fn development_build() -> Option<String> {
+    #[cfg(feature = "dev-paths")]
+    {
+        // Kept in the binary, whatever the linker removes.
+        std::hint::black_box(&ISTESSO_DEV_PATHS_BUILD);
+        Some(format!(
+            "warning: development build [{DEV_PATHS_MARKER}]: ISTESSO_CONFIG_DIR, \
+             ISTESSO_CACHE_DIR and XDG_RUNTIME_DIR move the identity, the paired devices and \
+             the sockets; never give this build permissions or a real key, never sign it"
+        ))
+    }
+    #[cfg(not(feature = "dev-paths"))]
+    None
+}
+
+/// Says once per process, on standard error, that this build takes its
+/// places from the environment.
+#[cfg(feature = "dev-paths")]
+fn warn_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Some(warning) = development_build() {
+            eprintln!("{warning}");
+        }
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -42,6 +94,8 @@ pub struct Environment {
     pub config_override: Option<PathBuf>,
     /// `ISTESSO_CACHE_DIR`, read only by development builds (`dev-paths`).
     pub cache_override: Option<PathBuf>,
+    /// `XDG_RUNTIME_DIR`, read only by development builds (`dev-paths`).
+    pub runtime_override: Option<PathBuf>,
 }
 
 impl Environment {
@@ -53,14 +107,18 @@ impl Environment {
     /// Only development builds look anything up.
     fn gather(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
         #[cfg(feature = "dev-paths")]
-        let (config_override, cache_override) = {
+        let (config_override, cache_override, runtime_override) = {
             let var = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-            (var("ISTESSO_CONFIG_DIR"), var("ISTESSO_CACHE_DIR"))
+            (
+                var("ISTESSO_CONFIG_DIR"),
+                var("ISTESSO_CACHE_DIR"),
+                var("XDG_RUNTIME_DIR"),
+            )
         };
         #[cfg(not(feature = "dev-paths"))]
-        let (config_override, cache_override) = {
+        let (config_override, cache_override, runtime_override) = {
             let _ = var;
-            (None, None)
+            (None, None, None)
         };
         Environment {
             home: account_home(),
@@ -68,6 +126,7 @@ impl Environment {
             macos: cfg!(target_os = "macos"),
             config_override,
             cache_override,
+            runtime_override,
         }
     }
 }
@@ -120,18 +179,24 @@ fn account_home() -> Option<PathBuf> {
 /// can enter. Not `XDG_RUNTIME_DIR`, which whoever starts the program chooses.
 #[cfg(target_os = "linux")]
 fn account_runtime_dir() -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
-    let dir = PathBuf::from(format!("/run/user/{uid}"));
-    let meta = std::fs::symlink_metadata(&dir).ok()?;
-    (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0).then_some(dir)
+    runtime_dir_if_ours(Path::new(&format!("/run/user/{uid}")), uid)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn account_runtime_dir() -> Option<PathBuf> {
     None
+}
+
+/// `dir`, if it is a directory itself (not a link), belongs to `uid`, and
+/// nobody else can enter it.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn runtime_dir_if_ours(dir: &Path, uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0).then(|| dir.to_path_buf())
 }
 
 /// Why a place for a socket was refused.
@@ -149,6 +214,8 @@ impl std::error::Error for NotOurPlace {}
 impl Paths {
     /// The locations for the current account.
     pub fn from_env() -> Self {
+        #[cfg(feature = "dev-paths")]
+        warn_once();
         Self::resolve(&Environment::current())
     }
 
@@ -173,9 +240,12 @@ impl Paths {
             (None, None) if env.macos => home.join("Library/Caches").join(APP_DIR),
             (None, None) => home.join(".cache").join(APP_DIR),
         };
-        let runtime = match env.config_override {
-            Some(_) => None,
-            None => env.runtime.clone(),
+        let runtime = match (&env.runtime_override, &env.config_override) {
+            (Some(dir), _) => Some(dir.clone()),
+            // Moved configuration, and no runtime directory of its own: the
+            // input socket goes next to the moved cache.
+            (None, Some(_)) => None,
+            (None, None) => env.runtime.clone(),
         };
         Paths {
             config,
@@ -196,9 +266,10 @@ impl Paths {
     }
 
     /// Where a program of this device may listen for input to pass on:
-    /// `asked`, if it names a file directly in the cache directory (or in the
-    /// runtime directory), which has to exist. Development builds
-    /// (`dev-paths`) take any place.
+    /// `asked`, if it names a file directly in the cache directory or in
+    /// `istesso/` in the runtime directory (not the runtime directory itself,
+    /// where other programs' sockets are), which has to exist. Development
+    /// builds (`dev-paths`) take any place.
     pub fn local_socket(&self, asked: &Path) -> Result<PathBuf, NotOurPlace> {
         if cfg!(feature = "dev-paths") {
             return Ok(asked.to_path_buf());
@@ -207,11 +278,15 @@ impl Paths {
     }
 
     fn socket_in_our_places(&self, asked: &Path) -> Result<PathBuf, NotOurPlace> {
+        let runtime = self.runtime.as_ref().map(|dir| dir.join(APP_DIR));
         let refuse = || {
+            let mut places = self.cache.display().to_string();
+            if let Some(dir) = &runtime {
+                places = format!("{places} or {}", dir.display());
+            }
             NotOurPlace(format!(
-                "{} is not a place of Istesso's: a socket goes directly into {}",
+                "{} is not a place of Istesso's: a socket goes directly into {places}",
                 asked.display(),
-                self.cache.display()
             ))
         };
         let name = asked
@@ -220,7 +295,7 @@ impl Paths {
             .ok_or_else(refuse)?;
         let parent = asked.parent().ok_or_else(refuse)?;
         let parent = std::fs::canonicalize(parent).map_err(|_| refuse())?;
-        let ours = [Some(&self.cache), self.runtime.as_ref()]
+        let ours = [Some(&self.cache), runtime.as_ref()]
             .into_iter()
             .flatten()
             .filter_map(|dir| std::fs::canonicalize(dir).ok())
@@ -355,6 +430,57 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_dir_others_can_enter_is_not_ours() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("runtime");
+        // SAFETY: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let dir = root.0.join("rt");
+        std::fs::create_dir(&dir).unwrap();
+        let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+
+        set(0o700).unwrap();
+        assert_eq!(runtime_dir_if_ours(&dir, uid), Some(dir.clone()));
+        // Another account's.
+        assert_eq!(runtime_dir_if_ours(&dir, uid.wrapping_add(1)), None);
+        // Others can enter or read it.
+        for mode in [0o750, 0o705, 0o755, 0o701] {
+            set(mode).unwrap();
+            assert_eq!(runtime_dir_if_ours(&dir, uid), None, "mode {mode:o}");
+        }
+        set(0o700).unwrap();
+        // A link to it, a file, nothing.
+        let link = root.0.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert_eq!(runtime_dir_if_ours(&link, uid), None);
+        let file = root.0.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(runtime_dir_if_ours(&file, uid), None);
+        assert_eq!(runtime_dir_if_ours(&root.0.join("missing"), uid), None);
+    }
+
+    #[cfg(feature = "dev-paths")]
+    #[test]
+    fn development_builds_move_the_runtime_dir_too() {
+        // As the trial starts its agent: everything below its own folder.
+        let env = Environment::gather(|name| match name {
+            "ISTESSO_CONFIG_DIR" => Some("/run/x/config".into()),
+            "ISTESSO_CACHE_DIR" => Some("/run/x/agent-cache".into()),
+            "XDG_RUNTIME_DIR" => Some("/run/x/rt".into()),
+            _ => None,
+        });
+        let paths = Paths::resolve(&env);
+        assert_eq!(paths.config, PathBuf::from("/run/x/config"));
+        assert_eq!(paths.cache, PathBuf::from("/run/x/agent-cache"));
+        assert_eq!(
+            paths.input_socket(),
+            PathBuf::from("/run/x/rt/istesso/input.sock")
+        );
+    }
+
     #[cfg(feature = "dev-paths")]
     #[test]
     fn development_builds_can_move_everything() {
@@ -377,12 +503,31 @@ mod tests {
         assert_eq!(paths.cache, PathBuf::from("/tmp/c"));
     }
 
+    /// A folder of the test's own, removed also when the test fails.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("istesso-paths-test-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TestDir(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn sockets_go_directly_into_our_places() {
-        let root =
-            std::env::temp_dir().join(format!("istesso-paths-test-{}-sockets", std::process::id()));
-        let paths = Paths::at(root.join("config"));
+        let dir = TestDir::new("sockets");
+        let root = &dir.0;
+        let mut paths = Paths::at(root.join("config"));
+        paths.runtime = Some(root.join("rt"));
         let elsewhere = root.join("elsewhere");
         // Not there yet: nothing is ours.
         assert!(paths
@@ -390,6 +535,10 @@ mod tests {
             .is_err());
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::create_dir_all(&paths.cache).unwrap();
+        std::fs::create_dir_all(root.join("rt").join(APP_DIR)).unwrap();
+        assert!(paths
+            .socket_in_our_places(&root.join("rt").join(APP_DIR).join("input.sock"))
+            .is_ok());
 
         let ok = paths
             .socket_in_our_places(&paths.cache.join("probe-input.sock"))
@@ -406,6 +555,8 @@ mod tests {
             paths.cache.join(".."),
             paths.cache.join("..").join("elsewhere").join("in.sock"),
             PathBuf::from("in.sock"),
+            // Beside other programs' sockets (the display's, the bus's).
+            root.join("rt").join("wayland-0"),
         ] {
             assert!(
                 paths.socket_in_our_places(&refused).is_err(),
@@ -418,8 +569,6 @@ mod tests {
         let link = paths.cache.join("link");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
         assert!(paths.socket_in_our_places(&link.join("in.sock")).is_err());
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

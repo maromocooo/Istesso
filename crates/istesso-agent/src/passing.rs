@@ -56,7 +56,8 @@ impl PassLog {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            // Not through a link someone put there.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let file = options.open(path)?;
         // A file that was already there keeps the rights it had.

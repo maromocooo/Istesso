@@ -231,7 +231,9 @@ unsafe fn text(text: *const c_char) -> Result<Option<String>> {
 /// and tests take another directory.
 fn paths(config_dir: Option<String>) -> Result<Paths> {
     match config_dir {
-        Some(dir) if cfg!(any(test, feature = "dev-paths")) => Ok(Paths::at(PathBuf::from(dir))),
+        Some(dir) if cfg!(test) || istesso_agent::paths::DEV_PATHS => {
+            Ok(Paths::at(PathBuf::from(dir)))
+        }
         Some(_) => Err(Error::Refused(
             "this build keeps its identity and its paired devices where istesso does; \
              pass no directory"

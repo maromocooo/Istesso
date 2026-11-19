@@ -32,5 +32,6 @@ libc = "0.2"
 
 [features]
 # Development builds only: the C interface takes a configuration directory
-# other than istesso's (`config_dir`). See crates/istesso-agent/Cargo.toml.
+# other than istesso's (`config_dir`). The switch is istesso-agent's: turned on
+# there by any crate, it is on here too. See crates/istesso-agent/Cargo.toml.
 dev-paths = ["istesso-agent/dev-paths"]

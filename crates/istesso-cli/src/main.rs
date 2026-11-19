@@ -464,6 +464,9 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Doctor { json } => {
+            if let Some(warning) = istesso_agent::paths::development_build() {
+                eprintln!("{warning}");
+            }
             let manifest = istesso_doctor::detect();
             // Other commands and the agent reuse this inspection for a while.
             cache::remember_local_manifest(&Paths::from_env(), &manifest);
@@ -692,9 +695,22 @@ fn relay_input(
         }
         // Written beside and moved over, so that nobody reads half of it. Whoever reads
         // it checks that the process named in it still runs.
+        // Made anew each time (never through a link left there), readable by
+        // the owner only.
         let beside = state.with_extension("state.new");
         let line = format!("{{\"pid\":{},\"input\":{cuts}}}\n", std::process::id());
-        if std::fs::write(&beside, line).is_ok() {
+        let _ = std::fs::remove_file(&beside);
+        let written = {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&beside)
+                .and_then(|mut file| file.write_all(line.as_bytes()))
+        };
+        if written.is_ok() {
             let _ = std::fs::rename(&beside, &state);
         }
     };
