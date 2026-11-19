@@ -54,7 +54,7 @@ pub const FIRST_ANSWER_WITHIN: Duration = Duration::from_secs(3);
 
 /// The keys that are pressed again when a conversation is back: Control,
 /// Shift, Alt and Super, left and right (Linux key numbers).
-const MODIFIERS: [u32; 8] = [29, 42, 54, 56, 97, 100, 125, 126];
+pub const MODIFIERS: [u32; 8] = [29, 42, 54, 56, 97, 100, 125, 126];
 
 /// What to do about a conversation that ended or could not be opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +176,15 @@ impl InputLine {
     /// Whether there is a conversation at the moment.
     pub fn is_open(&self) -> bool {
         self.client.is_some()
+    }
+
+    /// While there is no conversation: when the next attempt to open one is
+    /// due. Whoever looks after the line need not look before then.
+    pub fn due(&self) -> Option<Instant> {
+        match self.client {
+            Some(_) => None,
+            None => Some(self.due),
+        }
     }
 
     /// Whether the device answers "still here", so that silence is noticed.

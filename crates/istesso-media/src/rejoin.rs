@@ -143,6 +143,9 @@ pub struct Lasting {
     cuts: u64,
     /// It is over, and was said to be: nothing is tried again.
     over: bool,
+    /// Why the connection was cut, or why the latest attempt to make it
+    /// again failed. Nothing while there is a connection.
+    failed: Option<crate::Failure>,
     asker: Arc<Mutex<Option<Asker>>>,
 }
 
@@ -161,6 +164,7 @@ impl Lasting {
             ever: false,
             cuts: 0,
             over: false,
+            failed: None,
             asker: Arc::new(Mutex::new(None)),
         }
     }
@@ -176,6 +180,12 @@ impl Lasting {
     }
 
     /// How often the connection was cut and taken up again, or is being.
+    /// While there is no connection: why it was cut, or why the latest
+    /// attempt to make it failed, in one word that names no address.
+    pub fn last_failure(&self) -> Option<crate::Failure> {
+        self.failed
+    }
+
     pub fn cuts(&self) -> u64 {
         self.cuts
     }
@@ -215,6 +225,7 @@ impl Lasting {
                         Err(err)
                     }
                     Next::At(due) => {
+                        self.failed = Some(err.failure());
                         self.due = Some(due);
                         self.heard = Some(heard);
                         self.cuts += 1;
@@ -254,6 +265,7 @@ impl Lasting {
                     .map(|heard| heard.elapsed())
                     .unwrap_or_default();
                 self.viewer = Some(viewer);
+                self.failed = None;
                 self.pace.connected(Instant::now());
                 self.due = None;
                 Ok(Some(Step::Connected { again, silent_for }))
@@ -264,6 +276,7 @@ impl Lasting {
                     Err(err)
                 }
                 Next::At(due) => {
+                    self.failed = Some(err.failure());
                     self.due = Some(due);
                     Ok(None)
                 }

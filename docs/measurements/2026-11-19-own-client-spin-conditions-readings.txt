@@ -1,0 +1,211 @@
+== spinc-rehearsal-cond-235749  (form cond, wake: front,awake-spin,usage)
+   valid                                                      yes
+   inputs, followed all the way                               20, 20
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 12
+   load Mac/host (median during the inputs)                   1.73/0.60
+   Q1 relayed-local median/95/99 ms (official)                9.96/8.81/-2.44
+   Q1 relayed added, local added median/95 ms                 27.64/32.15 ; 17.68/23.33
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    2.17  (0.07 + 2.03 + 0.01 + 0.06)
+   Q1 client non-waits per input median/mean/95 ms            2.18/2.17/2.27
+      host non-waits, mean of the table (in+comp+enc)         5.97
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             100.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 100.0% / 100.0%
+   Q2 spin stretches; on-time s; share of the input period on 1; 10.9; 100.0%
+   Q2 input period s; longest gap between inputs s            8.4; 0.55
+   Q2 decoded frames while the spin was on                    42.2%
+   Q2 picture thread on fast cores: decoded / arrived         44.1% / 44.1%
+   Q2 spin thread cpu s (against on-time)                     10.9
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         46.5; 25.7; 1.81
+   Q3 client cpu s (on fast cores)                            12.8 (87%)
+   Q3 Mac power in, mean over the run W (system load W)       - (-)
+   Q3 battery before -> after                                 -
+   status                                                     2026-11-18 23:58:46 spinc-rehearsal-cond: status 0; Inputs: 20 sent, 20 shown by the local window, 20 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: spinc-rehearsal-cond-235749
+   status                                                     2026-11-18 23:58:46 spinc-rehearsal-cond: the client's wake line is the form's
+== spinc-off1-235846  (form off, wake: front,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 40
+   load Mac/host (median during the inputs)                   2.03/0.48
+   Q1 relayed-local median/95/99 ms (official)                9.52/10.55/10.56
+   Q1 relayed added, local added median/95 ms                 27.45/33.38 ; 17.93/22.83
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    3.74  (0.16 + 3.13 + 0.04 + 0.41)
+   Q1 client non-waits per input median/mean/95 ms            3.73/3.74/4.22
+      host non-waits, mean of the table (in+comp+enc)         6.20
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             0.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 0.0% / 0.0%
+   Q2 first inputs outside a stretch (ids)                    0 1 2 3 4 5 6 7
+   Q2 spin stretches; on-time s; share of the input period on 0; 0.0; 0.0%
+   Q2 input period s; longest gap between inputs s            176.0; 0.55
+   Q2 decoded frames while the spin was on                    0.0%
+   Q2 picture thread on fast cores: decoded / arrived         0.3% / 0.3%
+   Q2 spin thread cpu s (against on-time)                     -
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         2.3; 193.1; 0.01
+   Q3 client cpu s (on fast cores)                            19.3 (0%)
+   Q3 Mac power in, mean over the run W (system load W)       9.53 (9.53)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.28 C -> 30.28 C (d +0.00), virtual 29.59 -> 29.59 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery spinc-off1 before: 100% charged, AC Power, battery 30.28 C, system power in 14.8 W, thermal pressure 0
+   status                                                     2026-11-19 00:02:13 spinc-off1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: spinc-off1-235846
+   status                                                     2026-11-19 00:02:13 spinc-off1: the client's wake line is the form's
+   status                                                     battery spinc-off1 after: 100% charged, AC Power, battery 30.28 C, system power in 9.0 W, thermal pressure 0
+== spinc-cond1-000213  (form cond, wake: front,awake-spin,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 43
+   load Mac/host (median during the inputs)                   3.50/0.44
+   Q1 relayed-local median/95/99 ms (official)                8.40/8.01/8.57
+   Q1 relayed added, local added median/95 ms                 26.71/31.22 ; 18.31/23.20
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    2.16  (0.06 + 2.03 + 0.01 + 0.06)
+   Q1 client non-waits per input median/mean/95 ms            2.17/2.16/2.29
+      host non-waits, mean of the table (in+comp+enc)         6.01
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             100.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 100.0% / 100.0%
+   Q2 spin stretches; on-time s; share of the input period on 1; 179.1; 100.0%
+   Q2 input period s; longest gap between inputs s            176.7; 0.55
+   Q2 decoded frames while the spin was on                    92.3%
+   Q2 picture thread on fast cores: decoded / arrived         92.6% / 92.6%
+   Q2 spin thread cpu s (against on-time)                     179.1
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         668.8; 193.9; 3.45
+   Q3 client cpu s (on fast cores)                            183.7 (99%)
+   Q3 Mac power in, mean over the run W (system load W)       12.95 (12.95)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.28 C -> 30.31 C (d +0.03), virtual 29.59 -> 29.89 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery spinc-cond1 before: 100% charged, AC Power, battery 30.28 C, system power in 9.0 W, thermal pressure 0
+   status                                                     2026-11-19 00:05:58 spinc-cond1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: spinc-cond1-000213
+   status                                                     2026-11-19 00:05:58 spinc-cond1: the client's wake line is the form's
+   status                                                     battery spinc-cond1 after: 100% charged, AC Power, battery 30.31 C, system power in 14.8 W, thermal pressure 0
+== spinc-uncond1-000558  (form uncond, wake: front,awake-spin,awake-session,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 41
+   load Mac/host (median during the inputs)                   3.08/0.59
+   Q1 relayed-local median/95/99 ms (official)                8.63/8.31/9.77
+   Q1 relayed added, local added median/95 ms                 26.62/31.51 ; 17.99/23.21
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    2.18  (0.07 + 2.04 + 0.01 + 0.06)
+   Q1 client non-waits per input median/mean/95 ms            2.19/2.18/2.31
+      host non-waits, mean of the table (in+comp+enc)         6.01
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             100.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 100.0% / 100.0%
+   Q2 spin stretches; on-time s; share of the input period on 1; 193.9; 100.0%
+   Q2 input period s; longest gap between inputs s            176.7; 0.55
+   Q2 decoded frames while the spin was on                    100.0%
+   Q2 picture thread on fast cores: decoded / arrived         99.9% / 100.0%
+   Q2 spin thread cpu s (against on-time)                     193.8
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         672.2; 194.0; 3.47
+   Q3 client cpu s (on fast cores)                            197.1 (100%)
+   Q3 Mac power in, mean over the run W (system load W)       13.68 (13.68)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.31 C -> 30.36 C (d +0.05), virtual 29.89 -> 30.39 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery spinc-uncond1 before: 100% charged, AC Power, battery 30.31 C, system power in 14.8 W, thermal pressure 0
+   status                                                     2026-11-19 00:09:31 spinc-uncond1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: spinc-uncond1-000558
+   status                                                     2026-11-19 00:09:31 spinc-uncond1: the client's wake line is the form's
+   status                                                     battery spinc-uncond1 after: 100% charged, AC Power, battery 30.36 C, system power in 13.9 W, thermal pressure 0
+== spinc-off2-000932  (form off, wake: front,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 40
+   load Mac/host (median during the inputs)                   3.31/0.57
+   Q1 relayed-local median/95/99 ms (official)                9.13/10.07/10.74
+   Q1 relayed added, local added median/95 ms                 27.57/33.03 ; 18.44/22.96
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    3.48  (0.11 + 2.98 + 0.03 + 0.36)
+   Q1 client non-waits per input median/mean/95 ms            3.45/3.48/3.86
+      host non-waits, mean of the table (in+comp+enc)         6.28
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             0.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 0.0% / 0.0%
+   Q2 first inputs outside a stretch (ids)                    0 1 2 3 4 5 6 7
+   Q2 spin stretches; on-time s; share of the input period on 0; 0.0; 0.0%
+   Q2 input period s; longest gap between inputs s            175.5; 0.55
+   Q2 decoded frames while the spin was on                    0.0%
+   Q2 picture thread on fast cores: decoded / arrived         0.2% / 0.2%
+   Q2 spin thread cpu s (against on-time)                     -
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         3.2; 192.6; 0.02
+   Q3 client cpu s (on fast cores)                            16.8 (0%)
+   Q3 Mac power in, mean over the run W (system load W)       11.01 (11.01)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.36 C -> 30.4 C (d +0.04), virtual 30.39 -> 30.79 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery spinc-off2 before: 100% charged, AC Power, battery 30.36 C, system power in 13.9 W, thermal pressure 0
+   status                                                     2026-11-19 00:12:59 spinc-off2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: spinc-off2-000932
+   status                                                     2026-11-19 00:12:59 spinc-off2: the client's wake line is the form's
+   status                                                     battery spinc-off2 after: 100% charged, AC Power, battery 30.4 C, system power in 9.1 W, thermal pressure 0
+== spinc-cond2-001300  (form cond, wake: front,awake-spin,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 42
+   load Mac/host (median during the inputs)                   3.38/0.69
+   Q1 relayed-local median/95/99 ms (official)                8.64/8.84/8.50
+   Q1 relayed added, local added median/95 ms                 26.03/31.34 ; 17.38/22.50
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    2.16  (0.06 + 2.03 + 0.01 + 0.06)
+   Q1 client non-waits per input median/mean/95 ms            2.16/2.15/2.29
+      host non-waits, mean of the table (in+comp+enc)         5.98
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             100.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 100.0% / 100.0%
+   Q2 spin stretches; on-time s; share of the input period on 1; 179.9; 100.0%
+   Q2 input period s; longest gap between inputs s            177.5; 0.55
+   Q2 decoded frames while the spin was on                    92.3%
+   Q2 picture thread on fast cores: decoded / arrived         92.6% / 92.6%
+   Q2 spin thread cpu s (against on-time)                     179.9
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         639.2; 194.7; 3.28
+   Q3 client cpu s (on fast cores)                            184.5 (99%)
+   Q3 Mac power in, mean over the run W (system load W)       13.00 (13.00)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.4 C -> 30.42 C (d +0.02), virtual 30.79 -> 30.89 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery spinc-cond2 before: 100% charged, AC Power, battery 30.4 C, system power in 9.1 W, thermal pressure 0
+   status                                                     2026-11-19 00:16:47 spinc-cond2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: spinc-cond2-001300
+   status                                                     2026-11-19 00:16:47 spinc-cond2: the client's wake line is the form's
+   status                                                     battery spinc-cond2 after: 100% charged, AC Power, battery 30.42 C, system power in 13.5 W, thermal pressure 0
+== spinc-uncond2-001648  (form uncond, wake: front,awake-spin,awake-session,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 43
+   load Mac/host (median during the inputs)                   2.91/0.58
+   Q1 relayed-local median/95/99 ms (official)                7.73/8.43/8.94
+   Q1 relayed added, local added median/95 ms                 26.45/31.67 ; 18.73/23.25
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    2.18  (0.07 + 2.04 + 0.01 + 0.06)
+   Q1 client non-waits per input median/mean/95 ms            2.18/2.17/2.30
+      host non-waits, mean of the table (in+comp+enc)         5.99
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             100.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 100.0% / 100.0%
+   Q2 spin stretches; on-time s; share of the input period on 1; 193.9; 100.0%
+   Q2 input period s; longest gap between inputs s            176.8; 0.55
+   Q2 decoded frames while the spin was on                    100.0%
+   Q2 picture thread on fast cores: decoded / arrived         100.0% / 100.0%
+   Q2 spin thread cpu s (against on-time)                     193.9
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         682.1; 194.0; 3.52
+   Q3 client cpu s (on fast cores)                            197.2 (100%)
+   Q3 Mac power in, mean over the run W (system load W)       12.89 (12.89)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.42 C -> 30.44 C (d +0.02), virtual 30.89 -> 31.19 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery spinc-uncond2 before: 100% charged, AC Power, battery 30.42 C, system power in 13.5 W, thermal pressure 0
+   status                                                     2026-11-19 00:20:35 spinc-uncond2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: spinc-uncond2-001648
+   status                                                     2026-11-19 00:20:35 spinc-uncond2: the client's wake line is the form's
+   status                                                     battery spinc-uncond2 after: 100% charged, AC Power, battery 30.44 C, system power in 13.3 W, thermal pressure 0
+
+== per form (valid runs only; the two rounds' mean, and |round1 - round2| as the wobble)
+                                                                      off                      cond                    uncond
+   client non-waits, table mean ms                      3.61 (n2, +-0.26)         2.16 (n2, +-0.00)         2.18 (n2, +-0.00)
+   client non-waits per input, median ms                3.59 (n2, +-0.29)         2.16 (n2, +-0.01)         2.18 (n2, +-0.01)
+   relayed-local median ms                              9.32 (n2, +-0.39)         8.52 (n2, +-0.24)         8.18 (n2, +-0.90)
+   relayed-local 95% ms                                10.31 (n2, +-0.48)         8.43 (n2, +-0.83)         8.37 (n2, +-0.12)
+   host non-waits, table mean ms                        6.24 (n2, +-0.08)         5.99 (n2, +-0.03)         6.00 (n2, +-0.02)
+   inputs inside a spin stretch %                       0.00 (n2, +-0.00)       100.00 (n2, +-0.00)       100.00 (n2, +-0.00)
+   picture thread on fast cores (decoded) %             0.26 (n2, +-0.05)        92.58 (n2, +-0.05)        99.94 (n2, +-0.02)
+   client energy J                                      2.75 (n2, +-0.88)      653.99 (n2, +-29.68)       677.14 (n2, +-9.95)
+   client mean W                                        0.01 (n2, +-0.00)         3.37 (n2, +-0.17)         3.49 (n2, +-0.05)
+   spin on-time s                                       0.00 (n2, +-0.00)       179.53 (n2, +-0.78)       193.90 (n2, +-0.08)
+   Mac power in W                                      10.27 (n2, +-1.48)        12.98 (n2, +-0.05)        13.28 (n2, +-0.80)
+   battery temperature change C                         0.02 (n2, +-0.04)         0.03 (n2, +-0.01)         0.04 (n2, +-0.03)
+   battery temperature after C                         30.34 (n2, +-0.12)        30.37 (n2, +-0.11)        30.40 (n2, +-0.08)
+
+== the questions, by the lines written down before measuring
+   client non-waits, table mean ms: off 3.61, cond 2.16, uncond 2.18; cond - uncond -0.02 ms (line 0.10): AS MUCH; cond's part of uncond's shrink 101%; off - uncond 1.43 ms
+   relayed-local median ms: off 9.32, cond 8.52, uncond 8.18; cond - uncond +0.34 ms (line 0.90, widened to the rounds' wobble): AS MUCH; cond's part of uncond's shrink 70%; off - uncond 1.14 ms
+   Q2 condition in effect: cond's inputs inside a spin stretch 100.0%, 100.0% (line 99%): IN EFFECT
+   Q3 cost, client energy J off/cond/uncond: 2.7 / 654.0 / 677.1; Mac power in W: 10.27 / 12.98 / 13.28

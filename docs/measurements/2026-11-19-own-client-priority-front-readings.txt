@@ -1,0 +1,217 @@
+== priof-rehearsal-prio-021844  (form prio, wake: front,picture-qos,picture-realtime,input-qos,latency-critical,keys-qos,usage)
+   valid                                                      yes
+   inputs, followed all the way                               20, 20
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 12
+   load Mac/host (median during the inputs)                   2.44/0.17
+   Q1 relayed-local median/95/99 ms (official)                12.64/11.91/7.78
+   Q1 relayed added, local added median/95 ms                 30.16/34.58 ; 17.52/22.67
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    3.95  (0.19 + 3.30 + 0.04 + 0.42)
+   Q1 client non-waits per input median/mean/95 ms            4.09/3.96/4.36
+      host non-waits, mean of the table (in+comp+enc)         6.35
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             0.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 0.0% / 0.0%
+   Q2 first inputs outside a stretch (ids)                    0 1 2 3 4 5 6 7
+   Q2 spin stretches; on-time s; share of the input period on 0; 0.0; 0.0%
+   Q2 input period s; longest gap between inputs s            8.3; 0.54
+   Q2 decoded frames while the spin was on                    0.0%
+   Q2 picture thread on fast cores: decoded / arrived         2.1% / 2.1%
+   Q2 spin thread cpu s (against on-time)                     -
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         0.5; 25.5; 0.02
+   Q3 client cpu s (on fast cores)                            2.8 (2%)
+   Q3 Mac power in, mean over the run W (system load W)       - (-)
+   Q3 battery before -> after                                 -
+   status                                                     2026-11-19 02:19:40 priof-rehearsal-prio: status 0; Inputs: 20 sent, 20 shown by the local window, 20 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: priof-rehearsal-prio-021844
+   status                                                     2026-11-19 02:19:40 priof-rehearsal-prio: the client's wake line is the form's
+== priof-off1-021941  (form off, wake: front,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 39
+   load Mac/host (median during the inputs)                   2.52/0.18
+   Q1 relayed-local median/95/99 ms (official)                10.64/10.52/11.22
+   Q1 relayed added, local added median/95 ms                 28.69/33.76 ; 18.05/23.25
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    3.71  (0.14 + 3.13 + 0.04 + 0.40)
+   Q1 client non-waits per input median/mean/95 ms            3.66/3.71/4.33
+      host non-waits, mean of the table (in+comp+enc)         6.40
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             0.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 0.0% / 0.0%
+   Q2 first inputs outside a stretch (ids)                    0 1 2 3 4 5 6 7
+   Q2 spin stretches; on-time s; share of the input period on 0; 0.0; 0.0%
+   Q2 input period s; longest gap between inputs s            175.0; 0.55
+   Q2 decoded frames while the spin was on                    0.0%
+   Q2 picture thread on fast cores: decoded / arrived         0.3% / 0.3%
+   Q2 spin thread cpu s (against on-time)                     -
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         2.6; 192.2; 0.01
+   Q3 client cpu s (on fast cores)                            19.3 (0%)
+   Q3 Mac power in, mean over the run W (system load W)       9.57 (9.57)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.28 C -> 30.28 C (d +0.00), virtual 29.59 -> 29.59 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery priof-off1 before: 100% charged, AC Power, battery 30.28 C, system power in 8.1 W, thermal pressure 0
+   status                                                     2026-11-19 02:23:06 priof-off1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: priof-off1-021941
+   status                                                     2026-11-19 02:23:06 priof-off1: the client's wake line is the form's
+   status                                                     battery priof-off1 after: 100% charged, AC Power, battery 30.28 C, system power in 10.1 W, thermal pressure 0
+== priof-prio1-022306  (form prio, wake: front,picture-qos,picture-realtime,input-qos,latency-critical,keys-qos,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 43
+   load Mac/host (median during the inputs)                   2.23/0.37
+   Q1 relayed-local median/95/99 ms (official)                9.83/10.22/11.66
+   Q1 relayed added, local added median/95 ms                 27.94/33.46 ; 18.11/23.23
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    3.83  (0.15 + 3.20 + 0.04 + 0.44)
+   Q1 client non-waits per input median/mean/95 ms            3.84/3.84/4.43
+      host non-waits, mean of the table (in+comp+enc)         6.25
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             0.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 0.0% / 0.0%
+   Q2 first inputs outside a stretch (ids)                    0 1 2 3 4 5 6 7
+   Q2 spin stretches; on-time s; share of the input period on 0; 0.0; 0.0%
+   Q2 input period s; longest gap between inputs s            175.4; 0.55
+   Q2 decoded frames while the spin was on                    0.0%
+   Q2 picture thread on fast cores: decoded / arrived         0.3% / 0.3%
+   Q2 spin thread cpu s (against on-time)                     -
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         2.3; 192.4; 0.01
+   Q3 client cpu s (on fast cores)                            21.2 (0%)
+   Q3 Mac power in, mean over the run W (system load W)       9.62 (9.62)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.28 C -> 30.29 C (d +0.01), virtual 29.59 -> 29.69 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery priof-prio1 before: 100% charged, AC Power, battery 30.28 C, system power in 10.1 W, thermal pressure 0
+   status                                                     2026-11-19 02:26:50 priof-prio1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: priof-prio1-022306
+   status                                                     2026-11-19 02:26:50 priof-prio1: the client's wake line is the form's
+   status                                                     battery priof-prio1 after: 100% charged, AC Power, battery 30.29 C, system power in 9.8 W, thermal pressure 0
+== priof-cond1-022650  (form cond, wake: front,awake-spin,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 42
+   load Mac/host (median during the inputs)                   3.23/0.16
+   Q1 relayed-local median/95/99 ms (official)                8.11/8.61/8.25
+   Q1 relayed added, local added median/95 ms                 25.89/31.43 ; 17.78/22.82
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    2.15  (0.06 + 2.02 + 0.01 + 0.06)
+   Q1 client non-waits per input median/mean/95 ms            2.15/2.15/2.28
+      host non-waits, mean of the table (in+comp+enc)         5.99
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             100.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 100.0% / 100.0%
+   Q2 spin stretches; on-time s; share of the input period on 1; 179.6; 100.0%
+   Q2 input period s; longest gap between inputs s            177.2; 0.55
+   Q2 decoded frames while the spin was on                    92.4%
+   Q2 picture thread on fast cores: decoded / arrived         92.7% / 92.7%
+   Q2 spin thread cpu s (against on-time)                     179.6
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         666.1; 194.3; 3.43
+   Q3 client cpu s (on fast cores)                            184.3 (99%)
+   Q3 Mac power in, mean over the run W (system load W)       12.87 (12.87)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.29 C -> 30.33 C (d +0.04), virtual 29.69 -> 30.09 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery priof-cond1 before: 100% charged, AC Power, battery 30.29 C, system power in 9.8 W, thermal pressure 0
+   status                                                     2026-11-19 02:30:38 priof-cond1: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: priof-cond1-022650
+   status                                                     2026-11-19 02:30:38 priof-cond1: the client's wake line is the form's
+   status                                                     battery priof-cond1 after: 100% charged, AC Power, battery 30.33 C, system power in 14.9 W, thermal pressure 0
+== priof-off2-023038  (form off, wake: front,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 41
+   load Mac/host (median during the inputs)                   2.34/0.19
+   Q1 relayed-local median/95/99 ms (official)                9.70/10.57/10.89
+   Q1 relayed added, local added median/95 ms                 27.88/33.64 ; 18.18/23.07
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    3.86  (0.15 + 3.21 + 0.04 + 0.46)
+   Q1 client non-waits per input median/mean/95 ms            3.85/3.85/4.43
+      host non-waits, mean of the table (in+comp+enc)         6.22
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             0.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 0.0% / 0.0%
+   Q2 first inputs outside a stretch (ids)                    0 1 2 3 4 5 6 7
+   Q2 spin stretches; on-time s; share of the input period on 0; 0.0; 0.0%
+   Q2 input period s; longest gap between inputs s            175.2; 0.55
+   Q2 decoded frames while the spin was on                    0.0%
+   Q2 picture thread on fast cores: decoded / arrived         0.3% / 0.3%
+   Q2 spin thread cpu s (against on-time)                     -
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         2.4; 192.4; 0.01
+   Q3 client cpu s (on fast cores)                            21.4 (0%)
+   Q3 Mac power in, mean over the run W (system load W)       9.95 (9.95)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.33 C -> 30.36 C (d +0.03), virtual 30.09 -> 30.39 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery priof-off2 before: 100% charged, AC Power, battery 30.33 C, system power in 14.9 W, thermal pressure 0
+   status                                                     2026-11-19 02:34:22 priof-off2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: priof-off2-023038
+   status                                                     2026-11-19 02:34:22 priof-off2: the client's wake line is the form's
+   status                                                     battery priof-off2 after: 100% charged, AC Power, battery 30.36 C, system power in 9.7 W, thermal pressure 0
+== priof-prio2-023422  (form prio, wake: front,picture-qos,picture-realtime,input-qos,latency-critical,keys-qos,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 43
+   load Mac/host (median during the inputs)                   2.54/0.28
+   Q1 relayed-local median/95/99 ms (official)                10.14/10.31/11.78
+   Q1 relayed added, local added median/95 ms                 27.96/33.51 ; 17.82/23.19
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    3.82  (0.16 + 3.18 + 0.04 + 0.44)
+   Q1 client non-waits per input median/mean/95 ms            3.82/3.81/4.37
+      host non-waits, mean of the table (in+comp+enc)         6.22
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             0.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 0.0% / 0.0%
+   Q2 first inputs outside a stretch (ids)                    0 1 2 3 4 5 6 7
+   Q2 spin stretches; on-time s; share of the input period on 0; 0.0; 0.0%
+   Q2 input period s; longest gap between inputs s            175.2; 0.54
+   Q2 decoded frames while the spin was on                    0.0%
+   Q2 picture thread on fast cores: decoded / arrived         0.3% / 0.3%
+   Q2 spin thread cpu s (against on-time)                     -
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         2.3; 192.5; 0.01
+   Q3 client cpu s (on fast cores)                            20.2 (0%)
+   Q3 Mac power in, mean over the run W (system load W)       10.15 (10.15)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.36 C -> 30.36 C (d +0.00), virtual 30.39 -> 30.39 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery priof-prio2 before: 100% charged, AC Power, battery 30.36 C, system power in 9.7 W, thermal pressure 0
+   status                                                     2026-11-19 02:38:06 priof-prio2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: priof-prio2-023422
+   status                                                     2026-11-19 02:38:06 priof-prio2: the client's wake line is the form's
+   status                                                     battery priof-prio2 after: 100% charged, AC Power, battery 30.36 C, system power in 9.6 W, thermal pressure 0
+== priof-cond2-023806  (form cond, wake: front,awake-spin,usage)
+   valid                                                      yes
+   inputs, followed all the way                               400, 400
+   build UUID / reconnections / AWDL lines                    35F62E22-74B8-3555-BE5B-9422BE9C03F4 / 0/0 / 42
+   load Mac/host (median during the inputs)                   3.61/0.22
+   Q1 relayed-local median/95/99 ms (official)                8.51/8.29/9.15
+   Q1 relayed added, local added median/95 ms                 26.55/31.30 ; 18.04/23.00
+   Q1 client non-waits, mean of the table (arr+dec+q+sink)    2.15  (0.06 + 2.02 + 0.01 + 0.06)
+   Q1 client non-waits per input median/mean/95 ms            2.15/2.15/2.29
+      host non-waits, mean of the table (in+comp+enc)         5.94
+   Q2 inputs with the window in front / key / visible         100.0% / 100.0% / 100.0%
+   Q2 inputs inside a spin stretch, sent to drawn             100.0%
+   Q2 ... frame's arrival to drawn / spin on 1 ms before sent 100.0% / 100.0%
+   Q2 spin stretches; on-time s; share of the input period on 1; 179.2; 100.0%
+   Q2 input period s; longest gap between inputs s            176.8; 0.55
+   Q2 decoded frames while the spin was on                    92.4%
+   Q2 picture thread on fast cores: decoded / arrived         92.6% / 92.7%
+   Q2 spin thread cpu s (against on-time)                     179.2
+   Q2 front events                                            lost asked refused asked granted
+   Q3 client energy J; life s; mean W                         639.8; 193.8; 3.30
+   Q3 client cpu s (on fast cores)                            183.5 (99%)
+   Q3 Mac power in, mean over the run W (system load W)       13.00 (13.00)
+   Q3 battery before -> after                                 100% -> 100% (charged -> charged), 30.36 C -> 30.39 C (d +0.03), virtual 30.39 -> 30.69 C, thermal pressure 0 -> 0, charger yes/yes
+   status                                                     battery priof-cond2 before: 100% charged, AC Power, battery 30.36 C, system power in 9.6 W, thermal pressure 0
+   status                                                     2026-11-19 02:41:41 priof-cond2: status 0; Inputs: 400 sent, 400 shown by the local window, 400 by the relayed window (seed 20261116); reconnections during the run (own client, from its frame log's end line): picture 0, input 0; run tag: priof-cond2-023806
+   status                                                     2026-11-19 02:41:42 priof-cond2: the client's wake line is the form's
+   status                                                     battery priof-cond2 after: 100% charged, AC Power, battery 30.39 C, system power in 14.1 W, thermal pressure 0
+
+== per form (valid runs only; the two rounds' mean, and |round1 - round2| as the wobble)
+                                                                      off                      prio                      cond
+   client non-waits, table mean ms                      3.79 (n2, +-0.15)         3.83 (n2, +-0.01)         2.15 (n2, +-0.00)
+   client non-waits per input, median ms                3.75 (n2, +-0.19)         3.83 (n2, +-0.02)         2.15 (n2, +-0.00)
+   decode, table mean ms                                3.17 (n2, +-0.08)         3.19 (n2, +-0.02)         2.02 (n2, +-0.00)
+   sink (out to drawn), table mean ms                   0.43 (n2, +-0.06)         0.44 (n2, +-0.00)         0.06 (n2, +-0.00)
+   input path and network, table mean ms                1.39 (n2, +-0.03)         1.40 (n2, +-0.01)         1.11 (n2, +-0.04)
+   relayed-local median ms                             10.17 (n2, +-0.94)         9.98 (n2, +-0.31)         8.31 (n2, +-0.40)
+   relayed-local 95% ms                                10.54 (n2, +-0.05)        10.27 (n2, +-0.09)         8.45 (n2, +-0.32)
+   host non-waits, table mean ms                        6.31 (n2, +-0.18)         6.23 (n2, +-0.03)         5.96 (n2, +-0.05)
+   picture thread on fast cores (decoded) %             0.29 (n2, +-0.04)         0.28 (n2, +-0.02)        92.63 (n2, +-0.03)
+   client cpu on fast cores %                           0.32 (n2, +-0.01)         0.31 (n2, +-0.00)        99.16 (n2, +-0.20)
+   client cpu s                                        20.33 (n2, +-2.12)        20.73 (n2, +-1.02)       183.91 (n2, +-0.75)
+   client energy J                                      2.47 (n2, +-0.21)         2.34 (n2, +-0.00)      652.94 (n2, +-26.29)
+   client mean W                                        0.01 (n2, +-0.00)         0.01 (n2, +-0.00)         3.36 (n2, +-0.13)
+   Mac power in W                                       9.76 (n2, +-0.38)         9.89 (n2, +-0.53)        12.93 (n2, +-0.13)
+   battery temperature after C                         30.32 (n2, +-0.08)        30.32 (n2, +-0.07)        30.36 (n2, +-0.06)
+
+== the questions, by the lines written down before measuring
+   client non-waits, table mean ms: off 3.79, prio 3.83, cond 2.15; off - prio -0.04 ms; smallest gap between the rounds -0.12 (line 0.15, widened to the rounds' wobble): NO EFFECT SEEN; prio's part of cond's shrink -2%
+   relayed-local median ms: off 10.17, prio 9.98, cond 8.31; off - prio +0.19 ms; smallest gap between the rounds -0.44 (line 0.94, widened to the rounds' wobble): NO EFFECT SEEN; prio's part of cond's shrink 10%
+   Q2 where the picture thread ran: decoded on fast cores, off 0.3%, 0.3%, prio 0.3%, 0.3% (line 50%): did NOT move
+   cond's anchor: inputs inside a spin stretch 100.0%, 100.0% (line 99%): IN EFFECT
+   Q3 cost, client energy J off/prio/cond: 2.5 / 2.3 / 652.9; Mac power in W: 9.76 / 9.89 / 12.93
