@@ -169,7 +169,9 @@ pub struct InputLine {
     alive: bool,
     /// The device takes committed text; without, none is sent to it.
     text: bool,
-    /// Pieces of committed text not sent because the device does not take them.
+    /// The device takes composing text; without, none is sent to it.
+    preedit: bool,
+    /// Pieces of committed or composing text not sent because the device does not take them.
     text_dropped: u64,
     /// The level of scrolls the device takes (`istesso_proto::SCROLL_LEVEL`; 0: `dx`, `dy` only).
     scroll: u8,
@@ -212,13 +214,14 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let (alive, text, clipboard, scroll) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let (alive, text, scroll, clipboard, preedit) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let mut line = Self::waiting(connect);
         line.client = Some(client);
         line.alive = alive;
         line.text = text;
-        line.clipboard = clipboard;
+        line.preedit = preedit;
         line.scroll = scroll;
+        line.clipboard = clipboard;
         Ok(line)
     }
 
@@ -237,6 +240,7 @@ impl InputLine {
             client: None,
             alive: false,
             text: false,
+            preedit: false,
             text_dropped: 0,
             scroll: 0,
             scroll_told: false,
@@ -280,15 +284,21 @@ impl InputLine {
         self.text
     }
 
-    /// How many pieces of committed text were not sent because the device
-    /// does not take them.
-    pub fn text_dropped(&self) -> u64 {
-        self.text_dropped
-    }
-
     /// The level of scrolls the device takes, as it said when the conversation was opened.
     pub fn scroll_level(&self) -> u8 {
         self.scroll
+    }
+
+    /// Whether the device takes composing text, as it said when the
+    /// conversation was last opened.
+    pub fn takes_preedit(&self) -> bool {
+        self.preedit
+    }
+
+    /// How many pieces of committed or composing text were not sent because the device
+    /// does not take them.
+    pub fn text_dropped(&self) -> u64 {
+        self.text_dropped
     }
 
     /// Whether the device takes copy and paste, as it said when the conversation was last
@@ -349,6 +359,7 @@ impl InputLine {
         // The same for copy and paste.
         let not_taken = |e: &InputEvent| match e {
             InputEvent::Text { .. } => !self.text,
+            InputEvent::Preedit { .. } => !self.preedit,
             InputEvent::Copy { .. } | InputEvent::Paste { .. } => !self.clipboard,
             _ => false,
         };
@@ -356,7 +367,7 @@ impl InputLine {
             kept = events.iter().filter(|e| !not_taken(e)).cloned().collect();
             for event in events.iter().filter(|e| not_taken(e)) {
                 match event {
-                    InputEvent::Text { .. } => self.text_dropped += 1,
+                    InputEvent::Text { .. } | InputEvent::Preedit { .. } => self.text_dropped += 1,
                     _ => self.clipboard_dropped += 1,
                 }
             }
@@ -541,7 +552,7 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let (alive, text, clipboard, scroll) = match ask(&mut client, within) {
+        let (alive, text, scroll, clipboard, preedit) = match ask(&mut client, within) {
             Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
@@ -562,20 +573,27 @@ impl InputLine {
         self.client = Some(client);
         self.alive = alive;
         self.text = text;
-        self.clipboard = clipboard;
+        self.preedit = preedit;
         self.scroll = scroll;
         self.scroll_told = false;
+        self.clipboard = clipboard;
         self.unanswered_since = None;
         (self.said, self.listened, self.made_at) = (now_open, now_open, now_open);
         Ok(Some(Happened::Back { after }))
     }
 }
 
+/// What the device said when the conversation was opened: whether it answers "still here",
+/// takes committed text, the level of scrolls it takes, whether it takes copy and paste, and
+/// whether it takes composing text.
+type Taken = (bool, bool, u8, bool, bool);
+
 /// Asks whether input is taken, and to be answered when saying "still
 /// here"; the answer has `within` this time. `Ok` says whether the device
 /// answers; `Err` what to do about its refusal, and the refusal in a
 /// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
-fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, bool, u8), (Again, String)> {
+/// `Ok`: what the device said ([`Taken`]).
+fn ask(client: &mut Client, within: Duration) -> Result<Taken, (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
@@ -589,9 +607,10 @@ fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, bool, u8), 
         InputAnswer::Open {
             alive,
             text,
-            clipboard,
             scroll,
-        } => Ok((alive, text, clipboard && alive, scroll)),
+            clipboard,
+            preedit,
+        } => Ok((alive, text, scroll, clipboard && alive, preedit)),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -704,6 +723,11 @@ mod tests {
             [
                 key(30, false),
                 key(42, false),
+                // No composing text stays in the application either.
+                InputEvent::Preedit {
+                    text: String::new(),
+                    cursor: [0, 0]
+                },
                 key(42, true),
                 InputEvent::PointerAt { x: 7, y: 8 }
             ]
@@ -911,6 +935,20 @@ mod tests {
         // The daily line learns it when the conversation opens, as the first line does:
         // this agent takes committed text, and it is handed over.
         assert!(line.takes_text());
+        // And scrolls with their kind: a stage that moves nothing goes too.
+        assert_eq!(line.scroll_level(), istesso_proto::SCROLL_LEVEL);
+        let stage = InputEvent::Scroll {
+            dx: 0,
+            dy: 0,
+            source: Some(istesso_proto::ScrollSource::Finger),
+            v120: None,
+            pixels: Some([0.0, 0.0]),
+            phase: Some(istesso_proto::ScrollPhase::Began),
+            momentum: None,
+            momentum_follows: false,
+        };
+        assert!(line.pass(std::slice::from_ref(&stage), Instant::now()).sent);
+        assert_eq!(pair.all_handed_over(A_MOMENT), [stage]);
         let text = InputEvent::Text {
             text: "日本語".into(),
         };
@@ -1105,8 +1143,9 @@ mod tests {
                         .respond(&Response::InputOpen {
                             alive: false,
                             text: false,
-                            clipboard: false,
                             scroll: 0,
+                            clipboard: false,
+                            preedit: false,
                         })
                         .unwrap();
                 }
@@ -1114,6 +1153,8 @@ mod tests {
         });
         let mut line = line_through(&pair, addr);
         assert!(!line.is_answered());
+        // It says nothing of scrolls: they go as dx and dy (it reads no more of them).
+        assert_eq!(line.scroll_level(), 0);
         assert_eq!(turn_until_something(&mut line, SILENT_AFTER * 2), Ok(None));
         assert!(line.is_open());
         assert!(line.pass(&[key(30, true)], Instant::now()).sent);

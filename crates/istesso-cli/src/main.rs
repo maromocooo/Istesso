@@ -648,8 +648,12 @@ fn relay_input(
     // for the program that shows the window.
     let state = std::path::PathBuf::from(format!("{}.state", socket.display()));
     // "text": whether the device takes committed text (1) or not (0), for the window;
-    // "clipboard": the same for copy and paste (trial only, ADR 0022).
-    let tell = |event: &str, cuts: u64, after: Option<Duration>, text: bool, clipboard: bool| {
+    // "clipboard": the same for copy and paste (trial only, ADR 0022); "preedit": the same for
+    // composing text (trial only).
+    let tell = |event: &str,
+                cuts: u64,
+                after: Option<Duration>,
+                (text, clipboard, preedit): (bool, bool, bool)| {
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
@@ -674,10 +678,11 @@ fn relay_input(
             String::new()
         };
         let line = format!(
-            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{}{status}}}\n",
+            "{{\"pid\":{},\"input\":{cuts},\"text\":{},\"clipboard\":{},\"preedit\":{}{status}}}\n",
             std::process::id(),
             u8::from(text),
-            u8::from(clipboard)
+            u8::from(clipboard),
+            u8::from(preedit)
         );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
@@ -720,13 +725,24 @@ fn relay_input(
         UnixDatagram::unbound().map_err(|e| format!("cannot open a socket for answers: {e}"))?;
     istesso_agent::clipboard::set_buffers(&answering, istesso_agent::clipboard::SOCKET_BUFFER);
     let askers = std::cell::RefCell::new(Askers::default());
+    // Copy and paste on this socket, in counts only (never what, never a nonce): said on
+    // standard error whenever one of them grows.
+    let clipboard_seen = std::cell::Cell::new(ClipboardSeen::default());
     let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
+    // What the device said it takes, for the state line.
+    let takes = |line: &InputLine| {
+        (
+            line.takes_text(),
+            line.takes_clipboard(),
+            line.takes_preedit(),
+        )
+    };
     let opened = |line: &InputLine| {
         println!(
             "Input written to {} goes to the paired device.",
             socket.display()
         );
-        tell("open", 0, None, line.takes_text(), line.takes_clipboard());
+        tell("open", 0, None, takes(line));
         if !line.is_answered() {
             eprintln!(
                 "note: the device is of a version that does not answer \"still here\"; a connection \
@@ -735,7 +751,7 @@ fn relay_input(
         }
     };
     if daily {
-        tell("waiting", 0, None, false, false);
+        tell("waiting", 0, None, (false, false, false));
     } else {
         opened(&line);
     }
@@ -752,7 +768,15 @@ fn relay_input(
             };
             // A copy or a paste goes only with somewhere of this user's own for its answer.
             if let InputEvent::Copy { id, .. } | InputEvent::Paste { id, .. } = &event {
-                if !askers.borrow_mut().note(*id, datagram, from) {
+                let mut seen = clipboard_seen.get();
+                if askers.borrow_mut().note(*id, datagram, from) {
+                    seen.taken += 1;
+                    clipboard_seen.set(seen);
+                    seen.say();
+                } else {
+                    seen.refused += 1;
+                    clipboard_seen.set(seen);
+                    seen.say();
                     return;
                 }
             }
@@ -820,7 +844,11 @@ fn relay_input(
         listener.set_nonblocking(false).map_err(failed)?;
         for answer in line.take_clipboard_answers() {
             // To the socket that asked, with its nonce; what it carries is never written here.
+            let mut seen = clipboard_seen.get();
             let Some((nonce, to)) = askers.borrow_mut().answer_to(answer.id) else {
+                seen.unclaimed += 1;
+                clipboard_seen.set(seen);
+                seen.say();
                 continue;
             };
             let value = serde_json::json!({
@@ -831,9 +859,17 @@ fn relay_input(
                 "text": answer.text,
                 "why": answer.why,
             });
-            if let (Ok(bytes), true) = (serde_json::to_vec(&value), is_own_socket(&to)) {
-                let _ = answering.send_to(&bytes, &to);
+            let handed = match (serde_json::to_vec(&value), is_own_socket(&to)) {
+                (Ok(bytes), true) => answering.send_to(&bytes, &to).is_ok(),
+                _ => false,
+            };
+            if handed {
+                seen.answered += 1;
+            } else {
+                seen.unclaimed += 1;
             }
+            clipboard_seen.set(seen);
+            seen.say();
         }
         if line.clipboard_dropped() != clipboard_dropped {
             clipboard_dropped = line.clipboard_dropped();
@@ -848,23 +884,10 @@ fn relay_input(
                 "note: {text_dropped} piece(s) of committed text were not sent: the device does not take text"
             );
         }
-        if line.text_dropped() != text_dropped {
-            text_dropped = line.text_dropped();
-            // How many, never what.
-            eprintln!(
-                "note: {text_dropped} piece(s) of committed text were not sent: the device does not take text"
-            );
-        }
         match happened {
             Some(Happened::Cut) => {
                 eprintln!("note: the conversation with the device was cut; opening it again");
-                tell(
-                    "cut",
-                    line.cuts(),
-                    None,
-                    line.takes_text(),
-                    line.takes_clipboard(),
-                );
+                tell("cut", line.cuts(), None, takes(&line));
             }
             Some(Happened::Back { .. }) if daily && line.cuts() == 0 => opened(&line),
             Some(Happened::Back { after }) => {
@@ -872,13 +895,7 @@ fn relay_input(
                     "note: the conversation with the device is back after {:.2} s",
                     after.as_secs_f64()
                 );
-                tell(
-                    "back",
-                    line.cuts(),
-                    Some(after),
-                    line.takes_text(),
-                    line.takes_clipboard(),
-                );
+                tell("back", line.cuts(), Some(after), takes(&line));
             }
             None => {}
         }
@@ -904,9 +921,10 @@ impl Askers {
             .ok()
             .and_then(|value| value.get("nonce")?.as_str().map(str::to_string))
             .filter(|nonce| nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()));
-        let (Some(nonce), Some(path)) = (nonce, from.as_pathname()) else {
+        let (Some(nonce), Some(path)) = (nonce, from.as_pathname().map(sent_from_path)) else {
             return false;
         };
+        let path = path.as_path();
         if !is_own_socket(path) {
             return false;
         }
@@ -927,6 +945,42 @@ impl Askers {
     fn answer_to(&mut self, id: u32) -> Option<(String, std::path::PathBuf)> {
         let (nonce, path, until) = self.waiting.remove(&id)?;
         (until > std::time::Instant::now()).then_some((nonce, path))
+    }
+}
+
+/// The path of the socket a datagram came from, as a file. A sender that bound its socket with
+/// the whole `sockaddr_un` as the address's length (the trial viewer did, before 2026-11-19)
+/// comes with its path's unused bytes as NULs at the end: macOS hands the address back at the
+/// length it was bound with. They are not part of the path (no file name has a NUL in it).
+#[cfg(unix)]
+fn sent_from_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]))
+}
+
+/// Copy and paste seen by the relay, in counts only.
+#[cfg(unix)]
+#[derive(Default, Clone, Copy)]
+struct ClipboardSeen {
+    /// Requests from a socket of this user's own, with a nonce: passed on.
+    taken: u64,
+    /// Requests not passed on: no nonce, or not from a socket the relay can find as this user's.
+    refused: u64,
+    /// Answers handed to the socket that asked.
+    answered: u64,
+    /// Answers that found nobody waiting for them (too late, or the socket was gone).
+    unclaimed: u64,
+}
+
+#[cfg(unix)]
+impl ClipboardSeen {
+    fn say(&self) {
+        eprintln!(
+            "clipboard: {} request(s) taken, {} refused (no nonce, or not a socket of this user's that can be found), {} answer(s) handed back, {} unclaimed",
+            self.taken, self.refused, self.answered, self.unclaimed
+        );
     }
 }
 
@@ -2112,6 +2166,107 @@ fn render_probe(summary: &ProbeSummary, seed: u64) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_senders_path_is_read_without_the_nuls_after_it() {
+        use std::path::Path;
+        assert_eq!(
+            sent_from_path(Path::new("/var/folders/x/T/w.sock\0\0\0")),
+            Path::new("/var/folders/x/T/w.sock")
+        );
+        assert_eq!(
+            sent_from_path(Path::new("/tmp/w.sock")),
+            Path::new("/tmp/w.sock")
+        );
+    }
+
+    /// A window's socket bound by hand, as the trial viewer binds it: `length` is the address's
+    /// length given to `bind` (macOS hands the address back to the receiver at that length).
+    #[cfg(target_os = "macos")]
+    fn window_bound_at(
+        name: &std::path::Path,
+        length: impl Fn(usize) -> u32,
+    ) -> std::os::unix::net::UnixDatagram {
+        use std::os::fd::AsRawFd;
+        #[repr(C)]
+        struct Address {
+            len: u8,
+            family: u8,
+            path: [u8; 104],
+        }
+        extern "C" {
+            fn bind(socket: i32, address: *const Address, length: u32) -> i32;
+        }
+        let window = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        let bytes = name.to_str().unwrap().as_bytes();
+        let mut address = Address {
+            len: 0,
+            family: 1, // AF_UNIX
+            path: [0; 104],
+        };
+        address.path[..bytes.len()].copy_from_slice(bytes);
+        let length = length(bytes.len());
+        address.len = length as u8;
+        assert_eq!(unsafe { bind(window.as_raw_fd(), &address, length) }, 0);
+        window
+    }
+
+    /// Whether the relay notes a request from a window bound with `length`, and where it would
+    /// answer.
+    #[cfg(target_os = "macos")]
+    fn noted_from(
+        tag: &str,
+        length: impl Fn(usize) -> u32,
+    ) -> (bool, Option<std::path::PathBuf>, std::path::PathBuf) {
+        use std::os::unix::net::UnixDatagram;
+        let dir = std::env::temp_dir().join(format!("istesso-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let relay = UnixDatagram::bind(dir.join("r.sock")).unwrap();
+        let name = dir.join("w.sock");
+        let window = window_bound_at(&name, length);
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let request = format!(r#"{{"kind":"paste","id":7,"nonce":"{nonce}"}}"#);
+        window
+            .send_to(request.as_bytes(), dir.join("r.sock"))
+            .unwrap();
+        let mut buffer = [0u8; 256];
+        let (length, from) = relay.recv_from(&mut buffer).unwrap();
+        let mut askers = Askers::default();
+        let noted = askers.note(7, &buffer[..length], &from);
+        let to = askers.answer_to(7).map(|(_, to)| to);
+        let _ = std::fs::remove_dir_all(&dir);
+        (noted, to, name)
+    }
+
+    /// The path and its NUL (as the trial viewer binds since 2026-11-19, and as Rust binds).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_bound_with_its_path_and_nul_is_answered() {
+        let (noted, to, name) = noted_from("nul", |path| 2 + path as u32 + 1);
+        assert!(noted);
+        assert_eq!(to, Some(name));
+    }
+
+    /// The whole `sockaddr_un` (the viewer before 2026-11-19): the path comes with NULs after
+    /// it, which the relay leaves out.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_that_bound_with_the_whole_address_is_answered() {
+        let (noted, to, name) = noted_from("whole", |_| 106);
+        assert!(noted);
+        assert_eq!(to, Some(name));
+    }
+
+    /// SUN_LEN, without the NUL: the standard library reads the path as all but the last byte,
+    /// so the relay cannot find it and answers nothing. The viewer must not bind so.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_bound_without_its_nul_is_not_found() {
+        let (noted, to, _) = noted_from("sunlen", |path| 2 + path as u32);
+        assert!(!noted);
+        assert_eq!(to, None);
+    }
 
     #[cfg(unix)]
     #[test]
