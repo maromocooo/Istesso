@@ -166,6 +166,10 @@ pub struct InputLine {
     text: bool,
     /// Pieces of committed text not sent because the device does not take them.
     text_dropped: u64,
+    /// The level of scrolls the device takes (`istesso_proto::SCROLL_LEVEL`; 0: `dx`, `dy` only).
+    scroll: u8,
+    /// Said once in this conversation that the device does not take the kind of scrolls.
+    scroll_told: bool,
     /// When "still here" was last said.
     said: Instant,
     /// When it was first said without an answer having come since. Silence
@@ -194,11 +198,12 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let (alive, text) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let (alive, text, scroll) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let mut line = Self::waiting(connect);
         line.client = Some(client);
         line.alive = alive;
         line.text = text;
+        line.scroll = scroll;
         Ok(line)
     }
 
@@ -218,6 +223,8 @@ impl InputLine {
             alive: false,
             text: false,
             text_dropped: 0,
+            scroll: 0,
+            scroll_told: false,
             said: now,
             unanswered_since: None,
             listened: now,
@@ -252,6 +259,11 @@ impl InputLine {
     /// conversation was last opened.
     pub fn takes_text(&self) -> bool {
         self.text
+    }
+
+    /// The level of scrolls the device takes, as it said when the conversation was opened.
+    pub fn scroll_level(&self) -> u8 {
+        self.scroll
     }
 
     /// How many pieces of committed text were not sent because the device
@@ -297,6 +309,28 @@ impl InputLine {
                 .collect();
             self.text_dropped += (events.len() - kept.len()) as u64;
             &kept[..]
+        } else {
+            events
+        };
+        // A device that does not take the kind of scrolls uses their dx and dy only: one whose
+        // dx and dy are both 0 (a stage of a gesture) would only be an empty scroll there. Said
+        // once a conversation, in a plain line, instead of the scrolls being less without a word.
+        let fewer: Vec<InputEvent>;
+        let events = if self.scroll < istesso_proto::SCROLL_LEVEL
+            && events.iter().any(istesso_proto::scroll_has_kind)
+        {
+            if !self.scroll_told && self.client.is_some() {
+                self.scroll_told = true;
+                eprintln!(
+                    "note: the host's agent does not take: scroll kinds (wheel notches, finger pixels, stages); scrolls go as dx and dy only"
+                );
+            }
+            fewer = events
+                .iter()
+                .filter(|e| !matches!(e, InputEvent::Scroll { dx: 0, dy: 0, .. }))
+                .cloned()
+                .collect();
+            &fewer[..]
         } else {
             events
         };
@@ -427,7 +461,7 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let (alive, text) = match ask(&mut client, within) {
+        let (alive, text, scroll) = match ask(&mut client, within) {
             Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
@@ -448,6 +482,8 @@ impl InputLine {
         self.client = Some(client);
         self.alive = alive;
         self.text = text;
+        self.scroll = scroll;
+        self.scroll_told = false;
         self.unanswered_since = None;
         (self.said, self.listened, self.made_at) = (now_open, now_open, now_open);
         Ok(Some(Happened::Back { after }))
@@ -458,7 +494,7 @@ impl InputLine {
 /// here"; the answer has `within` this time. `Ok` says whether the device
 /// answers; `Err` what to do about its refusal, and the refusal in a
 /// sentence. Afterwards a write may take [`AGAIN_WITHIN`] at most.
-fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool), (Again, String)> {
+fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool, u8), (Again, String)> {
     let link = |err: LinkError| {
         let why = err.to_string();
         (after_failure(&ConnectFailure::Link(err)), why)
@@ -467,7 +503,11 @@ fn ask(client: &mut Client, within: Duration) -> Result<(bool, bool), (Again, St
     let answer = client.open_input_alive().map_err(link)?;
     client.set_timeout(AGAIN_WITHIN).map_err(link)?;
     match answer {
-        InputAnswer::Open { alive, text } => Ok((alive, text)),
+        InputAnswer::Open {
+            alive,
+            text,
+            scroll,
+        } => Ok((alive, text, scroll)),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -715,6 +755,20 @@ mod tests {
         // The daily line learns it when the conversation opens, as the first line does:
         // this agent takes committed text, and it is handed over.
         assert!(line.takes_text());
+        // And scrolls with their kind: a stage that moves nothing goes too.
+        assert_eq!(line.scroll_level(), istesso_proto::SCROLL_LEVEL);
+        let stage = InputEvent::Scroll {
+            dx: 0,
+            dy: 0,
+            source: Some(istesso_proto::ScrollSource::Finger),
+            v120: None,
+            pixels: Some([0.0, 0.0]),
+            phase: Some(istesso_proto::ScrollPhase::Began),
+            momentum: None,
+            momentum_follows: false,
+        };
+        assert!(line.pass(std::slice::from_ref(&stage), Instant::now()).sent);
+        assert_eq!(pair.all_handed_over(A_MOMENT), [stage]);
         let text = InputEvent::Text {
             text: "日本語".into(),
         };
@@ -909,6 +963,7 @@ mod tests {
                         .respond(&Response::InputOpen {
                             alive: false,
                             text: false,
+                            scroll: 0,
                         })
                         .unwrap();
                 }
@@ -916,6 +971,8 @@ mod tests {
         });
         let mut line = line_through(&pair, addr);
         assert!(!line.is_answered());
+        // It says nothing of scrolls: they go as dx and dy (it reads no more of them).
+        assert_eq!(line.scroll_level(), 0);
         assert_eq!(turn_until_something(&mut line, SILENT_AFTER * 2), Ok(None));
         assert!(line.is_open());
         assert!(line.pass(&[key(30, true)], Instant::now()).sent);

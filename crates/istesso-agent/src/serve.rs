@@ -322,7 +322,13 @@ impl InputSink {
                 } => {
                     held.buttons.remove(code);
                 }
-                InputEvent::PointerAt { .. } | InputEvent::Scroll { .. } | InputEvent::Focus => {}
+                InputEvent::PointerAt { .. } | InputEvent::Focus => {}
+                // A scroll out of bounds (not a number, too far) is dropped here.
+                InputEvent::Scroll { .. } => {
+                    if !istesso_proto::scroll_is_acceptable(event) {
+                        continue;
+                    }
+                }
                 // A size out of bounds is dropped here.
                 InputEvent::Resize { width, height } => {
                     if !istesso_proto::resize_is_acceptable(*width, *height) {
@@ -504,8 +510,13 @@ impl Shared {
                                 let _ = session.set_wait(INPUT_SILENCE);
                             }
                             asked.push("input");
-                            // This agent takes committed text (InputEvent::Text).
-                            Response::InputOpen { alive, text: true }
+                            // This agent takes committed text (InputEvent::Text), and
+                            // scrolls with their kind and stages.
+                            Response::InputOpen {
+                                alive,
+                                text: true,
+                                scroll: istesso_proto::SCROLL_LEVEL,
+                            }
                         }
                         Err(_) => Response::error(
                             ErrorCode::Internal,
@@ -709,7 +720,7 @@ mod tests {
 
         // The listener goes away: input is lost, nothing else happens.
         drop(listener);
-        sink.send(&InputEvent::Scroll { dx: 0, dy: 1 });
+        sink.send(&InputEvent::scroll(0, 1));
     }
 
     #[cfg(unix)]
@@ -752,7 +763,8 @@ mod tests {
                 asking.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             asking.send_input(&[]).unwrap();
@@ -798,6 +810,55 @@ mod tests {
         }
 
         #[test]
+        fn scrolls_are_passed_on_with_their_kind_and_scrolls_out_of_bounds_are_not() {
+            use istesso_proto::{ScrollPhase, ScrollSource};
+            let pair = InputPair::new("is");
+            let mut client = pair.connect();
+            client.open_input().unwrap();
+            let finger = |y: f64, phase: Option<ScrollPhase>| InputEvent::Scroll {
+                dx: 0,
+                dy: y as i32,
+                source: Some(ScrollSource::Finger),
+                v120: None,
+                pixels: Some([0.0, y]),
+                phase,
+                momentum: None,
+                momentum_follows: false,
+            };
+            let wheel = |v120: i32| InputEvent::Scroll {
+                dx: 0,
+                dy: 15,
+                source: Some(ScrollSource::Wheel),
+                v120: Some([0, v120]),
+                pixels: None,
+                phase: None,
+                momentum: None,
+                momentum_follows: false,
+            };
+            client
+                .send_input(&[
+                    finger(0.0, Some(ScrollPhase::Began)),
+                    finger(12.5, Some(ScrollPhase::Changed)),
+                    finger(20_000.0, Some(ScrollPhase::Changed)),
+                    wheel(120),
+                    wheel(i32::MAX),
+                    InputEvent::scroll(0, 30),
+                    finger(0.0, Some(ScrollPhase::Ended)),
+                ])
+                .unwrap();
+            assert_eq!(
+                pair.all_handed_over(A_MOMENT),
+                [
+                    finger(0.0, Some(ScrollPhase::Began)),
+                    finger(12.5, Some(ScrollPhase::Changed)),
+                    wheel(120),
+                    InputEvent::scroll(0, 30),
+                    finger(0.0, Some(ScrollPhase::Ended)),
+                ]
+            );
+        }
+
+        #[test]
         fn committed_text_is_passed_on_in_order_and_text_over_the_limits_is_not() {
             let pair = InputPair::new("it");
             let mut client = pair.connect();
@@ -832,7 +893,8 @@ mod tests {
                 first.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             first.send_input(&[key(29, true), key(30, true)]).unwrap();
@@ -846,7 +908,8 @@ mod tests {
                 second.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             second.send_input(&[key(29, true)]).unwrap();
@@ -887,7 +950,8 @@ mod tests {
                 client.open_input_alive().unwrap(),
                 InputAnswer::Open {
                     alive: true,
-                    text: true
+                    text: true,
+                    scroll: istesso_proto::SCROLL_LEVEL
                 }
             );
             // What was down comes up, and the conversation carries on.

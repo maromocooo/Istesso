@@ -3,7 +3,7 @@
 not have (docs/trial-daily.md, "静止画の質の下限", "日本語の入力" and "AURA：遅れをためない"). Trial
 only: started by scripts/daily.sh, and never by a measurement.
 
-    daily-pipeline.py [--min-qp N] [--text] [--flow [--no-adapt]] HOST_SCRIPT [its arguments...]
+    daily-pipeline.py [--min-qp N] [--text] [--scroll] [--flow [--no-adapt]] HOST_SCRIPT [its arguments...]
     daily-pipeline.py [--min-qp N] [--flow [--no-adapt]] --check
                                              print the encoder part as it would be, and end
 
@@ -18,6 +18,15 @@ this program takes those events out of what the host script reads (it wraps json
 datagrams of that kind only) and sends them itself, in order, on the same main loop. The text is
 never written anywhere, only checked against the limits (256 characters, 1024 bytes, no control
 characters) and passed on.
+
+--scroll: input events of the kind "scroll" that say their source (a wheel's notches, or fingers'
+pixels with the stage of the gesture; docs/adr/0007-control-channel.md, "スクロールの種類と段階")
+are given to the compositor as the custom upstream event PointerScroll (scripts/daily_scroll.py),
+which the trial compositor with the patch gst-wayland-display-trial-y-scroll turns into wl_pointer
+axis events of that source. Taken out of what the host script reads in the same way as text, and
+sent in order on the same main loop. A scroll of the old form goes on to the host script as before.
+Only for a compositor that knows PointerScroll: another one drops the event (scripts/daily.sh
+says --scroll only when the plugin's list of patches has that patch).
 
 --flow (for AURA): a frame goes into the encoder only when the viewer's connection has taken the
 one before it, so that nothing queues up on a link slower than the bit rate, and the bit rate
@@ -63,21 +72,35 @@ def acceptable(text):
     )
 
 
-def take_text(hand_over):
-    """Wraps json.loads so that a datagram of the kind "text" goes to hand_over(text) and reads,
-    for the host script, as an object of no kind (which it skips). Nothing else changes."""
+def take(handlers):
+    """Wraps json.loads so that a datagram that one of the handlers takes (handler(object) says
+    True) reads, for the host script, as an object of no kind (which it skips). Nothing else
+    changes."""
     import json
 
     loads = json.loads
 
     def taking(document, *args, **kwargs):
         value = loads(document, *args, **kwargs)
-        if isinstance(document, (bytes, bytearray)) and isinstance(value, dict) and value.get("kind") == "text":
-            hand_over(value.get("text"))
-            return {}
+        if isinstance(document, (bytes, bytearray)) and isinstance(value, dict):
+            for handler in handlers:
+                if handler(value):
+                    return {}
         return value
 
     json.loads = taking
+
+
+def take_text(hand_over):
+    """A handler for take(): a datagram of the kind "text" goes to hand_over(text)."""
+
+    def handler(value):
+        if value.get("kind") == "text":
+            hand_over(value.get("text"))
+            return True
+        return False
+
+    return handler
 
 
 def option(arguments, name, default):
@@ -93,7 +116,7 @@ def option(arguments, name, default):
 def main():
     arguments = sys.argv[1:]
     qp = None
-    text = flow = adapt = False
+    text = scroll = flow = adapt = False
     while arguments and arguments[0].startswith("--") and arguments[0] != "--check":
         word = arguments.pop(0)
         if word == "--min-qp" and arguments:
@@ -105,13 +128,15 @@ def main():
                 raise SystemExit("daily-pipeline: --min-qp is a number from 0 to 51")
         elif word == "--text":
             text = True
+        elif word == "--scroll":
+            scroll = True
         elif word == "--flow":
             flow = adapt = True
         elif word == "--no-adapt":
             adapt = False
         else:
             raise SystemExit(__doc__.split("\n\n")[1])
-    if not arguments or (qp is None and not text and not flow):
+    if not arguments or (qp is None and not text and not scroll and not flow):
         raise SystemExit(__doc__.split("\n\n")[1])
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
@@ -157,7 +182,7 @@ def main():
     import gi
 
     gi.require_version("Gst", "1.0")
-    from gi.repository import Gst
+    from gi.repository import GObject, Gst
 
     parse_launch = Gst.parse_launch
     made_pipelines = []
@@ -181,25 +206,81 @@ def main():
 
     Gst.parse_launch = made
 
+    def compositor_pad():
+        for pipeline in reversed(made_pipelines):
+            compositor = pipeline.get_by_name("compositor")
+            if compositor is not None:
+                return compositor.get_static_pad("src")
+        return None
+
+    handlers = []
     if text:
         dropped = {"count": 0}
 
         def hand_over(piece):
-            compositor = None
-            for pipeline in reversed(made_pipelines):
-                compositor = pipeline.get_by_name("compositor")
-                if compositor is not None:
-                    break
-            if compositor is None or not acceptable(piece):
+            pad = compositor_pad()
+            if pad is None or not acceptable(piece):
                 dropped["count"] += 1
                 print(f"daily: committed text dropped ({dropped['count']} so far; never shown)", file=sys.stderr, flush=True)
                 return
             structure = Gst.Structure.new_empty("TextCommit")
             structure.set_value("text", piece)
-            compositor.get_static_pad("src").send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+            pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
 
-        take_text(hand_over)
+        handlers.append(take_text(hand_over))
         print("daily: committed text goes to the compositor (trial only)", file=sys.stderr, flush=True)
+
+    if scroll:
+        import daily_scroll
+
+        counted = {"wheel": 0, "finger": 0, "dropped": 0}
+
+        def scroll_handler(value):
+            found = daily_scroll.pointer_scroll(value)
+            if found is None:
+                return False
+            pad = compositor_pad()
+            if not found or pad is None:
+                counted["dropped"] += 1
+                if counted["dropped"] in (1, 10, 100, 1000):
+                    print(f"daily: scrolls dropped ({counted['dropped']} so far)", file=sys.stderr, flush=True)
+                return True
+            structure = Gst.Structure.new_empty("PointerScroll")
+            for name, kind, field in found:
+                if kind == "int":
+                    gvalue = GObject.Value(GObject.TYPE_INT)
+                    gvalue.set_int(field)
+                    structure.set_value(name, gvalue)
+                elif kind == "boolean":
+                    gvalue = GObject.Value(GObject.TYPE_BOOLEAN)
+                    gvalue.set_boolean(field)
+                    structure.set_value(name, gvalue)
+                else:
+                    structure.set_value(name, field)
+            pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+            counted[found[0][2]] += 1
+            return True
+
+        handlers.append(scroll_handler)
+        print("daily: scrolls of the wheel and of fingers go to the compositor by their kind (trial only)", file=sys.stderr, flush=True)
+    else:
+        # A compositor without PointerScroll: a scroll that moves nothing in the old form (the
+        # stages of a gesture of a newer viewer) would only be an empty frame of a wheel there.
+        told = {"once": False}
+
+        def still_scroll(value):
+            if value.get("kind") != "scroll":
+                return False
+            if "source" in value and not told["once"]:
+                # Once, in a plain line, instead of the scrolls being less without a word.
+                told["once"] = True
+                print("daily: this compositor does not take: scroll kinds (started without --scroll: no trial-y-scroll); scrolls go as dx and dy only", file=sys.stderr, flush=True)
+            return value.get("dx") == 0 and value.get("dy") == 0
+
+        handlers.append(still_scroll)
+
+    if handlers:
+        take(handlers)
 
     sys.argv = [script] + rest
     runpy.run_path(script, run_name="__main__")

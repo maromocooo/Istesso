@@ -109,6 +109,13 @@
 #   DAILY_MAC_CONFIG, DAILY_HOST_CONFIG
 #                       identity and paired devices of a pair made for the check (the istesso-media
 #                       example `picture pair`): this Mac's own and the host's own are not used
+#   DAILY_SCROLL_MOMENTUM=app
+#                       for an application opened now: the trial compositor drops the inertia
+#                       macOS adds after a trackpad's fingers leave, and stops the scroll as they
+#                       leave, so that the application makes its own (as with a touchpad of the
+#                       desk). Not said: the Mac's inertia is passed on, as in a local application
+#                       of the Mac. To compare, close the application and open it again with or
+#                       without it
 #   DAILY_MIN_QP=N      the quality floor for the encoder of an application started now (min-qp-i,
 #                       -p and -b all N, 1-51; also `open ... --min-qp N`): 18 when not said, so
 #                       that a picture that stands still is encoded in very few bytes; 0 switches
@@ -138,7 +145,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo" || exit 1
 host_name=${ISTESSO_HOST:-istesso-ubuntu}
 host_dir=${DAILY_HOST_DIR:-'~/.cache/istesso-daily-wip'}
-plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-compositor-wip/gwd-trial27/target/release'}
+plugin_from=${DAILY_PLUGIN_FROM:-'~/.cache/istesso-scroll-wip/gwd-scroll3/target/release'}
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
 state="$HOME/Library/Caches/istesso-daily"
@@ -553,7 +560,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
         ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SCROLL_MOMENTUM=$([ "${DAILY_SCROLL_MOMENTUM:-}" = app ] && echo app) SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -773,6 +780,11 @@ grep -q -- "--text" "$src/scripts/daily-pipeline.py" 2>/dev/null || { echo "fail
 flow=""
 [ "$FOR" = aura ] && [ "$FLOW" != 0 ] && flow="--flow"
 [ -z "$flow" ] || [ -f "$src/scripts/daily_flow.py" ] || { echo "fail the trial's copy on the host has no scripts/daily_flow.py yet (scripts/daily.sh setup)"; exit 1; }
+# Scrolls by their kind (a wheel's notches, fingers' pixels and stages; docs/adr/0007-control-channel.md,
+# "スクロールの種類と段階") only for a compositor that knows them: one built with the patch
+# trial-y-scroll. Without it the scrolls go as before.
+scroll=""
+grep -q "trial-y-scroll" "$plugin/patches.txt" 2>/dev/null && [ -f "$src/scripts/daily_scroll.py" ] && scroll="--scroll"
 config=""
 [ -n "$HOST_CONFIG" ] && config=$(eval echo "$HOST_CONFIG")
 # For AURA (--for aura): the application's own AURA slot (picture 4793N, input 4794N), 4:2:0 at 72
@@ -1004,13 +1016,16 @@ PY2
     cat > "$run/pipeline.sh" <<SCRIPT
 #!/bin/bash
 export GST_PLUGIN_PATH=$plugin GST_REGISTRY=$run/gst-registry.bin XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
+# Whose inertia a trackpad's scroll gets (docs/adr/0007-control-channel.md): the Mac's, or with
+# DAILY_SCROLL_MOMENTUM=app the application's own.
+${SCROLL_MOMENTUM:+export ISTESSO_SCROLL_MOMENTUM=$SCROLL_MOMENTUM}
 # The keys arrive as places on the keyboard; this says what is printed on them.
 export XKB_DEFAULT_LAYOUT=$LAYOUT
 echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/pipeline.sid
 # The words for the pipeline are written into this pipe; it is held open so that it never ends.
 exec 3<>$run/control
-exec python3 -u $src/scripts/daily-pipeline.py --text ${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
+exec python3 -u $src/scripts/daily-pipeline.py --text ${scroll:+$scroll }${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
     [ -n "$MIN_QP" ] && echo "host: $NAME's encoder gets the quality floor min-qp $MIN_QP (trial only)"

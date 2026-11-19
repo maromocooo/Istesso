@@ -66,6 +66,10 @@ pub enum Response {
         alive: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         text: bool,
+        /// Trial: the level of scrolls taken (`istesso_proto::SCROLL_LEVEL`); 0
+        /// (left out): only `dx` and `dy` of a scroll are used.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        scroll: u8,
     },
     /// Still here: the answer to an empty [`Request::Input`] on a
     /// connection where that was agreed on.
@@ -87,6 +91,10 @@ pub enum ErrorCode {
     Internal,
     #[serde(other)]
     Other,
+}
+
+fn is_zero(value: &u8) -> bool {
+    *value == 0
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -166,7 +174,8 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                scroll: 0
             })
             .unwrap(),
             plain
@@ -179,7 +188,8 @@ mod tests {
             serde_json::from_str::<Response>(plain).unwrap(),
             Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                scroll: 0
             }
         );
         // Asked for, and agreed to.
@@ -192,7 +202,8 @@ mod tests {
             serde_json::from_str::<Response>(asking).unwrap(),
             Response::InputOpen {
                 alive: true,
-                text: false
+                text: false,
+                scroll: 0
             }
         );
         assert_eq!(
@@ -200,7 +211,17 @@ mod tests {
                 .unwrap(),
             Response::InputOpen {
                 alive: true,
-                text: true
+                text: true,
+                scroll: 0
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"type":"input_open","text":true,"scroll":1}"#)
+                .unwrap(),
+            Response::InputOpen {
+                alive: false,
+                text: true,
+                scroll: 1
             }
         );
         // An earlier version reads both as what it knows, and its own answer says
@@ -214,7 +235,8 @@ mod tests {
                 .unwrap(),
             Response::InputOpen {
                 alive: false,
-                text: false
+                text: false,
+                scroll: 0
             }
         );
         assert_eq!(

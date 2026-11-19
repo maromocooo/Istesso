@@ -55,6 +55,38 @@ scripts/daily.sh setup [--host mac]
 - `DAILY_DRY_RUN=1`：`daily-mac.sh` に渡すものを、渡さずに書くだけ（Ubuntu の側は、いつもどおり動く）。
 - 確かめ（窓を出さずに、Mac Studio には何もせずに）：`daily-mac.sh` の代わりの小さなスクリプトで、`open TextEdit --host mac [--for aura --size 1600x1000]`、`close … [--for aura]`（`aura-TextEdit` として渡る）、`setup --host mac`、`list`、`stop` が、その言葉のまま渡り、鍵の記述子を持っていないことを見た。`--min-qp` と `--host studio` は断った。Ubuntu の既定の道（`open editor`、`--host ubuntu`、`list`、`close`）は前のまま。Mac のホストの ssh の名前は `istesso-studio`（持ち主が開いている `ssh studio` のタブに相乗りする別名。`ISTESSO_MAC_HOST` で替えられる）。つながらないときは、`list` は `mac` の行に「Studio につながっていません（ssh studio のタブを開いてください）」と出し、ほかのコマンドも同じ一行を出して、すぐ終わる（つながらない名前で確かめた）。
 
+### スクロール（2026-11-19、M3 の宿題 4）
+
+[ADR 0007 の「スクロールの種類と段階」](adr/0007-control-channel.md)の試用版の側。ホイールは目盛り、トラックパッドは画素と段階（指が触れている、離れた、そのあとの慣性）で送り、Ubuntu の試用のコンポジターは、ホイールをホイールとして、指を指として、アプリに伝える。
+
+- ビューアー：`scroll.h`（窓なしで試せる C。`scroll-test` をビルドで動かす。C11、C17、Objective-C で警告なし）。ホイール（`hasPreciseScrollingDeltas` のないもの）は、イベントの整数の行（`kCGScrollWheelEventDeltaAxis1`、`2`）を `v120` に（1 クリックが 120）。トラックパッドは、`scrollingDeltaX/Y` に絵の画素と点の比を掛けた `pixels` と、`phase`、`momentumPhase`。指が離れたら、終わりの知らせを 60 ms まで手元で止め、macOS の慣性が始まれば `momentum_follows` を付けて送る（ネットワークの揺れが、慣性の二重を起こさないように）。動きは止めない。`dx`、`dy` は前と同じ値。
+- 中継とエージェント：`InputEvent::Scroll` に、省ける項目を 6 つ足した。エージェントは、範囲の外のスクロールを捨てる（古い `dx`、`dy` も 1 万まで。Mac ホストの流れの `61bb12a` と同じ）。エージェントは `input_open` の答えに `"scroll": 1` を付ける。中継は、それを言わないエージェントには、種類のあるスクロールのうち `dx` も `dy` も 0 のものを送らず、接続ごとに 1 度だけ `note: the host's agent does not take: scroll kinds …` と出す。
+- パイプライン：`daily-pipeline.py --scroll`（`scripts/daily_scroll.py`）が、種類を言うスクロールを `PointerScroll` にしてコンポジターへ渡す。種類に見合う量（`v120`、`pixels`）のないものは、古い形として。`--scroll` なしで起動したとき（`trial-y-scroll` のないプラグイン）は、`dx` も `dy` も 0 のスクロールを捨て、1 度だけ `daily: this compositor does not take: scroll kinds …` と出す。`daily.sh` は、写したプラグインの修正の一覧に `trial-y-scroll` があるときだけ `--scroll` を付ける。
+- コンポジター：試用の 7 つ目の修正 `gst-wayland-display-trial-y-scroll.patch`（ブランチ `m3-compositor-scroll`、ビルドは `~/.cache/istesso-scroll-wip/gwd-scroll3`。`DAILY_PLUGIN_FROM` の既定をここにした）。指の画素は、出力の拡大率で割る（アプリの論理の画素にする）。終わりが届かなかった指のスクロールは、最後の値から 400 ms で止める。コンポジターの試験 120 件が通った。`check-plugin.sh` は、このビルドを試用と言う（1）。計測に使うプラグインは、これまでどおり 0。
+- 慣性の切り替え：既定は Mac の慣性をそのまま渡す（手元の Mac のアプリ、Safari と同じ減り方を目指す）。`DAILY_SCROLL_MOMENTUM=app scripts/daily.sh open NAME` で、そのアプリのコンポジターだけ、Mac の慣性を捨ててアプリに任せる（`ISTESSO_SCROLL_MOMENTUM=app`）。比べるときは、`close` してから付けて、または外して、もう 1 度 `open`。
+
+確かめ（1 回目 13:58〜14:01、直したあと 14:22〜14:24、窓を出さずに）：中継、試用のエージェント、`daily-pipeline.py`、`m1-step3-host.py`、コンポジターは、試用版と同じ道（このブランチの写しを、流れ自身のフォルダーで、`daily.sh` と同じ引数で起動した。ポートは 47961、47962。確かめのための組）。アプリは、軸のイベントを 1 行ずつ書く試しのアプリ（`scripts/scroll-log.c`）。Mac の側は、ビューアーの `scroll.h` で作った NSEvent の形の値を、時刻どおりに中継の口へ書いた（ビューアーそのものは動かしていない）。身ぶりは作り物（下の「手元」は、手元の Mac のアプリが動かすはずの量で、NSScrollView がトラックパッドの点だけ動くこと、ホイールは行で動くことからの計算）。
+
+| 身ぶり | 手元 | 直す前（いまの試用版） | 直したあと（`gwd-scroll3`） |
+|---|---|---|---|
+| はじく（指 17 回 120 点 + 慣性 165 点） | 285.15 点 | **ホイール**として 2.4 目盛り、軸の値 7.0 | 指として 285.02 画素、慣性の終わりから 8 ms で `axis_stop` |
+| ゆっくり引く（120 点、慣性なし） | 120 点 | ホイール 1.0 目盛り、軸の値 2.97 | 指 120.0 画素、指を離して 60 ms（ビューアーの待ち）で `axis_stop` |
+| 小さく動かす（5.5 点） | 5.5 点 | ホイール 0.04 目盛り、軸の値 0.12 | 指 5.5 画素 |
+| ホイールを 1 クリックずつ 5 回 | 5 行 | 0.625 目盛り（1 回が 1/8） | 5.0 目盛り（`axis_value120` 600、軸の値 50） |
+| ホイールを速く回す（整数の行で 35） | 35 行 | 4.4 目盛り | 35.0 目盛り |
+
+距離（指の下に中身が残るか）：手元のアプリは、点の数だけ動く。遠くのアプリは、送った画素（÷ 出力の拡大率）だけ論理の画素で動き、それが Mac の窓に、絵の画素と点の比で縮めて映る。
+
+| 窓の 1 点あたりの絵の画素 | コンポジターの拡大率 | ゆっくり引く 120 点で、アプリに届いた値 | Mac の画面で動く量 |
+|---|---|---|---|
+| 1 | 1 | 120.0（見た） | 120 点 |
+| 2（大きい絵を小さい窓に） | 1 | 240.0（見た。はじくは 570.16） | 120 点 |
+| 1 | 2 | 8 画素が 4（コンポジターの試験で見た。試用版の出力は、いまは拡大率 1） | 同じになる（考え） |
+
+- 新しいビューアーと古いホスト（いまの `gwd-trial27`、`--scroll` なし）では、はじくとホイールが直す前と同じ数になり、空のホイールの知らせはなくなり、パイプラインの記録に「does not take」の 1 行が出た。
+- `ISTESSO_SCROLL_MOMENTUM=app`（1 回目）では、はじく身ぶりは指 120 画素と、指を離した 8 ms あとの `axis_stop` だけ（慣性はアプリが付ける）。
+- まだ見ていないこと：人の手のトラックパッドとホイール（本物の NSEvent。macOS が指を離してから慣性を始めるまでの間が、60 ms に収まるか。`kCGScrollWheelEventDeltaAxis1` の向きが `scrollingDeltaY` と同じか。速く回したときの整数の行の数）、本物のアプリ（GTK、Firefox、Chrome、Blender）での動き。
+
 ## いまの部品で、何が足りなかったか
 
 `scripts/try.sh` は、アプリを 1 つ映します。`ISTESSO_TRY_NAME` を付けると、2 つめを横で動かせますが、キーボードとマウスは届きません。ホストのエージェントが、入力を、ふだんのパイプラインの口 1 つにだけ渡すためです。

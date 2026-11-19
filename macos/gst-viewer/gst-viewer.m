@@ -1537,7 +1537,7 @@ static void send_input(const char *format, ...) {
     if (input_socket < 0) {
         return;
     }
-    char text[128];
+    char text[256]; // a scroll of the trackpad is the longest (scroll.h)
     va_list arguments;
     va_start(arguments, format);
     int length = vsnprintf(text, sizeof text, format, arguments);
@@ -1555,6 +1555,8 @@ static void send_input(const char *format, ...) {
 // ("Windows") keys. ISTESSO_COMMAND_KEY=super in the environment sends Super.
 static BOOL command_is_control = YES;
 
+#include "scroll.h"
+
 // The view the picture is shown in, when input is passed on: it takes the keyboard and the
 // pointer and writes what happens to the socket.
 @interface InputView : NSView
@@ -1563,7 +1565,7 @@ static BOOL command_is_control = YES;
 @implementation InputView {
     Keys _keys;          // keys that are down on the other side
     unsigned _buttons;   // buttons that are down on the other side (bit 0: left, 1: right, 2: other)
-    double _scroll[2];   // parts of a pixel not yet passed on
+    ScrollState _scroll; // parts of a pixel and of a notch not yet passed on
     BOOL _inside;        // the pointer is over the view
     NSPoint _at;         // where, in the view's own coordinates (from its bottom left)
 }
@@ -1790,22 +1792,45 @@ static NSCursor *empty_cursor(void) {
 - (void)otherMouseDown:(NSEvent *)event { [self button:0x112 pressed:YES event:event]; }
 - (void)otherMouseUp:(NSEvent *)event { [self button:0x112 pressed:NO event:event]; }
 
+static void send_scroll(void *context, const char *message) {
+    (void)context;
+    send_input("%s", message);
+}
+
 - (void)scrollWheel:(NSEvent *)event {
-    // macOS says how far the content moves; the other side wants how far to scroll. A wheel
-    // counts in lines, a trackpad in points.
-    double scale = event.hasPreciseScrollingDeltas ? 1.0 : 15.0;
-    _scroll[0] -= event.scrollingDeltaX * scale;
-    _scroll[1] -= event.scrollingDeltaY * scale;
-    int dx = (int)_scroll[0], dy = (int)_scroll[1];
     if (picture_stale) {
-        // Scrolling a picture that is not there moves something nobody sees.
-        _scroll[0] = _scroll[1] = 0;
+        // Scrolling a picture that is not there moves something nobody sees. An end held back
+        // is dropped too: the compositor stops a scroll whose end never comes by itself.
+        _scroll = (ScrollState){0};
         return;
     }
-    if (dx != 0 || dy != 0) {
-        _scroll[0] -= dx;
-        _scroll[1] -= dy;
-        send_input("{\"kind\":\"scroll\",\"dx\":%d,\"dy\":%d}", dx, dy);
+    // A wheel goes as notches (its whole lines), a trackpad as pixels of the picture with the
+    // stage of the gesture and of the inertia after it (scroll.h; ADR 0007, "スクロールの種類と
+    // 段階"), so that the content moves under the fingers as far as it would in a window here.
+    NSSize size = self.bounds.size;
+    CGEventRef cg = event.CGEvent;
+    ScrollIn in = {
+        .precise = event.hasPreciseScrollingDeltas,
+        .dx = event.scrollingDeltaX,
+        .dy = event.scrollingDeltaY,
+        .has_lines = cg != NULL,
+        .lines_x = cg ? (long)CGEventGetIntegerValueField(cg, kCGScrollWheelEventDeltaAxis2) : 0,
+        .lines_y = cg ? (long)CGEventGetIntegerValueField(cg, kCGScrollWheelEventDeltaAxis1) : 0,
+        .phase = (unsigned)event.phase,
+        .momentum = (unsigned)event.momentumPhase,
+        .scale_x = size.width > 0 && picture_width > 0 ? picture_width / size.width : 1.0,
+        .scale_y = size.height > 0 && picture_height > 0 ? picture_height / size.height : 1.0,
+    };
+    scroll_event(&_scroll, &in, event.timestamp * 1000.0, send_scroll, NULL);
+    if (_scroll.held) {
+        // The end of the gesture waits here for macOS's inertia; it goes without it once the
+        // wait is over (a later event that comes first sends it instead).
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((SCROLL_MOMENTUM_WAIT_MS + 1) * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+                           if (!picture_stale) {
+                               scroll_due(&self->_scroll, NSProcessInfo.processInfo.systemUptime * 1000.0, send_scroll, NULL);
+                           }
+                       });
     }
 }
 
