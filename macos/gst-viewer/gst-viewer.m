@@ -946,7 +946,12 @@ static void secure_input_off_at_exit(void) {
 @end
 
 // Field descriptions belong to one picture connection. Only the text input view consumes them.
+static BOOL windows_text_field(IstessoMediaTextInput field);
+
 static void update_text_input_field(IstessoMediaTextInput field) {
+    if (windows_text_field(field)) {
+        return;  // the application's other windows are shown too: every view was told
+    }
     if ([cursor_view respondsToSelector:@selector(setTextInputField:)]) {
         [cursor_view setTextInputField:field];
     }
@@ -966,6 +971,11 @@ static long relay_state_field(const char *line, const char *name, long otherwise
     return end == digits ? otherwise : value;
 }
 
+// The application's other windows (extra-windows.h; ISTESSO_WINDOWS=1 only).
+static void relay_windows_state(BOOL takes, long input);
+static void declare_windows(void);
+static void windows_listed(NSData *json);
+
 // Looks once a second at what the relay says about its own connection, off the main thread:
 // reading a file must never hold up a key on its way out.
 static void watch_relay_state(const char *socket_path) {
@@ -975,7 +985,7 @@ static void watch_relay_state(const char *socket_path) {
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
     dispatch_source_set_event_handler(timer, ^{
-        long now = -1, text = 0, clipboard = 0, preedit = 0;
+        long now = -1, text = 0, clipboard = 0, preedit = 0, windows = 0;
         BOOL reconnecting = NO;
         FILE *file = fopen(path.fileSystemRepresentation, "r");
         char content[256] = {0};
@@ -998,10 +1008,12 @@ static void watch_relay_state(const char *socket_path) {
                 text = relay_state_field(content, "text", 0) == 1;
                 clipboard = relay_state_field(content, "clipboard", 0) == 1;
                 preedit = relay_state_field(content, "preedit", 0) == 1;
+                windows = relay_state_field(content, "windows", 0) == 1;
                 reconnecting = daily_reconnect && relay_state_field(content, "reconnecting", 0) == 1;
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
+            relay_windows_state(windows != 0, now);
             host_takes_clipboard = clipboard != 0;
             if (host_takes_text != (text != 0) || host_takes_preedit != (preedit != 0)) {
                 host_takes_text = text != 0;
@@ -1393,6 +1405,17 @@ static void *channel_thread(void *unused) {
                     update_text_input_field(field);
                 });
             }
+        } else if (got == 6) {
+            // The application's other windows (ISTESSO_WINDOWS=1 only; extra-windows.h).
+            char *list = malloc(8193);
+            int32_t length = list != NULL ? istesso_media_watch_windows(watch, list, 8193) : -1;
+            if (length > 0) {
+                NSData *json = [NSData dataWithBytes:list length:(NSUInteger)length];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    windows_listed(json);
+                });
+            }
+            free(list);
         } else if (got == 3) {
             // Cut, and nobody said why: the library is connecting again.
             cut_at = now_ns();
@@ -1423,6 +1446,10 @@ static void *channel_thread(void *unused) {
             // A new connection begins with a key frame, and the decoder begins anew with it.
             vt_needs_key_frame = TRUE;
             channel_asked_ns = 0;
+            // A host that lists windows is told again that they can be shown one by one.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                declare_windows();
+            });
             if (daily_reconnect) {
                 daily_picture_drawn = NO;
                 if (state.again) {
@@ -1825,6 +1852,12 @@ static BOOL command_is_control = YES;
 // The view the picture is shown in, when input is passed on: it takes the keyboard and the
 // pointer and writes what happens to the socket.
 @interface InputView : NSView
+// 0: the application's first window (the picture of ISTESSO_CHANNEL), as always. 2 and up: another
+// window of the application that the host listed and streams on its own (ADR 0027, a proposal;
+// ISTESSO_WINDOWS=1 only): its pointer positions say its number, in its own picture's pixels.
+@property(nonatomic) uint32_t hostWindow;
+// That other window's picture, in its own pixels (0: none yet). Set on the main thread.
+@property(nonatomic) int ownPictureWidth, ownPictureHeight;
 @end
 
 @implementation InputView {
@@ -1834,6 +1867,14 @@ static BOOL command_is_control = YES;
     BOOL _inside;        // the pointer is over the view
     NSPoint _at;         // where, in the view's own coordinates (from its bottom left)
     NSMutableIndexSet *_taken;  // keys taken for copy and paste: their release is not passed on
+}
+
+// The size of the picture this view shows: the first window's, or its own.
+- (int)pictureWidth {
+    return self.hostWindow > 1 ? self.ownPictureWidth : picture_width;
+}
+- (int)pictureHeight {
+    return self.hostWindow > 1 ? self.ownPictureHeight : picture_height;
 }
 
 // A cursor that shows nothing: over the view the cursor is the one drawn into the layer.
@@ -1849,6 +1890,11 @@ static NSCursor *empty_cursor(void) {
 // that the application has hidden it. Cursor rectangles only work in the key window, which is
 // what is wanted: over a window that is not being used the Mac's cursor stays.
 - (void)resetCursorRects {
+    // Another window of the application draws no cursor of its own: the Mac's is shown over it.
+    if (self.hostWindow > 1) {
+        [super resetCursorRects];
+        return;
+    }
     if (cursor_layer != nil && cursor_shape != 1 && !picture_stale) {
         [self addCursorRect:self.bounds cursor:empty_cursor()];
     } else {
@@ -1858,7 +1904,7 @@ static NSCursor *empty_cursor(void) {
 
 // Puts the cursor's layer where the pointer is, at the picture's scale, or takes it away.
 - (void)placeCursor {
-    if (cursor_layer == nil) {
+    if (cursor_layer == nil || self.hostWindow > 1) {
         return;
     }
     BOOL here = cursor_pinned || (_inside && self.window.isKeyWindow);
@@ -2146,7 +2192,8 @@ static NSCursor *empty_cursor(void) {
 - (void)pointer:(NSEvent *)event {
     // The cursor is drawn here first: it does not wait for anything.
     [self pointerIsAt:event inside:NSPointInRect([self convertPoint:event.locationInWindow fromView:nil], self.bounds)];
-    if (picture_width <= 0 || picture_height <= 0) {
+    int pw = [self pictureWidth], ph = [self pictureHeight];
+    if (pw <= 0 || ph <= 0) {
         return;
     }
     NSPoint at = [self convertPoint:event.locationInWindow fromView:nil];
@@ -2155,11 +2202,15 @@ static NSCursor *empty_cursor(void) {
         return;
     }
     // The view counts from the bottom left in points, the picture from the top left in pixels.
-    int x = (int)(at.x * picture_width / size.width);
-    int y = (int)((size.height - at.y) * picture_height / size.height);
-    x = x < 0 ? 0 : (x >= picture_width ? picture_width - 1 : x);
-    y = y < 0 ? 0 : (y >= picture_height ? picture_height - 1 : y);
-    send_input("{\"kind\":\"pointer_at\",\"x\":%d,\"y\":%d}", x, y);
+    int x = (int)(at.x * pw / size.width);
+    int y = (int)((size.height - at.y) * ph / size.height);
+    x = x < 0 ? 0 : (x >= pw ? pw - 1 : x);
+    y = y < 0 ? 0 : (y >= ph ? ph - 1 : y);
+    if (self.hostWindow > 1) {
+        send_input("{\"kind\":\"pointer_at\",\"x\":%d,\"y\":%d,\"window\":%u}", x, y, self.hostWindow);
+    } else {
+        send_input("{\"kind\":\"pointer_at\",\"x\":%d,\"y\":%d}", x, y);
+    }
 }
 
 - (void)button:(unsigned)code pressed:(BOOL)pressed event:(NSEvent *)event {
@@ -2243,8 +2294,8 @@ static void scroll_modifiers_first(void *context) {
         .lines_y = cg ? (long)CGEventGetIntegerValueField(cg, kCGScrollWheelEventDeltaAxis1) : 0,
         .phase = (unsigned)event.phase,
         .momentum = (unsigned)event.momentumPhase,
-        .scale_x = size.width > 0 && picture_width > 0 ? picture_width / size.width : 1.0,
-        .scale_y = size.height > 0 && picture_height > 0 ? picture_height / size.height : 1.0,
+        .scale_x = size.width > 0 && [self pictureWidth] > 0 ? [self pictureWidth] / size.width : 1.0,
+        .scale_y = size.height > 0 && [self pictureHeight] > 0 ? [self pictureHeight] / size.height : 1.0,
     };
     // The modifiers over there are brought in line with this event's around what it sends, and
     // only when it sends something (a Command-scroll carries Command).
@@ -2682,6 +2733,8 @@ static BOOL moves_focus(NSEvent *event) {
 @end
 
 // The everyday trial's ISTESSO_END_WITH_WINDOW: the program ends with its window.
+#include "extra-windows.h"
+
 @interface EndWithWindow : NSObject <NSApplicationDelegate>
 @end
 
@@ -2784,6 +2837,11 @@ int main(int argc, char *argv[]) {
         // The everyday trial's switches (see the top of this file).
         daily_reconnect = getenv("ISTESSO_DAILY_RECONNECT") != NULL;
         BOOL no_window = getenv("ISTESSO_NO_WINDOW") != NULL;
+        // PROTOTYPE (ADR 0027, a proposal): the application's other windows in windows of their own,
+        // in the everyday form over the channel only (extra-windows.h).
+        const char *windows = getenv("ISTESSO_WINDOWS");
+        windows_on = windows != NULL && strcmp(windows, "1") == 0 && daily_reconnect && channel_address != NULL;
+        windows_hidden = no_window;
         const char *dock_tile = getenv("ISTESSO_DOCK_TILE");
         const char *pid_file = getenv("ISTESSO_PID_FILE");
         if (pid_file != NULL) {
@@ -2872,6 +2930,7 @@ int main(int argc, char *argv[]) {
         window.contentView = view;
         picture_window = window;
         picture_whole_display = whole_display;
+        windows_follow_first(window);
         if (daily_reconnect && !whole_display) {
             // The everyday trial (the Mac host's docs/m4-daily-host.md): when this window becomes
             // the one typed into, the host brings the application's window to the front; when the
