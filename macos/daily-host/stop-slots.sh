@@ -17,18 +17,17 @@ stop_written_down() {
     kill "$pid" 2>/dev/null || return 0
     for ((i=0; i<30; i++)); do same_process "$pid" "$started" || return 0; sleep 0.1; done
 }
-stop_slots() (
-    # Ask all slots at once. Wait only for this sweep's own children.
+stop_slots() {
+    # Slot by slot, the host program and then its agent: the launcher's stop as it was.
     local root run
     for root in "$@"; do
         for run in "$root"/*/; do
             [[ -d "$run" ]] || continue
-            stop_written_down "$run/host.pid" &
-            stop_written_down "$run/agent.pid" &
+            stop_written_down "$run/host.pid"
+            stop_written_down "$run/agent.pid"
         done
     done
-    wait
-)
+}
 
 if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then
     stop_slots "$@"

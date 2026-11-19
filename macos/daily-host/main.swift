@@ -2738,13 +2738,13 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.injector.releaseAll()
         }
-        // Something held, and no input for 8 s: a release was lost on the way; let go.
         if settings.menuBar && !settings.generated && !settings.inputDry &&
             ProcessInfo.processInfo.environment["DAILY_HOST_DIRECT"] == nil && Bundle.main.bundleURL.pathExtension == "app" {
             menuBar = HostMenuBar(.main, pidFile: settings.pidFile)
             if menuBar == nil { note("cannot initialize the daily host menu") }
             refreshMenu()
         }
+        // Something held, and no input for 8 s: a release was lost on the way; let go.
         let watchdog = DispatchSource.makeTimerSource(queue: .main)
         watchdog.schedule(deadline: .now() + 1, repeating: .seconds(1))
         watchdog.setEventHandler { [weak self] in
@@ -4113,7 +4113,8 @@ for name in [SIGTERM, SIGINT] {
     signal(name, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: name, queue: .main)
     source.setEventHandler {
-        guard !daily.stopping else { return }
+        // With the menu bar, its Stop may ask again while a stop runs; without it, as before.
+        if settings.menuBar && daily.stopping { return }
         daily.menuBar = nil
         daily.injector.releaseAll()
         // Istesso's input source is let go of before anything else (the Mac's own keyboard).

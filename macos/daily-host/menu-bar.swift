@@ -13,10 +13,35 @@ struct MenuSession: Codable, Equatable {
         return session
     }
 
+    /// The most rows of viewers the menu shows; the rest are counted in one row.
+    static let mostRows = 12
+
     static func lines(_ sessions: [Self]) -> [String] {
-        sessions.flatMap { session in
-            session.devices.map { "いま映しています：" + $0 + " — " + session.app }
+        let all = sessions.flatMap { session in
+            session.devices.map { "いま映しています：" + label($0) + " — " + label(session.app) }
         }.sorted()
+        guard all.count > mostRows else { return all }
+        return Array(all.prefix(mostRows)) + ["ほか \(all.count - mostRows) 件"]
+    }
+
+    /// A name as the menu shows it: no control, format (bidi, zero-width), separator, private or
+    /// unassigned characters; white space as single spaces; at most 40 characters.
+    static func label(_ text: String) -> String {
+        var kept = String.UnicodeScalarView()
+        var gap = false
+        for scalar in text.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .control, .spaceSeparator, .lineSeparator, .paragraphSeparator:
+                gap = !kept.isEmpty
+            case .format, .privateUse, .surrogate, .unassigned:
+                continue
+            default:
+                if kept.count >= 40 { return String(kept) + "…" }
+                if gap { kept.append(" "); gap = false }
+                kept.append(scalar)
+            }
+        }
+        return kept.isEmpty ? "?" : String(kept)
     }
 
     // Only live, registered hosts take part. The PID breaks simultaneous starts.
@@ -159,4 +184,10 @@ func menuBarSelfTest(_ check: (Bool, Bool, String) -> Void) {
     check(MenuSession.owner([20: first, 10: second]) == 20, true, "menu: first live instance owns the item")
     check(MenuSession.owner([10: second, 30: idle]) == 10, true, "menu: deterministic handover after owner exit")
     check(MenuSession.owner([:]) == nil, true, "menu: no owner without hosts")
+    check(MenuSession.label("A\u{202E}b\u{2066}c\u{200B}d") == "Abcd", true, "menu: bidi and zero-width characters are dropped")
+    check(MenuSession.label(" Ex\u{0}\n\tample\u{2028} ") == "Ex ample", true, "menu: control characters and line breaks become one space")
+    check(MenuSession.label("\u{202E}\u{7}") == "?", true, "menu: a name of nothing shown is a question mark")
+    check(MenuSession.label(String(repeating: "x", count: 50)) == String(repeating: "x", count: 40) + "…", true, "menu: long names are cut")
+    let many = MenuSession(started: 3, app: "Example App", devices: (0..<20).map { "Device \($0)" }) // check-private: ok synthetic display labels
+    check(MenuSession.lines([many]).count == MenuSession.mostRows + 1, true, "menu: many viewers end in one counting row")
 }

@@ -211,7 +211,7 @@ void istesso_media_host_offer(const IstessoMediaHost *host, int32_t offered);
 uint32_t istesso_media_host_viewers(const IstessoMediaHost *host);
 
 /* Calls visit synchronously for each connected viewer's paired display name.
- * Its UTF-8 bytes are borrowed for that visit only. */
+ * Its UTF-8 bytes are borrowed for that visit only. Nothing happens if host or visit is NULL. */
 void istesso_media_host_viewer_names(const IstessoMediaHost *host, void *context,
                                     void (*visit)(void *, const uint8_t *, size_t));
 

@@ -534,10 +534,10 @@ pub unsafe extern "C" fn istesso_media_host_viewers(host: *const IstessoMediaHos
 pub unsafe extern "C" fn istesso_media_host_viewer_names(
     host: *const IstessoMediaHost,
     context: *mut std::ffi::c_void,
-    visit: extern "C" fn(*mut std::ffi::c_void, *const u8, usize),
+    visit: Option<extern "C" fn(*mut std::ffi::c_void, *const u8, usize)>,
 ) {
     // SAFETY: the caller's promise.
-    if let Some(host) = unsafe { host.as_ref() } {
+    if let (Some(host), Some(visit)) = (unsafe { host.as_ref() }, visit) {
         for name in host.host.viewer_names() {
             visit(context, name.as_ptr(), name.len());
         }
@@ -1295,7 +1295,18 @@ mod tests {
                 assert!(began.elapsed() < Duration::from_secs(5));
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!((*host).host.viewer_names(), ["device"]); // check-private: ok synthetic paired device
+            extern "C" fn collect(context: *mut std::ffi::c_void, bytes: *const u8, len: usize) {
+                // SAFETY: the context is the Vec below; the bytes are borrowed for this call.
+                let names = unsafe { &mut *context.cast::<Vec<String>>() };
+                let name = unsafe { std::slice::from_raw_parts(bytes, len) };
+                names.push(String::from_utf8(name.to_vec()).unwrap());
+            }
+            let mut names: Vec<String> = Vec::new();
+            let context = (&mut names as *mut Vec<String>).cast();
+            istesso_media_host_viewer_names(host, context, Some(collect));
+            istesso_media_host_viewer_names(host, context, None);
+            istesso_media_host_viewer_names(std::ptr::null(), context, Some(collect));
+            assert_eq!(names, ["device"]); // check-private: ok synthetic paired device
             assert_eq!(istesso_media_host_key_frame_wanted(host), 1);
 
             let picture: Vec<u8> = (0..140_000u32).map(|i| (i % 253) as u8).collect();
