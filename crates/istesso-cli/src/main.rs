@@ -2297,7 +2297,7 @@ mod tests {
             name: "wlp7s0".to_string(),
             mac: "a0:ce:c8:44:55:66".to_string(),
             kind: NetKind::Wifi,
-            addresses: vec!["192.168.1.99".to_string()],
+            addresses: vec!["192.0.2.99".to_string()], // check-private: ok (RFC 5737 documentation address)
         });
         let text = render_hosts(&[silent], 1_000_000);
         assert!(text.contains("no answer"), "{text}");
