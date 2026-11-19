@@ -132,6 +132,19 @@ func readSettings() -> Settings {
 
 if CommandLine.arguments.dropFirst().first == "--self-test" { selfTest() }
 if CommandLine.arguments.dropFirst().first == "--close-document" { closeDocument(Array(CommandLine.arguments.dropFirst(2))) }
+if CommandLine.arguments.dropFirst().first == "--displays" {
+    // Read only: every active display, its place in the arrangement, and its mode.
+    var count: UInt32 = 0
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+    CGGetActiveDisplayList(16, &ids, &count)
+    for id in ids.prefix(Int(count)) {
+        let b = CGDisplayBounds(id)
+        let m = CGDisplayCopyDisplayMode(id)
+        print("display main=\(CGDisplayIsMain(id) != 0) origin=\(Int(b.minX)),\(Int(b.minY)) size=\(Int(b.width))x\(Int(b.height)) mode=\(m?.width ?? 0)x\(m?.height ?? 0)pt/\(m?.pixelWidth ?? 0)x\(m?.pixelHeight ?? 0)px@\(Int(m?.refreshRate ?? 0))Hz builtin=\(CGDisplayIsBuiltin(id) != 0)")
+    }
+    exit(0)
+}
+if CommandLine.arguments.dropFirst().first == "--vd-check" { runVirtualDisplayCheck(Array(CommandLine.arguments.dropFirst(2))) }
 let settings = readSettings()
 
 // MARK: - Saying things
@@ -995,6 +1008,199 @@ func closeDocument(_ arguments: [String]) -> Never {
     }
     print("{\"closed\":false,\"why\":\"no window shows that document\"}")
     exit(1)
+}
+
+// MARK: - The virtual display check (trial only; the owner's plan A, 2026-11-19)
+
+/// `--vd-check WxH@HZ`: makes a virtual display through the private CGVirtualDisplay classes
+/// (virtual-display.h: declared from the Objective-C runtime's own description, no other
+/// project's code), asks for W x H points at HZ with HiDPI (2 pixels a point), puts one window of
+/// this program on it that changes every frame, and reports, as one line of JSON each:
+/// the modes the display offers and the one it took (points, pixels, refresh rate); how many
+/// pictures a second the window drew and ScreenCaptureKit captured, and their size in pixels;
+/// where a click posted through the session at a known place landed in the window. Then it takes
+/// the display away and ends (about 20 s). Nothing of anybody else's is moved; the Mac's pointer
+/// goes onto the virtual display for the click and is put back where it was.
+func runVirtualDisplayCheck(_ arguments: [String]) -> Never {
+    let parts = (arguments.first ?? "1720x720@120").split(whereSeparator: { $0 == "x" || $0 == "@" }).compactMap { Double($0) }
+    guard parts.count == 3 else { print("{\"vd\":\"usage: --vd-check WxH@HZ\"}"); exit(2) }
+    let check = VirtualDisplayCheck(width: Int(parts[0]), height: Int(parts[1]), hertz: parts[2])
+    let application = NSApplication.shared
+    application.setActivationPolicy(.accessory)
+    application.delegate = check
+    application.run()
+    exit(0)
+}
+
+final class AnimatedView: NSView {
+    var frames = 0
+    var clicks: [NSPoint] = []
+    var link: CADisplayLink?
+    override func draw(_ dirtyRect: NSRect) {
+        let shade = CGFloat(frames % 60) / 60
+        NSColor(calibratedRed: shade, green: 1 - shade, blue: 0.5, alpha: 1).setFill()
+        bounds.fill()
+        NSColor.black.setFill()
+        NSRect(x: CGFloat(frames * 7 % Int(max(1, bounds.width))), y: 0, width: 4, height: bounds.height).fill()
+    }
+    @objc func tick(_ link: CADisplayLink) {
+        frames += 1
+        needsDisplay = true
+    }
+    override func mouseDown(with event: NSEvent) {
+        let inView = convert(event.locationInWindow, from: nil)
+        clicks.append(NSPoint(x: inView.x, y: bounds.height - inView.y))
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+final class VirtualDisplayCheck: NSObject, NSApplicationDelegate, SCStreamOutput {
+    let width: Int, height: Int, hertz: Double
+    var display: CGVirtualDisplay?
+    var window: NSWindow?
+    var view: AnimatedView?
+    var stream: SCStream?
+    var captured = 0
+    var capturedSize = (0, 0)
+    let queue = DispatchQueue(label: "istesso.vd-check.capture")
+    init(width: Int, height: Int, hertz: Double) { self.width = width; self.height = height; self.hertz = hertz }
+
+    func say(_ line: String) { print(line); fflush(stdout) }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard CGPreflightScreenCaptureAccess() else { say("{\"vd\":\"no screen recording\"}"); exit(3) }
+        let descriptor = CGVirtualDisplayDescriptor()
+        descriptor.name = "Istesso trial (Dev)"
+        descriptor.maxPixelsWide = UInt32(width * 2)
+        descriptor.maxPixelsHigh = UInt32(height * 2)
+        descriptor.sizeInMillimeters = CGSize(width: Double(width) / 110 * 25.4, height: Double(height) / 110 * 25.4)
+        descriptor.vendorID = 0x1234
+        descriptor.productID = 0x0002
+        descriptor.serialNum = 0x0001
+        descriptor.redPrimary = CGPoint(x: 0.64, y: 0.33)
+        descriptor.greenPrimary = CGPoint(x: 0.30, y: 0.60)
+        descriptor.bluePrimary = CGPoint(x: 0.15, y: 0.06)
+        descriptor.whitePoint = CGPoint(x: 0.3127, y: 0.3290)
+        descriptor.queue = DispatchQueue.main
+        guard let made = CGVirtualDisplay(descriptor: descriptor) else { say("{\"vd\":\"not made\"}"); exit(1) }
+        display = made
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = 1
+        settings.modes = [CGVirtualDisplayMode(width: UInt32(width), height: UInt32(height), refreshRate: hertz),
+                          CGVirtualDisplayMode(width: UInt32(width * 2), height: UInt32(height * 2), refreshRate: hertz)]
+        let applied = made.apply(settings)
+        say("{\"vd\":\"made\",\"applied\":\(applied),\"display\":\(made.displayID)}")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.modes() }
+    }
+
+    func modes() {
+        guard let id = display?.displayID else { return }
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        let all = (CGDisplayCopyAllDisplayModes(id, options) as? [CGDisplayMode]) ?? []
+        let list = all.map { "\"\($0.width)x\($0.height) pt \($0.pixelWidth)x\($0.pixelHeight) px \(Int($0.refreshRate)) Hz\"" }
+        say("{\"vd\":\"modes\",\"modes\":[\(list.joined(separator: ","))]}")
+        // The HiDPI one of the size asked for, at the rate asked for, if there is one.
+        if let hidpi = all.first(where: { $0.width == width && $0.pixelWidth == width * 2 }) {
+            let result = CGDisplaySetDisplayMode(id, hidpi, nil)
+            say("{\"vd\":\"set hidpi\",\"result\":\(result.rawValue)}")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.current() }
+    }
+
+    func current() {
+        guard let id = display?.displayID, let mode = CGDisplayCopyDisplayMode(id) else { return }
+        say("{\"vd\":\"current\",\"points\":\"\(mode.width)x\(mode.height)\",\"pixels\":\"\(mode.pixelWidth)x\(mode.pixelHeight)\",\"refresh_hz\":\(mode.refreshRate)}")
+        guard let screen = NSScreen.screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }) else {
+            say("{\"vd\":\"not among the screens\"}")
+            return finish()
+        }
+        say("{\"vd\":\"screen\",\"backing_scale\":\(screen.backingScaleFactor),\"max_fps\":\(screen.maximumFramesPerSecond)}")
+        let frame = NSRect(x: screen.frame.minX + 40, y: screen.frame.minY + 40, width: 600, height: 300)
+        let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false, screen: screen)
+        let view = AnimatedView(frame: NSRect(origin: .zero, size: frame.size))
+        window.contentView = view
+        window.setFrame(frame, display: true)
+        window.orderFrontRegardless()
+        let link = view.displayLink(target: view, selector: #selector(AnimatedView.tick(_:)))
+        link.add(to: .main, forMode: .common)
+        view.link = link
+        self.window = window
+        self.view = view
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.capture(id) }
+    }
+
+    func capture(_ id: CGDirectDisplayID) {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+            DispatchQueue.main.async {
+                guard let scDisplay = content?.displays.first(where: { $0.displayID == id }), let mode = CGDisplayCopyDisplayMode(id) else {
+                    self.say("{\"vd\":\"not capturable\"}")
+                    return self.finish()
+                }
+                let configuration = SCStreamConfiguration()
+                configuration.width = mode.pixelWidth
+                configuration.height = mode.pixelHeight
+                configuration.pixelFormat = kCVPixelFormatType_32BGRA
+                configuration.showsCursor = false
+                configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(self.hertz))
+                configuration.queueDepth = 4
+                let stream = SCStream(filter: SCContentFilter(display: scDisplay, excludingWindows: []), configuration: configuration, delegate: nil)
+                try? stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+                self.stream = stream
+                stream.startCapture { error in
+                    if let error { self.say("{\"vd\":\"capture failed\",\"why\":\"\(error.localizedDescription)\"}") }
+                }
+                let drawn0 = self.view?.frames ?? 0
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    let start = self.queue.sync { self.captured }
+                    let drawnStart = self.view?.frames ?? 0
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                        let got = self.queue.sync { self.captured } - start
+                        let drawn = (self.view?.frames ?? 0) - drawnStart
+                        let size = self.queue.sync { self.capturedSize }
+                        self.say("{\"vd\":\"rates\",\"drawn_per_s\":\(Double(drawn) / 5),\"captured_per_s\":\(Double(got) / 5),\"captured_pixels\":\"\(size.0)x\(size.1)\",\"drawn_before\":\(drawn0)}")
+                        self.click(id)
+                    }
+                }
+            }
+        }
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+           let raw = attachments.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw), status != .complete { return }
+        captured += 1
+        capturedSize = (CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer))
+    }
+
+    func click(_ id: CGDirectDisplayID) {
+        guard let window, CGPreflightPostEventAccess() else { say("{\"vd\":\"no click (no accessibility)\"}"); return finish() }
+        let before = CGEvent(source: nil)?.location ?? .zero
+        // 100, 50 points into the window, in global points from the top left.
+        let mainTop = NSScreen.screens[0].frame.maxY
+        let target = CGPoint(x: window.frame.minX + 100, y: mainTop - window.frame.maxY + 50)
+        for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
+            CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: target, mouseButton: .left)?.post(tap: .cgSessionEventTap)
+            usleep(30_000)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            CGWarpMouseCursorPosition(before)
+            let landed = self.view?.clicks.last.map { "[\(Int($0.x)),\(Int($0.y))]" } ?? "null"
+            self.say("{\"vd\":\"click\",\"asked\":[100,50],\"landed\":\(landed)}")
+            self.finish()
+        }
+    }
+
+    func finish() {
+        stream?.stopCapture { _ in }
+        window?.orderOut(nil)
+        window = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.display = nil  // the display goes away with its object
+            self.say("{\"vd\":\"removed\"}")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+        }
+    }
 }
 
 /// `--self-test`: the rule of the session form, without any window or permission.
