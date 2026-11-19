@@ -1,0 +1,43 @@
+# istesso-ime-probe serve macos/input-method/trial-textedit.txt --select
+# Run only with the agent's own TextEdit document in front (run-trial.sh opens it), with an input
+# source built with --trial-check. Checks by reading back through the input method (no
+# screenshot, no Accessibility); only "match: true/false" is printed, never a hash.
+wait 1
+caret
+check none
+# Raw input, caret at the end (9 bytes = 3 kana).
+mark 9 9 にほん
+check marked にほん
+# Converted, the first clause (日本, 6 bytes) selected.
+mark 0 6 日本語
+check marked 日本語
+commit 日本語
+# The same commit again (crossed on the wire): refused as stale, nothing lands twice.
+recommit 日本語
+# An emoji before the clause: 4 bytes = 2 UTF-16 units; the clause あ is bytes 4..7 = units 2..3.
+mark 4 7 😀あ
+check marked 😀あ
+commit 😀あ
+# A composition over the limit (a long live conversion): refused, the strip takes it.
+longmark 300
+longmark 100
+# A click elsewhere during a composition: the application ends it, the text lands once ("ended"),
+# no composition is left, and a commit that crossed "ended" is refused.
+mark 6 6 かな
+click -40 0
+check none
+recommit かな
+# The host goes away during a composition: nothing is left in the application.
+mark 3 3 て
+drop
+check none
+# Order of committed text and keys, fast, and of a key then a mark.
+post-access
+burst 30 noack
+burst 30 ack
+keymark 30 0
+keymark 30 36
+caret
+# The local keyboard comes first: 60 s; the owner presses a few keys in the TextEdit window when
+# told, then stops.
+connected 60 3

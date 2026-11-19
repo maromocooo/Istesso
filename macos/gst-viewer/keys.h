@@ -342,8 +342,40 @@ static inline size_t keys_hold_back(Keys *keys, KeyChange *out, size_t count, bo
 // key), one that is down over there and is not held comes up. Other keys are left as they are:
 // pressing a letter again would type it. Called when the picture is back and when the window is
 // the one typed into again, both only while it is the one typed into. `out` has room for 8 changes.
-static inline size_t keys_fall_in_line(Keys *keys, unsigned long flags, KeyChange *out) {
-    return keys_line_up(keys, flags, true, 0, out, 0);
+// With `match_sides` (the everyday trial's reconnection), a held modifier whose side the flags name
+// goes down on that side, so that its later release (flagsChanged names the side) lets go of the
+// key that is down over there.
+static inline size_t keys_fall_in_line(Keys *keys, unsigned long flags, bool match_sides, KeyChange *out) {
+    if (!match_sides) {
+        return keys_line_up(keys, flags, true, 0, out, 0);
+    }
+    bool as_control = keys->command_is_control;
+    const struct {
+        unsigned long left_flag, right_flag;
+    } sides[4] = {
+        {KEYS_DEVICE_LEFT_SHIFT, KEYS_DEVICE_RIGHT_SHIFT},
+        {KEYS_DEVICE_LEFT_CONTROL | (as_control ? KEYS_DEVICE_LEFT_COMMAND : 0),
+         KEYS_DEVICE_RIGHT_CONTROL | (as_control ? KEYS_DEVICE_RIGHT_COMMAND : 0)},
+        {KEYS_DEVICE_LEFT_OPTION, KEYS_DEVICE_RIGHT_OPTION},
+        {KEYS_DEVICE_LEFT_COMMAND, KEYS_DEVICE_RIGHT_COMMAND},
+    };
+    KeysModifier modifiers[4];
+    keys_modifiers(keys, flags, modifiers);
+    size_t count = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned left = modifiers[i].left, right = modifiers[i].right;
+        if (!modifiers[i].held) {
+            count = keys_set(keys, left, false, out, count);
+            count = keys_set(keys, right, false, out, count);
+        } else if (flags & (sides[i].left_flag | sides[i].right_flag)) {
+            // Restore the same side its later flagsChanged release will name.
+            count = keys_set(keys, left, (flags & sides[i].left_flag) != 0, out, count);
+            count = keys_set(keys, right, (flags & sides[i].right_flag) != 0, out, count);
+        } else if (!keys->down[left] && !keys->down[right]) {
+            count = keys_set(keys, left, true, out, count);
+        }
+    }
+    return count;
 }
 
 // The window is no longer the one that is typed into: no key stays down on the other side.

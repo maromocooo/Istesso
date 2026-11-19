@@ -47,6 +47,8 @@
 #   DAILY_NO_WINDOW=1    for checks: the viewer decodes but shows no window
 #   DAILY_FRAME_LOGS=1   frame logs on both sides
 #   DAILY_CLIPBOARD=1    copy and paste of text with the host (ADR 0022; the agent with --clipboard)
+#   DAILY_INLINE=1       composing text inside the host's application through the trial input source
+#                        Istesso Dev Input (ADR 0023; the host with --inline). Off: the viewer's strip
 #   DAILY_VIRTUAL_SIZE   the virtual display's size in points instead of this Mac's screen (WxH)
 #   DAILY_VIRTUAL=0      the application's window stays on the host's own screen (default: a virtual
 #                        display of this Mac's screen's size at 2x, 120 Hz, while the window is shown)
@@ -316,6 +318,11 @@ do_open() {
     if [ "${DAILY_CLIPBOARD:-}" = 1 ] && [ "$for_whom" != aura ] && [ -z "$display" ] && [[ "${DAILY_HOST_EXTRA:-}" != *--generated* ]]; then
         clipboard_agent="--clipboard"; clipboard_host="--clipboard"
     fi
+    # Composing text inline (ADR 0023, trial only): only with DAILY_INLINE=1, the application form only.
+    local inline_host=""
+    if [ "${DAILY_INLINE:-}" = 1 ] && [ "$for_whom" != aura ] && [ -z "$display" ] && [[ "${DAILY_HOST_EXTRA:-}" != *--generated* ]]; then
+        inline_host="--inline"
+    fi
     local target_args size_arg="--size $size"
     if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$what")"; fi
     [ "$start" = new-window ] && target_args="$target_args --new-window"
@@ -383,7 +390,7 @@ else
         printf '%s\n' "\$document" > "\$run/document"
     fi
     set -- "\$@" $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        $size_arg $virtual_arg $clipboard_host --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg $virtual_arg $clipboard_host $inline_host --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else

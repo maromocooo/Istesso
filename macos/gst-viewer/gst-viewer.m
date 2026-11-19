@@ -23,6 +23,27 @@
 // The Command keys are passed on as Control, where applications on Linux expect what Command
 // does on a Mac; with ISTESSO_COMMAND_KEY=super they are passed on as the Super keys.
 //
+// For the everyday trial only (branch trial-daily, docs/trial-daily.md; never in a build that is
+// measured):
+//   ISTESSO_DOCK_TILE=none     the program gets no tile in the Dock and no menu bar of its own
+//                              (an accessory application): the trial's launcher has the one tile
+//   ISTESSO_NO_WINDOW          for checks that must put nothing on the screen: the window is made
+//                              but never shown, the program never becomes the active one and has
+//                              no Dock tile; the picture is received, decoded and handed to the
+//                              window's layer as always, so that the frame log says what came
+//   ISTESSO_END_WITH_WINDOW    the program ends when its window is closed (otherwise it stays,
+//                              with nothing on the screen)
+//   ISTESSO_PID_FILE=PATH      write this program's process number to PATH once it runs: for a
+//                              program started through `open`, which does not say it
+//   ISTESSO_PRETEND_RESIZE=WxH for checks with ISTESSO_DAILY_RECONNECT: four seconds after the start,
+//                              as if the person had resized the window by hand to WxH points
+//   ISTESSO_TITLE_FILE=PATH    the signal USR1 sets the window's title to the first line of PATH
+//   ISTESSO_CLIPBOARD=1        the everyday trial's copy and paste of text (ADR 0022): Command-C,
+//                              Command-X and Command-V in the window copy from, cut from and paste
+//                              into the host's application, when the relay says the host takes them
+//                              (a window of the application wants attention, and back); when the
+//                              second line is "attention", the Dock tile asks for attention once
+//
 // Decoding with VideoToolbox. GStreamer's own VideoToolbox element holds frames back, so the
 // pipeline may instead end in an application sink called "vt" that hands over H.265 access
 // units:
@@ -147,10 +168,12 @@
 #import <QuartzCore/QuartzCore.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <IOSurface/IOSurface.h>
+#import <Carbon/Carbon.h>  // EnableSecureEventInput (the trial's password fields)
 #include <gio/gio.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #import <IOKit/hidsystem/IOLLEvent.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
@@ -160,6 +183,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <time.h>
 #include "istesso_media.h"
@@ -376,6 +400,9 @@ static GstCaps *vt_caps = NULL;
 static CALayer *vt_layer = nil;
 // Whether the access unit VideoToolbox is decoding is a key frame.
 static gboolean vt_decoding_key_frame = FALSE;
+static BOOL daily_reconnect = NO;
+// The synchronous decoder callback received a surface on the current daily connection.
+static BOOL daily_picture_drawn = NO;
 // Whether the stream says its picture is sRGB, as the content of any window is.
 static gboolean vt_srgb = FALSE;
 
@@ -455,6 +482,14 @@ static void on_picture(void *context, void *frame, OSStatus status, VTDecodeInfo
     }
 }
 
+static void on_daily_picture(void *context, void *frame, OSStatus status, VTDecodeInfoFlags flags,
+                             CVImageBufferRef picture, CMTime time, CMTime duration) {
+    on_picture(context, frame, status, flags, picture, time, duration);
+    if (!daily_picture_drawn && status == noErr && picture != NULL && vt_layer.contents != nil) {
+        daily_picture_drawn = YES;
+    }
+}
+
 // Sets VideoToolbox up for the stream the caps describe (H.265 with its parameter sets in "codec_data").
 // Size of the picture in its own pixels, once the stream has said it. Pointer positions are
 // given in these.
@@ -517,7 +552,7 @@ static gboolean vt_start_session(gboolean all_colour, const char *stream_colours
             @(all_colour ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{}
     };
-    VTDecompressionOutputCallbackRecord callback = {on_picture, NULL};
+    VTDecompressionOutputCallbackRecord callback = {daily_reconnect ? on_daily_picture : on_picture, NULL};
     OSStatus status = VTDecompressionSessionCreate(kCFAllocatorDefault, vt_format, (__bridge CFDictionaryRef)decoder,
                                           (__bridge CFDictionaryRef)pictures, &callback, &vt_session);
     if (status != noErr) {
@@ -647,6 +682,7 @@ static CATextLayer *note_layer = nil;
 static BOOL picture_stale = NO;
 // The connection was cut and the picture is not back yet.
 static BOOL cut_pending = NO;
+static BOOL waiting_for_first_picture = NO;
 static guint64 cut_noticed_ns = 0;
 static unsigned long cut_generation = 0, note_generation = 0;
 // Presses that were not passed on since the cut, and presses that were passed on in the second
@@ -659,6 +695,7 @@ static unsigned long press_count = 0;
 @interface NSView (IstessoHeldBack)
 - (void)holdBack;
 - (void)fallInLine;
+- (void)windowIsKeyOrNot;
 @end
 
 static void note_press(void) {
@@ -733,7 +770,7 @@ static void mark_the_picture(NSString *text) {
 
 // The connection was cut and is being made again.
 static void picture_was_cut(guint64 t) {
-    if (cut_pending) {
+    if (cut_pending || waiting_for_first_picture) {
         return;
     }
     cut_pending = YES;
@@ -741,7 +778,13 @@ static void picture_was_cut(guint64 t) {
     unsigned long generation = ++cut_generation;
     held_back_count = 0;
     in_doubt_count = presses_since(t > 1000000000ULL ? t - 1000000000ULL : 0);
-    NSString *line = @"Reconnecting. What you type now does not arrive.";
+    NSString *line = daily_reconnect ? @"つなぎ直しています…" : @"Reconnecting. What you type now does not arrive.";
+    if (daily_reconnect) {
+        // Stop input immediately, including during the short delay before the note appears.
+        picture_stale = YES;
+        [cursor_view holdBack];
+        [cursor_view cursorChanged];
+    }
     if (in_doubt_count > 0) {
         // Somebody is typing: said at once.
         mark_the_picture(line);
@@ -757,9 +800,11 @@ static void picture_was_cut(guint64 t) {
 
 // The first picture after a cut is on the screen.
 static void picture_is_back(void) {
-    if (!cut_pending) {
+    BOOL first = waiting_for_first_picture;
+    if (!cut_pending && !first) {
         return;
     }
+    waiting_for_first_picture = NO;
     cut_pending = NO;
     cut_generation++;
     BOOL was_marked = picture_stale;
@@ -778,14 +823,19 @@ static void picture_is_back(void) {
     }
     // What was typed is gone, and the person is told so for long enough to read it.
     NSString *line;
-    if (held_back_count > 0 && in_doubt_count > 0) {
-        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) during the cut did not arrive, and %lu just before it "
-                                          @"may not have.",
-                                          held_back_count, in_doubt_count];
+    if (first) {
+        line = [NSString stringWithFormat:@"最初の絵が映る前の入力 %lu 回は届いていません。", held_back_count];
+    } else if (held_back_count > 0 && in_doubt_count > 0) {
+        line = [NSString stringWithFormat:daily_reconnect
+                ? @"切れているあいだの入力 %lu 回は届いていません。切れる直前の %lu 回は届いたか分かりません。"
+                : @"The connection was cut. %lu input(s) during the cut did not arrive, and %lu just before it may not have.",
+                held_back_count, in_doubt_count];
     } else if (held_back_count > 0) {
-        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) during the cut did not arrive.", held_back_count];
+        line = [NSString stringWithFormat:daily_reconnect ? @"切れているあいだの入力 %lu 回は届いていません。"
+                : @"The connection was cut. %lu input(s) during the cut did not arrive.", held_back_count];
     } else {
-        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) just before it may not have arrived.", in_doubt_count];
+        line = [NSString stringWithFormat:daily_reconnect ? @"切れる直前の入力 %lu 回は届いたか分かりません。"
+                : @"The connection was cut. %lu input(s) just before it may not have arrived.", in_doubt_count];
     }
     show_note(line);
     unsigned long generation = note_generation;
@@ -799,17 +849,18 @@ static void picture_is_back(void) {
 // It is over, and the host said why or refused: nothing is tried again. The window stays, with
 // the last picture dimmed and the reason, until the person closes it.
 static void picture_is_over(int32_t why) {
+    waiting_for_first_picture = NO;
     cut_pending = NO;
     cut_generation++;
     NSString *line;
     switch (why) {
-        case ISTESSO_MEDIA_OVER_ENDED: line = @"The session has ended."; break;
-        case ISTESSO_MEDIA_OVER_NOT_SHOWN: line = @"The host shows this to another device now."; break;
-        case ISTESSO_MEDIA_OVER_SET_ASIDE: line = @"The host has put this session aside."; break;
-        case ISTESSO_MEDIA_OVER_NOT_PAIRED: line = @"This device is not paired with the host any more."; break;
-        case ISTESSO_MEDIA_OVER_FORBIDDEN: line = @"This device may not look at the host."; break;
-        case ISTESSO_MEDIA_OVER_UNSUPPORTED: line = @"The host sends its picture in a form this program cannot show."; break;
-        default: line = @"The host does not show its picture to this device."; break;
+        case ISTESSO_MEDIA_OVER_ENDED: line = daily_reconnect ? @"配信が終わりました。" : @"The session has ended."; break;
+        case ISTESSO_MEDIA_OVER_NOT_SHOWN: line = daily_reconnect ? @"ほかの端末に映しています。" : @"The host shows this to another device now."; break;
+        case ISTESSO_MEDIA_OVER_SET_ASIDE: line = daily_reconnect ? @"このセッションはいったん切り離されました。" : @"The host has put this session aside."; break;
+        case ISTESSO_MEDIA_OVER_NOT_PAIRED: line = daily_reconnect ? @"ホストとのペアリングがありません。" : @"This device is not paired with the host any more."; break;
+        case ISTESSO_MEDIA_OVER_FORBIDDEN: line = daily_reconnect ? @"この端末には閲覧の許可がありません。" : @"This device may not look at the host."; break;
+        case ISTESSO_MEDIA_OVER_UNSUPPORTED: line = daily_reconnect ? @"この映像の形式には対応していません。" : @"The host sends its picture in a form this program cannot show."; break;
+        default: line = daily_reconnect ? @"ホストはこの端末に映像を送っていません。" : @"The host does not show its picture to this device."; break;
     }
     mark_the_picture(line);
     log_held_back(YES);
@@ -825,8 +876,11 @@ static void picture_is_over(int32_t why) {
 static atomic_ulong picture_cuts;
 // The input's count as the relay says it; -1 when no relay that counts is running.
 static long input_cuts = -1;
+static BOOL input_reconnecting = NO;
 static NSWindow *counted_window = nil;
 static NSString *counted_title = nil;
+// A short line about copy and paste, shown in the title for two seconds (ADR 0022).
+static NSString *clipboard_shown = nil;
 
 static void log_reconnections(const char *at) {
     if (frame_log != NULL) {
@@ -840,9 +894,76 @@ static void show_counts(void) {
     if (counted_window == nil) {
         return;
     }
-    NSString *input = input_cuts < 0 ? @"input not counted" : [NSString stringWithFormat:@"input %ld", input_cuts];
-    counted_window.title =
-        [NSString stringWithFormat:@"%@ \u2014 reconnections: picture %lu, %@", counted_title, atomic_load(&picture_cuts), input];
+    if (daily_reconnect) {
+        NSString *input = input_cuts < 0 ? @"入力は未集計" : [NSString stringWithFormat:@"入力 %ld 回", input_cuts];
+        if (input_reconnecting) {
+            input = [input stringByAppendingString:input_cuts == 0 ? @"（入力をつないでいます…）" : @"（入力をつなぎ直しています…）"];
+        }
+        counted_window.title = [NSString stringWithFormat:@"%@ — 再接続：映像 %lu 回、%@%@",
+                                counted_title, atomic_load(&picture_cuts), input,
+                                clipboard_shown ? [@" — " stringByAppendingString:clipboard_shown] : @""];
+    } else {
+        NSString *input = input_cuts < 0 ? @"input not counted" : [NSString stringWithFormat:@"input %ld", input_cuts];
+        counted_window.title = [NSString stringWithFormat:@"%@ \u2014 reconnections: picture %lu, %@",
+                                counted_title, atomic_load(&picture_cuts), input];
+    }
+}
+
+// Whether the host said it takes committed text (ADR 0007, "確定した文字"): only then is any sent.
+static BOOL host_takes_text = NO;
+// Whether the host said it takes copy and paste (ADR 0022): only then are Command-C, X and V taken.
+static BOOL host_takes_clipboard = NO;
+static BOOL host_takes_preedit = NO;
+static BOOL force_preedit_strip = NO;
+// ISTESSO_OUTSIDE_FIELD=ime: outside a field, keys go through the input method as before.
+static BOOL outside_field_keys_through_ime = NO;
+
+// Trial only (ADR 0007, password fields): Secure Event Input is on while a password field of the
+// host has the keyboard and this window takes keys, so that other applications on this Mac
+// cannot see the keystrokes. Always let go: when that ends, and when the program ends (atexit;
+// the window's end and the stop signals end the program through exit()).
+// Atomic: the handler at exit may run on another thread than the main one.
+static atomic_bool secure_input_on = false;
+
+static void secure_input(BOOL on) {
+    bool was = !on;
+    if (atomic_compare_exchange_strong(&secure_input_on, &was, on ? true : false)) {
+        if (on) {
+            EnableSecureEventInput();
+        } else {
+            DisableSecureEventInput();
+        }
+    }
+}
+
+static void secure_input_off_at_exit(void) {
+    secure_input(NO);
+}
+
+@interface NSView (IstessoTextInput)
+- (void)setTextInputField:(IstessoMediaTextInput)field;
+- (void)textInputContextChanged;
+@end
+
+// Field descriptions belong to one picture connection. Only the text input view consumes them.
+static void update_text_input_field(IstessoMediaTextInput field) {
+    if ([cursor_view respondsToSelector:@selector(setTextInputField:)]) {
+        [cursor_view setTextInputField:field];
+    }
+}
+
+// The number after "NAME": in the relay's state line, or `otherwise` when the line does not say it.
+static long relay_state_field(const char *line, const char *name, long otherwise) {
+    char key[32];
+    snprintf(key, sizeof key, "\"%s\":", name);
+    const char *at = strstr(line, key);
+    if (at == NULL) {
+        return otherwise;
+    }
+    const char *digits = at + strlen(key);
+    char *end = NULL;
+    long value = strtol(digits, &end, 10);
+    return end == digits ? otherwise : value;
 }
 
 // Looks once a second at what the relay says about its own connection, off the main thread:
@@ -854,19 +975,47 @@ static void watch_relay_state(const char *socket_path) {
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
     dispatch_source_set_event_handler(timer, ^{
-        long now = -1;
+        long now = -1, text = 0, clipboard = 0, preedit = 0;
+        BOOL reconnecting = NO;
         FILE *file = fopen(path.fileSystemRepresentation, "r");
+        char content[256] = {0};
         if (file != NULL) {
-            long pid = 0, count = -1;
-            // Only a relay that still runs counts: a file left by an earlier one says nothing.
-            if (fscanf(file, "{\"pid\":%ld,\"input\":%ld}", &pid, &count) == 2 && pid > 0 && count >= 0
-                && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
-                now = count;
-            }
+            size_t got = fread(content, 1, sizeof content - 1, file);
+            content[got] = 0;
             fclose(file);
         }
+        if (strncmp(content, "{\"pid\":", 7) == 0) {
+            // Only a relay that still runs counts: a file left by an earlier one says nothing.
+            // "text" (whether the host takes committed text) is left out by an older relay, so are
+            // "clipboard" (copy and paste) and "preedit" (composing text), and "reconnecting" is
+            // said by a relay of the everyday trial's reconnecting kind only.
+            long pid = relay_state_field(content, "pid", 0);
+            long count = relay_state_field(content, "input", -1);
+            // A process number is a positive int: anything else (a negative one, or one past
+            // INT_MAX that the cast would turn into a group or every process) is not looked at.
+            if (pid > 0 && pid <= INT_MAX && count >= 0 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
+                now = count;
+                text = relay_state_field(content, "text", 0) == 1;
+                clipboard = relay_state_field(content, "clipboard", 0) == 1;
+                preedit = relay_state_field(content, "preedit", 0) == 1;
+                reconnecting = daily_reconnect && relay_state_field(content, "reconnecting", 0) == 1;
+            }
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (now != input_cuts) {
+            host_takes_clipboard = clipboard != 0;
+            if (host_takes_text != (text != 0) || host_takes_preedit != (preedit != 0)) {
+                host_takes_text = text != 0;
+                host_takes_preedit = preedit != 0;
+                if ([cursor_view respondsToSelector:@selector(textInputContextChanged)]) {
+                    [cursor_view textInputContextChanged];
+                }
+            }
+            if (now != input_cuts || reconnecting != input_reconnecting) {
+                if (daily_reconnect && now >= 0 && !reconnecting && !picture_stale &&
+                    [cursor_view respondsToSelector:@selector(fallInLine)]) {
+                    [cursor_view fallInLine];
+                }
+                input_reconnecting = reconnecting;
                 input_cuts = now;
                 show_counts();
             }
@@ -936,6 +1085,56 @@ static size_t split_access_unit(const uint8_t *data, size_t size, NalUnit *units
     return count;
 }
 
+// The everyday trial (ISTESSO_DAILY_RECONNECT): when the host starts its stream again at another
+// size (the Mac host does when the application's window is resized), the window follows: the same
+// points for each of the host's pixels as before (square pixels, as the host sends its window 1:1),
+// its top left where it was, and all of it on its screen (made smaller as a whole if needed).
+static NSWindow *picture_window = nil;
+static BOOL picture_whole_display = NO;
+// Points of the window to one pixel of the host's picture, as the window was first made (0: not
+// known yet). Kept when the window follows another size, so that the pixels stay as they were.
+static double points_per_pixel = 0;
+// A resize was asked of the host, and its answer (the next stream's size) is awaited.
+static BOOL resize_asked = NO;
+
+#include "window-size.h"
+
+static void window_follows_picture(int width, int height) {
+    if (picture_window == nil || picture_whole_display || width <= 0 || height <= 0) {
+        return;
+    }
+    NSRect frame = picture_window.frame;
+    NSRect content = [picture_window contentRectForFrameRect:frame];
+    CGFloat bar = frame.size.height - content.size.height;
+    NSRect room = (picture_window.screen ?: NSScreen.mainScreen).visibleFrame;
+    double w, h;
+    window_size_for_picture((unsigned)width, (unsigned)height, points_per_pixel, room.size.width, room.size.height - bar, &w, &h);
+    NSPoint top_left = NSMakePoint(NSMinX(frame), NSMaxY(frame));
+    [picture_window setContentSize:NSMakeSize(w, h)];
+    NSRect now = picture_window.frame;
+    top_left.x = MAX(NSMinX(room), MIN(top_left.x, NSMaxX(room) - now.size.width));
+    top_left.y = MIN(NSMaxY(room), MAX(top_left.y, NSMinY(room) + now.size.height));
+    [picture_window setFrameTopLeftPoint:top_left];
+    fprintf(stderr, "window: %.0fx%.0f points for a picture of %dx%d (top left %.0f,%.0f)\n", w, h, width, height, top_left.x, top_left.y);
+}
+
+// The person has stopped resizing the window by hand (the end of a live resize): once, the host is
+// asked for a picture of the size the window's picture area now has. While the window is being
+// resized nothing is sent (the picture is only made larger or smaller). The answer is the next
+// stream's size, to which the window then goes; that is never asked about again.
+static void send_input(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void ask_for_window_size(void) {
+    if (picture_window == nil || picture_whole_display) {
+        return;
+    }
+    NSRect content = [picture_window contentRectForFrameRect:picture_window.frame];
+    unsigned width, height;
+    picture_size_for_window(content.size.width, content.size.height, points_per_pixel, &width, &height);
+    resize_asked = YES;
+    send_input("{\"kind\":\"resize\",\"width\":%u,\"height\":%u}", width, height);
+    fprintf(stderr, "note: asked the host for a picture of %ux%u (the window was resized by hand)\n", width, height);
+}
+
 // Sets VideoToolbox up for a stream with these parameter sets, unless it is set up for them already.
 static gboolean channel_configure(const NalUnit *sets[3]) {
     gboolean same = vt_session != NULL;
@@ -970,8 +1169,29 @@ static gboolean channel_configure(const NalUnit *sets[3]) {
         return FALSE;
     }
     CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(vt_format);
+    int was_width = picture_width, was_height = picture_height;
     picture_width = size.width;
     picture_height = size.height;
+    // A new decoder for the new parameter sets is made below; the window follows a new size, and
+    // goes to the answer of a resize that was asked for even when the size stayed the same.
+    if (daily_reconnect) {
+        int width = size.width, height = size.height;
+        BOOL changed = was_width > 0 && (was_width != size.width || was_height != size.height);
+        if (changed) {
+            fprintf(stderr, "note: the host's picture is %dx%d now (it was %dx%d)\n", width, height, was_width, was_height);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (points_per_pixel <= 0 && picture_window != nil && !picture_whole_display) {
+                // As the window was made for the first picture.
+                NSRect content = [picture_window contentRectForFrameRect:picture_window.frame];
+                points_per_pixel = content.size.width / width;
+            }
+            if (changed || resize_asked) {
+                resize_asked = NO;
+                window_follows_picture(width, height);
+            }
+        });
+    }
     vt_srgb = channel_info.colour == 1;
     return vt_start_session(channel_info.chroma == 444, vt_srgb ? "srgb" : "-");
 }
@@ -1010,6 +1230,12 @@ static void on_channel_frame(IstessoMediaWatch *watch, const IstessoMediaFrame *
         }
     }
     if (frame->key_frame && sets[0] != NULL && sets[1] != NULL && sets[2] != NULL && !channel_configure(sets)) {
+        if (daily_reconnect && !daily_picture_drawn) {
+            // The decoder may still be unavailable after wake. Try the next key frame.
+            vt_needs_key_frame = TRUE;
+            channel_ask_for_key_frame(watch, now_ns());
+            return;
+        }
         exit(1);
     }
     if (frame->discontinuity && !frame->key_frame) {
@@ -1129,18 +1355,25 @@ static void *channel_thread(void *unused) {
         fprintf(stderr, "error: %s\n", istesso_media_last_error());
         exit(2);
     }
+    if (daily_reconnect) {
+        istesso_media_watch_follow_restarts(watch);
+    }
     guint64 began = now_ns(), cut_at = 0;
-    gboolean ever = FALSE, said_unreachable = FALSE, back_pending = FALSE;
+    gboolean ever = FALSE, said_unreachable = FALSE, back_pending = daily_reconnect;
     for (;;) {
         IstessoMediaFrame frame;
         int32_t got = istesso_media_watch_next(watch, 250, &frame);
         if (got == 1) {
             on_channel_frame(watch, &frame);
+            if (back_pending && daily_reconnect && !daily_picture_drawn) {
+                vt_needs_key_frame = TRUE;
+                channel_ask_for_key_frame(watch, now_ns());
+            }
             if (back_pending && !vt_needs_key_frame) {
                 // The first picture after the cut has been decoded and handed to the layer.
                 back_pending = FALSE;
                 guint64 t = now_ns();
-                if (frame_log != NULL) {
+                if (frame_log != NULL && cut_at != 0) {
                     fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"back\",\"gap_ms\":%.1f}\n",
                             (unsigned long long)t, (double)(t - cut_at) / 1e6);
                 }
@@ -1153,6 +1386,13 @@ static void *channel_thread(void *unused) {
             if (istesso_media_watch_cursor(watch, &cursor) == 1) {
                 on_channel_cursor(&cursor);
             }
+        } else if (got == 5) {
+            IstessoMediaTextInput field;
+            if (istesso_media_watch_text_input(watch, &field) == 1) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    update_text_input_field(field);
+                });
+            }
         } else if (got == 3) {
             // Cut, and nobody said why: the library is connecting again.
             cut_at = now_ns();
@@ -1164,6 +1404,7 @@ static void *channel_thread(void *unused) {
             guint64 t = cut_at;
             dispatch_async(dispatch_get_main_queue(), ^{
                 show_counts();
+                update_text_input_field((IstessoMediaTextInput){0});
                 picture_was_cut(t);
             });
         } else if (got == 4) {
@@ -1182,6 +1423,17 @@ static void *channel_thread(void *unused) {
             // A new connection begins with a key frame, and the decoder begins anew with it.
             vt_needs_key_frame = TRUE;
             channel_asked_ns = 0;
+            if (daily_reconnect) {
+                daily_picture_drawn = NO;
+                if (state.again) {
+                    if (vt_session != NULL) {
+                        VTDecompressionSessionInvalidate(vt_session);
+                        CFRelease(vt_session);
+                        vt_session = NULL;
+                    }
+                    channel_ask_for_key_frame(watch, now_ns());
+                }
+            }
         } else if (got < 0) {
             // Over: the host said why, or refused. Not tried again.
             IstessoMediaWatchState state;
@@ -1196,6 +1448,7 @@ static void *channel_thread(void *unused) {
             }
             int32_t why = state.why;
             dispatch_async(dispatch_get_main_queue(), ^{
+                update_text_input_field((IstessoMediaTextInput){0});
                 picture_is_over(why);
             });
             return NULL;
@@ -1258,6 +1511,10 @@ static gboolean use_channel(NSView *view) {
             }
         });
         dispatch_resume(typing);
+    }
+    if (daily_reconnect) {
+        waiting_for_first_picture = YES;
+        mark_the_picture(@"つないでいます…");
     }
     pthread_t thread;
     return pthread_create(&thread, NULL, channel_thread, NULL) == 0;
@@ -1368,7 +1625,7 @@ static void send_input(const char *format, ...) {
     if (input_socket < 0) {
         return;
     }
-    char text[128];
+    char text[256]; // a scroll of the trackpad is the longest (scroll.h)
     va_list arguments;
     va_start(arguments, format);
     int length = vsnprintf(text, sizeof text, format, arguments);
@@ -1382,9 +1639,188 @@ static void send_input(const char *format, ...) {
 // Which keys go to the other side for what happens on the keyboard: keys.h, tested by keys-test.c.
 #include "keys.h"
 
+// ---- Copy and paste of text with the host's application (ADR 0022, the everyday trial) ----
+//
+// Only on Command-C, Command-X and Command-V in this window, and only when the relay says the host
+// takes them. The window sends its requests from a socket of its own, in a folder only its user
+// can open, with a nonce of 128 random bits; the relay answers to that socket only, with that
+// nonce, and only the answer to the latest request, within two seconds, is used. What was copied
+// or pasted is never written anywhere by this program.
+
+#include "clipboard.h"
+
+static BOOL clipboard_on = NO;
+static uint32_t clipboard_next_id = 1;
+static uint32_t clipboard_waiting = 0;
+static char clipboard_nonce[33];
+static BOOL clipboard_cut = NO;
+static BOOL clipboard_pasting = NO;
+static char clipboard_folder[PATH_MAX];
+static char clipboard_socket_path[sizeof ((struct sockaddr_un *)0)->sun_path];
+
+// Shows `note` in the title for two seconds; nil shows nothing.
+static void clipboard_show(NSString *note) {
+    if (note == nil) {
+        return;
+    }
+    clipboard_shown = note;
+    show_counts();
+    if (counted_window == nil) {
+        // A window without the counted title (not the everyday trial's): only that something
+        // was not done, never what.
+        fprintf(stderr, "note: a copy or paste was not done\n");
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (clipboard_shown == note) {
+            clipboard_shown = nil;
+            show_counts();
+        }
+    });
+}
+
+// One datagram of a request. The relay reads at once; a full socket is tried again for 50 ms.
+static BOOL clipboard_send(NSData *datagram) {
+    for (int attempt = 0; attempt < 50; attempt++) {
+        if (sendto(input_socket, datagram.bytes, datagram.length, 0, (const struct sockaddr *)&input_to, sizeof input_to)
+            == (ssize_t)datagram.length) {
+            return YES;
+        }
+        if (errno != ENOBUFS && errno != EAGAIN) {
+            return NO;
+        }
+        usleep(1000);
+    }
+    return NO;
+}
+
+// Asks for a copy ('c'), a cut ('x') or a paste ('v'). On the main thread.
+static void clipboard_ask(char which) {
+    uint8_t random[16];
+    arc4random_buf(random, sizeof random);
+    for (int i = 0; i < 16; i++) {
+        snprintf(clipboard_nonce + 2 * i, 3, "%02x", random[i]);
+    }
+    uint32_t id = clipboard_next_id++;
+    NSMutableDictionary *request = [@{@"id": @(id), @"nonce": @(clipboard_nonce)} mutableCopy];
+    if (which == 'v') {
+        NSString *text = nil;
+        PasteKind kind = clipboard_read_paste(NSPasteboard.generalPasteboard, &text);
+        switch (kind) {
+        case PASTE_SECRET: clipboard_show(clipboard_note("paste:secret", NULL, NO)); return;
+        case PASTE_TOO_LARGE: clipboard_show(clipboard_note("paste:too_large", NULL, NO)); return;
+        case PASTE_NOT_TEXT: clipboard_show(clipboard_note("paste:not_text", NULL, NO)); return;
+        case PASTE_WITH_TEXT: request[@"text"] = text; break;
+        case PASTE_KEY_ONLY: break;
+        }
+        request[@"kind"] = @"paste";
+    } else {
+        request[@"kind"] = @"copy";
+        if (which == 'x') {
+            request[@"cut"] = @YES;
+        }
+    }
+    NSData *datagram = [NSJSONSerialization dataWithJSONObject:request options:0 error:NULL];
+    if (datagram == nil || !clipboard_send(datagram)) {
+        clipboard_show(clipboard_note("timeout", NULL, NO));
+        return;
+    }
+    clipboard_waiting = id;
+    clipboard_cut = which == 'x';
+    clipboard_pasting = which == 'v';
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(CLIPBOARD_WITHIN * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (clipboard_waiting == id) {
+            clipboard_waiting = 0;
+            clipboard_show(clipboard_note("timeout", NULL, NO));
+        }
+    });
+}
+
+// An answer from the relay. On the main thread.
+static void clipboard_answered(NSDictionary *answer) {
+    if (![answer isKindOfClass:NSDictionary.class] || ![answer[@"kind"] isEqual:@"clipboard"]) {
+        return;
+    }
+    NSNumber *id = answer[@"id"];
+    NSString *nonce = answer[@"nonce"], *result = answer[@"result"], *why = answer[@"why"], *text = answer[@"text"];
+    if (clipboard_waiting == 0 || ![id isKindOfClass:NSNumber.class] || id.unsignedIntValue != clipboard_waiting ||
+        ![nonce isKindOfClass:NSString.class] || strcmp(nonce.UTF8String, clipboard_nonce) != 0 ||
+        ![result isKindOfClass:NSString.class]) {
+        return;
+    }
+    clipboard_waiting = 0;
+    if (![why isKindOfClass:NSString.class]) {
+        why = nil;
+    }
+    if (clipboard_pasting) {
+        clipboard_show(clipboard_note([result isEqual:@"pasted"] ? "pasted" : "paste:none", NULL, NO));
+        return;
+    }
+    if ([result isEqual:@"text"]) {
+        if (![text isKindOfClass:NSString.class] || clipboard_text_problem(text) != NULL) {
+            clipboard_show(clipboard_note("not_text", NULL, clipboard_cut));
+            return;
+        }
+        NSPasteboard *board = NSPasteboard.generalPasteboard;
+        // This Mac only: not handed to other devices by Universal Clipboard (ADR 0022, decision 2).
+        [board prepareForNewContentsWithOptions:NSPasteboardContentsCurrentHostOnly];
+        [board setString:text forType:NSPasteboardTypeString];
+        return;
+    }
+    clipboard_show(clipboard_note(result.UTF8String, why.UTF8String, clipboard_cut));
+}
+
+// The window's own socket, in a folder of its own, for requests and their answers.
+static BOOL clipboard_start(void) {
+    snprintf(clipboard_folder, sizeof clipboard_folder, "%sistesso-viewer-XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);
+    if (mkdtemp(clipboard_folder) == NULL) {
+        return NO;
+    }
+    struct sockaddr_un own = {.sun_family = AF_UNIX};
+    if ((size_t)snprintf(own.sun_path, sizeof own.sun_path, "%s/w.sock", clipboard_folder) >= sizeof own.sun_path) {
+        rmdir(clipboard_folder);
+        return NO;
+    }
+    if (bind(input_socket, (const struct sockaddr *)&own, sizeof own) != 0) {
+        rmdir(clipboard_folder);
+        return NO;
+    }
+    strcpy(clipboard_socket_path, own.sun_path);
+    chmod(clipboard_socket_path, 0600);
+    atexit_b(^{
+        unlink(clipboard_socket_path);
+        rmdir(clipboard_folder);
+    });
+    int size = 256 * 1024;
+    setsockopt(input_socket, SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
+    setsockopt(input_socket, SOL_SOCKET, SO_RCVBUF, &size, sizeof size);
+    static dispatch_source_t reading;
+    reading = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)input_socket, 0,
+                                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    dispatch_source_set_event_handler(reading, ^{
+        static uint8_t buffer[192 * 1024];
+        for (;;) {
+            ssize_t length = recv(input_socket, buffer, sizeof buffer, 0);
+            if (length <= 0) {
+                break;
+            }
+            NSData *data = [NSData dataWithBytes:buffer length:(NSUInteger)length];
+            NSDictionary *answer = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+            if (answer != nil) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    clipboard_answered(answer);
+                });
+            }
+        }
+    });
+    dispatch_resume(reading);
+    return YES;
+}
+
 // Whether the Command keys go to the other side as Control (the default) or as the Super
 // ("Windows") keys. ISTESSO_COMMAND_KEY=super in the environment sends Super.
 static BOOL command_is_control = YES;
+
+#include "scroll.h"
 
 // The view the picture is shown in, when input is passed on: it takes the keyboard and the
 // pointer and writes what happens to the socket.
@@ -1394,9 +1830,10 @@ static BOOL command_is_control = YES;
 @implementation InputView {
     Keys _keys;          // keys that are down on the other side
     unsigned _buttons;   // buttons that are down on the other side (bit 0: left, 1: right, 2: other)
-    double _scroll[2];   // parts of a pixel not yet passed on
+    ScrollState _scroll; // parts of a pixel and of a notch not yet passed on
     BOOL _inside;        // the pointer is over the view
     NSPoint _at;         // where, in the view's own coordinates (from its bottom left)
+    NSMutableIndexSet *_taken;  // keys taken for copy and paste: their release is not passed on
 }
 
 // A cursor that shows nothing: over the view the cursor is the one drawn into the layer.
@@ -1523,6 +1960,7 @@ static NSCursor *empty_cursor(void) {
 - (void)letGo {
     KeyChange changes[256];
     [self send:changes count:keys_let_go(&_keys, changes)];
+    [_taken removeAllIndexes];
 }
 
 // This window is the one typed into: the key window of the active application. Only then do the
@@ -1590,10 +2028,36 @@ static NSCursor *empty_cursor(void) {
     }
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
-    [self send:changes count:keys_fall_in_line(&_keys, NSEvent.modifierFlags, changes)];
+    [self send:changes count:keys_fall_in_line(&_keys, NSEvent.modifierFlags, daily_reconnect, changes)];
+}
+
+// The state of the host's text input field that has the keyboard, as the host last said (0: none
+// said). Only the text input view hears it.
+- (unsigned int)fieldState {
+    return 0;
 }
 
 - (void)keyDown:(NSEvent *)event {
+    // Copy, cut and paste with the host (ADR 0022): the key itself does not go; the host presses
+    // its own. Once for each press: a repeat, and the release, do not go either.
+    if (clipboard_on && host_takes_clipboard) {
+        char which = clipboard_key(event.keyCode, event.charactersIgnoringModifiers, event.modifierFlags);
+        if (which != 0) {
+            if (_taken == nil) {
+                _taken = [NSMutableIndexSet indexSet];
+            }
+            [_taken addIndex:event.keyCode];
+            if (!event.isARepeat && !picture_stale) {
+                if (clipboard_refused_here(which, [self fieldState])) {
+                    // A password field over there: not asked at all, with the host's own notice.
+                    clipboard_show(clipboard_note("refused", "password_field", which == 'x'));
+                } else {
+                    clipboard_ask(which);
+                }
+            }
+            return;
+        }
+    }
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
     size_t count = keys_key_down(&_keys, event.keyCode, event.modifierFlags, event.isARepeat, changes);
@@ -1609,18 +2073,62 @@ static NSCursor *empty_cursor(void) {
 }
 
 - (void)keyUp:(NSEvent *)event {
+    if ([_taken containsIndex:event.keyCode]) {
+        [_taken removeIndex:event.keyCode];
+        return;
+    }
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
     [self send:changes count:keys_key_up(&_keys, event.keyCode, event.modifierFlags, changes)];
 }
 
-// Keys with Command come here first; they all go to the other side.
+// Keys with Command come here first; they all go to the other side, but for Command-V while the
+// host takes copy and paste.
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
-    if (self.window.firstResponder != self) {
+    // Only for the window that is typed into: a key equivalent can reach a window that is not
+    // (review of ADR 0022's code), and Command-C there must not copy from the host.
+    if (self.window.firstResponder != self || !self.window.isKeyWindow) {
+        return NO;
+    }
+    if (clipboard_on && host_takes_clipboard &&
+        clipboard_key(event.keyCode, event.charactersIgnoringModifiers, event.modifierFlags) == 'v') {
+        // Not taken here: it goes on to the Edit menu's Paste (paste:, below), so that this
+        // Mac's pasteboard is read in answer to a paste-related control, as macOS's pasteboard
+        // privacy asks ("input on a UI element that the system considers paste-related"). Without
+        // the menu the key comes to keyDown:, which asks as before.
         return NO;
     }
     [self keyDown:event];
     return YES;
+}
+
+// The Edit menu's Paste, by Command-V (or a click on it): the paste goes to the host with what
+// this Mac's pasteboard has. The key itself does not go, nor its repeats and its release.
+- (void)paste:(id)sender {
+    (void)sender;
+    if (!(clipboard_on && host_takes_clipboard) || self.window.firstResponder != self) {
+        return;
+    }
+    NSEvent *event = NSApp.currentEvent;
+    if (event.type == NSEventTypeKeyDown) {
+        if (_taken == nil) {
+            _taken = [NSMutableIndexSet indexSet];
+        }
+        [_taken addIndex:event.keyCode];
+        if (event.isARepeat) {
+            return;
+        }
+    }
+    if (!picture_stale) {
+        clipboard_ask('v');
+    }
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.action == @selector(paste:)) {
+        return clipboard_on && host_takes_clipboard && self.window.firstResponder == self && self.window.isKeyWindow;
+    }
+    return NO;
 }
 
 - (void)flagsChanged:(NSEvent *)event {
@@ -1694,30 +2202,493 @@ static NSCursor *empty_cursor(void) {
 - (void)otherMouseDown:(NSEvent *)event { [self button:0x112 pressed:YES event:event]; }
 - (void)otherMouseUp:(NSEvent *)event { [self button:0x112 pressed:NO event:event]; }
 
+static void send_scroll(void *context, const char *message) {
+    (void)context;
+    send_input("%s", message);
+}
+
+// The modifiers around one scroll event: brought in line before its first datagram (and lent
+// when the window is not the one typed into; keys_around_pointer() in keys.h), and the rest of
+// the changes after its last. Nothing for an event that sends nothing.
+typedef struct {
+    __unsafe_unretained InputView *view;
+    __unsafe_unretained NSEvent *event;
+    KeyChange around[KEYS_MOST];
+    size_t after, end;
+} ScrollModifiers;
+
+static void scroll_modifiers_first(void *context) {
+    ScrollModifiers *m = context;
+    m->after = [m->view modifiersBefore:m->event changes:m->around end:&m->end];
+}
+
 - (void)scrollWheel:(NSEvent *)event {
-    // macOS says how far the content moves; the other side wants how far to scroll. A wheel
-    // counts in lines, a trackpad in points.
-    double scale = event.hasPreciseScrollingDeltas ? 1.0 : 15.0;
-    _scroll[0] -= event.scrollingDeltaX * scale;
-    _scroll[1] -= event.scrollingDeltaY * scale;
-    int dx = (int)_scroll[0], dy = (int)_scroll[1];
     if (picture_stale) {
-        // Scrolling a picture that is not there moves something nobody sees.
-        _scroll[0] = _scroll[1] = 0;
+        // Scrolling a picture that is not there moves something nobody sees. An end held back
+        // is dropped too: the compositor stops a scroll whose end never comes by itself.
+        _scroll = (ScrollState){0};
         return;
     }
-    if (dx != 0 || dy != 0) {
-        _scroll[0] -= dx;
-        _scroll[1] -= dy;
-        KeyChange around[KEYS_MOST];
-        size_t end = 0, after = [self modifiersBefore:event changes:around end:&end];
-        send_input("{\"kind\":\"scroll\",\"dx\":%d,\"dy\":%d}", dx, dy);
-        if (end > after) {
-            [self send:around + after count:end - after];
-        }
+    // A wheel goes as notches (its whole lines), a trackpad as pixels of the picture with the
+    // stage of the gesture and of the inertia after it (scroll.h; ADR 0007, "スクロールの種類と
+    // 段階"), so that the content moves under the fingers as far as it would in a window here.
+    NSSize size = self.bounds.size;
+    CGEventRef cg = event.CGEvent;
+    ScrollIn in = {
+        .precise = event.hasPreciseScrollingDeltas,
+        .dx = event.scrollingDeltaX,
+        .dy = event.scrollingDeltaY,
+        .has_lines = cg != NULL,
+        .lines_x = cg ? (long)CGEventGetIntegerValueField(cg, kCGScrollWheelEventDeltaAxis2) : 0,
+        .lines_y = cg ? (long)CGEventGetIntegerValueField(cg, kCGScrollWheelEventDeltaAxis1) : 0,
+        .phase = (unsigned)event.phase,
+        .momentum = (unsigned)event.momentumPhase,
+        .scale_x = size.width > 0 && picture_width > 0 ? picture_width / size.width : 1.0,
+        .scale_y = size.height > 0 && picture_height > 0 ? picture_height / size.height : 1.0,
+    };
+    // The modifiers over there are brought in line with this event's around what it sends, and
+    // only when it sends something (a Command-scroll carries Command).
+    ScrollModifiers modifiers = {.view = self, .event = event};
+    ScrollAround around = {send_scroll, &modifiers, scroll_modifiers_first, false};
+    if (scroll_event_around(&_scroll, &in, event.timestamp * 1000.0, &around) && modifiers.end > modifiers.after) {
+        [self send:modifiers.around + modifiers.after count:modifiers.end - modifiers.after];
+    }
+    if (_scroll.held) {
+        // The end of the gesture waits here for macOS's inertia; it goes without it once the
+        // wait is over (a later event that comes first sends it instead).
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((SCROLL_MOMENTUM_WAIT_MS + 1) * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+                           if (!picture_stale) {
+                               scroll_due(&self->_scroll, NSProcessInfo.processInfo.systemUptime * 1000.0, send_scroll, NULL);
+                           }
+                       });
     }
 }
 
+@end
+
+// ADR 0007 ("確定した文字"), ADR 0020 route d: local composition in the trial viewer
+// is switched on by ISTESSO_TEXT_INPUT=1.
+#include "text-input.h"
+
+@interface TextInputView : InputView <NSTextInputClient>
+@end
+
+// Commits that could not be passed on whole (the rest of each was not sent).
+static unsigned long text_lost_count;
+
+// One datagram of a commit. The socket is non-blocking and holds only a few kilobytes on macOS: a
+// full one is tried again for up to 50 ms (the relay reads it at once), then given up.
+static BOOL send_text_datagram(const char *packet, size_t length) {
+    for (int attempt = 0; attempt < 50; attempt++) {
+        if (sendto(input_socket, packet, length, 0, (const struct sockaddr *)&input_to, sizeof input_to) == (ssize_t)length) {
+            return YES;
+        }
+        if (errno != ENOBUFS && errno != EAGAIN) {
+            return NO;
+        }
+        usleep(1000);
+    }
+    return NO;
+}
+
+@implementation TextInputView {
+    NSString *_marked;
+    NSRange _selection;
+    CATextLayer *_markedStrip;
+    NSEvent *_interpretedEvent;
+    BOOL _startedWithMark, _passKey, _discardingMark;
+    IstessoMediaTextInput _field;
+    BOOL _preeditSent, _stripComposition;
+    // Clicks and keys that may move the focus over there (not plain typing), sent since the
+    // host last said what the field is.
+    unsigned long _movesSinceNotice;
+}
+
+// Cancel the local composition and clear any preedit still visible on the host.
+- (void)discardComposition {
+    _interpretedEvent = nil;
+    _discardingMark = YES;
+    [self.inputContext discardMarkedText];
+    [self unmarkText];
+    _discardingMark = NO;
+}
+
+// Command-V (the Edit menu's Paste) while Japanese is being composed: performKeyEquivalent: left
+// it to the menu, so the input method never saw it. The composition is committed first.
+- (void)paste:(id)sender {
+    if (clipboard_on && host_takes_clipboard && self.window.firstResponder == self) {
+        [self commitComposition];
+    }
+    [super paste:sender];
+}
+
+- (void)letGo {
+    [self discardComposition];
+    [super letGo];
+    [self updatePasswordField];
+}
+
+- (void)windowIsKeyOrNot {
+    [super windowIsKeyOrNot];
+    [self updatePasswordField];
+}
+
+- (void)viewWillMoveToWindow:(NSWindow *)window {
+    if (window == nil) {
+        secure_input(NO);
+    }
+    [super viewWillMoveToWindow:window];
+}
+
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    if (self.window == nil) {
+        return;
+    }
+    // The candidates' place is in screen points: asked again when the window moves or changes
+    // size.
+    for (NSNotificationName name in @[ NSWindowDidMoveNotification, NSWindowDidResizeNotification ]) {
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(windowPlaceChanged)
+                                                   name:name
+                                                 object:self.window];
+    }
+}
+
+- (void)windowPlaceChanged {
+    [self.inputContext invalidateCharacterCoordinates];
+}
+
+// A password field of the host (field state 2): plain keys only, as on this Mac, without the
+// input method (Latin input sources only), no composing text and no strip; Secure Event Input
+// while this window takes keys.
+- (unsigned int)fieldState {
+    return _field.state;
+}
+
+- (void)updatePasswordField {
+    BOOL password = _field.state == 2;
+    self.inputContext.allowedInputSourceLocales = password ? @[ NSAllRomanInputSourcesLocaleIdentifier ] : nil;
+    secure_input(password && self.window.isKeyWindow && !picture_stale);
+}
+
+// A click, and a paste (Command-V by the Edit menu, which the input method never sees), commit
+// what is being composed, once, into the field it was composed for (as a Mac does), before the
+// click or the paste itself goes: a click may put the cursor into another field over there, and a
+// paste lands after the composition, never inside it. Committed text goes on the input socket
+// like the paste's request, so it arrives first.
+- (void)commitComposition {
+    if (!self.hasMarkedText) {
+        return;
+    }
+    NSString *text = [_marked copy];
+    [self discardComposition];
+    if (_field.state != 2 && host_takes_text && !picture_stale && input_socket >= 0) {
+        if (!text_input_packets(text, ^BOOL(const char *packet, size_t length) {
+                return send_text_datagram(packet, length);
+            })) {
+            text_lost_count++;
+            fprintf(stderr, "viewer: a commit could not be passed on whole, and the rest of it was not sent (%lu so far; the text is never shown)\n", text_lost_count);
+        }
+    }
+}
+- (void)mouseDown:(NSEvent *)event {
+    [self commitComposition];
+    _movesSinceNotice++;
+    [super mouseDown:event];
+}
+- (void)rightMouseDown:(NSEvent *)event {
+    [self commitComposition];
+    _movesSinceNotice++;
+    [super rightMouseDown:event];
+}
+- (void)otherMouseDown:(NSEvent *)event {
+    [self commitComposition];
+    _movesSinceNotice++;
+    [super otherMouseDown:event];
+}
+
+- (void)keyDown:(NSEvent *)event {
+    if ([self outsideField]) {
+        // Not in a field over there: keys as they are, no input method, no strip. Eisu and
+        // Kana still switch this Mac's input method, and nothing is sent for them.
+        if (event.keyCode == 0x66 || event.keyCode == 0x68) {
+            [self.inputContext handleEvent:event];
+        } else {
+            [super keyDown:event];
+        }
+        if (moves_focus(event)) {
+            _movesSinceNotice++;
+        }
+        return;
+    }
+    if (moves_focus(event)) {
+        _movesSinceNotice++;
+    }
+    if (_field.state == 2) {
+        // A password field: keys as they are, never through the input method. Eisu and Kana
+        // do nothing here.
+        if (event.keyCode != 0x66 && event.keyCode != 0x68) {
+            [super keyDown:event];
+        }
+        return;
+    }
+    // Eisu and Kana select the local input method, even with modifiers held.
+    if (event.keyCode == 0x66 || event.keyCode == 0x68) {
+        [self.inputContext handleEvent:event];
+        return;
+    }
+    _startedWithMark = self.hasMarkedText;
+    if (!_startedWithMark && (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl))) {
+        [super keyDown:event];
+        return;
+    }
+    _interpretedEvent = event;
+    _passKey = NO;
+    BOOL handled = [self.inputContext handleEvent:event];
+    if (_interpretedEvent && (_passKey || !handled)) {
+        [super keyDown:event];
+    }
+    _interpretedEvent = nil;
+}
+
+- (NSRect)markedStripRect {
+    return NSMakeRect(8, 8, MAX(1, NSWidth(self.bounds) - 16), 24);
+}
+
+- (BOOL)hasMarkedText {
+    return _marked.length > 0;
+}
+
+- (NSRange)markedRange {
+    return self.hasMarkedText ? NSMakeRange(0, _marked.length) : NSMakeRange(NSNotFound, 0);
+}
+
+- (NSRange)selectedRange {
+    return self.hasMarkedText ? _selection : NSMakeRange(0, 0);
+}
+
+static NSString *plain_text(id value) {
+    return [value isKindOfClass:NSAttributedString.class] ? [value string] : value;
+}
+
+- (void)setMarkedText:(id)value selectedRange:(NSRange)selection replacementRange:(NSRange)replacement {
+    if (_discardingMark) {
+        return;
+    }
+    _marked = [plain_text(value) copy];
+    if (!self.hasMarkedText) {
+        [self unmarkText];
+        return;
+    }
+    NSUInteger start = MIN(selection.location, _marked.length);
+    _selection = NSMakeRange(start, MIN(selection.length, _marked.length - start));
+    if ([self canUseInlinePreedit]) {
+        BOOL hasText = NO;
+        NSData *packet = text_input_preedit(_marked, _selection, &hasText);
+        if (packet && send_text_datagram(packet.bytes, packet.length)) {
+            _preeditSent = hasText;
+            [self hideStrip];
+            return;
+        }
+        // Never send just part of a mark, even if it gets shorter on the next edit.
+        _stripComposition = YES;
+    }
+    [self clearInlinePreedit];
+    [self showStrip:_marked selection:_selection];
+}
+
+- (BOOL)canUseInlinePreedit {
+    return !force_preedit_strip && !_stripComposition && host_takes_preedit && host_takes_text
+        && _field.state == 1 && !picture_stale && !cut_pending;
+}
+
+- (void)clearInlinePreedit {
+    if (_preeditSent) {
+        _preeditSent = NO;
+        // Also when the host has just said it takes no more: the relay drops it then, and it
+        // costs nothing; otherwise the application would go on showing a stale composition.
+        const char clear[] = "{\"kind\":\"preedit\",\"text\":\"\",\"cursor\":[0,0]}";
+        send_text_datagram(clear, sizeof clear - 1);
+    }
+}
+
+// Outside a field (state 3, newer than any click or focus-moving key since): keys go as they
+// are, without the input method and without the strip. Otherwise, as before.
+- (BOOL)outsideField {
+    return !outside_field_keys_through_ime && host_takes_preedit && _field.state == 3 && _movesSinceNotice == 0
+        && !picture_stale && !self.hasMarkedText;
+}
+
+// Whether a key may move the focus over there: anything but plain typing.
+static BOOL moves_focus(NSEvent *event) {
+    if (event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) {
+        return YES;
+    }
+    NSString *typed = event.charactersIgnoringModifiers;
+    if (typed.length != 1) {
+        return YES;
+    }
+    unichar c = [typed characterAtIndex:0];
+    // Tab, Return, Escape, Delete, arrows and other function keys are not plain typing.
+    return c < 0x20 || c == 0x7f || (c >= 0xF700 && c <= 0xF8FF);
+}
+
+- (void)setTextInputField:(IstessoMediaTextInput)field {
+    _movesSinceNotice = 0;
+    BOOL toPassword = field.state == 2 && _field.state != 2;
+    // Another field has the keyboard (the application moved it by itself, or it was enabled
+    // again): what was being composed ends here, on this Mac too, without being committed.
+    BOOL otherField = field.serial != _field.serial;
+    _field = field;
+    if ((toPassword || otherField) && self.hasMarkedText) {
+        [self discardComposition];
+    }
+    [self updatePasswordField];
+    [self textInputContextChanged];
+}
+
+- (void)textInputContextChanged {
+    if (self.hasMarkedText && ![self canUseInlinePreedit]) {
+        [self clearInlinePreedit];
+        [self showStrip:_marked selection:_selection];
+    }
+    [self.inputContext invalidateCharacterCoordinates];
+}
+
+- (void)showStrip:(NSString *)text selection:(NSRange)selection {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (!_markedStrip) {
+        self.wantsLayer = YES;
+        _markedStrip = [CATextLayer layer];
+        _markedStrip.frame = self.markedStripRect;
+        _markedStrip.autoresizingMask = kCALayerWidthSizable;
+        _markedStrip.backgroundColor = [NSColor colorWithWhite:0 alpha:0.75].CGColor;
+        _markedStrip.zPosition = 15;
+        [self.layer addSublayer:_markedStrip];
+    }
+    _markedStrip.contentsScale = self.window.backingScaleFactor;
+    NSMutableAttributedString *display = [[NSMutableAttributedString alloc] initWithString:text attributes:@{
+        NSForegroundColorAttributeName : NSColor.whiteColor, NSFontAttributeName : [NSFont systemFontOfSize:16]
+    }];
+    [display addAttribute:NSUnderlineStyleAttributeName value:@(NSUnderlineStyleSingle) range:selection];
+    _markedStrip.string = display;
+    _markedStrip.hidden = NO;
+    [CATransaction commit];
+}
+
+// A line in the strip for a few seconds, unless something is being composed by then.
+- (void)showNotice:(NSString *)notice {
+    [self showStrip:notice selection:NSMakeRange(notice.length, 0)];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (!self.hasMarkedText) {
+            [self unmarkText];
+        }
+    });
+}
+
+- (void)hideStrip {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _markedStrip.string = nil;
+    _markedStrip.hidden = YES;
+    [CATransaction commit];
+}
+
+- (void)unmarkText {
+    [self clearInlinePreedit];
+    _marked = nil;
+    _stripComposition = NO;
+    [self hideStrip];
+}
+
+- (void)insertText:(id)value replacementRange:(NSRange)replacement {
+    if (_discardingMark) {
+        return;
+    }
+    NSString *text = plain_text(value);
+    if (_interpretedEvent && !_startedWithMark && !self.hasMarkedText && [text isEqualToString:_interpretedEvent.characters]) {
+        _passKey = YES;
+        return;
+    }
+    if (picture_stale) {
+        [self unmarkText];
+        held_back_count += text.length > 0;
+        return;
+    }
+    if (!host_takes_text) {
+        // An agent that does not take committed text could not read the message at all
+        // (keys and all): the text stays here, and the strip says why.
+        [self unmarkText];
+        [self showNotice:@"このホストは文字の入力にまだ対応していません"];
+        return;
+    }
+    if (input_socket >= 0 && !text_input_packets(text, ^BOOL(const char *packet, size_t length) {
+            note_press();
+            return send_text_datagram(packet, length);
+        })) {
+        text_lost_count++;
+        fprintf(stderr, "viewer: a commit could not be passed on whole, and the rest of it was not sent (%lu so far; the text is never shown)\n", text_lost_count);
+    }
+    [self unmarkText];
+}
+
+- (void)doCommandBySelector:(SEL)selector {
+    if (_interpretedEvent && !_startedWithMark && !self.hasMarkedText) {
+        _passKey = YES;
+    }
+}
+
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    if (actual) {
+        *actual = self.hasMarkedText ? self.markedRange : self.selectedRange;
+    }
+    NSRect anchor = self.markedStripRect;
+    NSSize size = self.bounds.size;
+    CGFloat width = picture_width, height = picture_height;
+    // A field whose place the host does not know (all zero) keeps the strip's place.
+    BOOL placed = _field.x != 0 || _field.y != 0 || _field.width != 0 || _field.height != 0;
+    if ([self canUseInlinePreedit] && placed && (!self.hasMarkedText || _markedStrip.hidden || !_markedStrip)
+        && width > 0 && height > 0 && size.width > 0 && size.height >= 1) {
+        // Clip both edges in picture pixels before reversing -pointer:'s top-left mapping.
+        CGFloat left = MAX(0, MIN(width, (CGFloat)_field.x));
+        CGFloat right = MAX(0, MIN(width, (CGFloat)_field.x + _field.width));
+        CGFloat top = MAX(0, MIN(height, (CGFloat)_field.y));
+        CGFloat bottom = MAX(0, MIN(height, (CGFloat)_field.y + _field.height));
+        CGFloat h = MAX(1, (bottom - top) * size.height / height);
+        anchor = NSMakeRect(left * size.width / width, MIN(size.height - h, size.height - bottom * size.height / height),
+                            (right - left) * size.width / width, h);
+    }
+    NSRect rect = [self convertRect:anchor toView:nil];
+    return [self.window convertRectToScreen:rect];
+}
+
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    if (actual) {
+        *actual = NSMakeRange(NSNotFound, 0);
+    }
+    return nil;
+}
+
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText {
+    return @[];
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    return NSNotFound;
+}
+@end
+
+// The everyday trial's ISTESSO_END_WITH_WINDOW: the program ends with its window.
+@interface EndWithWindow : NSObject <NSApplicationDelegate>
+@end
+
+@implementation EndWithWindow
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+    return YES;
+}
 @end
 
 // A window without a title bar does not take the keyboard unless it says that it can.
@@ -1754,6 +2725,20 @@ static GstBusSyncReply on_message(GstBus *bus, GstMessage *message, gpointer use
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--pasteboard-access") == 0) {
+            // Says how macOS lets this application read the general pasteboard (its pasteboard
+            // privacy, macOS 15.4 and later) and ends. Reads nothing of the pasteboard: neither
+            // its contents nor its types nor its change count. No window, no menu.
+            NSPasteboard *board = NSPasteboard.generalPasteboard;
+            if (@available(macOS 15.4, *)) {
+                long behavior = (long)board.accessBehavior;
+                const char *names[] = {"default (asks at the first programmatic read)", "ask", "always allow", "always deny"};
+                printf("pasteboard access: %ld %s\n", behavior, behavior >= 0 && behavior <= 3 ? names[behavior] : "(unknown)");
+            } else {
+                printf("pasteboard access: not reported before macOS 15.4\n");
+            }
+            return 0;
+        }
         gst_init(&argc, &argv);
         if (argc < 7 || argc > 10) {
             fprintf(stderr, "usage: gst-viewer X Y WIDTH HEIGHT TITLE PIPELINE [FRAME_LOG [KEY_REQUEST_PORT [INPUT_SOCKET]]]\n");
@@ -1772,6 +2757,13 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "error: cannot open a socket for the input\n");
                 return 1;
             }
+            const char *clipboard = getenv("ISTESSO_CLIPBOARD");
+            if (clipboard != NULL && strcmp(clipboard, "1") == 0) {
+                clipboard_on = clipboard_start();
+                if (!clipboard_on) {
+                    fprintf(stderr, "note: copy and paste are off: no socket of this window's own\n");
+                }
+            }
         }
         if (argc >= 9 && channel_address == NULL) {
             int port = atoi(argv[8]);
@@ -1789,8 +2781,47 @@ int main(int argc, char *argv[]) {
             return 2;
         }
 
+        // The everyday trial's switches (see the top of this file).
+        daily_reconnect = getenv("ISTESSO_DAILY_RECONNECT") != NULL;
+        BOOL no_window = getenv("ISTESSO_NO_WINDOW") != NULL;
+        const char *dock_tile = getenv("ISTESSO_DOCK_TILE");
+        const char *pid_file = getenv("ISTESSO_PID_FILE");
+        if (pid_file != NULL) {
+            FILE *file = fopen(pid_file, "w");
+            if (file == NULL) {
+                fprintf(stderr, "error: cannot write ISTESSO_PID_FILE\n");
+                return 1;
+            }
+            fprintf(file, "%d\n", (int)getpid());
+            fclose(file);
+        }
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        if (clipboard_on) {
+            // With copy and paste on (ISTESSO_CLIPBOARD=1 and its socket made, above): an Edit
+            // menu with Paste on Command-V (sent to the window's view: paste:). See
+            // performKeyEquivalent: of InputView. The first item is the application's own menu.
+            NSMenu *bar = [NSMenu new];
+            NSMenuItem *own = [NSMenuItem new];
+            own.submenu = [NSMenu new];
+            [bar addItem:own];
+            NSMenuItem *edit = [NSMenuItem new];
+            edit.submenu = [[NSMenu alloc] initWithTitle:@"編集"];
+            [edit.submenu addItemWithTitle:@"ペースト" action:@selector(paste:) keyEquivalent:@"v"];
+            [bar addItem:edit];
+            NSApp.mainMenu = bar;
+        }
+        if (no_window) {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+        } else if (dock_tile != NULL && strcmp(dock_tile, "none") == 0) {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        } else {
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        }
+        static EndWithWindow *ender = nil;
+        if (getenv("ISTESSO_END_WITH_WINDOW") != NULL) {
+            ender = [EndWithWindow new];
+            NSApp.delegate = ender;
+        }
         NSRect display = NSZeroRect;
         if (whole_display) {
             // The display the point lies on. Screens count from the bottom left of the main one.
@@ -1817,7 +2848,8 @@ int main(int argc, char *argv[]) {
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO]
             : [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
-                                          styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                          styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                     (daily_reconnect ? NSWindowStyleMaskResizable : 0))
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
         window.title = [NSString stringWithUTF8String:argv[5]];
@@ -1826,14 +2858,100 @@ int main(int argc, char *argv[]) {
         }
         const char *command_key = getenv("ISTESSO_COMMAND_KEY");
         command_is_control = command_key == NULL || strcmp(command_key, "super") != 0;
-        // The view that follows the pointer: to pass it on, and, with the channel, to draw the cursor.
-        NSView *view = input_socket >= 0 || channel_address != NULL ? [[InputView alloc] initWithFrame:NSMakeRect(0, 0, width, height)]
-                                                                    : [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+        atexit(secure_input_off_at_exit);
+        const char *outside = getenv("ISTESSO_OUTSIDE_FIELD");
+        outside_field_keys_through_ime = outside != NULL && strcmp(outside, "ime") == 0;
+        const char *preedit = getenv("ISTESSO_PREEDIT");
+        force_preedit_strip = preedit != NULL && strcmp(preedit, "strip") == 0;
+        const char *text_input = getenv("ISTESSO_TEXT_INPUT");
+        Class viewClass = NSView.class;
+        if (input_socket >= 0 || channel_address != NULL) {
+            viewClass = input_socket >= 0 && text_input != NULL && strcmp(text_input, "1") == 0 ? TextInputView.class : InputView.class;
+        }
+        NSView *view = [[viewClass alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         window.contentView = view;
+        picture_window = window;
+        picture_whole_display = whole_display;
+        if (daily_reconnect && !whole_display) {
+            // The everyday trial (the Mac host's docs/m4-daily-host.md): when this window becomes
+            // the one typed into, the host brings the application's window to the front; when the
+            // person has resized it by hand, the host is asked once for a picture of that size.
+            [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidBecomeKeyNotification
+                                                            object:window
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) {
+                                                            (void)note;
+                                                            send_input("{\"kind\":\"focus\"}");
+                                                        }];
+            [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidEndLiveResizeNotification
+                                                            object:window
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) {
+                                                            (void)note;
+                                                            ask_for_window_size();
+                                                        }];
+            // For checks that must not touch the window: behave, once the first picture is there,
+            // as if the person had resized the window by hand to WxH points.
+            const char *pretend = getenv("ISTESSO_PRETEND_RESIZE");
+            double pretend_w = 0, pretend_h = 0;
+            if (pretend != NULL && sscanf(pretend, "%lfx%lf", &pretend_w, &pretend_h) == 2 && pretend_w > 0 && pretend_h > 0) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                    [window setContentSize:NSMakeSize(pretend_w, pretend_h)];
+                    ask_for_window_size();
+                });
+            }
+        }
         if (input_socket >= 0) {
             [window makeFirstResponder:view];
         }
-        [window orderFrontRegardless];
+        if (!no_window) {
+            [window orderFrontRegardless];
+        }
+        if (pid_file != NULL) {
+            // The everyday trial: the signal USR2 brings the window to the front, for a program
+            // started through `open` whose window is asked for again. Without a window it does
+            // nothing.
+            static dispatch_source_t front;
+            signal(SIGUSR2, SIG_IGN);
+            front = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR2, 0, dispatch_get_main_queue());
+            dispatch_source_set_event_handler(front, ^{
+                if (!no_window) {
+                    [NSApp activate];
+                    [window makeKeyAndOrderFront:nil];
+                }
+            });
+            dispatch_resume(front);
+        }
+        const char *title_file = getenv("ISTESSO_TITLE_FILE");
+        if (title_file != NULL) {
+            // The everyday trial: the title says when a window of the application is calling.
+            static dispatch_source_t retitle;
+            NSString *path = [NSString stringWithUTF8String:title_file];
+            signal(SIGUSR1, SIG_IGN);
+            retitle = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
+            dispatch_source_set_event_handler(retitle, ^{
+                NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+                NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+                if (lines.count == 0 || lines[0].length == 0) {
+                    return;
+                }
+                if (daily_reconnect && counted_window != nil) {
+                    counted_title = lines[0];
+                    show_counts();
+                } else {
+                    window.title = lines[0];
+                }
+                BOOL calling = lines.count > 1 && [lines[1] isEqualToString:@"attention"];
+                if (calling && !no_window) {
+                    [NSApp requestUserAttention:NSInformationalRequest];
+                }
+                fprintf(stderr, "title: %s%s\n", lines[0].UTF8String, calling ? " (asks for attention)" : "");
+            });
+            dispatch_resume(retitle);
+            // Said, so that USR1 is sent only to a program that takes it (it would end one that
+            // does not).
+            fprintf(stderr, "title file: ready\n");
+        }
         // Moved after it exists: at creation macOS pulls a window that is placed on another
         // display than the one in use back onto that one. Coordinates count from the top left
         // of the main display, which is the first screen.
