@@ -72,6 +72,7 @@ pub(crate) mod testing {
             },
             power: PowerCaps::default(),
             tools: Tools::default(),
+            capabilities: Default::default(),
             roles: vec![Role::AlwaysOnCandidate],
             warnings: Vec::new(),
         }

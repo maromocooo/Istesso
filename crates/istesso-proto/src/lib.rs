@@ -9,6 +9,8 @@
 //! fields have defaults, and values an older reader does not know either map
 //! to a catch-all variant or are skipped (see [`known_only`]).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Version of the wire vocabulary. Bump on incompatible changes.
@@ -18,7 +20,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///
 /// 2: network interfaces list only real adapters and carry their kind and
 /// current addresses.
-pub const MANIFEST_SCHEMA: u32 = 2;
+/// 3: capabilities: tools found and devices attached.
+pub const MANIFEST_SCHEMA: u32 = 3;
 
 /// Reads a list and drops the items this version does not understand.
 ///
@@ -220,6 +223,61 @@ pub struct Tools {
     pub cargo: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// Every tool of the fixed list, by name. None when the tool was not found.
+    #[serde(default)]
+    pub tools: BTreeMap<String, Option<ToolInfo>>,
+    #[serde(default)]
+    pub attached: Attached,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInfo {
+    /// None when the program was found but its version is unknown.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attached {
+    /// Real Apple devices known to devicectl, including disconnected ones.
+    #[serde(default)]
+    pub ios: Option<Vec<AppleDevice>>,
+    /// Simulators reported as available by simctl.
+    #[serde(default)]
+    pub simulators: Option<SimulatorCount>,
+    /// Devices listed by an already-running adb server.
+    #[serde(default)]
+    pub android: Option<AndroidCount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppleDevice {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulatorCount {
+    #[serde(default)]
+    pub available: u32,
+    #[serde(default)]
+    pub by_platform: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AndroidCount {
+    #[serde(default)]
+    pub count: u32,
+}
+
 /// What a host is good for. Derived from the detected facts; agents and the
 /// launcher use it to decide where an app or a job should run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -249,6 +307,8 @@ pub struct HostManifest {
     pub audio: AudioCaps,
     pub power: PowerCaps,
     pub tools: Tools,
+    #[serde(default)]
+    pub capabilities: Capabilities,
     #[serde(deserialize_with = "known_only")]
     pub roles: Vec<Role>,
     /// Things the user should know before relying on this host.
@@ -546,6 +606,7 @@ mod tests {
                 ],
             },
             tools: Tools::default(),
+            capabilities: Capabilities::default(),
             roles: vec![Role::MacApps],
             warnings: Vec::new(),
         };

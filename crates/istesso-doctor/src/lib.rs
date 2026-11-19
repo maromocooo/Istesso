@@ -5,7 +5,10 @@
 //! fact cannot be determined it is reported as unknown and, where it matters,
 //! mentioned in `warnings`.
 
+mod capabilities;
 pub mod parse;
+
+use capabilities::SearchPaths;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +16,8 @@ use std::process::Command;
 
 use istesso_proto::{
     AudioCaps, AudioServer, DisplayServer, EncoderApi, GpuVendor, Hardware, HostManifest,
-    NetInterface, NetKind, OsFamily, OsInfo, PowerCaps, Role, Tools, VideoCaps, MANIFEST_SCHEMA,
+    NetInterface, NetKind, OsFamily, OsInfo, PowerCaps, Role, ToolInfo, Tools, VideoCaps,
+    MANIFEST_SCHEMA,
 };
 
 /// macOS release that introduced Core Audio process taps (driver-free
@@ -23,11 +27,19 @@ const MACOS_AUDIO_TAPS: (u32, u32) = (14, 2);
 /// Inspects the current machine.
 pub fn detect() -> HostManifest {
     let os = detect_os();
-    let hardware = detect_hardware(&os);
+    let paths = SearchPaths::current();
+    let (hardware, nvidia_smi) = detect_hardware(&os, &paths);
     let video = detect_video(&os, &hardware);
     let audio = detect_audio(&os);
     let power = detect_power(&os);
-    let tools = detect_tools(&os);
+    let capabilities = capabilities::detect(&paths, os.family, nvidia_smi);
+    let found = |name: &str| capabilities.tools.get(name).and_then(Option::as_ref);
+    let tools = Tools {
+        xcode: found("xcodebuild").and_then(|tool| tool.version.clone()),
+        docker: found("docker").is_some(),
+        gstreamer: on_path("gst-launch-1.0"),
+        cargo: found("cargo").is_some(),
+    };
     let roles = derive_roles(&os, &hardware, &video, &audio, &power, &tools);
     let warnings = derive_warnings(&os, &video, &audio, &power);
     HostManifest {
@@ -39,6 +51,7 @@ pub fn detect() -> HostManifest {
         audio,
         power,
         tools,
+        capabilities,
         roles,
         warnings,
     }
@@ -191,7 +204,14 @@ pub fn derive_warnings(
 
 /// Runs a command and returns its stdout when it exits successfully.
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    stdout(Command::new(program).args(args))
+}
+
+fn stdout(cmd: &mut Command) -> Option<String> {
+    successful_stdout(cmd.output().ok()?)
+}
+
+fn successful_stdout(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
     }
@@ -252,21 +272,32 @@ fn detect_hostname(os: &OsInfo) -> String {
     }
 }
 
-fn detect_hardware(os: &OsInfo) -> Hardware {
+fn detect_hardware(os: &OsInfo, paths: &SearchPaths) -> (Hardware, Option<ToolInfo>) {
+    let mut nvidia_smi = None;
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(0);
-    match os.family {
+    let hardware = match os.family {
         OsFamily::Linux => {
-            let mut gpus = run(
-                "nvidia-smi",
-                &[
-                    "--query-gpu=name,memory.total,driver_version",
-                    "--format=csv,noheader,nounits",
-                ],
-            )
-            .map(|t| parse::nvidia_smi_csv(&t))
-            .unwrap_or_default();
+            let mut gpus = paths
+                .find("nvidia-smi")
+                .and_then(|path| {
+                    paths.run(
+                        &path,
+                        &[
+                            "--query-gpu=name,memory.total,driver_version",
+                            "--format=csv,noheader,nounits",
+                        ],
+                    )
+                })
+                .map(|t| parse::nvidia_smi_csv(&t))
+                .unwrap_or_default();
+            nvidia_smi = gpus.first().map(|gpu| ToolInfo {
+                version: gpu
+                    .driver
+                    .as_deref()
+                    .and_then(|s| parse::tool_version("nvidia-smi", s)),
+            });
             if gpus.is_empty() {
                 gpus = run("lspci", &[])
                     .map(|t| parse::lspci_gpus(&t))
@@ -299,7 +330,8 @@ fn detect_hardware(os: &OsInfo) -> Hardware {
             cpu_cores,
             ..Hardware::default()
         },
-    }
+    };
+    (hardware, nvidia_smi)
 }
 
 fn detect_video(os: &OsInfo, hardware: &Hardware) -> VideoCaps {
@@ -448,18 +480,6 @@ fn linux_interfaces() -> Vec<NetInterface> {
             })
         })
         .collect()
-}
-
-fn detect_tools(os: &OsInfo) -> Tools {
-    Tools {
-        xcode: (os.family == OsFamily::Macos)
-            .then(|| run("xcodebuild", &["-version"]))
-            .flatten()
-            .and_then(|t| parse::xcodebuild_version(&t)),
-        docker: on_path("docker"),
-        gstreamer: on_path("gst-launch-1.0"),
-        cargo: on_path("cargo"),
-    }
 }
 
 #[cfg(test)]
@@ -613,6 +633,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "runs installed tools on the machine"]
     fn detect_runs_on_this_machine() {
         let manifest = detect();
         assert_eq!(manifest.schema, MANIFEST_SCHEMA);

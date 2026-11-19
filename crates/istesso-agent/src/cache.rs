@@ -129,7 +129,11 @@ pub fn local_manifest(paths: &Paths, max_age: Duration) -> HostManifest {
 
 /// Inspects this machine now and remembers the result.
 pub fn refresh_local_manifest(paths: &Paths) -> HostManifest {
+    #[cfg(not(test))]
     let manifest = istesso_doctor::detect();
+    // Cache and survey tests exercise refresh without invoking installed tools.
+    #[cfg(test)]
+    let manifest = crate::testing::manifest("");
     remember_local_manifest(paths, &manifest);
     manifest
 }
