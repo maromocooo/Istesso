@@ -452,12 +452,17 @@ impl Drop for Forwarder {
 /// Hands `address` to the program that opens pages: the one given, or the
 /// system's. As one argument, never through a shell.
 fn open_page(opener: Option<&Path>, address: &str) -> std::io::Result<()> {
-    let program = match opener {
-        Some(program) => program.to_path_buf(),
-        None if cfg!(target_os = "macos") => PathBuf::from("/usr/bin/open"),
-        None => PathBuf::from("xdg-open"),
+    let mut command = match opener {
+        Some(program) => std::process::Command::new(program),
+        None if cfg!(target_os = "macos") => {
+            // `-u`: the argument is an address, never a file's name.
+            let mut open = std::process::Command::new("/usr/bin/open");
+            open.arg("-u");
+            open
+        }
+        None => std::process::Command::new("xdg-open"),
     };
-    let mut child = std::process::Command::new(program)
+    let mut child = command
         .arg(address)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

@@ -97,7 +97,7 @@ impl PortList {
         list.elsewhere.retain(|port| *port != 0);
         list.elsewhere.truncate(MAX_PORTS);
         for port in &mut list.ports {
-            port.process = printable(&port.process, MAX_PROCESS_NAME);
+            port.process = ascii_name(&port.process, MAX_PROCESS_NAME);
         }
         list.reason = list.reason.map(|reason| printable(&reason, 200));
         list.how = list.how.map(|how| printable(&how, 16));
@@ -112,9 +112,45 @@ pub fn is_forward_id(id: &str) -> bool {
 }
 
 /// `text` with every character a terminal could act on (control
-/// characters, escapes) left out, cut to `max` characters.
+/// characters, escapes) and every character that changes how the rest is
+/// shown without being seen (direction marks, zero-width characters) left
+/// out, cut to `max` characters.
 pub fn printable(text: &str, max: usize) -> String {
-    text.chars().filter(|c| !c.is_control()).take(max).collect()
+    text.chars()
+        .filter(|c| !c.is_control() && !invisible(*c))
+        .take(max)
+        .collect()
+}
+
+/// The name of a program, in visible ASCII and spaces only: anything else
+/// becomes `?`. Cut to `max` characters.
+pub fn ascii_name(text: &str, max: usize) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .take(max)
+        .collect()
+}
+
+/// Characters of Unicode's class "format" that change how text is shown:
+/// direction marks and overrides, zero-width characters, the soft hyphen.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+    )
 }
 
 /// One message on a forwarded connection.
@@ -212,7 +248,7 @@ mod tests {
         let list = PortList::decode(json.as_bytes()).unwrap();
         assert_eq!(list.ports.len(), 1);
         assert_eq!(list.ports[0].port, 8000);
-        assert_eq!(list.ports[0].process, "evil]0;titlename");
+        assert_eq!(list.ports[0].process, "evil?]0;title?name");
         assert!(PortList::decode(b"[1,2]").is_err());
         assert!(PortList::decode(&vec![b' '; MAX_LIST + 1]).is_err());
     }
@@ -235,6 +271,16 @@ mod tests {
         let mut huge = vec![0x01];
         huge.resize(2 + MAX_DATA_ACCEPTED, 0);
         assert!(matches!(ForwardFrame::decode(&huge), Err(Error::TooLarge)));
+    }
+
+    #[test]
+    fn names_cannot_turn_text_around_or_hide_in_it() {
+        // A right-to-left override and a zero-width space in a device's name.
+        assert_eq!(printable("a\u{202e}txt.exe\u{200b}b", 64), "atxt.exeb");
+        assert_eq!(printable("日本語の機械", 64), "日本語の機械");
+        assert_eq!(ascii_name("py\u{202e}thon3", 32), "py?thon3");
+        assert_eq!(ascii_name("node server", 32), "node server");
+        assert_eq!(ascii_name("サーバー", 32), "????");
     }
 
     #[test]

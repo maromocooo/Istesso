@@ -91,9 +91,17 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn head_names_this_forward(head: &[u8], port: u16) -> Result<(), Why> {
-    let head = std::str::from_utf8(head).map_err(|_| Why::Malformed)?;
-    let mut lines = head.split("\r\n");
+    let mut lines = split_lines(head);
     let request = lines.next().ok_or(Why::Malformed)?;
+    // A carriage return, line feed or NUL inside a line could end it for one
+    // program and not for another.
+    if request.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return Err(Why::Malformed);
+    }
+    let request = std::str::from_utf8(request)
+        .ok()
+        .filter(|line| line.is_ascii())
+        .ok_or(Why::NotHttp)?;
     let mut parts = request.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -111,32 +119,70 @@ fn head_names_this_forward(head: &[u8], port: u16) -> Result<(), Why> {
     if !(target.starts_with('/') || target == "*") {
         return Err(Why::Malformed);
     }
-    let mut host = None;
+    let mut host: Option<&[u8]> = None;
     for line in lines {
         // A header folded onto the next line (obsolete) does not read.
-        if line.starts_with([' ', '\t']) {
+        if line.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
             return Err(Why::Malformed);
         }
-        let (name, value) = line.split_once(':').ok_or(Why::Malformed)?;
-        if name.is_empty() || name.contains([' ', '\t']) {
+        let colon = line.iter().position(|b| *b == b':').ok_or(Why::Malformed)?;
+        let (name, value) = (&line[..colon], &line[colon + 1..]);
+        if name.is_empty() || !name.iter().all(|b| is_token(*b)) {
             return Err(Why::Malformed);
         }
-        if name.eq_ignore_ascii_case("host") {
+        // Visible characters, spaces and tabs, and (obsolete, but allowed)
+        // bytes above ASCII; no other control character.
+        if value
+            .iter()
+            .any(|b| (*b < 0x20 && *b != b'\t') || *b == 0x7f)
+        {
+            return Err(Why::Malformed);
+        }
+        if name.eq_ignore_ascii_case(b"host") {
             if host.is_some() {
                 return Err(Why::Malformed);
             }
-            host = Some(value.trim_matches([' ', '\t']));
+            host = Some(value.trim_ascii());
         }
     }
-    let host = host.ok_or(Why::Malformed)?.to_ascii_lowercase();
-    let allowed = ["localhost", "127.0.0.1", "[::1]"]
-        .iter()
-        .any(|name| host == format!("{name}:{port}"));
+    let host = host.ok_or(Why::Malformed)?;
+    let host = std::str::from_utf8(host)
+        .ok()
+        .filter(|host| host.is_ascii())
+        .ok_or(Why::OtherHost)?
+        .to_ascii_lowercase();
+    let allowed = ["localhost", "127.0.0.1", "[::1]"].iter().any(|name| {
+        // A browser leaves out the port when it is the scheme's own.
+        host == format!("{name}:{port}") || (port == 80 && host == *name)
+    });
     if allowed {
         Ok(())
     } else {
         Err(Why::OtherHost)
     }
+}
+
+/// The lines of a request's head, split at each CR LF.
+fn split_lines(head: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = Some(head);
+    std::iter::from_fn(move || {
+        let text = rest?;
+        match find(text, b"\r\n") {
+            Some(at) => {
+                rest = Some(&text[at + 2..]);
+                Some(&text[..at])
+            }
+            None => {
+                rest = None;
+                Some(text)
+            }
+        }
+    })
+}
+
+/// A character of a header's name (RFC 9110, `tchar`).
+fn is_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 /// What a refused HTTP request is answered with, before the connection is
@@ -222,6 +268,40 @@ mod tests {
         let mut endless = b"GET / HTTP/1.1\r\nX: ".to_vec();
         endless.resize(MAX_HEAD, b'a');
         assert_eq!(look(&endless, 80), Look::Refused(Why::Malformed));
+    }
+
+    #[test]
+    fn line_ends_and_nul_inside_a_line_are_refused_and_other_bytes_are_not() {
+        for bytes in [
+            b"GET / HTTP/1.1\r\nHost: localhost:80\rX: y\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: localhost:80\nHost: evil.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\nX: a\x00b\r\nHost: localhost:80\r\n\r\n",
+            b"GET /\x00 HTTP/1.1\r\nHost: localhost:80\r\n\r\n",
+            b"GET / HTTP/1.1\r\nX\x00: a\r\nHost: localhost:80\r\n\r\n",
+        ] {
+            assert_eq!(
+                look(bytes, 80),
+                Look::Refused(Why::Malformed),
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        // Bytes above ASCII in a header's value (a cookie, say) are allowed;
+        // in `Host` they are not this forward.
+        let latin = b"GET / HTTP/1.1\r\nCookie: a=\xe9\r\nHost: localhost:80\r\n\r\n";
+        assert_eq!(look(latin, 80), Look::Http);
+        let odd_host = b"GET / HTTP/1.1\r\nHost: localh\xf6st:80\r\n\r\n";
+        assert_eq!(look(odd_host, 80), Look::Refused(Why::OtherHost));
+    }
+
+    #[test]
+    fn the_port_may_be_left_out_when_it_is_the_schemes_own() {
+        assert_eq!(look(&request("localhost"), 80), Look::Http);
+        assert_eq!(look(&request("127.0.0.1"), 80), Look::Http);
+        assert_eq!(
+            look(&request("localhost"), 5173),
+            Look::Refused(Why::OtherHost)
+        );
     }
 
     #[test]

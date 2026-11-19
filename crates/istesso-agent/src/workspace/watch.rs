@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-use istesso_link::forward::{printable, MAX_PORTS, MAX_PROCESS_NAME};
+use istesso_link::forward::{ascii_name, MAX_PORTS, MAX_PROCESS_NAME};
 use istesso_link::forward::{ForwardedPort, PortList};
 use istesso_link::shell::ShellFrame;
 use istesso_pair::Peer;
@@ -274,7 +274,7 @@ impl Workspace {
                         id,
                         port: listening.port,
                         family: if listening.to.is_ipv4() { 4 } else { 6 },
-                        process: printable(
+                        process: ascii_name(
                             &super::procfs::program_name(listening.pid),
                             MAX_PROCESS_NAME,
                         ),
