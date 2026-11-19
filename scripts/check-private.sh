@@ -40,8 +40,8 @@ allowed="$allowed|$start[0-9+]*[A-Za-z0-9-]*@users\.noreply\.github\.com$end|${s
 allowed="$allowed|${start}noreply@anthropic\.com$end|${start}git@github\.com$end"
 allowed="$allowed|02:00:00:00:00:[0-9a-fA-F]{2}"
 # A version number of four parts, said to be one; the folder every user of a Mac shares.
-allowed="$allowed|(firmware|version|版は|版（) ?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|/Users/Shared"
-allowed="$allowed|/home/(u|user|you|me|runner)([/ \"'\`]|$)|/Users/(u|user|you|me|runner)([/ \"'\`]|$)"
+allowed="$allowed|(firmware|version|版は|版（) ?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"
+allowed="$allowed|/home/(u|user|you|me|runner)([/ \"'\`]|$)|/Users/(u|user|you|me|runner|Shared)([/ \"'\`]|$)"
 
 look() { # stdin: lines to look at; $1: what they are
     local hits
