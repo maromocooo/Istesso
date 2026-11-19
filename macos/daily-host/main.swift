@@ -175,6 +175,37 @@ if CommandLine.arguments.dropFirst().first == "--windows", let pid = Int(Command
     }
     exit(0)
 }
+if CommandLine.arguments.dropFirst().first == "--access-behavior" {
+    // Only how this program may read the general pasteboard (never what is on it).
+    let names = [0: "default (asks on the first programmatic read)", 1: "ask", 2: "always allow", 3: "always deny"]
+    if #available(macOS 15.4, *) {
+        let value = NSPasteboard.general.accessBehavior.rawValue
+        print("pasteboard access behavior: \(value) \(names[value] ?? "unknown")")
+    } else {
+        print("pasteboard access behavior: not on this macOS")
+    }
+    exit(0)
+}
+if CommandLine.arguments.dropFirst().first == "--prompt-windows" {
+    // Read only, for collecting what the system's confirmations look like: every on-screen window
+    // above the normal layer, with its layer and the owner's bundle id when it is Apple's own,
+    // else "another application". Never a title.
+    let windows = readWindowList(onScreenOnly: true, desktop: false).filter { $0.layer > 0 }
+    for window in windows {
+        let id = NSRunningApplication(processIdentifier: window.pid)?.bundleIdentifier ?? ""
+        let owner = id.hasPrefix("com.apple.") ? id : "another application"
+        print("layer \(window.layer) \(owner) \(Int(window.bounds.width))x\(Int(window.bounds.height))")
+    }
+    print("windows above the normal layer: \(windows.count)")
+    exit(0)
+}
+if CommandLine.arguments.dropFirst().first == "--ask-desktop" {
+    // A harmless Files-and-Folders confirmation for the owner's samples: asks to look into the
+    // Desktop folder, and says only whether it was allowed (no names, no counts).
+    let allowed = (try? FileManager.default.contentsOfDirectory(atPath: NSHomeDirectory() + "/Desktop")) != nil
+    print(allowed ? "desktop: allowed" : "desktop: not allowed")
+    exit(0)
+}
 if CommandLine.arguments.dropFirst().first == "--vd-check" { runVirtualDisplayCheck(Array(CommandLine.arguments.dropFirst(2))) }
 let settings = readSettings()
 
