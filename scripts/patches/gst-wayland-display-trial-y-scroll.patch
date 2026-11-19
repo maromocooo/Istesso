@@ -57,7 +57,7 @@ index 788fe16..de5d50c 100644
                  } else if structure.has_name("KeyboardKey") {
                      let key = structure.get::<u32>("key").expect("Should contain key");
 diff --git a/wayland-display-core/src/comp/clipboard.rs b/wayland-display-core/src/comp/clipboard.rs
-index 2a80da1..a6f99b0 100644
+index b434c64..0d47e91 100644
 --- a/wayland-display-core/src/comp/clipboard.rs
 +++ b/wayland-display-core/src/comp/clipboard.rs
 @@ -144,6 +144,7 @@ pub(crate) fn is_input(command: &Command) -> bool {
@@ -68,7 +68,7 @@ index 2a80da1..a6f99b0 100644
              | Command::TextCommit(_)
              | Command::TextPreedit(..)
              | Command::ClipboardCopy { .. }
-@@ -352,6 +353,7 @@ impl State {
+@@ -355,6 +356,7 @@ impl State {
                      Some(vertical_amount),
                  );
              }

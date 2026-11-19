@@ -401,6 +401,27 @@ Istesso の ADR 0022（`trial-daily-clipboard` ブランチ）の、Ubuntu の�
 
 確かめたこと（ホスト、2026-11-19）：`scripts/build-compositor.sh <自分のフォルダー>/gwd-trial28 --trial --test` で、7 つの修正が当たり、テストは 127 本すべて通った（このうち 15 本が新しい。本物の Wayland クライアントで、`hello`、コピー、切り取り、前からある選択は取らない、ほかのアプリがキーボードを取ったら取らない、パスワードの欄、秘密の印、上限と制御文字、貼り付け、文字を待つあいだのキー、期限、文字のない貼り付けの取り下げ、上限を超えた貼り付け。ほかに、上限と JSON の 2 本）。クリップボードのテストだけを 3 回続けて流して、3 回とも通った。`check-plugin.sh` は 1（試用）。試用版には、まだ組み込んでいない。本物のアプリ（Firefox、Blender、Text Editor）では、まだ試していない。
 
+### レビューのあとの確かめ（`gwd-trial29`、2026-11-19 14:2x〜14:32、ホストだけ）
+
+別の目のレビューの指摘（パスワードの拒みは、text-input-v3 で目的が password か pin のときにしか効かない）を、本物のツールキットで確かめた。どれも、自分のフォルダーの、窓を出さないコンポジター（fakesink）の中で、自分の XDG のフォルダー、`HOME`、`GSETTINGS_BACKEND=memory`、`GIO_USE_VFS=local`、試用と同じ何も起動できないバスで動かした。ダミーの語を打ち、Control-A、`ClipboardCopy` の印を送り、答えの result と why だけを見た（文字は出していない）。
+
+| アプリ、欄 | 答え | text-input-v3（コンポジターのログの語） | だれが止めたか |
+|---|---|---|---|
+| GTK 3 の `Gtk.Entry`（ふつう、対照） | text | 有効、normal | —（コピーされる） |
+| GTK 3 の `Gtk.Entry`、visibility を切ったもの | none | 有効、**normal** | アプリ自身（コピーしない） |
+| GTK 4 の `Gtk.Entry`（ふつう、対照） | text | 有効、normal | — |
+| GTK 4 の `Gtk.Entry`、visibility を切ったもの | none | 有効、**normal** | アプリ自身 |
+| GTK 4 の `Gtk.PasswordEntry` | refused、password_field | 有効、**password** | この修正（キーを押さない） |
+| Chrome（試用と同じ引数）、`<input type=text>`（対照） | text | 有効、normal（いったん無効も） | — |
+| Chrome、`<input type=password>` | none | 有効、**normal** | アプリ自身 |
+| Firefox | 動かしていない | — | ホストの Firefox は snap だけ（`/usr/bin/firefox` は snap への移行用のパッケージ）。持ち主の snap のフォルダーに触れないため |
+| Blender | 動かしていない | — | ホストの PATH にない。パスワードの欄もない |
+
+- 見たこと：text-input-v3 の目的が password になったのは、GTK 4 の `Gtk.PasswordEntry` だけ。visibility を切った GTK の欄と、Chrome のパスワードの欄は、normal と言う。そこからのコピーを止めたのは、アプリ自身だった（Control-C を押しても、選択を置かない）。この修正の拒みは、アプリが止めないときの第 2 の線にはならない。
+- アクセシビリティ（AT-SPI）：試用と同じ形のバス（サービスの置き場が空）の中から `org.a11y.Bus` を呼ぶと、`ServiceUnknown`（見た）。試用版はアプリに `NO_AT_BRIDGE=1` も渡している（`scripts/daily.sh` から。考えただけ）。試用のセッションの中では、2 つ目の目印として使えない。
+- 記録（ADR 0022 の確かめ 7）：`trial-daily-clipboard` の `scripts/daily-pipeline.py --clipboard`（a1a21fc）を、`m1-step3-host.py` の代わりの自前の小さなホストの台本（同じ入力の受け渡し、エンコーダーなし）で動かし、`GST_DEBUG='*:7'`、`RUST_LOG=trace` で、決めたダミーの語を貼り付けて、コピーし直した（貼り付け pasted、コピー text、同じ語に戻った）。標準出力（4 MB）、標準エラー、GStreamer のデバッグの記録（11 MB）、アプリの出力に、その語は 0 回。合い言葉は、GStreamer のデバッグの記録に 2 行（`GST_EVENT` の段の、印のイベントの中身。分かっていて受け入れたもの）。
+- テスト（2 本足した。129 本すべて通った）：(a) コピーの選択を書かず、パイプも閉じないクライアント：キーから 0.9 秒より前に `none`、そのあいだにほかのクライアントの往復が通る。(b) 貼り付けを取り下げたあと、前の `wl_data_offer` から読む：**直す前は、取り下げた文字が読めた**（見た）。直した：コンポジターが、いま出している文字のときだけ書き、ほかは何も書かずに閉じる。テキスト入力の目的は、変わったときだけ、語（password など）でログに書くようにした。
+
 ## スクロールの種類と段階（試用の 7 つ目の修正、2026-11-19）
 
 - 修正のファイル：`scripts/patches/gst-wayland-display-trial-y-scroll.patch`（`trial-windows`、`trial-x-text-input` の上に重ねる。名前の順で、最後に当たる）。試用のビルドにだけ入る（`--trial`）。判定で測るビルドは変わらない。
@@ -410,13 +431,14 @@ Istesso の ADR 0022（`trial-daily-clipboard` ブランチ）の、Ubuntu の�
 
 ## まとめた試用のビルド（`gwd-trial31`、2026-11-19）
 
-試用の修正を、1 つのビルドにまとめた（ブランチ `m3-compositor-trial`。`m3-compositor-text-input` の `0f37c3c`（変換中の文字をアプリの中に）に、`m3-compositor-clipboard` の `ee9e0f4` と `m3-compositor-scroll` の `bd8dbbc` をマージ）。当てる順は名前の順：trial-windows、trial-x-text-input、trial-y-clipboard、trial-y-scroll。
+試用の修正を、1 つのビルドにまとめた（ブランチ `m3-compositor-trial`。`m3-compositor-text-input` の `0f37c3c`（変換中の文字をアプリの中に）に、`m3-compositor-clipboard` の `ea84dad` と `m3-compositor-scroll` の `bd8dbbc` をマージ）。当てる順は名前の順：trial-windows、trial-x-text-input、trial-y-clipboard、trial-y-scroll。
 
 - trial-y-clipboard を、新しい trial-x-text-input の上に作り直した。両方の振る舞いを残した：
   - 変換中の文字（`TextPreedit`）と、確定した文字（`TextCommit`）は、どちらも入力として clipboard の `take_input` を通る（貼り付けが文字を待つあいだ、順のまま止める）。`TextInputSink` は、これまでどおりコマンドの受け口で。
   - パスワードの欄：両方の修正が `secret` を足していた。1 つにまとめ、目的（Password、PIN）か、ヒント（HiddenText、SensitiveData）のどちらかで秘密とする。Mac への「欄の知らせ」（2 は秘密の欄）も、コピーを断るのも、これで決める。内容の種類が変わったら、欄の知らせを送り直す。
+  - clipboard の `ea84dad` の、欄の目的の記録（`text input: state`、語だけ）も残した。
   - text-input の限った入り直し（`gwd-trial27`）は、変えていない。
 - trial-y-scroll は、その上で、そのまま当たった（`PointerScroll` も `take_input` を通る）。
-- ホストのビルド `~/.cache/istesso-scroll-wip/gwd-trial31`（`--trial --test`、14:54 に終わった）：コンポジターの試験 135 本（text-input と前の修正の 112 本、clipboard の 15 本、scroll の 8 本）が全部通った。`check-plugin.sh` は試用と言う（1）。関門の `gwd-cursor` は 0。
-- 前の `gwd-trial29`（`0f37c3c` より前の text-input）は、使わない。
+- ホストのビルド `~/.cache/istesso-scroll-wip/gwd-trial31`（`--trial --test`）：コンポジターの試験 137 本（text-input と前の修正の 112 本、clipboard の 17 本、scroll の 8 本）が全部通った（14:56 に終わった）。`check-plugin.sh` は試用と言う（1）。関門の `gwd-cursor` は 0。
+- この流れの前の `~/.cache/istesso-scroll-wip/gwd-trial29`（`0f37c3c` より前の text-input）は、使わない。clipboard の流れの `~/.cache/istesso-compositor-wip/gwd-trial29` とは別のもの。
 
