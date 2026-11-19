@@ -1564,6 +1564,45 @@ fn a_viewer_that_takes_nothing_is_not_sent_cursor_after_cursor() {
 }
 
 #[test]
+fn a_text_field_never_goes_behind_a_cursor_that_only_partly_went_out() {
+    let pair = pair();
+    // Connected, and never reading: a large cursor behind a frame fills the connection.
+    let _channel = pair.raw_watching();
+    pair.until(|| pair.host.viewers() == 1);
+    let pixels = vec![9u8; 256 * 256 * 4];
+    let large = Cursor::Image(CursorImage {
+        width: 256,
+        height: 256,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        scale: 1,
+        rgba: &pixels,
+    });
+    let began = Instant::now();
+    let mut n = 0;
+    // A cursor change and a field change behind every frame, until the viewer is cut off
+    // for not reading. Packets only partly sent are never followed by another one (the
+    // host's checks of that hold in this build).
+    while pair.host.viewers() > 0 {
+        assert!(began.elapsed() < Duration::from_secs(20), "still a viewer");
+        n += 1;
+        pair.host.set_cursor(&large).unwrap();
+        pair.host
+            .set_text_field(&crate::wire::TextField {
+                state: 1,
+                x: n,
+                y: 2,
+                width: 0,
+                height: 20,
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        let _ = pair.host.send_frame(b"key", 0, 0, true);
+    }
+    pair.until(|| pair.said("stopped showing the picture to air"));
+}
+
+#[test]
 fn a_frame_does_not_wait_for_a_viewer_whose_own_thread_holds_its_connection() {
     let pair = pair();
     let book = pair.another_device("book");

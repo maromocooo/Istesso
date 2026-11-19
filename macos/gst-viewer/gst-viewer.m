@@ -872,15 +872,17 @@ static BOOL force_preedit_strip = NO;
 // host has the keyboard and this window takes keys, so that other applications on this Mac
 // cannot see the keystrokes. Always let go: when that ends, and when the program ends (atexit;
 // the window's end and the stop signals end the program through exit()).
-static BOOL secure_input_on = NO;
+// Atomic: the handler at exit may run on another thread than the main one.
+static atomic_bool secure_input_on = false;
 
 static void secure_input(BOOL on) {
-    if (on && !secure_input_on) {
-        EnableSecureEventInput();
-        secure_input_on = YES;
-    } else if (!on && secure_input_on) {
-        DisableSecureEventInput();
-        secure_input_on = NO;
+    bool was = !on;
+    if (atomic_compare_exchange_strong(&secure_input_on, &was, on ? true : false)) {
+        if (on) {
+            EnableSecureEventInput();
+        } else {
+            DisableSecureEventInput();
+        }
     }
 }
 
@@ -1778,6 +1780,25 @@ static BOOL send_text_datagram(const char *packet, size_t length) {
     [super viewWillMoveToWindow:window];
 }
 
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    if (self.window == nil) {
+        return;
+    }
+    // The candidates' place is in screen points: asked again when the window moves or changes
+    // size.
+    for (NSNotificationName name in @[ NSWindowDidMoveNotification, NSWindowDidResizeNotification ]) {
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(windowPlaceChanged)
+                                                   name:name
+                                                 object:self.window];
+    }
+}
+
+- (void)windowPlaceChanged {
+    [self.inputContext invalidateCharacterCoordinates];
+}
+
 // A password field of the host (field state 2): plain keys only, as on this Mac, without the
 // input method (Latin input sources only), no composing text and no strip; Secure Event Input
 // while this window takes keys.
@@ -1884,10 +1905,10 @@ static NSString *plain_text(id value) {
 - (void)clearInlinePreedit {
     if (_preeditSent) {
         _preeditSent = NO;
-        if (host_takes_preedit) {
-            const char clear[] = "{\"kind\":\"preedit\",\"text\":\"\",\"cursor\":[0,0]}";
-            send_text_datagram(clear, sizeof clear - 1);
-        }
+        // Also when the host has just said it takes no more: the relay drops it then, and it
+        // costs nothing; otherwise the application would go on showing a stale composition.
+        const char clear[] = "{\"kind\":\"preedit\",\"text\":\"\",\"cursor\":[0,0]}";
+        send_text_datagram(clear, sizeof clear - 1);
     }
 }
 

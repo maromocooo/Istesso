@@ -836,8 +836,9 @@ impl Shared {
                 return Offered::Written;
             }
         }
-        // So does the text field (trial only; never set, nothing happens here).
-        if self.field_due(watcher) == Some(Duration::ZERO) {
+        // So does the text field (trial only; never set, nothing happens here), but only on a
+        // connection with nothing left half sent: the cursor may have gone out only in part.
+        if line.unsent_since.is_none() && self.field_due(watcher) == Some(Duration::ZERO) {
             if let Err(err) = self.tell_field(watcher, &mut line) {
                 drop(line);
                 self.close(watcher, &err);
