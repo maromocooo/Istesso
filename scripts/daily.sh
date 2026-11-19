@@ -22,7 +22,8 @@
 #                                     chrome 4: picture 4793N, input 4794N; 4:2:0, 72 fps, WxH as AURA
 #                                     asks, 1920x1080 if not said), with the trial identity AURA is
 #                                     paired with; at most 3 at once; nothing is shown here.
-#                                     --min-qp N: the encoder's quality floor (below)
+#                                     --min-qp N: the encoder's quality floor (18 if not said, 0 is
+#                                     off; below)
 #   scripts/daily.sh list             what is open, and in which state
 #   scripts/daily.sh close NAME [--for aura]
 #                                     ask the application to close its windows; one that is still
@@ -99,11 +100,12 @@
 #   DAILY_MAC_CONFIG, DAILY_HOST_CONFIG
 #                       identity and paired devices of a pair made for the check (the istesso-media
 #                       example `picture pair`): this Mac's own and the host's own are not used
-#   DAILY_MIN_QP=N      a quality floor for the encoder of an application started now (min-qp-i,
-#                       -p and -b all N, 0-51; also `open ... --min-qp N`): a picture that stands
-#                       still is encoded in very few bytes. Trial only: the pipeline is then started
-#                       through scripts/daily-pipeline.py, which gives the encoder the floor without
-#                       changing scripts/m1-step3-host.py; without it, the start is the old one
+#   DAILY_MIN_QP=N      the quality floor for the encoder of an application started now (min-qp-i,
+#                       -p and -b all N, 1-51; also `open ... --min-qp N`): 18 when not said, so
+#                       that a picture that stands still is encoded in very few bytes; 0 switches
+#                       it off. Trial only: with a floor the pipeline is started through
+#                       scripts/daily-pipeline.py, which gives the encoder the floor without changing
+#                       scripts/m1-step3-host.py; with 0 the start is the old one
 #   DAILY_AURA_CONFIG   the trial identity of the host that AURA is paired with (only read;
 #                       default ~/.cache/istesso-aura-trial/config on the host)
 #   DAILY_BLENDER_CONFIG
@@ -855,27 +857,42 @@ PREFS
         # MOZ_CRASHREPORTER_DISABLE: no crash reporter at all.
         app="env XDG_CONFIG_HOME=$home/config XDG_CACHE_HOME=$home/cache XDG_DATA_HOME=$home/data XDG_STATE_HOME=$home/state GSETTINGS_BACKEND=keyfile MOZ_CRASHREPORTER_DISABLE=1 $firefox --no-remote --profile $profile${doc:+ $doc}" ;;
     blender)
-        blender=$BLENDER
+        blender=$(eval echo "$BLENDER")
         [ -n "$blender" ] || blender=$(command -v blender)
         [ -n "$blender" ] || { [ -x "$HOME/.local/opt/blender/blender" ] && blender=$HOME/.local/opt/blender/blender; }
         [ -n "$blender" ] || blender=$(ls -d "$HOME"/*/blender-*-linux-x64/blender 2>/dev/null | sort | tail -1)
         [ -x "$blender" ] || { echo "fail blender was not found (DAILY_BLENDER)"; exit 1; }
         version=$(timeout 60 "$blender" --version 2>/dev/null | sed -n 's/^Blender \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
         [ -n "$version" ] || { echo "fail blender did not say its version"; exit 1; }
-        # Its settings: a copy of the owner's normal settings, taken once into the trial's folder
-        # and used from then on, never copied over again; the owner's own folder is only read. A
-        # check gives a folder of its own instead (DAILY_BLENDER_CONFIG), copied the same way.
+        # Its settings are the trial's own (the owner's decision, 2026-11-19). Only the very first
+        # start, when the trial has no settings of Blender's at all, takes a copy of the owner's
+        # normal settings (read only). From then on they are never copied again: not by `setup`, a
+        # rebuild, another compositor plugin, nor a new version of Blender, and what is changed
+        # inside the trial stays. A new version of Blender gets its folder from the trial's own
+        # folder of the newest earlier version, never from the owner's. A check gives a folder of
+        # its own instead (DAILY_BLENDER_CONFIG), which is treated the same way.
         settings=$D/apps/blender/config
         [ -n "$BLENDER_CONFIG" ] && settings=$(eval echo "$BLENDER_CONFIG")
         normal=$HOME/.config/blender/$version/config
-        if [ ! -e "$settings/copied-$version" ]; then
-            mkdir -p "$settings/blender/$version"
-            if [ -d "$normal" ] && [ ! -e "$settings/blender/$version/config" ]; then
-                cp -a "$normal" "$settings/blender/$version/config" || { echo "fail the owner's settings of Blender $version could not be copied"; exit 1; }
-                echo "$(date '+%Y-%m-%d %H:%M:%S') copied once from the owner's normal settings of Blender $version" > "$settings/copied-$version"
-                echo "host: Blender $version: the owner's normal settings were copied, once, into the trial's folder; that copy is used from now on"
+        mine=$settings/blender/$version/config
+        if [ ! -d "$mine" ]; then
+            mkdir -p "$settings/blender"
+            previous=$(ls -d "$settings"/blender/*/config 2>/dev/null | grep -v "/blender/$version/config\$" | sort -V | tail -1)
+            started=$(ls "$settings"/started-from-normal "$settings"/copied-* 2>/dev/null | head -1)
+            if [ -n "$previous" ]; then
+                from=$(basename "$(dirname "$previous")")
+                mkdir -p "$(dirname "$mine")"
+                cp -a "$previous" "$mine" || { echo "fail the trial's settings of Blender $from could not be copied for $version"; exit 1; }
+                echo "$(date '+%Y-%m-%d %H:%M:%S') Blender $version: made from the trial's own settings of Blender $from" >> "$settings/history"
+                echo "host: Blender $version: its settings were made from the trial's own settings of Blender $from (not from the owner's normal ones)"
+            elif [ -z "$started" ] && [ -d "$normal" ]; then
+                mkdir -p "$(dirname "$mine")"
+                cp -a "$normal" "$mine" || { echo "fail the owner's settings of Blender $version could not be copied"; exit 1; }
+                echo "$(date '+%Y-%m-%d %H:%M:%S') copied once from the owner's normal settings of Blender $version" > "$settings/started-from-normal"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') Blender $version: copied once from the owner's normal settings" >> "$settings/history"
+                echo "host: Blender $version: the owner's normal settings were copied, once, into the trial's folder; from now on the trial keeps its own"
             else
-                echo "$(date '+%Y-%m-%d %H:%M:%S') nothing copied: no normal settings of Blender $version, or a folder there already" > "$settings/copied-$version"
+                echo "host: Blender $version starts on the trial's own settings folder, which it makes itself (nothing is copied)"
             fi
         fi
         # The owner's own settings file as it is now: whenever this Blender ends, it is looked at again.
@@ -1092,7 +1109,9 @@ remember_settings() { # FOLDER
 
 do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
     name=${1:-}; shift
-    for_whom="" document="" min_qp=${DAILY_MIN_QP:-}
+    # The encoder's quality floor is 18 unless said otherwise (the owner's eye check, 2026-11-19);
+    # 0 switches it off, and the pipeline starts the old way.
+    for_whom="" document="" min_qp=${DAILY_MIN_QP:-18}
     while [ $# -gt 0 ]; do
         case "$1" in
         --for) for_whom=${2:-}; shift 2 ;;
@@ -1111,6 +1130,7 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
     esac
     [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { echo "error: --size is WIDTHxHEIGHT"; exit 2; }
     [ -z "$min_qp" ] || { [[ "$min_qp" =~ ^[0-9]+$ ]] && [ "$min_qp" -le 51 ]; } || { echo "error: --min-qp (DAILY_MIN_QP) is a number from 0 to 51"; exit 2; }
+    [ "$min_qp" = 0 ] && min_qp=""
     width=${size%x*}; height=${size#*x}
     refuse_when_busy
     if [ "$for_whom" = aura ]; then open_for_aura; return; fi
