@@ -18,8 +18,11 @@ struct Registration {
     folder: PathBuf,
 }
 
+/// A project name is typed as one word in later commands, so it must not
+/// look like an option (`-x`) or a path (`.`, `..`, `.hidden`).
 pub fn validate_name(name: &str) -> Result<(), String> {
     if (1..=64).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
         && name
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
@@ -27,7 +30,8 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(
-            "use 1 to 64 ASCII letters, digits, hyphens, underscores or dots for the project name"
+            "use 1 to 64 ASCII letters, digits, hyphens, underscores or dots for the project \
+             name, starting with a letter or digit"
                 .into(),
         )
     }

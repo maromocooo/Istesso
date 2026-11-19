@@ -29,11 +29,24 @@ impl Drop for Fixture {
 fn register_validates_names_and_folders() {
     let fixture = Fixture::new("validation");
     let paths = fixture.paths();
-    for name in ["", "two words", "a/b", "a\\b", "é", &"a".repeat(65)] {
+    for name in [
+        "",
+        "two words",
+        "a/b",
+        "a\\b",
+        "é",
+        &"a".repeat(65),
+        ".",
+        "..",
+        ".hidden",
+        "-demo",
+        "--json",
+        "_x",
+    ] {
         assert!(projects::add(&paths, name, &fixture.0).is_err());
         assert!(projects::remove(&paths, name).is_err());
     }
-    for name in [".", "..", "Az09-_.", &"a".repeat(64)] {
+    for name in ["a", "9", "Az09-_.", &"a".repeat(64)] {
         projects::add(&paths, name, &fixture.0).unwrap();
         projects::remove(&paths, name).unwrap();
     }
