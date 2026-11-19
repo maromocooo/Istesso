@@ -1,0 +1,475 @@
+Committed text for the client that has the keyboard (Istesso's ADR 0007, "確定した文字", and
+ADR 0020, route d): the compositor offers zwp_text_input_v3 to its clients, without an input
+method, and the custom upstream event TextCommit (text=string) hands a piece of committed text to
+the enabled text input of the client that has the keyboard (commit_string, then done). A client
+without an enabled text input gets printable ASCII as key presses (US layout; on another layout
+only letters, digits and the space); anything else is dropped. The text is never logged, only
+how many characters went which way.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86, on top of gst-wayland-display-render-on-commit.patch,
+gst-wayland-display-cursor-messages.patch, gst-wayland-display-windows.patch,
+gst-wayland-display-dialogs.patch and gst-wayland-display-trial-windows.patch in this directory,
+in that order (its name sorts after trial-windows on purpose). The lines of context are from that
+project and from those patches.
+
+FOR TRIALS AND EVERYDAY USE ONLY. It is not in the build the M1 gate and verdict measure, and it
+does not go into main before a review (it touches the input path and input rights).
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 5dafbc7..8d36da5 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -220,6 +220,12 @@ impl EventHandler for WaylandDisplaySrc {
+                         },
+                     ));
+ 
++                    return true;
++                } else if structure.has_name("TextCommit") {
++                    // Trial only: committed text (never logged).
++                    if let Ok(text) = structure.get::<String>("text") {
++                        let _ = self.command_tx.send(Command::TextCommit(text));
++                    }
+                     return true;
+                 } else if structure.has_name("TouchDown") {
+                     let x = structure.get::<f64>("x").expect("Should contain x");
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 8007d2c..6a3c352 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -175,6 +175,9 @@ pub struct State {
+     pub shm_state: ShmState,
+     viewporter_state: ViewporterState,
+     pub(crate) activation_state: XdgActivationState,
++    /// Trial only: the clients' text inputs, for committed text.
++    pub(crate) text_inputs: crate::wayland::handlers::text_input::TextInputs,
++    _text_input_global: smithay::reexports::wayland_server::backend::GlobalId,
+     /// The last key presses and button presses, for telling an activation token that comes
+     /// of one from one made at will.
+     pub(crate) input_serials: windows::InputSerials<ClientId>,
+@@ -218,6 +221,7 @@ impl State {
+         let shell_state = XdgShellState::new::<State>(&dh);
+         let viewporter_state = ViewporterState::new::<State>(&dh);
+         let activation_state = XdgActivationState::new::<State>(&dh);
++        let text_input_global = crate::wayland::handlers::text_input::TextInputs::global(&dh);
+         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+ 
+         let render_node: Option<DrmNode> = render_target.clone().into();
+@@ -319,6 +323,8 @@ impl State {
+             shm_state,
+             viewporter_state,
+             activation_state,
++            text_inputs: Default::default(),
++            _text_input_global: text_input_global,
+             input_serials: windows::InputSerials::default(),
+             pointer_window_at: None,
+             keyboard_holder: None,
+@@ -1242,6 +1248,9 @@ pub(crate) fn init(
+                         };
+                     }
+                 }
++                Event::Msg(Command::TextCommit(text)) => {
++                    state.commit_text(&text);
++                }
+                 Event::Msg(Command::CloseWindows) => {
+                     let asked = state.close_windows();
+                     tracing::info!(asked, "Asked the windows to close.");
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index e307e15..442eb42 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -60,6 +60,9 @@ pub enum Command {
+     /// Tell the sink how many windows the clients have, now and whenever that changes; with
+     /// `None`, nobody.
+     WindowSink(Option<WindowSink>),
++    /// Trial only: committed text for the client that has the keyboard (its text input, or
++    /// printable ASCII as keys).
++    TextCommit(String),
+     Quit,
+ }
+ 
+diff --git a/wayland-display-core/src/wayland/handlers/mod.rs b/wayland-display-core/src/wayland/handlers/mod.rs
+index b764f27..67b820f 100644
+--- a/wayland-display-core/src/wayland/handlers/mod.rs
++++ b/wayland-display-core/src/wayland/handlers/mod.rs
+@@ -7,6 +7,7 @@ pub mod presentation;
+ pub mod relative_pointer;
+ pub mod seat;
+ pub mod shm;
++pub mod text_input;
+ pub mod viewporter;
+ pub mod wl_drm;
+ pub mod xdg;
+diff --git a/wayland-display-core/src/wayland/handlers/seat.rs b/wayland-display-core/src/wayland/handlers/seat.rs
+index b0ef369..8583d4b 100644
+--- a/wayland-display-core/src/wayland/handlers/seat.rs
++++ b/wayland-display-core/src/wayland/handlers/seat.rs
+@@ -18,6 +18,11 @@ impl SeatHandler for State {
+ 
+     fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
+         self.tell_windows_which_is_active(focus);
++        let surface = focus.map(|target| match target {
++            FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().clone(),
++            FocusTarget::Popup(p) => p.wl_surface().clone(),
++        });
++        self.text_inputs.focus_changed(surface);
+         if let Some(surface) = focus {
+             let client = match surface {
+                 FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
+diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
+new file mode 100644
+index 0000000..d8c0927
+--- /dev/null
++++ b/wayland-display-core/src/wayland/handlers/text_input.rs
+@@ -0,0 +1,351 @@
++//! Trial only: committed text for the client that has the keyboard (Istesso's ADR 0007,
++//! "確定した文字", and ADR 0020, route d). The device a person types on composes the text with
++//! its own input method and sends only what was committed; here it is handed to the text input
++//! (`zwp_text_input_v3`) of the client that has the keyboard, when that client has enabled one.
++//! There is no input method on this side, so this is not Smithay's text-input module (which
++//! passes everything on to an input method and drops it without one).
++//!
++//! A client without an enabled text input gets printable ASCII as key presses of the US layout;
++//! other text is dropped. The text itself is never logged: only how many characters went which
++//! way.
++
++use smithay::backend::input::KeyState;
++use smithay::input::keyboard::Keycode;
++use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
++    zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
++    zwp_text_input_v3::{self, ZwpTextInputV3},
++};
++use smithay::reexports::wayland_server::{
++    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
++    backend::{ClientId, GlobalId, ObjectId},
++    protocol::wl_surface::WlSurface,
++};
++
++use crate::comp::State;
++
++/// The most characters of one piece of committed text (ADR 0007).
++pub const MOST_CHARS: usize = 256;
++/// The most bytes (UTF-8) of one piece of committed text (ADR 0007).
++pub const MOST_BYTES: usize = 1024;
++
++/// Whether a piece of committed text may be handed on: not empty, within the limits, and
++/// without control characters.
++pub fn acceptable(text: &str) -> bool {
++    !text.is_empty()
++        && text.len() <= MOST_BYTES
++        && text.chars().count() <= MOST_CHARS
++        && !text.chars().any(char::is_control)
++}
++
++/// The key (Linux number) and whether Shift goes with it, for a printable ASCII character on
++/// the US layout.
++pub fn us_key(c: char) -> Option<(u32, bool)> {
++    const LETTERS: [u32; 26] = [
++        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47,
++        17, 45, 21, 44,
++    ];
++    Some(match c {
++        'a'..='z' => (LETTERS[(c as u8 - b'a') as usize], false),
++        'A'..='Z' => (LETTERS[(c as u8 - b'A') as usize], true),
++        '1'..='9' => ((c as u8 - b'1') as u32 + 2, false),
++        '0' => (11, false),
++        '!' => (2, true),
++        '@' => (3, true),
++        '#' => (4, true),
++        '$' => (5, true),
++        '%' => (6, true),
++        '^' => (7, true),
++        '&' => (8, true),
++        '*' => (9, true),
++        '(' => (10, true),
++        ')' => (11, true),
++        ' ' => (57, false),
++        '-' => (12, false),
++        '_' => (12, true),
++        '=' => (13, false),
++        '+' => (13, true),
++        '[' => (26, false),
++        '{' => (26, true),
++        ']' => (27, false),
++        '}' => (27, true),
++        '\\' => (43, false),
++        '|' => (43, true),
++        ';' => (39, false),
++        ':' => (39, true),
++        '\'' => (40, false),
++        '"' => (40, true),
++        '`' => (41, false),
++        '~' => (41, true),
++        ',' => (51, false),
++        '<' => (51, true),
++        '.' => (52, false),
++        '>' => (52, true),
++        '/' => (53, false),
++        '?' => (53, true),
++        _ => return None,
++    })
++}
++
++const KEY_LEFTSHIFT: u32 = 42;
++
++/// The text inputs of all clients, and which surface has the keyboard.
++#[derive(Default)]
++pub struct TextInputs {
++    instances: Vec<Instance>,
++    focus: Option<WlSurface>,
++}
++
++struct Instance {
++    object: ZwpTextInputV3,
++    /// How many `commit` requests the client has made (the serial of `done`).
++    commits: u32,
++    /// What the client asked for since its last `commit`.
++    pending: Option<bool>,
++    enabled: bool,
++    /// The surface it was told it entered, if any.
++    entered: Option<WlSurface>,
++}
++
++fn same_client(a: &ObjectId, b: &ObjectId) -> bool {
++    a.same_client_as(b)
++}
++
++impl TextInputs {
++    pub fn global(dh: &DisplayHandle) -> GlobalId {
++        dh.create_global::<State, ZwpTextInputManagerV3, _>(1, ())
++    }
++
++    fn add(&mut self, object: ZwpTextInputV3) {
++        let mut instance = Instance {
++            object,
++            commits: 0,
++            pending: None,
++            enabled: false,
++            entered: None,
++        };
++        if let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) {
++            if same_client(&instance.object.id(), &focus.id()) {
++                instance.object.enter(focus);
++                instance.entered = Some(focus.clone());
++            }
++        }
++        self.instances.push(instance);
++    }
++
++    fn remove(&mut self, id: &ObjectId) {
++        self.instances.retain(|i| &i.object.id() != id);
++    }
++
++    fn instance(&mut self, object: &ZwpTextInputV3) -> Option<&mut Instance> {
++        self.instances.iter_mut().find(|i| &i.object == object)
++    }
++
++    /// The keyboard went to `surface` (or to nobody): the text inputs of the old one's client
++    /// are told they left, those of the new one's client that they entered.
++    pub fn focus_changed(&mut self, surface: Option<WlSurface>) {
++        let surface = surface.filter(|s| s.is_alive());
++        if self.focus == surface {
++            return;
++        }
++        for instance in &mut self.instances {
++            if let Some(old) = instance.entered.take() {
++                if old.is_alive() {
++                    instance.object.leave(&old);
++                }
++            }
++            // Until the client enables it again for the new surface.
++            instance.enabled = false;
++            instance.pending = None;
++        }
++        self.focus = surface;
++        if let Some(focus) = &self.focus {
++            for instance in &mut self.instances {
++                if same_client(&instance.object.id(), &focus.id()) {
++                    instance.object.enter(focus);
++                    instance.entered = Some(focus.clone());
++                }
++            }
++        }
++    }
++
++    /// Hands `text` to the enabled text input of the client that has the keyboard. False when
++    /// there is none.
++    pub fn commit(&mut self, text: &str) -> bool {
++        let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
++            return false;
++        };
++        let Some(instance) = self
++            .instances
++            .iter()
++            .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
++        else {
++            return false;
++        };
++        instance.object.commit_string(Some(text.to_string()));
++        instance.object.done(instance.commits);
++        true
++    }
++}
++
++impl State {
++    /// Committed text from the device (ADR 0007, "確定した文字"): to the enabled text input of
++    /// the client that has the keyboard; otherwise printable ASCII as keys; otherwise dropped.
++    pub fn commit_text(&mut self, text: &str) {
++        let chars = text.chars().count();
++        if !acceptable(text) {
++            tracing::info!(chars, "text dropped: not within the limits");
++            return;
++        }
++        if self.text_inputs.commit(text) {
++            tracing::info!(chars, "text delivered through text-input-v3");
++            return;
++        }
++        let keyboard = self.seat.get_keyboard().unwrap();
++        if keyboard.current_focus().is_none() {
++            tracing::info!(chars, "text dropped: nobody has the keyboard");
++            return;
++        }
++        // On another layout than US (XKB_DEFAULT_LAYOUT, as the everyday trial sets it) only the
++        // keys that are the same on it: letters, digits and the space.
++        let us = std::env::var("XKB_DEFAULT_LAYOUT").map_or(true, |l| l.is_empty() || l == "us");
++        let keys: Option<Vec<(u32, bool)>> = text
++            .chars()
++            .map(|c| if us || c.is_ascii_alphanumeric() || c == ' ' { us_key(c) } else { None })
++            .collect();
++        let Some(keys) = keys else {
++            tracing::info!(
++                chars,
++                "text dropped: the client with the keyboard has no text input enabled, and the text is not ASCII"
++            );
++            return;
++        };
++        let held = keyboard.modifier_state();
++        if held.shift || held.ctrl || held.alt || held.logo {
++            tracing::info!(chars, "text dropped: a modifier key is held");
++            return;
++        }
++        for (code, shift) in keys {
++            let time = std::time::Duration::from(self.clock.now()).as_millis() as u32;
++            if shift {
++                let key = self.scancode_to_keycode(KEY_LEFTSHIFT);
++                self.keyboard_input(time, key, KeyState::Pressed);
++            }
++            let key: Keycode = self.scancode_to_keycode(code);
++            self.keyboard_input(time, key, KeyState::Pressed);
++            self.keyboard_input(time, key, KeyState::Released);
++            if shift {
++                let key = self.scancode_to_keycode(KEY_LEFTSHIFT);
++                self.keyboard_input(time, key, KeyState::Released);
++            }
++        }
++        tracing::info!(chars, "text delivered as keys");
++    }
++}
++
++impl GlobalDispatch<ZwpTextInputManagerV3, ()> for State {
++    fn bind(
++        _: &mut State,
++        _: &DisplayHandle,
++        _: &Client,
++        resource: New<ZwpTextInputManagerV3>,
++        _: &(),
++        data_init: &mut DataInit<'_, State>,
++    ) {
++        data_init.init(resource, ());
++    }
++}
++
++impl Dispatch<ZwpTextInputManagerV3, ()> for State {
++    fn request(
++        state: &mut State,
++        _: &Client,
++        _: &ZwpTextInputManagerV3,
++        request: zwp_text_input_manager_v3::Request,
++        _: &(),
++        _: &DisplayHandle,
++        data_init: &mut DataInit<'_, State>,
++    ) {
++        match request {
++            zwp_text_input_manager_v3::Request::GetTextInput { id, .. } => {
++                let object = data_init.init(id, ());
++                state.text_inputs.add(object);
++            }
++            zwp_text_input_manager_v3::Request::Destroy => {}
++            _ => {}
++        }
++    }
++}
++
++impl Dispatch<ZwpTextInputV3, ()> for State {
++    fn request(
++        state: &mut State,
++        _: &Client,
++        resource: &ZwpTextInputV3,
++        request: zwp_text_input_v3::Request,
++        _: &(),
++        _: &DisplayHandle,
++        _: &mut DataInit<'_, State>,
++    ) {
++        match request {
++            zwp_text_input_v3::Request::Enable => {
++                if let Some(instance) = state.text_inputs.instance(resource) {
++                    instance.pending = Some(true);
++                }
++            }
++            zwp_text_input_v3::Request::Disable => {
++                if let Some(instance) = state.text_inputs.instance(resource) {
++                    instance.pending = Some(false);
++                }
++            }
++            zwp_text_input_v3::Request::Commit => {
++                if let Some(instance) = state.text_inputs.instance(resource) {
++                    instance.commits = instance.commits.wrapping_add(1);
++                    if let Some(enable) = instance.pending.take() {
++                        // Only a text input that was told it entered a surface may be enabled.
++                        instance.enabled = enable && instance.entered.is_some();
++                    }
++                }
++            }
++            zwp_text_input_v3::Request::Destroy => {
++                state.text_inputs.remove(&resource.id());
++            }
++            // Surrounding text, content type, cursor rectangle: nothing on this side uses them.
++            _ => {}
++        }
++    }
++
++    fn destroyed(state: &mut State, _: ClientId, resource: &ZwpTextInputV3, _: &()) {
++        state.text_inputs.remove(&resource.id());
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn limits() {
++        assert!(acceptable("日本語"));
++        assert!(acceptable(&"あ".repeat(256)));
++        assert!(!acceptable(&"あ".repeat(257)));
++        assert!(!acceptable(&"a".repeat(1025)));
++        assert!(!acceptable(&"\u{1F600}".repeat(257)));
++        assert!(!acceptable(""));
++        assert!(!acceptable("a\nb"));
++        assert!(!acceptable("a\u{7f}"));
++        assert!(!acceptable("a\u{85}"));
++    }
++
++    #[test]
++    fn every_printable_ascii_character_has_a_key() {
++        for c in ' '..='~' {
++            assert!(us_key(c).is_some(), "{c:?}");
++        }
++        assert_eq!(us_key('a'), Some((30, false)));
++        assert_eq!(us_key('Z'), Some((44, true)));
++        assert_eq!(us_key('0'), Some((11, false)));
++        assert_eq!(us_key('?'), Some((53, true)));
++        assert_eq!(us_key('あ'), None);
++        assert_eq!(us_key('\t'), None);
++    }
++}
