@@ -193,7 +193,23 @@ do_open() {
     [ -z "$slot" ] || [[ "$slot" =~ ^[1-3]$ ]] || { echo "error: --slot is 1, 2 or 3"; exit 2; }
     [ -z "$for_whom" ] || [ "$for_whom" = aura ] || { echo "error: --for knows only aura"; exit 2; }
     refuse_when_busy
-    local name chroma=444 base_pic=47910 base_in=47920
+    local name chroma=444 base_pic=47910 base_in=47920 what="" start=""
+    if [ -z "$display" ]; then
+        # Only what the allow-list names (scripts/daily-mac-apps.txt and the owner's own list).
+        local entry
+        entry=$(cat "$repo/scripts/daily-mac-apps.txt" "$HOME/.config/istesso/daily-mac-apps.txt" 2>/dev/null | grep -v '^#' |
+            awk -v n="$(printf '%s' "$app" | tr 'A-Z' 'a-z')" 'tolower($1) == n {print $2, $3; exit}')
+        [ -n "$entry" ] || { echo "error: $app is not in the list of applications that may be opened (scripts/daily-mac-apps.txt, ~/.config/istesso/daily-mac-apps.txt)"; exit 2; }
+        what=${entry% *}; start=${entry#* }
+        [[ "$what" =~ ^[A-Za-z0-9._~/-]+$ ]] || { echo "error: the list's entry for $app is not a bundle id or a ~/ path"; exit 2; }
+        # A path written with _ for spaces (the list is split at spaces).
+        what=${what//_/ }
+        case "$start" in
+            document:txt | document:rtf) [ -n "$new_document" ] || new_document=${start#document:} ;;
+            new-window | as-is) ;;
+            *) echo "error: the list's start for $app is not document:KIND, new-window or as-is"; exit 2 ;;
+        esac
+    fi
     name=$(run_name "$app")
     [ -n "$display" ] && name=display
     if [ "$for_whom" = aura ]; then name="aura-$name"; chroma=420; base_pic=47930; base_in=47940; fps=${fps:-60}; fi
@@ -215,7 +231,8 @@ do_open() {
         [[ "$here_size" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]] && virtual_arg="--virtual-display $here_size@120"
     fi
     local target_args size_arg="--size $size"
-    if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$app")"; fi
+    if [ -n "$display" ]; then target_args="--display"; else target_args="--app $(printf '%q' "$what")"; fi
+    [ "$start" = new-window ] && target_args="$target_args --new-window"
     # The whole display keeps its own shape unless a size was asked for.
     [ -z "$size_given" ] && [ "$for_whom" != aura ] && size_arg=""
     # A new, empty document of the trial's own (EXT: its kind, e.g. txt), so that the application
@@ -268,9 +285,10 @@ else
         mkdir -p "\$D/documents"
         document=\$D/documents/\$NAME-\$(date +%Y%m%d-%H%M%S).$document_arg
         : > "\$document"
+        printf '%s\n' "\$document" > "\$run/document"
     fi
     set -- $target_args \${document:+--document "\$document"} --port \$port --config-dir "\$config" --control "\$run/control" --input-socket "\$run/rt/istesso/input.sock" \
-        $size_arg $virtual_arg --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
+        $size_arg $virtual_arg --virtual-slot \$slot --fps $fps --click-form $click_form --chroma $chroma --pid-file "\$run/host.number" --log $frames ${DAILY_HOST_EXTRA:-}
     if [ -n "${DAILY_HOST_DIRECT:-}" ]; then
         nohup "\$D/$bundle_name/Contents/MacOS/istesso-daily-host" "\$@" > "\$run/host.log" 2> "\$run/host.err" < /dev/null &
     else
@@ -454,7 +472,28 @@ do_close() {
     refuse_when_busy
     on_host <<HOST
 NAME=$name; run=\$D/run/\$NAME
-if still_runs "\$run/host.pid"; then
+H="\$D/$bundle_name/Contents/MacOS/istesso-daily-host"
+document=\$(cat "\$run/document" 2>/dev/null)
+if [ -n "\$document" ] && still_runs "\$run/host.pid"; then
+    # A document of the trial's own: its window is closed (never the application), and the file
+    # is deleted only once the window list shows that window no more (the owner's rule).
+    pid=\$(sed -n 's/.*"opened","pid":\([0-9]*\).*/\1/p' "\$run/host.log" | tail -1)
+    window=\$(sed -n 's/.*"shown","window":\([0-9]*\).*/\1/p' "\$run/host.log" | tail -1)
+    stop_written_down "\$run/host.pid"   # the window goes back from the virtual display
+    sleep 1
+    : > "\$run/close.out"
+    open -n -g --stdout "\$run/close.out" --stderr "\$run/close.out" "\$D/$bundle_name" --args --close-document "\$pid" "\$document"
+    for i in \$(seq 1 40); do [ -s "\$run/close.out" ] && break; sleep 0.1; done
+    sleep 0.5
+    if [ -n "\$window" ] && ! "\$H" --windows "\$pid" | grep -q "^window \$window "; then
+        case "\$document" in
+            "\$D"/documents/*-[0-9]*-[0-9]*.txt | "\$D"/documents/*-[0-9]*-[0-9]*.rtf) rm -f -- "\$document" && : > "\$run/document" && echo "host: \$NAME: the trial's document was closed, and then deleted" ;;
+            *) echo "host: \$NAME: the document is not one of the trial's: kept" ;;
+        esac
+    else
+        echo "host: \$NAME: its window is still there (\$(cat "\$run/close.out")): the document is kept; close it by hand"
+    fi
+elif still_runs "\$run/host.pid"; then
     if [ "\$NAME" != display ] && [ "\${NAME#aura-display}" = "\$NAME" ]; then
         tell \$NAME close
         for i in \$(seq 1 100); do still_runs "\$run/host.pid" || break; sleep 0.1; done

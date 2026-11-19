@@ -73,6 +73,12 @@ struct Settings {
     /// How long a virtual display stays after the last viewer left (it may come back).
     var virtualKeep: Double = 30
     var virtualNow = false
+    /// Which of several virtual displays this program's is (1-3): they are laid in a row from the
+    /// main display's bottom right corner, so that each touches the main one at most at a corner.
+    var virtualSlot = 1
+    /// Start with a new window of the application's own (Command-N to its process once it is in
+    /// front), never with what it opens by itself; the new window is the one shown.
+    var newWindow = false
 }
 
 func usage() -> Never {
@@ -136,6 +142,8 @@ func readSettings() -> Settings {
             s.virtualDisplay = (Int(parts[0]), Int(parts[1]), parts[2])
         case "--virtual-keep": s.virtualKeep = Double(number())
         case "--virtual-now": s.virtualNow = true
+        case "--virtual-slot": s.virtualSlot = max(1, min(3, number()))
+        case "--new-window": s.newWindow = true
         default: usage()
         }
     }
@@ -828,6 +836,13 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 /// bottom right corner (diagonally), so that the pointer does not wander onto it from an edge.
 func cornerOrigin(main: CGRect) -> CGPoint { CGPoint(x: main.maxX, y: main.maxY) }
 
+/// The place of the virtual display of slot N: in a row from that corner, each the receiver's
+/// width apart (slot 1 at the corner itself; the others touch only the one before them).
+func rowOrigin(main: CGRect, width: Double, slot: Int) -> CGPoint {
+    let corner = cornerOrigin(main: main)
+    return CGPoint(x: corner.x + Double(max(0, slot - 1)) * width, y: corner.y)
+}
+
 /// A window's place made to fit inside the visible area (kept as large as fits, moved inside).
 func fitInto(_ frame: CGRect, _ visible: CGRect) -> CGRect {
     let w = min(frame.width, visible.width), h = min(frame.height, visible.height)
@@ -1088,9 +1103,11 @@ final class VirtualScreen {
     private var display: CGVirtualDisplay?
     let size: CGSize
     let hertz: Double
-    init(width: Int, height: Int, hertz: Double) {
+    let slot: Int
+    init(width: Int, height: Int, hertz: Double, slot: Int = 1) {
         size = CGSize(width: width, height: height)
         self.hertz = hertz
+        self.slot = slot
     }
     var id: CGDirectDisplayID? { display?.displayID }
     var frame: CGRect? { id.map(CGDisplayBounds) }
@@ -1123,13 +1140,16 @@ final class VirtualScreen {
             tries += 1
             let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
             let modes = (CGDisplayCopyAllDisplayModes(id, options) as? [CGDisplayMode]) ?? []
-            if let hidpi = modes.first(where: { $0.width == Int(self.size.width) && $0.pixelWidth == Int(self.size.width) * 2 }) {
+            let pointsWide: Int = Int(self.size.width)
+            let pixelsWide: Int = pointsWide * 2
+            if let hidpi = modes.first(where: { (mode: CGDisplayMode) -> Bool in mode.width == pointsWide && mode.pixelWidth == pixelsWide }) {
                 timer.invalidate()
                 CGDisplaySetDisplayMode(id, hidpi, nil)
                 // Diagonal to the main display: for this program only (macOS undoes it when it ends).
                 var config: CGDisplayConfigRef?
                 if CGBeginDisplayConfiguration(&config) == .success, let config {
-                    let origin = cornerOrigin(main: CGDisplayBounds(CGMainDisplayID()))
+                    let mainBounds: CGRect = CGDisplayBounds(CGMainDisplayID())
+                    let origin: CGPoint = rowOrigin(main: mainBounds, width: Double(self.size.width), slot: self.slot)
                     CGConfigureDisplayOrigin(config, id, Int32(origin.x), Int32(origin.y))
                     CGCompleteDisplayConfiguration(config, .forAppOnly)
                 }
@@ -1562,6 +1582,7 @@ func selfTest() -> Never {
     }
     let mainDisplay = CGRect(x: 0, y: 0, width: 3440, height: 1440)
     checkPanel(cornerOrigin(main: mainDisplay) == CGPoint(x: 3440, y: 1440), true, "virtual display: touches the main one at its bottom right corner only")
+    checkPanel(rowOrigin(main: mainDisplay, width: 1710, slot: 2) == CGPoint(x: 5150, y: 1440), true, "virtual display 2: in the row, touching only the first")
     let visibleMain = CGRect(x: 0, y: 25, width: 3440, height: 1415)
     checkPanel(fitInto(CGRect(x: 5000, y: 2000, width: 600, height: 400), visibleMain) == CGRect(x: 2840, y: 1040, width: 600, height: 400), true, "back: a place now off every display is fitted into the main one")
     checkPanel(fitInto(CGRect(x: 10, y: 0, width: 5000, height: 400), visibleMain) == CGRect(x: 0, y: 25, width: 3440, height: 400), true, "back: too large is made as large as fits")
@@ -2420,11 +2441,29 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             return quit(0)
         }
         let all = windowList(onScreenOnly: false).filter { $0.pid == app.processIdentifier && $0.layer == 0 && $0.bounds.width > 40 && $0.bounds.height > 40 }
+        if settings.newWindow {
+            if windowsAtOpen == nil { windowsAtOpen = Set(all.map(\.id)) }
+            if !askedNewWindow, appInFront(), injector.mayPost {
+                // Command-N, to the application's process only.
+                askedNewWindow = true
+                for (key, down) in [(UInt16(0x37), true), (UInt16(0x2d), true), (UInt16(0x2d), false), (UInt16(0x37), false)] {
+                    if let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down) {
+                        event.flags = down || key == 0x2d ? .maskCommand : []
+                        if key == 0x37 { event.type = .flagsChanged }
+                        event.postToPid(app.processIdentifier)
+                    }
+                }
+            }
+            // Until the new window is there, nothing is shown.
+            guard all.contains(where: { !(windowsAtOpen?.contains($0.id) ?? true) }) else { return }
+        }
         if all.count != windowCount {
             windowCount = all.count
             say("windows", [("count", all.count)])
         }
-        let shown = all.filter { $0.onScreen && $0.alpha > 0.05 }
+        var shown = all.filter { $0.onScreen && $0.alpha > 0.05 }
+        // With a new window asked for, only windows that came after the start are shown.
+        if settings.newWindow, let before = windowsAtOpen { shown = shown.filter { !before.contains($0.id) } }
         // Keep the window shown so far while it is there; else the largest one.
         let chosen = shown.first { $0.id == windowId } ?? shown.max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
         guard let chosen else { return }
@@ -2435,6 +2474,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         }
         if chosen.id != windowId {
             windowId = chosen.id
+            // Which window is shown (its number only): the close path checks it is gone before
+            // the trial's own document is deleted.
+            say("shown", [("window", Int(chosen.id))])
             windowBounds = .zero
             if settings.fitWindow && settings.size != nil { fit(chosen) }
         }
@@ -2944,6 +2986,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// The virtual display of the application form, and the place each window had before it was
     /// moved there (to put it back).
     var virtualScreen: VirtualScreen?
+    var windowsAtOpen: Set<CGWindowID>?
+    var askedNewWindow = false
     var makingVirtual = false
     var movedFrom: [CGWindowID: CGRect] = [:]
 
@@ -2956,7 +3000,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let viewed = transport.viewers > 0 || settings.virtualNow
         if viewed && !screenLocked() && virtualScreen == nil && !makingVirtual {
             makingVirtual = true
-            let screen = VirtualScreen(width: spec.width, height: spec.height, hertz: spec.hertz)
+            let screen = VirtualScreen(width: spec.width, height: spec.height, hertz: spec.hertz, slot: settings.virtualSlot)
             screen.make { frame in
                 self.makingVirtual = false
                 guard let frame else { return note("the virtual display could not be made: the window stays where it is") }
@@ -3180,7 +3224,18 @@ for name in [SIGTERM, SIGINT] {
     let source = DispatchSource.makeSignalSource(signal: name, queue: .main)
     source.setEventHandler {
         daily.injector.releaseAll()
-        exit(0)
+        // A stop: the windows go back where they were and the virtual display away, then the end.
+        if daily.virtualScreen != nil {
+            daily.moveWindowsBack()
+            daily.lookout.queue.async {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    daily.virtualScreen?.remove()
+                    exit(0)
+                }
+            }
+        } else {
+            exit(0)
+        }
     }
     source.resume()
     signalSources.append(source)
