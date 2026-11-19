@@ -1,5 +1,7 @@
 # Istesso
 
+**English** · [日本語](README.ja.md) · [简体中文](README.zh-Hans.md) · [한국어](README.ko.md) · [Español](README.es.md)
+
 Istesso shows apps that run on your other computers as ordinary windows on the one in front of you, over its own encrypted channel. Its one rule: if it feels remote, even slightly, it has failed.
 
 <!-- Picture to come (docs/images/): part of one screen with three windows that look the same — an app
