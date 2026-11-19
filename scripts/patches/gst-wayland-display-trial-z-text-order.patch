@@ -21,6 +21,12 @@ ADR 0015, "文字の入力の欄"). Trial only.
 - wayland.text-input gains `serial`: one more (mod 256) whenever another field (the surface with
   the keyboard and its enabled text input), or the same one enabled again, has the keyboard; the
   device ends its composition when it changes.
+- After a click or a key that may move the focus (Tab, Return, arrows, Home, End, Page Up and
+  Down, Escape, function keys, keys with Control, Alt or Super), the field is told again 150 ms
+  later even when it did not change: the device sends plain keys outside a field only while its
+  latest notice is newer than such a move (seen in the owner's hands-on: after a click on an
+  empty part of a page the device kept its input method, and Space went as composed text that
+  had nowhere to go).
 - "Not in a field" is told only after it has held for 100 ms: between two fields a client says
   it briefly (Tab, Control+L, a click), and the device would send the first keys after it
   without its input method. A field or a password field is told at once.
@@ -156,10 +162,10 @@ index 9d884af..93f8895 100644
              let client = match surface {
                  FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
 diff --git a/wayland-display-core/src/wayland/handlers/text_input.rs b/wayland-display-core/src/wayland/handlers/text_input.rs
-index 18846af..8928fc8 100644
+index 18846af..864b86f 100644
 --- a/wayland-display-core/src/wayland/handlers/text_input.rs
 +++ b/wayland-display-core/src/wayland/handlers/text_input.rs
-@@ -124,28 +124,47 @@ struct Instance {
+@@ -124,28 +124,49 @@ struct Instance {
  
  /// Told whenever the field with the keyboard changes: 0 none, 1 a field, 2 a password field;
  /// and the text cursor's rectangle in the output (x, y, width, height). Trial only.
@@ -183,6 +189,8 @@ index 18846af..8928fc8 100644
 +    /// fields a client says it briefly (Tab, Control+L, a click), and the device would send
 +    /// the first keys after it without its input method.
 +    three_pending: bool,
++    /// Counts the requests to tell the field again, so that only the last one does.
++    retell_generation: u64,
  }
  
 +/// How long "not in a field" has to hold before it is told.
@@ -211,7 +219,7 @@ index 18846af..8928fc8 100644
          }
      }
  }
-@@ -235,8 +254,40 @@ impl TextInputs {
+@@ -235,8 +256,40 @@ impl TextInputs {
              .then_some(focus)
      }
  
@@ -254,7 +262,7 @@ index 18846af..8928fc8 100644
      fn field(&self) -> (u32, Option<(i32, i32, i32, i32)>) {
          let Some(focus) = self.focus.as_ref().filter(|s| s.is_alive()) else {
              return (0, None);
-@@ -247,6 +298,9 @@ impl TextInputs {
+@@ -247,6 +300,9 @@ impl TextInputs {
              .find(|i| i.enabled && i.entered.as_ref() == Some(focus))
          {
              Some(i) => (if i.secret { 2 } else { 1 }, i.rect),
@@ -264,10 +272,27 @@ index 18846af..8928fc8 100644
              None => (0, None),
          }
      }
-@@ -308,6 +362,14 @@ impl TextInputs {
+@@ -308,6 +364,31 @@ impl TextInputs {
  impl State {
      /// Tells the sink, if there is one, about the field with the keyboard: where its text
      /// cursor is in the output, for the device to put its input method's candidates there.
++    /// Tells the field again 150 ms from now, also when it is as it was (see `note_sent`).
++    pub(crate) fn retell_field_soon(&mut self) {
++        self.text_input_report.retell_generation += 1;
++        let generation = self.text_input_report.retell_generation;
++        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++        let _ = self.handle.insert_source(
++            Timer::from_duration(std::time::Duration::from_millis(150)),
++            move |_, _, state| {
++                if state.text_input_report.retell_generation == generation {
++                    state.text_input_report.last = None;
++                    state.tell_text_input();
++                }
++                TimeoutAction::Drop
++            },
++        );
++    }
++
 +    /// The keyboard moved: nothing waits for the client that had it any more. What waited goes
 +    /// on the next turn of the loop (not from inside the keyboard's own handling).
 +    pub(crate) fn text_order_focus_moved(&mut self) {
@@ -279,7 +304,7 @@ index 18846af..8928fc8 100644
      pub fn tell_text_input(&mut self) {
          use smithay::wayland::seat::WaylandFocus;
          let (state, rect) = self.text_inputs.field();
-@@ -329,7 +391,24 @@ impl State {
+@@ -329,7 +410,24 @@ impl State {
                  }
              }
          }
@@ -305,7 +330,7 @@ index 18846af..8928fc8 100644
      }
  
      /// After the keyboard moved to a window: if a text input of its client entered it and has
-@@ -507,6 +586,9 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -507,6 +605,9 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                  }
              }
              zwp_text_input_v3::Request::Commit => {
@@ -315,7 +340,7 @@ index 18846af..8928fc8 100644
                  if let Some(instance) = state.text_inputs.instance(resource) {
                      instance.commits = instance.commits.wrapping_add(1);
                      if let Some(enable) = instance.pending.take() {
-@@ -539,6 +621,19 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
+@@ -539,6 +640,19 @@ impl Dispatch<ZwpTextInputV3, ()> for State {
                          );
                      }
                  }
@@ -335,7 +360,7 @@ index 18846af..8928fc8 100644
              }
              zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
                  if let Some(instance) = state.text_inputs.instance(resource) {
-@@ -618,3 +713,119 @@ mod tests {
+@@ -618,3 +732,135 @@ mod tests {
          assert_eq!(us_key('\t'), None);
      }
  }
@@ -370,6 +395,11 @@ index 18846af..8928fc8 100644
 +    client: Option<ClientId>,
 +    probe: bool,
 +    pub(crate) held: bool,
++}
++
++/// Keys that may move the focus: Tab, Return, the arrows, Home, End, Page Up and Down.
++fn moves_focus(scancode: u32) -> bool {
++    matches!(scancode, 15 | 28 | 96 | 102..=109)
 +}
 +
 +/// Keys that do not type or edit: Escape, F1 to F12, Print, Scroll Lock, Pause.
@@ -413,7 +443,18 @@ index 18846af..8928fc8 100644
 +    /// input: a key press (not a modifier) or text.
 +    pub(crate) fn note_sent(&mut self, command: &crate::Command) {
 +        use crate::Command;
-+        use smithay::backend::input::KeyState;
++        use smithay::backend::input::{ButtonState, KeyState};
++        // A click or a key that may move the focus: the field is told again a little later,
++        // even when it did not change, so that the device knows its notice is newer than the
++        // move (it sends plain keys outside a field only then; ADR 0007).
++        let moves = match command {
++            Command::PointerButton(_, ButtonState::Pressed) => true,
++            Command::KeyboardInput(code, KeyState::Pressed) => !types(*code) || moves_focus(*code) || self.chording(),
++            _ => false,
++        };
++        if moves {
++            self.retell_field_soon();
++        }
 +        if !matches!(self.text_inputs.field().0, 1 | 2) {
 +            self.text_order.waiting = None;
 +            return;
