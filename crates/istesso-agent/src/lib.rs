@@ -12,9 +12,13 @@
 //!   channel, and answers a device that asks for one.
 //! * [`workspace`] forwards the ports of such a shell's workspace to the
 //!   device that opened it, and passes on its requests to open a page.
+//! * [`mount`] shows a folder of this machine to another, read-only, over
+//!   the same channel.
 
 pub mod cache;
 pub mod discovery;
+#[cfg(unix)]
+pub mod mount;
 pub mod passing;
 pub mod paths;
 pub mod relay;

@@ -12,6 +12,7 @@
 //! * [`shell`] is what a conversation carries once it has become a shell.
 //! * [`forward`] is what it carries once it has become a forwarded
 //!   connection to a port of a shell's workspace.
+//! * [`mount`] is what it carries once it shows a folder, read-only.
 //!
 //! Addresses are never trusted. Whoever answers at an address has to pass the
 //! handshake, so a wrong or forged address (from discovery or from memory) can
@@ -24,11 +25,12 @@ pub mod client;
 pub mod forward;
 mod frame;
 pub mod message;
+pub mod mount;
 pub mod server;
 pub mod shell;
 
 pub use channel::{Channel, ChannelReader, ChannelWriter, LocalKeys};
-pub use client::{Client, ForwardAnswer, InputAnswer, ShellAnswer};
+pub use client::{Client, ForwardAnswer, InputAnswer, MountAnswer, ShellAnswer};
 pub use message::{ErrorCode, Request, Response, ShellRequest};
 pub use server::{HangUp, Session};
 
