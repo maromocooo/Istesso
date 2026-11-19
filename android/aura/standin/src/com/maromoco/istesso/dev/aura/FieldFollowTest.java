@@ -5,9 +5,35 @@ import static com.maromoco.istesso.dev.aura.FieldFollow.Act.*;
 
 public final class FieldFollowTest {
     static int failed;
+    static int count;
+
+    static void change(boolean want, boolean composing, boolean shown, int state, String what) {
+        count++;
+        if (FieldFollow.holdOnFieldChange(composing, shown, state) != want) {
+            failed++;
+            System.out.println("FAIL " + what);
+        }
+    }
+
+    static void commit(FieldFollow.Commit want, boolean open, boolean takes, int state, String what) {
+        count++;
+        if (FieldFollow.onCommit(open, takes, state) != want) {
+            failed++;
+            System.out.println("FAIL " + what);
+        }
+    }
+
+    static void unplaced(boolean want, int state, String what) {
+        count++;
+        if (FieldFollow.keepUnplaced(state) != want) {
+            failed++;
+            System.out.println("FAIL " + what);
+        }
+    }
 
     static void expect(FieldFollow.Act want, int state, boolean became, boolean typing, boolean manualOff, boolean auto,
             boolean takes, boolean resumed, String what) {
+        count++;
         FieldFollow.Act got = FieldFollow.decide(state, became, typing, manualOff, auto, takes, resumed);
         if (got != want) {
             failed++;
@@ -16,6 +42,7 @@ public final class FieldFollowTest {
     }
 
     static void hold(boolean want, boolean composing, int lastState, String what) {
+        count++;
         if (FieldFollow.holdOnClose(composing, lastState) != want) {
             failed++;
             System.out.println("FAIL " + what);
@@ -23,6 +50,7 @@ public final class FieldFollowTest {
     }
 
     static void place(boolean want, boolean held, int state, boolean takes, String what) {
+        count++;
         if (FieldFollow.canPlaceHeld(held, state, takes) != want) {
             failed++;
             System.out.println("FAIL " + what);
@@ -43,13 +71,27 @@ public final class FieldFollowTest {
         hold(true, true, 1, "composing when the field goes: kept on the panel");
         hold(false, false, 1, "nothing composed: nothing kept");
         hold(false, true, 2, "a password field: nothing of it kept");
+        hold(false, true, 0, "nothing known (Chrome's Tab into a password field): never kept");
+        change(true, true, false, 1, "another field, composition on the strip only: kept");
+        change(false, true, true, 1, "another field, composition shown in the host's app: the app commits it, not kept");
+        change(false, true, false, 2, "from a password field: not kept");
+        change(false, true, false, 0, "nothing known: not kept");
+        change(false, false, false, 1, "nothing composed: nothing kept");
+        commit(FieldFollow.Commit.SEND, true, true, 1, "open input, host takes text: sent");
+        commit(FieldFollow.Commit.SEND, true, true, 0, "open input, nothing known: sent as before");
+        commit(FieldFollow.Commit.HOLD, false, true, 1, "input reconnecting, plain field: kept on the panel");
+        commit(FieldFollow.Commit.DROP, false, true, 2, "input reconnecting, password field: never kept");
+        commit(FieldFollow.Commit.DROP, false, true, 0, "input reconnecting, nothing known: never kept");
+        unplaced(true, 1, "the host could not place text from a plain field: kept on the panel");
+        unplaced(false, 2, "nor from a password field: not kept");
+        unplaced(false, 0, "nor when nothing was known: not kept");
         place(true, true, 1, true, "kept text, a plain field again: may be put there");
         place(false, true, 2, true, "kept text, a password field: not put there");
         place(false, true, 3, true, "kept text, not in a field: waits");
         place(false, true, 0, true, "kept text, nothing known: waits");
         place(false, true, 1, false, "kept text, the host takes no text: waits");
         place(false, false, 1, true, "nothing kept: nothing to put");
-        System.out.println(failed == 0 ? "FieldFollow: all 19 cases pass" : "FieldFollow: " + failed + " failed");
+        System.out.println(failed == 0 ? "FieldFollow: all " + count + " cases pass" : "FieldFollow: " + failed + " of " + count + " failed");
         System.exit(failed == 0 ? 0 : 1);
     }
 }

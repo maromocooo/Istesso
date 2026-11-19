@@ -78,16 +78,20 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 manualOff = false; // another field: the keyboard follows the host again
             }
             // Another field has the keyboard over there, or the field became a password field:
-            // what is being composed here is dropped, never committed into it.
-            if ((fieldSerial >= 0 && serial != fieldSerial || toPassword) && view.composing()) {
+            // what is being composed here is never committed into it. Shown only on the strip,
+            // it is kept on the panel; shown inside the host's application, the application
+            // commits it into the old field itself, and it is let go here (not typed twice).
+            if ((otherSerial || toPassword) && view.composing()) {
+                boolean keep = FieldFollow.holdOnFieldChange(true, preeditSent, composeState);
                 clearInlinePreedit();
-                view.cancelComposing(imm);
+                String taken = view.takeComposing(imm);
+                committedComposeState = -1; // taken, not committed
+                if (keep) {
+                    hold(taken);
+                }
             }
             fieldState = state;
             fieldSerial = serial;
-            if (fieldActive()) {
-                lastActiveState = state;
-            }
             showHeld();
             boolean becameActive = fieldActive() && (!wasActive || otherSerial);
             // A password field: the input method is told so (no composing, nothing learnt).
@@ -99,11 +103,10 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             }
             // The host had nowhere to put the text just sent (its count went up within 3 s of
             // the commit; a count that went back, as after a restart of the host, says nothing).
-            if (resumed && fieldDropped >= 0 && dropped > fieldDropped && lastSent != null
+            // It goes onto the bar of kept text, from where it can be put into the next field.
+            if (fieldDropped >= 0 && dropped > fieldDropped && lastSent != null
                     && System.nanoTime() - lastSentNs < 3_000_000_000L) {
-                composingLine.setText(getString(R.string.text_dropped, lastSent));
-                composingLine.setVisibility(View.VISIBLE);
-                composingLine.postDelayed(() -> composingLine.setVisibility(View.GONE), 10000);
+                hold(lastSent);
                 lastSent = null;
             }
             fieldDropped = dropped;
@@ -264,10 +267,22 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 // Only to an agent that said it takes committed text (ADR 0007): one that does
                 // not could not read the message, keys and all. Otherwise it stays here.
                 clearInlinePreedit();
-                if (input != 0 && hostTakesText) {
-                    Native.inputText(input, text);
-                    lastSent = fieldState == 2 ? null : text;
-                    lastSentNs = System.nanoTime();
+                int typedIn = committedComposeState >= 0 ? committedComposeState : fieldState;
+                committedComposeState = -1;
+                long[] st = input == 0 ? null : Native.inputState(input);
+                boolean open = st != null && st[1] != 0;
+                switch (FieldFollow.onCommit(open, hostTakesText, typedIn)) {
+                    case SEND:
+                        Native.inputText(input, text);
+                        lastSent = FieldFollow.keepUnplaced(typedIn) ? text : null;
+                        lastSentNs = System.nanoTime();
+                        break;
+                    case HOLD:
+                        // The input is connecting again: the input library would drop it.
+                        hold(text);
+                        break;
+                    default:
+                        break;
                 }
             }
 
@@ -275,6 +290,13 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             public void composing(String text, int cursor) {
                 // Inside the host's application when it has a field and takes composing text
                 // (as the Air's viewer does); otherwise on the panel's strip only.
+                // The field the composition began in decides whether it may ever be kept.
+                if (!text.isEmpty() && composeState < 0) {
+                    composeState = fieldState;
+                } else if (text.isEmpty() && composeState >= 0) {
+                    committedComposeState = composeState;
+                    composeState = -1;
+                }
                 if (!text.isEmpty() && inline()) {
                     Native.inputPreedit(input, text, cursor, cursor);
                     preeditSent = true;
@@ -433,12 +455,14 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
                 // What is being composed is neither committed (there is no field over there to
                 // take it) nor dropped: it is kept on the panel, to be put into the next field
                 // (the owner, 2026-11-19: "a lost typed character is the worst").
-                if (FieldFollow.holdOnClose(view.composing(), lastActiveState)) {
+                if (view.composing()) {
+                    boolean keep = FieldFollow.holdOnClose(true, composeState);
                     clearInlinePreedit();
                     String taken = view.takeComposing(
                             (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE));
-                    if (!taken.isEmpty()) {
-                        heldText = heldText == null ? taken : heldText + taken;
+                    committedComposeState = -1; // taken, not committed
+                    if (keep) {
+                        hold(taken);
                     }
                 }
                 autoTyping = false;
@@ -454,8 +478,25 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
 
     /** Composing text kept when its field went away (never sent, never logged), or null. */
     private String heldText;
-    /** The state of the last field that had the keyboard (2: a password field). */
-    private int lastActiveState;
+    /** The field's state when the current composition began (-1: nothing composed). */
+    private int composeState = -1;
+    /** The same, for the composition that has just ended in a commit (-1: none). */
+    private int committedComposeState = -1;
+
+    /** Whether the input's conversation is open now (text sent otherwise would be dropped). */
+    private boolean inputOpen() {
+        long[] st = input == 0 ? null : Native.inputState(input);
+        return st != null && st[1] != 0;
+    }
+
+    /** Keeps text on the panel's bar (never sent, never logged). */
+    private void hold(String text) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        heldText = heldText == null ? text : heldText + text;
+        showHeld();
+    }
     private android.widget.LinearLayout heldBar;
     private TextView heldLine;
     private android.widget.Button heldPlace;
@@ -470,13 +511,13 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             return;
         }
         heldLine.setText(getString(R.string.held_text, heldText));
-        heldPlace.setEnabled(FieldFollow.canPlaceHeld(true, fieldState, hostTextKnown && hostTakesText) && input != 0);
+        heldPlace.setEnabled(FieldFollow.canPlaceHeld(true, fieldState, hostTextKnown && hostTakesText) && inputOpen());
         heldBar.setVisibility(View.VISIBLE);
     }
 
     /** Puts the kept text into the field that has the keyboard now, as committed text. */
     private void placeHeld() {
-        if (heldText == null || !FieldFollow.canPlaceHeld(true, fieldState, hostTextKnown && hostTakesText) || input == 0) {
+        if (heldText == null || !FieldFollow.canPlaceHeld(true, fieldState, hostTextKnown && hostTakesText) || !inputOpen()) {
             return;
         }
         clearInlinePreedit();
@@ -524,10 +565,12 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             clearInlinePreedit();
             // Whatever closes the keyboard (by hand, the panel going to the background, the field
             // going away), what is being composed is kept on the panel, not dropped.
-            if (FieldFollow.holdOnClose(view.composing(), lastActiveState) && imm != null) {
+            if (view.composing() && imm != null) {
+                boolean keep = FieldFollow.holdOnClose(true, composeState);
                 String taken = view.takeComposing(imm);
-                if (!taken.isEmpty()) {
-                    heldText = heldText == null ? taken : heldText + taken;
+                committedComposeState = -1; // taken, not committed
+                if (keep) {
+                    hold(taken);
                 }
             }
         }
@@ -729,6 +772,7 @@ public final class StreamActivity extends Activity implements SurfaceHolder.Call
             inputLine = getString(R.string.input_over) + (why == null || why.isEmpty() ? "" : "：" + why);
         } else if (s != null) {
             inputLine = s[1] != 0 ? getString(R.string.input_open) : getString(R.string.input_waiting);
+            showHeld(); // "put it here" follows whether the input is open
             if (s[1] != 0) {
                 boolean takes = s.length > 5 && s[5] != 0;
                 if (takes != hostTakesText) {

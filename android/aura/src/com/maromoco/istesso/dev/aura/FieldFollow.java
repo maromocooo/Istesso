@@ -23,8 +23,50 @@ final class FieldFollow {
      * whether what is being composed is kept on the panel (never committed into whatever has the
      * keyboard over there, never dropped). Not from a password field (nothing of it is kept).
      */
-    static boolean holdOnClose(boolean composing, int lastFieldState) {
-        return composing && lastFieldState != 2;
+    static boolean holdOnClose(boolean composing, int composeState) {
+        return composing && keepable(composeState);
+    }
+
+    /**
+     * Only text typed while the host said a plain field had the keyboard (state 1) is ever kept
+     * on the panel. A password field (2), and nothing known (0: e.g. Chrome when Tab moves into a
+     * password field, which it then does not say), are never kept: nothing typed into what may be
+     * a password field lands on the bar.
+     */
+    static boolean keepable(int state) {
+        return state == 1;
+    }
+
+    /**
+     * Another field has the keyboard over there, or the field became a password field, while
+     * something is composed here. Shown inside the host's application (preedit), the application
+     * commits it into the old field itself (Firefox does): it is not kept, or it would be typed
+     * twice. Shown only on the panel's strip, it would be lost: it is kept.
+     */
+    static boolean holdOnFieldChange(boolean composing, boolean preeditShownInHost, int composeState) {
+        return composing && !preeditShownInHost && keepable(composeState);
+    }
+
+    enum Commit {
+        /** To the host now. */
+        SEND,
+        /** Kept on the panel (the input is reconnecting: the input library would drop it). */
+        HOLD,
+        /** Neither (not a plain field: never kept). */
+        DROP
+    }
+
+    /** What becomes of committed text: sent when the input is open to a host that takes text. */
+    static Commit onCommit(boolean inputOpen, boolean takesText, int state) {
+        if (inputOpen && takesText) {
+            return Commit.SEND;
+        }
+        return keepable(state) ? Commit.HOLD : Commit.DROP;
+    }
+
+    /** Committed text the host had nowhere to put: kept on the panel when it was typed in a plain field. */
+    static boolean keepUnplaced(int sentState) {
+        return keepable(sentState);
     }
 
     /**
