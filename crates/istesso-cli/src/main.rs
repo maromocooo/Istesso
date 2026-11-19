@@ -411,6 +411,7 @@ fn run(cli: Cli) -> Result<(), String> {
             bind,
             port,
             discovery: !no_discovery,
+            follow_input_restarts: std::env::var_os("ISTESSO_DAILY_RECONNECT").is_some(),
             verbose,
             input_timings,
             ..AgentOptions::default()
@@ -545,36 +546,7 @@ fn relay_input(
             )
         })
     };
-    let began = std::time::Instant::now();
-    let mut said = false;
-    let client = loop {
-        match connect(Duration::from_secs(3)) {
-            Ok(client) => break client,
-            Err(why) if began.elapsed() < keep_trying => {
-                if !said {
-                    eprintln!("cannot reach the device yet ({why}); trying again");
-                    said = true;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(why) => return Err(why.to_string()),
-        }
-    };
-    let mut line = InputLine::open(client, connect)
-        .map_err(|(_, why)| format!("the device does not take input from here: {why}"))?;
-    // A socket left by an earlier run is in the way of a new one.
-    match std::fs::remove_file(socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot replace {}: {e}", socket.display())),
-    }
-    let listener = UnixDatagram::bind(socket)
-        .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
-    let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
-    println!(
-        "Input written to {} goes to the paired device.",
-        socket.display()
-    );
+    let daily = std::env::var_os("ISTESSO_DAILY_RECONNECT").is_some();
     // How often the conversation was cut is always said, also when it is 0: on standard
     // output, in the log of times if there is one, and in a small file next to the socket
     // for the program that shows the window.
@@ -595,17 +567,69 @@ fn relay_input(
         // Written beside and moved over, so that nobody reads half of it. Whoever reads
         // it checks that the process named in it still runs.
         let beside = state.with_extension("state.new");
-        let line = format!("{{\"pid\":{},\"input\":{cuts}}}\n", std::process::id());
+        let status = if daily {
+            format!(
+                ",\"reconnecting\":{}",
+                u8::from(matches!(event, "waiting" | "cut"))
+            )
+        } else {
+            String::new()
+        };
+        let line = format!(
+            "{{\"pid\":{},\"input\":{cuts}{status}}}\n",
+            std::process::id()
+        );
         if std::fs::write(&beside, line).is_ok() {
             let _ = std::fs::rename(&beside, &state);
         }
     };
-    tell("open", 0, None);
-    if !line.is_answered() {
-        eprintln!(
-            "note: the device is of a version that does not answer \"still here\"; a connection \
-             that goes silent is only noticed when sending fails"
+    let mut line = if daily {
+        InputLine::for_daily_window(connect)
+    } else {
+        let began = std::time::Instant::now();
+        let mut said = false;
+        let client = loop {
+            match connect(Duration::from_secs(3)) {
+                Ok(client) => break client,
+                Err(why) if began.elapsed() < keep_trying => {
+                    if !said {
+                        eprintln!("cannot reach the device yet ({why}); trying again");
+                        said = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(why) => return Err(why.to_string()),
+            }
+        };
+        InputLine::open(client, connect)
+            .map_err(|(_, why)| format!("the device does not take input from here: {why}"))?
+    };
+    // A socket left by an earlier run is in the way of a new one.
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot replace {}: {e}", socket.display())),
+    }
+    let listener = UnixDatagram::bind(socket)
+        .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
+    let failed = |e: std::io::Error| format!("cannot read from {}: {e}", socket.display());
+    let opened = |line: &InputLine| {
+        println!(
+            "Input written to {} goes to the paired device.",
+            socket.display()
         );
+        tell("open", 0, None);
+        if !line.is_answered() {
+            eprintln!(
+                "note: the device is of a version that does not answer \"still here\"; a connection \
+                 that goes silent is only noticed when sending fails"
+            );
+        }
+    };
+    if daily {
+        tell("waiting", 0, None);
+    } else {
+        opened(&line);
     }
 
     let mut buffer = [0u8; 2048];
@@ -621,30 +645,38 @@ fn relay_input(
             _ => events.push(event),
         }
     };
+    // Called with the socket nonblocking, including just after the handshake.
+    let drain = |events: &mut Vec<InputEvent>, buffer: &mut [u8]| loop {
+        match listener.recv(buffer) {
+            Ok(length) => take(events, &buffer[..length]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    };
     loop {
         let mut events = Vec::new();
         // Wait for something to happen, but not for long: the conversation is looked
         // after in between (saying "still here", hearing the answers, opening it again
         // when it was cut).
-        // While it is being opened again, more often: the attempt is due at once.
         let wait = if line.is_open() {
             LISTEN_EVERY
+        } else if daily {
+            line.retry_in(std::time::Instant::now())
         } else {
             Duration::from_millis(5)
         };
-        listener.set_read_timeout(Some(wait)).map_err(failed)?;
-        match listener.recv(&mut buffer) {
-            Ok(length) => take(&mut events, &buffer[..length]),
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(e) => return Err(failed(e)),
+        if !wait.is_zero() {
+            listener.set_read_timeout(Some(wait)).map_err(failed)?;
+            match listener.recv(&mut buffer) {
+                Ok(length) => take(&mut events, &buffer[..length]),
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(e) => return Err(failed(e)),
+            }
         }
         let in_hand = istesso_agent::PassLog::mark();
         // Whatever else has arrived meanwhile goes into the same message.
         listener.set_nonblocking(true).map_err(failed)?;
-        while let Ok(length) = listener.recv(&mut buffer) {
-            take(&mut events, &buffer[..length]);
-        }
-        listener.set_nonblocking(false).map_err(failed)?;
+        drain(&mut events, &mut buffer);
         let now = std::time::Instant::now();
         let mut happened = None;
         if !events.is_empty() {
@@ -656,15 +688,23 @@ fn relay_input(
             }
         }
         if happened.is_none() {
-            happened = line.turn(now).map_err(|why| {
-                format!("the device does not take input from here any more: {why}")
-            })?;
+            happened = line
+                .turn_with_pending(now, || {
+                    events.clear();
+                    drain(&mut events, &mut buffer);
+                    events
+                })
+                .map_err(|why| {
+                    format!("the device does not take input from here any more: {why}")
+                })?;
         }
+        listener.set_nonblocking(false).map_err(failed)?;
         match happened {
             Some(Happened::Cut) => {
                 eprintln!("note: the conversation with the device was cut; opening it again");
                 tell("cut", line.cuts(), None);
             }
+            Some(Happened::Back { .. }) if daily && line.cuts() == 0 => opened(&line),
             Some(Happened::Back { after }) => {
                 eprintln!(
                     "note: the conversation with the device is back after {:.2} s",

@@ -14,7 +14,8 @@
 //! that arrives a second late is typed into a picture that has changed
 //! since, and what was sent just before the cut may have arrived, so sending
 //! it again could type it twice. When the conversation is back, the
-//! modifiers that are held are pressed again, and nothing else.
+//! modifiers that are held are pressed again, and nothing else. The daily
+//! trial first releases any keys and buttons left down on the old channel.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -115,6 +116,46 @@ pub struct Passed {
     pub happened: Option<Happened>,
 }
 
+/// Keys and buttons the daily relay may have left down. The old agent
+/// normally releases them. A restarted agent has no record of them.
+#[derive(Default)]
+struct HeldInput {
+    keys: BTreeSet<u32>,
+    buttons: BTreeSet<u32>,
+}
+
+impl HeldInput {
+    fn record(&mut self, events: &[InputEvent], sent: bool) {
+        for event in events {
+            let (held, code, pressed) = match *event {
+                InputEvent::Key { code, pressed } => (&mut self.keys, code, pressed),
+                InputEvent::Button { code, pressed } => (&mut self.buttons, code, pressed),
+                _ => continue,
+            };
+            if pressed {
+                held.insert(code);
+            } else if sent {
+                // A failed write may have lost this release. Keep it for the next channel.
+                held.remove(&code);
+            }
+        }
+    }
+
+    fn releases(&self) -> Vec<InputEvent> {
+        self.keys
+            .iter()
+            .map(|&code| InputEvent::Key {
+                code,
+                pressed: false,
+            })
+            .chain(self.buttons.iter().map(|&code| InputEvent::Button {
+                code,
+                pressed: false,
+            }))
+            .collect()
+    }
+}
+
 /// The conversation input is sent on.
 pub struct InputLine {
     connect: Connect,
@@ -130,6 +171,7 @@ pub struct InputLine {
     listened: Instant,
     /// The modifiers that are down on this side, as far as the events say.
     modifiers: BTreeSet<u32>,
+    daily_held: Option<HeldInput>,
     /// Where the pointer is, as far as the events say.
     pointer: Option<(i32, i32)>,
     /// Since when there has been no conversation, and when the next attempt
@@ -149,21 +191,37 @@ impl InputLine {
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
         let alive = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let mut line = Self::waiting(connect);
+        line.client = Some(client);
+        line.alive = alive;
+        Ok(line)
+    }
+
+    /// A daily relay waits for the first input socket as well as later ones.
+    /// It releases old keys and buttons before restoring held modifiers.
+    pub fn for_daily_window(connect: Connect) -> Self {
+        let mut line = Self::waiting(connect);
+        line.daily_held = Some(HeldInput::default());
+        line
+    }
+
+    fn waiting(connect: Connect) -> Self {
         let now = Instant::now();
-        Ok(InputLine {
+        InputLine {
             connect,
-            client: Some(client),
-            alive,
+            client: None,
+            alive: false,
             said: now,
             unanswered_since: None,
             listened: now,
             modifiers: BTreeSet::new(),
+            daily_held: None,
             pointer: None,
             without_since: None,
             due: now,
             made_at: now,
             cuts: 0,
-        })
+        }
     }
 
     /// How often the conversation was cut since this line was opened,
@@ -178,14 +236,17 @@ impl InputLine {
         self.client.is_some()
     }
 
+    /// How long a disconnected relay can wait for input before its next attempt.
+    pub fn retry_in(&self, now: Instant) -> Duration {
+        self.due.saturating_duration_since(now).min(LISTEN_EVERY)
+    }
+
     /// Whether the device answers "still here", so that silence is noticed.
     pub fn is_answered(&self) -> bool {
         self.alive
     }
 
-    /// Sends what a person did. Without a conversation it is not sent, now
-    /// or later.
-    pub fn pass(&mut self, events: &[InputEvent], now: Instant) -> Passed {
+    fn observe_input(&mut self, events: &[InputEvent]) {
         for event in events {
             match *event {
                 InputEvent::Key { code, pressed } if MODIFIERS.contains(&code) => {
@@ -195,10 +256,18 @@ impl InputLine {
                         self.modifiers.remove(&code);
                     }
                 }
-                InputEvent::PointerAt { x, y } => self.pointer = Some((x, y)),
+                InputEvent::PointerAt { x, y } if self.daily_held.is_none() => {
+                    self.pointer = Some((x, y));
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Sends what a person did. Without a conversation it is not sent, now
+    /// or later.
+    pub fn pass(&mut self, events: &[InputEvent], now: Instant) -> Passed {
+        self.observe_input(events);
         let Some(client) = &mut self.client else {
             return Passed {
                 sent: false,
@@ -207,15 +276,13 @@ impl InputLine {
         };
         // What a person types is not answered, so it says nothing about whether the
         // conversation is alive: "still here" goes on being said beside it.
-        match client.send_input(events) {
-            Ok(()) => Passed {
-                sent: true,
-                happened: None,
-            },
-            Err(_) => Passed {
-                sent: false,
-                happened: Some(self.cut(now)),
-            },
+        let sent = client.send_input(events).is_ok();
+        if let Some(held) = &mut self.daily_held {
+            held.record(events, sent);
+        }
+        Passed {
+            sent,
+            happened: (!sent).then(|| self.cut(now)),
         }
     }
 
@@ -224,8 +291,18 @@ impl InputLine {
     /// To be called every [`LISTEN_EVERY`] or so. `Err` says why the device
     /// does not take input from here any more; nothing is tried after that.
     pub fn turn(&mut self, now: Instant) -> Result<Option<Happened>, String> {
+        self.turn_with_pending(now, Vec::new)
+    }
+
+    /// On a daily reconnect, drain local input received during the handshake.
+    /// Only the resulting modifier state is used on the new channel.
+    pub fn turn_with_pending(
+        &mut self,
+        now: Instant,
+        pending: impl FnOnce() -> Vec<InputEvent>,
+    ) -> Result<Option<Happened>, String> {
         let Some(client) = &mut self.client else {
-            return self.open_again(now);
+            return self.open_again(now, pending);
         };
         let silent = self
             .unanswered_since
@@ -285,34 +362,52 @@ impl InputLine {
         }
     }
 
-    fn open_again(&mut self, now: Instant) -> Result<Option<Happened>, String> {
-        if now < self.due {
-            return Ok(None);
-        }
-        let mut client = match (self.connect)(AGAIN_WITHIN) {
-            Ok(client) => client,
-            Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
-        };
-        let alive = match ask(&mut client, AGAIN_WITHIN) {
-            Ok(alive) => alive,
-            Err((what, why)) => return self.wait(what, why, now),
-        };
-        // The device let go of everything the conversation before had down. What is
-        // held on this side now is in line again: the modifiers go down, and the
-        // pointer is where it is. Other keys and the buttons are not pressed again: a
-        // letter would be typed once more, a drag would begin somewhere else.
-        let mut events: Vec<InputEvent> = self
-            .modifiers
-            .iter()
-            .map(|&code| InputEvent::Key {
-                code,
-                pressed: true,
-            })
-            .collect();
+    fn reconnect_events(&self) -> Vec<InputEvent> {
+        let mut events = self
+            .daily_held
+            .as_ref()
+            .map_or_else(Vec::new, HeldInput::releases);
+        events.extend(self.modifiers.iter().map(|&code| InputEvent::Key {
+            code,
+            pressed: true,
+        }));
         if let Some((x, y)) = self.pointer {
             events.push(InputEvent::PointerAt { x, y });
         }
-        if client.send_input(&events).is_err() {
+        events
+    }
+
+    fn open_again(
+        &mut self,
+        now: Instant,
+        pending: impl FnOnce() -> Vec<InputEvent>,
+    ) -> Result<Option<Happened>, String> {
+        if now < self.due {
+            return Ok(None);
+        }
+        let within = if self.cuts == 0 {
+            FIRST_ANSWER_WITHIN
+        } else {
+            AGAIN_WITHIN
+        };
+        let mut client = match (self.connect)(within) {
+            Ok(client) => client,
+            Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
+        };
+        let alive = match ask(&mut client, within) {
+            Ok(alive) => alive,
+            Err((what, why)) => return self.wait(what, why, now),
+        };
+        if self.daily_held.is_some() {
+            self.observe_input(&pending());
+        }
+        let events = self.reconnect_events();
+        let sent = client.send_input(&events).is_ok();
+        if let Some(held) = &mut self.daily_held {
+            // A failed write may have delivered some of the restored modifiers.
+            held.record(&events, sent);
+        }
+        if !sent {
             return self.wait(Again::Soon, "the conversation ended at once".into(), now);
         }
         let now_open = Instant::now();
@@ -461,6 +556,151 @@ mod tests {
             pair.handed_over(Duration::from_secs(3)),
             Some(key(31, true))
         );
+    }
+
+    #[test]
+    fn daily_recovery_releases_even_keys_whose_last_write_failed() {
+        let mut held = HeldInput::default();
+        held.record(&[key(30, true), key(42, true)], true);
+        held.record(&[key(30, false)], true);
+        held.record(&[key(42, false), key(29, true)], false);
+        assert_eq!(held.releases(), [key(29, false), key(42, false)]);
+    }
+
+    #[test]
+    fn daily_reconnect_uses_the_last_modifier_state_and_never_retypes_a_key() {
+        let mut line = InputLine::for_daily_window(Box::new(|_| unreachable!()));
+        let button = InputEvent::Button {
+            code: 0x110,
+            pressed: true,
+        };
+        let before = [key(42, true), key(56, true), key(30, true), button];
+        line.observe_input(&before);
+        line.daily_held.as_mut().unwrap().record(&before, true);
+
+        // Shift stays held. Alt comes up, Control goes down and a letter is typed.
+        assert!(
+            !line
+                .pass(
+                    &[key(56, false), key(29, true), key(48, true)],
+                    Instant::now()
+                )
+                .sent
+        );
+        // A whole modifier tap queued during the handshake is already over.
+        line.observe_input(&[key(125, true), key(125, false), key(48, false)]);
+        assert_eq!(
+            line.reconnect_events(),
+            [
+                key(30, false),
+                key(42, false),
+                key(56, false),
+                InputEvent::Button {
+                    code: 0x110,
+                    pressed: false
+                },
+                key(29, true),
+                key(42, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn daily_relay_discards_offline_input_and_backs_off_until_the_host_returns() {
+        let mut line = InputLine::for_daily_window(Box::new(|_| {
+            Err(ConnectFailure::Link(LinkError::Refused))
+        }));
+        let now = line.due;
+        for elapsed in [Duration::ZERO, SOON_FOR, Duration::from_secs(60)] {
+            let at = now + elapsed;
+            assert_eq!(line.turn(at), Ok(None));
+            assert_eq!(
+                line.due,
+                at + if elapsed < SOON_FOR {
+                    RETRY
+                } else {
+                    RETRY_SLOWLY
+                }
+            );
+            assert_eq!(line.retry_in(at), LISTEN_EVERY);
+            assert_eq!(
+                line.retry_in(line.due - Duration::from_millis(7)),
+                Duration::from_millis(7)
+            );
+            assert_eq!(line.retry_in(line.due), Duration::ZERO);
+            assert!(!line.pass(&[key(42, true), key(30, true)], at).sent);
+        }
+        assert!(line.daily_held.as_ref().unwrap().releases().is_empty());
+        assert_eq!(line.cuts(), 0);
+    }
+
+    #[test]
+    fn daily_input_releases_old_keys_and_buttons_then_restores_current_modifiers() {
+        use std::os::unix::net::UnixDatagram;
+        let pair = std::sync::Arc::new(InputPair::with_pipeline_restarts("restart", true));
+        let again = pair.clone();
+        let mut line = InputLine::for_daily_window(Box::new(move |within| {
+            again.connect_to(again.addr, within)
+        }));
+        let wait = Duration::from_secs(5);
+        assert!(matches!(
+            turn_until_something(&mut line, wait),
+            Ok(Some(Happened::Back { .. }))
+        ));
+        let button = |pressed| InputEvent::Button {
+            code: 0x110,
+            pressed,
+        };
+        let down = [key(42, true), key(30, true), button(true)];
+        assert!(line.pass(&down, Instant::now()).sent);
+        assert_eq!(pair.all_handed_over(A_MOMENT), down);
+
+        let path = pair
+            .taken
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .to_owned();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            turn_until_something(&mut line, wait),
+            Ok(Some(Happened::Cut))
+        );
+        // The agent still answers, but cannot open its pipeline's input socket.
+        assert_eq!(turn_until_something(&mut line, A_MOMENT), Ok(None));
+        assert!(
+            !line
+                .pass(
+                    &[key(29, true), key(48, true), key(30, false)],
+                    Instant::now()
+                )
+                .sent
+        );
+
+        let restarted = UnixDatagram::bind(path).unwrap();
+        restarted.set_read_timeout(Some(wait)).unwrap();
+        std::thread::sleep(line.due.saturating_duration_since(Instant::now()));
+        // Control comes up during the handshake. Only Shift is still held.
+        assert!(matches!(
+            line.turn_with_pending(Instant::now(), || vec![key(29, false), key(32, true)]),
+            Ok(Some(Happened::Back { .. }))
+        ));
+        assert!(line.pass(&[key(31, true)], Instant::now()).sent);
+        let mut buffer = [0u8; 512];
+        for expected in [
+            key(30, false),
+            key(42, false),
+            button(false),
+            key(42, true),
+            key(31, true),
+        ] {
+            let len = restarted.recv(&mut buffer).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<InputEvent>(&buffer[..len]).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

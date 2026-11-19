@@ -202,24 +202,31 @@ static inline size_t keys_hold_back(Keys *keys, KeyChange *out, size_t count, bo
 // this keyboard now (`flags` as an event has them): one that is held and is not down over there
 // goes down, one that is down over there and is not held comes up. Other keys are left as they
 // are: pressing a letter again would type it. `out` has room for 8 changes.
-static inline size_t keys_fall_in_line(Keys *keys, unsigned long flags, KeyChange *out) {
-    bool command = (flags & KEYS_FLAG_COMMAND) != 0;
+static inline size_t keys_fall_in_line(Keys *keys, unsigned long flags, bool match_sides, KeyChange *out) {
+    bool as_control = keys->command_is_control;
     const struct {
-        bool held;
+        unsigned long flag, left_flag, right_flag;
         unsigned left, right;
     } modifiers[4] = {
-        {(flags & KEYS_FLAG_SHIFT) != 0, 42, 54},
-        {(flags & KEYS_FLAG_CONTROL) != 0 || (command && keys->command_is_control), 29, 97},
-        {(flags & KEYS_FLAG_OPTION) != 0, 56, 100},
-        {command && !keys->command_is_control, 125, 126},
+        {KEYS_FLAG_SHIFT, KEYS_DEVICE_LEFT_SHIFT, KEYS_DEVICE_RIGHT_SHIFT, 42, 54},
+        {KEYS_FLAG_CONTROL | (as_control ? KEYS_FLAG_COMMAND : 0),
+         KEYS_DEVICE_LEFT_CONTROL | (as_control ? KEYS_DEVICE_LEFT_COMMAND : 0),
+         KEYS_DEVICE_RIGHT_CONTROL | (as_control ? KEYS_DEVICE_RIGHT_COMMAND : 0), 29, 97},
+        {KEYS_FLAG_OPTION, KEYS_DEVICE_LEFT_OPTION, KEYS_DEVICE_RIGHT_OPTION, 56, 100},
+        {as_control ? 0 : KEYS_FLAG_COMMAND, KEYS_DEVICE_LEFT_COMMAND, KEYS_DEVICE_RIGHT_COMMAND, 125, 126},
     };
     size_t count = 0;
     for (int i = 0; i < 4; i++) {
-        if (!modifiers[i].held) {
-            count = keys_set(keys, modifiers[i].left, false, out, count);
-            count = keys_set(keys, modifiers[i].right, false, out, count);
-        } else if (!keys->down[modifiers[i].left] && !keys->down[modifiers[i].right]) {
-            count = keys_set(keys, modifiers[i].left, true, out, count);
+        unsigned left = modifiers[i].left, right = modifiers[i].right;
+        if (!(flags & modifiers[i].flag)) {
+            count = keys_set(keys, left, false, out, count);
+            count = keys_set(keys, right, false, out, count);
+        } else if (match_sides && (flags & (modifiers[i].left_flag | modifiers[i].right_flag))) {
+            // Restore the same side its later flagsChanged release will name.
+            count = keys_set(keys, left, (flags & modifiers[i].left_flag) != 0, out, count);
+            count = keys_set(keys, right, (flags & modifiers[i].right_flag) != 0, out, count);
+        } else if (!keys->down[left] && !keys->down[right]) {
+            count = keys_set(keys, left, true, out, count);
         }
     }
     return count;

@@ -121,6 +121,10 @@ pub(crate) mod testing {
     #[cfg(unix)]
     impl InputPair {
         pub fn new(tag: &str) -> Self {
+            Self::with_pipeline_restarts(tag, false)
+        }
+
+        pub fn with_pipeline_restarts(tag: &str, follow_input_restarts: bool) -> Self {
             use istesso_pair::{Hello, Identity, Peer, PeerStore};
             let (host, device) = (TempDir::new(tag), TempDir::new(tag));
             let identities = [&host, &device]
@@ -148,6 +152,7 @@ pub(crate) mod testing {
                 discovery: false,
                 refresh_peers: None,
                 input_socket: Some(socket),
+                follow_input_restarts,
                 ..crate::AgentOptions::default()
             };
             let agent =

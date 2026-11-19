@@ -392,6 +392,9 @@ static GstCaps *vt_caps = NULL;
 static CALayer *vt_layer = nil;
 // Whether the access unit VideoToolbox is decoding is a key frame.
 static gboolean vt_decoding_key_frame = FALSE;
+static BOOL daily_reconnect = NO;
+// The synchronous decoder callback received a surface on the current daily connection.
+static BOOL daily_picture_drawn = NO;
 // Whether the stream says its picture is sRGB, as the content of any window is.
 static gboolean vt_srgb = FALSE;
 
@@ -471,6 +474,14 @@ static void on_picture(void *context, void *frame, OSStatus status, VTDecodeInfo
     }
 }
 
+static void on_daily_picture(void *context, void *frame, OSStatus status, VTDecodeInfoFlags flags,
+                             CVImageBufferRef picture, CMTime time, CMTime duration) {
+    on_picture(context, frame, status, flags, picture, time, duration);
+    if (!daily_picture_drawn && status == noErr && picture != NULL && vt_layer.contents != nil) {
+        daily_picture_drawn = YES;
+    }
+}
+
 // Sets VideoToolbox up for the stream the caps describe (H.265 with its parameter sets in "codec_data").
 // Size of the picture in its own pixels, once the stream has said it. Pointer positions are
 // given in these.
@@ -533,7 +544,7 @@ static gboolean vt_start_session(gboolean all_colour, const char *stream_colours
             @(all_colour ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{}
     };
-    VTDecompressionOutputCallbackRecord callback = {on_picture, NULL};
+    VTDecompressionOutputCallbackRecord callback = {daily_reconnect ? on_daily_picture : on_picture, NULL};
     OSStatus status = VTDecompressionSessionCreate(kCFAllocatorDefault, vt_format, (__bridge CFDictionaryRef)decoder,
                                           (__bridge CFDictionaryRef)pictures, &callback, &vt_session);
     if (status != noErr) {
@@ -663,6 +674,7 @@ static CATextLayer *note_layer = nil;
 static BOOL picture_stale = NO;
 // The connection was cut and the picture is not back yet.
 static BOOL cut_pending = NO;
+static BOOL waiting_for_first_picture = NO;
 static guint64 cut_noticed_ns = 0;
 static unsigned long cut_generation = 0, note_generation = 0;
 // Presses that were not passed on since the cut, and presses that were passed on in the second
@@ -749,7 +761,7 @@ static void mark_the_picture(NSString *text) {
 
 // The connection was cut and is being made again.
 static void picture_was_cut(guint64 t) {
-    if (cut_pending) {
+    if (cut_pending || waiting_for_first_picture) {
         return;
     }
     cut_pending = YES;
@@ -757,7 +769,13 @@ static void picture_was_cut(guint64 t) {
     unsigned long generation = ++cut_generation;
     held_back_count = 0;
     in_doubt_count = presses_since(t > 1000000000ULL ? t - 1000000000ULL : 0);
-    NSString *line = @"Reconnecting. What you type now does not arrive.";
+    NSString *line = daily_reconnect ? @"つなぎ直しています…" : @"Reconnecting. What you type now does not arrive.";
+    if (daily_reconnect) {
+        // Stop input immediately, including during the short delay before the note appears.
+        picture_stale = YES;
+        [cursor_view holdBack];
+        [cursor_view cursorChanged];
+    }
     if (in_doubt_count > 0) {
         // Somebody is typing: said at once.
         mark_the_picture(line);
@@ -773,9 +791,11 @@ static void picture_was_cut(guint64 t) {
 
 // The first picture after a cut is on the screen.
 static void picture_is_back(void) {
-    if (!cut_pending) {
+    BOOL first = waiting_for_first_picture;
+    if (!cut_pending && !first) {
         return;
     }
+    waiting_for_first_picture = NO;
     cut_pending = NO;
     cut_generation++;
     BOOL was_marked = picture_stale;
@@ -794,14 +814,19 @@ static void picture_is_back(void) {
     }
     // What was typed is gone, and the person is told so for long enough to read it.
     NSString *line;
-    if (held_back_count > 0 && in_doubt_count > 0) {
-        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) during the cut did not arrive, and %lu just before it "
-                                          @"may not have.",
-                                          held_back_count, in_doubt_count];
+    if (first) {
+        line = [NSString stringWithFormat:@"最初の絵が映る前の入力 %lu 回は届いていません。", held_back_count];
+    } else if (held_back_count > 0 && in_doubt_count > 0) {
+        line = [NSString stringWithFormat:daily_reconnect
+                ? @"切れているあいだの入力 %lu 回は届いていません。切れる直前の %lu 回は届いたか分かりません。"
+                : @"The connection was cut. %lu input(s) during the cut did not arrive, and %lu just before it may not have.",
+                held_back_count, in_doubt_count];
     } else if (held_back_count > 0) {
-        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) during the cut did not arrive.", held_back_count];
+        line = [NSString stringWithFormat:daily_reconnect ? @"切れているあいだの入力 %lu 回は届いていません。"
+                : @"The connection was cut. %lu input(s) during the cut did not arrive.", held_back_count];
     } else {
-        line = [NSString stringWithFormat:@"The connection was cut. %lu input(s) just before it may not have arrived.", in_doubt_count];
+        line = [NSString stringWithFormat:daily_reconnect ? @"切れる直前の入力 %lu 回は届いたか分かりません。"
+                : @"The connection was cut. %lu input(s) just before it may not have arrived.", in_doubt_count];
     }
     show_note(line);
     unsigned long generation = note_generation;
@@ -815,17 +840,18 @@ static void picture_is_back(void) {
 // It is over, and the host said why or refused: nothing is tried again. The window stays, with
 // the last picture dimmed and the reason, until the person closes it.
 static void picture_is_over(int32_t why) {
+    waiting_for_first_picture = NO;
     cut_pending = NO;
     cut_generation++;
     NSString *line;
     switch (why) {
-        case ISTESSO_MEDIA_OVER_ENDED: line = @"The session has ended."; break;
-        case ISTESSO_MEDIA_OVER_NOT_SHOWN: line = @"The host shows this to another device now."; break;
-        case ISTESSO_MEDIA_OVER_SET_ASIDE: line = @"The host has put this session aside."; break;
-        case ISTESSO_MEDIA_OVER_NOT_PAIRED: line = @"This device is not paired with the host any more."; break;
-        case ISTESSO_MEDIA_OVER_FORBIDDEN: line = @"This device may not look at the host."; break;
-        case ISTESSO_MEDIA_OVER_UNSUPPORTED: line = @"The host sends its picture in a form this program cannot show."; break;
-        default: line = @"The host does not show its picture to this device."; break;
+        case ISTESSO_MEDIA_OVER_ENDED: line = daily_reconnect ? @"配信が終わりました。" : @"The session has ended."; break;
+        case ISTESSO_MEDIA_OVER_NOT_SHOWN: line = daily_reconnect ? @"ほかの端末に映しています。" : @"The host shows this to another device now."; break;
+        case ISTESSO_MEDIA_OVER_SET_ASIDE: line = daily_reconnect ? @"このセッションはいったん切り離されました。" : @"The host has put this session aside."; break;
+        case ISTESSO_MEDIA_OVER_NOT_PAIRED: line = daily_reconnect ? @"ホストとのペアリングがありません。" : @"This device is not paired with the host any more."; break;
+        case ISTESSO_MEDIA_OVER_FORBIDDEN: line = daily_reconnect ? @"この端末には閲覧の許可がありません。" : @"This device may not look at the host."; break;
+        case ISTESSO_MEDIA_OVER_UNSUPPORTED: line = daily_reconnect ? @"この映像の形式には対応していません。" : @"The host sends its picture in a form this program cannot show."; break;
+        default: line = daily_reconnect ? @"ホストはこの端末に映像を送っていません。" : @"The host does not show its picture to this device."; break;
     }
     mark_the_picture(line);
     log_held_back(YES);
@@ -841,6 +867,7 @@ static void picture_is_over(int32_t why) {
 static atomic_ulong picture_cuts;
 // The input's count as the relay says it; -1 when no relay that counts is running.
 static long input_cuts = -1;
+static BOOL input_reconnecting = NO;
 static NSWindow *counted_window = nil;
 static NSString *counted_title = nil;
 
@@ -856,9 +883,18 @@ static void show_counts(void) {
     if (counted_window == nil) {
         return;
     }
-    NSString *input = input_cuts < 0 ? @"input not counted" : [NSString stringWithFormat:@"input %ld", input_cuts];
-    counted_window.title =
-        [NSString stringWithFormat:@"%@ \u2014 reconnections: picture %lu, %@", counted_title, atomic_load(&picture_cuts), input];
+    if (daily_reconnect) {
+        NSString *input = input_cuts < 0 ? @"入力は未集計" : [NSString stringWithFormat:@"入力 %ld 回", input_cuts];
+        if (input_reconnecting) {
+            input = [input stringByAppendingString:input_cuts == 0 ? @"（入力をつないでいます…）" : @"（入力をつなぎ直しています…）"];
+        }
+        counted_window.title = [NSString stringWithFormat:@"%@ — 再接続：映像 %lu 回、%@",
+                                counted_title, atomic_load(&picture_cuts), input];
+    } else {
+        NSString *input = input_cuts < 0 ? @"input not counted" : [NSString stringWithFormat:@"input %ld", input_cuts];
+        counted_window.title = [NSString stringWithFormat:@"%@ \u2014 reconnections: picture %lu, %@",
+                                counted_title, atomic_load(&picture_cuts), input];
+    }
 }
 
 // Looks once a second at what the relay says about its own connection, off the main thread:
@@ -871,18 +907,27 @@ static void watch_relay_state(const char *socket_path) {
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
     dispatch_source_set_event_handler(timer, ^{
         long now = -1;
+        BOOL reconnecting = NO;
         FILE *file = fopen(path.fileSystemRepresentation, "r");
         if (file != NULL) {
             long pid = 0, count = -1;
             // Only a relay that still runs counts: a file left by an earlier one says nothing.
-            if (fscanf(file, "{\"pid\":%ld,\"input\":%ld}", &pid, &count) == 2 && pid > 0 && count >= 0
+            int cut = 0;
+            int fields = fscanf(file, "{\"pid\":%ld,\"input\":%ld,\"reconnecting\":%d}", &pid, &count, &cut);
+            if (fields >= 2 && pid > 0 && count >= 0
                 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
                 now = count;
+                reconnecting = daily_reconnect && fields == 3 && cut == 1;
             }
             fclose(file);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (now != input_cuts) {
+            if (now != input_cuts || reconnecting != input_reconnecting) {
+                if (daily_reconnect && now >= 0 && !reconnecting && !picture_stale &&
+                    [cursor_view respondsToSelector:@selector(fallInLine)]) {
+                    [cursor_view fallInLine];
+                }
+                input_reconnecting = reconnecting;
                 input_cuts = now;
                 show_counts();
             }
@@ -1026,6 +1071,12 @@ static void on_channel_frame(IstessoMediaWatch *watch, const IstessoMediaFrame *
         }
     }
     if (frame->key_frame && sets[0] != NULL && sets[1] != NULL && sets[2] != NULL && !channel_configure(sets)) {
+        if (daily_reconnect && !daily_picture_drawn) {
+            // The decoder may still be unavailable after wake. Try the next key frame.
+            vt_needs_key_frame = TRUE;
+            channel_ask_for_key_frame(watch, now_ns());
+            return;
+        }
         exit(1);
     }
     if (frame->discontinuity && !frame->key_frame) {
@@ -1145,18 +1196,25 @@ static void *channel_thread(void *unused) {
         fprintf(stderr, "error: %s\n", istesso_media_last_error());
         exit(2);
     }
+    if (daily_reconnect) {
+        istesso_media_watch_follow_restarts(watch);
+    }
     guint64 began = now_ns(), cut_at = 0;
-    gboolean ever = FALSE, said_unreachable = FALSE, back_pending = FALSE;
+    gboolean ever = FALSE, said_unreachable = FALSE, back_pending = daily_reconnect;
     for (;;) {
         IstessoMediaFrame frame;
         int32_t got = istesso_media_watch_next(watch, 250, &frame);
         if (got == 1) {
             on_channel_frame(watch, &frame);
+            if (back_pending && daily_reconnect && !daily_picture_drawn) {
+                vt_needs_key_frame = TRUE;
+                channel_ask_for_key_frame(watch, now_ns());
+            }
             if (back_pending && !vt_needs_key_frame) {
                 // The first picture after the cut has been decoded and handed to the layer.
                 back_pending = FALSE;
                 guint64 t = now_ns();
-                if (frame_log != NULL) {
+                if (frame_log != NULL && cut_at != 0) {
                     fprintf(frame_log, "{\"kind\":\"stream\",\"t_ns\":%llu,\"event\":\"back\",\"gap_ms\":%.1f}\n",
                             (unsigned long long)t, (double)(t - cut_at) / 1e6);
                 }
@@ -1198,6 +1256,17 @@ static void *channel_thread(void *unused) {
             // A new connection begins with a key frame, and the decoder begins anew with it.
             vt_needs_key_frame = TRUE;
             channel_asked_ns = 0;
+            if (daily_reconnect) {
+                daily_picture_drawn = NO;
+                if (state.again) {
+                    if (vt_session != NULL) {
+                        VTDecompressionSessionInvalidate(vt_session);
+                        CFRelease(vt_session);
+                        vt_session = NULL;
+                    }
+                    channel_ask_for_key_frame(watch, now_ns());
+                }
+            }
         } else if (got < 0) {
             // Over: the host said why, or refused. Not tried again.
             IstessoMediaWatchState state;
@@ -1274,6 +1343,10 @@ static gboolean use_channel(NSView *view) {
             }
         });
         dispatch_resume(typing);
+    }
+    if (daily_reconnect) {
+        waiting_for_first_picture = YES;
+        mark_the_picture(@"つないでいます…");
     }
     pthread_t thread;
     return pthread_create(&thread, NULL, channel_thread, NULL) == 0;
@@ -1541,7 +1614,7 @@ static NSCursor *empty_cursor(void) {
 - (void)fallInLine {
     KeyChange changes[KEYS_MOST];
     _keys.command_is_control = command_is_control;
-    [self send:changes count:keys_fall_in_line(&_keys, NSEvent.modifierFlags, changes)];
+    [self send:changes count:keys_fall_in_line(&_keys, NSEvent.modifierFlags, daily_reconnect, changes)];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -1934,6 +2007,7 @@ int main(int argc, char *argv[]) {
         }
 
         // The everyday trial's switches (see the top of this file).
+        daily_reconnect = getenv("ISTESSO_DAILY_RECONNECT") != NULL;
         BOOL no_window = getenv("ISTESSO_NO_WINDOW") != NULL;
         const char *dock_tile = getenv("ISTESSO_DOCK_TILE");
         const char *pid_file = getenv("ISTESSO_PID_FILE");
@@ -2035,7 +2109,12 @@ int main(int argc, char *argv[]) {
                 if (lines.count == 0 || lines[0].length == 0) {
                     return;
                 }
-                window.title = lines[0];
+                if (daily_reconnect && counted_window != nil) {
+                    counted_title = lines[0];
+                    show_counts();
+                } else {
+                    window.title = lines[0];
+                }
                 BOOL calling = lines.count > 1 && [lines[1] isEqualToString:@"attention"];
                 if (calling && !no_window) {
                     [NSApp requestUserAttention:NSInformationalRequest];

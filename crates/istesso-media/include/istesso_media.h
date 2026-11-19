@@ -246,6 +246,10 @@ void istesso_media_client_close(IstessoMediaClient *client);
 IstessoMediaWatch *istesso_media_watch_open(const char *config_dir, const char *addr,
                                             const char *peer);
 
+/* Daily windows also follow a clean pipeline restart. Call once, before sharing the new watch.
+ * Detach, reassignment and refusal remain terminal. */
+void istesso_media_watch_follow_restarts(IstessoMediaWatch *watch);
+
 /*
  * Waits for the next thing, for `wait_ms` at most (an attempt to connect may take longer:
  * three seconds the first time, one second after a cut).
