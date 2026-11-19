@@ -492,9 +492,16 @@ mod tests {
             assert_eq!(serde_json::from_str::<InputEvent>(&json).unwrap(), event);
         }
         assert!(serde_json::from_str::<InputEvent>(r#"{"kind":"thought"}"#).is_err());
-        assert_eq!(serde_json::to_string(&InputEvent::Focus).unwrap(), r#"{"kind":"focus"}"#);
         assert_eq!(
-            serde_json::to_string(&InputEvent::Resize { width: 800, height: 600 }).unwrap(),
+            serde_json::to_string(&InputEvent::Focus).unwrap(),
+            r#"{"kind":"focus"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&InputEvent::Resize {
+                width: 800,
+                height: 600
+            })
+            .unwrap(),
             r#"{"kind":"resize","width":800,"height":600}"#
         );
         assert!(super::resize_is_acceptable(800, 600));

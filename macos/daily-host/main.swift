@@ -1133,6 +1133,38 @@ func selfTest() -> Never {
     checkPanel(lockResumes(pausedForLock: false, detached: false, held: false), false, "unlock: an explicit pause stays")
     checkPanel(lockResumes(pausedForLock: true, detached: true, held: false), false, "unlock: a detach stays")
     checkPanel(lockResumes(pausedForLock: true, detached: false, held: true), false, "unlock: held for a measurement, it stays stopped")
+    let shownWin = CGRect(x: 100, y: 100, width: 600, height: 400)
+    checkPanel(keysMayGo(appInFront: true, focused: shownWin, shown: shownWin), true, "keys: the shown window is the focused one")
+    checkPanel(keysMayGo(appInFront: true, focused: shownWin.offsetBy(dx: 40, dy: 30), shown: shownWin), false, "keys: a raise that did not take (another window has the keys) sends nothing")
+    checkPanel(keysMayGo(appInFront: true, focused: nil, shown: shownWin), false, "keys: no focused window known, nothing is sent")
+    checkPanel(keysMayGo(appInFront: false, focused: shownWin, shown: shownWin), false, "keys: not in front, nothing is sent")
+    do {
+        // The key path asks Accessibility nothing: a thousand keys, one lookup (the notification's).
+        let counted = Lookout()
+        var lookups = 0
+        counted.focusedLookup = { _ in lookups += 1; return shownWin }
+        counted.refreshFocused(1)
+        counted.queue.sync {}
+        var allowed = 0
+        for _ in 0..<1000 where keysMayGo(appInFront: true, focused: counted.focused, shown: shownWin) { allowed += 1 }
+        checkPanel(lookups == 1 && allowed == 1000, true, "keys: no Accessibility call on the key path; the notification's answer is used")
+        // A notification that the key window moved away: keys stop at once.
+        counted.focusedLookup = { _ in lookups += 1; return shownWin.offsetBy(dx: 200, dy: 0) }
+        counted.refreshFocused(1)
+        counted.queue.sync {}
+        checkPanel(!keysMayGo(appInFront: true, focused: counted.focused, shown: shownWin), true, "keys: after the key window moved away, nothing is sent")
+    }
+    do {
+        // A stand-in raise that does not take: the focused window stays another one.
+        let stuck = Lookout()
+        stuck.focusedLookup = { _ in shownWin.offsetBy(dx: 40, dy: 30) }
+        let done = DispatchSemaphore(value: 0)
+        stuck.queue.async { done.signal() }
+        stuck.refreshFocused(1)
+        stuck.queue.sync {}
+        _ = done.wait(timeout: .now() + 1)
+        checkPanel(!keysMayGo(appInFront: true, focused: stuck.focused, shown: shownWin), true, "keys: after a raise that did not take, keys are not sent")
+    }
     let guardedFlag = Guarded()
     var ran = 0
     _ = guardedFlag.use { ran += 1 }
@@ -1175,6 +1207,44 @@ final class Lookout {
 
     /// Runs one Accessibility action away from the input; returns at once.
     func act(_ work: @escaping () -> Void) { queue.async(execute: work) }
+
+    /// The place of the application's focused window (the one keys go to), as last looked up.
+    private var focusedCache: CGRect?
+    var focusedLookup: (pid_t) -> CGRect? = axFocusedWindowBounds
+    var focused: CGRect? { lock.lock(); defer { lock.unlock() }; return focusedCache }
+    /// Looks up the focused window again, away from the input; `then` runs on the main queue.
+    func refreshFocused(_ pid: pid_t, then: (() -> Void)? = nil) {
+        queue.async {
+            let found = self.focusedLookup(pid)
+            self.lock.lock(); self.focusedCache = found; self.lock.unlock()
+            if let then { DispatchQueue.main.async(execute: then) }
+        }
+    }
+}
+
+/// The place of an application's focused window through Accessibility (global points, top left).
+func axFocusedWindowBounds(_ pid: pid_t) -> CGRect? {
+    let app = AXUIElementCreateApplication(pid)
+    var window: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &window) == .success,
+          let window else { return nil }
+    var position: CFTypeRef?, extent: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(window as! AXUIElement, kAXPositionAttribute as CFString, &position) == .success,
+          AXUIElementCopyAttributeValue(window as! AXUIElement, kAXSizeAttribute as CFString, &extent) == .success,
+          let position, let extent else { return nil }
+    var p = CGPoint.zero, s = CGSize.zero
+    AXValueGetValue(position as! AXValue, .cgPoint, &p)
+    AXValueGetValue(extent as! AXValue, .cgSize, &s)
+    return CGRect(origin: p, size: s)
+}
+
+/// Whether keys may go to the application now: it is in front, and the window keys go to (its
+/// focused window, by Accessibility) is the very window that is shown, by its place and size in
+/// the window list. Otherwise typed text would land in a window nobody sees.
+func keysMayGo(appInFront: Bool, focused: CGRect?, shown: CGRect) -> Bool {
+    guard appInFront, let focused, shown != .zero else { return false }
+    return abs(focused.minX - shown.minX) < 2 && abs(focused.minY - shown.minY) < 2
+        && abs(focused.width - shown.width) < 2 && abs(focused.height - shown.height) < 2
 }
 
 /// After an unlock, whether the picture comes back: only when the lock stopped it, and the
@@ -1788,11 +1858,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     // that is the application's panel.
                     return top.pid == pid || self.appPanels().contains { $0.id == top.id }
                 }
-                self.injector.keysAllowed = { [weak self] in self?.appInFront() ?? false }
+                self.injector.keysAllowed = { [weak self] in
+                    guard let self else { return false }
+                    return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.windowBounds)
+                }
                 self.injector.onFocus = { [weak self] in self?.raiseShownWindow() }
                 self.injector.onResize = { [weak self] w, h in self?.resizeAsked(width: w, height: h) }
                 self.injector.onKeysDropped = { dropped in say(dropped ? "keys-dropped" : "keys-taken") }
                 self.injector.windowAt = { [weak self] point in self?.appWindow(at: point) }
+                self.watchFocus(running.processIdentifier)
                 self.watchApp()
             }
         }
@@ -1827,6 +1901,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let bounds = windowBounds
         raisedWindow = windowId
         lookout.act { bringToFront(pid, bounds: bounds) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
     }
 
     /// The other side asks for another size (once its resizing has ended). The shown window of
@@ -1866,6 +1941,36 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 if !self.restarting { self.restartStream(width: w, height: h, windowSize: now.bounds.size) }
             }
         }
+    }
+
+    /// Which window takes the keys is looked up again only when it may have changed: the
+    /// application's focused or main window changed (Accessibility notifications), or another
+    /// application came to the front, and after a raise. Never on a keystroke: each key uses the
+    /// answer found last (the input never waits on Accessibility).
+    var focusObserver: AXObserver?
+    func watchFocus(_ pid: pid_t) {
+        lookout.refreshFocused(pid)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.lookout.refreshFocused(pid)
+        }
+        let callback: AXObserverCallback = { _, _, _, refcon in
+            guard let refcon else { return }
+            let host = Unmanaged<DailyHost>.fromOpaque(refcon).takeUnretainedValue()
+            if let pid = host.app?.processIdentifier { host.lookout.refreshFocused(pid) }
+        }
+        var observer: AXObserver?
+        guard AXObserverCreate(pid, callback, &observer) == .success, let observer else {
+            return note("the application's focus cannot be watched: keys wait for a click")
+        }
+        let element = AXUIElementCreateApplication(pid)
+        let me = Unmanaged.passUnretained(self).toOpaque()
+        // A move or a resize of the window also changes the place keys are checked against.
+        for name in [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification,
+                     kAXWindowMovedNotification, kAXWindowResizedNotification] {
+            AXObserverAddNotification(observer, element, name as CFString, me)
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        focusObserver = observer
     }
 
     func appInFront() -> Bool {
@@ -2358,7 +2463,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             let pid = running.processIdentifier
             lookout.act { bringToFront(pid, bounds: bounds) }
             waiting = [data]
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            // The raise is looked at again before anything is sent: the keys go only if it took.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 let events = self.waiting
                 self.waiting = []
                 for event in events where !self.detached && self.picture == "running" { self.injector.handle(event) }

@@ -422,7 +422,7 @@ do_guard() {
                 base="$(cat "$mine/app" 2>/dev/null) (Mac host)"
                 wanted=$base
                 # Never silently: a key that the host could not hand over is said in the title.
-                [ "$keys_word" = keys-dropped ] && wanted="$base — クリックすると打てます"
+                [ "$keys_word" = keys-dropped ] && wanted="$base — この窓にまだ打てません。クリックしてください"
                 [ "$lock_word" = locked ] && wanted="$base — Studio はロック中"
                 if [ "$(head -1 "$mine/title" 2>/dev/null)" != "$wanted" ]; then
                     printf '%s\n\n' "$wanted" > "$mine/title"
