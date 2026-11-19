@@ -159,10 +159,22 @@ enum PointerTarget: Equatable {
 /// `window` nil, 0 or 1: the first window's picture (`first`), as without --windows; 2 and up:
 /// the listed window's (`place`), or nowhere when it is not listed.
 func pointerTarget(x: Double, y: Double, window: UInt32?, first: (origin: CGPoint, scale: Double),
-                   place: (UInt32) -> (origin: CGPoint, scale: Double)?) -> PointerTarget {
+                   place: (UInt32) -> WindowPlace?) -> PointerTarget {
     guard let window, window > 1 else { return .at(CGPoint(x: first.origin.x + x * first.scale, y: first.origin.y + y * first.scale), window: 1) }
     guard let p = place(window) else { return .nowhere(window) }
-    return .at(CGPoint(x: p.origin.x + x * p.scale, y: p.origin.y + y * p.scale), window: window)
+    return .at(CGPoint(x: p.origin.x + x * p.scaleX, y: p.origin.y + y * p.scaleY), window: window)
+}
+
+/// Where another window's picture lies on the screen: its top left, and points to one pixel of
+/// the picture across and down (the picture's sides are capped one by one: extraPictureSize).
+struct WindowPlace: Equatable {
+    let origin: CGPoint
+    let scaleX: Double
+    let scaleY: Double
+}
+
+func extraPlace(bounds: CGRect, width: Int, height: Int) -> WindowPlace {
+    WindowPlace(origin: bounds.origin, scaleX: bounds.width / Double(max(1, width)), scaleY: bounds.height / Double(max(1, height)))
 }
 
 /// While the pointer is nowhere, a button event goes only when it releases a button that is down.
@@ -208,8 +220,8 @@ final class ExtraStream {
         pump.window = Int(number)
     }
 
-    /// Points of the screen to one pixel of its picture, and where the picture's top left is.
-    var place: (origin: CGPoint, scale: Double) { (bounds.origin, bounds.width / Double(width)) }
+    /// Where its picture lies on the screen.
+    var place: WindowPlace { extraPlace(bounds: bounds, width: width, height: height) }
 
     /// Opens the encoder, then the capture (`filter` and `sourceRect`), or a still picture of the
     /// stand-in when there is no filter. `done` on the main queue, with why it did not start.
@@ -510,7 +522,7 @@ extension DailyHost {
     }
 
     /// Where a pointer position in a window's picture lies on the screen.
-    func windowPlace(_ number: UInt32) -> (origin: CGPoint, scale: Double)? {
+    func windowPlace(_ number: UInt32) -> WindowPlace? {
         guard settings.windows else { return nil }
         return extras.streams[number]?.place
     }
@@ -639,7 +651,7 @@ func windowsSelfTest() -> Int {
     check(extraPictureSize(CGRect(x: 0, y: 0, width: 20, height: 3000), density: 2) == (64, 2160), "within 64 and 3840 x 2160")
     // Review 2: a position in a window that is not listed goes nowhere, and the next press with it.
     let firstPlace = (origin: CGPoint(x: 100, y: 50), scale: 0.5)
-    let listed: (UInt32) -> (origin: CGPoint, scale: Double)? = { $0 == 2 ? (CGPoint(x: 400, y: 300), 0.5) : nil }
+    let listed: (UInt32) -> WindowPlace? = { $0 == 2 ? WindowPlace(origin: CGPoint(x: 400, y: 300), scaleX: 0.5, scaleY: 0.5) : nil }
     check(pointerTarget(x: 10, y: 20, window: nil, first: firstPlace, place: listed) == .at(CGPoint(x: 105, y: 60), window: 1),
           "without a number: the first window, as before")
     check(pointerTarget(x: 10, y: 20, window: 2, first: firstPlace, place: listed) == .at(CGPoint(x: 405, y: 310), window: 2),
@@ -647,6 +659,18 @@ func windowsSelfTest() -> Int {
     check(pointerTarget(x: 10, y: 20, window: 9, first: firstPlace, place: listed) == .nowhere(9), "a number not listed is nowhere")
     check(!passesNowhere(pressed: true, held: false) && passesNowhere(pressed: false, held: true) && !passesNowhere(pressed: false, held: false),
           "nowhere: no press; only the release of a button that is down")
+    // Review 7: a picture capped on one side only maps each side by its own scale.
+    let tall = CGRect(x: 10, y: 20, width: 1000, height: 1500)
+    let (tw, th) = extraPictureSize(tall, density: 2)
+    let tallPlace = extraPlace(bounds: tall, width: tw, height: th)
+    check(tw == 2000 && th == 2160 && tallPlace.scaleX == 0.5 && abs(tallPlace.scaleY - 1500.0 / 2160.0) < 1e-9,
+          "a window's picture capped in height: its own scale down")
+    if case let .at(corner, window: 2) = pointerTarget(x: Double(tw - 1), y: Double(th - 1), window: 2, first: firstPlace, place: { _ in tallPlace }) {
+        check(abs(corner.x - (10 + 999.5)) < 1e-6 && abs(corner.y - (20 + 1500 - 1500.0 / 2160.0)) < 1e-6,
+              "its bottom right pixel is at the window's bottom right")
+    } else {
+        check(false, "its bottom right pixel is at the window's bottom right")
+    }
     // Review 9: without --windows Accessibility is asked nothing more than before.
     check(!axAsksTitle(windows: false) && axAsksTitle(windows: true), "a window's title is read only with --windows")
     return failed

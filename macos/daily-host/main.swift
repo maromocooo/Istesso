@@ -2232,7 +2232,7 @@ final class Injector {
     var onWindows: (() -> Void)?
     var onClose: ((UInt32) -> Void)?
     var onFocusWindow: ((UInt32) -> Void)?
-    var windowPlace: (UInt32) -> (origin: CGPoint, scale: Double)? = { _ in nil }
+    var windowPlace: (UInt32) -> WindowPlace? = { _ in nil }
     /// The window whose picture the last pointer position was in (1: the first), and whether that
     /// was a window not listed (nowhere).
     private(set) var pointerWindow: UInt32 = 1
