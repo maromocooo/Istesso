@@ -202,8 +202,14 @@ if CommandLine.arguments.dropFirst().first == "--prompt-windows" {
 if CommandLine.arguments.dropFirst().first == "--ask-desktop" {
     // A harmless Files-and-Folders confirmation for the owner's samples: asks to look into the
     // Desktop folder, and says only whether it was allowed (no names, no counts).
-    let allowed = (try? FileManager.default.contentsOfDirectory(atPath: NSHomeDirectory() + "/Desktop")) != nil
-    print(allowed ? "desktop: allowed" : "desktop: not allowed")
+    // The folder is only opened, never read: the same confirmation, and nothing is listed.
+    let fd = open(NSHomeDirectory() + "/Desktop", O_RDONLY | O_DIRECTORY)
+    if fd >= 0 {
+        close(fd)
+        print("desktop: allowed")
+    } else {
+        print(errno == ENOENT ? "desktop: missing" : "desktop: not allowed")
+    }
     exit(0)
 }
 if CommandLine.arguments.dropFirst().first == "--vd-check" { runVirtualDisplayCheck(Array(CommandLine.arguments.dropFirst(2))) }
