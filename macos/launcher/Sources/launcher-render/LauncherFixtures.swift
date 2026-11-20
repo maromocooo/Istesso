@@ -1,0 +1,1 @@
+../launcher-check/LauncherFixtures.swift

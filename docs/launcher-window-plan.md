@@ -53,7 +53,25 @@ M3 のランチャーの提案（自前のクライアントに組み込む、�
 ## 5. 確かめ方
 
 - 今日（Air だけ。画面には何も出さない）：`cargo test -p istesso-cli`、`launcher-check`、`launcher-render` の PNG を目で見る。描いたあとで、システムの記録に、新しいアプリの登録が出ていないことを見る。
-- 夜（持ち主）：ターミナルから 1 行で、窓を出す（束にしないので、登録は増えない）。試すこと：検索、Ubuntu と Studio のアプリを 1 つずつ開く、Air のアプリを 1 つ開く、プロジェクトのコマンドを写す。
+- 夜（持ち主）：ターミナルから 1 行で、窓を出す。束にしないので、アプリの登録は増えない見込み（描く道具では、増えなかった。窓を出す本体では、まだ見ていない）。試すこと：検索、Ubuntu と Studio のアプリを 1 つずつ開く、Air のアプリを 1 つ開く、プロジェクトのコマンドを写す。
+
+### 試作の使い方
+
+```sh
+cargo build --release -p istesso-cli
+swift build -c release --package-path macos/launcher
+macos/launcher/.build/release/istesso-launcher --istesso target/release/istesso --trial <試用の checkout>
+```
+
+- `--trial` には、試用の近道が使っているのと同じ checkout を渡す。
+- 窓は、束にしていない実行ファイルから出る。Dock には、実行ファイルの名前で出るはず（推測。まだ見ていない）。
+- Esc で検索を消す。もう一度 Esc で窓を閉じる（窓を閉じると、終わる）。↑↓ で選ぶ。Return で開く。
+
+### 2026-11-20 に見たこと（Air。画面には何も出していない）
+
+- `istesso launcher apps --json` を、試用の `daily.sh` の写し（自分のフォルダーに置き、状態のフォルダーも自分のもの）に向けて動かした。Ubuntu が 4、Studio が 1、この Mac が 103 で、試用の近道は 0 だった。`--dry-run` で、`daily.sh open firefox --host ubuntu`、`daily.sh open TextEdit --host mac`、`/usr/bin/open -a <束>` が組まれた。
+- `launcher-render` の絵（見本の一覧。名前は作ったもの）：[明るい表示](img/launcher-window/light.png)、[暗い表示](img/launcher-window/dark.png)。見出し、行、右端の印、下の 1 行が出た。最初の絵では、表が空だった（窓の外では、表に大きさがない）。描く前に、表の大きさを決めるようにした。次の絵では、印のある行だけ、説明の文字が少し切れていた。印の幅を決め、説明がその手前まで広がる形にして、直った。選んでいる行の色は、窓の外の絵には出ない（窓で確かめる）。絵の埋め込みの情報（色の設定、撮った機械など）は、落とした。
+- `launcher-render` を動かした前後のシステムの記録：プロセスごとに `registering self` のあと `Failed to register: -10811`（登録されない）。入力の監視の確かめ（`preflight`。問いは出ない）が 1 回。ネットワークの決まりの作り直し（`apps installed`）と、接続の切断は、なかった。
 
 ## 6. 持ち主に決めてほしいこと
 
