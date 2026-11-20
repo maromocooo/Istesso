@@ -706,7 +706,10 @@ fn born_with_input(number: i32) -> Result<std::os::unix::net::UnixDatagram, Stri
 
 /// One line for the person on standard error. Whether it could be written
 /// decides nothing: a program whose standard error is closed, or is a pipe
-/// nobody reads to the end, goes on without it.
+/// whose reading end is gone, goes on without it. A pipe that is still open
+/// but never read is another thing: once it is full, writing waits until
+/// it is read, so whoever gives this program a pipe for standard error
+/// reads it (or gives it none).
 fn note(line: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "{line}");
@@ -793,7 +796,9 @@ fn relay_input(
             Ok(client) => break client,
             Err(why) if began.elapsed() < keep_trying => {
                 if !said {
-                    eprintln!("cannot reach the device yet ({why}); trying again");
+                    note(&format!(
+                        "cannot reach the device yet ({why}); trying again"
+                    ));
                     said = true;
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -886,9 +891,9 @@ fn relay_input(
     };
     tell("open", 0, None);
     if !line.is_answered() {
-        eprintln!(
+        note(
             "note: the device is of a version that does not answer \"still here\"; a connection \
-             that goes silent is only noticed when sending fails"
+             that goes silent is only noticed when sending fails",
         );
     }
 
@@ -950,14 +955,14 @@ fn relay_input(
         }
         match happened {
             Some(Happened::Cut) => {
-                eprintln!("note: the conversation with the device was cut; opening it again");
+                note("note: the conversation with the device was cut; opening it again");
                 tell("cut", line.cuts(), None);
             }
             Some(Happened::Back { after }) => {
-                eprintln!(
+                note(&format!(
                     "note: the conversation with the device is back after {:.2} s",
                     after.as_secs_f64()
-                );
+                ));
                 tell("back", line.cuts(), Some(after));
             }
             None => {}

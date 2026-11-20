@@ -438,6 +438,88 @@ fn input_goes_from_end_to_end_without_a_name() {
     }
 }
 
+/// A relay whose standard error nobody reads any more keeps going: it is
+/// still trying to reach the device when it says so for the first time,
+/// and passes input once the device is there.
+#[test]
+fn a_relay_whose_notes_nobody_reads_keeps_going() {
+    if !DEV_PATHS {
+        eprintln!("left out: only a development build runs in folders of its own");
+        return;
+    }
+    let (host, device) = (TestDir::new("host-unread"), TestDir::new("device-unread"));
+    paired(&host.0, &device.0);
+    let port = a_port(6);
+
+    // The relay first, with nobody at the address yet.
+    let (window, relays) = pair().unwrap();
+    let mut command = istesso();
+    let number = hand_to_child(&mut command, relays);
+    let mut relay = command
+        .args(["input", "relay", "--to", "a host", "--keep-trying", "30"])
+        .arg("--address")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--input-fd")
+        .arg(number.to_string())
+        .arg("--started-by")
+        .arg(std::process::id().to_string())
+        .env("ISTESSO_CONFIG_DIR", &device.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Nobody reads what it says from now on.
+    drop(relay.stderr.take());
+    let mut relay = Started(relay);
+    drop(command);
+    // Long enough for "cannot reach the device yet" to have been said.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        relay.0.try_wait().unwrap().is_none(),
+        "the relay ended when nobody read what it said"
+    );
+
+    let (shows, agents) = pair().unwrap();
+    let mut command = istesso();
+    let number = hand_to_child(&mut command, agents);
+    let agent = command
+        .args(["agent", "--no-discovery", "--bind", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .arg("--input-fd")
+        .arg(number.to_string())
+        .env("ISTESSO_CONFIG_DIR", &host.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _agent = Started(agent);
+    drop(command);
+
+    let pressed = br#"{"kind":"key","code":32,"pressed":true}"#;
+    shows
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let began = Instant::now();
+    let mut buffer = [0u8; 256];
+    let arrived = loop {
+        window.send(pressed).unwrap();
+        if let Ok(length) = shows.recv(&mut buffer) {
+            break buffer[..length].to_vec();
+        }
+        assert!(
+            relay.0.try_wait().unwrap().is_none(),
+            "the relay ended when nobody read what it said"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "nothing arrived at the application's end"
+        );
+    };
+    assert_eq!(arrived, pressed);
+}
+
 /// The form with a name still works, for the measuring tools, and the socket
 /// the relay makes is the owner's alone whatever the starter's umask says.
 /// That keeps other accounts out; the relay says that it does not keep other
