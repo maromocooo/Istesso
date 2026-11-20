@@ -3,47 +3,96 @@
 //! Which software that is comes from the adapter's declaration; the core
 //! knows no product by name. While such software runs, Istesso does not touch
 //! the device: both would draw on the same buttons and both would react to
-//! the same press.
+//! the same press. If Istesso cannot tell whether the software runs, it also
+//! leaves the device alone.
 
 use std::process::Command;
 
 use istesso_device_api::Software;
 
-/// `Some(true)` when the software runs on this machine, `Some(false)` when it
-/// does not, `None` when it cannot be told (the software does not exist for
-/// this system, or the system's tool gave no answer).
-pub fn is_running(software: &Software) -> Option<bool> {
+/// What Istesso knows about one declared program on this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    /// A copy runs on this machine.
+    Runs,
+    /// The system's tool answered and no copy runs.
+    DoesNotRun,
+    /// The declaration names nothing to look for on this system, so the program cannot run here.
+    NotForThisSystem,
+    /// The tool gave no answer or there is no way to check here. Istesso leaves the device alone.
+    CannotTell,
+}
+
+/// Whether the declared software runs on this machine.
+pub fn is_running(software: &Software) -> State {
     if cfg!(target_os = "macos") {
-        let bundle = software.macos_bundle_id?;
+        let Some(bundle) = software.macos_bundle_id else {
+            return State::NotForThisSystem;
+        };
         // Prints one line per running copy and nothing when there is none.
-        let output = Command::new("/usr/bin/lsappinfo")
+        let Ok(output) = Command::new("/usr/bin/lsappinfo")
             .args(["find", &format!("bundleID={bundle}")])
             .output()
-            .ok()?;
+        else {
+            return State::CannotTell;
+        };
         if !output.status.success() {
-            return None;
+            return State::CannotTell;
         }
-        Some(parse_lsappinfo_find(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
+        if parse_lsappinfo_find(&String::from_utf8_lossy(&output.stdout)) {
+            State::Runs
+        } else {
+            State::DoesNotRun
+        }
     } else if cfg!(target_os = "linux") {
-        let name = software.linux_process?;
-        let entries = std::fs::read_dir("/proc").ok()?;
-        Some(entries.flatten().any(|entry| {
-            std::fs::read_to_string(entry.path().join("comm"))
+        let Some(name) = software.linux_process else {
+            return State::NotForThisSystem;
+        };
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return State::CannotTell;
+        };
+        let mut state = State::DoesNotRun;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                state = State::CannotTell;
+                continue;
+            };
+            if std::fs::read_to_string(entry.path().join("comm"))
                 .is_ok_and(|comm| comm.trim_end() == name)
-        }))
+            {
+                return State::Runs;
+            }
+        }
+        state
     } else {
-        None
+        State::CannotTell
     }
 }
 
-/// The names of the declared software that is running now.
-pub fn running(all: &[Software]) -> Vec<&'static str> {
-    all.iter()
-        .filter(|software| is_running(software) == Some(true))
-        .map(|software| software.name)
-        .collect()
+/// Declared software that keeps Istesso from touching the device.
+#[derive(Default)]
+pub struct Look {
+    /// Names of programs running on this machine.
+    pub running: Vec<&'static str>,
+    /// Names of programs whose running state is unknown.
+    pub cannot_tell: Vec<&'static str>,
+}
+
+/// Lists the declared programs that run here or whose running state is unknown.
+pub fn look(all: &[Software]) -> Look {
+    look_with(all, is_running)
+}
+
+fn look_with(all: &[Software], lookup: impl Fn(&Software) -> State) -> Look {
+    let mut result = Look::default();
+    for software in all {
+        match lookup(software) {
+            State::Runs => result.running.push(software.name),
+            State::CannotTell => result.cannot_tell.push(software.name),
+            State::DoesNotRun | State::NotForThisSystem => {}
+        }
+    }
+    result
 }
 
 /// `lsappinfo find` answers with lines such as `ASN:0x0-0x1234-"Name":`.
@@ -64,14 +113,17 @@ mod tests {
     }
 
     #[test]
-    fn software_that_does_not_exist_here_cannot_be_told() {
+    fn software_without_a_platform_identifier() {
         let nowhere = Software {
             name: "Nowhere",
             macos_bundle_id: None,
             linux_process: None,
         };
-        assert_eq!(is_running(&nowhere), None);
-        assert!(running(&[nowhere]).is_empty());
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(is_running(&nowhere), State::NotForThisSystem);
+        } else {
+            assert_eq!(is_running(&nowhere), State::CannotTell);
+        }
     }
 
     #[test]
@@ -79,10 +131,36 @@ mod tests {
         let absent = Software {
             name: "Absent",
             macos_bundle_id: Some("invalid.istesso.test.not-installed"),
-            linux_process: Some("istesso-test-not-running"),
+            linux_process: Some("istesso-absent"),
         };
         if cfg!(any(target_os = "macos", target_os = "linux")) {
-            assert_eq!(is_running(&absent), Some(false));
+            assert_eq!(is_running(&absent), State::DoesNotRun);
         }
+    }
+
+    #[test]
+    fn look_lists_running_and_unknown_software_in_declaration_order() {
+        let all = [
+            "Unknown B",
+            "Running B",
+            "Stopped",
+            "Other OS",
+            "Running A",
+            "Unknown A",
+        ]
+        .map(|name| Software {
+            name,
+            macos_bundle_id: None,
+            linux_process: None,
+        });
+        let result = look_with(&all, |software| match software.name {
+            "Running A" | "Running B" => State::Runs,
+            "Unknown A" | "Unknown B" => State::CannotTell,
+            "Stopped" => State::DoesNotRun,
+            "Other OS" => State::NotForThisSystem,
+            _ => unreachable!(),
+        });
+        assert_eq!(result.running, ["Running B", "Running A"]);
+        assert_eq!(result.cannot_tell, ["Unknown B", "Unknown A"]);
     }
 }

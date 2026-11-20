@@ -9,6 +9,9 @@ use istesso_device_api::Declaration;
 
 /// Longest name of a device, a piece of software or an application.
 const NAME_LENGTH: usize = 64;
+/// Linux keeps at most 15 bytes of a process name in `/proc/<pid>/comm`.
+/// A longer declared name can never match.
+const LINUX_PROCESS_LENGTH: usize = 15;
 /// Longest note on what a report is for.
 const PURPOSE_LENGTH: usize = 80;
 
@@ -51,7 +54,12 @@ pub fn check(declaration: &Declaration) -> Result<(), String> {
             check_text("a bundle identifier", bundle, NAME_LENGTH)?;
         }
         if let Some(process) = software.linux_process {
-            check_text("a process name", process, NAME_LENGTH)?;
+            if process.len() > LINUX_PROCESS_LENGTH {
+                return Err(format!(
+                    "a process name: at most {LINUX_PROCESS_LENGTH} bytes, the length Linux keeps"
+                ));
+            }
+            check_text("a process name", process, LINUX_PROCESS_LENGTH)?;
         }
     }
     for app in declaration.used_by_apps {
@@ -130,6 +138,27 @@ mod tests {
             "0123456789012345678901234567890123456789012345678901234567890123456789"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn a_linux_process_name_must_fit_in_15_bytes() {
+        let mut d = declaration("Pad");
+        d.other_software = &[Software {
+            name: "Tool",
+            macos_bundle_id: None,
+            linux_process: Some("123456789012345"),
+        }];
+        assert!(check(&d).is_ok());
+
+        d.other_software = &[Software {
+            name: "Tool",
+            macos_bundle_id: None,
+            linux_process: Some("1234567890123456"),
+        }];
+        assert_eq!(
+            check(&d).unwrap_err(),
+            "a process name: at most 15 bytes, the length Linux keeps"
+        );
     }
 
     #[test]
