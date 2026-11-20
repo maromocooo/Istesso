@@ -114,7 +114,7 @@ pub(crate) fn warn_once_if_open(dir: &Path) {
         if let Some(mode) = open_to_others(dir) {
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
-                    "warning: other users may write into {} (mode {mode:o}); `chmod 700` it so that nobody else can add a paired device or replace this device's identity",
+                    "warning: the group or other users may write into {} (mode {mode:o}); `chmod 700` it so that nobody else can add a paired device or replace this device's identity",
                     dir.display()
                 );
             }
