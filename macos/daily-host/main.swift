@@ -1884,6 +1884,28 @@ func selfTest() -> Never {
         checkPanel(injector.pointerPlace == CGPoint(x: 110, y: 115), true, "injector: pointer_at inside the picture is as said")
     }
     do {
+        // A place in another listed window (windows.swift) is kept inside that window's picture,
+        // never measured against the first window's.
+        let injector = Injector()
+        injector.mayPost = true
+        injector.origin = CGPoint(x: 100, y: 100)
+        injector.scale = 0.5
+        injector.pictureSize = { CGSize(width: 400, height: 200) }
+        injector.onWindows = {}
+        injector.windowPlace = { $0 == 2 ? WindowPlace(origin: CGPoint(x: 600, y: 300), scaleX: 0.5, scaleY: 0.5) : nil }
+        injector.windowPictureSize = { $0 == 2 ? CGSize(width: 800, height: 100) : nil }
+        injector.listNow = { [appWin] }
+        injector.lockedNow = { false }
+        injector.windowAt = { _ in appWin }
+        injector.postProcess = { _, _ in }
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "window": 2, "x": 100_000, "y": 150]))
+        checkPanel(injector.pointerPlace == CGPoint(x: 600 + 799 * 0.5, y: 300 + 99 * 0.5), true, "injector: pointer_at beyond another window's picture is kept inside that one")
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "window": 2, "x": 500, "y": 50]))
+        checkPanel(injector.pointerPlace == CGPoint(x: 850, y: 325), true, "injector: another window's place is not held to the first picture's size")
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "x": 500, "y": 50]))
+        checkPanel(injector.pointerPlace == CGPoint(x: 100 + 399 * 0.5, y: 125), true, "injector: the first window's place is still kept inside its own picture")
+    }
+    do {
         // A button code that is none of the three: nothing is posted, nothing is held.
         let injector = Injector()
         var posted = 0
@@ -2443,6 +2465,8 @@ final class Injector {
     var onClose: ((UInt32) -> Void)?
     var onFocusWindow: ((UInt32) -> Void)?
     var windowPlace: (UInt32) -> WindowPlace? = { _ in nil }
+    /// Another listed window's picture size in pixels (nil: not listed): a place in it is kept inside it.
+    var windowPictureSize: (UInt32) -> CGSize? = { _ in nil }
     /// The window whose picture the last pointer position was in (1: the first), and whether that
     /// was a window not listed (nowhere).
     private(set) var pointerWindow: UInt32 = 1
@@ -2632,9 +2656,11 @@ final class Injector {
             // In the first window's picture, or (windows.swift) in another listed window's; a number
             // not listed is nowhere: no press and no scroll goes until the pointer is somewhere again.
             let number = onWindows != nil ? (object["window"] as? NSNumber)?.uint32Value : nil
-            // Kept inside the first window's picture: a place beyond it would be a part of the screen
-            // nobody sees (another window of the application, another display).
-            if (number ?? 1) <= 1, let size = pictureSize(), size.width >= 1, size.height >= 1 {
+            // Kept inside the picture it is in (the first window's, or another listed window's): a
+            // place beyond it would be a part of the screen nobody sees (another window of the
+            // application, another display).
+            let size = (number ?? 1) <= 1 ? pictureSize() : windowPictureSize(number ?? 1)
+            if let size, size.width >= 1, size.height >= 1 {
                 x = min(max(x, 0), size.width - 1)
                 y = min(max(y, 0), size.height - 1)
             }

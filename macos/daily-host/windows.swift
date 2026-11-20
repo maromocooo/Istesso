@@ -609,6 +609,12 @@ extension DailyHost {
         return extras.streams[number]?.place
     }
 
+    /// The size in pixels of a listed window's picture.
+    func windowPictureSize(_ number: UInt32) -> CGSize? {
+        guard settings.windows, let stream = extras.streams[number] else { return nil }
+        return CGSize(width: stream.width, height: stream.height)
+    }
+
     /// Windows that pointer events in window `number` (1: the first) must pass over: the first
     /// window and the other streamed ones, which may lie over it on the same display.
     func windowsPassedOver(pointerIn number: UInt32) -> Set<CGWindowID> {
@@ -799,5 +805,6 @@ extension DailyHost {
         injector.onClose = { [weak self] number in self?.closeWindowAsked(number) }
         injector.onFocusWindow = { [weak self] number in self?.focusWindowAsked(number) }
         injector.windowPlace = { [weak self] number in self?.windowPlace(number) }
+        injector.windowPictureSize = { [weak self] number in self?.windowPictureSize(number) }
     }
 }
