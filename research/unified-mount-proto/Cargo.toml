@@ -1,0 +1,25 @@
+[package]
+name = "unified-mount-proto"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Research prototype: show a folder that lives on another machine at a fixed path, read-only, through a loopback NFSv3 server and the built-in macOS NFS client, fed over Istesso's control channel."
+
+# Its own workspace: this prototype is not part of the product workspace. It uses the
+# product's crates for the encrypted channel and the device's end of a shown folder.
+[workspace]
+
+[dependencies]
+istesso-agent = { path = "../../crates/istesso-agent" }
+istesso-link = { path = "../../crates/istesso-link" }
+istesso-pair = { path = "../../crates/istesso-pair" }
+nfsserve = "0.11"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "process", "signal", "time"] }
+libc = "0.2"
+
+# The NFS library with limits on what an unauthenticated local client can make it allocate
+# (vendor/nfsserve, BSD-3-Clause; the changes are marked "Istesso patch").
+[patch.crates-io]
+nfsserve = { path = "vendor/nfsserve" }

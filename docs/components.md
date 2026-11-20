@@ -25,6 +25,9 @@
 | winit、softbuffer | テストアプリ（`istesso-flash`）の窓と描画。`istesso` 本体には入らない | Apache-2.0、MIT OR Apache-2.0 | <https://github.com/rust-windowing/winit>、<https://github.com/rust-windowing/softbuffer> |
 | glutin、glutin-winit、glow | テストアプリが GPU で描くときの OpenGL（`--draw gpu`）。`istesso` 本体には入らない | Apache-2.0、MIT、MIT OR Apache-2.0 OR Zlib | <https://github.com/rust-windowing/glutin>、<https://github.com/grovesNL/glow> |
 | if-addrs、unicode-width、zeroize | ネットワークアダプターのアドレス取得、表の桁そろえ、鍵のメモリ消去 | MIT OR BSD-3-Clause、MIT OR Apache-2.0 | <https://crates.io> |
+| ignore、globset（`ignore` は 0.4.31 より前、`globset` は 0.4.20 より前に止めている）、regex-automata、crossbeam-deque、walkdir、same-file、bstr | 読むだけで見せるフォルダー（試作。ADR 0007 の【提案】）で、Git が無視するファイルを、受け側が隠す（`istesso-agent` の `mount`）。止めているのは、それより新しい版が、このワークスペースより新しい Rust を求めるため | ignore は Unlicense OR MIT（MIT を選ぶ）。globset、regex-automata、walkdir、same-file は Unlicense OR MIT か MIT OR Apache-2.0。crossbeam-deque、bstr は MIT OR Apache-2.0 | <https://github.com/BurntSushi/ripgrep> |
+| unicode-normalization、tinyvec | 同じ。名前と規則を、合成形（NFC）にそろえて比べる | MIT OR Apache-2.0、Zlib OR Apache-2.0 OR MIT | <https://github.com/unicode-rs/unicode-normalization> |
+| nfsserve 0.11.0（**写して、手を入れた**） | 読むだけで見せるフォルダーの、見る側（Mac）の手元だけの NFS のサーバー（試作。`research/unified-mount-proto` のワークスペースだけ。製品のワークスペースには入らない）。`research/unified-mount-proto/vendor/nfsserve` に写し、ローカルの相手が言うままに確保させない手を入れた（印は「Istesso patch」。ADR 0007）。写しの `Cargo.toml` は `publish = false`。作者の名前とメールアドレスの欄（`authors`）だけを外した | BSD-3-Clause（XetData、Hugging Face）。写しに LICENSE を添えている。**配る前に**、この文面を `third-party-licenses/` に置き、配るものに入れる（BSD-3 の条件。いまは配っていない） | <https://github.com/huggingface/nfsserve> |
 
 Wolf は、アプリを Docker コンテナで起動する部分を使いません。使うのは、コンポジターの本体（gst-wayland-display の `wayland-display-core`）です。元のコミットに小さな修正を重ね、修正は元のプロジェクトに提案できる形に保ちます（[ADR 0009](adr/0009-host-compositor.md)）。入力はコンポジターに直接渡すので、仮想入力（inputtino）は、ゲームパッドが要るようになるまで使いません。
 

@@ -550,7 +550,8 @@ mod tests {
                         Request::InputOpen { .. }
                         | Request::Input { .. }
                         | Request::ShellOpen(_)
-                        | Request::ForwardOpen { .. } => continue,
+                        | Request::ForwardOpen { .. }
+                        | Request::MountOpen(_) => continue,
                     };
                     if session.respond(&response).is_err() {
                         break;

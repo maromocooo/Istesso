@@ -53,6 +53,12 @@ pub enum Request {
     /// error. Once it is open, the connection carries only the frames of
     /// [`crate::forward::ForwardFrame`]. Proposed in ADR 0007 ("ポートの転送").
     ForwardOpen { forward: String },
+    /// May I see this folder of yours, read-only? Answered with
+    /// [`Response::MountOpen`] or an error. Once it is open, the connection
+    /// carries only the questions and answers of [`crate::mount`], and no
+    /// more JSON of this kind. Proposed in ADR 0007 ("フォルダーを読むだけで
+    /// 見せる"); off unless the host was told which folders and which devices.
+    MountOpen(crate::mount::MountRequest),
 }
 
 /// What a device says when it asks for a shell ([`Request::ShellOpen`]).
@@ -111,6 +117,14 @@ pub enum Response {
     /// The connection to the port is made. From now on the conversation
     /// carries the frames of [`crate::forward::ForwardFrame`] only.
     ForwardOpen,
+    /// The folder is open. From now on the connection carries the questions
+    /// and answers of [`crate::mount`] only.
+    MountOpen {
+        /// The attributes of the folder itself.
+        root: crate::mount::Attr,
+        /// The most bytes one read is answered with.
+        max_read: u32,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -310,6 +324,31 @@ mod tests {
             serde_json::to_string(&Response::ForwardOpen).unwrap(),
             r#"{"type":"forward_open"}"#
         );
+    }
+
+    #[test]
+    fn asking_for_a_folder_names_it_by_id_only() {
+        let request = Request::MountOpen(crate::mount::MountRequest {
+            folder: "istesso".into(),
+        });
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"mount_open","folder":"istesso"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        let answer = Response::MountOpen {
+            root: crate::mount::Attr {
+                kind: crate::mount::Kind::Dir,
+                mode: 0o755,
+                nlink: 2,
+                size: 0,
+                mtime: 1,
+                mtime_nsec: 0,
+                ctime: 1,
+                ctime_nsec: 0,
+            },
+            max_read: crate::mount::MAX_READ,
+        };
+        let json = serde_json::to_string(&answer).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), answer);
     }
 
     #[test]
