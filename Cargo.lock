@@ -919,6 +919,7 @@ dependencies = [
  "istesso-measure",
  "istesso-pair",
  "istesso-proto",
+ "libc",
  "serde",
  "serde_json",
  "unicode-width",
