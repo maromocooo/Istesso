@@ -42,6 +42,15 @@
 2. `ssh studio` のタブが開いている：`ssh -O check istesso-studio` が `Master running`。
 3. 夕方の試用が終わっている。Studio のアプリの窓を Air で閉じてから：`~/link-proj-m4-daily/scripts/daily-mac.sh stop`（最後が `here: windows, relays and the guard are stopped`。Studio のアプリは開いたまま）。
 4. いまの版を読む（読むだけ）：`"$W/scripts/mac-host-swap.sh" show`。`usual place: CDHash=…` が出る（記録では 542ad7c の `521e9fd8…`）。書き留める。
+5. **署名した人が同じか**（読むだけ。台本は CDHash しか比べないので、手で）：Studio のいつもの場所の束と、包みの束の「決まり」（designated requirement）を 1 行ずつ出す。**2 行がまったく同じときだけ、4 章（入れ替え）へ進む。** 違えば、そこでやめる（違う証明書の束を入れると、画面収録とアクセシビリティの許可が外れ、Studio の画面に確認が出る）。
+
+   ```sh
+   ssh istesso-studio 'codesign -d -r- "$HOME/.cache/istesso-daily-mac/Istesso Dev Daily Host.app" 2>&1 | grep "^designated"'
+   codesign -d -r- "$P/Istesso Dev Daily Host.app" 2>&1 | grep "^designated"
+   ```
+
+   包みの行は `designated => identifier "com.maromoco.istesso-dev.daily-host" and certificate leaf = H"3b9456d4c30db0a11001f7c061f72cd2b0b3c46b"`（見た）。
+6. 今夜決めること 4 が「はい」のときだけ：5-3 の 1 の写しを、**ここで一度**取る（入れ替えの前の「確認を出した時刻」。A1 のあとにもう一度取って比べる）。
 
 ## 4. 入れ替え（1 分）
 
@@ -51,7 +60,7 @@
 
 - 最後が `usual place: CDHash=a4cafd0d1a28fc3cc5ca8c4496f1743c15960694`。その前の行が `kept: replaced/before-studio-next-Istesso Dev Daily Host.app (CDHash=…), replaced/before-studio-next-istesso`（前の版は消さずに、`~/.cache/istesso-daily-mac/replaced/` に残る）。
 - 台本がすること：Air で、包みが `package.txt` のとおりか確かめる → Studio で、合図が `free`、ホストのプログラムとエージェントが動いていない、`before-studio-next` がまだない、を確かめる → いつもの場所の隣の `incoming-studio-next/` に写し、もう一度確かめる → いまの束を `replaced/` に動かし、包みの束を**いつもの場所**（`~/.cache/istesso-daily-mac/Istesso Dev Daily Host.app`）に置く → `bin/istesso` を写しで残し、包みのものに置き換える。何も開かない、起動しない、消さない。
-- 断られたとき（何も変わっていない）：`a latency measurement is running` → 合図が `free` になってから。`a host program or an agent of the trial runs there` → 3 の `stop` から。`is kept there already` → 前の入れ替えが戻されていない（5 の戻し方を先に）。`not reached` → `ssh studio` を開き直す。
+- 断られたとき（何も変わっていない）：`a latency measurement is running` → 合図が `free` になってから。`a host program or an agent of the trial runs there` → 3 の `stop` から。`is kept there already` → 前の入れ替えが戻されていない（6 の戻し方を先に）。`not reached` → `ssh studio` を開き直す。
 
 ## 5. 入れ替えのあとの確かめ（持ち主、20 分ほど）
 
@@ -61,7 +70,7 @@
 
 | # | すること | 見るもの | ちがうとき |
 |---|---|---|---|
-| A1 | `TextEdit (Studio)` を開く | 絵が来る。**Studio の画面に、画面収録の確認が出ない**。Air の窓の題名に「Studio で確認が出ています」が出ない | 確認が出たら、許可せず、文面を控えて、5 の戻し方 |
+| A1 | `TextEdit (Studio)` を開く | 絵が来る。**Studio の画面に、画面収録の確認が出ない**。Air の窓の題名に「Studio で確認が出ています」が出ない | 確認が出たら、許可せず、文面を控えて、6 の戻し方 |
 | A2 | 文字を打つ（英字、日本語を数行）、⌘C／⌘V、クリック | どれも届く（アクセシビリティが残った） | 届かなければ、`stop` して、とりまとめ役に |
 | A3 | とりまとめ役：下の 1 行（読むだけ） | `"screen_recording":true,"accessibility":true` | false があれば、戻す |
 | A4 | 変換中の文字をアプリの中に出す形（`DAILY_INLINE=1`）を使っているとき | 変換中の文字が、前と同じにアプリの中に出る（入力ソースとホストは、同じ証明書どうしで確かめ合う。証明書は変えていない） | 帯に戻ったら、知らせる（文字は落ちない） |
@@ -90,6 +99,8 @@ ssh istesso-studio 'grep -c "did not go onto the virtual display" ~/.cache/istes
 
 印は Air の窓の題名に出る。Air のいつもの `~/link-proj-m4-daily` には入っていないので、このブランチの作業ツリーから開く。
 
+**始める前に**：`~/link-proj-m4-daily/scripts/daily-mac.sh stop`。5-1、5-2 の TextEdit のホストのプログラムや、いつもの起動口の見張りが残っていると、それが前の設定のまま使われ、印は出ない。
+
 1. とりまとめ役：Studio の画面収録の記録から、ホストの束の 1 行だけを写す（Studio で読むだけ。全体は Air に置かない。写しは Air の状態フォルダーに 1 つできる）：
 
    ```sh
@@ -101,7 +112,7 @@ ssh istesso-studio 'grep -c "did not go onto the virtual display" ~/.cache/istes
    ```
 
    `"state":"upcoming"` と日付が出る（11-19 の記録では 12-19 11:47 ごろ）。`unknown` なら、印は出ない（推測はしない）。**入れ替えの前に一度、A1 のあとにもう一度**写すと、`kScreenCaptureApprovalLastAlerted` が変わっていないこと（＝確認が出なかったこと）も分かる。
-2. 持ち主：試用のアプリを閉じてから、
+2. 持ち主：上の `stop` のあとで、
 
    ```sh
    DAILY_CAPTURE_NOTICE=1 DAILY_CAPTURE_NOTICE_DAYS=40 DAILY_ISTESSO_BIN="$P/bin/istesso" "$W/scripts/daily-mac.sh" open TextEdit
@@ -111,15 +122,24 @@ ssh istesso-studio 'grep -c "did not go onto the virtual display" ~/.cache/istes
 
 ### 5-4. 新しい窓（任意。今夜するかは持ち主が決める、10 分）
 
-`docs/proto-new-windows.md` の 5 章の S1〜S7 を、次のコマンドで（このブランチの作業ツリーの見張り、包みのリレーとビューアー）：
+`docs/proto-new-windows.md` の 5 章の S1〜S7 を、次のコマンドで（このブランチの作業ツリーの見張り、包みのリレーとビューアー）。**先に** `~/link-proj-m4-daily/scripts/daily-mac.sh stop`（TextEdit のホストのプログラムが残っていると「もう動いている。設定は始めたときのまま」となり、切り替えが使われない）：
 
 ```sh
+~/link-proj-m4-daily/scripts/daily-mac.sh stop
 DAILY_WINDOWS=1 DAILY_FRAME_LOGS=1 DAILY_ISTESSO_BIN="$P/bin/istesso" DAILY_VIEWER="$P/air/gst-viewer" "$W/scripts/daily-mac.sh" open TextEdit
 ```
 
+開いたあと、切り替えが使われたかを読む（読むだけ）。1 以上なら使われている。0 なら、S の確かめをせずに `stop`：
+
+```sh
+ssh istesso-studio 'grep -c "\"windows\",\"declared\":true" ~/.cache/istesso-daily-mac/run/TextEdit/host.log'
+```
+
+**S3 のまえに知っておくこと**：新しい窓を付けた形（いつもの押し方、形 4）では、Studio の上で 2 枚の窓が重なっているところをクリックやスクロールすると、Air で指した窓ではなく、Studio で上にある窓に届くことがある（たとえば 2 枚目の書類が 1 枚目に重なっているとき、1 枚目をクリックすると 2 枚目にカーソルが入る）。思わないことが起きたら、最初のクリックで、やめる（`stop`）。
+
 5 章の「入れ替え」と「戻す」は、この文書の 4 と 6 で置き換える（同じ束を 2 回入れない）。
 
-**H1（最後の窓を閉じて ⌘N）は、`DAILY_WINDOWS` なしで確かめる。** 新しい窓を付けたまま最後の窓を閉じて ⌘N を押したとき、新しい窓が「映す窓」になるか「足された窓」になるかは、まだ決まっていない（読んだ。守りの直しと新しい窓の、組み合わせの見直しの問い）。
+**H1（最後の窓を閉じて ⌘N）は、`DAILY_WINDOWS` なしで確かめる。** 新しい窓を付けたまま最後の窓を閉じて ⌘N を押したとき、新しい窓は「映す窓」になる、と見直しで読んだ（実機では見ていない）。
 
 ## 6. 戻し方（前の版 542ad7c へ、1 分）
 
@@ -132,7 +152,7 @@ DAILY_WINDOWS=1 DAILY_FRAME_LOGS=1 DAILY_ISTESSO_BIN="$P/bin/istesso" DAILY_VIEW
 
 ## 7. 気をつけること
 
-- 入れ替えたあとに、`~/link-proj-m4-daily` で `scripts/daily-mac.sh setup` を打つと、56246d8 から作り直した束（守りの直しなし）で置き換わる（包みは `replaced/` に残る。同じ証明書なので確認は出ない見込み）。入れ替えたままにするなら、setup は打たない。
+- 入れ替えたままにするなら、**`~/link-proj-m4-daily` を `studio-next` へ進めるまで、そこで `scripts/daily-mac.sh setup` を打たない。** setup は、打ったチェックアウト（いまは 56246d8）から作り直して、いつもの場所の束と `bin/istesso` を、何も言わずに置き換える（守りの直しのない束になる。同じ証明書なので、確認は出ない見込み）。そのとき `replaced/` に残るのは包みの**束だけ**で、包みの `bin/istesso` は上書きされる（Air の SSD の `P/bin/istesso` には残る）。`~/link-proj-m4-daily` を進めるかどうかは、持ち主が決める（進めると、Air の起動口に新しい切り替え（既定は切）が入り、次の setup でリレーも新しくなる）。
 - 新しい窓は、`DAILY_WINDOWS=1` を付けたときだけ。いつもの開き方では、いまと同じ。
 - 束は、いつもの場所のほかでは起動しない（`replaced/` や `incoming-…` の中のものを `open` しない）。場所が変わると、Studio に画面収録の確認が出る。
 
@@ -147,6 +167,8 @@ DAILY_WINDOWS=1 DAILY_FRAME_LOGS=1 DAILY_ISTESSO_BIN="$P/bin/istesso" DAILY_VIEW
 - ビューアー：`macos/gst-viewer/build.sh` と同じ確かめ（キー、文字、コピー、窓の一覧、窓の大きさ、スクロール）が全部通り、警告なしでつないだ。
 - 入れ替えの台本：`scripts/tests/mac-host-swap-test.sh`（ssh の代わりに、手元の作り物の家で動かす。アドホックの署名の小さな束 2 つ）が全部通った。断る場合（中身が違う、ホストのプログラムが動いている、合図が busy、同じ名前がもう残っている、戻すものがない、変な名前とフォルダー）、`in`、`show`、`back`、前の失敗の残り。本物の包みでも、作り物の家に対して `in`、`show`、`back` が通った（写したあとも CDHash は同じ）。
 - `scripts/studio_capture_notice_test.py` 17 件 OK。`DAILY_CAPTURE_NOTICE_DAYS` の変な値（abc、401、-1、12345）は、何も始めずに終了コード 2。
+
+- 別の目の見直し（2026-11-20 12:53〜13:15、56246d8..02cda60）：「直し 7 と 11 のあとで準備よし」。7（署名した人を比べる）は 3 の 5、11（戻し方の番号）は直した。ほかの指摘（新しい窓の形 4 のクリック、台本の比べと動かす合間など）は、今夜の手順の注か、あとの直し。
 
 ### 見ていない
 
