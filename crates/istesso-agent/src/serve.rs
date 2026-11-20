@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use istesso_link::{ErrorCode, HangUp, LocalKeys, Request, Response, Session, DEFAULT_PORT};
+use istesso_link::{
+    ErrorCode, HangUp, LocalKeys, RefusalLog, Request, Response, Session, DEFAULT_PORT,
+};
 use istesso_pair::{Identity, PeerStore, Permission};
 use istesso_proto::{AppEntry, HostManifest, InputEvent};
 
@@ -97,6 +99,8 @@ pub struct Agent {
 struct Shared {
     paths: Paths,
     keys: LocalKeys,
+    /// How many refused connections have been told lately (a few a minute).
+    refusals: Mutex<RefusalLog>,
     fingerprint: String,
     manifest: Mutex<Option<HostManifest>>,
     apps: Mutex<Option<(Instant, Vec<AppEntry>)>>,
@@ -201,6 +205,7 @@ impl Agent {
             shared: Arc::new(Shared {
                 paths,
                 keys,
+                refusals: Mutex::new(RefusalLog::new()),
                 fingerprint: identity.fingerprint(),
                 manifest: Mutex::new(None),
                 apps: Mutex::new(None),
@@ -527,7 +532,16 @@ impl Shared {
                         | istesso_link::Error::BadIdentity
                 ) {
                     let from = remote.map(|a| a.ip().to_string()).unwrap_or_default();
-                    (self.log)(format!("refused a connection from {from}: {err}"));
+                    let line = format!("refused a connection from {from}: {err}");
+                    // A caller that calls again and again fills the log with a few lines a
+                    // minute, and a count.
+                    let lines = match self.refusals.lock() {
+                        Ok(mut refusals) => refusals.refused(Instant::now(), line),
+                        Err(_) => vec![line],
+                    };
+                    for line in lines {
+                        (self.log)(line);
+                    }
                 }
                 return;
             }
@@ -1533,6 +1547,71 @@ mod tests {
         let mut peers = PeerStore::open(paths.peers()).unwrap();
         peers.add(peer.clone()).unwrap();
         assert!(may_still_control(&paths, &peer));
+    }
+
+    #[test]
+    fn a_caller_that_is_refused_again_and_again_fills_no_log() {
+        use istesso_pair::{Hello, Peer};
+        let (host, device) = (TempDir::new("refused"), TempDir::new("refused"));
+        let host_identity = Identity::load_or_create(&host.paths().identity()).unwrap();
+        let device_identity = Identity::load_or_create(&device.paths().identity()).unwrap();
+        // The device knows the host; the host does not know the device.
+        PeerStore::open(device.paths().peers())
+            .unwrap()
+            .add(Peer::from_hello(&Hello {
+                device_name: "a host".into(),
+                public_key: host_identity.public_key(),
+            }))
+            .unwrap();
+        let said = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log: Log = {
+            let said = said.clone();
+            Arc::new(move |line| said.lock().unwrap().push(line))
+        };
+        let options = AgentOptions {
+            bind: Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            discovery: false,
+            refresh_peers: None,
+            verbose: false,
+            ..AgentOptions::default()
+        };
+        let agent = Agent::bind(host.paths(), &options, log).unwrap();
+        let addr = agent.local_addr().unwrap();
+        std::thread::spawn(move || agent.run());
+        let keys = LocalKeys::new(&device_identity).unwrap();
+        let peers = PeerStore::open(device.paths().peers()).unwrap();
+        let refused = || {
+            said.lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.starts_with("refused a connection"))
+                .count()
+        };
+        for _ in 0..12 {
+            assert!(istesso_link::Client::connect(
+                addr,
+                &keys,
+                &peers,
+                None,
+                Duration::from_secs(3)
+            )
+            .is_err());
+        }
+        let began = Instant::now();
+        while refused() < istesso_link::refusals::SHOWN_A_MINUTE as usize
+            && began.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        // A few a minute; the rest are counted, and told when the next minute begins.
+        assert_eq!(
+            refused(),
+            istesso_link::refusals::SHOWN_A_MINUTE as usize,
+            "{:?}",
+            said.lock().unwrap()
+        );
     }
 
     #[test]

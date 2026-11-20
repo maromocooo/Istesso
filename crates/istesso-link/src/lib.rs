@@ -20,11 +20,13 @@ pub mod channel;
 pub mod client;
 mod frame;
 pub mod message;
+pub mod refusals;
 pub mod server;
 
 pub use channel::{Channel, LocalKeys};
 pub use client::{Client, ClipboardAnswer, Heard, InputAnswer};
 pub use message::{ErrorCode, Request, Response};
+pub use refusals::RefusalLog;
 pub use server::{HangUp, Session};
 
 /// Port the agent listens on unless told otherwise.

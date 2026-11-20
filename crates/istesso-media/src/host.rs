@@ -168,6 +168,8 @@ struct Shared {
     recheck_paused: AtomicBool,
     stop: AtomicBool,
     log: Log,
+    /// How many refused connections have been told lately (a few a minute).
+    refusals: Mutex<istesso_link::RefusalLog>,
 }
 
 /// The viewers, and what is being sent to them. Held only for moments:
@@ -364,6 +366,7 @@ impl Host {
             recheck_paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             log,
+            refusals: Mutex::new(istesso_link::RefusalLog::new()),
         });
         let accepting = {
             let shared = shared.clone();
@@ -990,7 +993,16 @@ impl Shared {
                                 | LinkError::BadIdentity
                         )
                     ) {
-                        (shared.log)(format!("refused a connection: {err}"));
+                        // A caller that calls again and again fills the log with a few
+                        // lines a minute, and a count.
+                        let line = format!("refused a connection: {err}");
+                        let lines = match shared.refusals.lock() {
+                            Ok(mut refusals) => refusals.refused(std::time::Instant::now(), line),
+                            Err(_) => vec![line],
+                        };
+                        for line in lines {
+                            (shared.log)(line);
+                        }
                     }
                 }
             });
