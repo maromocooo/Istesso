@@ -96,9 +96,9 @@ typedef struct IstessoMediaTextInput {
     uint32_t height;
     uint32_t serial;  /* 0 to 255: changes whenever another field, or the same one enabled again,
                          has the keyboard; the client ends its composition then */
-    uint32_t dropped; /* Pieces of committed text the host had nowhere to put so far. Counts above
-                         65535 are sent as 65535. When it grows, the client keeps what it sent last
-                         for the person. */
+    uint32_t dropped; /* Pieces of committed text the host had nowhere to put so far, sent mod
+                         65536: only a change counts. When it changes, the client keeps what it
+                         sent last for the person. */
 } IstessoMediaTextInput;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -197,7 +197,7 @@ int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const Istess
  * istesso_media_host_set_cursor() says what the cursor is (the latest only, behind frames, to
  * viewers that may be sent the frames, and to one that connects later). Nothing is sent until
  * this is first called. Returns 0, or -1 for a state above 3 or a serial above 255.
- * A side or a count of dropped text above 65535 is sent as 65535.
+ * A side above 65535 is sent as 65535; the count of dropped text is sent mod 65536.
  */
 int32_t istesso_media_host_set_text_input(const IstessoMediaHost *host, const IstessoMediaTextInput *field);
 

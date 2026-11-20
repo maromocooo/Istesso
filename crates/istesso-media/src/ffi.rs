@@ -669,11 +669,12 @@ pub struct IstessoMediaTextInput {
     pub height: u32,
     /// The field's serial (0 to 255): changes whenever another field has the keyboard.
     pub serial: u32,
-    /// Pieces of committed text the host had nowhere to put so far. Counts above 65535 are sent as 65535.
+    /// Pieces of committed text the host had nowhere to put so far. Sent mod 65536, as the
+    /// wire counts it: only a change counts, so the count may go round.
     pub dropped: u32,
 }
 
-/// A number for a 16-bit field of the wire: larger ones are sent as the largest.
+/// A side for a 16-bit field of the wire: larger ones are sent as the largest.
 fn at_most_u16(number: u32) -> u16 {
     u16::try_from(number).unwrap_or(u16::MAX)
 }
@@ -697,7 +698,9 @@ pub unsafe extern "C" fn istesso_media_host_set_text_input(
     let field = crate::wire::TextField {
         state,
         serial,
-        dropped: at_most_u16(field.dropped),
+        // A count, not a side: it goes round (mod 65536) instead of stopping at the top, so
+        // that a viewer, which looks only for a change, keeps noticing new drops.
+        dropped: field.dropped as u16,
         x: field.x,
         y: field.y,
         width: at_most_u16(field.width),
@@ -1097,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn text_field_sides_and_counts_saturate_at_u16_max() {
+    fn text_field_sides_saturate_at_u16_max() {
         assert_eq!(at_most_u16(0), 0);
         assert_eq!(at_most_u16(123), 123);
         assert_eq!(at_most_u16(65_535), u16::MAX);
@@ -1109,7 +1112,8 @@ mod tests {
     #[test]
     fn a_text_field_with_large_numbers_still_travels_and_a_wrong_state_does_not() {
         let dirs = Dirs::new("text-field");
-        let bind = CString::new("127.0.0.1:0").unwrap(); // check-private: ok, loopback with a temporary test port.
+        let (host_dir, device_dir) = (c(&dirs.host()), c(&dirs.device()));
+        let bind = CString::new("127.0.0.1:0").unwrap();
         let field = IstessoMediaTextInput {
             state: 2,
             x: 10,
@@ -1119,17 +1123,70 @@ mod tests {
             serial: 9,
             dropped: 70_000,
         };
-        // SAFETY: The C strings, stream description and fields live through their calls.
-        // The setter accepts a null field pointer. The host is closed once at the end.
+        // SAFETY: C strings, a description and fields that live through the calls, pointers
+        // to live values, and handles used as the header says. The setter takes a null field.
         unsafe {
-            let host = istesso_media_host_listen(c(&dirs.host()).as_ptr(), bind.as_ptr(), &INFO);
+            let host = istesso_media_host_listen(host_dir.as_ptr(), bind.as_ptr(), &INFO);
             assert!(!host.is_null(), "{}", last_error());
+            let addr =
+                CString::new(format!("127.0.0.1:{}", istesso_media_host_port(host))).unwrap();
+            let watch =
+                istesso_media_watch_open(device_dir.as_ptr(), addr.as_ptr(), std::ptr::null());
+            assert!(!watch.is_null(), "{}", last_error());
+            let mut frame = std::mem::zeroed::<IstessoMediaFrame>();
+            // Waits for what the watch says next, past the waits that say nothing.
+            let until = |wanted: i32, frame: &mut IstessoMediaFrame| {
+                let began = std::time::Instant::now();
+                loop {
+                    assert!(began.elapsed() < Duration::from_secs(5), "waited too long");
+                    match istesso_media_watch_next(watch, 50, frame) {
+                        0 => continue,
+                        got => {
+                            assert_eq!(got, wanted, "{}", last_error());
+                            return;
+                        }
+                    }
+                }
+            };
+            until(4, &mut frame);
+            let began = std::time::Instant::now();
+            while istesso_media_host_viewers(host) != 1 {
+                assert!(began.elapsed() < Duration::from_secs(5), "waited too long");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            // Sides above 65535 arrive as 65535; the count of dropped text goes round.
             assert_eq!(
                 istesso_media_host_set_text_input(host, &field),
                 0,
                 "{}",
                 last_error()
             );
+            until(5, &mut frame);
+            let mut got = IstessoMediaTextInput::default();
+            assert_eq!(istesso_media_watch_text_input(watch, &mut got), 1);
+            assert_eq!(
+                (got.state, got.x, got.y, got.width, got.height, got.serial),
+                (2, 10, 20, 65_535, 65_535, 9)
+            );
+            assert_eq!(got.dropped, 70_000 % 65_536);
+            // One more drop is still a change that the viewer sees (a count stopped at
+            // 65535 would have said the same number twice).
+            let one_more = IstessoMediaTextInput {
+                dropped: 70_001,
+                ..field
+            };
+            assert_eq!(
+                istesso_media_host_set_text_input(host, &one_more),
+                0,
+                "{}",
+                last_error()
+            );
+            until(5, &mut frame);
+            assert_eq!(istesso_media_watch_text_input(watch, &mut got), 1);
+            assert_eq!(got.dropped, 70_001 % 65_536);
+
+            // The caller's own mistakes are still refused.
             let wrong_state = IstessoMediaTextInput { state: 4, ..field };
             assert_eq!(istesso_media_host_set_text_input(host, &wrong_state), -1);
             let wrong_serial = IstessoMediaTextInput {
@@ -1141,6 +1198,7 @@ mod tests {
                 istesso_media_host_set_text_input(host, std::ptr::null()),
                 -1
             );
+            istesso_media_watch_close(watch);
             istesso_media_host_close(host);
         }
     }
