@@ -180,8 +180,9 @@ enum Command {
         /// Do not show here the windows that the shell's workspace opens on
         /// the device (`istesso-edit <file>`: a file in the device's main
         /// editor). They are shown by default, with the program
-        /// ISTESSO_WINDOW_OPENER names, and only with forwards (a
-        /// prototype, ADR 0007, proposal)
+        /// ISTESSO_WINDOW_OPENER names, and only with forwards; without that
+        /// program, the host is not asked for them (a prototype, ADR 0007,
+        /// proposal)
         #[arg(long)]
         no_windows: bool,
     },

@@ -695,3 +695,30 @@ fn a_shell_whose_answer_cannot_be_sent_is_hung_up_and_not_served() {
         pair.log()
     );
 }
+
+#[test]
+fn windows_are_asked_for_only_with_forwards_and_a_program_that_shows_them() {
+    use super::client::Options;
+    let mut options = Options {
+        windows: true,
+        window_opener: Some("/opt/fixture-one/opener".into()),
+        ..Options::default()
+    };
+    options.forward.enabled = true;
+    assert!(options.asks_for_windows());
+    // No program here that shows them: a program's `xdg-open <text file>`
+    // must not start the host's editor (review 7c, finding 3).
+    let without_opener = Options {
+        window_opener: None,
+        ..options.clone()
+    };
+    assert!(!without_opener.asks_for_windows());
+    let turned_off = Options {
+        windows: false,
+        ..options.clone()
+    };
+    assert!(!turned_off.asks_for_windows());
+    let mut without_forwards = options.clone();
+    without_forwards.forward.enabled = false;
+    assert!(!without_forwards.asks_for_windows());
+}

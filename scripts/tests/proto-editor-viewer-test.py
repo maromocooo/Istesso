@@ -56,8 +56,11 @@ class OpenerTest(unittest.TestCase):
     def pids(log):
         return [int(line) for line in log.read_text().split()] if log.exists() else []
 
-    def opener(self, *args):
-        subprocess.run(["bash", str(OPENER), *args], env=self.env, check=True, timeout=20,
+    def opener(self, *args, locale=None):
+        env = self.env
+        if locale is not None:
+            env = dict(env, LC_ALL=locale, LANG=locale)
+        subprocess.run(["bash", str(OPENER), *args], env=env, check=True, timeout=20,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def wait_for(self, what, seconds=5):
@@ -80,6 +83,23 @@ class OpenerTest(unittest.TestCase):
         viewer, relay = self.pids(self.viewers)[0], self.pids(self.relays)[0]
         self.opener("stop")
         self.wait_for(lambda: not runs(viewer) and not runs(relay))
+
+    def test_a_window_opened_under_one_locale_is_known_under_another(self):
+        # `ps` writes the start time in the locale's form (on macOS, Japanese gives another
+        # order and other words): a record written under one must still be found under the other.
+        for first, then in (("ja_JP.UTF-8", "C"), ("C", "ja_JP.UTF-8")):
+            with self.subTest(first=first, then=then):
+                before = (len(self.pids(self.viewers)), len(self.pids(self.relays)))
+                self.opener("127.0.0.1", "5", "6", locale=first)  # check-private: ok loopback address
+                self.wait_for(lambda: len(self.pids(self.viewers)) == before[0] + 1
+                              and len(self.pids(self.relays)) == before[1] + 1)
+                self.opener("127.0.0.1", "5", "6", locale=then)  # check-private: ok loopback address
+                time.sleep(0.5)
+                self.assertEqual((len(self.pids(self.viewers)), len(self.pids(self.relays))),
+                                 (before[0] + 1, before[1] + 1), "a second window was opened")
+                viewer, relay = self.pids(self.viewers)[-1], self.pids(self.relays)[-1]
+                self.opener("stop", locale=then)
+                self.wait_for(lambda: not runs(viewer) and not runs(relay))
 
     def test_the_relay_ends_with_the_window(self):
         self.opener("127.0.0.1", "5", "6")  # check-private: ok loopback address

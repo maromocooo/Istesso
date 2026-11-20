@@ -33,8 +33,10 @@ mkdir -p "$dir" && chmod 700 "$dir"
 log=$dir/opener.log
 
 # The start time of the process $1 as `ps` says it, without the blanks around it: macOS pads it
-# with spaces at the end, which `read` would drop, so that it would never match again.
-started_of() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+# with spaces at the end, which `read` would drop, so that it would never match again. Always in
+# the C locale: under another, `ps` writes the time in another form, and a record written from one
+# terminal would not match in another (review 7c, finding 1).
+started_of() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 still_runs() { # FILE: the process written down there (number and start time) still runs
     local pid started
     [ -s "$1" ] || return 1

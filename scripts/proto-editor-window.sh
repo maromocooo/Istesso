@@ -76,8 +76,9 @@ busy() {
         { [ -n "$test_signal" ] && [ "$(head -c 4 "$test_signal" 2>/dev/null)" = busy ]; }
 }
 # The start time of the process $1 as `ps` says it, without the blanks around it (macOS pads it
-# with spaces at the end, which `read` drops; the same helper is in proto-editor-viewer.sh).
-started_of() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+# with spaces at the end, which `read` drops; the same helper is in proto-editor-viewer.sh). Always in
+# the C locale, as there.
+started_of() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 # The recorded process still runs. If given, the second argument is the required pid.
 still_runs() {
     local pid started

@@ -58,6 +58,17 @@ pub struct Options {
     pub window_opener: Option<std::path::PathBuf>,
 }
 
+impl Options {
+    /// Whether this device asks the host for the windows of the shell's
+    /// workspace: only with forwards (the host keeps a workspace only then)
+    /// and only with a program here that shows them. Without one, a
+    /// program's `xdg-open <text file>` in the shell would start the host's
+    /// main editor, hidden, for nothing (review 7c, finding 3).
+    pub fn asks_for_windows(&self) -> bool {
+        self.windows && self.forward.enabled && self.window_opener.is_some()
+    }
+}
+
 /// The folder a shell on the device `id` was last opened in, if one is
 /// remembered.
 pub fn remembered_project(paths: &Paths, id: &str) -> Option<String> {
@@ -148,7 +159,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
             .or_else(|| variable("LANG")),
         project: project.clone(),
         forward: options.forward.enabled,
-        windows: options.windows && options.forward.enabled,
+        windows: options.asks_for_windows(),
     };
     let peer_id = client.peer().id.clone();
     match client.open_shell(request) {
@@ -231,7 +242,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
     };
     // Windows the host opens for the shell are looked for on the host the
     // shell is on, at the address it was reached at.
-    let windows = match (options.windows && options.forward.enabled, &address) {
+    let windows = match (options.asks_for_windows(), &address) {
         (true, Ok(address)) => {
             let notice: crate::workspace::device::Notice = Arc::new(|line: &str| {
                 let _ = write!(std::io::stderr(), "\r\nistesso: {line}\r\n");
