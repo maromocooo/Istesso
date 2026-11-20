@@ -189,10 +189,112 @@ private final class Checks {
               model.status == "Copied “ish scene”. Paste it in a terminal. Ubuntu is not answering.", "copy an offline project") // check-private: ok (invented machine label)
 
         try await checkSectionStates(app: apps.apps[0], invalid: invalid)
+        do {
+            try await checkProcessRunner()
+        } catch {
+            check(false, "create and read the process runner fixture")
+        }
     }
 
     func entries(_ model: LauncherModel) -> [Entry] {
         model.rows.compactMap { if case .entry(let entry) = $0 { return entry }; return nil }
+    }
+
+    func checkProcessRunner() async throws {
+        let files = FileManager.default
+        let dir = files.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try files.createDirectory(at: dir, withIntermediateDirectories: false)
+        defer { try? files.removeItem(at: dir) }
+
+        let fake = dir.appendingPathComponent("fake-istesso")
+        let script = #"""
+        #!/bin/sh
+        {
+            echo call
+            for a in "$@"; do printf 'arg=%s\n' "$a"; done
+            echo "DAILY_OWNER=${DAILY_OWNER-unset}"
+            echo "DAILY_OPEN_HANDLER=${DAILY_OPEN_HANDLER-unset}"
+            echo "LAUNCHER_CHECK_KEEP=${LAUNCHER_CHECK_KEEP-unset}"
+            echo end
+        } >> "$(dirname "$0")/record"
+        case "$#:$1:$2" in
+            5:launcher:apps)
+                [ "$3" = --json ] && [ "$4" = --trial ] || exit 9
+                case "$5" in
+                    */slow) exec /bin/sleep 30 ;;
+                    */fail) exit 4 ;;
+                esac
+                echo '{"apps":[{"id":"local/com.example.fake","name":"Fake","machine":"This Mac","host":"local"}],"problems":[]}' # check-private: ok (invented app and machine label)
+                ;;
+            2:projects:--json) echo '[]' ;;
+            5:launcher:open)
+                [ "$4" = --trial ] || exit 9
+                case "$3" in
+                    */exit-3) exit 3 ;;
+                    */exit-1) exit 1 ;;
+                esac
+                ;;
+            *) exit 9 ;;
+        esac
+        exit 0
+        """#
+        try script.write(to: fake, atomically: true, encoding: .utf8)
+        try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+        setenv("DAILY_OWNER", "1", 1)
+        setenv("DAILY_OPEN_HANDLER", "/opt/fixture-one/handler", 1)
+        setenv("LAUNCHER_CHECK_KEEP", "kept", 1)
+        defer {
+            unsetenv("DAILY_OWNER")
+            unsetenv("DAILY_OPEN_HANDLER")
+            unsetenv("LAUNCHER_CHECK_KEEP")
+        }
+
+        let trial = dir.appendingPathComponent("trial").path
+        let runner = ProcessRunner(istesso: fake.path, trial: trial)
+        let apps = await runner.listApps()
+        check((try? apps.get().apps.map(\.id)) == ["local/com.example.fake"], "process decodes the app ID")
+        let projects = await runner.listProjects()
+        check((try? projects.get().isEmpty) == true, "process decodes an empty project list")
+        let literalID = "local/Fake App;$(x)"
+        check(await runner.open(appID: literalID) == 0, "open returns exit 0")
+        check(await runner.open(appID: "local/exit-1") == 1, "open returns exit 1")
+        check(await runner.open(appID: "local/exit-3") == 3, "open returns exit 3")
+
+        func failureMessage(_ result: Result<AppList, LauncherFailure>) -> String? {
+            if case .failure(let error) = result { return error.message }
+            return nil
+        }
+        let fail = dir.appendingPathComponent("fail").path
+        let failing = ProcessRunner(istesso: fake.path, trial: fail)
+        check(failureMessage(await failing.listApps()) == "could not read the app list", "report a nonzero list exit")
+        let missing = ProcessRunner(istesso: dir.appendingPathComponent("missing").path, trial: trial)
+        check(await missing.open(appID: literalID) == 127, "missing executable returns exit 127")
+        check(failureMessage(await missing.listApps()) != nil, "missing executable fails the app list")
+
+        let slow = dir.appendingPathComponent("slow").path
+        let timed = ProcessRunner(istesso: fake.path, trial: slow, appSeconds: 1)
+        let clock = ContinuousClock()
+        let start = clock.now
+        let result = await timed.listApps()
+        let elapsed = start.duration(to: clock.now)
+        check(failureMessage(result) == "did not answer in time", "report the app list timeout")
+        check(elapsed >= .milliseconds(900) && elapsed < .seconds(5), "honor the one-second app list deadline")
+
+        let record = try String(contentsOf: dir.appendingPathComponent("record"), encoding: .utf8)
+        let calls = record.split(separator: "\n").map(String.init).split(separator: "end")
+        let arguments = [
+            ["launcher", "apps", "--json", "--trial", trial],
+            ["projects", "--json"],
+            ["launcher", "open", literalID, "--trial", trial],
+            ["launcher", "open", "local/exit-1", "--trial", trial],
+            ["launcher", "open", "local/exit-3", "--trial", trial],
+            ["launcher", "apps", "--json", "--trial", fail],
+            ["launcher", "apps", "--json", "--trial", slow],
+        ]
+        let expectedCalls = arguments.map { ["call"] + $0.map { "arg=" + $0 } }
+        check(calls.map { Array($0.dropLast(3)) } == expectedCalls, "pass each argument literally and in order")
+        let environment = ["DAILY_OWNER=unset", "DAILY_OPEN_HANDLER=unset", "LAUNCHER_CHECK_KEEP=kept"]
+        check(calls.allSatisfy { $0.suffix(3).elementsEqual(environment) }, "strip both owner variables and keep the rest")
     }
 
     func checkSectionStates(app: AppRow, invalid: ProjectRow) async throws {

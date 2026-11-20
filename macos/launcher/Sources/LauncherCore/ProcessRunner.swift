@@ -3,18 +3,22 @@ import Foundation
 public struct ProcessRunner: LauncherRunner, Sendable {
     private let executable: URL
     private let trial: String
+    private let appSeconds: Int
+    private let projectSeconds: Int
 
-    public init(istesso: String, trial: String) {
+    public init(istesso: String, trial: String, appSeconds: Int = 10, projectSeconds: Int = 20) {
         executable = URL(fileURLWithPath: istesso)
         self.trial = trial
+        self.appSeconds = appSeconds
+        self.projectSeconds = projectSeconds
     }
 
     public func listApps() async -> Result<AppList, LauncherFailure> {
-        await list(["launcher", "apps", "--json", "--trial", trial], seconds: 10, name: "app")
+        await list(["launcher", "apps", "--json", "--trial", trial], seconds: appSeconds, name: "app")
     }
 
     public func listProjects() async -> Result<[ProjectRow], LauncherFailure> {
-        await list(["projects", "--json"], seconds: 20, name: "project")
+        await list(["projects", "--json"], seconds: projectSeconds, name: "project")
     }
 
     private func process(_ arguments: [String]) -> Process {
