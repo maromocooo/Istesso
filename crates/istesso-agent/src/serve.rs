@@ -38,6 +38,17 @@ const INPUT_RECHECK: Duration = Duration::from_secs(1);
 /// say "still here" twice a second (`alive` at `input_open`). A device that
 /// did not agree to that has [`WAIT`], and says so every two seconds.
 const INPUT_SILENCE: Duration = Duration::from_secs(2);
+/// The most events taken from one `input` message; the rest of it is dropped. A
+/// person's input comes in far smaller messages (the relay sends what arrived since
+/// the last one, pointer moves in a row as one); a device that sends more holds the
+/// conversation's record of what is down for as long as it takes to pass them on.
+const MAX_EVENTS_A_MESSAGE: usize = 1024;
+/// How long the keys and buttons of a conversation that is over may wait, all
+/// together, for room in the socket of the program behind it: a program that is
+/// still reading what came before must not lose them.
+const LET_GO_WITHIN: Duration = Duration::from_millis(250);
+/// How long to wait before trying again when that socket has no room.
+const ROOM_STEP: Duration = Duration::from_micros(200);
 /// How long a full inspection of this machine stays valid. The agent repeats
 /// the inspection twice as often and always answers from memory.
 pub const MANIFEST_MAX_AGE: Duration = Duration::from_secs(600);
@@ -464,30 +475,70 @@ impl InputSink {
     /// The conversation is over, however it ended: every key and button it
     /// had down comes up, so that none stays down and goes on typing, and
     /// nothing more is passed on for it. Doing it twice does nothing more.
+    ///
+    /// Unlike the events on the way, these wait for room when the program
+    /// behind the socket has not read what came before (a device that sent a
+    /// flood of pointer moves just before it went): for [`LET_GO_WITHIN`] all
+    /// together at most.
     fn let_go(&self) {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         if held.over {
             return;
         }
         held.over = true;
+        let until = Instant::now() + LET_GO_WITHIN;
         for code in std::mem::take(&mut held.keys) {
-            self.send(&InputEvent::Key {
-                code,
-                pressed: false,
-            });
+            self.send_with_room(
+                &InputEvent::Key {
+                    code,
+                    pressed: false,
+                },
+                until,
+            );
         }
         for code in std::mem::take(&mut held.buttons) {
-            self.send(&InputEvent::Button {
-                code,
-                pressed: false,
-            });
+            self.send_with_room(
+                &InputEvent::Button {
+                    code,
+                    pressed: false,
+                },
+                until,
+            );
         }
         // And no composing text stays drawn in the application (the device's own clearing may
         // have been lost with the conversation). A program that does not know it passes it over.
-        self.send(&InputEvent::Preedit {
-            text: String::new(),
-            cursor: [0, 0],
-        });
+        self.send_with_room(
+            &InputEvent::Preedit {
+                text: String::new(),
+                cursor: [0, 0],
+            },
+            until,
+        );
+    }
+
+    /// One event, one datagram, as [`InputSink::send`], but when the socket has no room
+    /// it is tried again until `until`. A program that has gone away loses it at once.
+    fn send_with_room(&self, event: &InputEvent, until: Instant) {
+        #[cfg(unix)]
+        if let Ok(bytes) = serde_json::to_vec(event) {
+            loop {
+                match self.socket.send(&bytes) {
+                    Ok(_) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    // A full socket: "would block" on Linux, "no buffer space" on macOS.
+                    Err(e)
+                        if (e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.raw_os_error() == Some(libc::ENOBUFS))
+                            && Instant::now() < until =>
+                    {
+                        std::thread::sleep(ROOM_STEP);
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (event, until);
     }
 
     #[cfg(not(unix))]
@@ -515,6 +566,13 @@ impl InputSink {
         #[cfg(not(unix))]
         let _ = event;
     }
+}
+
+/// The events of one `input` message that are taken, and how many are dropped
+/// ([`MAX_EVENTS_A_MESSAGE`]).
+fn within_a_message(events: &[InputEvent]) -> (&[InputEvent], usize) {
+    let taken = events.len().min(MAX_EVENTS_A_MESSAGE);
+    (&events[..taken], events.len() - taken)
 }
 
 /// Whether the device is, at this moment, still paired and still allowed to
@@ -634,6 +692,8 @@ impl Shared {
         let mut clipboard_on = false;
         let (answering, answers) = std::sync::mpsc::channel::<ClipboardAnswer>();
         let mut clipboard_counts = ClipboardCounts::default();
+        // Whether a message with more events than are taken was told of.
+        let mut told_beyond = false;
         while let Ok(Some(request)) = session.next_request() {
             // Answers to copy and paste are written when the device next says something: it
             // says "still here" often while it waits for one.
@@ -652,6 +712,15 @@ impl Shared {
                     // that nothing takes any more, is dropped.
                     let Some(sink) = &input else { continue };
                     let in_hand = crate::PassLog::mark();
+                    let (events, beyond) = within_a_message(&events);
+                    if beyond > 0 && !told_beyond {
+                        // Once a conversation; how many, never what.
+                        told_beyond = true;
+                        (self.log)(format!(
+                            "dropped {beyond} event(s) from {}: more than {MAX_EVENTS_A_MESSAGE} in one message",
+                            session.peer().name
+                        ));
+                    }
                     // The device sends something at least every two seconds, so this is
                     // looked at often enough.
                     if checked.elapsed() >= INPUT_RECHECK {
@@ -667,7 +736,7 @@ impl Shared {
                     let mut clipboard = |event: &InputEvent| {
                         self.clipboard_mark(clipboard_on, event, &answering, &mut clipboard_counts)
                     };
-                    let dropped = sink.pass(&events, &mut clipboard);
+                    let dropped = sink.pass(events, &mut clipboard);
                     if dropped > 0 {
                         // How many, never what.
                         (self.log)(format!(
@@ -1646,6 +1715,54 @@ mod tests {
             assert_eq!(pair.handed_over(A_MOMENT), None);
         }
 
+        /// Reads what the agent hands over as a program that does not keep up does: 50 µs a
+        /// datagram. Gives back the keys that came up, once nothing came for half a second.
+        fn read_slowly(pair: &InputPair) -> std::thread::JoinHandle<Vec<u32>> {
+            let taken = pair.taken.try_clone().unwrap();
+            taken
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            std::thread::spawn(move || {
+                let mut up = Vec::new();
+                let mut buffer = vec![0u8; 512];
+                while let Ok(length) = taken.recv(&mut buffer) {
+                    if let Ok(InputEvent::Key {
+                        code,
+                        pressed: false,
+                    }) = serde_json::from_slice(&buffer[..length])
+                    {
+                        up.push(code);
+                    }
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                up
+            })
+        }
+
+        #[test]
+        fn keys_come_up_after_a_flood_even_when_the_program_behind_does_not_keep_up() {
+            let pair = InputPair::new("iw");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            let keys: Vec<u32> = (30..38).collect();
+            let down: Vec<InputEvent> = keys.iter().map(|&code| key(code, true)).collect();
+            client.send_input(&down).unwrap();
+            assert_eq!(pair.all_handed_over(A_MOMENT).len(), keys.len());
+            // As many pointer moves as are taken from one message, in several messages:
+            // the program behind has not read them by the time the device is gone.
+            let reader = read_slowly(&pair);
+            let moves: Vec<InputEvent> = (0..super::super::MAX_EVENTS_A_MESSAGE as i32)
+                .map(|x| InputEvent::PointerAt { x, y: 1 })
+                .collect();
+            for _ in 0..4 {
+                client.send_input(&moves).unwrap();
+            }
+            drop(client);
+            let mut up = reader.join().unwrap();
+            up.sort_unstable();
+            assert_eq!(up, keys, "the keys that came up");
+        }
+
         /// Waits until the device is told that its conversation is over.
         fn is_cut_off(client: &mut istesso_link::Client, within: Duration) -> bool {
             let began = Instant::now();
@@ -1805,6 +1922,18 @@ mod tests {
             set_rights(&pair, &[Permission::View]);
             assert!(refused(client.open_input_alive().unwrap()));
         }
+    }
+
+    #[test]
+    fn no_more_events_than_the_most_are_taken_from_one_message() {
+        let moves: Vec<InputEvent> = (0..MAX_EVENTS_A_MESSAGE as i32 + 5)
+            .map(|x| InputEvent::PointerAt { x, y: 0 })
+            .collect();
+        let (taken, beyond) = within_a_message(&moves);
+        assert_eq!((taken.len(), beyond), (MAX_EVENTS_A_MESSAGE, 5));
+        assert_eq!(taken, &moves[..MAX_EVENTS_A_MESSAGE]);
+        let (taken, beyond) = within_a_message(&moves[..3]);
+        assert_eq!((taken.len(), beyond), (3, 0));
     }
 
     #[test]
