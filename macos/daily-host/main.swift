@@ -1833,6 +1833,23 @@ func selfTest() -> Never {
         injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "x": 20, "y": 30]))
         checkPanel(injector.pointerPlace == CGPoint(x: 110, y: 115), true, "injector: pointer_at inside the picture is as said")
     }
+    do {
+        // A button code that is none of the three: nothing is posted, nothing is held.
+        let injector = Injector()
+        var posted = 0
+        injector.mayPost = true
+        injector.clickForm = 3
+        injector.listNow = { [appWin] }
+        injector.lockedNow = { false }
+        injector.windowAt = { _ in appWin }
+        injector.postProcess = { _, _ in posted += 1 }
+        injector.postSession = { _ in posted += 1 }
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "button", "code": 0x113, "pressed": true]))
+        checkPanel(posted == 0 && !injector.holding && injector.counts["unknown_button"] == 1, true, "injector: an unknown button is dropped, not taken for the left one")
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "button", "code": 0x110, "pressed": true]))
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "button", "code": 0x110, "pressed": false]))
+        checkPanel(posted == 2 && !injector.holding, true, "injector: the left button is posted as before")
+    }
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: []), true, "resize: a running picture comes back")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["pause"]), false, "resize: a pause during the restart is kept")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["detach"]), false, "resize: a detach during the restart is kept")
@@ -2611,6 +2628,9 @@ final class Injector {
     }
 
     private func button(_ code: UInt32, _ pressed: Bool) {
+        // Only the three buttons the other side may say; any other code is dropped before anything
+        // is done with it (it is never taken for the left button, nor kept as held).
+        guard [buttonLeft, buttonRight, buttonMiddle].contains(code) else { return count("unknown_button") }
         if pressed { freshWindowList(); onButtonPressed?() }
         guard let window = windowAt(point) else {
             // A release with no window under it (the window closed while the button was down):
@@ -2640,7 +2660,8 @@ final class Injector {
         switch code {
         case buttonRight: nsType = pressed ? .rightMouseDown : .rightMouseUp; cgType = pressed ? .rightMouseDown : .rightMouseUp; cgButton = .right
         case buttonMiddle: nsType = pressed ? .otherMouseDown : .otherMouseUp; cgType = pressed ? .otherMouseDown : .otherMouseUp; cgButton = .center
-        default: nsType = pressed ? .leftMouseDown : .leftMouseUp; cgType = pressed ? .leftMouseDown : .leftMouseUp; cgButton = .left
+        case buttonLeft: nsType = pressed ? .leftMouseDown : .leftMouseUp; cgType = pressed ? .leftMouseDown : .leftMouseUp; cgButton = .left
+        default: return count("unknown_button")
         }
         var event: CGEvent?
         if clickForm >= 3 {
