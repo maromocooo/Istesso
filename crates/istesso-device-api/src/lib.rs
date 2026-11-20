@@ -80,6 +80,7 @@ pub struct Software {
     /// Bundle identifier on macOS, when the software exists there.
     pub macos_bundle_id: Option<&'static str>,
     /// Name of the process on Linux, when the software exists there.
+    /// At most 15 bytes: what Linux keeps in `/proc/<pid>/comm`, that is the first 15 bytes of a longer name.
     pub linux_process: Option<&'static str>,
 }
 

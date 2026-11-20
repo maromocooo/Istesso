@@ -56,7 +56,8 @@ pub fn check(declaration: &Declaration) -> Result<(), String> {
         if let Some(process) = software.linux_process {
             if process.len() > LINUX_PROCESS_LENGTH {
                 return Err(format!(
-                    "a process name: at most {LINUX_PROCESS_LENGTH} bytes, the length Linux keeps"
+                    "a process name: at most {LINUX_PROCESS_LENGTH} bytes, as Linux shows it in \
+                     /proc/<pid>/comm (the first {LINUX_PROCESS_LENGTH} bytes of a longer name)"
                 ));
             }
             check_text("a process name", process, LINUX_PROCESS_LENGTH)?;
@@ -157,7 +158,8 @@ mod tests {
         }];
         assert_eq!(
             check(&d).unwrap_err(),
-            "a process name: at most 15 bytes, the length Linux keeps"
+            "a process name: at most 15 bytes, as Linux shows it in /proc/<pid>/comm \
+             (the first 15 bytes of a longer name)"
         );
     }
 
