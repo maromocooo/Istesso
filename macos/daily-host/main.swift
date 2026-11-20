@@ -640,10 +640,24 @@ func pictureHeldForVirtual(configured: Bool, onVirtual: Bool, streamMatches: Boo
 /// first move is one Accessibility call, which the application may not take (busy, or its window
 /// still being made); without another try the picture stays at 1x, half the size, after the 5 s
 /// hold. Only while a viewer is there, not locked, no new stream being made, the window placed,
-/// and its middle not on the virtual display.
-func movesAgainToVirtual(viewed: Bool, locked: Bool, restarting: Bool, placed: Bool, window: CGRect?, virtual: CGRect?) -> Bool {
-    guard viewed, !locked, !restarting, placed, let window, let virtual else { return false }
+/// and its middle not on the virtual display; at most `maxMoveTries` times for one window (one
+/// that refuses the move is left where it is), and never while the Mac's own keyboard or mouse
+/// was used in the last `idle` seconds (the owner at the Mac may be using that window).
+// (A function, not a global constant: main.swift's globals are made in the order the file runs,
+// and --self-test runs before this line would.)
+func maxMoveTries() -> Int { 5 }
+func movesAgainToVirtual(viewed: Bool, locked: Bool, restarting: Bool, placed: Bool, window: CGRect?, virtual: CGRect?,
+                         tries: Int, localIdle: Double, idle: Double) -> Bool {
+    guard viewed, !locked, !restarting, placed, tries < maxMoveTries(), localIdle >= idle, let window, let virtual else { return false }
     return !virtual.contains(CGPoint(x: window.midX, y: window.midY))
+}
+
+/// Seconds since the Mac's own keyboard or mouse was last used (the hardware's state, not the
+/// events this program makes).
+func localInputIdle() -> Double {
+    let kinds: [CGEventType] = [.keyDown, .flagsChanged, .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+                                .leftMouseDragged, .scrollWheel]
+    return kinds.map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min() ?? 0
 }
 
 /// What the pump does with the newest picture: nothing (nobody watches, nobody waits for a resumed
@@ -2114,14 +2128,17 @@ func selfTest() -> Never {
         let virtualFrame = CGRect(x: 1920, y: 0, width: 1920, height: 1080)
         let onMain = CGRect(x: 100, y: 100, width: 800, height: 600), onIt = onMain.offsetBy(dx: 1920, dy: 0)
         func again(viewed: Bool = true, locked: Bool = false, restarting: Bool = false, placed: Bool = true,
-                   window: CGRect? = onMain, virtual: CGRect? = virtualFrame) -> Bool {
-            movesAgainToVirtual(viewed: viewed, locked: locked, restarting: restarting, placed: placed, window: window, virtual: virtual)
+                   window: CGRect? = onMain, virtual: CGRect? = virtualFrame, tries: Int = 0, localIdle: Double = 10) -> Bool {
+            movesAgainToVirtual(viewed: viewed, locked: locked, restarting: restarting, placed: placed, window: window, virtual: virtual,
+                                tries: tries, localIdle: localIdle, idle: 3)
         }
         checkPanel(again(), true, "2x: a window still on the main display is moved again")
         checkPanel(again(window: onIt), false, "2x: not once it is on the virtual display")
         checkPanel(again(viewed: false) || again(locked: true) || again(restarting: true) || again(placed: false), false,
                    "2x: not without a viewer, when locked, while a new stream is made, or before it is placed")
         checkPanel(again(window: nil) || again(virtual: nil), false, "2x: not when the window is not on the screen, nor without the virtual display")
+        checkPanel(again(tries: maxMoveTries() - 1) && !again(tries: maxMoveTries()), true, "2x: at most \(maxMoveTries()) more tries for one window")
+        checkPanel(again(localIdle: 1), false, "2x: not while the Mac's own keyboard or mouse was used in the last seconds")
         // The pump's gate (every path to the encoder: a new picture, a filler, the next after one).
         checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: false) == .held, true, "pump: a picture while held is kept, not encoded")
         checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: true) == .held, true, "pump: also with a resume waiting, while a viewer is there (the 5 s limit applies)")
@@ -3982,8 +3999,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var makingVirtual = false
     var virtualFailedAt: TimeInterval = -1000
     var movedFrom: [CGWindowID: CGRect] = [:]
-    /// The windows that were moved again at least once (said once each).
-    var movedAgain: Set<CGWindowID> = []
+    /// How often each window was moved onto the virtual display again since it was made, and the
+    /// windows given up on (said once each).
+    var moveTries: [CGWindowID: Int] = [:]
+    var movesGivenUp: Set<CGWindowID> = []
 
     /// Looked at every second: while a device is shown the picture (and the Mac is not locked),
     /// the shown window is on the virtual display; once nobody has been shown it for the time a
@@ -4006,20 +4025,26 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     return note("the virtual display could not be made: the window stays where it is")
                 }
                 self.virtualScreen = screen
+                self.moveTries = [:]
+                self.movesGivenUp = []
                 if frameLog.on { frameLog.write("{\"kind\":\"virtual\",\"t_ns\":\(nowNs()),\"state\":\"made\",\"points\":\"\(Int(frame.width))x\(Int(frame.height))\"}") }
                 say("virtual", [("state", "made"), ("points", "\(Int(frame.width))x\(Int(frame.height))")])
                 self.moveShownWindow(to: frame)
             }
-        } else if let screen = virtualScreen, let frame = screen.frame,
-                  movesAgainToVirtual(viewed: viewed, locked: screenLocked(), restarting: restarting, placed: windowBounds != .zero,
-                                      window: windowList().first(where: { $0.id == windowId })?.bounds, virtual: frame) {
-            // The window is on the screen now (a closed or minimised one is not moved, and its
-            // application not raised) and not on the virtual display: moved again.
-            if let id = windowId, !movedAgain.contains(id) {
-                movedAgain.insert(id)
-                note("the shown window is not on the virtual display: moved again (every second until it is)")
+        } else if viewed, let screen = virtualScreen, let frame = screen.frame, let id = windowId,
+                  let current = windowList().first(where: { $0.id == id })?.bounds,
+                  !frame.contains(CGPoint(x: current.midX, y: current.midY)) {
+            // The shown window is on the screen (a closed or minimised one is not moved, and its
+            // application not raised) and not on the virtual display: moved again, a few times.
+            let tries = moveTries[id, default: 0]
+            if movesAgainToVirtual(viewed: viewed, locked: screenLocked(), restarting: restarting, placed: windowBounds != .zero,
+                                   window: current, virtual: frame, tries: tries, localIdle: localInputIdle(), idle: settings.inlineIdle) {
+                moveTries[id] = tries + 1
+                moveShownWindow(to: frame)
+            } else if tries >= maxMoveTries(), !movesGivenUp.contains(id) {
+                movesGivenUp.insert(id)
+                note("the shown window did not go onto the virtual display after \(maxMoveTries()) more tries: it stays where it is")
             }
-            moveShownWindow(to: frame)
         } else if let screen = virtualScreen, !viewed, now - lastViewed > settings.virtualKeep {
             // The windows first (the moves are queued for Accessibility), the display after them.
             virtualScreen = nil
@@ -4054,7 +4079,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 guard let self, inlineMayRekey(appInFront: self.appInFront(), localIdle: localIdle(), idle: idle) else { return }
                 self.lookout.act {
-                    guard localIdle() >= idle else { return }
+                    // Looked at again right before: still in front (the owner may have switched).
+                    guard localIdle() >= idle, NSRunningApplication(processIdentifier: pid)?.isActive == true else { return }
                     bringToFront(pid, bounds: target)
                 }
             }
