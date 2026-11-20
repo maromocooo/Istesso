@@ -147,6 +147,23 @@ pub unsafe fn inherited(number: RawFd) -> io::Result<UnixDatagram> {
     Ok(ManuallyDrop::into_inner(socket))
 }
 
+/// A datagram socket with a name at `path`, for its owner only from the
+/// moment it exists: made while this process's file mode mask lets nobody
+/// but the owner in, not changed to that afterwards. A program of another
+/// account that connected in between would keep its connection after a
+/// change. Programs of the same user are not kept out (docs/adr/0028).
+///
+/// The mask is the whole process's: a file another thread makes in the
+/// same moment is made for its owner only too, never more open.
+pub fn bind_for_its_owner_only(path: &std::path::Path) -> io::Result<UnixDatagram> {
+    // SAFETY: umask cannot fail; it is set back right after.
+    let before = unsafe { libc::umask(0o177) };
+    let bound = UnixDatagram::bind(path);
+    // SAFETY: as above.
+    unsafe { libc::umask(before) };
+    bound
+}
+
 /// Marks every descriptor of this process from 3 up as closed on starting a
 /// program, the end of a pair among them ([`inherited`] does that too).
 /// Whatever else this program was born with (a starter's own end, leaked to

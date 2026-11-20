@@ -815,10 +815,12 @@ fn relay_input(
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("cannot replace {}: {e}", socket.display())),
             }
-            let listener = UnixDatagram::bind(socket)
+            // For the owner only from the moment it exists, whatever the
+            // starter's umask says. This keeps other accounts out, not other
+            // programs of this one.
+            let listener = istesso_agent::endpoint::bind_for_its_owner_only(socket)
                 .map_err(|e| format!("cannot listen on {}: {e}", socket.display()))?;
-            // For the owner only, whatever the starter's umask says. This
-            // keeps other accounts out, not other programs of this one.
+            // And said once more, should the system have made it otherwise.
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
