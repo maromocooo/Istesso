@@ -3379,6 +3379,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                         : SCContentFilter(display: display, including: self.panelWindows)
                     rect = placed
                 } else {
+                    // The whole display only in its own form: an application's session whose
+                    // application is not there (not opened yet, or ended) shows nothing.
+                    guard case .display = settings.target else { return done(nil) }
                     filter = SCContentFilter(display: display, excludingWindows: [])
                 }
                 self.capture = capture
