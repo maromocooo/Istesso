@@ -669,8 +669,13 @@ pub struct IstessoMediaTextInput {
     pub height: u32,
     /// The field's serial (0 to 255): changes whenever another field has the keyboard.
     pub serial: u32,
-    /// Pieces of committed text the host had nowhere to put so far (0 to 65535).
+    /// Pieces of committed text the host had nowhere to put so far. Counts above 65535 are sent as 65535.
     pub dropped: u32,
+}
+
+/// A number for a 16-bit field of the wire: larger ones are sent as the largest.
+fn at_most_u16(number: u32) -> u16 {
+    u16::try_from(number).unwrap_or(u16::MAX)
 }
 
 /// # Safety
@@ -685,24 +690,18 @@ pub unsafe extern "C" fn istesso_media_host_set_text_input(
         remember("no host, or no field, was given");
         return -1;
     };
-    let (Ok(state), Ok(width), Ok(height), Ok(serial), Ok(dropped)) = (
-        u8::try_from(field.state),
-        u16::try_from(field.width),
-        u16::try_from(field.height),
-        u8::try_from(field.serial),
-        u16::try_from(field.dropped),
-    ) else {
+    let (Ok(state), Ok(serial)) = (u8::try_from(field.state), u8::try_from(field.serial)) else {
         remember("the text field's numbers are out of range");
         return -1;
     };
     let field = crate::wire::TextField {
         state,
         serial,
-        dropped,
+        dropped: at_most_u16(field.dropped),
         x: field.x,
         y: field.y,
-        width,
-        height,
+        width: at_most_u16(field.width),
+        height: at_most_u16(field.height),
     };
     match host.host.set_text_field(&field) {
         Ok(()) => 0,
@@ -1095,6 +1094,55 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IstessoMediaFrame, key_frame), 56);
         assert_eq!(std::mem::size_of::<IstessoMediaCursor>(), 48);
         assert_eq!(std::mem::offset_of!(IstessoMediaCursor, pixels), 24);
+    }
+
+    #[test]
+    fn text_field_sides_and_counts_saturate_at_u16_max() {
+        assert_eq!(at_most_u16(0), 0);
+        assert_eq!(at_most_u16(123), 123);
+        assert_eq!(at_most_u16(65_535), u16::MAX);
+        assert_eq!(at_most_u16(65_536), u16::MAX);
+        assert_eq!(at_most_u16(70_000), u16::MAX);
+        assert_eq!(at_most_u16(u32::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn a_text_field_with_large_numbers_still_travels_and_a_wrong_state_does_not() {
+        let dirs = Dirs::new("text-field");
+        let bind = CString::new("127.0.0.1:0").unwrap(); // check-private: ok, loopback with a temporary test port.
+        let field = IstessoMediaTextInput {
+            state: 2,
+            x: 10,
+            y: 20,
+            width: 70_000,
+            height: u32::MAX,
+            serial: 9,
+            dropped: 70_000,
+        };
+        // SAFETY: The C strings, stream description and fields live through their calls.
+        // The setter accepts a null field pointer. The host is closed once at the end.
+        unsafe {
+            let host = istesso_media_host_listen(c(&dirs.host()).as_ptr(), bind.as_ptr(), &INFO);
+            assert!(!host.is_null(), "{}", last_error());
+            assert_eq!(
+                istesso_media_host_set_text_input(host, &field),
+                0,
+                "{}",
+                last_error()
+            );
+            let wrong_state = IstessoMediaTextInput { state: 4, ..field };
+            assert_eq!(istesso_media_host_set_text_input(host, &wrong_state), -1);
+            let wrong_serial = IstessoMediaTextInput {
+                serial: 256,
+                ..field
+            };
+            assert_eq!(istesso_media_host_set_text_input(host, &wrong_serial), -1);
+            assert_eq!(
+                istesso_media_host_set_text_input(host, std::ptr::null()),
+                -1
+            );
+            istesso_media_host_close(host);
+        }
     }
 
     #[test]
