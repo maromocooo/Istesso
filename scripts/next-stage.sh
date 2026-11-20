@@ -153,17 +153,31 @@ export ISH_DIR ISH_PORT
 EOF
     if viewer_on; then
         cat <<EOF
-# The host's main editor (istesso-edit <file> in the shell) is shown in a window here.
+# The host's main editor (istesso-edit <file> in the shell) is shown in a window here. Each shell
+# has a folder of its own for its window's records, and its window goes when the shell does (the
+# host ends that editor with the shell); a window of another shell is left as it is.
 [ -n "\${ISTESSO_WINDOW_OPENER:-}" ] || ISTESSO_WINDOW_OPENER=$(q "$AD/scripts/proto-editor-viewer.sh")
 [ -n "\${EDITOR_VIEWER_SRC:-}" ] || EDITOR_VIEWER_SRC=$(q "$NEXT_VIEWER_SRC")
-[ -n "\${EDITOR_VIEWER_DIR:-}" ] || EDITOR_VIEWER_DIR=$(q "$AD/viewer")
+[ -n "\${EDITOR_VIEWER_DIR:-}" ] || EDITOR_VIEWER_DIR=$(q "$AD/viewer")/shell-\$\$
 [ -n "\${EDITOR_VIEWER_CONFIG:-}" ] || EDITOR_VIEWER_CONFIG=$(q "$AD/config")
 export ISTESSO_WINDOW_OPENER EDITOR_VIEWER_SRC EDITOR_VIEWER_DIR EDITOR_VIEWER_CONFIG
 EOF
     fi
     [ "$NEXT_VIEWER_DRY" = 1 ] && echo "EDITOR_VIEWER_DRY=1; export EDITOR_VIEWER_DRY"
     [ -n "$NEXT_URL_OPENER" ] && echo "ISTESSO_URL_OPENER=$(q "$NEXT_URL_OPENER"); export ISTESSO_URL_OPENER"
-    echo "exec $(q "$AD/scripts/ish") \"\$@\""
+    if viewer_on; then
+        cat <<EOF
+close_window() { $(q "$AD/scripts/proto-editor-viewer.sh") stop > /dev/null 2>&1; }
+trap 'close_window; exit 129' HUP
+trap 'close_window; exit 143' TERM
+$(q "$AD/scripts/ish") "\$@"
+status=\$?
+close_window
+exit \$status
+EOF
+    else
+        echo "exec $(q "$AD/scripts/ish") \"\$@\""
+    fi
 }
 shim_forwards() {
     cat <<EOF
@@ -358,6 +372,11 @@ EOF
         done
         echo "  checked: the host's agent lists the projects $(folder_ids | tr '\n' ' ')"
     fi
+    echo "Note (review 7c, 2): the mark \"(from a program)\" in a window's title says only who asked for the"
+    echo "file that opened that window; with the window open, a program's file arrives unmarked, and the"
+    echo "line in the terminal is the only sign."
+    echo "Note (review 7c, 11): at the first try, watch whether a newly opened window takes the keys from"
+    echo "what you are typing on this Mac."
     echo "Note (review A1): the scope runs as your own user, so a command in it can still open your other"
     echo "terminals on the host (/dev/pts): read part of what is typed there, write text, turn echo off."
     echo "The fix is the dedicated coding user, later."

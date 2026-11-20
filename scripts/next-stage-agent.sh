@@ -28,7 +28,7 @@ case "$UNTIL" in '' | *[!0-9]*) log "no end time in agent.conf"; exit 2 ;; esac
 [ -n "$BIND" ] && [ -n "$DEVICE" ] || { log "no address or device in agent.conf"; exit 2; }
 
 busy() { [ "$(head -c 4 "$signal" 2>/dev/null)" = busy ]; }
-started_of() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+started_of() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 
 args=(agent --bind "$BIND" --port "$PORT" --no-discovery --no-refresh -v --allow-shell "$DEVICE")
 for m in $MOUNTS; do args+=(--mount-folder "$m"); done

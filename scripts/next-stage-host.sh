@@ -37,7 +37,7 @@ signal=$HOME/.local/state/istesso/measuring
 say() { echo "$*"; }
 fail() { echo "next-stage (host): $*" >&2; exit 1; }
 short() { case "$1" in "$HOME") echo "~" ;; "$HOME"/*) echo "~/${1#"$HOME"/}" ;; *) echo "$1" ;; esac; }
-started_of() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+started_of() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 written_runs() { # FILE: the process written there (number and start time) still runs
     local pid started
     [ -s "$1" ] || return 1
