@@ -19,6 +19,10 @@
 #   LF_BIND     the address the stream listens on (127.0.0.1 or the host's wired address)
 #   LF_PORT, LF_FLASH_PORT   26935 and 26937 unless given
 #   LF_RENDER   the render node, /dev/dri/renderD129 unless given
+#   LF_SIZE     the size of the picture, 1720x720 unless given
+#   LF_FLASH    more arguments for istesso-flash (for example "--draw gpu": the window system
+#               gets a buffer that is on the GPU already, as in the M1 runs; without it the
+#               application paints on the CPU and the compositor uploads the pixels)
 #   LF_DEMO     a number: both plugins (built with the demonstration patch) give the renderer
 #               that much extra work before every frame; unset for a run that compares
 #   LF_STATE_DIR  where the signals are (~/.local/state/istesso unless given)
@@ -38,7 +42,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 : "${LF_TARGET:?}" "${LF_PLUGIN_A:?}" "${LF_PLUGIN_B:?}" "${LF_CONFIG:?}" "${LF_BIND:?}"
 port=${LF_PORT:-26935} fp=${LF_FLASH_PORT:-26937}
 render=${LF_RENDER:-/dev/dri/renderD129}
-size=1720x720 fps=85
+size=${LF_SIZE:-1720x720} fps=85
+read -r -a flash_more <<< "${LF_FLASH:-}"
 state=${LF_STATE_DIR:-$HOME/.local/state/istesso}
 says_busy() { [ -f "$1" ] && [ "$(cut -d' ' -f1 "$1" 2>/dev/null)" = busy ]; }
 busy() {
@@ -78,7 +83,7 @@ run() {
     local demo=()
     [ -n "${LF_DEMO:-}" ] && demo=(ISTESSO_LATE_FRAME_DEMO="$LF_DEMO")
     {
-        echo "{\"kind\":\"run\",\"form\":\"one\",\"build\":\"$build\",\"demo\":\"${LF_DEMO:-}\",\"name\":\"$name\",\"seed\":$seed,\"count\":$count,\"started\":\"$(date +%H:%M:%S)\"}"
+        echo "{\"kind\":\"run\",\"form\":\"one\",\"build\":\"$build\",\"demo\":\"${LF_DEMO:-}\",\"size\":\"$size\",\"flash\":\"${LF_FLASH:-}\",\"name\":\"$name\",\"seed\":$seed,\"count\":$count,\"started\":\"$(date +%H:%M:%S)\"}"
         echo "{\"kind\":\"load\",\"when\":\"before\",\"loadavg\":\"$(cut -d' ' -f1-3 /proc/loadavg)\",\"gpu\":\"$(nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,clocks.gr,pstate --format=csv,noheader 2>/dev/null | tr -d '\n')\"}"
     } > "$dir/run.jsonl"
     setsid "${isolated[@]}" "${demo[@]}" GST_PLUGIN_PATH="$plugin" GST_REGISTRY="$out/registry-$build.bin" \
@@ -94,7 +99,7 @@ run() {
         sleep 0.25
     done
     if [ -z "$sock" ]; then echo "$name: the compositor did not start"; tail -5 "$dir/host.log"; stop_all; return 1; fi
-    setsid "${isolated[@]}" WAYLAND_DISPLAY="$sock" "$LF_TARGET/istesso-flash" --borderless --picture grey --fps $fps \
+    setsid "${isolated[@]}" WAYLAND_DISPLAY="$sock" "$LF_TARGET/istesso-flash" --borderless --picture grey --fps $fps "${flash_more[@]}" \
         --listen "127.0.0.1:$fp" --log "$dir/flash-1.jsonl" < /dev/null > "$dir/flash-1.err" 2>&1 &
     pids+=($!)
     for _ in $(seq 1 40); do [ -s "$dir/flash-1.jsonl" ] && break; sleep 0.25; done
