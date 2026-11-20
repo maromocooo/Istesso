@@ -489,13 +489,16 @@ impl InputSink {
 
 /// Whether the device is, at this moment, still paired and still allowed to
 /// control this host: read from the list on disk, not remembered from when
-/// the conversation began.
+/// the conversation began. Control takes the right to look as well: input goes
+/// into what the device would otherwise not be allowed to see, and a copy
+/// brings text out of it.
 fn may_still_control(paths: &Paths, peer: &istesso_pair::Peer) -> bool {
     PeerStore::open(paths.peers()).is_ok_and(|peers| {
         peers.peers().iter().any(|known| {
             known.id == peer.id
                 && known.public_key == peer.public_key
                 && known.permissions.contains(&Permission::Control)
+                && known.permissions.contains(&Permission::View)
         })
     })
 }
@@ -600,7 +603,9 @@ impl Shared {
                     }
                     Response::InputAlive
                 }
-                Request::InputOpen { .. } if !session.allows(Permission::Control) => {
+                // Read again from the list on disk every time it is asked, not taken from
+                // when the conversation began.
+                Request::InputOpen { .. } if !may_still_control(&self.paths, session.peer()) => {
                     Response::error(ErrorCode::Forbidden, "this device may not control the host")
                 }
                 Request::InputOpen { alive } => {
@@ -1435,6 +1440,57 @@ mod tests {
                 }
             ));
         }
+
+        fn set_rights(pair: &InputPair, rights: &[istesso_pair::Permission]) {
+            let mut peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+            let mut laptop = peers.find("a laptop").unwrap().unwrap().clone();
+            laptop.permissions = rights.to_vec();
+            peers.add(laptop).unwrap();
+        }
+
+        fn refused(answer: InputAnswer) -> bool {
+            matches!(
+                answer,
+                InputAnswer::Refused {
+                    code: istesso_link::ErrorCode::Forbidden,
+                    ..
+                }
+            )
+        }
+
+        #[test]
+        fn a_device_that_may_control_but_not_look_is_not_given_input() {
+            use istesso_pair::Permission;
+            let pair = InputPair::new("iv");
+            set_rights(&pair, &[Permission::Control]);
+            let mut client = pair.connect();
+            assert!(refused(client.open_input_alive().unwrap()));
+            // Nothing it sends afterwards is handed over.
+            client.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(A_MOMENT), None);
+        }
+
+        #[test]
+        fn the_rights_are_read_again_each_time_input_is_asked_for() {
+            use istesso_pair::Permission;
+            let pair = InputPair::new("ir");
+            // Allowed both when the conversation begins ...
+            let mut client = pair.connect();
+            // ... but no longer allowed to look by the time it asks for input.
+            set_rights(&pair, &[Permission::Control]);
+            assert!(refused(client.open_input_alive().unwrap()));
+            // Given back, in the same conversation: the answer follows the list on disk.
+            set_rights(&pair, &[Permission::View, Permission::Control]);
+            assert!(matches!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Open { .. }
+            ));
+            client.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            // Taken away and asked again in the same conversation: refused at once.
+            set_rights(&pair, &[Permission::View]);
+            assert!(refused(client.open_input_alive().unwrap()));
+        }
     }
 
     #[test]
@@ -1466,6 +1522,17 @@ mod tests {
         let mut peers = PeerStore::open(paths.peers()).unwrap();
         peers.add(peer.clone()).unwrap();
         assert!(!may_still_control(&paths, &peer));
+        // Allowed to control, but not to look: it may neither type into what it cannot see
+        // nor copy text out of it.
+        peer.permissions = vec![Permission::Control];
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(!may_still_control(&paths, &peer));
+        // Both, in either order.
+        peer.permissions = vec![Permission::Control, Permission::View];
+        let mut peers = PeerStore::open(paths.peers()).unwrap();
+        peers.add(peer.clone()).unwrap();
+        assert!(may_still_control(&paths, &peer));
     }
 
     #[test]
