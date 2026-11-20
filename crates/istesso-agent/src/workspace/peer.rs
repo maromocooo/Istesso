@@ -8,22 +8,22 @@
 //!   connection's addresses the other way round, whose socket a process
 //!   still holds (its inode is not 0). Its `uid` is the socket's owner
 //!   (proc(5)); nothing here needs root.
-//! * macOS: this user's processes (`proc_listpids`) and their sockets
-//!   (`proc_pidinfo` with `PROC_PIDLISTFDS`, `proc_pidfdinfo` with
-//!   `PROC_PIDFDSOCKETINFO`, `<sys/proc_info.h>`) are looked through for
-//!   the socket with these addresses; the process that holds it must be
-//!   this user's, by its effective and its real user. (The system leaves
-//!   the owner in a socket's own `stat` at 0, so the holder is what
-//!   counts.) It does not show the sockets of another user's processes to
-//!   a program that is not root, so not finding the other end means
-//!   refusing it.
+//! * macOS: the entry of the system's table of TCP connections (`sysctl
+//!   net.inet.tcp.pcblist64`, what `netstat` reads) with this connection's
+//!   addresses the other way round, whose socket a descriptor still holds.
+//!   Its user is the one that made the socket; nothing here needs root, and
+//!   the table lists every user's connections. The sockets of the
+//!   processes are NOT looked at one by one (`proc_pidfdinfo`): that holds
+//!   each descriptor for a moment, and a descriptor closed in that moment
+//!   (a duplicate, or a child's copy on its way to `exec`) leaves its
+//!   socket refusing every waiting read with `EBADF`, in whichever program
+//!   of this user it belongs to (seen 2026-11-20, ADR 0007).
 //! * Elsewhere: nothing is found, so every connection is refused.
 //!
 //! What this does not guard against: any program of this user (it may
 //! connect, and it is let through); root; a socket handed from one process
-//! to another (it counts as its creator's on Linux, and as the holder's
-//! that is found first on macOS); and it costs one look through the
-//! system's tables for every connection. The look is a picture of one
+//! to another (it counts as its creator's); and it costs one look through
+//! the system's table for every connection. The look is a picture of one
 //! moment: when the other end is gone by then (closed, or not held by any
 //! process), the connection is refused.
 
@@ -53,9 +53,9 @@ impl Peer {
     }
 }
 
-/// One end of a TCP connection, as Linux lists it: its own address, the
-/// address it is connected to, and the user that owns the socket.
-#[cfg(any(target_os = "linux", test))]
+/// One end of a TCP connection, as the system lists it: its own address,
+/// the address it is connected to, and the user that owns the socket.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct End {
     pub local: SocketAddr,
@@ -101,7 +101,7 @@ pub(crate) fn is_other_end(
 
 /// Who holds the other end of that connection, among `ends`: the first
 /// that [`is_other_end`]; nothing found is [`Peer::NotFound`].
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub(crate) fn judge(
     ends: impl IntoIterator<Item = End>,
     here: SocketAddr,
@@ -208,353 +208,146 @@ mod system {
     }
 }
 
+/// The connected sockets in what `sysctl net.inet.tcp.pcblist64` gives on
+/// macOS that a descriptor still holds: a `struct xinpgen`, then one
+/// `struct xtcpcb64` for each connection, then a `struct xinpgen` again
+/// (`<netinet/in_pcb.h>`, `<netinet/tcp_var.h>`, `<sys/socketvar.h>`). Each
+/// begins with its own length. Only the fields named below are read, at the
+/// places a small C program printed with `offsetof` against the macOS SDK
+/// (arm64; the structures are packed and of fixed-size fields, so x86_64 has
+/// the same). An entry that is cut short, or too short to hold them, ends
+/// the list: what is not read is not found, and so refused.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_pcblist(table: &[u8]) -> Vec<End> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    /// `xt_inpcb.inp_fport` and `inp_lport`, in network order.
+    const FOREIGN_PORT: usize = 20;
+    const LOCAL_PORT: usize = 22;
+    /// `xt_inpcb.inp_vflag`: `INP_IPV4` or `INP_IPV6`.
+    const VERSION: usize = 96;
+    const INP_IPV4: u8 = 0x1;
+    const INP_IPV6: u8 = 0x2;
+    /// `xt_inpcb.inp_dependfaddr` and `inp_dependladdr`: 16 bytes, an IPv6
+    /// address, or an IPv4 one in the last four.
+    const FOREIGN_ADDRESS: usize = 100;
+    const LOCAL_ADDRESS: usize = 116;
+    /// `xt_inpcb.xi_socket.so_state`. Its lowest bit (BSD's `SS_NOFDREF`)
+    /// says that no descriptor holds the socket any more: it was closed and
+    /// only finishes its end (seen with a C program: 0x2 while open, 0x12
+    /// after `shutdown`, 0x2031 once closed).
+    const STATE: usize = 166;
+    const NO_DESCRIPTOR: u16 = 0x1;
+    /// `xt_inpcb.xi_socket.so_uid`: the user that made the socket.
+    const USER: usize = 252;
+    /// The least an entry is long to hold all of those.
+    const ENOUGH: usize = USER + 4;
+
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_ne_bytes(table.get(at..at + 4)?.try_into().ok()?))
+    };
+    let mut ends = Vec::new();
+    // Past the head.
+    let Some(mut at) = word(0).map(|len| len as usize).filter(|len| *len >= 4) else {
+        return ends;
+    };
+    while let Some(len) = word(at).map(|len| len as usize) {
+        // The tail (a `struct xinpgen`) is shorter than any entry.
+        let Some(entry) = table
+            .get(at..at.saturating_add(len))
+            .filter(|_| len >= ENOUGH)
+        else {
+            break;
+        };
+        at += len;
+        let state = u16::from_ne_bytes([entry[STATE], entry[STATE + 1]]);
+        if state & NO_DESCRIPTOR != 0 {
+            continue;
+        }
+        let port = |at: usize| u16::from_be_bytes([entry[at], entry[at + 1]]);
+        let address = |at: usize, port: u16| -> Option<SocketAddr> {
+            let bytes: [u8; 16] = entry[at..at + 16].try_into().ok()?;
+            if entry[VERSION] & INP_IPV4 != 0 {
+                let v4: [u8; 4] = bytes[12..16].try_into().ok()?;
+                Some(SocketAddr::from((Ipv4Addr::from(v4), port)))
+            } else if entry[VERSION] & INP_IPV6 != 0 {
+                Some(SocketAddr::from((Ipv6Addr::from(bytes), port)))
+            } else {
+                None
+            }
+        };
+        let (Some(local), Some(remote)) = (
+            address(LOCAL_ADDRESS, port(LOCAL_PORT)),
+            address(FOREIGN_ADDRESS, port(FOREIGN_PORT)),
+        ) else {
+            continue;
+        };
+        ends.push(End {
+            local,
+            remote,
+            uid: u32::from_ne_bytes([
+                entry[USER],
+                entry[USER + 1],
+                entry[USER + 2],
+                entry[USER + 3],
+            ]),
+        });
+    }
+    ends
+}
+
 #[cfg(target_os = "macos")]
 mod system {
-    //! The structures of `<sys/proc_info.h>` that `PROC_PIDFDSOCKETINFO`
-    //! fills (the system's interface; the `libc` crate has the calls and
-    //! `proc_fdinfo`, not these). Only the fields read here are named
-    //! plainly; the sizes and places are checked against the header below.
-
-    use super::{is_other_end, Peer};
-    use std::mem::{offset_of, size_of};
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    const PROC_UID_ONLY: u32 = 4;
-    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
-    const SOCKINFO_TCP: i32 = 2;
-    const INI_IPV4: u8 = 0x1;
-    const INI_IPV6: u8 = 0x2;
-
-    #[repr(C)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct ProcFileInfo {
-        open_flags: u32,
-        status: u32,
-        offset: i64,
-        kind: i32,
-        guard_flags: u32,
-    }
-
-    #[repr(C)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct VinfoStat {
-        dev: u32,
-        mode: u16,
-        nlink: u16,
-        ino: u64,
-        uid: u32,
-        gid: u32,
-        /// Access, change, status change and birth: seconds and nanoseconds.
-        times: [i64; 8],
-        size: i64,
-        blocks: i64,
-        block_size: i32,
-        flags: u32,
-        generation: u32,
-        rdev: u32,
-        spare: [i64; 2],
-    }
-
-    #[repr(C)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct SockbufInfo {
-        /// Bytes, high water, mbuf bytes, mbuf most, low water.
-        counts: [u32; 5],
-        flags: i16,
-        timeout: i16,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct InV4 {
-        tos: u8,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct InV6 {
-        hop_limit: u8,
-        checksum: i32,
-        interface: u16,
-        hops: i16,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct InSockinfo {
-        /// The other end's port, then this end's, in network order.
-        foreign_port: i32,
-        local_port: i32,
-        generation: u64,
-        flags: u32,
-        flow: u32,
-        /// [`INI_IPV4`] or [`INI_IPV6`].
-        version: u8,
-        ttl: u8,
-        reserved: u32,
-        /// 16 bytes: an IPv6 address, or an IPv4 one in the last four.
-        foreign_address: [u8; 16],
-        local_address: [u8; 16],
-        v4: InV4,
-        v6: InV6,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct TcpSockinfo {
-        ini: InSockinfo,
-        state: i32,
-        timers: [i32; 4],
-        mss: i32,
-        flags: u32,
-        reserved: u32,
-        handle: u64,
-    }
-
-    /// The protocol's part: as large as the largest kind (a Unix socket's,
-    /// with its two addresses).
-    #[repr(C)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    union SoiProto {
-        tcp: TcpSockinfo,
-        size: [u64; 66],
-    }
-
-    #[repr(C)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct SocketInfo {
-        stat: VinfoStat,
-        handle: u64,
-        pcb: u64,
-        kind_type: i32,
-        protocol: i32,
-        family: i32,
-        options: i16,
-        linger: i16,
-        state: i16,
-        queue: i16,
-        incomplete_queue: i16,
-        queue_limit: i16,
-        timeout: i16,
-        error: u16,
-        oob_mark: u32,
-        receive: SockbufInfo,
-        send: SockbufInfo,
-        kind: i32,
-        reserved: u32,
-        proto: SoiProto,
-    }
-
-    #[repr(C)]
-    #[allow(dead_code)] // The system's layout: most fields are not read.
-    struct SocketFdInfo {
-        file: ProcFileInfo,
-        socket: SocketInfo,
-    }
-
-    // As the header has them (sizeof and offsetof, printed by a small C
-    // program against the macOS SDK on the Air, arm64; the same on x86_64,
-    // where the types have the same sizes and alignments).
-    const _: () = assert!(size_of::<SocketFdInfo>() == 792);
-    const _: () = assert!(size_of::<SocketInfo>() == 768);
-    const _: () = assert!(size_of::<VinfoStat>() == 136);
-    const _: () = assert!(size_of::<InSockinfo>() == 80);
-    const _: () = assert!(size_of::<TcpSockinfo>() == 120);
-    const _: () = assert!(offset_of!(SocketFdInfo, socket) == 24);
-    const _: () = assert!(offset_of!(VinfoStat, uid) == 16);
-    const _: () = assert!(offset_of!(SocketInfo, family) == 160);
-    const _: () = assert!(offset_of!(SocketInfo, kind) == 232);
-    const _: () = assert!(offset_of!(SocketInfo, proto) == 240);
-    const _: () = assert!(offset_of!(InSockinfo, version) == 24);
-    const _: () = assert!(offset_of!(InSockinfo, foreign_address) == 32);
-    const _: () = assert!(offset_of!(InSockinfo, local_address) == 48);
-    const _: () = assert!(offset_of!(TcpSockinfo, state) == 80);
+    use super::{judge, parse_pcblist, Peer};
+    use std::net::SocketAddr;
 
     pub(super) fn look(here: SocketAddr, there: SocketAddr, me: u32) -> Peer {
-        let mut fds: Vec<libc::proc_fdinfo> = Vec::new();
-        let holder = processes_of(me).into_iter().find(|pid| {
-            tcp_ends(*pid, &mut fds)
-                .into_iter()
-                .any(|(local, remote)| is_other_end(local, remote, here, there))
-        });
-        let Some(pid) = holder else {
-            return Peer::NotFound;
-        };
-        // Read again for the one that holds it: listed by its effective
-        // user, it must be this user by its real one too.
-        match users_of(pid) {
-            Some((effective, real)) if effective == me && real == me => Peer::ThisUser,
-            Some(_) => Peer::OtherUser,
+        match table() {
+            Some(table) => judge(parse_pcblist(&table), here, there, me),
             None => Peer::NotFound,
         }
     }
 
-    /// The effective and the real user of a process.
-    fn users_of(pid: libc::pid_t) -> Option<(u32, u32)> {
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
-        let size = size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
-        // SAFETY: the buffer is a proc_bsdshortinfo, and its size is given.
-        let got = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDT_SHORTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if got != size {
-            return None;
-        }
-        // SAFETY: zeroed first, and filled whole by the system.
-        let info = unsafe { info.assume_init() };
-        Some((info.pbsi_uid, info.pbsi_ruid))
-    }
-
-    /// The processes of the user `uid` (by their effective user).
-    fn processes_of(uid: u32) -> Vec<libc::pid_t> {
-        // SAFETY: with no buffer, the call only says how many bytes it needs.
-        let needed = unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, std::ptr::null_mut(), 0) };
-        if needed <= 0 {
-            return Vec::new();
-        }
-        // Room for processes started in the meantime.
-        let room = needed as usize / size_of::<libc::pid_t>() + 64;
-        let mut pids: Vec<libc::pid_t> = vec![0; room];
-        // SAFETY: the buffer holds `room` pids, and its length in bytes is given.
-        let got = unsafe {
-            libc::proc_listpids(
-                PROC_UID_ONLY,
-                uid,
-                pids.as_mut_ptr().cast(),
-                (room * size_of::<libc::pid_t>()) as libc::c_int,
-            )
-        };
-        if got <= 0 {
-            return Vec::new();
-        }
-        pids.truncate(got as usize / size_of::<libc::pid_t>());
-        pids.retain(|pid| *pid > 0);
-        pids
-    }
-
-    /// The TCP sockets that the process `pid` holds: their own address and
-    /// the one they are connected to. `fds` is a buffer kept from one
-    /// process to the next.
-    fn tcp_ends(
-        pid: libc::pid_t,
-        fds: &mut Vec<libc::proc_fdinfo>,
-    ) -> Vec<(SocketAddr, SocketAddr)> {
-        const ONE: usize = size_of::<libc::proc_fdinfo>();
-        if fds.capacity() < 256 {
-            fds.reserve(256);
-        }
-        let count = loop {
-            let room = fds.capacity();
-            // SAFETY: the buffer has room for `room` entries, and its
-            // length in bytes is given; the system writes whole entries.
-            let got = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDLISTFDS,
+    /// The system's table of TCP connections, as `netstat` reads it. Its
+    /// size is asked for first; when the table has grown past the room by
+    /// the time it is read, it is asked again, a few times at most.
+    fn table() -> Option<Vec<u8>> {
+        const NAME: &std::ffi::CStr = c"net.inet.tcp.pcblist64";
+        for _ in 0..4 {
+            let mut needed: libc::size_t = 0;
+            // SAFETY: with no buffer, the call only says how many bytes it
+            // needs; the name ends with a 0.
+            let asked = unsafe {
+                libc::sysctlbyname(
+                    NAME.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut needed,
+                    std::ptr::null_mut(),
                     0,
-                    fds.as_mut_ptr().cast(),
-                    (room * ONE) as libc::c_int,
                 )
             };
-            if got <= 0 {
-                return Vec::new();
+            if asked != 0 {
+                return None;
             }
-            let count = got as usize / ONE;
-            // A full buffer may have left some out: a larger one, a few
-            // times at most.
-            if count < room || room >= 1 << 16 {
-                break count;
+            // Room for connections made in the meantime.
+            let mut table = vec![0u8; needed + needed / 8 + 4096];
+            let mut len: libc::size_t = table.len();
+            // SAFETY: the buffer is `len` bytes long, and the system writes
+            // no more than that and says how many it wrote.
+            let read = unsafe {
+                libc::sysctlbyname(
+                    NAME.as_ptr(),
+                    table.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if read == 0 && len <= table.len() {
+                table.truncate(len);
+                return Some(table);
             }
-            fds.reserve(room * 4);
-        };
-        // SAFETY: the system wrote `count` entries into the buffer.
-        unsafe { fds.set_len(count) };
-        let ends = fds
-            .iter()
-            .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
-            .filter_map(|fd| tcp_end(pid, fd.proc_fd))
-            .collect();
-        fds.clear();
-        ends
-    }
-
-    /// One TCP socket of a process, when it is one.
-    fn tcp_end(pid: libc::pid_t, fd: i32) -> Option<(SocketAddr, SocketAddr)> {
-        let mut info = std::mem::MaybeUninit::<SocketFdInfo>::zeroed();
-        // SAFETY: the buffer is a socket_fdinfo, and its size is given.
-        let got = unsafe {
-            libc::proc_pidfdinfo(
-                pid,
-                fd,
-                PROC_PIDFDSOCKETINFO,
-                info.as_mut_ptr().cast(),
-                size_of::<SocketFdInfo>() as libc::c_int,
-            )
-        };
-        if got != size_of::<SocketFdInfo>() as libc::c_int {
-            return None;
         }
-        // SAFETY: zeroed first, and filled whole by the system: every field
-        // is plain numbers.
-        let info = unsafe { info.assume_init() };
-        let socket = &info.socket;
-        if socket.kind != SOCKINFO_TCP
-            || (socket.family != libc::AF_INET && socket.family != libc::AF_INET6)
-        {
-            return None;
-        }
-        // SAFETY: the kind says the protocol's part is TCP's.
-        let ini = unsafe { socket.proto.tcp.ini };
-        Some((
-            address(ini.version, &ini.local_address, ini.local_port)?,
-            address(ini.version, &ini.foreign_address, ini.foreign_port)?,
-        ))
-    }
-
-    /// An address of `<sys/proc_info.h>`: IPv4 in the last four bytes when
-    /// the version says so, IPv6 otherwise; the port in network order.
-    fn address(version: u8, bytes: &[u8; 16], port: i32) -> Option<SocketAddr> {
-        let port = u16::from_be(port as u16);
-        if version & INI_IPV4 != 0 {
-            let v4: [u8; 4] = bytes[12..16].try_into().ok()?;
-            Some(SocketAddr::from((Ipv4Addr::from(v4), port)))
-        } else if version & INI_IPV6 != 0 {
-            Some(SocketAddr::from((Ipv6Addr::from(*bytes), port)))
-        } else {
-            None
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn addresses_are_read_by_their_version_and_ports_in_network_order() {
-            let mut bytes = [0u8; 16];
-            bytes[12..16].copy_from_slice(&[127, 0, 0, 1]);
-            let port = i32::from(8080u16.to_be());
-            assert_eq!(
-                address(INI_IPV4, &bytes, port),
-                Some("127.0.0.1:8080".parse().unwrap())
-            );
-            let one = Ipv6Addr::LOCALHOST.octets();
-            assert_eq!(
-                address(INI_IPV6, &one, port),
-                Some("[::1]:8080".parse().unwrap())
-            );
-            assert_eq!(address(0, &one, port), None);
-        }
+        None
     }
 }
 
@@ -720,10 +513,183 @@ mod tests {
         .is_empty());
     }
 
+    /// One entry of the macOS table (`struct xtcpcb64`, 472 bytes), with
+    /// the fields that are read.
+    fn pcb_entry(local: &str, remote: &str, uid: u32, state: u16) -> Vec<u8> {
+        let (local, remote) = (at(local), at(remote));
+        let mut entry = vec![0u8; 472];
+        entry[0..4].copy_from_slice(&472u32.to_ne_bytes());
+        entry[20..22].copy_from_slice(&remote.port().to_be_bytes());
+        entry[22..24].copy_from_slice(&local.port().to_be_bytes());
+        entry[96] = if local.is_ipv4() { 0x1 } else { 0x2 };
+        for (place, address) in [(100, remote), (116, local)] {
+            match address.ip() {
+                std::net::IpAddr::V4(v4) => {
+                    entry[place + 12..place + 16].copy_from_slice(&v4.octets())
+                }
+                std::net::IpAddr::V6(v6) => entry[place..place + 16].copy_from_slice(&v6.octets()),
+            }
+        }
+        entry[166..168].copy_from_slice(&state.to_ne_bytes());
+        entry[252..256].copy_from_slice(&uid.to_ne_bytes());
+        entry
+    }
+
+    /// The table as the system gives it: a head, the entries, a tail.
+    fn pcb_table(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut edge = vec![0u8; 24];
+        edge[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        let mut table = edge.clone();
+        for entry in entries {
+            table.extend_from_slice(entry);
+        }
+        table.extend_from_slice(&edge);
+        table
+    }
+
+    #[test]
+    fn the_macos_table_gives_held_connections_with_their_owner() {
+        const OPEN: u16 = 0x2;
+        const HALF_CLOSED: u16 = 0x12;
+        const CLOSED: u16 = 0x2031;
+        let entries = vec![
+            // A listening socket: connected to nothing.
+            pcb_entry("127.0.0.1:8000", "0.0.0.0:0", 501, 0),
+            // This side, and the other end, of another user.
+            pcb_entry("127.0.0.1:8000", "127.0.0.1:51000", 501, OPEN),
+            pcb_entry("127.0.0.1:51000", "127.0.0.1:8000", 502, OPEN),
+            // Closed by its program, still finishing: nobody holds it.
+            pcb_entry("127.0.0.1:51001", "127.0.0.1:8000", 501, CLOSED),
+            // Done sending, still held.
+            pcb_entry("127.0.0.1:51002", "127.0.0.1:8000", 501, HALF_CLOSED),
+            pcb_entry("[::1]:51008", "[::1]:8000", 501, OPEN),
+            // Root's.
+            pcb_entry("127.0.0.1:51003", "127.0.0.1:8000", 0, OPEN),
+        ];
+        let table = pcb_table(&entries);
+        assert_eq!(
+            parse_pcblist(&table),
+            vec![
+                end("127.0.0.1:8000", "0.0.0.0:0", 501),
+                end("127.0.0.1:8000", "127.0.0.1:51000", 501),
+                end("127.0.0.1:51000", "127.0.0.1:8000", 502),
+                end("127.0.0.1:51002", "127.0.0.1:8000", 501),
+                end("[::1]:51008", "[::1]:8000", 501),
+                end("127.0.0.1:51003", "127.0.0.1:8000", 0),
+            ]
+        );
+        let here = at("127.0.0.1:8000");
+        let who = |there: &str| judge(parse_pcblist(&table), here, at(there), 501);
+        assert_eq!(who("127.0.0.1:51000"), Peer::OtherUser);
+        assert_eq!(who("127.0.0.1:51001"), Peer::NotFound);
+        assert_eq!(who("127.0.0.1:51002"), Peer::ThisUser);
+        assert_eq!(who("127.0.0.1:51003"), Peer::OtherUser);
+        assert_eq!(who("127.0.0.1:51004"), Peer::NotFound);
+        assert_eq!(
+            judge(
+                parse_pcblist(&table),
+                at("[::1]:8000"),
+                at("[::1]:51008"),
+                501
+            ),
+            Peer::ThisUser
+        );
+
+        // A table that is cut short gives the entries that are whole, and
+        // nothing is read past its end.
+        for cut in 0..table.len() {
+            let whole = cut.saturating_sub(24) / 472;
+            assert_eq!(
+                parse_pcblist(&table[..cut]).len(),
+                whole.min(entries.len()) - usize::from(whole > 3),
+                "{cut}"
+            );
+        }
+        // An entry too short to hold the fields, or one that says it is
+        // longer than what is left, ends the list.
+        let mut short = pcb_entry("127.0.0.1:51000", "127.0.0.1:8000", 501, OPEN);
+        short.truncate(200);
+        short[0..4].copy_from_slice(&200u32.to_ne_bytes());
+        let after = pcb_entry("127.0.0.1:51005", "127.0.0.1:8000", 501, OPEN);
+        assert!(parse_pcblist(&pcb_table(&[short, after.clone()])).is_empty());
+        let mut long = after.clone();
+        long[0..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(parse_pcblist(&pcb_table(&[long])).is_empty());
+        // A longer entry (a later system's) is read by its own length.
+        let mut grown = after.clone();
+        grown.extend_from_slice(&[0u8; 40]);
+        grown[0..4].copy_from_slice(&512u32.to_ne_bytes());
+        assert_eq!(parse_pcblist(&pcb_table(&[grown, after])).len(), 2);
+        // Neither IPv4 nor IPv6: left out.
+        let mut neither = pcb_entry("127.0.0.1:51006", "127.0.0.1:8000", 501, OPEN);
+        neither[96] = 0;
+        assert!(parse_pcblist(&pcb_table(&[neither])).is_empty());
+        assert!(parse_pcblist(&[]).is_empty());
+        assert!(parse_pcblist(&[0, 0, 0, 0]).is_empty());
+    }
+
+    /// macOS, seen 2026-11-20 (ADR 0007): while the sockets of this user's
+    /// processes were looked at one by one, a read that waited on a
+    /// connection failed with `EBADF` when a child was started at the same
+    /// moment (the child's copy of the socket was closed while it was
+    /// looked at). The look must leave a waiting read alone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn looks_leave_a_waiting_read_alone_while_children_are_started() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let near = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut waiting, _) = listener.accept().unwrap();
+        let looked_from = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (looked_at, _) = listener.accept().unwrap();
+        waiting
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        let reader = std::thread::spawn(move || waiting.read(&mut [0u8; 1]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let looker = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut looks = 0u32;
+                while !stop.load(Ordering::SeqCst) {
+                    assert_eq!(of(&looked_at), Peer::ThisUser);
+                    looks += 1;
+                }
+                looks
+            })
+        };
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_secs(1) {
+            let _ = std::process::Command::new("/usr/bin/true").status();
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(looker.join().unwrap() > 0);
+        // Nothing was sent: the read ends when its time is up, and not
+        // before, with an error of the socket.
+        let read = reader.join().unwrap();
+        assert!(
+            matches!(&read, Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )),
+            "{read:?}"
+        );
+        drop((near, looked_from));
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_connection_from_this_user_is_seen_as_this_users_and_a_closed_one_is_not_found() {
-        for (listen, client) in [("127.0.0.1:0", "127.0.0.1"), ("[::1]:0", "::1")] {
+        for (listen, client) in [
+            ("127.0.0.1:0", "127.0.0.1"),
+            ("[::1]:0", "::1"),
+            // An IPv6 socket that reaches the IPv4 address.
+            ("127.0.0.1:0", "::ffff:127.0.0.1"),
+        ] {
             let Ok(listener) = TcpListener::bind(listen) else {
                 // No IPv6 on this machine.
                 continue;
@@ -746,17 +712,33 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_connection_from_another_program_of_this_user_is_seen_as_this_users() {
-        // Another process: `bash` opens the connection (`/dev/tcp`) and
-        // holds it for a while.
+        // Another process: `bash` opens the connection (`/dev/tcp`), says
+        // a word and holds it for a while.
+        use std::io::Read;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let mut child = std::process::Command::new("/bin/bash")
             .arg("-c")
-            .arg(format!("exec 3<>/dev/tcp/127.0.0.1/{port}; sleep 5"))
+            .arg(format!(
+                "exec 3<>/dev/tcp/127.0.0.1/{port}; echo here >&3; sleep 5"
+            ))
             .stdin(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let (taken, _) = listener.accept().unwrap();
+        // A forward of another test that looks for a free number connects
+        // for a moment to the numbers above its own, and the system hands
+        // numbers out in a row: such a connection says nothing and is
+        // closed at once (seen 2026-11-20). The one that says a word is
+        // `bash`'s.
+        let taken = loop {
+            let (mut taken, _) = listener.accept().unwrap();
+            taken
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            if matches!(taken.read(&mut [0u8; 1]), Ok(1)) {
+                break taken;
+            }
+        };
         let seen = of(&taken);
         let _ = child.kill();
         let _ = child.wait();
