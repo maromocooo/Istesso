@@ -67,6 +67,10 @@
 #   DAILY_WINDOWS=1      PROTOTYPE (ADR 0027, a proposal): the application's other windows (Command-N,
 #                        dialogs) in windows of their own here: the host with --windows, the viewer
 #                        with ISTESSO_WINDOWS=1. Needs this branch's host, agent, relay and viewer
+#   DAILY_CAPTURE_NOTICE=1  PROTOTYPE: the window's title says when the host will ask again whether
+#                        its program may record the screen, read from a copy of the host's record in
+#                        this Mac's state folder (capture-approvals.json; this script fetches nothing)
+#   DAILY_CAPTURE_NOTICE_DAYS  how many days ahead the title says it (default 7; 0 to 400)
 #   DAILY_HOST_DIRECT=1  for checks with a stand-in host only: start the host program's executable
 #                        itself instead of through `open` (it then has no permission of its own)
 set -u
@@ -79,6 +83,8 @@ host_dir=${DAILY_MAC_DIR:-'~/.cache/istesso-daily-mac'}
 [[ "${DAILY_HOST_EXTRA:-}" =~ ^[A-Za-z0-9\ ._/-]*$ ]] || { echo "error: DAILY_HOST_EXTRA holds only words of letters, digits, . _ / -"; exit 2; }
 [ "${DAILY_WINDOWS:-}" = 1 ] && DAILY_HOST_EXTRA="${DAILY_HOST_EXTRA:-} --windows"
 [ -z "${DAILY_CLICK_FORM:-}" ] || [[ "$DAILY_CLICK_FORM" =~ ^[1-4]$ ]] || { echo "error: DAILY_CLICK_FORM is 1, 2, 3 or 4"; exit 2; }
+[ -z "${DAILY_CAPTURE_NOTICE_DAYS:-}" ] || { [[ "$DAILY_CAPTURE_NOTICE_DAYS" =~ ^[0-9]{1,3}$ ]] && [ "$DAILY_CAPTURE_NOTICE_DAYS" -le 400 ]; } ||
+    { echo "error: DAILY_CAPTURE_NOTICE_DAYS is a number of days from 0 to 400"; exit 2; }
 state=${DAILY_MAC_STATE:-"$HOME/Library/Caches/istesso-daily-mac"}
 istesso=${DAILY_ISTESSO_BIN:-"$repo/target/release/istesso"}
 bundle_name="Istesso Dev Daily Host.app"
@@ -624,7 +630,7 @@ HOST
                 if [ "${DAILY_CAPTURE_NOTICE:-0}" = 1 ] && [ -s "$state/capture-approvals.json" ]; then
                     local notice_word
                     notice_word=$("$repo/scripts/studio-capture-notice.py" "$state/capture-approvals.json" \
-                        --bundle "$bundle_name" --ja --within 7 2>/dev/null) || notice_word=
+                        --bundle "$bundle_name" --ja --within "${DAILY_CAPTURE_NOTICE_DAYS:-7}" 2>/dev/null) || notice_word=
                     [ -n "$notice_word" ] && wanted="$wanted — $notice_word"
                 fi
                 if [ "$(head -1 "$mine/title" 2>/dev/null)" != "$wanted" ]; then
