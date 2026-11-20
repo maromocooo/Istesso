@@ -23,6 +23,12 @@ gstreamer"), but only after the copy has been asked for; with this patch that la
 comes back at once. The frames in system memory and as DMABuf are not changed in what they
 show (the first is read back through the renderer, the second was waited for already).
 
+It covers the first output only. The second output of the new-windows prototype
+(gst-wayland-display-proto-second-output.patch in this folder: `create_second_frame`) asks for
+its copy in the same order and waits only afterwards (comp/second.rs); this patch does not
+change it, and it applies cleanly with that one in either order, so nothing warns. That output
+needs the same wait in the second-output patch itself.
+
 diff --git a/wayland-display-core/src/comp/rendering.rs b/wayland-display-core/src/comp/rendering.rs
 index 22619ab..81c7286 100644
 --- a/wayland-display-core/src/comp/rendering.rs
