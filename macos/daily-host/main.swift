@@ -1817,6 +1817,22 @@ func selfTest() -> Never {
         send(["kind": "button", "code": 0x110, "pressed": false])
         checkPanel(downs == 1 && ups == 1 && !injector.holding, true, "injector: a release with no window lets the press go, and nothing stays held")
     }
+    do {
+        // A place beyond the picture is kept inside it.
+        let injector = Injector()
+        injector.mayPost = true
+        injector.origin = CGPoint(x: 100, y: 100)
+        injector.scale = 0.5
+        injector.pictureSize = { CGSize(width: 400, height: 200) }
+        injector.listNow = { [appWin] }
+        injector.lockedNow = { false }
+        injector.windowAt = { _ in appWin }
+        injector.postProcess = { _, _ in }
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "x": 100_000, "y": -50]))
+        checkPanel(injector.pointerPlace == CGPoint(x: 100 + 399 * 0.5, y: 100), true, "injector: pointer_at beyond the picture is kept inside it")
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "x": 20, "y": 30]))
+        checkPanel(injector.pointerPlace == CGPoint(x: 110, y: 115), true, "injector: pointer_at inside the picture is as said")
+    }
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: []), true, "resize: a running picture comes back")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["pause"]), false, "resize: a pause during the restart is kept")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["detach"]), false, "resize: a detach during the restart is kept")
@@ -2267,6 +2283,9 @@ final class Injector {
     /// Where the picture lies on the screen: picture pixels to global points.
     var origin = CGPoint.zero
     var scale = 1.0  // points per picture pixel
+    /// The picture's size in pixels (set by the host; nil: not known, as in --self-test's older
+    /// checks): a place the other side says is kept inside it.
+    var pictureSize: () -> CGSize? = { nil }
     /// The process input goes to now, and the window a pointer event is aimed at.
     var target: () -> pid_t? = { nil }
     var windowAt: (CGPoint) -> WindowInfo? = { _ in nil }
@@ -2473,7 +2492,14 @@ final class Injector {
             guard let code = (object["code"] as? NSNumber)?.uint32Value, let pressed = object["pressed"] as? Bool else { return count("unreadable") }
             key(code, pressed)
         case "pointer_at":
-            guard let x = (object["x"] as? NSNumber)?.doubleValue, let y = (object["y"] as? NSNumber)?.doubleValue else { return count("unreadable") }
+            guard var x = (object["x"] as? NSNumber)?.doubleValue, var y = (object["y"] as? NSNumber)?.doubleValue,
+                  x.isFinite, y.isFinite else { return count("unreadable") }
+            // Kept inside the picture: a place beyond it would be a part of the screen nobody sees
+            // (another window of the application, another display).
+            if let size = pictureSize(), size.width >= 1, size.height >= 1 {
+                x = min(max(x, 0), size.width - 1)
+                y = min(max(y, 0), size.height - 1)
+            }
             moved(to: CGPoint(x: origin.x + x * scale, y: origin.y + y * scale))
         case "button":
             guard let code = (object["code"] as? NSNumber)?.uint32Value, let pressed = object["pressed"] as? Bool else { return count("unreadable") }
@@ -2795,6 +2821,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         watchdog.resume()
         timers.append(watchdog)
         _ = gateWired
+        injector.pictureSize = { [weak self] in
+            guard let self, self.width > 0, self.height > 0 else { return nil }
+            return CGSize(width: self.width, height: self.height)
+        }
         mayCapture = settings.generated || CGPreflightScreenCaptureAccess()
         injector.mayPost = CGPreflightPostEventAccess()
         say("permissions", [("screen_recording", mayCapture), ("accessibility", injector.mayPost)])
