@@ -91,6 +91,9 @@ plan)
         say "             main editor                          off (no built trial at '$(short "$EDITOR_SRC")' or no plugin)"
     fi
     say "             scope-keys/, bin/scope-run           a test identity of its own for the scope's questions"
+    say "             NOTE (review A1): run as the owner's own user, a command in the scope can still open the"
+    say "             owner's other terminals on the host (/dev/pts): read part of what is typed there, write"
+    say "             text, turn echo off. The fix is the dedicated coding user, later."
     say "  start    an agent on ${NEXT_BIND:?}:$PORT (main editor $((PORT + 1))-$((PORT + 2)), scope questions $((PORT + 3))),"
     say "           until $(date -d "@${NEXT_UNTIL:?}" '+%F %H:%M') or the rollback; stopped while the measuring signal is busy"
     say "  keep     the record in $(short "$KEEP")/<stamp>/"
@@ -146,7 +149,9 @@ CONF
 #!/bin/bash
 # scope-run COMMAND...: runs COMMAND in this folder under scope level 1 (prototype,
 # docs/research/agent-scope-proto.md). What it needs outside the folder is held and asked on the
-# Mac: run the stage's scope-answer there first. Not for real work yet (rights under review).
+# Mac: run the stage's scope-answer there first. Run as the owner's own user, a command in the
+# scope can still open the owner's other terminals here (/dev/pts): read part of what is typed
+# there, write text, turn echo off (review A1; the fix is the dedicated coding user, later).
 exec "$HD/bin/istesso-scope" run --level 1 --project "\$PWD" --state "$HD/scope-state" \\
     --hold-files --hold-connect --ask-listen "$NEXT_BIND:$((PORT + 3))" --link-keys "$HD/scope-keys" \\
     --ask-device mac --ask-wait 60 --ask-timeout 30 --grants "$HD/scope-grants/grants" -- "\$@"

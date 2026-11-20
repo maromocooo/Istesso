@@ -13,7 +13,9 @@
 #   - forwards of the shell's ports take connections from this user's programs only;
 #   - `cd ~/Istesso/ubuntu/<ID>` (with cd-switch.zsh) mounts that host folder read-only first;
 #   - `istesso-edit <file>` in the shell shows the host's main editor in a window here;
-#   - the scope prototype (bin/scope-run on the host, bin/scope-answer here), not for real work yet.
+#   - the scope prototype (bin/scope-run on the host, bin/scope-answer here). Run as the owner's own
+#     user, a command in it can still open the owner's other terminals on the host (/dev/pts: read
+#     part of what is typed there, write text, turn echo off; review A1, fixed by the dedicated user).
 # None of it touches this Mac's own Istesso identity or the day agent on the host (port 26850): the
 # shell uses a copy of the test identity of today's `ish`, and the host a copy of the day agent's.
 #
@@ -115,8 +117,9 @@ until_epoch() {
 }
 
 # The host's half, with every setting it needs.
-host() {
-    local words=() w
+host() { # ACTION [NEXT_KEY=VALUE...]
+    local words=("$1") w
+    shift
     for w in NEXT_COMMIT="$commit" NEXT_HOST_DIR="$NEXT_HOST_DIR" NEXT_KEEP="$NEXT_HOST_KEEP" \
         NEXT_STAGE="$NEXT_HOST_STAGE" NEXT_HOST_FROM="$NEXT_HOST_FROM" NEXT_PORT="$NEXT_PORT" \
         NEXT_BIND="$addr" NEXT_FOLDERS="$NEXT_FOLDERS" NEXT_EDITOR_SRC="$NEXT_HOST_EDITOR_SRC" \
@@ -347,6 +350,9 @@ EOF
         done
         echo "  checked: the host's agent lists the projects $(folder_ids | tr '\n' ' ')"
     fi
+    echo "Note (review A1): the scope runs as your own user, so a command in it can still open your other"
+    echo "terminals on the host (/dev/pts): read part of what is typed there, write text, turn echo off."
+    echo "The fix is the dedicated coding user, later."
     echo "installed ($stamp). Back as before: scripts/next-stage.sh rollback"
 }
 
