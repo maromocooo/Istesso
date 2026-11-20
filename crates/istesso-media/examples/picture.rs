@@ -413,7 +413,7 @@ fn stay(mut args: Args) -> Result<(), Failure> {
                     }
                 }
             }
-            Ok(Some(Step::Event(Event::Cursor(_) | Event::TextField(_)))) => {}
+            Ok(Some(Step::Event(Event::Cursor(_) | Event::TextField(_) | Event::Windows(_)))) => {}
             Ok(Some(Step::Cut)) => {
                 since_cut = Some(Instant::now());
                 println!("{}  cut after {frames} frames; connecting again", at(began));

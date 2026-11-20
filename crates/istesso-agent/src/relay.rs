@@ -181,6 +181,15 @@ pub struct InputLine {
     clipboard: bool,
     /// Copies and pastes not sent because the device does not take them.
     clipboard_dropped: u64,
+    /// The device takes the application's other windows (trial only, ADR 0027 proposal):
+    /// window numbers, `close` and `windows`. Without, none of them is sent to it
+    /// ([`istesso_proto::needs_windows`]).
+    windows: bool,
+    /// Events not sent because they were for the other windows and the device does not take
+    /// them.
+    windows_dropped: u64,
+    /// Said once in this conversation that the device does not take them.
+    windows_told: bool,
     /// The copies and pastes sent on this conversation that wait for their answer, and until
     /// when.
     awaiting: BTreeMap<u32, Instant>,
@@ -196,8 +205,8 @@ pub struct InputLine {
     /// The modifiers that are down on this side, as far as the events say.
     modifiers: BTreeSet<u32>,
     daily_held: Option<HeldInput>,
-    /// Where the pointer is, as far as the events say.
-    pointer: Option<(i32, i32)>,
+    /// Where the pointer is, and in which window of the application, as far as the events say.
+    pointer: Option<(i32, i32, Option<u32>)>,
     /// Since when there has been no conversation, and when the next attempt
     /// is due.
     without_since: Option<Instant>,
@@ -214,14 +223,15 @@ impl InputLine {
     /// that refuses is not asked again ([`Again::Never`]); one that did not
     /// answer in time may be, with a new conversation.
     pub fn open(mut client: Client, connect: Connect) -> Result<Self, (Again, String)> {
-        let (alive, text, scroll, clipboard, preedit) = ask(&mut client, FIRST_ANSWER_WITHIN)?;
+        let taken = ask(&mut client, FIRST_ANSWER_WITHIN)?;
         let mut line = Self::waiting(connect);
         line.client = Some(client);
-        line.alive = alive;
-        line.text = text;
-        line.preedit = preedit;
-        line.scroll = scroll;
-        line.clipboard = clipboard;
+        line.alive = taken.alive;
+        line.text = taken.text;
+        line.preedit = taken.preedit;
+        line.scroll = taken.scroll;
+        line.clipboard = taken.clipboard;
+        line.windows = taken.windows;
         Ok(line)
     }
 
@@ -246,6 +256,9 @@ impl InputLine {
             scroll_told: false,
             clipboard: false,
             clipboard_dropped: 0,
+            windows: false,
+            windows_dropped: 0,
+            windows_told: false,
             awaiting: BTreeMap::new(),
             answers: Vec::new(),
             said: now,
@@ -312,6 +325,18 @@ impl InputLine {
         self.clipboard_dropped
     }
 
+    /// Whether the device takes the application's other windows (window numbers, `close` and
+    /// `windows`), as it said when the conversation was last opened (trial only).
+    pub fn takes_windows(&self) -> bool {
+        self.windows
+    }
+
+    /// How many events for the other windows were not sent because the device does not take
+    /// them.
+    pub fn windows_dropped(&self) -> u64 {
+        self.windows_dropped
+    }
+
     /// The answers to copy and paste that came since this was last asked, in their order.
     pub fn take_clipboard_answers(&mut self) -> Vec<ClipboardAnswer> {
         std::mem::take(&mut self.answers)
@@ -342,8 +367,8 @@ impl InputLine {
                         self.modifiers.remove(&code);
                     }
                 }
-                InputEvent::PointerAt { x, y } if self.daily_held.is_none() => {
-                    self.pointer = Some((x, y));
+                InputEvent::PointerAt { x, y, window } if self.daily_held.is_none() => {
+                    self.pointer = Some((x, y, window));
                 }
                 _ => {}
             }
@@ -356,20 +381,36 @@ impl InputLine {
         // A device that did not say it takes committed text cannot read a message with
         // it, keys and all: none goes to it.
         let kept: Vec<InputEvent>;
-        // The same for copy and paste.
+        // The same for copy and paste. And for what is meant for the application's other
+        // windows (trial only): a device that does not know window numbers would take a
+        // pointer meant for another window for one on the first.
         let not_taken = |e: &InputEvent| match e {
             InputEvent::Text { .. } => !self.text,
             InputEvent::Preedit { .. } => !self.preedit,
             InputEvent::Copy { .. } | InputEvent::Paste { .. } => !self.clipboard,
-            _ => false,
+            _ => !self.windows && istesso_proto::needs_windows(e),
         };
         let events = if events.iter().any(not_taken) {
             kept = events.iter().filter(|e| !not_taken(e)).cloned().collect();
+            let mut windows_dropped = false;
             for event in events.iter().filter(|e| not_taken(e)) {
                 match event {
                     InputEvent::Text { .. } | InputEvent::Preedit { .. } => self.text_dropped += 1,
-                    _ => self.clipboard_dropped += 1,
+                    InputEvent::Copy { .. } | InputEvent::Paste { .. } => {
+                        self.clipboard_dropped += 1
+                    }
+                    _ => {
+                        self.windows_dropped += 1;
+                        windows_dropped = true;
+                    }
                 }
+            }
+            // Said once a conversation, in a plain line, as for the kind of scrolls.
+            if windows_dropped && !self.windows_told && self.client.is_some() {
+                self.windows_told = true;
+                eprintln!(
+                    "note: the host's agent does not take: the application's other windows (window numbers, close, windows); what is meant for them is not sent"
+                );
             }
             &kept[..]
         } else {
@@ -529,8 +570,8 @@ impl InputLine {
             code,
             pressed: true,
         }));
-        if let Some((x, y)) = self.pointer {
-            events.push(InputEvent::PointerAt { x, y });
+        if let Some((x, y, window)) = self.pointer {
+            events.push(InputEvent::PointerAt { x, y, window });
         }
         events
     }
@@ -552,14 +593,19 @@ impl InputLine {
             Ok(client) => client,
             Err(failure) => return self.wait(after_failure(&failure), failure.to_string(), now),
         };
-        let (alive, text, scroll, clipboard, preedit) = match ask(&mut client, within) {
+        let taken = match ask(&mut client, within) {
             Ok(answer) => answer,
             Err((what, why)) => return self.wait(what, why, now),
         };
         if self.daily_held.is_some() {
             self.observe_input(&pending());
         }
-        let events = self.reconnect_events();
+        let mut events = self.reconnect_events();
+        // A device that does not take window numbers is not given the pointer back in another
+        // window (it would put it on the first).
+        if !taken.windows {
+            events.retain(|e| !istesso_proto::needs_windows(e));
+        }
         let sent = client.send_input(&events).is_ok();
         if let Some(held) = &mut self.daily_held {
             // A failed write may have delivered some of the restored modifiers.
@@ -571,22 +617,35 @@ impl InputLine {
         let now_open = Instant::now();
         let after = now_open.saturating_duration_since(self.without_since.take().unwrap_or(now));
         self.client = Some(client);
-        self.alive = alive;
-        self.text = text;
-        self.preedit = preedit;
-        self.scroll = scroll;
+        self.alive = taken.alive;
+        self.text = taken.text;
+        self.preedit = taken.preedit;
+        self.scroll = taken.scroll;
         self.scroll_told = false;
-        self.clipboard = clipboard;
+        self.clipboard = taken.clipboard;
+        self.windows = taken.windows;
+        self.windows_told = false;
         self.unanswered_since = None;
         (self.said, self.listened, self.made_at) = (now_open, now_open, now_open);
         Ok(Some(Happened::Back { after }))
     }
 }
 
-/// What the device said when the conversation was opened: whether it answers "still here",
-/// takes committed text, the level of scrolls it takes, whether it takes copy and paste, and
-/// whether it takes composing text.
-type Taken = (bool, bool, u8, bool, bool);
+/// What the device said when the conversation was opened.
+struct Taken {
+    /// It answers "still here".
+    alive: bool,
+    /// It takes committed text.
+    text: bool,
+    /// The level of scrolls it takes.
+    scroll: u8,
+    /// It takes copy and paste (and answers "still here", where their answers are heard).
+    clipboard: bool,
+    /// It takes composing text.
+    preedit: bool,
+    /// It takes the application's other windows (trial only).
+    windows: bool,
+}
 
 /// Asks whether input is taken, and to be answered when saying "still
 /// here"; the answer has `within` this time. `Ok` says whether the device
@@ -610,7 +669,15 @@ fn ask(client: &mut Client, within: Duration) -> Result<Taken, (Again, String)> 
             scroll,
             clipboard,
             preedit,
-        } => Ok((alive, text, scroll, clipboard && alive, preedit)),
+            windows,
+        } => Ok(Taken {
+            alive,
+            text,
+            scroll,
+            clipboard: clipboard && alive,
+            preedit,
+            windows,
+        }),
         InputAnswer::Refused { code, message } => Err((after_refusal(code), message)),
     }
 }
@@ -663,11 +730,7 @@ mod tests {
         let now = Instant::now();
         assert!(
             line.pass(
-                &[
-                    key(42, true),
-                    key(30, true),
-                    InputEvent::PointerAt { x: 7, y: 8 }
-                ],
+                &[key(42, true), key(30, true), InputEvent::pointer_at(7, 8)],
                 now
             )
             .sent
@@ -729,7 +792,7 @@ mod tests {
                     cursor: [0, 0]
                 },
                 key(42, true),
-                InputEvent::PointerAt { x: 7, y: 8 }
+                InputEvent::pointer_at(7, 8)
             ]
         );
         // And the line carries input again.
@@ -817,10 +880,11 @@ mod tests {
         let pair = std::sync::Arc::new(InputPair::new("fr"));
         let mut line = line_through(&pair, pair.addr);
         let events = [
-            InputEvent::Focus,
+            InputEvent::Focus { window: None },
             InputEvent::Resize {
                 width: 1280,
                 height: 720,
+                window: None,
             },
         ];
         assert!(line.pass(&events, Instant::now()).sent);
@@ -830,6 +894,7 @@ mod tests {
             InputEvent::Resize {
                 width: 10,
                 height: 720,
+                window: None,
             },
             key(30, true),
             key(30, false),
@@ -839,6 +904,113 @@ mod tests {
             pair.all_handed_over(A_MOMENT),
             [key(30, true), key(30, false)]
         );
+    }
+
+    /// What is meant for the application's other windows (trial only), and a key beside it.
+    fn for_the_windows() -> [InputEvent; 8] {
+        [
+            InputEvent::Windows { version: 1 },
+            InputEvent::PointerAt {
+                x: 3,
+                y: 4,
+                window: Some(2),
+            },
+            InputEvent::pointer_at(5, 6),
+            InputEvent::PointerAt {
+                x: 7,
+                y: 8,
+                window: Some(1),
+            },
+            InputEvent::Focus { window: Some(2) },
+            InputEvent::Resize {
+                width: 640,
+                height: 480,
+                window: Some(3),
+            },
+            InputEvent::Close { window: 2 },
+            key(30, true),
+        ]
+    }
+
+    #[test]
+    fn window_numbers_close_and_windows_go_to_a_device_that_takes_them() {
+        let pair = std::sync::Arc::new(InputPair::new("rw"));
+        let mut line = line_through(&pair, pair.addr);
+        assert!(line.takes_windows());
+        let events = for_the_windows();
+        assert!(line.pass(&events, Instant::now()).sent);
+        assert_eq!(pair.all_handed_over(A_MOMENT), events);
+        assert_eq!(line.windows_dropped(), 0);
+    }
+
+    #[test]
+    fn nothing_for_another_window_goes_to_a_device_that_does_not_take_it() {
+        use istesso_link::{LocalKeys, Request, Response, Session};
+        let pair = std::sync::Arc::new(InputPair::new("rv"));
+        // A stand-in for an agent that takes input and says nothing of windows: it keeps
+        // what it is sent.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let paths = pair.host.paths();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let identity = istesso_pair::Identity::load_or_create(&paths.identity()).unwrap();
+            let keys = LocalKeys::new(&identity).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let peers = istesso_pair::PeerStore::open(paths.peers()).unwrap();
+            let mut session =
+                Session::accept(stream, &keys, &peers, Duration::from_secs(5)).unwrap();
+            while let Ok(Some(request)) = session.next_request() {
+                match request {
+                    Request::InputOpen { .. } => session
+                        .respond(&Response::InputOpen {
+                            alive: false,
+                            text: true,
+                            scroll: 0,
+                            clipboard: false,
+                            preedit: true,
+                            windows: false,
+                        })
+                        .unwrap(),
+                    Request::Input { events } => {
+                        for event in events {
+                            let _ = sent.send(event);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let mut line = line_through(&pair, addr);
+        assert!(!line.takes_windows());
+        assert!(line.pass(&for_the_windows(), Instant::now()).sent);
+        // The pointer in the first window, said either way, and the key go; the rest is
+        // counted and goes nowhere: no pointer meant for another window lands on the first.
+        let mut arrived = Vec::new();
+        while let Ok(event) = received.recv_timeout(A_MOMENT) {
+            arrived.push(event);
+        }
+        assert_eq!(
+            arrived,
+            [
+                InputEvent::pointer_at(5, 6),
+                InputEvent::PointerAt {
+                    x: 7,
+                    y: 8,
+                    window: Some(1),
+                },
+                key(30, true),
+            ]
+        );
+        assert_eq!(line.windows_dropped(), 5);
+        // Only such events: nothing goes, and the conversation is not taken for cut.
+        assert!(
+            line.pass(&[InputEvent::Close { window: 2 }], Instant::now())
+                .sent
+        );
+        assert_eq!(line.windows_dropped(), 6);
+        assert!(received.recv_timeout(A_MOMENT).is_err());
+        assert_eq!(line.cuts(), 0);
     }
 
     #[test]
@@ -1146,6 +1318,7 @@ mod tests {
                             scroll: 0,
                             clipboard: false,
                             preedit: false,
+                            windows: false,
                         })
                         .unwrap();
                 }

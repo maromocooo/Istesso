@@ -112,6 +112,11 @@ struct Settings {
     var inline = ProcessInfo.processInfo.environment["ISTESSO_DAILY_INLINE"] == "1"
     /// How long this Mac's own keyboard must be idle before Istesso's source is selected again.
     var inlineIdle = 3.0
+    /// PROTOTYPE (ADR 0027, a proposal; windows.swift): the application's other windows, each as a
+    /// stream of its own, for a viewer that says it shows them one by one. Off unless asked for.
+    var windows = false
+    /// With --generated and --windows: this many other windows of the stand-in (1-3), still pictures.
+    var generatedWindows = 0
 }
 
 func usage() -> Never {
@@ -121,7 +126,7 @@ func usage() -> Never {
            [--bitrate KBIT] [--keep-awake FPS] [--min-qp N] [--input-socket PATH] [--input-dry]
            [--control FIFO] [--log FILE|-] [--no-fit-window] [--click-form 1|2|3] [--generated]
            [--pid-file FILE] [--signal FILE] [--system-prompt-owner BUNDLE_ID]...
-           [--inline [--inline-local-idle SECONDS]]
+           [--inline [--inline-local-idle SECONDS]] [--windows [--generated-windows N]]
 
     """.utf8))
     exit(2)
@@ -188,6 +193,8 @@ func readSettings() -> Settings {
         case "--clipboard": s.clipboard = true
         case "--inline": s.inline = true
         case "--inline-local-idle": s.inlineIdle = Double(max(1, min(60, number())))
+        case "--windows": s.windows = true
+        case "--generated-windows": s.generatedWindows = max(1, min(3, number()))
         default: usage()
         }
     }
@@ -408,10 +415,11 @@ final class Transport {
     private let guarded = Guarded()
     /// Fail closed: the host always starts admitting nobody, and is then told who is shown the
     /// picture (the remembered state), before anything else is done with it.
-    init?(settings: Settings, width: Int, height: Int, admitting: AdmitState, offered: Bool = true) {
+    /// `port`: another window's stream (windows.swift) listens on a port of its own (0: any free one).
+    init?(settings: Settings, width: Int, height: Int, admitting: AdmitState, offered: Bool = true, port: Int? = nil) {
         var info = IstessoMediaStreamInfo(codec: 1, width: UInt32(width), height: UInt32(height),
                                           fps: UInt32(settings.fps), chroma: settings.chroma, colour: 1)
-        let bind = "\(settings.bind):\(settings.port)"
+        let bind = "\(settings.bind):\(port ?? settings.port)"
         var made: OpaquePointer?
         startStream(admitting: admitting, offered: offered,
                     listenClosed: { made = istesso_media_host_listen_closed(settings.configDir, bind, &info); return made != nil },
@@ -427,6 +435,10 @@ final class Transport {
     }
     var closed: Bool { guarded.isClosed }
     var viewers: Int { guarded.use { Int(istesso_media_host_viewers(native)) } ?? 0 }
+    /// The port it listens on (0 once closed).
+    var port: Int { guarded.use { Int(istesso_media_host_port(native)) } ?? 0 }
+    /// Packet kind 6, the application's other windows (windows.swift; PROTOTYPE, --windows only).
+    func setWindows(_ json: String) -> Bool { guarded.use { istesso_media_host_set_windows(native, json) == 0 } ?? false }
     /// Ends every stream and stops listening; nothing reaches the native host afterwards.
     func close() { guarded.close { istesso_media_host_close(native) } }
     func keyFrameWanted() -> Bool { guarded.use { istesso_media_host_key_frame_wanted(native) != 0 } ?? false }
@@ -687,6 +699,9 @@ final class Pump {
     let transport: Transport
     let width: Int
     let height: Int
+    /// 1: the first window. 2 and up: another window of the application (windows.swift); its pump
+    /// writes only its line a second, with the window's number, to the frame log.
+    var window = 1
     private var encoder: Encoder?
     private var last: CVPixelBuffer?
     private var lastPts: UInt64 = 0
@@ -752,7 +767,7 @@ final class Pump {
         guard running else { return }
         captured += 1
         let arrived = nowNs()
-        if frameLog.on {
+        if frameLog.on && window == 1 {
             frameLog.write("{\"kind\":\"frame_out\",\"pts\":\(displayNs),\"t_ns\":\(arrived)}")
         }
         if fresh { dropped += 1 }  // the one kept before was never encoded
@@ -815,7 +830,7 @@ final class Pump {
                 sent = self.transport.send(frame, pts: pts, encoded: done, key: isKey)
             }
             let written = nowNs()
-            if frameLog.on, let frame {
+            if frameLog.on, self.window == 1, let frame {
                 frameLog.write("{\"kind\":\"encoded\",\"pts\":\(pts),\"t_ns\":\(done),\"handed_ns\":\(handed),\"bytes\":\(frame.count),\"key\":\(isKey ? 1 : 0),\"filler\":\(filler ? 1 : 0)}")
                 if let sent {
                     frameLog.write("{\"kind\":\"sent\",\"pts\":\(pts),\"t_ns\":\(done),\"rtp\":\(sent.seq),\"packets\":\(sent.messages),\"written_ns\":\(written),\"viewers\":\(sent.viewers),\"queued\":\(sent.queued),\"bytes\":\(frame.count)}")
@@ -873,7 +888,8 @@ final class Pump {
         let median = encodeMs.isEmpty ? 0 : encodeMs[encodeMs.count / 2]
         let worst = encodeMs.last ?? 0
         if frameLog.on {
-            frameLog.write("{\"kind\":\"second\",\"t_ns\":\(nowNs()),\"captured\":\(captured),\"encoded\":\(encoded),\"fillers\":\(fillers),\"dropped\":\(dropped),\"failed\":\(failed),\"sent\":\(sentFrames),\"viewers\":\(transport.viewers),\"encode_median_ms\":\(String(format: "%.2f", median)),\"encode_max_ms\":\(String(format: "%.2f", worst))}")
+            let which = window == 1 ? "" : ",\"window\":\(window)"
+            frameLog.write("{\"kind\":\"second\"\(which),\"t_ns\":\(nowNs()),\"captured\":\(captured),\"encoded\":\(encoded),\"fillers\":\(fillers),\"dropped\":\(dropped),\"failed\":\(failed),\"sent\":\(sentFrames),\"viewers\":\(transport.viewers),\"encode_median_ms\":\(String(format: "%.2f", median)),\"encode_max_ms\":\(String(format: "%.2f", worst))}")
         }
         captured = 0; encoded = 0; dropped = 0; sentFrames = 0; fillers = 0; failed = 0
         encodeMs.removeAll(keepingCapacity: true)
@@ -900,7 +916,18 @@ final class Generated {
         CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
     }
 
-    func start(on queue: DispatchQueue, fps: Int, each: @escaping (CVPixelBuffer, UInt64) -> Void) {
+    /// `still`: one picture only, as a window that does not change (the pump keeps it awake).
+    func start(on queue: DispatchQueue, fps: Int, still: Bool = false, each: @escaping (CVPixelBuffer, UInt64) -> Void) {
+        if still {
+            return queue.async { [weak self] in
+                guard let self, let pool = self.pool else { return }
+                var made: CVPixelBuffer?
+                guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &made) == 0, let buffer = made else { return }
+                self.frame = self.width / 16
+                self.draw(buffer)
+                each(buffer, nowNs())
+            }
+        }
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
         timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / fps), leeway: .microseconds(200))
         timer.setEventHandler { [weak self] in
@@ -1201,9 +1228,15 @@ struct AXWindowInfo {
     let bounds: CGRect
     let role: String
     let subrole: String
+    /// Its title, for the list of windows (windows.swift) only: never written anywhere.
+    var title: String = ""
 }
 
-func axWindows(_ pid: pid_t) -> [AXWindowInfo] {
+/// Whether a window's title is asked of Accessibility as well: only for the other windows' list
+/// (--windows, windows.swift); otherwise nothing more is asked of the application than before.
+func axAsksTitle(windows: Bool) -> Bool { windows }
+
+func axWindows(_ pid: pid_t, titles: Bool = false) -> [AXWindowInfo] {
     let app = AXUIElementCreateApplication(pid)
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
@@ -1219,7 +1252,10 @@ func axWindows(_ pid: pid_t) -> [AXWindowInfo] {
         var role: CFTypeRef?, subrole: CFTypeRef?
         AXUIElementCopyAttributeValue(window, kAXRoleAttribute as CFString, &role)
         AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subrole)
-        return AXWindowInfo(bounds: CGRect(origin: p, size: s), role: role as? String ?? "", subrole: subrole as? String ?? "")
+        var title: CFTypeRef?
+        if titles { AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &title) }
+        return AXWindowInfo(bounds: CGRect(origin: p, size: s), role: role as? String ?? "", subrole: subrole as? String ?? "",
+                            title: title as? String ?? "")
     }
 }
 
@@ -2147,6 +2183,7 @@ func selfTest() -> Never {
         checkPanel(encodeGate(heldForVirtual: false, viewers: 2, resumeWaiting: false) == .encode, true, "pump: not held: encoded")
     }
     failed += inlineSelfTest()
+    failed += windowsSelfTest()
     print(failed == 0 ? "all passed" : "\(failed) failed")
     exit(failed == 0 ? 0 : 1)
 }
@@ -2160,7 +2197,7 @@ final class Lookout {
     private var cached: [AXWindowInfo] = []
     private var asked = false
     /// The lookup itself; a stand-in in --self-test.
-    var lookup: (pid_t) -> [AXWindowInfo] = axWindows
+    var lookup: (pid_t) -> [AXWindowInfo] = { axWindows($0, titles: axAsksTitle(windows: settings.windows)) }
 
     /// The application's windows as Accessibility listed them last; never waits.
     var windows: [AXWindowInfo] { lock.lock(); defer { lock.unlock() }; return cached }
@@ -2399,6 +2436,17 @@ final class Injector {
     var redispatchAll: (([Data]) -> Void)?
     var onText: ((String) -> Bool)?
     var onKeyPressed: (() -> Void)?
+    /// The application's other windows (windows.swift; --windows only, nil otherwise): the viewer
+    /// shows them one by one; it closed one; one of them (or 1, the first) became the one typed
+    /// into; and where a window's picture lies on the screen.
+    var onWindows: (() -> Void)?
+    var onClose: ((UInt32) -> Void)?
+    var onFocusWindow: ((UInt32) -> Void)?
+    var windowPlace: (UInt32) -> WindowPlace? = { _ in nil }
+    /// The window whose picture the last pointer position was in (1: the first), and whether that
+    /// was a window not listed (nowhere).
+    private(set) var pointerWindow: UInt32 = 1
+    private var pointerNowhere = false
     func beginHold() { holdingForChord = true }
     func endHold(flush: Bool) {
         holdingForChord = false
@@ -2531,6 +2579,11 @@ final class Injector {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return count("unreadable") }
         lastInput = ProcessInfo.processInfo.systemUptime
+        // The viewer shows the application's windows one by one (windows.swift): said, not typed.
+        if kind == "windows" {
+            count("windows")
+            return onWindows?() ?? ()
+        }
         if holdingForChord && (kind == "key" || kind == "text" || kind == "preedit") {
             let code = (object["code"] as? NSNumber)?.uint32Value ?? 0
             let pressed = object["pressed"] as? Bool ?? true
@@ -2551,7 +2604,17 @@ final class Injector {
             let held = kind == "key" ? keysDown.contains(code) : buttonsDown.contains(code)
             guard passesWhileLocked(kind: kind, pressed: pressed, held: held) else { return count("dropped_locked") }
         }
+        if kind == "close", let onClose {
+            // The viewer's window of another window of the application was closed (windows.swift).
+            guard let number = (object["window"] as? NSNumber)?.uint32Value else { return count("unreadable") }
+            count("close")
+            return onClose(number)
+        }
         if settings.inputDry || !mayPost {
+            if settings.inputDry, onWindows != nil, let number = (object["window"] as? NSNumber)?.uint32Value {
+                // For checks of the other windows: which window, never where.
+                return count("dry_\(kind)_window_\(number)")
+            }
             if settings.inputDry, kind == "text", let text = object["text"] as? String {
                 // For checks: how many characters, in which order of pieces; never what.
                 counts["dry_text_characters", default: 0] += text.count
@@ -2566,20 +2629,35 @@ final class Injector {
         case "pointer_at":
             guard var x = (object["x"] as? NSNumber)?.doubleValue, var y = (object["y"] as? NSNumber)?.doubleValue,
                   x.isFinite, y.isFinite else { return count("unreadable") }
-            // Kept inside the picture: a place beyond it would be a part of the screen nobody sees
-            // (another window of the application, another display).
-            if let size = pictureSize(), size.width >= 1, size.height >= 1 {
+            // In the first window's picture, or (windows.swift) in another listed window's; a number
+            // not listed is nowhere: no press and no scroll goes until the pointer is somewhere again.
+            let number = onWindows != nil ? (object["window"] as? NSNumber)?.uint32Value : nil
+            // Kept inside the first window's picture: a place beyond it would be a part of the screen
+            // nobody sees (another window of the application, another display).
+            if (number ?? 1) <= 1, let size = pictureSize(), size.width >= 1, size.height >= 1 {
                 x = min(max(x, 0), size.width - 1)
                 y = min(max(y, 0), size.height - 1)
             }
-            moved(to: CGPoint(x: origin.x + x * scale, y: origin.y + y * scale))
+            switch pointerTarget(x: x, y: y, window: number, first: (origin, scale), place: windowPlace) {
+            case let .at(place, window):
+                pointerWindow = window
+                pointerNowhere = false
+                moved(to: place)
+            case let .nowhere(window):
+                pointerWindow = window
+                pointerNowhere = true
+                count("dropped_unknown_window")
+            }
         case "button":
             guard let code = (object["code"] as? NSNumber)?.uint32Value, let pressed = object["pressed"] as? Bool else { return count("unreadable") }
+            // Nowhere: only the release of a button that is down goes (at the last place).
+            guard !pointerNowhere || passesNowhere(pressed: pressed, held: buttonsDown.contains(code)) else { return count("dropped_nowhere") }
             button(code, pressed)
         case "scroll":
             // Bounded before anything is done with them: Int32's least value has no opposite.
             guard let rawX = (object["dx"] as? NSNumber)?.doubleValue, let rawY = (object["dy"] as? NSNumber)?.doubleValue,
                   rawX.isFinite, rawY.isFinite, abs(rawX) <= 10_000, abs(rawY) <= 10_000 else { return count("unreadable") }
+            guard !pointerNowhere else { return count("dropped_nowhere") }
             let dx = Int32(rawX), dy = Int32(rawY)
             let numbers = { (key: String) -> [Double]? in
                 guard let list = object[key] as? [NSNumber], list.count == 2 else { return nil }
@@ -2607,6 +2685,7 @@ final class Injector {
             count("preedit")
         case "focus":
             count("focus")
+            onFocusWindow?((object["window"] as? NSNumber)?.uint32Value ?? 1)
             onFocus()
         case "resize":
             guard let w = (object["width"] as? NSNumber)?.intValue, let h = (object["height"] as? NSNumber)?.intValue,
@@ -2867,6 +2946,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var lastField: FieldReport?
     /// A stop has begun (a signal, or quit): the inline part is not started any more.
     var stopping = false
+    /// The application's other windows (windows.swift; --windows only).
+    let extras = ExtraWindows()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let path = settings.pidFile {
@@ -2939,6 +3020,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         transport = made
         transport.ownCursor()
         if let lastField { transport.setTextInput(lastField) }
+        extras.told = nil  // the list of other windows is told to a new stream again
         pump = Pump(transport: transport, width: width, height: height)
         pictureWindowSize = nil
         if frameLog.on {
@@ -2959,6 +3041,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             injector.target = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
             injector.windowAt = { _ in nil }  // nothing to point at: the input is only counted
             injector.keysAllowed = { true }
+            if settings.windows {
+                // The stand-in's other windows (windows.swift), looked at as an application's are.
+                wireWindows()
+                let timer = DispatchSource.makeTimerSource(queue: .main)
+                timer.schedule(deadline: .now(), repeating: .milliseconds(200))
+                timer.setEventHandler { [weak self] in self?.lookAtWindows() }
+                timer.resume()
+                timers.append(timer)
+            }
             openPicture { why in self.started(why) }
             return
         }
@@ -3060,8 +3151,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     // window opened at exactly the same place does not pass for it).
                     let pid = self.app?.processIdentifier
                     let front = windowList().first { $0.pid == pid && $0.layer == 0 && $0.onScreen && $0.bounds.width > 40 && $0.bounds.height > 40 }?.id
-                    return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.windowBounds,
-                                     shownIsFront: front != nil && front == self.windowId)
+                    return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.keyWindowBounds,
+                                     shownIsFront: front != nil && front == self.keyWindowId)
                 }
                 // The last shown window closed or minimised: in front, and no window of the
                 // application on the screen at any layer from 0 to below the menu bar's (24), of
@@ -3079,7 +3170,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     // not the shown window: they are let go of, with the notice.
                     guard let self, let pid = self.app?.processIdentifier, chordMayChangeWindow(code), !self.injector.holdingForChord else { return }
                     self.injector.beginHold()
-                    let shown = self.windowId
+                    let shown = self.keyWindowId
                     var looks = 0
                     func look() {
                         guard self.injector.holdingForChord else { return }
@@ -3099,6 +3190,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 self.injector.onResize = { [weak self] w, h in self?.resizeAsked(width: w, height: h) }
                 self.injector.onKeysDropped = { dropped in say(dropped ? "keys-dropped" : "keys-taken") }
                 self.injector.windowAt = { [weak self] point in self?.appWindow(at: point) }
+                if settings.windows { self.wireWindows() }
                 self.watchFocus(running.processIdentifier)
                 self.watchApp()
                 self.startInline(running)
@@ -3140,9 +3232,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// the one typed into, or a first key comes): through Accessibility, away from the input.
     var raisedWindow: CGWindowID?
     func raiseShownWindow() {
-        guard let pid = app?.processIdentifier, windowBounds != .zero else { return }
-        let bounds = windowBounds
-        raisedWindow = windowId
+        guard let pid = app?.processIdentifier, keyWindowBounds != .zero else { return }
+        let bounds = keyWindowBounds
+        raisedWindow = keyWindowId
         lookout.act { bringToFront(pid, bounds: bounds) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { self.lookout.refreshFocused(pid) }
     }
@@ -3204,10 +3296,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
             self?.lookout.refreshFocused(pid)
         }
-        let callback: AXObserverCallback = { _, _, _, refcon in
+        let callback: AXObserverCallback = { _, _, notification, refcon in
             guard let refcon else { return }
             let host = Unmanaged<DailyHost>.fromOpaque(refcon).takeUnretainedValue()
             if let pid = host.app?.processIdentifier { host.lookout.refreshFocused(pid) }
+            // A new window (windows.swift): looked at once Accessibility can list it.
+            if settings.windows, notification as String == kAXWindowCreatedNotification as String, let pid = host.app?.processIdentifier {
+                host.lookout.refresh(pid)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { host.lookAtApp() }
+            }
         }
         var observer: AXObserver?
         guard AXObserverCreate(pid, callback, &observer) == .success, let observer else {
@@ -3217,7 +3314,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let me = Unmanaged.passUnretained(self).toOpaque()
         // A move or a resize of the window also changes the place keys are checked against.
         for name in [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification,
-                     kAXWindowMovedNotification, kAXWindowResizedNotification] {
+                     kAXWindowMovedNotification, kAXWindowResizedNotification] + (settings.windows ? [kAXWindowCreatedNotification] : []) {
             AXObserverAddNotification(observer, element, name as CFString, me)
         }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
@@ -3236,7 +3333,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         // The application's own panel first: it lies over its windows. A press on it keeps its
         // drag and release inside it.
         if let panel = appPanels().first(where: { $0.bounds.contains(point) }) { return panel }
-        let mine = windowList().filter { $0.pid == pid && $0.alpha > 0.05 }
+        // The first window and the other streamed ones lie on the same display: a position in one
+        // window's picture passes over the others (windows.swift; nothing with one window).
+        let over = windowsPassedOver(pointerIn: injector.pointerWindow)
+        let mine = windowList().filter { $0.pid == pid && $0.alpha > 0.05 && !over.contains($0.id) }
         return mine.first { $0.bounds.contains(point) } ?? mine.first { $0.id == windowId }
     }
 
@@ -3286,6 +3386,13 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         // Keep the window shown so far while it is there; else the largest one.
         let chosen = shown.first { $0.id == windowId } ?? shown.max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
         guard let chosen else { return }
+        if settings.windows {
+            // The windows that are never another window to stream (windows.swift, WindowBaseline):
+            // recorded once the application has finished launching (a cold start restores its
+            // windows meanwhile), from then on with its 1.5 s of grace.
+            let every = windowList(onScreenOnly: false).filter { $0.pid == app.processIdentifier }.map(\.id)
+            extras.baseline.look(all: every, firstShown: app.isFinishedLaunching, now: ProcessInfo.processInfo.systemUptime)
+        }
         if transport == nil {
             let density = densityAt(chosen.bounds)
             let w = min(3840, Int(chosen.bounds.width * density)) & ~1, h = min(2160, Int(chosen.bounds.height * density)) & ~1
@@ -3306,6 +3413,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         let panelShown = services + [-1] + appPanels().map { Int($0.id) }.sorted()
         followSize(chosen)
         if restarting { return }
+        if settings.windows { lookAtWindows() }
         // Locked: nothing of the application is shown (the lock's privacy). The program is ready,
         // the other side says that the Mac is locked, and the picture begins once it is unlocked.
         if screenLocked() {
@@ -3429,18 +3537,22 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 // filter names windows one by one: the application's own and exactly the allowed
                 // panel windows; a new window of the service is never in it.
                 let filter: SCContentFilter
+                // The application's other windows that have streams of their own are left out
+                // (windows.swift; none with one window).
+                let leftOut = Set(self.extras.leftOut.map(\.windowID))
                 if allowedIds.isEmpty {
-                    filter = SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
+                    filter = SCContentFilter(display: display, including: [scApp],
+                                             exceptingWindows: content.windows.filter { leftOut.contains($0.windowID) })
                     self.panelWindows = []
                 } else {
-                    let own = content.windows.filter { $0.owningApplication?.processID == scApp.processID }.map(\.windowID)
+                    let own = content.windows.filter { $0.owningApplication?.processID == scApp.processID && !leftOut.contains($0.windowID) }.map(\.windowID)
                     let service = content.windows.filter { $0.owningApplication.map { shownPanels.contains($0.processID) } ?? false }.map(\.windowID)
                     let named = Set(capturedWindows(appWindows: own, serviceWindows: service, allowed: allowedIds))
                     let windows = content.windows.filter { named.contains($0.windowID) }
                     filter = SCContentFilter(display: display, including: windows)
                     self.panelWindows = windows
                 }
-                let names = [Int(scApp.processID)] + allowedIds.map { Int($0) }.sorted()
+                let names = [Int(scApp.processID)] + allowedIds.map { Int($0) }.sorted() + (leftOut.isEmpty ? [] : [-2] + leftOut.map { Int($0) }.sorted())
                 self.panelApplications = panels
                 if let capture = self.capture, self.display?.displayID == display.displayID {
                     if names != self.includedPids { capture.update(filter) }
@@ -3534,7 +3646,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     // Only the application's windows; other applications are not in the picture.
                     guard let scApp = self.scApplication, let placed = self.captureRect else { return done(nil) }  // placed later
                     filter = self.panelWindows.isEmpty
-                        ? SCContentFilter(display: display, including: [scApp], exceptingWindows: [])
+                        ? SCContentFilter(display: display, including: [scApp], exceptingWindows: self.extras.leftOut)
                         : SCContentFilter(display: display, including: self.panelWindows)
                     rect = placed
                 } else {
@@ -3557,6 +3669,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// Stops capturing and gives the encoder back (on the main thread).
     func stopPicture(offered: Bool, done: @escaping () -> Void) {
         let asked = nowNs()
+        windowsReset("the picture stopped")
         if !offered { transport?.offer(false) }
         self.offered = offered
         injector.releaseAll()
@@ -3655,6 +3768,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             return wordsDuringRestart.append((line, lockWord))
         }
         let words = line.split(separator: " ").map(String.init)
+        // Fail closed: the other windows' streams were made for whoever was admitted, and are shown
+        // to nobody else (windows.swift; nothing without --windows).
+        if let first = words.first, windowsEnd(after: first) { windowsReset("said: \(first)") }
         switch words.first {
         case "pause":
             // An explicit pause wins over the lock's own: an unlock does not undo it.
@@ -3786,13 +3902,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         if pasteGate.waitingFor != nil { return pasteGate.hold(data) }
         // Behind whatever waits for a raise, in order: a copy right after a select-all goes after it.
         if !waiting.isEmpty { return waiting.append(data) }
-        let notRaised = app != nil && raisedWindow != windowId && isKeyOrText(data)
+        // Keys for no window (a focus for a window not listed; windows.swift): nothing is raised,
+        // and the injector lets none of them go.
+        if extras.focus == .none && isKeyOrText(data) { return dispatch(data) }
+        let notRaised = app != nil && raisedWindow != keyWindowId && isKeyOrText(data)
         if needsFront(data), !screenLocked(), let running = frontCandidate(data),
            notRaised || running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
-            if app != nil && isKeyOrText(data) { raisedWindow = windowId }
+            if app != nil && isKeyOrText(data) { raisedWindow = keyWindowId }
             // The window under the pointer for a press, else the application's shown window.
             let isPress = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["kind"] as? String == "button"
-            let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? windowBounds : nil)
+            let bounds = isPress ? injector.windowAt(injector.pointerPlace)?.bounds : (app != nil ? keyWindowBounds : nil)
             let pid = running.processIdentifier
             lookout.act { bringToFront(pid, bounds: bounds) }
             waiting = [data]
@@ -4228,6 +4347,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// the same port; the picture comes back as it was (running or not).
     var restarts = 0
     func restartStream(width w: Int, height h: Int, windowSize: CGSize) {
+        // The other windows' streams end with the first one's (windows.swift; nothing without --windows).
+        if windowsEnd(after: "resize") { windowsReset("the first window's picture has another size") }
         restarting = true
         restarts += 1
         let old = transport!
@@ -4258,6 +4379,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     self.width = w
                     self.height = h
                     self.transport = made
+                    self.extras.told = nil  // the list of other windows is told to the new stream again
                 if let field = self.lastField { made.setTextInput(field) }
                     made.ownCursor()
                     self.pump = Pump(transport: made, width: w, height: h)

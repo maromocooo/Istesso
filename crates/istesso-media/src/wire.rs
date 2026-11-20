@@ -9,7 +9,7 @@
 //!   offset  bytes  content
 //!   0       1      version of this layout (1)
 //!   1       1      kind: 1 frame, 2 nothing to show at the moment, 3 end, 4 the cursor,
-//!                  5 the text input field (trial only)
+//!                  5 the text input field (trial only), 6 the windows (trial only)
 //!   2       2      length of the header (40 in this version)
 //!   4       4      flags: bit 0, a key frame; bit 1, does not follow on from
 //!                  the frame sent before it on this connection
@@ -67,6 +67,27 @@
 //!
 //! No typed text is in it. A viewer that does not know kind 5 passes the packet over.
 //!
+//! A packet of kind 6 (trial only, ADR 0027 proposal) says which other windows the
+//! application has besides the first, so that the viewer can show each of them in a window of
+//! its own. It carries JSON (UTF-8), at most 8192 bytes, in place of the encoded frame:
+//!
+//! ```text
+//!   {"serial":N,"windows":[{"id":2,"port":P,"width":W,"height":H,"title":"...",
+//!                           "modal":false,"key":false,"attention":false}]}
+//! ```
+//!
+//! `serial` is one more whenever the program on the host says the list anew. `id` names the
+//! window (2 or more; the first window is 1, and is not in the list), as window numbers in
+//! input do. `port` is where the host shows that window's picture (0: not yet), `width` and
+//! `height` its size in pixels (at most 8192), `title` its title (at most 256 bytes; never
+//! logged), `modal` whether it keeps the rest of the application from being used, `key`
+//! whether it is the one typed into, `attention` whether it asks for the person's attention,
+//! and, when the host says it, `points` its size on the host in points (`[W, H]`, each 1 to
+//! 8192), so that the viewer's window has that size whatever density its picture has.
+//! At most 16 windows. Neither end takes a list that is not within these limits, and fields a
+//! later version adds are passed over. The latest list is the whole of it: a window that is
+//! not in it is gone. A viewer that does not know kind 6 passes the packet over.
+//!
 //! All numbers are little-endian. A reader goes by the length of the header
 //! that the packet states and skips what lies between the fields it knows and
 //! the frame: a later version can add fields without a new layout version.
@@ -98,6 +119,14 @@ pub const CURSOR_FIXED_LEN: usize = 16;
 pub const TEXT_FIELD_FIXED_LEN: usize = 18;
 /// The fixed part of kind 5 as its first version wrote it: still read.
 const TEXT_FIELD_FIRST_LEN: usize = 16;
+/// Most bytes of what a packet of kind 6 carries (trial only).
+pub const MAX_WINDOWS_BYTES: usize = 8192;
+/// Most windows in a packet of kind 6, besides the first.
+pub const MAX_WINDOWS: usize = 16;
+/// Most pixels of a window's side in a packet of kind 6.
+pub const MAX_WINDOW_SIDE: u32 = 8192;
+/// Longest title of a window in a packet of kind 6, in bytes.
+pub const MAX_WINDOW_TITLE: usize = 256;
 
 const FLAG_KEY_FRAME: u32 = 1;
 const FLAG_DISCONTINUITY: u32 = 2;
@@ -248,6 +277,8 @@ pub enum Kind {
     Cursor,
     /// The text input field of the application with the keyboard ([`TextField`]). Trial only.
     TextField,
+    /// The application's other windows ([`Windows`]). Trial only.
+    Windows,
 }
 
 /// The text input field of the application with the keyboard, and where its text cursor
@@ -266,6 +297,108 @@ pub struct TextField {
     /// Pieces of committed text the host had nowhere to put so far (mod 65536): when it grows,
     /// the viewer keeps what it sent last for the person.
     pub dropped: u16,
+}
+
+/// The application's windows besides the first, as the host says them (trial only, ADR 0027
+/// proposal): what a packet of kind 6 carries. See the module's description for the limits,
+/// which [`Windows::check`] holds it to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Windows {
+    /// One more whenever the program on the host says the list anew (it counts; this crate
+    /// passes the number on).
+    pub serial: u64,
+    pub windows: Vec<Window>,
+}
+
+/// One of the application's other windows (trial only).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Window {
+    /// 2 or more: the window's number in input events.
+    pub id: u32,
+    /// Where the host shows this window's picture; 0: not yet.
+    pub port: u16,
+    pub width: u32,
+    pub height: u32,
+    /// Never logged: `{:?}` does not show it.
+    #[serde(default)]
+    pub title: String,
+    /// It keeps the rest of the application from being used until it is closed.
+    #[serde(default)]
+    pub modal: bool,
+    /// It is the window typed into.
+    #[serde(default)]
+    pub key: bool,
+    /// It asks for the person's attention.
+    #[serde(default)]
+    pub attention: bool,
+    /// Its size on the host, in the host's points (each 1 to [`MAX_WINDOW_SIDE`]): the viewer's
+    /// window takes this size, whatever the density of the screen it was captured from (added
+    /// 2026-11-20; left out by an earlier writer, and then not written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub points: Option<[u32; 2]>,
+}
+
+/// Written without the title: a window's title may say what a person is working on.
+impl std::fmt::Debug for Window {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Window")
+            .field("id", &self.id)
+            .field("port", &self.port)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("modal", &self.modal)
+            .field("key", &self.key)
+            .field("attention", &self.attention)
+            .field("points", &self.points)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Windows {
+    /// Whether the list is within the limits: at most [`MAX_WINDOWS`] windows, each of number
+    /// 2 or more, of sides of at most [`MAX_WINDOW_SIDE`], with a title of at most
+    /// [`MAX_WINDOW_TITLE`] bytes. Any port is taken (0: no picture yet).
+    pub fn check(&self) -> Result<(), WireError> {
+        let fits = self.windows.len() <= MAX_WINDOWS
+            && self.windows.iter().all(|window| {
+                window.id >= 2
+                    && window.width <= MAX_WINDOW_SIDE
+                    && window.height <= MAX_WINDOW_SIDE
+                    && window.title.len() <= MAX_WINDOW_TITLE
+                    && window
+                        .points
+                        .is_none_or(|p| p.iter().all(|&side| (1..=MAX_WINDOW_SIDE).contains(&side)))
+            });
+        if fits {
+            Ok(())
+        } else {
+            Err(WireError::Windows)
+        }
+    }
+
+    /// Reads a list from JSON of the form a packet of kind 6 carries, and checks it: at most
+    /// [`MAX_WINDOWS_BYTES`] bytes, of the form, within the limits. Fields this version does
+    /// not know are passed over.
+    pub fn from_json(json: &[u8]) -> Result<Windows, WireError> {
+        if json.len() > MAX_WINDOWS_BYTES {
+            return Err(WireError::Windows);
+        }
+        let windows: Windows = serde_json::from_slice(json).map_err(|_| WireError::Windows)?;
+        windows.check()?;
+        Ok(windows)
+    }
+
+    /// The list as JSON, with only what this version knows in it. A list that is not within
+    /// the limits, or that comes to more than [`MAX_WINDOWS_BYTES`] bytes written out, is not
+    /// written.
+    pub fn to_json(&self) -> Result<Vec<u8>, WireError> {
+        self.check()?;
+        let json = serde_json::to_vec(self).map_err(|_| WireError::Windows)?;
+        if json.len() > MAX_WINDOWS_BYTES {
+            return Err(WireError::Windows);
+        }
+        Ok(json)
+    }
 }
 
 /// What the pointer's cursor looks like on the host.
@@ -366,6 +499,11 @@ pub enum WireError {
     Cursor,
     #[error("the text field is not one this version knows")]
     TextField,
+    #[error(
+        "the list of windows is not one that may travel: not of the form, too long, or with \
+         numbers out of range"
+    )]
+    Windows,
 }
 
 /// Writes one packet into `out`, replacing what was there.
@@ -379,6 +517,7 @@ pub fn encode(header: &Header, frame: &[u8], out: &mut Vec<u8>) {
         Kind::End => 3,
         Kind::Cursor => 4,
         Kind::TextField => 5,
+        Kind::Windows => 6,
     });
     out.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
     out.extend_from_slice(&flags(header).to_le_bytes());
@@ -447,6 +586,7 @@ pub fn decode(packet: &[u8]) -> Result<(Header, std::ops::Range<usize>), WireErr
         3 => Kind::End,
         4 => Kind::Cursor,
         5 => Kind::TextField,
+        6 => Kind::Windows,
         other => return Err(WireError::Kind(other)),
     };
     let flags = quad(4);
@@ -569,6 +709,21 @@ pub fn decode_text_field(body: &[u8]) -> Result<TextField, WireError> {
             0
         },
     })
+}
+
+/// Writes one packet that says what the application's other windows are into `out`, replacing
+/// what was there (trial only). A list that may not travel ([`Windows::to_json`]) is not
+/// written; what is written is the list as this version knows it, not what it was read from.
+pub fn encode_windows(windows: &Windows, seq: u64, out: &mut Vec<u8>) -> Result<(), WireError> {
+    let body = windows.to_json()?;
+    encode(&Header::without_frame(Kind::Windows, seq), &body, out);
+    Ok(())
+}
+
+/// Reads what a packet of kind [`Kind::Windows`] carries: a list that is not of the form or
+/// not within the limits is refused ([`Windows::from_json`]).
+pub fn decode_windows(body: &[u8]) -> Result<Windows, WireError> {
+    Windows::from_json(body)
 }
 
 /// How many messages of the encrypted channel a frame of `frame_len` bytes
@@ -815,6 +970,155 @@ mod tests {
             encode_text_field(&odd, 0, &mut Vec::new()),
             Err(WireError::TextField)
         );
+    }
+
+    fn a_dialog() -> Window {
+        Window {
+            id: 2,
+            port: 47811,
+            width: 480,
+            height: 320,
+            title: "Save changes?".into(),
+            modal: true,
+            key: true,
+            attention: false,
+            points: None,
+        }
+    }
+
+    #[test]
+    fn a_windows_size_in_points_travels_when_said_and_is_checked() {
+        let sized = Windows {
+            serial: 1,
+            windows: vec![Window {
+                points: Some([640, 400]),
+                ..a_dialog()
+            }],
+        };
+        let json = String::from_utf8(sized.to_json().unwrap()).unwrap();
+        assert!(json.contains(r#""points":[640,400]"#), "{json}");
+        assert_eq!(Windows::from_json(json.as_bytes()), Ok(sized));
+        for odd in [[0, 400], [640, 9000]] {
+            let wrong = Windows {
+                serial: 1,
+                windows: vec![Window {
+                    points: Some(odd),
+                    ..a_dialog()
+                }],
+            };
+            assert_eq!(wrong.check(), Err(WireError::Windows));
+        }
+    }
+
+    #[test]
+    fn a_list_of_windows_comes_back_as_it_was_written_and_later_fields_are_passed_over() {
+        let windows = Windows {
+            serial: 3,
+            windows: vec![
+                a_dialog(),
+                Window {
+                    id: 3,
+                    port: 0,
+                    title: String::new(),
+                    ..a_dialog()
+                },
+            ],
+        };
+        let mut packet = Vec::new();
+        encode_windows(&windows, 7, &mut packet).unwrap();
+        let (header, at) = decode(&packet).unwrap();
+        assert_eq!((header.kind, header.seq), (Kind::Windows, 7));
+        assert_eq!(decode_windows(&packet[at.clone()]), Ok(windows.clone()));
+        assert!(packet[at].starts_with(
+            br#"{"serial":3,"windows":[{"id":2,"port":47811,"width":480,"height":320,"title":"Save changes?","modal":true,"key":true,"attention":false}"#
+        ));
+        // What a later version adds is passed over, and not written on.
+        let later = br#"{"serial":4,"later":[1,2],"windows":[{"id":2,"port":1,"width":1,"height":1,"title":"a","depth":3}]}"#;
+        let read = Windows::from_json(later).unwrap();
+        assert_eq!(read.windows[0].id, 2);
+        assert!(!read.windows[0].modal);
+        let written = String::from_utf8(read.to_json().unwrap()).unwrap();
+        assert!(
+            !written.contains("later") && !written.contains("depth"),
+            "{written}"
+        );
+        // No window besides the first is a list too.
+        assert_eq!(
+            Windows::from_json(br#"{"serial":5,"windows":[]}"#)
+                .unwrap()
+                .windows
+                .len(),
+            0
+        );
+        // The title is never shown by `{:?}`.
+        let shown = format!("{windows:?}");
+        assert!(!shown.contains("Save changes"), "{shown}");
+    }
+
+    #[test]
+    fn a_list_of_windows_out_of_bounds_or_not_of_the_form_is_neither_written_nor_read() {
+        let with = |change: &dyn Fn(&mut Window)| {
+            let mut window = a_dialog();
+            change(&mut window);
+            Windows {
+                serial: 1,
+                windows: vec![window],
+            }
+        };
+        for odd in [
+            with(&|w| w.id = 1),
+            with(&|w| w.id = 0),
+            with(&|w| w.width = MAX_WINDOW_SIDE + 1),
+            with(&|w| w.height = u32::MAX),
+            with(&|w| w.title = "x".repeat(MAX_WINDOW_TITLE + 1)),
+            Windows {
+                serial: 1,
+                windows: vec![a_dialog(); MAX_WINDOWS + 1],
+            },
+        ] {
+            assert_eq!(
+                encode_windows(&odd, 0, &mut Vec::new()),
+                Err(WireError::Windows)
+            );
+            // The same list as somebody else wrote it.
+            let json = serde_json::to_vec(&odd).unwrap();
+            assert_eq!(decode_windows(&json), Err(WireError::Windows));
+        }
+        // At the limits it is taken.
+        let full = with(&|w| {
+            w.width = MAX_WINDOW_SIDE;
+            w.title = "x".repeat(MAX_WINDOW_TITLE);
+        });
+        assert!(encode_windows(&full, 0, &mut Vec::new()).is_ok());
+        // Titles within the limit that come to more than 8192 bytes written out.
+        let escaped = Windows {
+            serial: 1,
+            windows: vec![
+                Window {
+                    title: "\u{1}".repeat(MAX_WINDOW_TITLE),
+                    ..a_dialog()
+                };
+                MAX_WINDOWS
+            ],
+        };
+        assert_eq!(escaped.check(), Ok(()));
+        assert_eq!(escaped.to_json(), Err(WireError::Windows));
+        // Not of the form, and longer than any list may be.
+        for odd in [
+            &b"not json"[..],
+            br#"{"windows":[]}"#,
+            br#"{"serial":1,"windows":[{"id":2}]}"#,
+            br#"{"serial":1,"windows":[{"id":2,"port":70000,"width":1,"height":1}]}"#,
+            br#"{"serial":-1,"windows":[]}"#,
+            &[0xff, 0xfe],
+        ] {
+            assert_eq!(decode_windows(odd), Err(WireError::Windows));
+        }
+        let mut long = br#"{"serial":1,"windows":[],"later":""#.to_vec();
+        long.resize(9 * 1024, b'x');
+        long.extend_from_slice(br#""}"#);
+        assert!(serde_json::from_slice::<Windows>(&long).is_ok());
+        assert_eq!(decode_windows(&long), Err(WireError::Windows));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use istesso_link::LocalKeys;
 use istesso_pair::{Identity, PeerStore};
 
 use crate::rejoin::{Lasting, LastingAsker, Step};
-use crate::wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, WireError};
+use crate::wire::{Chroma, Codec, Colour, Cursor, CursorImage, StreamInfo, Windows, WireError};
 use crate::{clock, realtime, Admit, Asker, Error, Event, Frame, Host, Result, Viewer};
 
 /// What a host tells its viewers about the picture.
@@ -603,8 +603,9 @@ pub unsafe extern "C" fn istesso_media_client_next(
     match viewer.next(Duration::from_millis(wait_ms.into())) {
         // What the cursor is now is fetched with `istesso_media_client_cursor`.
         Ok(Some(Event::Cursor(_))) => 2,
-        // The text field (trial only) is told to watches only; here it is nothing new.
-        Ok(Some(Event::TextField(_))) => 0,
+        // The text field and the other windows (trial only) are told to watches only; here
+        // they are nothing new.
+        Ok(Some(Event::TextField(_) | Event::Windows(_))) => 0,
         Ok(Some(Event::Frame(got))) => {
             // SAFETY: not null, and room for the result by the caller's
             // promise. The bytes belong to the viewer, which lives until
@@ -744,6 +745,71 @@ pub unsafe extern "C" fn istesso_media_watch_text_input(
         }
     };
     1
+}
+
+/// # Safety
+/// `host` as for `istesso_media_host_send`; `json` is null or a C string.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_host_set_windows(
+    host: *const IstessoMediaHost,
+    json: *const c_char,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let Some(host) = (unsafe { host.as_ref() }) else {
+        remember("no host was given");
+        return -1;
+    };
+    // SAFETY: a C string or null by the caller's promise.
+    let result = unsafe { text(json) }.and_then(|json| {
+        let json = json.ok_or_else(|| Error::Refused("no list of windows was given".into()))?;
+        // Read, checked and written anew: what goes out is what this version knows.
+        host.host.set_windows(&Windows::from_json(json.as_bytes())?)
+    });
+    match result {
+        Ok(()) => 0,
+        // Said without the list: it has the windows' titles in it.
+        Err(err) => {
+            remember(err);
+            -1
+        }
+    }
+}
+
+/// # Safety
+/// `watch` as for `istesso_media_watch_cursor`; `out` points to `room` bytes, or is null.
+#[no_mangle]
+pub unsafe extern "C" fn istesso_media_watch_windows(
+    watch: *const IstessoMediaWatch,
+    out: *mut c_char,
+    room: usize,
+) -> i32 {
+    // SAFETY: the caller's promise.
+    let (Some(watch), false) = (unsafe { watch.as_ref() }, out.is_null()) else {
+        return -1;
+    };
+    let lasting = watch.lasting.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(viewer) = lasting.viewer() else {
+        return -1;
+    };
+    let Some(now) = viewer.windows() else {
+        return 0;
+    };
+    // What was read, as this version knows it: within the limits, so never more than
+    // `MAX_WINDOWS_BYTES`, and without a zero byte (JSON writes one as `\u0000`).
+    let Ok(json) = now.to_json() else {
+        return -1;
+    };
+    if json.len() >= room {
+        remember("the room given is too small for the list of windows");
+        return -1;
+    }
+    // SAFETY: `out` points to `room` bytes by the caller's promise, and the JSON and its
+    // closing zero take fewer than that. Nothing else points into them.
+    unsafe {
+        std::ptr::copy_nonoverlapping(json.as_ptr(), out.cast::<u8>(), json.len());
+        *out.add(json.len()) = 0;
+    }
+    json.len() as i32
 }
 
 /// What the cursor is, for C. A name is kept in `kept`, which has to outlive the use of
@@ -892,6 +958,8 @@ pub unsafe extern "C" fn istesso_media_watch_next(
         Ok(Some(Step::Event(Event::Cursor(_)))) => 2,
         // What the text field is now is fetched with `istesso_media_watch_text_input`.
         Ok(Some(Step::Event(Event::TextField(_)))) => 5,
+        // What the other windows are now is fetched with `istesso_media_watch_windows`.
+        Ok(Some(Step::Event(Event::Windows(_)))) => 6,
         Ok(Some(Step::Cut)) => {
             state.cuts += 1;
             3
@@ -1225,6 +1293,92 @@ mod tests {
             assert_eq!(got.shape, 0);
 
             istesso_media_client_close(client);
+            istesso_media_host_close(host);
+        }
+    }
+
+    #[test]
+    fn the_windows_travel_through_the_c_interface_and_a_list_that_may_not_is_refused() {
+        let dirs = Dirs::new("windows");
+        let bind = CString::new("127.0.0.1:0").unwrap();
+        let list = CString::new(
+            r#"{"serial":1,"windows":[{"id":2,"port":47811,"width":480,"height":320,"title":"Save changes?","modal":true,"later":7}]}"#,
+        )
+        .unwrap();
+        // What the viewer hands on: the fields this version knows, and no others.
+        let known = r#"{"serial":1,"windows":[{"id":2,"port":47811,"width":480,"height":320,"title":"Save changes?","modal":true,"key":false,"attention":false}]}"#;
+        // SAFETY: C strings and room that outlive the calls; the handles are closed once, at
+        // the end.
+        unsafe {
+            let host = istesso_media_host_listen(c(&dirs.host()).as_ptr(), bind.as_ptr(), &INFO);
+            assert!(!host.is_null(), "{}", last_error());
+            // Refused, each of them, and said why without the list.
+            let long = CString::new(format!(
+                r#"{{"serial":1,"windows":[],"padding":"{}"}}"#,
+                "x".repeat(9 * 1024)
+            ))
+            .unwrap();
+            for odd in [
+                CString::new("{ not a list").unwrap(),
+                CString::new(r#"{"serial":1,"windows":[{"id":1,"port":0,"width":1,"height":1}]}"#)
+                    .unwrap(),
+                long,
+            ] {
+                assert_eq!(istesso_media_host_set_windows(host, odd.as_ptr()), -1);
+                assert!(last_error().contains("windows"), "{}", last_error());
+            }
+            assert_eq!(istesso_media_host_set_windows(host, std::ptr::null()), -1);
+            assert_eq!(
+                istesso_media_host_set_windows(host, list.as_ptr()),
+                0,
+                "{}",
+                last_error()
+            );
+
+            let addr =
+                CString::new(format!("127.0.0.1:{}", istesso_media_host_port(host))).unwrap();
+            let watch = istesso_media_watch_open(
+                c(&dirs.device()).as_ptr(),
+                addr.as_ptr(),
+                std::ptr::null(),
+            );
+            assert!(!watch.is_null(), "{}", last_error());
+            let mut room = vec![0 as c_char; crate::wire::MAX_WINDOWS_BYTES + 1];
+            // Without a connection there is nothing to say.
+            assert_eq!(
+                istesso_media_watch_windows(watch, room.as_mut_ptr(), room.len()),
+                -1
+            );
+            let mut frame = std::mem::zeroed::<IstessoMediaFrame>();
+            let mut seen = Vec::new();
+            let began = Instant::now();
+            while seen.last() != Some(&6) {
+                assert!(began.elapsed() < Duration::from_secs(5), "{seen:?}");
+                match istesso_media_watch_next(watch, 50, &mut frame) {
+                    0 => {}
+                    got => seen.push(got),
+                }
+            }
+            // Connected first, then told.
+            assert_eq!(seen, [4, 6]);
+            let len = istesso_media_watch_windows(watch, room.as_mut_ptr(), room.len());
+            assert_eq!(len, known.len() as i32, "{}", last_error());
+            assert_eq!(CStr::from_ptr(room.as_ptr()).to_str().unwrap(), known);
+            // Room for the list but not for its closing zero is too little.
+            assert_eq!(
+                istesso_media_watch_windows(watch, room.as_mut_ptr(), known.len()),
+                -1
+            );
+            assert_eq!(
+                istesso_media_watch_windows(watch, room.as_mut_ptr(), known.len() + 1),
+                known.len() as i32
+            );
+            assert_eq!(
+                istesso_media_watch_windows(watch, std::ptr::null_mut(), 9000),
+                -1
+            );
+
+            istesso_media_watch_close(watch);
             istesso_media_host_close(host);
         }
     }

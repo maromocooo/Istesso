@@ -41,7 +41,7 @@ use istesso_pair::{Identity, Peer, PeerStore, Permission};
 use crate::clock;
 use crate::timed::{wait_for, Ready, Timed, Wake};
 use crate::wire::{
-    self, Ask, Cursor, Ending, ErrorCode, Header, Kind, Reply, StreamInfo, TextField,
+    self, Ask, Cursor, Ending, ErrorCode, Header, Kind, Reply, StreamInfo, TextField, Windows,
 };
 use crate::{Error, Log, Result};
 
@@ -159,6 +159,9 @@ struct Shared {
     /// nothing goes out on the frames' path but one comparison.
     field: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
     field_no: AtomicU64,
+    /// Trial only: the application's other windows, as `field`.
+    windows: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
+    windows_no: AtomicU64,
     /// How long a caller has for the handshake and its first message.
     hello_wait_ms: AtomicU64,
     /// The picture is not offered: no caller is taken. Set while the session it belongs to
@@ -228,6 +231,9 @@ struct Watcher {
     /// Which text field this viewer was told last, and when (trial only).
     field_told: AtomicU64,
     field_told_ns: AtomicU64,
+    /// Which list of the other windows this viewer was told last, and when (trial only).
+    windows_told: AtomicU64,
+    windows_told_ns: AtomicU64,
     /// Makes the viewer's thread look up.
     wake: Wake,
     /// The connection, for waiting on it without holding `line`.
@@ -359,6 +365,8 @@ impl Host {
             cursor_no: AtomicU64::new(0),
             field: Mutex::new(None),
             field_no: AtomicU64::new(0),
+            windows: Mutex::new(None),
+            windows_no: AtomicU64::new(0),
             hello_wait_ms: AtomicU64::new(HELLO_WAIT.as_millis() as u64),
             withheld: AtomicBool::new(false),
             recheck_paused: AtomicBool::new(false),
@@ -532,6 +540,28 @@ impl Host {
             let number = shared.field_no.load(Ordering::SeqCst) + 1;
             *now = Some((number, Arc::new(packet)));
             shared.field_no.store(number, Ordering::SeqCst);
+        }
+        for watcher in shared.watchers().list.iter() {
+            watcher.wake.wake();
+        }
+        Ok(())
+    }
+
+    /// Trial only (ADR 0027 proposal): says what the application's windows besides the first
+    /// are, as [`Host::set_text_field`] says what the text field is: the latest only, at most
+    /// once in a frame's interval, behind frames, to viewers that may be sent the frames, and
+    /// to a viewer that connects later. A list that may not travel ([`Windows::to_json`]) is
+    /// refused here and reaches nobody. Nothing is sent until this is first called. The titles
+    /// are never logged.
+    pub fn set_windows(&self, windows: &Windows) -> Result<()> {
+        let shared = &*self.shared;
+        let mut packet = Vec::new();
+        wire::encode_windows(windows, shared.seq.load(Ordering::SeqCst), &mut packet)?;
+        {
+            let mut now = shared.windows.lock().unwrap_or_else(|e| e.into_inner());
+            let number = shared.windows_no.load(Ordering::SeqCst) + 1;
+            *now = Some((number, Arc::new(packet)));
+            shared.windows_no.store(number, Ordering::SeqCst);
         }
         for watcher in shared.watchers().list.iter() {
             watcher.wake.wake();
@@ -868,8 +898,18 @@ impl Shared {
                 return Offered::Written;
             }
         }
+        // The other windows the same way (trial only; never set, nothing happens here), on a
+        // connection with nothing left half sent (the field may have gone out only in part).
+        if line.unsent_since.is_none() && self.windows_due(watcher) == Some(Duration::ZERO) {
+            if let Err(err) = self.tell_windows(watcher, &mut line) {
+                drop(line);
+                self.close(watcher, &err);
+                return Offered::Written;
+            }
+        }
         // The cursor goes behind the frame, never in front of it, and only on a connection
-        // with nothing left half sent (the field may have gone out only in part).
+        // with nothing left half sent (the field or the windows may have gone out only in
+        // part).
         if line.unsent_since.is_none() && self.cursor_due(watcher) == Some(Duration::ZERO) {
             if let Err(err) = self.tell_cursor(watcher, &mut line) {
                 drop(line);
@@ -902,6 +942,37 @@ impl Shared {
         Some(Duration::from_nanos(
             self.frame_interval_ns().saturating_sub(since),
         ))
+    }
+
+    /// As `cursor_due`, for the other windows.
+    fn windows_due(&self, watcher: &Watcher) -> Option<Duration> {
+        if watcher.windows_told.load(Ordering::SeqCst) == self.windows_no.load(Ordering::SeqCst) {
+            return None;
+        }
+        let since = clock::now_ns().saturating_sub(watcher.windows_told_ns.load(Ordering::SeqCst));
+        Some(Duration::from_nanos(
+            self.frame_interval_ns().saturating_sub(since),
+        ))
+    }
+
+    /// As `tell_cursor`, for the other windows.
+    fn tell_windows(&self, watcher: &Watcher, line: &mut Line) -> Result<()> {
+        let now = self
+            .windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some((number, packet)) = now else {
+            return Ok(());
+        };
+        if self.seal(watcher, line, &packet)? == Sealed::Nothing {
+            return Ok(());
+        }
+        let at = clock::now_ns();
+        watcher.windows_told.store(number, Ordering::SeqCst);
+        watcher.windows_told_ns.store(at, Ordering::SeqCst);
+        watcher.last_sent_ns.store(at, Ordering::SeqCst);
+        Ok(())
     }
 
     /// As `tell_cursor`, for the text field.
@@ -1110,6 +1181,8 @@ impl Shared {
             cursor_told_ns: AtomicU64::new(0),
             field_told: AtomicU64::new(0),
             field_told_ns: AtomicU64::new(0),
+            windows_told: AtomicU64::new(0),
+            windows_told_ns: AtomicU64::new(0),
             wake: Wake::new()?,
             fd,
             line: Mutex::new(Line {
@@ -1248,6 +1321,24 @@ impl Shared {
                     let still_due = self.field_due(watcher) == Some(Duration::ZERO);
                     if still_due && line.unsent_since.is_none() {
                         if let Err(err) = self.tell_field(watcher, &mut line) {
+                            drop(line);
+                            return self.close(watcher, &err);
+                        }
+                    }
+                }
+                Some(wait) => tick = tick.min(wait),
+                None => {}
+            }
+            // And the other windows (trial only).
+            match self.windows_due(watcher) {
+                Some(_) if self.frames_are_going(watcher) => {
+                    tick = tick.min(Duration::from_nanos(self.frame_interval_ns()));
+                }
+                Some(Duration::ZERO) => {
+                    let mut line = watcher.line();
+                    let still_due = self.windows_due(watcher) == Some(Duration::ZERO);
+                    if still_due && line.unsent_since.is_none() {
+                        if let Err(err) = self.tell_windows(watcher, &mut line) {
                             drop(line);
                             return self.close(watcher, &err);
                         }

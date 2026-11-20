@@ -27,6 +27,10 @@ extern "C" {
 /* The port a host listens on unless told otherwise. */
 #define ISTESSO_MEDIA_DEFAULT_PORT 47803
 
+/* Trial only: the most bytes of a list of windows (istesso_media_host_set_windows()), without
+   its closing zero. Room for one more is enough for istesso_media_watch_windows(). */
+#define ISTESSO_MEDIA_WINDOWS_MAX_BYTES 8192
+
 /* What a host tells its viewers about the picture. */
 typedef struct IstessoMediaStreamInfo {
     uint32_t codec;  /* 1: H.265, one access unit per frame, NAL units behind start codes
@@ -201,6 +205,21 @@ int32_t istesso_media_host_set_cursor(const IstessoMediaHost *host, const Istess
 int32_t istesso_media_host_set_text_input(const IstessoMediaHost *host, const IstessoMediaTextInput *field);
 
 /*
+ * Trial only (ADR 0027 proposal): says what the application's windows besides the first are, as
+ * istesso_media_host_set_text_input() says what the text field is (the latest only, behind
+ * frames, to viewers that may be sent the frames, and to one that connects later). `json` is
+ * UTF-8, at most ISTESSO_MEDIA_WINDOWS_MAX_BYTES bytes:
+ *   {"serial":N,"windows":[{"id":2,"port":P,"width":W,"height":H,"title":"...",
+ *                           "modal":false,"key":false,"attention":false,"points":[W,H]}]}
+ * `id` 2 or more (the first window is 1, and is not listed), `port` where that window's picture
+ * is shown (0: not yet), sides of at most 8192 pixels, a title of at most 256 bytes, `points`
+ * (may be left out) its size on the host in points, each 1 to 8192, at most 16 windows. Fields this version does not know are passed over; what goes out is the list as this
+ * version knows it. Nothing is sent until this is first called. The titles are never logged.
+ * 0, or -1 when it is not of that form or not within the limits (nothing is sent then).
+ */
+int32_t istesso_media_host_set_windows(const IstessoMediaHost *host, const char *json);
+
+/*
  * Offers the picture to paired devices (1, as from the start) or stops offering it (0): every
  * viewer is cut off at once and no caller is taken, or even answered, until it is offered again.
  * For a session that is shown to nobody for the time being.
@@ -288,6 +307,8 @@ void istesso_media_watch_follow_restarts(IstessoMediaWatch *watch);
  *       sends now, and the first frame that follows is a key frame.
  *    5: (trial only) the host has said what the text input field is; fetch it with
  *       istesso_media_watch_text_input().
+ *    6: (trial only) the host has said what the application's other windows are; fetch the
+ *       list with istesso_media_watch_windows().
  *   -1: it is over and is not tried again; istesso_media_watch_state() says why, and
  *       istesso_media_last_error() in a sentence.
  * One thread calls this.
@@ -304,6 +325,13 @@ int32_t istesso_media_watch_cursor(const IstessoMediaWatch *watch, IstessoMediaC
 /* Trial only: what the host last said the text input field is. 1: `field` is filled in. 0: it
  * has said nothing yet. -1: no connection. The thread that calls istesso_media_watch_next(). */
 int32_t istesso_media_watch_text_input(const IstessoMediaWatch *watch, IstessoMediaTextInput *field);
+
+/* Trial only: what the host last said the application's other windows are, as JSON of the form
+ * istesso_media_host_set_windows() takes, with only the fields this version knows. Copied into
+ * `out`, which has `room` bytes, with a closing zero; returns its length without the zero. 0: it
+ * has said nothing yet. -1: no connection, or `room` is too small (ISTESSO_MEDIA_WINDOWS_MAX_BYTES
+ * + 1 is always enough). The thread that calls istesso_media_watch_next(). */
+int32_t istesso_media_watch_windows(const IstessoMediaWatch *watch, char *out, size_t room);
 
 /* How it stands. From any thread. 0, or -1. */
 int32_t istesso_media_watch_state(const IstessoMediaWatch *watch, IstessoMediaWatchState *state);
