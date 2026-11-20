@@ -91,7 +91,8 @@ pub enum Delivery {
     ToProcess(Pid),
     /// At the session's input tap (`CGEventPost`): the weaker form. It moves
     /// the host's real pointer and the window server routes it. Reached only
-    /// when direct delivery is off, and never while locked.
+    /// when direct delivery is off, never while locked, and only for the
+    /// pointer: a key always goes to the process (ADR 0017).
     SessionTap,
     /// Not delivered. Counted by reason.
     Drop(DropReason),
@@ -155,7 +156,9 @@ impl Confine {
             return Delivery::ToProcess(app);
         }
         // The session tap: unlocked only, application frontmost, and for a
-        // pointer the topmost window under it must be the application's.
+        // pointer the topmost window under it must be the application's. A
+        // key passes the same checks and then goes to the process, never at
+        // the session's tap (ADR 0017: keys and text go to the process).
         match state.lock {
             Lock::Unlocked => {}
             Lock::Locked => return Delivery::Drop(DropReason::LockedSessionTap),
@@ -165,7 +168,7 @@ impl Confine {
             return Delivery::Drop(DropReason::NotFrontmost);
         }
         match item {
-            Item::Key => Delivery::SessionTap,
+            Item::Key => Delivery::ToProcess(app),
             Item::Pointer { x, y } => match top_window_at(state.windows, x, y) {
                 Some(window) if window.owner == app => Delivery::SessionTap,
                 Some(_) => Delivery::Drop(DropReason::OtherWindowOnTop),
@@ -295,7 +298,33 @@ mod tests {
         );
         assert_eq!(
             confine.decide(Item::Key, &state(false, APP, &windows)),
-            Delivery::SessionTap,
+            Delivery::ToProcess(APP),
+        );
+    }
+
+    #[test]
+    fn a_key_is_never_answered_with_the_session_tap() {
+        let tap = Confine {
+            direct: false,
+            ..Confine::default()
+        };
+        let windows = [window(APP, rect(0.0, 0.0, 100.0, 100.0))];
+        for confine in [Confine::default(), tap] {
+            for locked in [false, true] {
+                for front in [APP, OTHER] {
+                    assert_ne!(
+                        confine.decide(Item::Key, &state(locked, front, &windows)),
+                        Delivery::SessionTap,
+                        "direct={} locked={locked} front={front}",
+                        confine.direct
+                    );
+                }
+            }
+        }
+        // With the session tap, the key keeps its checks, then goes to the process.
+        assert_eq!(
+            tap.decide(Item::Key, &state(false, APP, &windows)),
+            Delivery::ToProcess(APP),
         );
     }
 
