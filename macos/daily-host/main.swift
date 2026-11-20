@@ -3513,8 +3513,12 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 // A pause or a detach that came while the encoder opened, or a new stream: no
                 // capture is started (that stop, or the new stream, closes this pump; the picture
-                // comes back by the next resume, or by the new stream's own start).
-                guard self.picture == "running", !self.restarting, self.pump === pump else { return done(nil) }
+                // comes back by the next resume, or by the new stream's own start). Locked
+                // meanwhile: nothing is captured either; the lock pauses the picture as it pauses a
+                // running one (enforceLock, at the lock's notice or at its look every second), and
+                // the unlock brings it back.
+                guard self.picture == "running", !self.restarting, self.pump === pump,
+                      !screenLocked() || settings.generated else { return done(nil) }
                 if settings.generated {
                     let source = Generated(width: self.width, height: self.height)
                     self.generated = source
