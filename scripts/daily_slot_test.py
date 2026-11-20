@@ -74,7 +74,7 @@ class WindowsFollowTheSlot(unittest.TestCase):
               "#!/bin/bash\nfor a in \"$@\"; do [ \"$a\" = -G ] && { echo 'hostname stand-in-host'; exit 0; }; done\n"
               "cat > /dev/null\ncat \"$ANSWER\"\n", 0o700)
         write(os.path.join(bin_folder, "route"), "#!/bin/sh\necho '  interface: stand-in0'\n", 0o700)
-        write(os.path.join(bin_folder, "ipconfig"), "#!/bin/sh\necho stand-in-mac\n", 0o700)
+        write(os.path.join(bin_folder, "ipconfig"), "#!/bin/sh\necho 192.0.2.10\n", 0o700)
         self.state = os.path.join(work, "state")
         os.makedirs(self.state)
         # The guard of this Mac's side is taken as running (this test's own process), so that none
@@ -299,9 +299,57 @@ class TheHostGetsTheSettingsAsTheyAre(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         return dict(item.split("=", 1) for item in done.stdout.decode().split("\0") if "=" in item)
 
+    def test_a_folder_that_could_be_read_as_a_command_is_refused_here(self):
+        hostile = f"~/a b$(touch {self.mark})"
+        for setting in ("DAILY_HOST_CONFIG", "DAILY_HOST_DIR", "DAILY_BLENDER", "DAILY_PLUGIN_FROM",
+                        "DAILY_AURA_CONFIG", "DAILY_BLENDER_CONFIG"):
+            for value in (hostile, "~/a;b", "x`y`", "~/it's"):
+                env = dict(self.env, **{setting: value})
+                done = subprocess.run([self.daily, "list"], env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                self.assertIn(f"error: {setting} is a folder or file of the host", done.stdout)
+        self.assertEqual(os.listdir(self.calls), [])
+        self.assertFalse(os.path.exists(self.mark))
+
+    def test_quoted_values_mean_the_same_to_zsh_and_bash(self):
+        with open(SCRIPT) as f:
+            function = re.search(r"^quoted\(\) \{.*?\}", f.read(), re.M).group(0)
+        shells = ["bash"] + (["zsh"] if shutil.which("zsh") else [])
+        for value in ("=ls", "a:=b", "a:~/b", "~/x", "it's", f"$(touch {self.mark})", "a b"):
+            for shell in shells:
+                done = subprocess.run([shell, "-c", f'export X={self.quoted(function, value)}; printf %s "$X"'],
+                                      capture_output=True, text=True, env={"HOME": self.home, "PATH": os.environ["PATH"]})
+                self.assertEqual(done.stdout, value, (shell, value))
+        self.assertFalse(os.path.exists(self.mark))
+
+    def quoted(self, function, value):
+        return subprocess.run(["bash", "-c", function + '\nquoted "$1"', "-", value], capture_output=True,
+                              text=True, check=True).stdout
+
+    def test_setups_copy_unpacks_into_the_folder_as_given(self):
+        with open(SCRIPT) as f:
+            text = f.read()
+        functions = "\n".join(re.search(pattern, text, re.S | re.M).group(0) for pattern in
+                              (r"^quoted\(\) \{.*?\}", r"^copy_command\(\) \{.*?^\}$"))
+        made = subprocess.run(["bash", "-c", functions + '\nhost_dir=$1; copy_command', "-", "~/copy-test"],
+                              capture_output=True, text=True, check=True).stdout
+        archive = os.path.join(self.folder.name, "files.tgz")
+        source = os.path.join(self.folder.name, "files")
+        os.makedirs(source)
+        write(os.path.join(source, "one.txt"), "one\n")
+        subprocess.run(["tar", "-czf", archive, "-C", source, "one.txt"], check=True)
+        shells = ["bash"] + (["zsh"] if shutil.which("zsh") else [])
+        for shell in shells:
+            with open(archive, "rb") as given:
+                done = subprocess.run([shell, "-c", made], stdin=given, capture_output=True,
+                                      env={"HOME": self.home, "PATH": os.environ["PATH"]})
+            self.assertEqual(done.returncode, 0, done.stderr)
+            with open(os.path.join(self.home, "copy-test", "src", "one.txt")) as f:
+                self.assertEqual(f.read(), "one\n")
+            shutil.rmtree(os.path.join(self.home, "copy-test"))
+
     def test_nothing_in_a_value_is_run_on_the_host(self):
-        hostile = f"~/a b$(touch {self.mark})`touch {self.mark}`; touch {self.mark} 'q\""
-        self.env.update(DAILY_HOST_CONFIG=hostile, DAILY_HOST_DIR="~/trial dir", DAILY_BLENDER=hostile)
+        self.env.update(DAILY_HOST_CONFIG="~/cfg.d/x-1", DAILY_HOST_DIR="~/trial-dir", DAILY_BLENDER="/opt/b/blender")
         self.open("firefox", 1)
         calls = self.lines()
         self.assertTrue(calls)
@@ -311,16 +359,16 @@ class TheHostGetsTheSettingsAsTheyAre(unittest.TestCase):
         shells = ["bash"] + (["zsh"] if shutil.which("zsh") else [])
         for shell in shells:
             got = self.received(shell, calls[0][-1])
-            self.assertFalse(os.path.exists(self.mark), f"{shell} ran a part of a value")
-            self.assertEqual(got["HOST_CONFIG"], hostile)
-            self.assertEqual(got["BLENDER"], hostile)
+            self.assertEqual(got["HOST_CONFIG"], "~/cfg.d/x-1")
+            self.assertEqual(got["BLENDER"], "/opt/b/blender")
+            self.assertEqual(got["MAC"], "192.0.2.10")
             self.assertEqual(got["NAME"], "firefox")
             self.assertEqual(got["SIZE"], "1720x720")
             self.assertEqual(got["MIN_QP"], "18")
             self.assertEqual(got["NAMES"].split(), ["firefox", "blender", "editor", "chrome", "aura-editor",
                                                     "aura-firefox", "aura-blender", "aura-chrome"])
             # A folder's leading ~ arrives as it is too: home_path reads it on the host.
-            self.assertEqual(got["DAILY_DIR"], "~/trial dir")
+            self.assertEqual(got["DAILY_DIR"], "~/trial-dir")
 
     def test_a_size_or_layout_of_another_form_stops_everything_at_once(self):
         for setting, value in (("SIZE", "1720x720; touch x"), ("SIZE", "big"), ("LAYOUT", "us;x"),

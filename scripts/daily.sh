@@ -187,6 +187,19 @@ layout=${LAYOUT:-us}
 # Both go to the host as they are: only the forms they can take are let through.
 [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { echo "error: SIZE is WIDTHxHEIGHT in pixels, such as 1720x720"; exit 2; }
 [[ "$layout" =~ ^[A-Za-z0-9_,-]+$ ]] || { echo "error: LAYOUT is the name of a keyboard layout, such as us or jp"; exit 2; }
+# Folders and files on the host are written into the host's scripts as they are: only a leading ~
+# and plain characters are let through, so that nothing in them can be read as a command there.
+safe_folder='^~?[A-Za-z0-9_./-]+$'
+for each in "DAILY_HOST_DIR=$host_dir" "DAILY_PLUGIN_FROM=$plugin_from" "DAILY_AURA_CONFIG=${DAILY_AURA_CONFIG:-}" \
+    "DAILY_HOST_CONFIG=${DAILY_HOST_CONFIG:-}" "DAILY_BLENDER_CONFIG=${DAILY_BLENDER_CONFIG:-}" \
+    "DAILY_BLENDER=${DAILY_BLENDER:-}"; do
+    [ -z "${each#*=}" ] || [[ "${each#*=}" =~ $safe_folder ]] ||
+        { echo "error: ${each%%=*} is a folder or file of the host in letters, digits and _ . / - (a leading ~ is the home folder there)"; exit 2; }
+done
+for each in DAILY_FLOW DAILY_TEST_SIGNAL DAILY_FRAME_LOGS DAILY_KEY_RECORD DAILY_BLENDER_EVENTS; do
+    [[ "${!each:-}" =~ ^[A-Za-z0-9_]*$ ]] || { echo "error: $each is a word of letters and digits, such as 1"; exit 2; }
+done
+quoted() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; } # one word for any shell
 # DAILY_STATE_DIR and DAILY_BUNDLE_PLACE are for a rehearsal of `setup` that touches nothing of the
 # person's trial (with DAILY_HOST_DIR on the host): its own state and lock, its own staged bundle.
 state=${DAILY_STATE_DIR:-"$HOME/Library/Caches/istesso-daily"}
@@ -628,10 +641,15 @@ LIB
 limited() { # SECONDS COMMAND...: the command is ended when it takes longer
     perl -e 'alarm shift; exec @ARGV or exit 127' "$@"
 }
+copy_command() { # the command on the host that unpacks this checkout's files (setup)
+    # The folder arrives in single quotes; its leading ~ is the home folder there, as in home_path.
+    printf '%s' "export LC_ALL=C DAILY_DIR=$(quoted "$host_dir"); bash -c 'D=\$DAILY_DIR; case \$D in \"~\" | \"~/\"*) D=\$HOME\${D#\"~\"} ;; esac; mkdir -p \"\$D/src\" \"\$D/run\" && chmod 700 \"\$D\" && tar -xzf - -C \"\$D/src\" 2> \"\$D/run/copy.log\"; s=\$?; grep -v \"extended header\" \"\$D/run/copy.log\"; exit \$s'"
+}
 remote_settings() { # the settings of the host's part, as one line for the host's login shell
-    # Every value is quoted, so that it arrives as it is and nothing in it is run there; a folder's
-    # leading ~ is read on the host (home_path). This Mac's bash leaves a leading ~ unquoted.
-    local line="export LC_ALL=C" pair value
+    # Every value is in single quotes, so that it arrives as it is and nothing in it is read by the
+    # host's login shell (zsh there: `=`, `~` and `:~` mean something to it outside quotes); a
+    # folder's leading ~ is read on the host (home_path).
+    local line="export LC_ALL=C" pair
     for pair in "DAILY_DIR=$host_dir" "NAME=${name:-}" \
         "SCROLL_MOMENTUM=$([ "${DAILY_SCROLL_MOMENTUM:-}" = app ] && echo app)" \
         "SIZE=$size" "LAYOUT=$layout" "MAC=${mac_address:-}" "PLUGIN_FROM=$plugin_from" \
@@ -642,17 +660,18 @@ remote_settings() { # the settings of the host's part, as one line for the host'
         "HOST_CONFIG=${DAILY_HOST_CONFIG:-}" "TEST_SIGNAL=${DAILY_TEST_SIGNAL:-}" \
         "FRAME_LOGS=${DAILY_FRAME_LOGS:-}" "KEY_RECORD=${DAILY_KEY_RECORD:-}" \
         "BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}"; do
-        value=$(printf '%q' "${pair#*=}")
-        [ "${value:0:1}" = "~" ] && value="\\$value"
-        line+=" ${pair%%=*}=$value"
+        line+=" ${pair%%=*}=$(quoted "${pair#*=}")"
     done
     printf '%s; bash -s\n' "$line"
 }
 on_host() { # the commands come on standard input; with limit=SECONDS, ended after that long
     # LC_ALL=C is for the trial's own commands there, whose output is read; the applications get
     # the desk's language instead (host_open).
+    local settings
+    settings=$(remote_settings)
+    [ -n "$settings" ] || { echo "error: the settings for the host could not be put together: nothing was sent"; return 1; }
     { printf '%s\n' "$host_lib"; cat; } |
-        ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host_name" "$(remote_settings)" 2>&1 |
+        ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host_name" "$settings" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -667,7 +686,7 @@ find_the_way() {
     host_address=$(ssh -G -- "$host_name" 2>/dev/null | awk '/^hostname / {print $2}')
     interface=$(route -n get "$host_address" 2>/dev/null | awk '/interface:/ {print $2}')
     mac_address=$(ipconfig getifaddr "${interface:-en0}" 2>/dev/null)
-    [ -n "$mac_address" ] || { echo "error: cannot tell which of this Mac's addresses the host can reach"; return 1; }
+    [[ "$mac_address" =~ ^[0-9.]+$ ]] || { echo "error: cannot tell which of this Mac's addresses the host can reach"; return 1; }
 }
 
 # ---- Setting up ----
@@ -742,8 +761,7 @@ do_setup() {
     run_guarded macos/gst-viewer/build.sh >> "$state/setup-mac.log" 2>&1 || { echo "error: the viewer did not build (see $state/setup-mac.log)"; exit 1; }
     echo "the host: copying this checkout's files"
     git ls-files -z | COPYFILE_DISABLE=1 tar --null -T - -czf - |
-        ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host_name" \
-            "LC_ALL=C bash -c 'D=\$(eval echo $host_dir); mkdir -p \$D/src \$D/run && chmod 700 \$D && tar -xzf - -C \$D/src 2> \$D/run/copy.log; s=\$?; grep -v \"extended header\" \$D/run/copy.log; exit \$s'" ||
+        ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host_name" "$(copy_command)" ||
         { echo "error: the copy did not reach the host"; exit 1; }
     on_host <<'HOST'
 take_turn

@@ -1,7 +1,8 @@
 #import <AppKit/AppKit.h>
 #include <limits.h>
 #include <pwd.h>
-#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // The environment daily.sh gets, made here as the owner shim makes its own: nothing of the one this
@@ -11,12 +12,16 @@ static NSMutableDictionary<NSString *, NSString *> *cleanEnvironment(NSString **
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         char tmpdir[PATH_MAX];
-        // The Darwin lookup can fall back to TMPDIR. Only accept the system directory.
-        unsetenv("TMPDIR");
+        // The Darwin lookup can fall back to TMPDIR. This process's own environment is left as
+        // it is (other threads read it): only the system's directory, the user's own, is taken.
         size_t len = confstr(_CS_DARWIN_USER_TEMP_DIR, tmpdir, sizeof tmpdir);
         struct passwd *account = getpwuid(getuid());
+        struct stat place;
         if (!account || !account->pw_dir || !account->pw_dir[0] || !account->pw_name ||
-            !account->pw_name[0] || len <= 1 || len > sizeof tmpdir)
+            !account->pw_name[0] || len <= 1 || len > sizeof tmpdir ||
+            (strncmp(tmpdir, "/var/folders/", 13) != 0 && strncmp(tmpdir, "/private/var/folders/", 21) != 0) ||
+            lstat(tmpdir, &place) != 0 || !S_ISDIR(place.st_mode) || place.st_uid != getuid() ||
+            (place.st_mode & (S_IWGRP | S_IWOTH)))
             return;
         NSString *user = @(account->pw_name);
         made = @{@"HOME" : @(account->pw_dir), @"USER" : user, @"LOGNAME" : user,
