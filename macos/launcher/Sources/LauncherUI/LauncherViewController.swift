@@ -80,6 +80,8 @@ public final class LauncherViewController: NSViewController, NSTableViewDataSour
         let root = BackgroundView(frame: NSRect(x: 0, y: 0, width: 560, height: 420))
         search.placeholderString = "Search apps and projects"
         search.delegate = self
+        search.target = self
+        search.action = #selector(searchChanged)
         search.setAccessibilityLabel("Search apps and projects")
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("entry"))
@@ -187,7 +189,15 @@ public final class LauncherViewController: NSViewController, NSTableViewDataSour
         view.layoutSubtreeIfNeeded()
     }
 
-    public func controlTextDidChange(_ notification: Notification) { model.query = search.stringValue }
+    private func syncQuery() {
+        if model.query != search.stringValue { model.query = search.stringValue }
+    }
+
+    @objc private func searchChanged() { syncQuery() }
+
+    public func controlTextDidChange(_ notification: Notification) { syncQuery() }
+
+    public func searchFieldDidEndSearching(_ sender: NSSearchField) { syncQuery() }
 
     public func control(_ control: NSControl, textView: NSTextView,
                         doCommandBy commandSelector: Selector) -> Bool {
