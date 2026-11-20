@@ -1,0 +1,12 @@
+5.3
+blender
+blender-launcher
+blender-symbolic.svg
+blender-system-info.sh
+blender-thumbnailer
+blender.desktop
+blender.svg
+copyright.txt
+lib
+license
+readme.html

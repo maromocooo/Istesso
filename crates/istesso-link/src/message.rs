@@ -68,8 +68,10 @@ pub struct ShellRequest {
     /// The language the person uses, for `LANG` (`ja_JP.UTF-8`, say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
-    /// A folder on the host to start in: absolute, or below the home folder
-    /// (`~/...`). The home folder when absent.
+    /// Where on the host to start: a folder, absolute or below the home
+    /// folder (`~/...`), or the name of a project registered on the host
+    /// (`istesso projects add`), which never starts with `/` or `~` and
+    /// which the host looks up itself. The home folder when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     /// Send the ports that the shell and what it starts listen on, and

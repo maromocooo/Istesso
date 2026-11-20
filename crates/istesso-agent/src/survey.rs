@@ -106,7 +106,7 @@ pub fn survey(paths: &Paths, options: &SurveyOptions) -> Result<Vec<HostView>, S
         let (paths, options) = (paths.clone(), options.clone());
         std::thread::spawn(move || refresh_peers(&paths, &options))
     };
-    let local = local_view(paths, &identity, options);
+    let local = local_view(paths, &identity, options)?;
     let remote = remote
         .join()
         .map_err(|_| "internal error while asking the paired devices".to_string())??;
@@ -240,9 +240,14 @@ pub fn local_agent_running(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
-fn local_view(paths: &Paths, identity: &Identity, options: &SurveyOptions) -> HostView {
-    let manifest = cache::local_manifest(paths, MANIFEST_MAX_AGE);
-    HostView {
+fn local_view(
+    paths: &Paths,
+    identity: &Identity,
+    options: &SurveyOptions,
+) -> Result<HostView, String> {
+    let mut manifest = cache::local_manifest(paths, MANIFEST_MAX_AGE);
+    manifest.projects = crate::projects::list(paths)?;
+    Ok(HostView {
         id: identity.fingerprint(),
         name: manifest.name.clone(),
         local: true,
@@ -257,7 +262,7 @@ fn local_view(paths: &Paths, identity: &Identity, options: &SurveyOptions) -> Ho
         address: None,
         problem: None,
         manifest: Some(manifest),
-    }
+    })
 }
 
 fn unreachable_view(peer: &Peer, snapshot: Option<HostSnapshot>, problem: String) -> HostView {

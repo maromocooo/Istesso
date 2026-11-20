@@ -3,7 +3,9 @@
 //! Nothing here touches the machine, so every function can be tested on any
 //! platform with captured samples.
 
-use istesso_proto::{AudioServer, Gpu, GpuVendor, NetInterface, NetKind};
+use istesso_proto::{
+    AndroidCount, AppleDevice, AudioServer, Gpu, GpuVendor, NetInterface, NetKind, SimulatorCount,
+};
 
 /// Parses `/etc/os-release` and returns `(name, version)`.
 pub fn os_release(text: &str) -> Option<(String, String)> {
@@ -178,6 +180,92 @@ pub fn xcodebuild_version(text: &str) -> Option<String> {
     let first = text.lines().next()?.trim();
     let version = first.strip_prefix("Xcode ")?.trim();
     (!version.is_empty()).then(|| version.to_string())
+}
+
+/// Only the dotted numeric versions present in the supported output shapes.
+fn version_number(text: &str) -> Option<String> {
+    let numeric = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    (text.contains('.') && text.split('.').all(numeric)).then(|| text.to_owned())
+}
+
+pub(crate) fn tool_version(name: &str, text: &str) -> Option<String> {
+    let line = text.lines().next()?.trim();
+    let token = match name {
+        "xcodebuild" => return xcodebuild_version(text).and_then(|v| version_number(&v)),
+        "swift" => text
+            .lines()
+            .find_map(|line| line.split_once("Swift version "))?
+            .1
+            .split_whitespace()
+            .next()?,
+        "cargo" => line.strip_prefix("cargo ")?.split_whitespace().next()?,
+        "node" => text.trim().strip_prefix('v')?,
+        "python3" => line.strip_prefix("Python ")?,
+        "git" => line
+            .strip_prefix("git version ")?
+            .split_whitespace()
+            .next()?,
+        "docker" => line.strip_prefix("Docker version ")?.split_once(',')?.0,
+        "adb" => line.strip_prefix("Android Debug Bridge version ")?,
+        "npm" | "devicectl" | "blender" | "nvidia-smi" => text.trim(),
+        _ => return None,
+    };
+    version_number(token)
+}
+
+/// A release archive has a major.minor directory beside the Blender executable.
+pub(crate) fn blender_directory_version(name: &str) -> Option<String> {
+    (name.matches('.').count() == 1)
+        .then(|| version_number(name))
+        .flatten()
+}
+
+pub(crate) fn apple_devices(text: &str) -> Option<Vec<AppleDevice>> {
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    let mut devices = Vec::new();
+    for device in root["result"]["devices"].as_array()? {
+        let hardware = &device["properties"]["hardware"];
+        let connection = &device["properties"]["connection"];
+        if hardware["reality"] == "simulated" || device["visibilityClass"] == "simulators" {
+            continue;
+        }
+        devices.push(AppleDevice {
+            model: hardware["marketingName"].as_str().map(str::to_owned),
+            platform: hardware["platform"].as_str().map(str::to_owned),
+            state: connection["state"].as_str().map(str::to_owned),
+            transport: connection["transportType"].as_str().map(str::to_owned),
+        });
+    }
+    devices.sort_by(|a, b| (&a.platform, &a.model).cmp(&(&b.platform, &b.model)));
+    Some(devices)
+}
+
+pub(crate) fn simulator_count(text: &str) -> Option<SimulatorCount> {
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    let mut counts = SimulatorCount::default();
+    for (runtime, devices) in root["devices"].as_object()? {
+        let (platform, _) = runtime
+            .strip_prefix("com.apple.CoreSimulator.SimRuntime.")?
+            .split_once('-')?;
+        let available = devices
+            .as_array()?
+            .iter()
+            .filter(|d| d["isAvailable"] == true)
+            .count();
+        let available = u32::try_from(available).ok()?;
+        counts.available = counts.available.checked_add(available)?;
+        *counts.by_platform.entry(platform.to_owned()).or_default() += available;
+    }
+    Some(counts)
+}
+
+pub(crate) fn android_count(text: &str) -> Option<AndroidCount> {
+    let mut lines = text.lines();
+    lines.find(|line| line.trim() == "List of devices attached")?;
+    let count = lines.filter(|line| !line.trim().is_empty()).count();
+    Some(AndroidCount {
+        count: count.try_into().ok()?,
+    })
 }
 
 /// Parses `networksetup -listallhardwareports` on macOS and keeps the real
@@ -506,5 +594,177 @@ mod tests {
             "Now drawing from 'AC Power'\n -InternalBattery-0 (id=1234)\t100%; charged;"
         ));
         assert!(!pmset_has_battery("Now drawing from 'AC Power'\n"));
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!("../tests/fixtures/real-shape/", $name))
+        };
+    }
+
+    #[test]
+    fn versions_from_tool_stdout() {
+        for (tool, text, version) in [
+            ("xcodebuild", fixture!("mac-xcodebuild-version.txt"), "26.6"),
+            ("swift", fixture!("mac-swift-version.txt"), "6.3.3"),
+            ("swift", fixture!("studio-swift-version.txt"), "6.4.2"),
+            ("cargo", fixture!("mac-cargo-version.txt"), "1.93.0"),
+            ("cargo", fixture!("linux-cargo-version.txt"), "1.100.0"),
+            ("node", fixture!("mac-node-version.txt"), "24.12.0"),
+            ("node", fixture!("linux-node-version.txt"), "22.22.0"),
+            ("npm", fixture!("mac-npm-version.txt"), "11.6.2"),
+            ("npm", fixture!("linux-npm-version.txt"), "10.9.4"),
+            ("python3", fixture!("mac-python3-version.txt"), "3.15.2"),
+            ("python3", fixture!("studio-python3-version.txt"), "3.9.6"),
+            ("python3", fixture!("linux-python3-version.txt"), "3.12.3"),
+            ("git", fixture!("mac-git-version.txt"), "2.50.1"),
+            ("git", fixture!("studio-git-version.txt"), "2.54.0"),
+            ("git", fixture!("linux-git-version.txt"), "2.43.0"),
+            ("docker", fixture!("linux-docker-version.txt"), "29.2.1"),
+            ("adb", fixture!("mac-adb-version.txt"), "1.0.41"),
+            ("adb", fixture!("linux-adb-version.txt"), "1.0.41"),
+            (
+                "devicectl",
+                fixture!("mac-devicectl-version.txt"),
+                "642.0.1",
+            ),
+            ("blender", fixture!("mac-blender-app-version.txt"), "5.1.2"),
+        ] {
+            assert_eq!(tool_version(tool, text).as_deref(), Some(version), "{tool}");
+            assert_eq!(tool_version(tool, ""), None, "{tool}");
+        }
+        let gpus = nvidia_smi_csv(fixture!("linux-nvidia-smi-query.txt"));
+        assert_eq!(gpus[0].driver.as_deref(), Some("590.48.01"));
+        assert_eq!(
+            fixture!("linux-blender-dir-listing.txt")
+                .lines()
+                .filter_map(blender_directory_version)
+                .collect::<Vec<_>>(),
+            ["5.3"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_successful_stdout_reaches_the_xcode_probes() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        let capture = |code: i32, out: &str, err: &str| {
+            crate::successful_stdout(Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: out.as_bytes().to_vec(),
+                stderr: err.as_bytes().to_vec(),
+            })
+        };
+        for (code, out, err) in [
+            (
+                1,
+                fixture!("studio-xcodebuild-version.txt"),
+                fixture!("studio-xcodebuild-version.stderr.txt"),
+            ),
+            (
+                72,
+                fixture!("studio-xcrun-find-simctl.txt"),
+                fixture!("studio-xcrun-find-simctl.stderr.txt"),
+            ),
+            (
+                72,
+                fixture!("studio-xcrun-find-devicectl.txt"),
+                fixture!("studio-xcrun-find-devicectl.stderr.txt"),
+            ),
+        ] {
+            assert_eq!(capture(code, out, err), None);
+        }
+        for out in [
+            fixture!("mac-xcrun-find-simctl.txt"),
+            fixture!("mac-xcrun-find-devicectl.txt"),
+        ] {
+            assert!(capture(0, out, "").is_some());
+        }
+        for (out, err) in [
+            (
+                fixture!("mac-swift-version.txt"),
+                fixture!("mac-swift-version.stderr.txt"),
+            ),
+            (
+                fixture!("studio-swift-version.txt"),
+                fixture!("studio-swift-version.stderr.txt"),
+            ),
+        ] {
+            assert_eq!(capture(0, out, err).as_deref(), Some(out));
+        }
+    }
+
+    #[test]
+    fn real_apple_devices_only_with_public_fields_in_order() {
+        let devices = apple_devices(fixture!("mac-devicectl-list-devices.json")).unwrap();
+        assert_eq!(
+            serde_json::to_value(devices).unwrap(),
+            serde_json::json!([
+                {"model":null,"platform":"iOS","state":"unavailable","transport":null},
+                {"model":"Example Phone 1","platform":"iOS","state":"unavailable","transport":null},
+                {"model":"Example Tablet 1","platform":"iOS","state":"disconnected","transport":"localNetwork"}
+            ])
+        );
+    }
+
+    #[test]
+    fn either_simulator_marker_excludes_a_device() {
+        let mut list: serde_json::Value =
+            serde_json::from_str(fixture!("mac-devicectl-list-devices.json")).unwrap();
+        let devices = list["result"]["devices"].as_array_mut().unwrap();
+        for device in devices {
+            if device["visibilityClass"] == "simulators" {
+                if device["properties"]["hardware"]["platform"] == "iOS" {
+                    device.as_object_mut().unwrap().remove("visibilityClass");
+                } else {
+                    device["properties"]["hardware"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("reality");
+                }
+            }
+        }
+        assert_eq!(
+            apple_devices(&list.to_string()),
+            apple_devices(fixture!("mac-devicectl-list-devices.json"))
+        );
+    }
+
+    #[test]
+    fn counts_available_simulators_and_adb_rows() {
+        let text = fixture!("mac-simctl-list-devices-available.json");
+        let sims = simulator_count(text).unwrap();
+        assert_eq!(
+            serde_json::to_value(sims).unwrap(),
+            serde_json::json!({
+                "available":39,"by_platform":{"iOS":33,"watchOS":5,"xrOS":1}
+            })
+        );
+        let mut changed: serde_json::Value = serde_json::from_str(text).unwrap();
+        changed["devices"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .find(|list| !list.as_array().unwrap().is_empty())
+            .unwrap()[0]["isAvailable"] = false.into();
+        assert_eq!(simulator_count(&changed.to_string()).unwrap().available, 38);
+
+        let list = fixture!("mac-adb-devices-l.txt");
+        assert_eq!(android_count(list).unwrap().count, 0);
+        // The rows are opaque. Counting does not depend on a device line format.
+        assert_eq!(
+            android_count(&format!("{list}\nrow\n\nrow\n"))
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(android_count(""), None);
     }
 }

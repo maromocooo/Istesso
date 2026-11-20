@@ -46,6 +46,8 @@
 | Apple 向けのビルドと署名 | Xcode の入った Mac |
 
 迷ったら、その PC で `istesso doctor --json` を実行して `roles` を確認してください。`gpu`、`xcode_build`、`always_on_candidate` などが判断材料になります。
+同じ出力の `capabilities` には、入っている道具とその版、つないである実機の数や機種名が出ます。`istesso hosts --json` では、ペアリングした機械のぶんも見られます。
+3D なら `blender` と `gpu`、iOS なら `xcodebuild` と `devicectl` と `attached.ios` を見てください。
 
 ### 計測の合図
 
