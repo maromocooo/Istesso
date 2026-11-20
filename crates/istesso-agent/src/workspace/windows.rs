@@ -124,7 +124,8 @@ impl Windows {
             ));
             return false;
         };
-        let started = std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        command
             .arg(&self.host)
             .arg(window.picture.to_string())
             .arg(window.input.to_string())
@@ -133,8 +134,9 @@ impl Windows {
             .env(ASKED_BY_VARIABLE, asked_by)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        unblocked_signals(&mut command);
+        let started = command.spawn();
         match started {
             Ok(mut child) => {
                 (self.notice)(&format!(
@@ -156,6 +158,26 @@ impl Windows {
                 false
             }
         }
+    }
+}
+
+/// The shell takes its signals in a thread of its own, with them blocked in
+/// every other thread ([`crate::remote_shell::client`]). A program started
+/// from such a thread keeps that mask across `exec`: the window's viewer and
+/// relay could then not be ended by TERM (the opener's `stop`, seen on the
+/// Mac on 2026-11-20 with stand-ins), nor by HUP or INT. The program starts
+/// with none blocked.
+fn unblocked_signals(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: between fork and exec only sigemptyset and sigprocmask run,
+    // both async-signal-safe; the closure touches no memory of the parent.
+    unsafe {
+        command.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+            Ok(())
+        });
     }
 }
 
@@ -251,6 +273,59 @@ mod tests {
         );
         let said = lines.lock().unwrap()[2].clone();
         assert!(said.contains("does not say who asked"), "{said}");
+    }
+
+    #[test]
+    fn the_program_starts_with_no_signal_blocked_even_when_the_shell_blocks_them() {
+        let dir = TempDir::new("win-signals");
+        let started = dir.path().join("started");
+        let survived = dir.path().join("survived");
+        let program = dir.path().join("show.sh");
+        // It ends itself with TERM: with TERM blocked, it would go on.
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n: > '{}'\nkill -TERM $$\nsleep 0.2\n: > '{}'\n",
+                started.display(),
+                survived.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (notice, _) = heard();
+        let windows = Windows::new(
+            Some(program),
+            "127.0.0.1:26890".parse().unwrap(),
+            "the-hosts-id",
+            notice,
+        );
+        // Blocked in this thread, as in the shell's threads (remote_shell::client).
+        // SAFETY: the set is made by sigemptyset before use; only this test's own
+        // thread's mask changes, and it is put back as it was.
+        let opened = unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigaddset(&mut set, libc::SIGHUP);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            let opened = windows.open(&window(26891));
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            opened
+        };
+        assert!(opened);
+        let began = Instant::now();
+        while !started.exists() {
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "the program did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !survived.exists(),
+            "TERM was blocked in the window's program"
+        );
     }
 
     #[test]
