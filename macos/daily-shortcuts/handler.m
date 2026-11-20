@@ -1,4 +1,31 @@
 #import <AppKit/AppKit.h>
+#include <limits.h>
+#include <pwd.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+// The environment daily.sh gets, made here as the owner shim makes its own: nothing of the one this
+// handler was started with (a setting given to the whole login session, say) reaches the trial.
+static NSMutableDictionary<NSString *, NSString *> *cleanEnvironment(NSString **home) {
+    static NSDictionary<NSString *, NSString *> *made;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        char tmpdir[PATH_MAX];
+        // The Darwin lookup can fall back to TMPDIR. Only accept the system directory.
+        unsetenv("TMPDIR");
+        size_t len = confstr(_CS_DARWIN_USER_TEMP_DIR, tmpdir, sizeof tmpdir);
+        struct passwd *account = getpwuid(getuid());
+        if (!account || !account->pw_dir || !account->pw_dir[0] || !account->pw_name ||
+            !account->pw_name[0] || len <= 1 || len > sizeof tmpdir)
+            return;
+        NSString *user = @(account->pw_name);
+        made = @{@"HOME" : @(account->pw_dir), @"USER" : user, @"LOGNAME" : user,
+                 @"PATH" : @"/usr/bin:/bin:/usr/sbin:/sbin", @"TMPDIR" : @(tmpdir), @"LANG" : @"en_US.UTF-8"};
+    });
+    if (!made) return nil;
+    *home = made[@"HOME"];
+    return [made mutableCopy];
+}
 
 // The signed resource contains the complete set of URLs and argv arrays made at build time.
 // No part of an incoming URL is used as a command, a path or an argument.
@@ -12,14 +39,14 @@ static NSString *openShortcut(NSString *url, NSDictionary *config) {
 
     NSURL *checkout = [NSURL fileURLWithPath:config[@"checkout"] isDirectory:YES];
     NSTask *task = [[NSTask alloc] init];
-    NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
-    [environment removeObjectForKey:@"DAILY_OWNER"];
-    [environment removeObjectForKey:@"DAILY_OPEN_HANDLER"];
-    [environment removeObjectForKey:@"ISTESSO_APP_ICON"];
+    // Never DAILY_OWNER or DAILY_OPEN_HANDLER: they are not in it.
+    NSString *home = nil;
+    NSMutableDictionary *environment = cleanEnvironment(&home);
+    if (!environment) return @"Could not build the shortcut environment.";
     NSString *title = config[@"titles"][args[3]][args[1]];
     if (title && args.count == 4) {
         NSString *relative = [NSString stringWithFormat:@"Applications/Istesso Dev/%@.app/Contents/Resources/Shortcut.icns", title];
-        environment[@"ISTESSO_APP_ICON"] = [NSHomeDirectory() stringByAppendingPathComponent:relative];
+        environment[@"ISTESSO_APP_ICON"] = [home stringByAppendingPathComponent:relative];
     }
     task.environment = environment;
     task.currentDirectoryURL = checkout;

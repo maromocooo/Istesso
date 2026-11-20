@@ -372,7 +372,7 @@ scripts/daily.sh shortcuts install
 
 Spotlight か Alfred で `Blender (Ubuntu)`、`Firefox (Ubuntu)`、`Text Editor (Ubuntu)`、`Chrome (Ubuntu)` を検索して開きます。Dock に置くには、Finder で使いたい近道を Dock にドラッグします。
 
-通常の近道は受付役に URL を渡します。たとえば Text Editor の近道は `istesso-dev-open://open/editor?host=ubuntu` を開きます。URL に `&for=aura` を足すと、AURA に開きます。受付役が試用版の `daily.sh open` を呼び、中継が LAN に接続します。初回に「ローカルネットワーク」の許可を尋ねられたら、`Istesso Dev Open` に許可してください。[許可をまとめた理由](adr/0024-trial-daily-shortcuts.md)。
+通常の近道は受付役に URL を渡します。たとえば Text Editor の近道は `istesso-dev-open://open/editor?host=ubuntu` を開きます。URL に `&for=aura` を足すと、AURA に開きます。受付役が試用版の `daily.sh open` を呼び、中継が LAN に接続します。受付役は、`daily.sh` に渡す環境を、持ち主用の包みと同じように自分で作ります（`HOME`、`USER`、`LOGNAME`、`PATH`、`TMPDIR`、`LANG`、絵の場所だけ。2026-11-20 から）。ログインのセッションに足された設定（`DAILY_…` や `ISTESSO_HOST` など）は、近道からは効きません。ターミナルから打つときだけ効きます。初回に「ローカルネットワーク」の許可を尋ねられたら、`Istesso Dev Open` に許可してください。[許可をまとめた理由](adr/0024-trial-daily-shortcuts.md)。
 
 Mac ホスト用の通常の近道は `TextEdit (Studio)` から始めます。`macos/daily-shortcuts/mac-apps.txt` にアプリ名を 1 行ずつ書き、作成と登録をやり直すと一覧が替わります。
 

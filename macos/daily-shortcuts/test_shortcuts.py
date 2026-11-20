@@ -22,6 +22,51 @@ from urllib.parse import quote
 import shortcuts as sc
 
 
+class HandlerEnvironmentTest(unittest.TestCase):
+    """The URL handler gives daily.sh an environment of its own making, as the owner shim does:
+    nothing of the environment it was started with reaches the trial. Needs no staged bundles."""
+
+    @classmethod
+    def setUpClass(cls):
+        sc.check_measurement()
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.runner = Path(cls.temp.name) / "url-test"
+        subprocess.run(["clang", "-DSHORTCUT_TEST", "-fobjc-arc", "-Wall", "-Wextra", "-Werror",
+                        sc.SOURCE / "handler.m", "-framework", "AppKit", "-o", cls.runner], check=True)
+
+    def test_inherited_settings_do_not_reach_daily_sh(self):
+        checkout = Path(self.temp.name) / "trial with spaces"
+        (checkout / "scripts").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, checkout)
+        daily = checkout / "scripts/daily.sh"
+        daily.write_text('#!/bin/sh\nprintf "%s\\0" "$@" > recorded\n/usr/bin/env -0 > seen\n')
+        daily.chmod(0o700)
+        url = f"{sc.SCHEME}://open/editor?host=ubuntu"
+        routes = checkout / "Routes.plist"
+        sc.write_plist(routes, dict(checkout=str(checkout), routes={url: ["open", "editor", "--host", "ubuntu"]},
+                                    titles={"ubuntu": {"editor": "Text Editor"}}))
+        planted = dict(os.environ, DAILY_HOST_CONFIG="planted", DAILY_PLUGIN_FROM="planted",
+                       ISTESSO_HOST="planted", DAILY_OWNER="1", DAILY_OPEN_HANDLER="1", BASH_ENV="/planted",
+                       ISTESSO_APP_ICON="planted", HOME="/planted-home", TMPDIR="/planted/",
+                       PATH="/planted:" + os.environ["PATH"])
+        done = subprocess.run([self.runner, routes, url], env=planted, capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stderr), (0, ""))
+        self.assertEqual((checkout / "recorded").read_bytes(), b"open\0editor\0--host\0ubuntu\0")
+        seen = dict(item.split("=", 1) for item in (checkout / "seen").read_text().split("\0") if "=" in item)
+        for kept_by_the_shell in ("PWD", "SHLVL", "_", "OLDPWD"):
+            seen.pop(kept_by_the_shell, None)
+        account = pwd.getpwuid(os.getuid())
+        self.assertEqual(set(seen), {"HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "ISTESSO_APP_ICON"})
+        self.assertEqual(seen["HOME"], account.pw_dir)
+        self.assertEqual((seen["USER"], seen["LOGNAME"]), (account.pw_name, account.pw_name))
+        self.assertEqual(seen["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertEqual(seen["LANG"], "en_US.UTF-8")
+        self.assertFalse(seen["TMPDIR"].startswith("/planted"))
+        self.assertEqual(seen["ISTESSO_APP_ICON"], os.path.join(
+            account.pw_dir, "Applications/Istesso Dev/Text Editor.app/Contents/Resources/Shortcut.icns"))
+
+
 class ShortcutsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -88,7 +88,8 @@
 # Everything is stopped by the process numbers written down when it was started, and only while the
 # process still is what was started. Nothing is stopped by name.
 #
-# In the environment, when the defaults do not fit:
+# In the environment, when the defaults do not fit (each value reaches the host as it is; in a folder
+# on the host, a leading ~ is the home folder there, and nothing else is expanded):
 #   ISTESSO_HOST        ssh name of the host (default: istesso-ubuntu)
 #   DAILY_HOST_DIR      the trial's own directory on the host (default: ~/.cache/istesso-daily-wip)
 #   DAILY_PLUGIN_FROM   for `setup`: the folder on the host to copy the built compositor plugin from,
@@ -183,6 +184,9 @@ high) port_base=47900 ;;
 esac
 size=${SIZE:-1720x720}; width=${size%x*}; height=${size#*x}
 layout=${LAYOUT:-us}
+# Both go to the host as they are: only the forms they can take are let through.
+[[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { echo "error: SIZE is WIDTHxHEIGHT in pixels, such as 1720x720"; exit 2; }
+[[ "$layout" =~ ^[A-Za-z0-9_,-]+$ ]] || { echo "error: LAYOUT is the name of a keyboard layout, such as us or jp"; exit 2; }
 # DAILY_STATE_DIR and DAILY_BUNDLE_PLACE are for a rehearsal of `setup` that touches nothing of the
 # person's trial (with DAILY_HOST_DIR on the host): its own state and lock, its own staged bundle.
 state=${DAILY_STATE_DIR:-"$HOME/Library/Caches/istesso-daily"}
@@ -292,7 +296,14 @@ my_turn() { # WHAT: waits up to a minute for the turn, or says why not and ends
 # What every command on the host begins with. The host's login shell is not bash: everything goes
 # through `bash -s`.
 IFS= read -r -d '' host_lib <<'LIB'
-D=$(eval echo "$DAILY_DIR"); src=$D/src; plugin=$D/plugin
+home_path() { # a folder as given in a setting: a leading ~ is the home folder here; nothing else is expanded
+    case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${1:2}" ;;
+    *) printf '%s\n' "$1" ;;
+    esac
+}
+D=$(home_path "$DAILY_DIR"); src=$D/src; plugin=$D/plugin
 take_turn() { # one command of the trial at a time on the host, whoever sent it; held until it ends
     mkdir -p "$D/run"
     exec 9>>"$D/run/lock"
@@ -596,12 +607,31 @@ LIB
 limited() { # SECONDS COMMAND...: the command is ended when it takes longer
     perl -e 'alarm shift; exec @ARGV or exit 127' "$@"
 }
+remote_settings() { # the settings of the host's part, as one line for the host's login shell
+    # Every value is quoted, so that it arrives as it is and nothing in it is run there; a folder's
+    # leading ~ is read on the host (home_path). This Mac's bash leaves a leading ~ unquoted.
+    local line="export LC_ALL=C" pair value
+    for pair in "DAILY_DIR=$host_dir" "NAME=${name:-}" \
+        "SCROLL_MOMENTUM=$([ "${DAILY_SCROLL_MOMENTUM:-}" = app ] && echo app)" \
+        "SIZE=$size" "LAYOUT=$layout" "MAC=${mac_address:-}" "PLUGIN_FROM=$plugin_from" \
+        "BLENDER=${DAILY_BLENDER:-}" "BLENDER_CONFIG=${DAILY_BLENDER_CONFIG:-}" \
+        "NAMES=$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)" \
+        "FOR=${for_whom:-}" "AURA_MAX=$aura_max" "PORT_BASE=$port_base" "MIN_QP=${min_qp:-}" \
+        "FLOW=${DAILY_FLOW:-1}" "DOCUMENT=${document:-}" "AURA_CONFIG=$aura_config" \
+        "HOST_CONFIG=${DAILY_HOST_CONFIG:-}" "TEST_SIGNAL=${DAILY_TEST_SIGNAL:-}" \
+        "FRAME_LOGS=${DAILY_FRAME_LOGS:-}" "KEY_RECORD=${DAILY_KEY_RECORD:-}" \
+        "BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}"; do
+        value=$(printf '%q' "${pair#*=}")
+        [ "${value:0:1}" = "~" ] && value="\\$value"
+        line+=" ${pair%%=*}=$value"
+    done
+    printf '%s; bash -s\n' "$line"
+}
 on_host() { # the commands come on standard input; with limit=SECONDS, ended after that long
     # LC_ALL=C is for the trial's own commands there, whose output is read; the applications get
     # the desk's language instead (host_open).
     { printf '%s\n' "$host_lib"; cat; } |
-        ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
-            "export LC_ALL=C DAILY_DIR=$host_dir NAME=${name:-} SCROLL_MOMENTUM=$([ "${DAILY_SCROLL_MOMENTUM:-}" = app ] && echo app) SIZE=$size LAYOUT=$layout MAC=${mac_address:-} PLUGIN_FROM=$plugin_from BLENDER=$(printf '%q' "${DAILY_BLENDER:-}") BLENDER_CONFIG=$(printf '%q' "${DAILY_BLENDER_CONFIG:-}") NAMES='$apps $(for each in $aura_apps; do printf 'aura-%s ' "$each"; done)' FOR=${for_whom:-} AURA_MAX=$aura_max PORT_BASE=$port_base MIN_QP=${min_qp:-} FLOW=${DAILY_FLOW:-1} DOCUMENT=$(printf '%q' "${document:-}") AURA_CONFIG=$aura_config HOST_CONFIG=$(printf '%q' "${DAILY_HOST_CONFIG:-}") TEST_SIGNAL=${DAILY_TEST_SIGNAL:-} FRAME_LOGS=${DAILY_FRAME_LOGS:-} KEY_RECORD=${DAILY_KEY_RECORD:-} BLENDER_EVENTS=${DAILY_BLENDER_EVENTS:-}; bash -s" 2>&1 |
+        ${limit:+limited "$limit"} ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host_name" "$(remote_settings)" 2>&1 |
         grep -v "Pseudo-terminal"
     local ssh_status=${PIPESTATUS[1]}
     if [ "$ssh_status" = 255 ]; then
@@ -613,7 +643,7 @@ on_host() { # the commands come on standard input; with limit=SECONDS, ended aft
 # Where the host is, as this Mac reaches it, and which of the Mac's addresses lies on that way.
 find_the_way() {
     local host_address interface
-    host_address=$(ssh -G "$host_name" 2>/dev/null | awk '/^hostname / {print $2}')
+    host_address=$(ssh -G -- "$host_name" 2>/dev/null | awk '/^hostname / {print $2}')
     interface=$(route -n get "$host_address" 2>/dev/null | awk '/interface:/ {print $2}')
     mac_address=$(ipconfig getifaddr "${interface:-en0}" 2>/dev/null)
     [ -n "$mac_address" ] || { echo "error: cannot tell which of this Mac's addresses the host can reach"; return 1; }
@@ -691,7 +721,7 @@ do_setup() {
     run_guarded macos/gst-viewer/build.sh >> "$state/setup-mac.log" 2>&1 || { echo "error: the viewer did not build (see $state/setup-mac.log)"; exit 1; }
     echo "the host: copying this checkout's files"
     git ls-files -z | COPYFILE_DISABLE=1 tar --null -T - -czf - |
-        ssh -o BatchMode=yes -o ConnectTimeout=10 "$host_name" \
+        ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$host_name" \
             "LC_ALL=C bash -c 'D=\$(eval echo $host_dir); mkdir -p \$D/src \$D/run && chmod 700 \$D && tar -xzf - -C \$D/src 2> \$D/run/copy.log; s=\$?; grep -v \"extended header\" \$D/run/copy.log; exit \$s'" ||
         { echo "error: the copy did not reach the host"; exit 1; }
     on_host <<'HOST'
@@ -726,7 +756,7 @@ tail -1 "$D/run/build.log"
 grep -q "build: exit 0" "$D/run/build.log" || exit 1
 # The compositor plugin: a copy, read only, so that a later build of the plugin elsewhere leaves the
 # trial as it is.
-from=$(eval echo "$PLUGIN_FROM")
+from=$(home_path "$PLUGIN_FROM")
 [ -e "$from/libgstwaylanddisplaysrc.so" ] && [ -e "$from/libwaylanddisplaycore.so" ] ||
     { echo "host: no built compositor plugin in $PLUGIN_FROM (DAILY_PLUGIN_FROM)"; exit 1; }
 patches=$from/../../.istesso-patches
@@ -822,7 +852,7 @@ flow=""
 scroll=""
 grep -q "trial-y-scroll" "$plugin/patches.txt" 2>/dev/null && [ -f "$src/scripts/daily_scroll.py" ] && scroll="--scroll"
 config=""
-[ -n "$HOST_CONFIG" ] && config=$(eval echo "$HOST_CONFIG")
+[ -n "$HOST_CONFIG" ] && config=$(home_path "$HOST_CONFIG")
 # For AURA (--for aura): the application's own AURA slot (picture 4793N, input 4794N), 4:2:0 at 72
 # frames a second, the size AURA asks for, the pointer drawn into the picture, and the trial
 # identity that AURA is paired with (only read, shared). Its run is "aura-NAME"; everything else is
@@ -830,7 +860,7 @@ config=""
 APP=${NAME#aura-}
 pipe_options="--cursor --fps 85"
 if [ "$FOR" = aura ]; then
-    config=$(eval echo "$AURA_CONFIG")
+    config=$(home_path "$AURA_CONFIG")
     [ -s "$config/identity.key" ] || { echo "fail no trial identity for AURA in $AURA_CONFIG (pair AURA first)"; exit 1; }
     pipe_options="--chroma 420 --fps 72"
 fi
@@ -971,7 +1001,7 @@ PREFS
         # MOZ_CRASHREPORTER_DISABLE: no crash reporter at all.
         app="env XDG_CONFIG_HOME=$home/config XDG_CACHE_HOME=$home/cache XDG_DATA_HOME=$home/data XDG_STATE_HOME=$home/state GSETTINGS_BACKEND=keyfile MOZ_CRASHREPORTER_DISABLE=1 $firefox --no-remote --profile $profile${doc:+ $doc}" ;;
     blender)
-        blender=$(eval echo "$BLENDER")
+        blender=$(home_path "$BLENDER")
         [ -n "$blender" ] || blender=$(command -v blender)
         [ -n "$blender" ] || { [ -x "$HOME/.local/opt/blender/blender" ] && blender=$HOME/.local/opt/blender/blender; }
         [ -n "$blender" ] || blender=$(ls -d "$HOME"/*/blender-*-linux-x64/blender 2>/dev/null | sort | tail -1)
@@ -989,7 +1019,7 @@ PREFS
         if [ -n "$BLENDER_CONFIG" ]; then
             # A check's folder: kept under a key of its own, so that the trial's real one never
             # follows a check.
-            settings=$(eval echo "$BLENDER_CONFIG")
+            settings=$(home_path "$BLENDER_CONFIG")
             trial_location blender-check "$settings"
         else
             trial_location blender "$settings"
@@ -1526,7 +1556,7 @@ mac_script=${DAILY_MAC_SCRIPT:-"$HOME/link-proj-m4-daily/scripts/daily-mac.sh"}
 # connection only), unless ISTESSO_MAC_HOST says otherwise.
 export ISTESSO_MAC_HOST=${ISTESSO_MAC_HOST:-istesso-studio}
 mac_unreachable="Studio につながっていません（ssh studio のタブを開いてください）"
-mac_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=3 "$ISTESSO_MAC_HOST" true > /dev/null 2>&1; }
+mac_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=3 -- "$ISTESSO_MAC_HOST" true > /dev/null 2>&1; }
 on_mac() { # COMMAND [ARGUMENTS...]
     [ -x "$mac_script" ] || { echo "error: the Mac host's script is not there: $mac_script (DAILY_MAC_SCRIPT)"; return 1; }
     if [ -n "${DAILY_DRY_RUN:-}" ]; then

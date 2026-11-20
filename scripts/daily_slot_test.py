@@ -259,6 +259,97 @@ class AnApplicationThatEndedByItself(unittest.TestCase):
         self.assertEqual(self.host('app_ended "$D/run/firefox" && echo ended || echo runs\n'), "runs")
 
 
+class TheHostGetsTheSettingsAsTheyAre(unittest.TestCase):
+    """The command line that ssh hands to the host's login shell: every value arrives as it was
+    given and nothing in it is run (an ssh stand-in writes down its arguments; the line is then run
+    by this machine's bash, and zsh when there is one, as the host's login shell would)."""
+
+    setUp_slots = WindowsFollowTheSlot.setUp
+    stop_stand_ins = WindowsFollowTheSlot.stop_stand_ins
+    open = WindowsFollowTheSlot.open
+
+    def setUp(self):
+        self.setUp_slots()
+        work = self.folder.name
+        self.calls = os.path.join(work, "calls")
+        os.makedirs(self.calls)
+        write(os.path.join(work, "bin", "ssh"),
+              "#!/bin/bash\nfor a in \"$@\"; do [ \"$a\" = -G ] && { echo 'hostname stand-in-host'; exit 0; }; done\n"
+              "n=$(ls \"$CALLS\" | wc -l | tr -d ' ')\nprintf '%s\\0' \"$@\" > \"$CALLS/$n\"\n"
+              "cat > /dev/null\ncat \"$ANSWER\"\n", 0o700)
+        self.home = os.path.join(work, "home")
+        os.makedirs(self.home)
+        self.mark = os.path.join(work, "ran")
+        self.env.update(CALLS=self.calls)
+
+    def lines(self):
+        """The arguments of each ssh call, in order."""
+        calls = []
+        for n in sorted(os.listdir(self.calls), key=int):
+            with open(os.path.join(self.calls, n), "rb") as f:
+                calls.append(f.read().decode().split("\0")[:-1])
+        return calls
+
+    def received(self, shell, line):
+        """What the host's part would get in its environment, the line run by SHELL."""
+        self.assertTrue(line.endswith("; bash -s"), line)
+        done = subprocess.run([shell, "-c", line[:-len("; bash -s")] + "; env -0"], capture_output=True,
+                              env={"HOME": self.home, "PATH": os.environ["PATH"]}, cwd=self.folder.name)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return dict(item.split("=", 1) for item in done.stdout.decode().split("\0") if "=" in item)
+
+    def test_nothing_in_a_value_is_run_on_the_host(self):
+        hostile = f"~/a b$(touch {self.mark})`touch {self.mark}`; touch {self.mark} 'q\""
+        self.env.update(DAILY_HOST_CONFIG=hostile, DAILY_HOST_DIR="~/trial dir", DAILY_BLENDER=hostile)
+        self.open("firefox", 1)
+        calls = self.lines()
+        self.assertTrue(calls)
+        for args in calls:
+            # The host's name is never read as an option of ssh.
+            self.assertEqual(args[args.index("--") + 1], "stand-in-host", args)
+        shells = ["bash"] + (["zsh"] if shutil.which("zsh") else [])
+        for shell in shells:
+            got = self.received(shell, calls[0][-1])
+            self.assertFalse(os.path.exists(self.mark), f"{shell} ran a part of a value")
+            self.assertEqual(got["HOST_CONFIG"], hostile)
+            self.assertEqual(got["BLENDER"], hostile)
+            self.assertEqual(got["NAME"], "firefox")
+            self.assertEqual(got["SIZE"], "1720x720")
+            self.assertEqual(got["MIN_QP"], "18")
+            self.assertEqual(got["NAMES"].split(), ["firefox", "blender", "editor", "chrome", "aura-editor",
+                                                    "aura-firefox", "aura-blender", "aura-chrome"])
+            # A folder's leading ~ arrives as it is too: home_path reads it on the host.
+            self.assertEqual(got["DAILY_DIR"], "~/trial dir")
+
+    def test_a_size_or_layout_of_another_form_stops_everything_at_once(self):
+        for setting, value in (("SIZE", "1720x720; touch x"), ("SIZE", "big"), ("LAYOUT", "us;x"),
+                               ("LAYOUT", "$(x)")):
+            env = dict(self.env, **{setting: value})
+            done = subprocess.run([self.daily, "list"], env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+            self.assertIn(f"error: {setting} is", done.stdout)
+            self.assertEqual(os.listdir(self.calls), [])
+
+
+class TheHostReadsAFolderWithoutRunningIt(unittest.TestCase):
+    def test_home_path(self):
+        found = re.search(r"^home_path\(\) \{.*?^\}$", host_library(), re.S | re.M).group(0)
+        with tempfile.TemporaryDirectory() as home:
+            mark = os.path.join(home, "ran")
+
+            def path(value):
+                done = subprocess.run(["bash", "-c", found + '\nhome_path "$1"', "-", value], capture_output=True,
+                                      text=True, env={"HOME": home, "PATH": os.environ["PATH"]})
+                return done.stdout.rstrip("\n")
+
+            self.assertEqual(path("~"), home)
+            self.assertEqual(path("~/a b"), os.path.join(home, "a b"))
+            self.assertEqual(path("/opt/x"), "/opt/x")
+            self.assertEqual(path(f"$(touch {mark})"), f"$(touch {mark})")
+            self.assertEqual(path(f"~/`touch {mark}`"), os.path.join(home, f"`touch {mark}`"))
+            self.assertFalse(os.path.exists(mark))
+
+
 class TheTakenPortIsSaidPlainly(unittest.TestCase):
     def test_the_pattern_matches_what_the_agent_says(self):
         with open(SCRIPT) as f:
