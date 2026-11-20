@@ -146,7 +146,7 @@ impl PeerStore {
     /// list as it was left on disk.
     fn change<T>(&mut self, apply: impl FnOnce(&mut Vec<Peer>) -> Result<(T, bool)>) -> Result<T> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::identity::create_private_dir(parent)?;
         }
         let _lock = StoreLock::take(&self.path)?;
         let mut peers = read_peers(&self.path)?;
@@ -702,6 +702,30 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&path.with_file_name("peers.json.lock")), 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_of_a_new_store_is_its_owners_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_store("folder");
+        let dir = path.parent().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        PeerStore::open(&path)
+            .unwrap()
+            .add(Peer::from_hello(&hello("mac", 1)))
+            .unwrap();
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        // A folder that was already there keeps its mode.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        PeerStore::open(&path)
+            .unwrap()
+            .add(Peer::from_hello(&hello("pad", 2)))
+            .unwrap();
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -49,6 +49,9 @@ impl Identity {
     pub fn load_or_create(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
+                if let Some(parent) = path.parent() {
+                    warn_once_if_open(parent);
+                }
                 let seed: [u8; 32] = from_hex(text.trim())
                     .and_then(|bytes| bytes.try_into().ok())
                     .ok_or_else(|| {
@@ -59,7 +62,7 @@ impl Identity {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let identity = Identity::generate();
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    create_private_dir(parent)?;
                 }
                 write_private(path, to_hex(&identity.signing.to_bytes()).as_bytes())?;
                 Ok(identity)
@@ -67,6 +70,58 @@ impl Identity {
             Err(err) => Err(err.into()),
         }
     }
+}
+
+/// Makes the folder that holds the identity and the list of paired devices,
+/// for its owner only (0700), when it is not there yet. A folder that is
+/// already there is left as it is, and warned about once when others may write
+/// into it.
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    warn_once_if_open(dir);
+    Ok(())
+}
+
+/// The mode of `dir` when its group or other users may write into it: whoever
+/// can do that can put a device of their own into the list of paired devices,
+/// or replace this device's identity.
+#[cfg(unix)]
+pub(crate) fn open_to_others(dir: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(dir).ok()?.permissions().mode() & 0o7777;
+    (mode & 0o022 != 0).then_some(mode)
+}
+
+/// Says once in a process, on the standard error, that the folder `dir` is
+/// open to others. Nothing is changed: the folder is the owner's.
+pub(crate) fn warn_once_if_open(dir: &Path) {
+    #[cfg(unix)]
+    {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WARNED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if let Some(mode) = open_to_others(dir) {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "warning: other users may write into {} (mode {mode:o}); `chmod 700` it so that nobody else can add a paired device or replace this device's identity",
+                    dir.display()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Writes a file that only its owner can read.
@@ -132,6 +187,38 @@ mod tests {
         assert_eq!(fp.len(), 19);
         assert_eq!(fp.matches('-').count(), 3);
         assert_ne!(fp, Identity::from_seed([2u8; 32]).fingerprint());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_folder_is_made_for_its_owner_only_and_an_old_one_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let base =
+            std::env::temp_dir().join(format!("istesso-pair-identity-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Made here, two levels deep: both levels are the owner's only.
+        let fresh = base.join("made").join("istesso");
+        Identity::load_or_create(&fresh.join("identity.key")).unwrap();
+        assert_eq!(mode(&fresh) & 0o077, 0, "{:o}", mode(&fresh));
+        assert_eq!(mode(fresh.parent().unwrap()) & 0o077, 0);
+        assert_eq!(open_to_others(&fresh), None);
+
+        // Already there and open to the group: kept as it was, and told as open.
+        let open = base.join("open");
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        Identity::load_or_create(&open.join("identity.key")).unwrap();
+        Identity::load_or_create(&open.join("identity.key")).unwrap();
+        assert_eq!(mode(&open), 0o770);
+        assert_eq!(open_to_others(&open), Some(0o770));
+        // Writable by others only, too.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o702)).unwrap();
+        assert_eq!(open_to_others(&open), Some(0o702));
+        // Readable by others is not what this is about: they cannot change anything.
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(open_to_others(&open), None);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
