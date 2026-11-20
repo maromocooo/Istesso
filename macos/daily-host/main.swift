@@ -3496,10 +3496,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             return done(nil)
         }
         opening = true
-        let done: (String?) -> Void = { why in self.opening = false; done(why) }
         // The pump of this stream, taken now: everything below, the frames too, goes to it on its
         // own queue, never to a pump a new stream (a resize) made meanwhile.
         let pump: Pump = self.pump
+        // This open ends the opening only while its pump is still the stream's: after a new
+        // stream, that stream's own open may be on its way (place() must not start another).
+        let done: (String?) -> Void = { why in
+            if self.pump === pump { self.opening = false }
+            done(why)
+        }
         pump.queue.async {
             if let why = pump.open() {
                 return DispatchQueue.main.async { done("no encoder could be opened: \(why)") }
