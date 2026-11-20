@@ -97,7 +97,13 @@ plan)
     say "  start    an agent on ${NEXT_BIND:?}:$PORT (main editor $((PORT + 1))-$((PORT + 2)), scope questions $((PORT + 3))),"
     say "           until $(date -d "@${NEXT_UNTIL:?}" '+%F %H:%M') or the rollback; stopped while the measuring signal is busy"
     say "  keep     the record in $(short "$KEEP")/<stamp>/"
-    say "  untouched: the day agent (port 26850) and its folder; nothing else is written"
+    say "  while it is used: the agent's own folder in the runtime folder (istesso-<uid>-<hash>, until logout),"
+    say "           the main editor's folder for each start there (the names of the files it opened and the"
+    say "           full text of its drafts; until logout), the NVIDIA driver's cache in ~/.nv, and the history"
+    say "           of the ish shells (they are your own login shell)"
+    say "  after the rollback: the copy of the test identity and the scope's test keys stay in"
+    say "           $(short "$KEEP")/<stamp>/removed/ (0700); nothing is deleted"
+    say "  untouched: the day agent (port 26850) and its folder"
     if listening; then say "  STOP: port $PORT is in use on the host"; fi
     ;;
 install)
@@ -171,6 +177,7 @@ rollback)
         say "host: not installed"
         exit 0
     fi
+    [ "$(head -c 4 "$signal" 2>/dev/null)" = busy ] && fail "the measuring signal is busy on the host: nothing was done"
     stamp=$(cat "$KEEP/current")
     rec=$KEEP/$stamp
     read -r kind dir < "$rec/record"

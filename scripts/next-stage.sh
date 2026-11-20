@@ -127,9 +127,27 @@ host() { # ACTION [NEXT_KEY=VALUE...]
         NEXT_EDITOR_PLUGIN="$NEXT_HOST_EDITOR_PLUGIN" "$@"; do
         words+=("$(printf '%q' "$w")")
     done
+    # The package's copy (checked against its SHA256SUMS by install), not the working copy; only
+    # the plan, which writes nothing, falls back to the working copy before a package is made.
+    local script=$pkg/next-stage-host.sh
+    [ -f "$script" ] || script=$here/scripts/next-stage-host.sh
     # shellcheck disable=SC2029
     /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=10 "$NEXT_HOST" \
-        "env LC_ALL=C $NEXT_HOST_ENV bash -s -- ${words[*]}" < "$here/scripts/next-stage-host.sh"
+        "env LC_ALL=C $NEXT_HOST_ENV bash -s -- ${words[*]}" < "$script"
+}
+
+# The worktree as committed: install and rollback run only from a clean one (review: the install
+# said one commit and could run another one's code).
+check_clean() {
+    [ -z "$(git -C "$here" status --porcelain)" ] ||
+        fail "the worktree $here has changes that are not committed (git status): nothing was done"
+}
+started_of() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+written_runs() { # FILE: the process written there (number and start time) still runs
+    local pid started
+    [ -s "$1" ] || return 1
+    read -r pid started < "$1"
+    [ -n "$pid" ] && [ -n "$started" ] && [ "$(started_of "$pid")" = "$started" ]
 }
 
 # The Mac's entries: what the install writes here. One line each: KIND TAB PATH.
@@ -263,13 +281,17 @@ plan() {
         echo "  mounts   at $(short "$NEXT_MOUNT_ROOT")/ubuntu/<ID> (made, 0700, at the first mount; moved away by the rollback)"
     fi
     [ -n "$NEXT_FOLDERS" ] || echo "  (NEXT_FOLDERS is empty: no host folder is shown, no project name is known)"
-    echo "  kept     old copies and the record in $(short "$NEXT_KEEP")/<stamp>/"
+    echo "  kept     old copies and the record in $(short "$NEXT_KEEP")/<stamp>/ (0700); after the rollback"
+    echo "           it keeps them, and what was added (the copy of the test identity, the scope's test keys)"
+    echo "           in its removed/: nothing is deleted"
+    echo "  while it is used: ish-mount's locks, numbers and logs in this user's temporary folder"
     echo "  untouched: this Mac's Istesso identity and paired devices, $(short "$NEXT_BIN")/$NEXT_NAME-shell-only,"
     echo "             the everyday trial"
     host plan NEXT_UNTIL="$(until_epoch)" || echo "  (the host could not be asked)"
 }
 
 install() {
+    check_clean
     check_package
     check_signals
     [ -s "$NEXT_KEEP/current" ] && fail "an install is in place ($(short "$NEXT_KEEP")/$(cat "$NEXT_KEEP/current")); roll it back first"
@@ -285,6 +307,7 @@ install() {
         read -r answer || answer=
         [ "$answer" = yes ] || fail "not installed (nothing was changed)"
     fi
+    check_signals
     local stamp rec n=0 kind path
     stamp=$(date +%Y%m%d-%H%M%S)
     rec=$NEXT_KEEP/$stamp
@@ -296,9 +319,10 @@ install() {
     local v
     for v in NEXT_NAME NEXT_BIN NEXT_MOUNT_ROOT NEXT_FOLDERS NEXT_ZSH NEXT_AIR_DIR NEXT_PORT NEXT_HOST \
         NEXT_HOST_DIR NEXT_HOST_KEEP NEXT_HOST_FROM NEXT_HOST_EDITOR_SRC NEXT_HOST_EDITOR_PLUGIN \
-        NEXT_HOST_STAGE NEXT_HOST_ENV; do
+        NEXT_HOST_STAGE NEXT_HOST_ENV NEXT_STAGE NEXT_VIEWER_SRC; do
         echo "$v=$(q "${!v}")"
     done > "$rec/settings"
+    echo "NEXT_COMMIT=$commit" >> "$rec/settings"
     echo "$stamp" > "$NEXT_KEEP/current"
     half() { echo "next-stage: the install stopped half way: $*. \`scripts/next-stage.sh rollback\` undoes what was done." >&2; exit 1; }
     # Whether the mount place was there before (the rollback leaves it then).
@@ -393,11 +417,32 @@ rollback() {
     # shellcheck disable=SC1091
     [ -f "$rec/settings" ] && . "$rec/settings"
     AD=$NEXT_AIR_DIR
+    # The host's half of the install's own package.
+    commit=${NEXT_COMMIT:-$commit}
+    pkg=$NEXT_STAGE/$commit
+    check_clean
     busy_here && fail "the measuring signal is busy on this Mac: nothing was done"
-    # Nothing of the stage may still run here: a shell, a mount.
+    # Nothing of the stage may still run here: a shell, the scope's answering form, a mount.
     if ps -axo command= | grep -F -- "$AD/bin/istesso shell" | grep -v -F grep > /dev/null; then
         fail "a shell of the stage is still open here: exit it, then roll back again (nothing was done)"
     fi
+    if ps -axo command= | grep -F -- "$AD/bin/istesso-scope answer" | grep -v -F grep > /dev/null; then
+        fail "scope-answer of the stage still runs here: stop it (Control-C), then roll back again (nothing was done)"
+    fi
+    # The main editor's windows here and their relays (they outlive a shell whose terminal was
+    # killed): closed by the opener's own records, then looked at again.
+    local vdir f
+    for vdir in "$AD/viewer" "$AD"/viewer/shell-*; do
+        [ -d "$vdir" ] || continue
+        EDITOR_VIEWER_SRC="$NEXT_VIEWER_SRC" EDITOR_VIEWER_DIR="$vdir" "$AD/scripts/proto-editor-viewer.sh" stop > /dev/null 2>&1
+    done
+    for vdir in "$AD/viewer" "$AD"/viewer/shell-*; do
+        for f in viewer.pid relay.pid; do
+            for _ in 1 2 3 4 5 6 7 8 9 10; do written_runs "$vdir/$f" || break; sleep 0.3; done
+            written_runs "$vdir/$f" &&
+                fail "a window of the main editor (or its relay) did not close: close it, then roll back again (nothing else was done)"
+        done
+    done
     local id
     for id in $(mount | sed -n "s|.* on $NEXT_MOUNT_ROOT/ubuntu/\([^ /]*\) (.*|\1|p"); do
         ISH_DIR="$AD" ISH_PORT="$NEXT_PORT" ISTESSO_MOUNT_ROOT="$NEXT_MOUNT_ROOT" "$AD/scripts/ish-mount" --release "$id" > /dev/null 2>&1
@@ -412,7 +457,14 @@ rollback() {
     while IFS=$'\t' read -r kind i sha_old mode_old _ path; do
         case "$kind" in
         replace)
-            if [ -e "$path" ] || [ -L "$path" ]; then mv "$path" "$rec/removed/$i" || fail "cannot move $(short "$path") away"; fi
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                local away=$rec/removed/$i
+                [ -e "$away" ] && away=$away.$(date +%s)
+                if [ -f "$rec/new-$i" ] && [ "$(sha "$path")" != "$(sha "$rec/new-$i")" ]; then
+                    echo "  note: $(short "$path") was changed after the install; that version is in $(short "$away")"
+                fi
+                mv "$path" "$away" || fail "cannot move $(short "$path") away"
+            fi
             cp -p "$rec/old/$i" "$path" || fail "cannot put $(short "$path") back"
             if [ "$(sha "$path")" = "$sha_old" ] && [ "$(mode "$path")" = "$mode_old" ]; then
                 echo "  put back  $(short "$path")   (sha256 $(echo "$sha_old" | cut -c1-12)…, as before)"
@@ -434,6 +486,7 @@ rollback() {
     echo "rolled-back $(date +%s)" >> "$rec/record"
     : > "$NEXT_KEEP/current"
     echo "this Mac: as before the install (the old and the new copies stay in $(short "$rec"))"
+    echo "A terminal that read the new cd-switch.zsh keeps it: open a new terminal."
 }
 
 status() {
@@ -467,11 +520,18 @@ stage() {
     cp -p "$here/scripts/dev/ish-mount" "$pkg.part/ish-mount"
     cp -p "$here/scripts/dev/cd-switch.zsh" "$pkg.part/cd-switch.zsh"
     cp -p "$here/scripts/proto-editor-viewer.sh" "$pkg.part/proto-editor-viewer.sh"
+    cp -p "$here/scripts/next-stage-host.sh" "$pkg.part/next-stage-host.sh"
     (cd "$pkg.part" && shasum -a 256 istesso istesso-scope unified-mount-proto ish ish-mount cd-switch.zsh \
-        proto-editor-viewer.sh > SHA256SUMS)
+        proto-editor-viewer.sh next-stage-host.sh > SHA256SUMS)
     [ -e "$pkg" ] && mv "$pkg" "$pkg.old-$(date +%s)"
     mv "$pkg.part" "$pkg"
     echo "building on the host ($commit)"
+    # rsync --delete goes there: only a folder of its own below ~/istesso-scratch/.
+    case "$NEXT_HOST_SRC" in
+    *..* | *' '*) fail "NEXT_HOST_SRC: no .. and no blanks" ;;
+    '~/istesso-scratch/'?*/?*) ;;
+    *) fail "NEXT_HOST_SRC must be a folder below ~/istesso-scratch/<name>/ (it is synced with --delete)" ;;
+    esac
     /usr/bin/rsync -a --delete --exclude target --exclude .git "$here/" "$NEXT_HOST:${NEXT_HOST_SRC#'~/'}/" ||
         fail "cannot copy the source to the host"
     /usr/bin/ssh -o BatchMode=yes "$NEXT_HOST" "LC_ALL=C bash -s -- $commit ${NEXT_HOST_SRC#'~/'} ${NEXT_HOST_TARGET#'~/'} ${NEXT_HOST_STAGE#'~/'}" <<'HOST' || fail "the host's build failed"
