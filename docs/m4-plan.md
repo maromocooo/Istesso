@@ -177,8 +177,8 @@ Mac mini の映像の出力を、何につなぐか：
 # Mac mini：コードと、Air で打つコマンドが表示される
 istesso pair host
 
-# Air：表示されたコマンドをそのまま実行する（アドレスは、Mac mini の有線のもの）
-istesso pair join <Mac mini のアドレス> <コード>
+# Air：表示されたコマンドをそのまま実行し、聞かれたらコードを打つ（アドレスは、Mac mini の有線のもの）
+istesso pair join <Mac mini のアドレス>
 
 # 両方で、エージェントを動かしたままにする
 istesso agent

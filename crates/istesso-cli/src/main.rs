@@ -363,8 +363,10 @@ enum PairAction {
     Join {
         /// Address of the waiting device, e.g. `studio.local` or `192.168.1.20:47800`
         address: String,
-        /// The code shown on the other device
-        code: String,
+        /// The code shown on the other device. Asked for when it is left out,
+        /// which is better: other users of this machine can read a command line
+        /// (`ps`), and the shell keeps it in its history.
+        code: Option<String>,
         /// Name to present to the other device (default: the host name)
         #[arg(long)]
         name: Option<String>,
@@ -1371,14 +1373,10 @@ fn run_pair(action: PairAction) -> Result<(), String> {
 
             println!("Pairing code: {code}");
             println!("On the other device run:");
-            for line in join_commands(
-                &istesso_doctor::lan_addresses(),
-                port,
-                &name,
-                &code.to_string(),
-            ) {
+            for line in join_commands(&istesso_doctor::lan_addresses(), port, &name) {
                 println!("  {line}");
             }
+            println!("and type the code when it is asked for.");
             println!("Waiting for up to {timeout} seconds. The code works once.");
 
             let (hello, remote) = tcp::host(
@@ -1408,6 +1406,13 @@ fn run_pair(action: PairAction) -> Result<(), String> {
             // As above: `add` reads the file again before it writes.
             let mut peers = open_peers()?;
             let name = name.unwrap_or_else(istesso_doctor::hostname);
+            let code = match code {
+                Some(code) => {
+                    eprintln!("note: {CODE_ON_THE_LINE}");
+                    code
+                }
+                None => ask_for_code()?,
+            };
             let code = PairCode::parse(&code).map_err(|e| e.to_string())?;
             let addr = resolve(&address, tcp::DEFAULT_PORT)?;
 
@@ -1427,8 +1432,41 @@ fn run_pair(action: PairAction) -> Result<(), String> {
     }
 }
 
-/// The commands to show while waiting for another device to join.
-fn join_commands(addresses: &[String], port: u16, name: &str, code: &str) -> Vec<String> {
+/// Said when the pairing code is given on the command line (kept for scripts).
+const CODE_ON_THE_LINE: &str = "a code on the command line can be read by other users of this machine (`ps`) and stays in the shell's history; leave it out to be asked for it";
+
+/// Asks for the pairing code on the terminal, or reads it from the first line
+/// of the standard input when that is not a terminal (a script).
+fn ask_for_code() -> Result<String, String> {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    let asking = stdin.is_terminal();
+    read_code(stdin.lock(), asking.then(std::io::stderr))
+}
+
+/// The code typed on the first line of `input`, after `prompt` was shown.
+fn read_code(
+    mut input: impl std::io::BufRead,
+    prompt: Option<impl std::io::Write>,
+) -> Result<String, String> {
+    if let Some(mut prompt) = prompt {
+        let _ = write!(prompt, "Pairing code shown on the other device: ");
+        let _ = prompt.flush();
+    }
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .map_err(|e| format!("cannot read the pairing code: {e}"))?;
+    let code = line.trim();
+    if code.is_empty() {
+        return Err("no pairing code was given".to_string());
+    }
+    Ok(code.to_string())
+}
+
+/// The commands to show while waiting for another device to join. The code is
+/// not in them: it is typed when asked for, so that it shows nowhere else.
+fn join_commands(addresses: &[String], port: u16, name: &str) -> Vec<String> {
     let target = |address: &str| {
         if port == tcp::DEFAULT_PORT {
             address.to_string()
@@ -1438,7 +1476,7 @@ fn join_commands(addresses: &[String], port: u16, name: &str, code: &str) -> Vec
     };
     if addresses.is_empty() {
         return vec![format!(
-            "istesso pair join {} {code}",
+            "istesso pair join {}",
             target(&format!("<address of {name}>"))
         )];
     }
@@ -1447,7 +1485,7 @@ fn join_commands(addresses: &[String], port: u16, name: &str, code: &str) -> Vec
         .enumerate()
         .map(|(index, address)| {
             let prefix = if index == 0 { "" } else { "or: " };
-            format!("{prefix}istesso pair join {} {code}", target(address))
+            format!("{prefix}istesso pair join {}", target(address))
         })
         .collect()
 }
@@ -2572,22 +2610,61 @@ mod tests {
 
     #[test]
     fn pairing_shows_commands_that_can_be_typed_as_they_are() {
-        let two = vec!["192.168.1.23".to_string(), "10.0.0.5".to_string()];
+        let two = vec!["192.0.2.23".to_string(), "198.51.100.5".to_string()];
+        // The code is not in them: it is asked for, and shows nowhere else.
         assert_eq!(
-            join_commands(&two, tcp::DEFAULT_PORT, "air", "ABCD-EFGH"),
+            join_commands(&two, tcp::DEFAULT_PORT, "air"),
             vec![
-                "istesso pair join 192.168.1.23 ABCD-EFGH",
-                "or: istesso pair join 10.0.0.5 ABCD-EFGH"
+                "istesso pair join 192.0.2.23",
+                "or: istesso pair join 198.51.100.5"
             ]
         );
         assert_eq!(
-            join_commands(&two[..1], 5000, "air", "ABCD-EFGH"),
-            vec!["istesso pair join 192.168.1.23:5000 ABCD-EFGH"]
+            join_commands(&two[..1], 5000, "air"),
+            vec!["istesso pair join 192.0.2.23:5000"]
         );
         assert_eq!(
-            join_commands(&[], tcp::DEFAULT_PORT, "air", "ABCD-EFGH"),
-            vec!["istesso pair join <address of air> ABCD-EFGH"]
+            join_commands(&[], tcp::DEFAULT_PORT, "air"),
+            vec!["istesso pair join <address of air>"]
         );
+    }
+
+    #[test]
+    fn the_pairing_code_is_asked_for_when_it_is_left_out() {
+        // On a terminal: asked for, and the line typed is the code.
+        let mut shown = Vec::new();
+        assert_eq!(
+            read_code(&b" abcd-efgh \n"[..], Some(&mut shown)).unwrap(),
+            "abcd-efgh"
+        );
+        assert!(String::from_utf8(shown).unwrap().contains("Pairing code"));
+        // From a script: the first line, nothing shown.
+        assert_eq!(
+            read_code(&b"ABCDEFGH\nmore\n"[..], None::<Vec<u8>>).unwrap(),
+            "ABCDEFGH"
+        );
+        // Nothing typed: an error, not an empty code.
+        assert!(read_code(&b"\n"[..], None::<Vec<u8>>).is_err());
+        assert!(read_code(&b""[..], None::<Vec<u8>>).is_err());
+    }
+
+    #[test]
+    fn a_code_given_on_the_line_is_still_taken() {
+        let cli =
+            Cli::try_parse_from(["istesso", "pair", "join", "host.local", "ABCD-EFGH"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pair {
+                action: PairAction::Join { code: Some(ref code), .. }
+            } if code == "ABCD-EFGH"
+        ));
+        let cli = Cli::try_parse_from(["istesso", "pair", "join", "host.local"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pair {
+                action: PairAction::Join { code: None, .. }
+            }
+        ));
     }
 
     #[test]
