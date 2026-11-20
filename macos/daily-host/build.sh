@@ -25,11 +25,15 @@ output=${1:-"$here/build"}
 bundle="$output/Istesso Dev Daily Host.app"
 
 (cd "$repo" && cargo build --release -p istesso-media >&2)
+# Where cargo put the library: CARGO_TARGET_DIR when it is set (relative to the checkout, as cargo
+# takes it here), else the checkout's own target folder.
+target_dir=${CARGO_TARGET_DIR:-"$repo/target"}
+case "$target_dir" in /*) ;; *) target_dir="$repo/$target_dir" ;; esac
 mkdir -p "$bundle/Contents/MacOS"
 swiftc -O -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.2 \
     -import-objc-header "$here/bridge.h" -I "$repo/crates/istesso-media/include" \
     -o "$bundle/Contents/MacOS/istesso-daily-host" "$here/main.swift" "$here/keys.swift" "$here/clipboard.swift" "$here/inline.swift" "$here/windows.swift" "$here/../input-method/wire.swift" \
-    "$repo/target/release/libistesso_media.a" -liconv \
+    "$target_dir/release/libistesso_media.a" -liconv \
     -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
     -framework AppKit -framework ApplicationServices -framework Carbon -framework Security
 # The rule of the session form, tested without any window or permission.
