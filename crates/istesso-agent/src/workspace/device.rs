@@ -148,6 +148,9 @@ struct Inner {
     control: Mutex<Option<PathBuf>>,
     /// [`HEAD_WITHIN`], in milliseconds; tests change it.
     head_within_ms: AtomicU64,
+    /// Who is at the other end of a connection: [`super::peer::of`]; tests
+    /// change it.
+    who: Mutex<fn(&TcpStream) -> super::peer::Peer>,
 }
 
 /// The forwards of one shell.
@@ -191,6 +194,7 @@ impl Forwarder {
             state: Mutex::new(State::default()),
             control: Mutex::new(None),
             head_within_ms: AtomicU64::new(HEAD_WITHIN.as_millis() as u64),
+            who: Mutex::new(super::peer::of),
         });
         match control_socket(paths) {
             Ok((path, listener)) => {
@@ -579,7 +583,8 @@ fn take(inner: &Inner, entry: &Entry, mut stream: TcpStream) {
     *entry.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
     // Before a byte is read: another user's program is not let through to
     // the host's port (the person's decision, 2026-11-20).
-    let peer = super::peer::of(&stream);
+    let who = *inner.who.lock().unwrap_or_else(|e| e.into_inner());
+    let peer = who(&stream);
     if peer != super::peer::Peer::ThisUser {
         entry.other_user.fetch_add(1, Ordering::SeqCst);
         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -991,7 +996,11 @@ mod tests {
         let soon = |what: &dyn Fn() -> bool| {
             let began = std::time::Instant::now();
             while !what() {
-                assert!(began.elapsed() < Duration::from_secs(5));
+                assert!(
+                    began.elapsed() < Duration::from_secs(5),
+                    "{:?}",
+                    shown(&forwarder.inner).forwards[0]
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
@@ -1054,6 +1063,74 @@ mod tests {
             "{lasted:?}"
         );
         assert_eq!(shown(&forwarder.inner).forwards[0].turned_away, 2);
+        drop(forwarder);
+        std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_connection_from_another_users_program_is_closed_before_anything_is_read() {
+        use istesso_link::forward::ForwardedPort;
+        let device = crate::testing::TempDir::new("fwd-users");
+        let notices = Arc::new(Mutex::new(Vec::<String>::new()));
+        let heard = notices.clone();
+        let forwarder = Forwarder::new(
+            &device.paths(),
+            "a host",
+            "an id",
+            // Never reached: a refused connection goes no further.
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Settings {
+                enabled: true,
+                ..Settings::default()
+            },
+            Arc::new(move |line: &str| heard.lock().unwrap().push(line.to_string())),
+        )
+        .unwrap();
+        // As the system would answer for a program of another user.
+        *forwarder.inner.who.lock().unwrap() = |_| super::super::peer::Peer::OtherUser;
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let there = probe.local_addr().unwrap().port();
+        drop(probe);
+        forwarder.update(PortList {
+            watching: true,
+            ports: vec![ForwardedPort {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                port: there,
+                family: 4,
+                process: String::new(),
+                exposed: false,
+            }],
+            ..PortList::default()
+        });
+        let here = shown(&forwarder.inner).forwards[0].here;
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(("127.0.0.1", here)).unwrap();
+            // A whole request for the right name: it is not looked at.
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut answer = Vec::new();
+            let _ = stream.read_to_end(&mut answer);
+            // Closed, without the 403 of the look.
+            assert!(answer.is_empty(), "{answer:?}");
+        }
+        let now = shown(&forwarder.inner).forwards[0].clone();
+        assert_eq!(
+            (now.other_user, now.refused, now.failed, now.connections),
+            (2, 0, 0, 2)
+        );
+        let said = notices.lock().unwrap().join("\n");
+        assert_eq!(
+            said.matches(&format!(
+                "refused a connection to localhost:{here}: it comes from a program of another user"
+            ))
+            .count(),
+            1,
+            "{said}"
+        );
         drop(forwarder);
         std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();
     }
