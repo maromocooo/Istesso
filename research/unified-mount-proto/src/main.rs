@@ -207,8 +207,9 @@ fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<(PathBuf, boo
     let machine = std::fs::canonicalize(&machine).map_err(|e| e.to_string())?;
     let point = machine.join(folder);
     if is_mounted(&point) {
+        // Not a "mount:" line: `ensure` shows those as the reasons for a failure.
         say!(
-            "mount: a mount was left at {}; taking it off",
+            "a mount was left at {}; taking it off if nothing uses it",
             point.display()
         );
         match glue::plain_unmount(&point) {

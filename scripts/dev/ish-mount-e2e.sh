@@ -104,7 +104,11 @@ case "${1:-}" in
         if mounted; then echo "FAIL still mounted"; exit 1; fi
         echo "ok not mounted"
         # The mount program ends within 2 s of its folder being unmounted.
+        # Its number is in its log (`release` removes the pid file of a mount it took off).
         pid=$(cat "$ISH_MOUNT_STATE"/*-"ubuntu=$FOLDER.pid" 2>/dev/null || true)
+        if [ -z "$pid" ]; then
+            pid=$(cat "$ISH_MOUNT_STATE"/*-"ubuntu=$FOLDER.log" 2>/dev/null | sed -n 's/^process: //p' | tail -1)
+        fi
         if [ -n "$pid" ]; then
             for _ in $(seq 40); do
                 kill -0 "$pid" 2>/dev/null || break
