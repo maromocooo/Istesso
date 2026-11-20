@@ -147,6 +147,117 @@ pub unsafe fn inherited(number: RawFd) -> io::Result<UnixDatagram> {
     Ok(ManuallyDrop::into_inner(socket))
 }
 
+/// Marks every descriptor of this process from 3 up as closed on starting a
+/// program, the end of a pair among them ([`inherited`] does that too).
+/// Whatever else this program was born with (a starter's own end, leaked to
+/// it by mistake, say) is then not passed on to the programs it starts.
+/// Descriptors that are open stay open here; only what a started program
+/// is born with changes. Call it at the start, after [`inherited`]. A
+/// descriptor this process hands to a program on purpose afterwards is
+/// handed over with [`hand_to_child`], which clears the mark in that one
+/// child only.
+pub fn pass_nothing_on() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // All at once (Linux 5.11 and later). Called through the system call
+        // number: the C library's own name for it is newer still.
+        // SAFETY: a call without pointers; the arguments are those the
+        // system documents.
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_uint,
+            )
+        };
+        if done == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        // An older system: one at a time, below.
+        if !matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+            return Err(err);
+        }
+    }
+    mark_one_at_a_time()
+}
+
+/// [`pass_nothing_on`], one descriptor after another.
+fn mark_one_at_a_time() -> io::Result<()> {
+    for number in open_descriptors()? {
+        if number >= 3 {
+            mark_closed_on_starting(number)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sets the mark on one descriptor; one that is not open (any more) is not
+/// an error.
+fn mark_closed_on_starting(number: RawFd) -> io::Result<()> {
+    // SAFETY: calls without pointers on a number; a number that is not open
+    // is answered with EBADF.
+    let flags = unsafe { libc::fcntl(number, libc::F_GETFD) };
+    if flags == -1 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::EBADF) => Ok(()),
+            _ => Err(err),
+        };
+    }
+    if flags & libc::FD_CLOEXEC != 0 {
+        return Ok(());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(number, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The numbers of this process's open descriptors, as the system lists
+/// them (macOS).
+#[cfg(target_os = "macos")]
+fn open_descriptors() -> io::Result<Vec<RawFd>> {
+    let info = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    // Asked twice: the size first, then the list, with room for a few more
+    // opened in between.
+    // SAFETY: a null buffer asks for the size only.
+    let size = unsafe { libc::proc_pidinfo(me, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut list: Vec<libc::proc_fdinfo> = Vec::with_capacity(size as usize / info + 16);
+    let room = (list.capacity() * info) as libc::c_int;
+    // SAFETY: `list` has room for `room` bytes, which the call fills in and
+    // whose length it returns.
+    let got =
+        unsafe { libc::proc_pidinfo(me, libc::PROC_PIDLISTFDS, 0, list.as_mut_ptr().cast(), room) };
+    if got <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call filled in `got` bytes of whole entries.
+    unsafe { list.set_len(got as usize / info) };
+    Ok(list.iter().map(|entry| entry.proc_fd).collect())
+}
+
+/// Every number a descriptor can have in this process (up to the limit on
+/// open files): where there is no list to ask, and on Linux before 5.11.
+#[cfg(not(target_os = "macos"))]
+fn open_descriptors() -> io::Result<Vec<RawFd>> {
+    // SAFETY: zeroed storage is a valid value to be filled in.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: `limit` is valid for the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let last = RawFd::try_from(limit.rlim_cur.min(1 << 20)).unwrap_or(1 << 20);
+    Ok((0..last).collect())
+}
+
 /// Keeps other programs of the same user out of this process, as far as the
 /// system offers it, and says whether it does.
 ///
@@ -234,6 +345,34 @@ mod tests {
         // SAFETY: an open descriptor.
         let flags = unsafe { libc::fcntl(taken.as_raw_fd(), libc::F_GETFD) };
         assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
+    /// A pipe this test makes without the mark stands for what a program
+    /// could be born with besides its end.
+    #[test]
+    fn nothing_else_is_passed_on() {
+        let mut ends = [0 as libc::c_int; 2];
+        // On Linux, the way for older systems too.
+        for mark in [pass_nothing_on, mark_one_at_a_time] {
+            // SAFETY: `ends` has room for the two numbers.
+            assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+            // SAFETY: open descriptors of this test.
+            let marked = |number| unsafe { libc::fcntl(number, libc::F_GETFD) } & libc::FD_CLOEXEC;
+            assert_eq!(marked(ends[0]), 0);
+            assert_eq!(marked(ends[1]), 0);
+            mark().unwrap();
+            assert_eq!(marked(ends[0]), libc::FD_CLOEXEC);
+            assert_eq!(marked(ends[1]), libc::FD_CLOEXEC);
+            // Still open: only what a started program is born with changed.
+            // SAFETY: as above; one byte from a valid buffer.
+            assert_eq!(unsafe { libc::write(ends[1], b"x".as_ptr().cast(), 1) }, 1);
+            // The standard descriptors are left as they are.
+            assert_eq!(marked(0), 0);
+            for number in ends {
+                // SAFETY: ours to close.
+                unsafe { libc::close(number) };
+            }
+        }
     }
 
     #[test]

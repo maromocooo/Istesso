@@ -682,6 +682,10 @@ fn born_with_input(number: i32) -> Result<std::os::unix::net::UnixDatagram, Stri
     // it could own at that number; whoever started the program gave it.
     let end = unsafe { istesso_agent::endpoint::inherited(number) }
         .map_err(|e| format!("cannot take input there: {e}"))?;
+    // Nor anything else it was born with: the programs this one starts
+    // (helpers found through PATH) get none of it.
+    istesso_agent::endpoint::pass_nothing_on()
+        .map_err(|e| format!("cannot keep what this program was born with to itself: {e}"))?;
     // The end is worth what the process is: no other program of the same
     // user gets to look into this one, where the system offers that. Where
     // it offers it and refuses, the end is not used.
