@@ -1,5 +1,6 @@
 //! `istesso` — the command line entry point of Istesso.
 
+mod launcher;
 mod projects;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
@@ -47,6 +48,11 @@ enum Command {
     Apps {
         #[command(subcommand)]
         action: AppsAction,
+    },
+    /// List and open applications from the launcher
+    Launcher {
+        #[command(subcommand)]
+        action: launcher::Action,
     },
     /// List projects and their development machines, or manage local registrations
     Projects {
@@ -464,7 +470,7 @@ fn permission_names(permissions: &[istesso_pair::Permission]) -> String {
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(message) => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
@@ -472,7 +478,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Command::Doctor { json } => {
             let paths = Paths::from_env();
@@ -501,6 +507,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         }
+        Command::Launcher { action } => return launcher::run(action),
         Command::Projects { action, name, json } => projects::run(action, name.as_deref(), json),
         Command::Apps { action } => run_apps(action),
         Command::Pair { action } => run_pair(action),
@@ -545,7 +552,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 timings.as_deref(),
             ),
         },
-    }
+    }?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The comparison of a run, cut into parts of equal length in the order the
