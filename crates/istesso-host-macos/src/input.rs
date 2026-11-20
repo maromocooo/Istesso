@@ -4,16 +4,19 @@
 //! Two halves. [`Translator`] is plain arithmetic and is tested: it turns
 //! events in the picture's pixels and Linux key numbers into the Mac's
 //! events, keeps track of which modifiers and buttons are held, and counts
-//! double clicks. [`post`] (macOS only) hands such an event to the system.
-//! Posting needs the Accessibility permission (ADR 0017) and **has not been
-//! run**: nothing here asks for the permission, and without it nothing is
-//! posted.
+//! double clicks. [`post`] (macOS only) hands such an event to the system,
+//! only where [`crate::confine`] said it may go: it takes that answer
+//! ([`Delivery`]) and refuses a drop, and a key at the session's tap
+//! ([`route`], tested on any machine). Posting needs the Accessibility
+//! permission (ADR 0017) and **has not been run**: nothing here asks for the
+//! permission, and without it nothing is posted.
 //!
 //! [`Event`] has the shape of `istesso_proto::InputEvent` on the branch of
 //! ADR 0007; once that is in `main`, this type goes and that one is used.
 
 use std::time::{Duration, Instant};
 
+use crate::confine::{Delivery, DropReason, Pid};
 use crate::keys;
 
 /// What a person did with the keyboard or the pointer.
@@ -250,6 +253,13 @@ pub enum PostError {
     NotAllowed,
     /// The system would not make the event.
     NotMade,
+    /// The policy (`crate::confine`) said the event is not delivered.
+    Dropped(DropReason),
+    /// A key or a modifier goes straight to the application's process only,
+    /// never at the session's tap (ADR 0017): refused.
+    KeyAtSessionTap,
+    /// No process to post to (an id that is not a process's).
+    NoProcess,
 }
 
 impl std::fmt::Display for PostError {
@@ -261,11 +271,42 @@ impl std::fmt::Display for PostError {
                  System Settings > Privacy & Security > Accessibility"
             ),
             PostError::NotMade => write!(f, "the system would not make the input event"),
+            PostError::Dropped(reason) => write!(f, "the input is not delivered: {reason:?}"),
+            PostError::KeyAtSessionTap => write!(
+                f,
+                "a key is sent only to the application's process, never at the session's tap"
+            ),
+            PostError::NoProcess => write!(f, "there is no process to send the input to"),
         }
     }
 }
 
 impl std::error::Error for PostError {}
+
+/// Where [`post`] hands an event, once the policy's answer is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Straight to this process (`CGEventPostToPid`).
+    Process(Pid),
+    /// At the session's tap (`CGEventPost`): pointer events only.
+    Session,
+}
+
+/// What [`post`] does with an event and the policy's answer for it, decided
+/// before anything is made or the permission is asked: straight to the
+/// process it names; at the session's tap only for the pointer, never a key
+/// (ADR 0017: keys and text go to the process); nothing for a drop.
+pub fn route(event: &Synthetic, delivery: Delivery) -> Result<Route, PostError> {
+    match delivery {
+        Delivery::ToProcess(pid) if pid > 0 => Ok(Route::Process(pid)),
+        Delivery::ToProcess(_) => Err(PostError::NoProcess),
+        Delivery::SessionTap => match event {
+            Synthetic::Key { .. } => Err(PostError::KeyAtSessionTap),
+            Synthetic::Mouse { .. } | Synthetic::Scroll { .. } => Ok(Route::Session),
+        },
+        Delivery::Drop(reason) => Err(PostError::Dropped(reason)),
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub use mac::{may_post, post};
@@ -274,7 +315,7 @@ pub use mac::{may_post, post};
 mod mac {
     use std::ffi::c_void;
 
-    use super::{Button, MouseKind, PostError, Synthetic};
+    use super::{route, Button, Delivery, MouseKind, PostError, Route, Synthetic};
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -323,6 +364,7 @@ mod mac {
         fn CGEventSetLocation(event: CGEventRef, at: CGPoint);
         fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
         fn CGEventPost(tap: u32, event: CGEventRef);
+        fn CGEventPostToPid(pid: i32, event: CGEventRef);
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -337,9 +379,12 @@ mod mac {
         unsafe { CGPreflightPostEventAccess() }
     }
 
-    /// Hands one event to the system. Refuses, without asking for it, when
-    /// the permission is missing.
-    pub fn post(event: &Synthetic) -> Result<(), PostError> {
+    /// Hands one event to the system, where the policy said it may go
+    /// (`crate::confine::Confine::decide`). Refuses a drop and a key at the
+    /// session's tap before anything is made ([`route`]); refuses, without
+    /// asking for it, when the permission is missing.
+    pub fn post(event: &Synthetic, delivery: Delivery) -> Result<(), PostError> {
+        let route = route(event, delivery)?;
         if !may_post() {
             return Err(PostError::NotAllowed);
         }
@@ -411,7 +456,10 @@ mod mac {
             if made.is_null() {
                 return Err(PostError::NotMade);
             }
-            CGEventPost(TAP_SESSION, made);
+            match route {
+                Route::Process(pid) => CGEventPostToPid(pid, made),
+                Route::Session => CGEventPost(TAP_SESSION, made),
+            }
             CFRelease(made.cast_const());
         }
         Ok(())
@@ -724,6 +772,101 @@ mod tests {
                 pressed: true,
                 flags: 0
             })
+        );
+    }
+
+    const KEY: Synthetic = Synthetic::Key {
+        key: 0x00,
+        pressed: true,
+        flags: 0,
+    };
+    const CLICK: Synthetic = Synthetic::Mouse {
+        kind: MouseKind::Down(Button::Left),
+        x: 10.0,
+        y: 10.0,
+        clicks: 1,
+        flags: 0,
+    };
+    const WHEEL: Synthetic = Synthetic::Scroll {
+        x: 10.0,
+        y: 10.0,
+        right: 0,
+        down: 3,
+        flags: 0,
+    };
+
+    #[test]
+    fn everything_goes_to_the_process_the_policy_names() {
+        for event in [KEY, CLICK, WHEEL] {
+            assert_eq!(
+                route(&event, Delivery::ToProcess(501)),
+                Ok(Route::Process(501))
+            );
+            assert_eq!(
+                route(&event, Delivery::ToProcess(0)),
+                Err(PostError::NoProcess)
+            );
+            assert_eq!(
+                route(&event, Delivery::ToProcess(-1)),
+                Err(PostError::NoProcess)
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_never_goes_at_the_session_tap() {
+        assert_eq!(
+            route(&KEY, Delivery::SessionTap),
+            Err(PostError::KeyAtSessionTap)
+        );
+        let release = Synthetic::Key {
+            key: 0x37,
+            pressed: false,
+            flags: 0,
+        };
+        assert_eq!(
+            route(&release, Delivery::SessionTap),
+            Err(PostError::KeyAtSessionTap)
+        );
+        assert_eq!(route(&CLICK, Delivery::SessionTap), Ok(Route::Session));
+        assert_eq!(route(&WHEEL, Delivery::SessionTap), Ok(Route::Session));
+    }
+
+    #[test]
+    fn a_drop_is_never_posted() {
+        for reason in [
+            DropReason::NoSessionApp,
+            DropReason::NotFrontmost,
+            DropReason::LockedSessionTap,
+            DropReason::SessionStateUnknown,
+            DropReason::OtherWindowOnTop,
+            DropReason::NoWindowUnderPoint,
+        ] {
+            for event in [KEY, CLICK, WHEEL] {
+                assert_eq!(
+                    route(&event, Delivery::Drop(reason)),
+                    Err(PostError::Dropped(reason))
+                );
+            }
+        }
+    }
+
+    /// The refusals come before anything is made or posted, so this runs
+    /// on the Mac without posting (whatever the permission is).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn post_refuses_before_anything_is_made() {
+        assert_eq!(
+            post(&KEY, Delivery::SessionTap),
+            Err(PostError::KeyAtSessionTap)
+        );
+        assert_eq!(
+            post(&CLICK, Delivery::Drop(DropReason::LockedSessionTap)),
+            Err(PostError::Dropped(DropReason::LockedSessionTap))
+        );
+        assert_eq!(
+            post(&WHEEL, Delivery::ToProcess(0)),
+            Err(PostError::NoProcess)
         );
     }
 

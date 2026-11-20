@@ -8,9 +8,10 @@
 //! delivered, or that it is dropped and for what reason. It posts nothing and
 //! needs no permission, so it is tested on any machine.
 //!
-//! The posting itself (`crate::input::post`, macOS only) must ask this module
-//! first and obey it. The reasons for the rule are in docs/m4-plan.md 5c and
-//! ADR 0017.
+//! The posting itself (`crate::input::post`, macOS only) takes this module's
+//! answer ([`Delivery`]) and goes only there: it refuses a drop, and a key at
+//! the session's tap (keys go to the process only, ADR 0017). The reasons for
+//! the rule are in docs/m4-plan.md 5c and ADR 0017.
 
 /// A process, by its id.
 pub type Pid = i32;
