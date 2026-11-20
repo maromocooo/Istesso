@@ -1446,15 +1446,18 @@ fn ask_for_code() -> Result<String, String> {
 
 /// The code typed on the first line of `input`, after `prompt` was shown.
 fn read_code(
-    mut input: impl std::io::BufRead,
+    input: impl std::io::BufRead,
     prompt: Option<impl std::io::Write>,
 ) -> Result<String, String> {
     if let Some(mut prompt) = prompt {
         let _ = write!(prompt, "Pairing code shown on the other device: ");
         let _ = prompt.flush();
     }
+    use std::io::BufRead;
+    // A code is a few characters; a line without an end is not read on and on.
     let mut line = String::new();
     input
+        .take(256)
         .read_line(&mut line)
         .map_err(|e| format!("cannot read the pairing code: {e}"))?;
     let code = line.trim();
@@ -2643,6 +2646,9 @@ mod tests {
             read_code(&b"ABCDEFGH\nmore\n"[..], None::<Vec<u8>>).unwrap(),
             "ABCDEFGH"
         );
+        // A line without an end is read only so far.
+        let long = vec![b'A'; 100_000];
+        assert_eq!(read_code(&long[..], None::<Vec<u8>>).unwrap().len(), 256);
         // Nothing typed: an error, not an empty code.
         assert!(read_code(&b"\n"[..], None::<Vec<u8>>).is_err());
         assert!(read_code(&b""[..], None::<Vec<u8>>).is_err());
