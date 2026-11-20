@@ -1866,6 +1866,8 @@ func selfTest() -> Never {
         checkPanel(before && !during && after, true, "keys: stopped after a Command chord until the key window is known again")
     }
     checkPanel(!keysMayGo(appInFront: true, focused: shownWin, shown: shownWin, shownIsFront: false), true, "keys: a window at the same place in front of the shown one does not pass")
+    checkPanel(keysMayGo(appInFront: true, focused: nil, shown: shownWin, shownIsFront: false, noWindowOnScreen: true), true, "keys: no window of the application on the screen at all, in front: keys reach its menus (Command-N)")
+    checkPanel(!keysMayGo(appInFront: false, focused: nil, shown: shownWin, shownIsFront: false, noWindowOnScreen: true), true, "keys: no window on the screen, not in front: nothing is sent")
     func chordRun(flush: Bool) -> (posted: Int, discarded: Int) {
         let injector = Injector()
         var posted = 0
@@ -2103,7 +2105,11 @@ func chordMayChangeWindow(_ code: UInt32) -> Bool { ![46, 47, 45, 44, 30, 38, 33
 /// Whether keys may go to the application now: it is in front, and the window keys go to (its
 /// focused window, by Accessibility) is the very window that is shown, by its place and size in
 /// the window list. Otherwise typed text would land in a window nobody sees.
-func keysMayGo(appInFront: Bool, focused: CGRect?, shown: CGRect, shownIsFront: Bool = true) -> Bool {
+/// One exception: the application is in front and has no window of layer 0 on the screen at all
+/// (the last shown one was closed or minimised). Then there is no window for text to land in;
+/// keys reach only its menus, so that Command-N can make a window, which becomes the shown one.
+func keysMayGo(appInFront: Bool, focused: CGRect?, shown: CGRect, shownIsFront: Bool = true, noWindowOnScreen: Bool = false) -> Bool {
+    if appInFront && noWindowOnScreen { return true }
     guard appInFront, shownIsFront, let focused, shown != .zero else { return false }
     return abs(focused.minX - shown.minX) < 2 && abs(focused.minY - shown.minY) < 2
         && abs(focused.width - shown.width) < 2 && abs(focused.height - shown.height) < 2
@@ -2891,10 +2897,15 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     guard let self else { return false }
                     // The shown window must also be the application's front window in the window list (a
                     // window opened at exactly the same place does not pass for it).
-                    let pid = self.app?.processIdentifier
-                    let front = windowList().first { $0.pid == pid && $0.layer == 0 && $0.onScreen && $0.bounds.width > 40 && $0.bounds.height > 40 }?.id
+                    guard let pid = self.app?.processIdentifier else { return false }
+                    let list = windowList()
+                    let front = list.first { $0.pid == pid && $0.layer == 0 && $0.onScreen && $0.bounds.width > 40 && $0.bounds.height > 40 }?.id
+                    // No window of layer 0 on the screen at all, of any size (the last one closed or
+                    // minimised): keys go while it is in front (keysMayGo). A click has no window to
+                    // go to (appWindow finds none); the next window that comes is the shown one.
+                    let none = !list.contains { $0.pid == pid && $0.layer == 0 && $0.onScreen }
                     return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.windowBounds,
-                                     shownIsFront: front != nil && front == self.windowId)
+                                     shownIsFront: front != nil && front == self.windowId, noWindowOnScreen: none)
                 }
                 self.injector.onFocus = { [weak self] in self?.raiseShownWindow() }
                 self.injector.onCommandChord = { [weak self] code in
