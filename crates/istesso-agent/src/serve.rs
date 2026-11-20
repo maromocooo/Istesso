@@ -498,14 +498,55 @@ impl InputSink {
 /// into what the device would otherwise not be allowed to see, and a copy
 /// brings text out of it.
 fn may_still_control(paths: &Paths, peer: &istesso_pair::Peer) -> bool {
-    PeerStore::open(paths.peers()).is_ok_and(|peers| {
-        peers.peers().iter().any(|known| {
-            known.id == peer.id
-                && known.public_key == peer.public_key
-                && known.permissions.contains(&Permission::Control)
-                && known.permissions.contains(&Permission::View)
-        })
-    })
+    control_right(paths, peer).is_ok()
+}
+
+/// Why a device may not send input now, as [`may_still_control`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoControl {
+    /// The list of paired devices cannot be read: perhaps for a moment only.
+    Unreadable,
+    NotPaired,
+    MayNotControl,
+    MayNotView,
+}
+
+impl NoControl {
+    /// The answer to `input_open`: a list that cannot be read is worth asking again.
+    fn answer(self) -> Response {
+        let (code, why) = match self {
+            NoControl::Unreadable => (
+                ErrorCode::Internal,
+                "the list of paired devices cannot be read just now",
+            ),
+            NoControl::NotPaired => (ErrorCode::Forbidden, "this device is not paired any more"),
+            NoControl::MayNotControl => (
+                ErrorCode::Forbidden,
+                "this device may not control the host (it has no right to control)",
+            ),
+            NoControl::MayNotView => (
+                ErrorCode::Forbidden,
+                "this device may not control the host (control needs the right to view as well)",
+            ),
+        };
+        Response::error(code, why)
+    }
+}
+
+fn control_right(paths: &Paths, peer: &istesso_pair::Peer) -> Result<(), NoControl> {
+    let peers = PeerStore::open(paths.peers()).map_err(|_| NoControl::Unreadable)?;
+    let known = peers
+        .peers()
+        .iter()
+        .find(|known| known.id == peer.id && known.public_key == peer.public_key)
+        .ok_or(NoControl::NotPaired)?;
+    if !known.permissions.contains(&Permission::Control) {
+        return Err(NoControl::MayNotControl);
+    }
+    if !known.permissions.contains(&Permission::View) {
+        return Err(NoControl::MayNotView);
+    }
+    Ok(())
 }
 
 impl Shared {
@@ -569,6 +610,12 @@ impl Shared {
             if !self.answer_clipboard(&mut session, &answers, &mut clipboard_counts) {
                 break;
             }
+            // Read again from the list on disk every time input is asked for, not taken from
+            // when the conversation began.
+            let mut input_refused = match request {
+                Request::InputOpen { .. } => control_right(&self.paths, session.peer()).err(),
+                _ => None,
+            };
             let response = match request {
                 Request::Input { events } => {
                     // Passed on and not answered. Input that was not asked for first, or
@@ -617,10 +664,17 @@ impl Shared {
                     }
                     Response::InputAlive
                 }
-                // Read again from the list on disk every time it is asked, not taken from
-                // when the conversation began.
-                Request::InputOpen { .. } if !may_still_control(&self.paths, session.peer()) => {
-                    Response::error(ErrorCode::Forbidden, "this device may not control the host")
+                Request::InputOpen { .. } if input_refused.is_some() => {
+                    // Refused: input that was open on this conversation is over as well, and
+                    // what it had down comes up at once.
+                    if let Some(earlier) = input.take() {
+                        earlier.let_go();
+                        self.forget_input(session.peer(), &earlier);
+                    }
+                    match input_refused.take() {
+                        Some(why) => why.answer(),
+                        None => NoControl::Unreadable.answer(),
+                    }
                 }
                 Request::InputOpen { alive } => {
                     match InputSink::open(&self.input_socket, self.follow_input_restarts) {
@@ -1470,6 +1524,42 @@ mod tests {
                     ..
                 }
             )
+        }
+
+        #[test]
+        fn a_refused_second_request_lets_go_of_the_first() {
+            use istesso_pair::Permission;
+            let pair = InputPair::new("iz");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client.send_input(&[key(30, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(30, true)));
+            set_rights(&pair, &[Permission::Control]);
+            match client.open_input_alive().unwrap() {
+                InputAnswer::Refused { code, message } => {
+                    assert_eq!(code, istesso_link::ErrorCode::Forbidden);
+                    assert!(message.contains("view"), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+            // At once, without waiting for the next look at the rights.
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(30, false), cleared()]);
+            client.send_input(&[key(31, true)]).unwrap();
+            assert_eq!(pair.handed_over(A_MOMENT), None);
+        }
+
+        #[test]
+        fn a_list_that_cannot_be_read_is_answered_as_worth_asking_again() {
+            let pair = InputPair::new("iu");
+            let mut client = pair.connect();
+            std::fs::write(pair.host.paths().peers(), "{ not json").unwrap();
+            assert!(matches!(
+                client.open_input_alive().unwrap(),
+                InputAnswer::Refused {
+                    code: istesso_link::ErrorCode::Internal,
+                    ..
+                }
+            ));
         }
 
         #[test]
