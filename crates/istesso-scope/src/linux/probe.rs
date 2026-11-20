@@ -330,3 +330,23 @@ pub fn socket(family: i32, ty: i32, protocol: i32) -> i32 {
         })(),
     )
 }
+
+/// Asks for a stream socket pair of this family (only inside the enclosure, as for `socket`).
+pub fn socketpair(family: i32) -> i32 {
+    outcome(
+        &format!("socketpair {family}"),
+        (|| {
+            let mut fds = [0i32; 2];
+            // SAFETY: socketpair into a local array; both descriptors are closed at once.
+            let r = unsafe { libc::socketpair(family, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            Ok(String::new())
+        })(),
+    )
+}

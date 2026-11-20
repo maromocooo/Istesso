@@ -92,6 +92,7 @@ impl Drop for Fixture {
             "outside/x.txt",
             "outside/cr.txt\r",
             "outside/keep/grants",
+            "outside/hl",
             "outside/excl.txt",
             "outside/\u{202e}txt.exe",
         ] {
@@ -506,6 +507,8 @@ fn the_grants_file_is_never_given_to_the_command() {
     );
     let text = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(text.contains("not kept"), "{text}");
+    assert!(text.contains("0 widened and kept"), "{text}");
+    assert!(text.contains("1 keeps not kept"), "{text}");
     let kept = std::fs::read_to_string(&grants).unwrap_or_default();
     assert!(!kept.contains("folder"), "{kept}");
 }
@@ -559,6 +562,10 @@ fn sockets_outside_the_allow_list_are_refused() {
             ("2", "1", "262", "os error 93"),  // MPTCP: EPROTONOSUPPORT
             ("10", "1", "132", "os error 93"), // SCTP stream
             ("2", "5", "0", "os error 93"),    // SEQPACKET
+            ("2", "2", "115", "os error 93"),  // L2TP datagrams (a module)
+            ("2", "3", "0", "os error 93"),    // raw
+            ("16", "3", "31", "os error 93"),  // netlink, unregistered protocol
+            ("16", "3", "16", "os error 93"),  // generic netlink
         ] {
             let (ok, text) = f.probe("1", extra, &["socket", family, ty, proto]);
             assert!(!ok, "{text}");
@@ -568,10 +575,19 @@ fn sockets_outside_the_allow_list_are_refused() {
             ("2", "1", "0"),
             ("10", "1", "6"),
             ("2", "2", "0"),
+            ("2", "2", "17"),
             ("1", "1", "0"),
+            ("16", "3", "0"),
         ] {
             let (ok, text) = f.probe("1", extra, &["socket", family, ty, proto]);
             assert!(ok, "{text}");
+        }
+        for (family, ok_expected) in [("1", true), ("2", false), ("43", false)] {
+            let (ok, text) = f.probe("1", extra, &["socketpair", family]);
+            assert_eq!(ok, ok_expected, "{text}");
+            if !ok {
+                assert!(text.contains("os error 97"), "{text}");
+            }
         }
     }
 }
@@ -630,6 +646,94 @@ fn a_second_connect_on_an_approved_socket_is_not_asked_again() {
         text.contains("second 106") || text.contains("second 0"),
         "{text}"
     );
+}
+
+/// The grants file under another name (a hard link made outside the enclosure) is not handed
+/// over, and a read rule over the grants file's folder stops the start.
+#[test]
+fn the_grants_file_under_another_name_is_not_handed_over() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.p("outside/keep")).unwrap();
+    let grants = f.p("outside/keep/grants");
+    std::fs::write(&grants, "").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&grants, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::hard_link(&grants, f.p("outside/hl")).unwrap();
+    let g = grants.display().to_string();
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 0", "--grants", &g],
+        &["write", &f.p("outside/hl").display().to_string()],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("under another name"), "{text}");
+    let keep = f.p("outside/keep").display().to_string();
+    let (ok, text) = f.probe(
+        "1",
+        &["--read", &keep, "--grants", &g],
+        &["read", &f.p("project/inside.txt").display().to_string()],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("could read the grants file"), "{text}");
+}
+
+/// A path longer than the form shows whole is not asked about.
+#[test]
+fn a_path_too_long_to_show_is_not_asked_about() {
+    if !supported() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let f = Fixture::new();
+    let dir = f.p(&format!("outside/{}/{}", "a".repeat(120), "b".repeat(120)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "x").unwrap();
+    let (ok, text) = f.probe(
+        "1",
+        &["--hold-files", "--ask-cmd", "exit 0"],
+        &["read", &file.display().to_string()],
+    );
+    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+    std::fs::remove_dir(dir.parent().unwrap()).unwrap();
+    assert!(!ok, "{text}");
+    assert!(text.contains(" 0 asked"), "{text}");
+}
+
+/// "Once" for a connection is one connection: after a disconnect (AF_UNSPEC), connecting the
+/// same socket again is asked again.
+#[test]
+fn a_reconnected_socket_is_asked_again() {
+    if !supported() || !cfg!(target_arch = "x86_64") || !python() {
+        return;
+    }
+    let f = Fixture::new();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = other.local_addr().unwrap().port();
+    let script = format!(
+        "import ctypes, socket\n\
+         libc = ctypes.CDLL(None, use_errno=True)\n\
+         s = socket.socket()\n\
+         for i in range(3):\n\
+         \x20   s.connect(('127.0.0.1', {port}))\n\
+         \x20   unspec = (ctypes.c_ubyte * 16)()\n\
+         \x20   print('disconnect', libc.connect(s.fileno(), unspec, 16))\n"
+    );
+    let out = f.run(
+        "1",
+        &["--hold-connect", "--ask-cmd", "exit 0"],
+        &["/usr/bin/python3", "-c", &script],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("; 3 asked"), "{text}");
 }
 
 #[test]

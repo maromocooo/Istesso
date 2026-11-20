@@ -213,6 +213,10 @@ enum ProbeCmd {
         ty: i32,
         protocol: i32,
     },
+    /// Asks for a stream socket pair (family as a number). Only inside the enclosure.
+    Socketpair {
+        family: i32,
+    },
     /// Connects with MPTCP (IPv4 address:port).
     Mptcp {
         addr: String,
@@ -721,6 +725,13 @@ fn check_private_places(plan: &Plan, hold: &HoldArgs) -> Result<Vec<PathBuf>, St
                 parent.display()
             ));
         }
+        // Nor read it (a --read rule over its folder).
+        if plan.covers(&parent.join(name), false) {
+            return Err(format!(
+                "the confined command could read the grants file in {}; keep it outside its rules",
+                parent.display()
+            ));
+        }
         private.push(parent.join(name));
     }
     Ok(private)
@@ -757,6 +768,7 @@ fn probe(what: ProbeCmd) -> i32 {
             ty,
             protocol,
         } => p::socket(family, ty, protocol),
+        ProbeCmd::Socketpair { family } => p::socketpair(family),
         ProbeCmd::Mptcp { addr } => p::mptcp(&addr),
         ProbeCmd::ServeAbstract {
             name,

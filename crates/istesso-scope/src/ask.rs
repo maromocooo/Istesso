@@ -473,6 +473,9 @@ impl Asker {
         let (tx, rx) = std::sync::mpsc::channel::<Done>();
         let mut in_flight = 0usize;
         loop {
+            if Instant::now() >= deadline {
+                return Err("no answering device connected in time".into());
+            }
             while let Ok(done) = rx.try_recv() {
                 in_flight -= 1;
                 match done {
@@ -528,9 +531,6 @@ impl Asker {
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err("no answering device connected in time".into());
-                    }
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => return Err(format!("accept: {e}")),
@@ -657,6 +657,12 @@ impl Terminal {
 
 impl PromptInput for Terminal {
     fn drain(&mut self) {
+        // A terminal: drop its input queue. Anything else (a pipe): read what is there.
+        // SAFETY: plain calls on our descriptor.
+        if unsafe { libc::isatty(self.fd) } == 1 {
+            unsafe { libc::tcflush(self.fd, libc::TCIFLUSH) };
+            return;
+        }
         let mut buf = [0u8; 256];
         while self.ready() {
             if self.read_some(&mut buf) == 0 {
@@ -748,28 +754,41 @@ fn collapse_spaces(text: &str) -> String {
     out
 }
 
-/// At most about `max` characters: the start and the end, and how much was left out between.
+/// At most `max` characters in all: the start and the end, and how much was left out between
+/// them.
 pub fn shorten(text: &str, max: usize) -> String {
     let n = text.chars().count();
     if n <= max {
         return text.to_string();
     }
-    let half = max / 2;
-    let head: String = text.chars().take(half).collect();
-    let tail: String = text.chars().skip(n - half).collect();
-    format!("{head}...[{} characters left out]...{tail}", n - 2 * half)
+    let note = |left: usize| format!("...[{left} characters left out]...");
+    let room = max.saturating_sub(note(n).chars().count());
+    if room == 0 {
+        return text.chars().take(max).collect();
+    }
+    let head_len = room / 2;
+    let tail_len = room - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(n - tail_len).collect();
+    // `n - room` has no more digits than `n`, so the whole is at most `max`.
+    format!("{head}{}{tail}", note(n - room))
 }
 
-/// Text chosen by the confined program, as the launcher sends it: runs of spaces collapsed, at
-/// most about `max` characters (the device escapes it again when it shows it).
-pub fn clip(text: &str, max: usize) -> String {
-    shorten(&collapse_spaces(text), max)
-}
+/// The longest path the launcher asks about. The form shows a path whole, never shortened, so
+/// that the owner can read all of what is granted; a longer one is left to the kernel (refused).
+pub const MAX_SHOWN_PATH: usize = 240;
 
 /// Text chosen by the confined program as the form and the launcher's log show it: escaped
-/// ([`printable`]), runs of spaces collapsed, at most about `max` characters.
+/// ([`printable`]), runs of spaces collapsed, at most `max` characters. The result shows the
+/// same when it goes through this again (the launcher sends "asked as" this way, and the
+/// device shows it this way).
 pub fn shown(text: &str, max: usize) -> String {
     shorten(&collapse_spaces(&printable(text)), max)
+}
+
+/// As [`shown`], never shortened: for a path that is granted.
+pub fn shown_whole(text: &str) -> String {
+    collapse_spaces(&printable(text))
 }
 
 /// Shows one question as the test form does.
@@ -793,7 +812,7 @@ pub fn render(q: &Question, out: &mut impl Write) -> io::Result<()> {
                 out,
                 "wants to: {} the {what} {}",
                 access.name(),
-                shown(path, 300)
+                shown_whole(path)
             )?;
             if let Some(a) = asked_as {
                 writeln!(out, "asked as: {}", shown(a, 200))?;
@@ -809,7 +828,7 @@ pub fn render(q: &Question, out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  [2] widen for this run: {}",
-        shown(&q.wants.widen_target(), 400)
+        shown_whole(&q.wants.widen_target())
     )?;
     writeln!(
         out,
@@ -831,27 +850,40 @@ pub fn answer<P: PromptInput>(
 ) -> Result<i32, String> {
     let keys = load_keys(keys_dir)?;
     let deadline = Instant::now() + retry;
-    let stream = loop {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-            Ok(s) => break s,
-            Err(e) if Instant::now() < deadline => {
-                let _ = e;
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            Err(e) => return Err(format!("connect {addr}: {e}")),
+    // Connect and shake hands, again and again until `retry` has passed: the launcher may not
+    // listen yet, or may be busy with other handshakes and close this one. A launcher that
+    // answers but does not trust this device (or is not the trusted host) is not tried again.
+    let (mut channel, host) = loop {
+        let attempt = (|| -> Result<(Channel<TcpStream>, String), istesso_link::Error> {
+            let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+                .map_err(istesso_link::Error::Io)?;
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+            let mut host = String::new();
+            let channel = Channel::initiate(stream, &keys.local, |key| {
+                let p = keys
+                    .peers
+                    .find_by_key(key)
+                    .ok_or(istesso_link::Error::UnknownPeer)?;
+                host = p.name.clone();
+                Ok(())
+            })?;
+            Ok((channel, host))
+        })();
+        match attempt {
+            Ok(done) => break done,
+            Err(
+                e @ (istesso_link::Error::NotTrusted
+                | istesso_link::Error::UnknownPeer
+                | istesso_link::Error::BadIdentity
+                | istesso_link::Error::WrongPeer { .. }
+                | istesso_link::Error::Version { .. }),
+            ) => return Err(format!("link: {e}")),
+            Err(e) if Instant::now() >= deadline => return Err(format!("link to {addr}: {e}")),
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
         }
     };
-    let _ = stream.set_nodelay(true);
-    let mut host = String::new();
-    let mut channel = Channel::initiate(stream, &keys.local, |key| {
-        let p = keys
-            .peers
-            .find_by_key(key)
-            .ok_or(istesso_link::Error::UnknownPeer)?;
-        host = p.name.clone();
-        Ok(())
-    })
-    .map_err(|e| format!("link: {e}"))?;
     // Questions can be far apart; the launcher ends the conversation when the command ends.
     let _ = channel
         .stream()
@@ -1239,8 +1271,22 @@ mod tests {
         assert!(!s.contains("  "), "{s}");
         let long = "x".repeat(1000);
         let s = shown(&long, 200);
-        assert!(s.chars().count() < 260, "{s}");
-        assert!(s.contains("[800 characters left out]"), "{s}");
+        let len = s.chars().count();
+        assert!((195..=200).contains(&len), "{len}: {s}");
+        let left: usize = s
+            .split("...[")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert_eq!(s.chars().filter(|&c| c == 'x').count() + left, 1000, "{s}");
+        // Shown twice (sent by the launcher, shown by the device): the same.
+        assert_eq!(shown(&s, 200), s);
+        let padded_twice = shown(&shown(&padded, 200), 200);
+        assert_eq!(padded_twice, shown(&padded, 200));
+        // Paths are shown whole.
+        let path = format!("/w/{}", "p/".repeat(110));
+        assert_eq!(shown_whole(&path), path);
         assert_eq!(shown("/w/a b", 200), "/w/a b");
     }
 

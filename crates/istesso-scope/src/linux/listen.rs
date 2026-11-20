@@ -145,8 +145,11 @@ fn errno() -> i32 {
         .unwrap_or(libc::EINVAL)
 }
 
-/// `bind(fd, addr, len)` of thread `tid`. `read` reads the caller's memory.
+/// `bind(fd, addr, len)` of thread `tid`, held as notification `id` on `notify`. `read` reads
+/// the caller's memory.
 pub fn bind(
+    notify: std::os::fd::RawFd,
+    id: u64,
     tid: u32,
     args: [u64; 6],
     read: impl Fn(u32, u64, usize) -> Option<Vec<u8>>,
@@ -154,6 +157,11 @@ pub fn bind(
     let Ok(sock) = take_fd(tid, args[0] as i32) else {
         return Outcome::Kernel; // not a descriptor: the kernel says so
     };
+    // The descriptor came from the thread that is still held in this call (not from another
+    // process that got its number since).
+    if !crate::linux::hold::still_valid(notify, id) {
+        return Outcome::Done(-libc::EACCES);
+    }
     let domain = socket_domain(&sock);
     if !matches!(domain, Some(libc::AF_INET) | Some(libc::AF_INET6)) {
         return Outcome::Kernel;
@@ -186,11 +194,14 @@ pub fn bind(
     Outcome::Done(0)
 }
 
-/// `listen(fd, backlog)` of thread `tid`.
-pub fn listen(tid: u32, args: [u64; 6]) -> Outcome {
+/// `listen(fd, backlog)` of thread `tid`, held as notification `id` on `notify`.
+pub fn listen(notify: std::os::fd::RawFd, id: u64, tid: u32, args: [u64; 6]) -> Outcome {
     let Ok(sock) = take_fd(tid, args[0] as i32) else {
         return Outcome::Kernel;
     };
+    if !crate::linux::hold::still_valid(notify, id) {
+        return Outcome::Done(-libc::EACCES);
+    }
     let fd = sock.as_raw_fd();
     let domain = socket_domain(&sock);
     if matches!(domain, Some(libc::AF_INET) | Some(libc::AF_INET6)) {
