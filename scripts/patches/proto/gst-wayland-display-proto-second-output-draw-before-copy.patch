@@ -1,0 +1,36 @@
+PROTOTYPE ONLY (ADR 0027 proposal, new windows on the Linux host, docs/proto-new-windows-ubuntu.md).
+Never include this patch in a build used for a trial, the gate or a verdict.
+
+Apply to gst-wayland-display (MIT License), commit 1301f86. Apply the four measured patches
+in scripts/patches first, in order: render-on-commit, cursor-messages, windows, dialogs.
+Then apply these patches from scripts/patches/proto in order:
+  gst-wayland-display-proto-second-output.patch (U0)
+  gst-wayland-display-proto-second-output-on-commit.patch
+  gst-wayland-display-proto-second-output-window-list.patch
+  gst-wayland-display-proto-second-output-draw-before-copy.patch (this patch)
+The context comes from that project and those patches.
+
+For output=1, create_second_frame waits for the render fence before asking to copy the
+picture into the element's buffer. Without that wait, a CUDA copy can run before the
+draw finishes and read the previous frame. If the wait fails, create_second_frame
+returns SyncInterrupted before requesting the copy. The caller's later wait on the
+same fence returns at once. The first output keeps its existing order.
+
+diff --git a/wayland-display-core/src/comp/rendering.rs b/wayland-display-core/src/comp/rendering.rs
+index 8fb7b17..ef9895e 100644
+--- a/wayland-display-core/src/comp/rendering.rs
++++ b/wayland-display-core/src/comp/rendering.rs
+@@ -121,6 +121,13 @@ impl State {
+             &mut second.dtr,
+             [0.0, 0.0, 0.0, 1.0],
+         )?;
++        // Without this wait, nothing orders the element's buffer copy after the draw.
++        // A CUDA copy that runs first reads the previous frame. The caller's later
++        // wait now returns at once. The first output keeps its existing order.
++        render_output_result
++            .sync
++            .wait()
++            .map_err(|_| OutputDamageTrackerError::Rendering(GlesError::SyncInterrupted))?;
+         match second
+             .buffer
+             .clone()
