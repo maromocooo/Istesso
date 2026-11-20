@@ -70,6 +70,9 @@ pub struct Keeping {
     identity: PathBuf,
     peers: PathBuf,
     vault: Option<Arc<dyn Vault>>,
+    /// Why nothing is reached at all: set when the place that is meant
+    /// could not be found ([`Keeping::refusing`]).
+    refused: Option<&'static str>,
 }
 
 impl Keeping {
@@ -81,6 +84,7 @@ impl Keeping {
             identity: identity.into(),
             peers: peers.into(),
             vault: None,
+            refused: None,
         }
     }
 
@@ -103,6 +107,29 @@ impl Keeping {
             ..files
         };
         files
+    }
+
+    /// The form of this build, through which nothing is reached: asking it
+    /// for the key or the list refuses with `why`, before any file or the
+    /// keychain is looked at. For when the account's own place could not
+    /// be found: no other place stands in for it. `why` goes into logs: no
+    /// path, no key.
+    pub fn refusing(why: &'static str) -> Self {
+        Keeping {
+            refused: Some(why),
+            ..Keeping::of_this_build(PathBuf::new(), PathBuf::new())
+        }
+    }
+
+    /// The refusal of [`Keeping::refusing`], if this is one.
+    fn refuse(&self) -> Result<()> {
+        match self.refused {
+            None => Ok(()),
+            Some(why) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                why,
+            ))),
+        }
     }
 
     /// The form [`Keeping::of_this_build`] gives.
@@ -156,6 +183,7 @@ impl Keeping {
     /// This device's identity. One is made, and kept, when there is none
     /// yet.
     pub fn identity(&self) -> Result<Identity> {
+        self.refuse()?;
         match &self.vault {
             None => Identity::load_or_create(&self.identity),
             Some(vault) => self
@@ -167,6 +195,7 @@ impl Keeping {
     /// This device's identity, if it has one. None is made: a device
     /// without one is paired with nobody.
     pub fn identity_if_any(&self) -> Result<Option<Identity>> {
+        self.refuse()?;
         match &self.vault {
             None => Identity::read_file(&self.identity),
             Some(vault) => self.identity_in(vault.as_ref(), false),
@@ -175,6 +204,7 @@ impl Keeping {
 
     /// The list of paired devices, as it is kept now.
     pub fn peers(&self) -> Result<PeerStore> {
+        self.refuse()?;
         PeerStore::open_in(match &self.vault {
             None => Place::File(self.peers.clone()),
             Some(vault) => Place::Vault {
@@ -423,6 +453,23 @@ mod tests {
             device_name: name.to_string(),
             public_key: Identity::from_seed([seed; 32]).public_key(),
         })
+    }
+
+    #[test]
+    fn a_refusing_keeping_reaches_nothing() {
+        let keeping = Keeping::refusing("the place could not be found");
+        assert_eq!(keeping.form(), Keeping::FORM_OF_THIS_BUILD);
+        assert!(keeping.open_to_the_same_user().is_some());
+        for refused in [
+            keeping.identity().map(|_| ()),
+            keeping.identity_if_any().map(|_| ()),
+            keeping.peers().map(|_| ()),
+        ] {
+            let Err(Error::Io(err)) = refused else {
+                panic!("not refused: {refused:?}");
+            };
+            assert_eq!(err.to_string(), "the place could not be found");
+        }
     }
 
     #[test]

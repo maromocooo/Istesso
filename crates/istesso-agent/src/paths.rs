@@ -90,21 +90,6 @@ compile_error!(
      places from the environment and must never hold a real key"
 );
 
-/// The configuration directory of the account itself, as a build without
-/// any override resolves it.
-#[cfg(feature = "login-keychain")]
-fn accounts_own_config() -> &'static PathBuf {
-    static OWN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    OWN.get_or_init(|| {
-        Paths::resolve(&Environment {
-            home: account_home(),
-            macos: cfg!(target_os = "macos"),
-            ..Environment::default()
-        })
-        .config
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub config: PathBuf,
@@ -112,6 +97,25 @@ pub struct Paths {
     /// The account's runtime directory, which nobody else can enter
     /// (Linux: `/run/user/<uid>`); `None` where there is none.
     pub runtime: Option<PathBuf>,
+    /// Whose places these are. Decides the form the key and the list are
+    /// kept in ([`Paths::keeping`]); only [`Paths::from_env`] says they are
+    /// the account's own.
+    whose: Whose,
+}
+
+/// Whose places a [`Paths`] names. Said once, by whoever made the `Paths`:
+/// never found out later by looking the account up again and comparing
+/// paths, where a second lookup that fails would quietly mean files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Whose {
+    /// Given by the caller ([`Paths::at`], [`Paths::resolve`]), or moved by
+    /// a development build: tests and trials, kept in files.
+    Given,
+    /// The account's own, from its home in the system's user database.
+    Account,
+    /// The account's own, but its home could not be looked up: nothing is
+    /// reached ([`istesso_pair::Keeping::refusing`]).
+    AccountWithoutHome,
 }
 
 /// What decides the locations.
@@ -250,7 +254,21 @@ impl Paths {
     pub fn from_env() -> Self {
         #[cfg(feature = "dev-paths")]
         warn_once();
-        Self::resolve(&Environment::current())
+        Self::of_the_account(&Environment::current())
+    }
+
+    /// The locations `env` gives, marked as the account's own unless a
+    /// development build moved the configuration.
+    fn of_the_account(env: &Environment) -> Self {
+        let whose = match (&env.config_override, &env.home) {
+            (Some(_), _) => Whose::Given,
+            (None, Some(_)) => Whose::Account,
+            (None, None) => Whose::AccountWithoutHome,
+        };
+        Paths {
+            whose,
+            ..Self::resolve(env)
+        }
     }
 
     pub fn resolve(env: &Environment) -> Self {
@@ -285,6 +303,7 @@ impl Paths {
             config,
             cache,
             runtime,
+            whose: Whose::Given,
         }
     }
 
@@ -296,6 +315,7 @@ impl Paths {
             config,
             cache,
             runtime: None,
+            whose: Whose::Given,
         }
     }
 
@@ -348,17 +368,24 @@ impl Paths {
     }
 
     /// The one door to this device's key and its list of paired devices
-    /// (`istesso_pair::Keeping`). The account's own key and list are kept in
-    /// the form this build was made for; directories that are not the
-    /// account's own (tests, development builds) always keep theirs in
-    /// files, so that no test and no development build reaches the person's
-    /// keychain.
+    /// (`istesso_pair::Keeping`). The account's own key and list
+    /// ([`Paths::from_env`]) are kept in the form this build was made for;
+    /// directories given by the caller (tests, development builds) always
+    /// keep theirs in files, so that no test and no development build
+    /// reaches the person's keychain. Which of the two is decided by who
+    /// made this `Paths`, never by comparing directories. When the
+    /// account's home could not be looked up, nothing is reached: no other
+    /// place stands in for the account's own.
     pub fn keeping(&self) -> istesso_pair::Keeping {
-        #[cfg(feature = "login-keychain")]
-        if self.config == *accounts_own_config() {
-            return istesso_pair::Keeping::of_this_build(self.identity(), self.peers());
+        use istesso_pair::Keeping;
+        match self.whose {
+            Whose::Given => Keeping::in_files(self.identity(), self.peers()),
+            Whose::Account => Keeping::of_this_build(self.identity(), self.peers()),
+            Whose::AccountWithoutHome => Keeping::refusing(
+                "this account's home directory is not in the system's user database: the \
+                 device key and the list of paired devices are not reached",
+            ),
         }
-        istesso_pair::Keeping::in_files(self.identity(), self.peers())
     }
 
     /// Where the program that shows an application of this machine to
@@ -646,6 +673,61 @@ mod tests {
         assert!(dir.paths().identity().exists());
         let again = dir.paths().keeping().identity_if_any().unwrap().unwrap();
         assert_eq!(made.public_key(), again.public_key());
+    }
+
+    #[test]
+    fn only_the_accounts_own_places_are_kept_in_the_form_of_this_build() {
+        use istesso_pair::{Form, Keeping};
+        // Nothing here asks the keychain anything: the form is asked, not
+        // the key or the list.
+        let own = Paths::of_the_account(&env());
+        assert_eq!(own.keeping().form(), Keeping::FORM_OF_THIS_BUILD);
+        // The same directories, given by a caller: files. No comparison of
+        // directories decides.
+        let given = Paths::resolve(&env());
+        assert_eq!(given.config, own.config);
+        assert_eq!(given.keeping().form(), Form::Files);
+        assert_eq!(Paths::at(&own.config).keeping().form(), Form::Files);
+        // Moved by a development build: files.
+        let moved = Paths::of_the_account(&Environment {
+            config_override: Some(PathBuf::from("/opt/fixture-one/config")),
+            ..env()
+        });
+        assert_eq!(moved.keeping().form(), Form::Files);
+    }
+
+    /// The lookup of the account fails: the account's key and list are not
+    /// reached, neither in the form of this build nor in files somewhere.
+    #[test]
+    fn without_the_accounts_home_nothing_is_reached() {
+        let lost = Paths::of_the_account(&Environment::default());
+        let keeping = lost.keeping();
+        assert_eq!(keeping.form(), istesso_pair::Keeping::FORM_OF_THIS_BUILD);
+        for refused in [
+            keeping.identity().map(|_| ()),
+            keeping.identity_if_any().map(|_| ()),
+            keeping.peers().map(|_| ()),
+        ] {
+            let said = refused.unwrap_err().to_string();
+            assert!(said.contains("not reached"), "{said}");
+            // No place is named: none stands in for the account's own.
+            assert!(!said.contains("nonexistent"), "{said}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_accounts_own_places_are_said_to_be_its_own() {
+        assert_eq!(
+            Paths::from_env().whose,
+            if cfg!(feature = "dev-paths")
+                && std::env::var_os("ISTESSO_CONFIG_DIR").is_some_and(|v| !v.is_empty())
+            {
+                Whose::Given
+            } else {
+                Whose::Account
+            }
+        );
     }
 
     #[test]
