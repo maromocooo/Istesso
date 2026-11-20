@@ -636,6 +636,30 @@ func pictureHeldForVirtual(configured: Bool, onVirtual: Bool, streamMatches: Boo
     return !onVirtual || !streamMatches || restarting
 }
 
+/// Whether the shown window is moved onto the virtual display again (looked at every second). The
+/// first move is one Accessibility call, which the application may not take (busy, or its window
+/// still being made); without another try the picture stays at 1x, half the size, after the 5 s
+/// hold. Only while a viewer is there, not locked, no new stream being made, the window placed,
+/// and its middle not on the virtual display; at most `maxMoveTries` times for one window (one
+/// that refuses the move is left where it is), and never while the Mac's own keyboard or mouse
+/// was used in the last `idle` seconds (the owner at the Mac may be using that window).
+// (A function, not a global constant: main.swift's globals are made in the order the file runs,
+// and --self-test runs before this line would.)
+func maxMoveTries() -> Int { 5 }
+func movesAgainToVirtual(viewed: Bool, locked: Bool, restarting: Bool, placed: Bool, window: CGRect?, virtual: CGRect?,
+                         tries: Int, localIdle: Double, idle: Double) -> Bool {
+    guard viewed, !locked, !restarting, placed, tries < maxMoveTries(), localIdle >= idle, let window, let virtual else { return false }
+    return !virtual.contains(CGPoint(x: window.midX, y: window.midY))
+}
+
+/// Seconds since the Mac's own keyboard or mouse was last used (the hardware's state, not the
+/// events this program makes).
+func localInputIdle() -> Double {
+    let kinds: [CGEventType] = [.keyDown, .flagsChanged, .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+                                .leftMouseDragged, .scrollWheel]
+    return kinds.map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min() ?? 0
+}
+
 /// What the pump does with the newest picture: nothing (nobody watches, nobody waits for a resumed
 /// picture), hold it (the window is on its way to the virtual display: the picture is kept, and the
 /// first one after the hold goes as a key frame), or encode it. A `resume` while nobody watches is
@@ -1784,6 +1808,62 @@ func selfTest() -> Never {
         send(["kind": "button", "code": 0x110, "pressed": true])
         checkPanel(downs == 1 && ups == 1, true, "restarting: a held button is released, a new press is dropped")
     }
+    do {
+        // The window closes while the button is down: the release finds no window.
+        let injector = Injector()
+        var list = [appWin]
+        var downs = 0, ups = 0
+        injector.mayPost = true
+        injector.clickForm = 4
+        injector.listNow = { list }
+        injector.lockedNow = { false }
+        injector.inRange = { _, top in top?.pid == 100 }
+        injector.windowAt = { point in list.first { $0.bounds.contains(point) } }
+        injector.postSession = { event in
+            if event.type == .leftMouseDown { downs += 1 }
+            if event.type == .leftMouseUp { ups += 1 }
+        }
+        injector.postProcess = { _, _ in }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        send(["kind": "pointer_at", "x": 150, "y": 150])
+        send(["kind": "button", "code": 0x110, "pressed": true])
+        list = []
+        send(["kind": "button", "code": 0x110, "pressed": false])
+        checkPanel(downs == 1 && ups == 1 && !injector.holding, true, "injector: a release with no window lets the press go, and nothing stays held")
+    }
+    do {
+        // A place beyond the picture is kept inside it.
+        let injector = Injector()
+        injector.mayPost = true
+        injector.origin = CGPoint(x: 100, y: 100)
+        injector.scale = 0.5
+        injector.pictureSize = { CGSize(width: 400, height: 200) }
+        injector.listNow = { [appWin] }
+        injector.lockedNow = { false }
+        injector.windowAt = { _ in appWin }
+        injector.postProcess = { _, _ in }
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "x": 100_000, "y": -50]))
+        checkPanel(injector.pointerPlace == CGPoint(x: 100 + 399 * 0.5, y: 100), true, "injector: pointer_at beyond the picture is kept inside it")
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "pointer_at", "x": 20, "y": 30]))
+        checkPanel(injector.pointerPlace == CGPoint(x: 110, y: 115), true, "injector: pointer_at inside the picture is as said")
+    }
+    do {
+        // A button code that is none of the three: nothing is posted, nothing is held.
+        let injector = Injector()
+        var posted = 0
+        injector.mayPost = true
+        injector.clickForm = 3
+        injector.listNow = { [appWin] }
+        injector.lockedNow = { false }
+        injector.windowAt = { _ in appWin }
+        injector.postProcess = { _, _ in posted += 1 }
+        injector.postSession = { _ in posted += 1 }
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "button", "code": 0x113, "pressed": true]))
+        checkPanel(posted == 0 && !injector.holding && injector.counts["unknown_button"] == 1, true, "injector: an unknown button is dropped, not taken for the left one")
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "button", "code": 0x110, "pressed": true]))
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "button", "code": 0x110, "pressed": false]))
+        checkPanel(posted == 2 && !injector.holding, true, "injector: the left button is posted as before")
+    }
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: []), true, "resize: a running picture comes back")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["pause"]), false, "resize: a pause during the restart is kept")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["detach"]), false, "resize: a detach during the restart is kept")
@@ -1866,6 +1946,34 @@ func selfTest() -> Never {
         checkPanel(before && !during && after, true, "keys: stopped after a Command chord until the key window is known again")
     }
     checkPanel(!keysMayGo(appInFront: true, focused: shownWin, shown: shownWin, shownIsFront: false), true, "keys: a window at the same place in front of the shown one does not pass")
+    do {
+        // No window of the application on the screen, in front: only Command-N goes.
+        let injector = Injector()
+        var posted: [Int64] = []
+        var noWindow = true
+        injector.mayPost = true
+        injector.target = { 100 }
+        injector.keysAllowed = { false }
+        injector.noWindowInFront = { noWindow }
+        injector.lockedNow = { false }
+        injector.postProcess = { event, _ in posted.append(event.getIntegerValueField(.keyboardEventKeycode)) }
+        func key(_ code: Int, _ pressed: Bool) { injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "key", "code": code, "pressed": pressed])) }
+        key(125, true); key(49, true); key(49, false); key(125, false)
+        checkPanel(posted == [0x37, 0x2d, 0x2d, 0x37], true, "keys: no window, in front: Command-N goes")
+        posted = []
+        key(30, true); key(30, false); key(49, true); key(49, false)
+        checkPanel(posted.isEmpty, true, "keys: no window: a letter, and N without Command, are not sent")
+        key(125, true); key(29, true); key(49, true); key(29, false); key(56, true); key(49, true); key(56, false); key(42, true); key(49, true); key(42, false); key(30, true); key(125, false)
+        checkPanel(!posted.contains(0x2d) && !posted.contains(0x00), true, "keys: no window: Control-, Option-, Shift-Command-N and Command-A are not sent")
+        posted = []
+        injector.handle(try! JSONSerialization.data(withJSONObject: ["kind": "text", "text": "abc"]))
+        checkPanel(posted.isEmpty, true, "keys: no window: committed text is not sent")
+        noWindow = false
+        key(125, true); key(49, true)
+        checkPanel(posted.isEmpty, true, "keys: with a window on the screen that is not the shown one, nothing goes, Command-N included")
+        checkPanel(newWindowKeyMayGo(code: 49, held: [125]) && !newWindowKeyMayGo(code: 49, held: []) && newWindowKeyMayGo(code: 126, held: []),
+                   true, "keys: newWindowKeyMayGo is Command-N and the modifier keys")
+    }
     func chordRun(flush: Bool) -> (posted: Int, discarded: Int) {
         let injector = Injector()
         var posted = 0
@@ -2017,6 +2125,20 @@ func selfTest() -> Never {
         checkPanel(held(on: true, matches: true), false, "2x: on it, the stream of its size: the picture goes")
         checkPanel(held(waited: 5.1), false, "2x: never held longer than 5 s")
         checkPanel(held(failed: true) || held(locked: true) || held(false), false, "2x: not held when the display could not be made, when locked, or without a virtual display")
+        let virtualFrame = CGRect(x: 1920, y: 0, width: 1920, height: 1080)
+        let onMain = CGRect(x: 100, y: 100, width: 800, height: 600), onIt = onMain.offsetBy(dx: 1920, dy: 0)
+        func again(viewed: Bool = true, locked: Bool = false, restarting: Bool = false, placed: Bool = true,
+                   window: CGRect? = onMain, virtual: CGRect? = virtualFrame, tries: Int = 0, localIdle: Double = 10) -> Bool {
+            movesAgainToVirtual(viewed: viewed, locked: locked, restarting: restarting, placed: placed, window: window, virtual: virtual,
+                                tries: tries, localIdle: localIdle, idle: 3)
+        }
+        checkPanel(again(), true, "2x: a window still on the main display is moved again")
+        checkPanel(again(window: onIt), false, "2x: not once it is on the virtual display")
+        checkPanel(again(viewed: false) || again(locked: true) || again(restarting: true) || again(placed: false), false,
+                   "2x: not without a viewer, when locked, while a new stream is made, or before it is placed")
+        checkPanel(again(window: nil) || again(virtual: nil), false, "2x: not when the window is not on the screen, nor without the virtual display")
+        checkPanel(again(tries: maxMoveTries() - 1) && !again(tries: maxMoveTries()), true, "2x: at most \(maxMoveTries()) more tries for one window")
+        checkPanel(again(localIdle: 1), false, "2x: not while the Mac's own keyboard or mouse was used in the last seconds")
         // The pump's gate (every path to the encoder: a new picture, a filler, the next after one).
         checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: false) == .held, true, "pump: a picture while held is kept, not encoded")
         checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: true) == .held, true, "pump: also with a resume waiting, while a viewer is there (the 5 s limit applies)")
@@ -2107,6 +2229,19 @@ func keysMayGo(appInFront: Bool, focused: CGRect?, shown: CGRect, shownIsFront: 
     guard appInFront, shownIsFront, let focused, shown != .zero else { return false }
     return abs(focused.minX - shown.minX) < 2 && abs(focused.minY - shown.minY) < 2
         && abs(focused.width - shown.width) < 2 && abs(focused.height - shown.height) < 2
+}
+
+/// With the application in front and no window of it on the screen (the last shown one was closed
+/// or minimised; `Injector.noWindowInFront`), the one key path that is open: the modifier keys
+/// themselves, and N (Linux 49) with Command held and none of Control, Option and Shift (Command-
+/// Shift-N makes a folder in the Finder). So Command-N can make a window, which becomes the shown
+/// one; any other key, text, composing text and the clipboard wait for a window (keysAllowed).
+/// Releases of keys already sent go as always.
+func newWindowKeyMayGo(code: UInt32, held: Set<UInt32>) -> Bool {
+    if modifierFlag(code) != nil { return true }
+    guard code == 49 else { return false }
+    let flags = modifierFlags(of: held)
+    return flags.contains(.maskCommand) && flags.isDisjoint(with: [.maskControl, .maskAlternate, .maskShift])
 }
 
 /// After an unlock, whether the picture comes back: only when the lock stopped it, and the
@@ -2217,6 +2352,9 @@ final class Injector {
     /// Where the picture lies on the screen: picture pixels to global points.
     var origin = CGPoint.zero
     var scale = 1.0  // points per picture pixel
+    /// The picture's size in pixels (set by the host; nil: not known, as in --self-test's older
+    /// checks): a place the other side says is kept inside it.
+    var pictureSize: () -> CGSize? = { nil }
     /// The process input goes to now, and the window a pointer event is aimed at.
     var target: () -> pid_t? = { nil }
     var windowAt: (CGPoint) -> WindowInfo? = { _ in nil }
@@ -2231,6 +2369,9 @@ final class Injector {
     /// this process is in it, and whether keys may be sent now. Set by the host for its mode.
     var inRange: (CGPoint, WindowInfo?) -> Bool = { _, _ in false }
     var keysAllowed: () -> Bool = { false }
+    /// The application is in front and has no window on the screen: only key() looks at it, and
+    /// lets through only what newWindowKeyMayGo allows (Command-N).
+    var noWindowInFront: () -> Bool = { false }
     /// The other side's window became the one typed into; it was resized (picture pixels).
     var onFocus: () -> Void = {}
     var onResize: (Int, Int) -> Void = { _, _ in }
@@ -2423,7 +2564,14 @@ final class Injector {
             guard let code = (object["code"] as? NSNumber)?.uint32Value, let pressed = object["pressed"] as? Bool else { return count("unreadable") }
             key(code, pressed)
         case "pointer_at":
-            guard let x = (object["x"] as? NSNumber)?.doubleValue, let y = (object["y"] as? NSNumber)?.doubleValue else { return count("unreadable") }
+            guard var x = (object["x"] as? NSNumber)?.doubleValue, var y = (object["y"] as? NSNumber)?.doubleValue,
+                  x.isFinite, y.isFinite else { return count("unreadable") }
+            // Kept inside the picture: a place beyond it would be a part of the screen nobody sees
+            // (another window of the application, another display).
+            if let size = pictureSize(), size.width >= 1, size.height >= 1 {
+                x = min(max(x, 0), size.width - 1)
+                y = min(max(y, 0), size.height - 1)
+            }
             moved(to: CGPoint(x: origin.x + x * scale, y: origin.y + y * scale))
         case "button":
             guard let code = (object["code"] as? NSNumber)?.uint32Value, let pressed = object["pressed"] as? Bool else { return count("unreadable") }
@@ -2472,8 +2620,10 @@ final class Injector {
 
     private func key(_ code: UInt32, _ pressed: Bool) {
         guard let pid = target() else { return count("dropped_no_target") }
-        // A release is always let through for a key that went down, so that none stays down.
-        guard keysAllowed() || (!pressed && keysDown.contains(code)) else {
+        // A release is always let through for a key that went down, so that none stays down. With
+        // no window of the application on the screen, only Command-N (newWindowKeyMayGo).
+        guard keysAllowed() || (!pressed && keysDown.contains(code))
+                || (noWindowInFront() && newWindowKeyMayGo(code: code, held: keysDown)) else {
             if !keysDroppedSaid { keysDroppedSaid = true; onKeysDropped(true) }
             return count("dropped_not_in_front")
         }
@@ -2535,8 +2685,20 @@ final class Injector {
     }
 
     private func button(_ code: UInt32, _ pressed: Bool) {
+        // Only the three buttons the other side may say; any other code is dropped before anything
+        // is done with it (it is never taken for the left button, nor kept as held).
+        guard [buttonLeft, buttonRight, buttonMiddle].contains(code) else { return count("unknown_button") }
         if pressed { freshWindowList(); onButtonPressed?() }
-        guard let window = windowAt(point) else { return count("dropped_no_window") }
+        guard let window = windowAt(point) else {
+            // A release with no window under it (the window closed while the button was down):
+            // nothing is posted at the point, but the button is let go here, and every press
+            // posted through the session is released inside its own window, so none stays down.
+            if !pressed {
+                buttonsDown.remove(code)
+                releaseSessionPresses()
+            }
+            return count("dropped_no_window")
+        }
         let pid = window.pid
         if pressed { buttonsDown.insert(code) } else { buttonsDown.remove(code) }
         if pressed {
@@ -2555,7 +2717,8 @@ final class Injector {
         switch code {
         case buttonRight: nsType = pressed ? .rightMouseDown : .rightMouseUp; cgType = pressed ? .rightMouseDown : .rightMouseUp; cgButton = .right
         case buttonMiddle: nsType = pressed ? .otherMouseDown : .otherMouseUp; cgType = pressed ? .otherMouseDown : .otherMouseUp; cgButton = .center
-        default: nsType = pressed ? .leftMouseDown : .leftMouseUp; cgType = pressed ? .leftMouseDown : .leftMouseUp; cgButton = .left
+        case buttonLeft: nsType = pressed ? .leftMouseDown : .leftMouseUp; cgType = pressed ? .leftMouseDown : .leftMouseUp; cgButton = .left
+        default: return count("unknown_button")
         }
         var event: CGEvent?
         if clickForm >= 3 {
@@ -2736,6 +2899,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         watchdog.resume()
         timers.append(watchdog)
         _ = gateWired
+        injector.pictureSize = { [weak self] in
+            guard let self, self.width > 0, self.height > 0 else { return nil }
+            return CGSize(width: self.width, height: self.height)
+        }
         mayCapture = settings.generated || CGPreflightScreenCaptureAccess()
         injector.mayPost = CGPreflightPostEventAccess()
         say("permissions", [("screen_recording", mayCapture), ("accessibility", injector.mayPost)])
@@ -2895,6 +3062,14 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     let front = windowList().first { $0.pid == pid && $0.layer == 0 && $0.onScreen && $0.bounds.width > 40 && $0.bounds.height > 40 }?.id
                     return keysMayGo(appInFront: self.appInFront(), focused: self.lookout.focused, shown: self.windowBounds,
                                      shownIsFront: front != nil && front == self.windowId)
+                }
+                // The last shown window closed or minimised: in front, and no window of the
+                // application on the screen at any layer from 0 to below the menu bar's (24), of
+                // any size. Then only Command-N goes (key(); newWindowKeyMayGo); a click has no
+                // window to go to (appWindow finds none). The next window that comes is the shown one.
+                self.injector.noWindowInFront = { [weak self] in
+                    guard let self, let pid = self.app?.processIdentifier, self.appInFront() else { return false }
+                    return !windowList().contains { $0.pid == pid && $0.onScreen && $0.layer >= 0 && $0.layer < 24 }
                 }
                 self.injector.onFocus = { [weak self] in self?.raiseShownWindow() }
                 self.injector.onCommandChord = { [weak self] code in
@@ -3321,21 +3496,37 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             return done(nil)
         }
         opening = true
-        let done: (String?) -> Void = { why in self.opening = false; done(why) }
+        // The pump of this stream, taken now: everything below, the frames too, goes to it on its
+        // own queue, never to a pump a new stream (a resize) made meanwhile.
+        let pump: Pump = self.pump
+        // This open ends the opening only while its pump is still the stream's: after a new
+        // stream, that stream's own open may be on its way (place() must not start another).
+        let done: (String?) -> Void = { why in
+            if self.pump === pump { self.opening = false }
+            done(why)
+        }
         pump.queue.async {
-            if let why = self.pump.open() {
+            if let why = pump.open() {
                 return DispatchQueue.main.async { done("no encoder could be opened: \(why)") }
             }
-            if let asked = resumeAsked { self.pump.resumed(asked: asked) }
+            if let asked = resumeAsked { pump.resumed(asked: asked) }
             DispatchQueue.main.async {
+                // A pause or a detach that came while the encoder opened, or a new stream: no
+                // capture is started (that stop, or the new stream, closes this pump; the picture
+                // comes back by the next resume, or by the new stream's own start). Locked
+                // meanwhile: nothing is captured either; the lock pauses the picture as it pauses a
+                // running one (enforceLock, at the lock's notice or at its look every second), and
+                // the unlock brings it back.
+                guard self.picture == "running", !self.restarting, self.pump === pump,
+                      !screenLocked() || settings.generated else { return done(nil) }
                 if settings.generated {
                     let source = Generated(width: self.width, height: self.height)
                     self.generated = source
-                    source.start(on: self.pump.queue, fps: settings.fps) { [weak self] buffer, at in self?.pump.picture(buffer, displayNs: at) }
+                    source.start(on: pump.queue, fps: settings.fps) { buffer, at in pump.picture(buffer, displayNs: at) }
                     return done(nil)
                 }
                 guard let display = self.display else { return done(nil) }  // the app's window comes later
-                let capture = Capture(queue: self.pump.queue) { [weak self] buffer, at in self?.pump.picture(buffer, displayNs: at) }
+                let capture = Capture(queue: pump.queue) { buffer, at in pump.picture(buffer, displayNs: at) }
                 capture.onStop = { why in note("the capture stopped: \(why)") }
                 let filter: SCContentFilter
                 var rect: CGRect?
@@ -3347,6 +3538,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                         : SCContentFilter(display: display, including: self.panelWindows)
                     rect = placed
                 } else {
+                    // The whole display only in its own form: an application's session whose
+                    // application is not there (not opened yet, or ended) shows nothing.
+                    guard case .display = settings.target else { return done(nil) }
                     filter = SCContentFilter(display: display, excludingWindows: [])
                 }
                 self.capture = capture
@@ -3370,10 +3564,14 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         generated = nil
         let capture = self.capture
         self.capture = nil
+        // The pump of the picture being stopped, taken now: a pause or a detach that overlaps a
+        // resize closes this one on its own queue, never the new stream's pump. The new stream
+        // stays closed as well (its start waits while the picture is stopping) until a resume.
+        let pump: Pump? = self.pump
         let finish: () -> Void = {
-            guard let pump = self.pump else { return done() }
+            guard let pump else { return done() }
             pump.queue.async {
-                self.pump.close()
+                pump.close()
                 let took = Double(nowNs() - asked) / 1e6
                 if frameLog.on { frameLog.write("{\"kind\":\"picture\",\"t_ns\":\(nowNs()),\"state\":\"paused\",\"offered\":\(offered ? 1 : 0),\"took_ms\":\(String(format: "%.3f", took))}") }
                 say("paused", [("offered", offered), ("took_ms", took)])
@@ -3452,7 +3650,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 injector.releaseAll()
             }
             if line.hasPrefix("admit") { injector.releaseAll() }
-            return wordsDuringRestart.append(line)
+            // Whether the lock said it is kept with it: said again after the restart, the lock's
+            // pause must not clear pausedForLock as the controller's own pause does.
+            return wordsDuringRestart.append((line, lockWord))
         }
         let words = line.split(separator: " ").map(String.init)
         switch words.first {
@@ -3737,8 +3937,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         guard injector.mayPost, !settings.inputDry,
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return false }
+        // Only what starts something raises an application: a release (of a key or a button) goes
+        // where it goes, and never brings anything to the front.
         switch kind {
-        case "key", "text", "clipboard_copy", "clipboard_paste": return true
+        case "key": return object["pressed"] as? Bool == true
+        case "text", "clipboard_copy", "clipboard_paste": return true
         case "button": return object["pressed"] as? Bool == true
         default: return false
         }
@@ -3805,6 +4008,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var makingVirtual = false
     var virtualFailedAt: TimeInterval = -1000
     var movedFrom: [CGWindowID: CGRect] = [:]
+    /// How often each window was moved onto the virtual display again since it was made, and the
+    /// windows given up on (said once each).
+    var moveTries: [CGWindowID: Int] = [:]
+    var movesGivenUp: Set<CGWindowID> = []
 
     /// Looked at every second: while a device is shown the picture (and the Mac is not locked),
     /// the shown window is on the virtual display; once nobody has been shown it for the time a
@@ -3827,9 +4034,25 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     return note("the virtual display could not be made: the window stays where it is")
                 }
                 self.virtualScreen = screen
+                self.moveTries = [:]
+                self.movesGivenUp = []
                 if frameLog.on { frameLog.write("{\"kind\":\"virtual\",\"t_ns\":\(nowNs()),\"state\":\"made\",\"points\":\"\(Int(frame.width))x\(Int(frame.height))\"}") }
                 say("virtual", [("state", "made"), ("points", "\(Int(frame.width))x\(Int(frame.height))")])
                 self.moveShownWindow(to: frame)
+            }
+        } else if viewed, let screen = virtualScreen, let frame = screen.frame, let id = windowId,
+                  let current = windowList().first(where: { $0.id == id })?.bounds,
+                  !frame.contains(CGPoint(x: current.midX, y: current.midY)) {
+            // The shown window is on the screen (a closed or minimised one is not moved, and its
+            // application not raised) and not on the virtual display: moved again, a few times.
+            let tries = moveTries[id, default: 0]
+            if movesAgainToVirtual(viewed: viewed, locked: screenLocked(), restarting: restarting, placed: windowBounds != .zero,
+                                   window: current, virtual: frame, tries: tries, localIdle: localInputIdle(), idle: settings.inlineIdle) {
+                moveTries[id] = tries + 1
+                moveShownWindow(to: frame)
+            } else if tries >= maxMoveTries(), !movesGivenUp.contains(id) {
+                movesGivenUp.insert(id)
+                note("the shown window did not go onto the virtual display after \(maxMoveTries()) more tries: it stays where it is")
             }
         } else if let screen = virtualScreen, !viewed, now - lastViewed > settings.virtualKeep {
             // The windows first (the moves are queued for Accessibility), the display after them.
@@ -3865,7 +4088,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 guard let self, inlineMayRekey(appInFront: self.appInFront(), localIdle: localIdle(), idle: idle) else { return }
                 self.lookout.act {
-                    guard localIdle() >= idle else { return }
+                    // Looked at again right before: still in front (the owner may have switched).
+                    guard localIdle() >= idle, NSRunningApplication(processIdentifier: pid)?.isActive == true else { return }
                     bringToFront(pid, bounds: target)
                 }
             }
@@ -3948,14 +4172,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var resumeAfterSignal = false
 
     func startTimers() {
+        // The pump these timers were made for, on its own queue (never a later stream's).
+        let pump: Pump = self.pump
         let tick = DispatchSource.makeTimerSource(flags: .strict, queue: pump.queue)
         tick.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .microseconds(500))
-        tick.setEventHandler { [weak self] in self?.pump.tick() }
+        tick.setEventHandler { [weak pump] in pump?.tick() }
         tick.resume()
         let second = DispatchSource.makeTimerSource(queue: pump.queue)
         second.schedule(deadline: .now() + 1, repeating: .seconds(1))
-        second.setEventHandler { [weak self] in
-            self?.pump.second()
+        second.setEventHandler { [weak self, weak pump] in
+            pump?.second()
             DispatchQueue.main.async {
                 guard let self, frameLog.on, !self.injector.counts.isEmpty else { return }
                 let counts = self.injector.counts.map { "\"\($0.key)\":\($0.value)" }.joined(separator: ",")
@@ -3969,7 +4195,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// Who is shown the picture, as last said; a new stream (after a resize) starts with it.
     var admitState: AdmitState = settings.admitNobody ? .nobody : .paired
     /// Words that came while a new stream was being made: said to the new one, in order.
-    var wordsDuringRestart: [String] = []
+    var wordsDuringRestart: [(line: String, byLock: Bool)] = []
 
     // ---- A new size: the application's window was resized ----
 
@@ -4019,7 +4245,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     old.close()
                     // The words that came meanwhile decide who may look and whether it is offered
                     // BEFORE the new stream listens; it is never offered to anybody it should not be.
-                    let queued = self.wordsDuringRestart
+                    let queued = self.wordsDuringRestart.map(\.line)
                     let (admit, offer, gone) = stateAfter(words: queued, admit: self.admitState, offered: self.offered,
                                                           detached: self.detached, held: self.heldForSignal)
                     self.admitState = admit
@@ -4046,8 +4272,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     let words = self.wordsDuringRestart
                     self.wordsDuringRestart = []
                     let resumes = restartResumes(picture: self.picture, detached: self.detached, offered: self.offered,
-                                                 held: self.heldForSignal, wordsMeanwhile: words)
-                    for word in words { self.word(word) }
+                                                 held: self.heldForSignal, wordsMeanwhile: words.map(\.line))
+                    // The lock's own words as the lock's: a lock during the restart keeps
+                    // pausedForLock, so the picture comes back at the unlock (enforceLock).
+                    for word in words { if word.byLock { self.sayForLock(word.line) } else { self.word(word.line) } }
                     if resumes && self.picture == "running" && !self.detached && self.offered && !self.heldForSignal {
                         self.openPicture { why in if let why { note("after the resize: \(why)") } }
                     }
