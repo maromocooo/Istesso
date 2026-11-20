@@ -31,3 +31,7 @@ dev-paths = ["istesso-agent/dev-paths"]
 # The device key and the paired devices in the macOS login keychain: see
 # crates/istesso-agent/Cargo.toml.
 login-keychain = ["istesso-agent/login-keychain"]
+
+[dev-dependencies]
+# For the test that takes in orphans (`tests/starter_gone_first.rs`).
+libc = "0.2"

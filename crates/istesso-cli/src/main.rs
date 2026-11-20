@@ -142,9 +142,20 @@ enum InputAction {
         /// born with at this descriptor number. The program that shows the
         /// window makes a pair of sockets, starts this command with one end
         /// and writes to the other; no other program can write to the pair
-        /// or take its place. The command ends when that program is gone
-        #[arg(long, value_name = "NUMBER", conflicts_with = "socket")]
+        /// or take its place. Needs --started-by
+        #[arg(
+            long,
+            value_name = "NUMBER",
+            conflicts_with = "socket",
+            requires = "started_by"
+        )]
         input_fd: Option<i32>,
+        /// With --input-fd: the process number of the program that starts
+        /// this command and holds the other end, as that program knows it.
+        /// The command does not start unless that program is its parent,
+        /// and ends when it no longer is: when that program is gone
+        #[arg(long, value_name = "PROCESS", requires = "input_fd")]
+        started_by: Option<u32>,
         /// Reach the device at this address only, instead of at whichever
         /// of its remembered addresses answers first: for when the way the
         /// input takes matters, as in a measurement over a cable
@@ -563,15 +574,19 @@ fn run(cli: Cli) -> Result<(), String> {
                 to,
                 socket,
                 input_fd,
+                started_by,
                 address,
                 keep_trying,
                 timings,
             } => relay_input(
                 &to,
-                match (input_fd, socket) {
-                    (Some(number), _) => InputFrom::BornWith(number),
-                    (None, Some(socket)) => InputFrom::Socket(socket),
-                    (None, None) => return Err("give --socket or --input-fd".to_string()),
+                match (input_fd, started_by, socket) {
+                    (Some(number), Some(started_by), _) => {
+                        InputFrom::BornWith { number, started_by }
+                    }
+                    (Some(_), None, _) => return Err("--input-fd needs --started-by".to_string()),
+                    (None, _, Some(socket)) => InputFrom::Socket(socket),
+                    (None, _, None) => return Err("give --socket or --input-fd".to_string()),
                 },
                 address.as_deref(),
                 Duration::from_secs(keep_trying),
@@ -653,9 +668,10 @@ enum InputFrom {
     /// A socket with a name, which every program of the same user can write
     /// to and replace: the form the measuring tools use.
     Socket(PathBuf),
-    /// The end of a pair without a name this program was born with, at this
-    /// descriptor number.
-    BornWith(i32),
+    /// The end of a pair without a name this program was born with, at
+    /// descriptor `number`, from the program `started_by` (its process
+    /// number, as it said it).
+    BornWith { number: i32, started_by: u32 },
 }
 
 /// The end of a pair of sockets this program was born with at descriptor
@@ -714,9 +730,12 @@ fn relay_input(
     // born with, which nothing else can reach, or a name in a place of
     // Istesso's own, so that whoever starts it does not choose where it
     // listens.
-    let (born_with, socket) = match from {
-        InputFrom::BornWith(number) => (Some(born_with_input(number)?), None),
+    let (born_with, started_by, socket) = match from {
+        InputFrom::BornWith { number, started_by } => {
+            (Some(born_with_input(number)?), Some(started_by), None)
+        }
         InputFrom::Socket(asked) => (
+            None,
             None,
             Some(
                 Paths::from_env()
@@ -725,14 +744,15 @@ fn relay_input(
             ),
         ),
     };
-    // The program that holds the other end of the pair. When it is gone the
-    // system gives this one another parent, and nothing can arrive any more.
-    // A parent that is the system's first process from the start means that
-    // it was gone before this program could look.
-    let started_by = std::os::unix::process::parent_id();
-    let on_a_pair = born_with.is_some();
-    let starter_gone =
-        move || on_a_pair && (started_by == 1 || std::os::unix::process::parent_id() != started_by);
+    // The program that holds the other end of the pair, by the number it
+    // said itself. When it is gone the system gives this one another parent
+    // (the system's first process, or whichever process takes in orphans,
+    // as `systemd --user` does), and nothing can arrive any more. The
+    // number is said, not looked up here: a parent looked up at the first
+    // look would already be the new one if the starter went before it.
+    let starter_gone = move || {
+        started_by.is_some_and(|started_by| std::os::unix::process::parent_id() != started_by)
+    };
     if starter_gone() {
         return Err("the program that started this one is gone already".to_string());
     }

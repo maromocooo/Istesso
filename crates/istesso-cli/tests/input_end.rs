@@ -90,8 +90,18 @@ fn refused(dir: &TestDir, mut command: Command) -> Option<(bool, String)> {
 fn a_number_nothing_was_handed_over_at_is_refused_before_anything_else() {
     let dir = TestDir::new("refused");
     let port = a_port(3).to_string();
+    let me = std::process::id().to_string();
     for arguments in [
-        vec!["input", "relay", "--to", "nobody", "--input-fd", "987"],
+        vec![
+            "input",
+            "relay",
+            "--to",
+            "nobody",
+            "--input-fd",
+            "987",
+            "--started-by",
+            &me,
+        ],
         vec![
             "agent",
             "--no-discovery",
@@ -103,7 +113,16 @@ fn a_number_nothing_was_handed_over_at_is_refused_before_anything_else() {
             "987",
         ],
         // Never the standard descriptors.
-        vec!["input", "relay", "--to", "nobody", "--input-fd", "0"],
+        vec![
+            "input",
+            "relay",
+            "--to",
+            "nobody",
+            "--input-fd",
+            "0",
+            "--started-by",
+            &me,
+        ],
     ] {
         let mut command = istesso();
         command.args(&arguments);
@@ -131,7 +150,9 @@ fn a_socket_with_a_name_is_not_taken_as_an_end() {
     let number = hand_to_child(&mut command, to_a_name);
     command
         .args(["input", "relay", "--to", "nobody", "--input-fd"])
-        .arg(number.to_string());
+        .arg(number.to_string())
+        .arg("--started-by")
+        .arg(std::process::id().to_string());
     let Some((refused, said)) = refused(&config, command) else {
         return;
     };
@@ -146,12 +167,57 @@ fn a_name_and_an_end_are_not_given_together() {
     let mut command = istesso();
     command
         .args(["input", "relay", "--to", "nobody", "--input-fd", "5"])
+        .arg("--started-by")
+        .arg(std::process::id().to_string())
         .args(["--socket", "/nonexistent/in.sock"]);
     let Some((refused, said)) = refused(&config, command) else {
         return;
     };
     assert!(refused);
     assert!(said.contains("cannot be used with"), "{said}");
+}
+
+/// An end and no word of who holds the other one is not taken: without it,
+/// a relay whose starter went before it could look would not know.
+#[test]
+fn an_end_needs_the_number_of_its_starter() {
+    let config = TestDir::new("no-starter-config");
+    let mut command = istesso();
+    command.args(["input", "relay", "--to", "nobody", "--input-fd", "5"]);
+    let Some((refused, said)) = refused(&config, command) else {
+        return;
+    };
+    assert!(refused);
+    assert!(said.contains("--started-by"), "{said}");
+    assert_eq!(std::fs::read_dir(&config.0).unwrap().count(), 0);
+}
+
+/// The program that says it started the relay is not its parent: gone
+/// already, or never there. The relay does not start, and uses no key.
+#[test]
+fn the_relay_does_not_start_for_a_starter_that_is_not_its_parent() {
+    let config = TestDir::new("not-the-parent-config");
+    // A program that was there and is gone.
+    let mut gone = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let gone_number = gone.id();
+    gone.wait().unwrap();
+    let (_window, relays) = pair().unwrap();
+    let mut command = istesso();
+    let number = hand_to_child(&mut command, relays);
+    command
+        .args(["input", "relay", "--to", "nobody", "--input-fd"])
+        .arg(number.to_string())
+        .arg("--started-by")
+        .arg(gone_number.to_string());
+    let Some((refused, said)) = refused(&config, command) else {
+        return;
+    };
+    assert!(refused);
+    assert!(said.contains("gone already"), "{said}");
+    assert_eq!(std::fs::read_dir(&config.0).unwrap().count(), 0);
 }
 
 /// What a build does not guard is said to a person, in one line, and is
@@ -315,6 +381,8 @@ fn input_goes_from_end_to_end_without_a_name() {
         .arg(format!("127.0.0.1:{port}"))
         .arg("--input-fd")
         .arg(number.to_string())
+        .arg("--started-by")
+        .arg(std::process::id().to_string())
         .env("ISTESSO_CONFIG_DIR", &device.0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -465,7 +533,7 @@ fn the_relay_stops_trying_when_the_program_that_started_it_is_gone() {
         .arg("-c")
         .arg(
             "\"$ISTESSO\" input relay --to 'a host' --keep-trying 60 --address \"$ADDRESS\" \
-             --input-fd \"$NUMBER\" >/dev/null 2>&1 & echo $!; sleep 2",
+             --input-fd \"$NUMBER\" --started-by $$ >/dev/null 2>&1 & echo $!; sleep 2",
         )
         .env("ISTESSO", env!("CARGO_BIN_EXE_istesso"))
         .env("ADDRESS", format!("127.0.0.1:{port}"))
@@ -550,7 +618,7 @@ fn the_relay_ends_with_the_program_that_started_it() {
         .arg("-c")
         .arg(
             "\"$ISTESSO\" input relay --to 'a host' --keep-trying 20 --address \"$ADDRESS\" \
-             --input-fd \"$NUMBER\" >/dev/null 2>&1 & echo $!; sleep 2",
+             --input-fd \"$NUMBER\" --started-by $$ >/dev/null 2>&1 & echo $!; sleep 2",
         )
         .env("ISTESSO", env!("CARGO_BIN_EXE_istesso"))
         .env("ADDRESS", format!("127.0.0.1:{port}"))
