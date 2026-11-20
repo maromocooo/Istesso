@@ -77,6 +77,9 @@ fake_function() { : }
 check "a function alone, AUTO_CD" "-" "$(target 'fake_function')"
 alias fake_alias=true
 check "an alias alone, AUTO_CD" "-" "$(target 'fake_alias')"
+check "a quoted command alone, AUTO_CD" "-" "$(target "'true'")"
+check "a command in double quotes, AUTO_CD" "-" "$(target '"ls"')"
+check "a command with a backslash, AUTO_CD" "-" "$(target '\ls')"
 unsetopt autocd
 check "a newline in the folder" "-" "$(target $'cd \'/x\ny\'')"
 

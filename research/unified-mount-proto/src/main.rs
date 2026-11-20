@@ -196,8 +196,10 @@ fn private_dir(dir: &Path) -> Result<(), String> {
 /// The empty folder to mount at: <base>/<machine>/<folder-id>, with the two above it private.
 /// `machine` is a checked folder name ([`glue::valid_machine_folder`]). The path is the real
 /// one (no links in it), as the mount table has it. A mount left there by an earlier run that
-/// was killed is taken off first; the mount point itself is not looked at before that (a
-/// mount whose server is gone may not answer).
+/// was killed is taken off first, by a plain unmount: one that a program here still uses may
+/// be another run's that this one cannot tell apart, and is not forced off (the person can,
+/// with `umount -f`). The mount point itself is not looked at before that (a mount whose
+/// server is gone may not answer).
 fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<(PathBuf, bool), String> {
     private_dir(base)?;
     let machine = base.join(machine);
@@ -209,11 +211,21 @@ fn mount_point(base: &Path, machine: &str, folder: &str) -> Result<(PathBuf, boo
             "mount: a mount was left at {}; taking it off",
             point.display()
         );
-        if !unmount(&point) {
-            return Err(format!(
-                "{} is still mounted and could not be unmounted",
-                point.display()
-            ));
+        match glue::plain_unmount(&point) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                return Err(format!(
+                    "a mount is at {} already and a program on this Mac uses it; close what uses it (or, if it is a mount left behind that no longer answers, take it off with `umount -f`) and try again",
+                    point.display()
+                ));
+            }
+            Err(_) if !is_mounted(&point) => {}
+            Err(e) => {
+                return Err(format!(
+                    "{} is still mounted and could not be unmounted: {e}",
+                    point.display()
+                ));
+            }
         }
     }
     let made = std::fs::symlink_metadata(&point).is_err();
@@ -404,6 +416,8 @@ fn run_mount(options: Options) -> ExitCode {
         }
     }
     let began = Instant::now();
+    // For the next `ensure`, which waits for this program to end before it mounts here again.
+    say!("process: {}", std::process::id());
     let paths = Paths::from_env();
     // The place first, from the list of paired devices, without asking the device: a mount
     // left there by a run that was killed is taken off even when the device cannot be

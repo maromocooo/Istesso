@@ -73,8 +73,8 @@ _istesso_cd_target() {
         arg=$first[1]
     elif (( ${#first} == 1 && ${#words} == 1 )) && [[ -o autocd ]]; then
         # A command, an alias, a function or a builtin of that name runs as
-        # one; AUTO_CD takes only a word that is none of those.
-        whence -- $first[1] >/dev/null && return 1
+        # one, quoted or not; AUTO_CD takes only a word that is none of those.
+        whence -- ${(Q)first[1]} >/dev/null && return 1
         arg=$first[1]
     else
         return 1

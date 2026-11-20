@@ -9,8 +9,9 @@
 #   E2E_BIN       the `istesso` program to run as the agent
 #   E2E_BIND      the address to listen on (the wired one; never 0.0.0.0)
 #   E2E_PORT      the port of the test's agent
-#   E2E_DEVICE    the Mac's test device (id or name) that may open a shell
-#                 and see the folder
+#   E2E_DEVICE    the id of the Mac's test device (as `istesso peers` shows
+#                 it; a name is refused) that may open a shell and see the
+#                 folder
 #   E2E_ACTION    start (default) or stop
 #
 # start: makes the test project E2E_DIR/proj (a Git repository with a

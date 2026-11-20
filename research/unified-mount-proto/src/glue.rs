@@ -261,7 +261,8 @@ struct Record {
     lost: bool,
     /// The mount's identity in the kernel's table.
     fsid: Option<crate::Fsid>,
-    /// The watcher's process number.
+    /// The process numbers of the `mount` and of its watcher.
+    process: Option<i32>,
     watcher: Option<i32>,
     /// The reasons it gave for failing before it was mounted.
     reasons: Vec<String>,
@@ -277,6 +278,8 @@ fn read_log(text: &str) -> Record {
             record.fsid = fsid.parse().ok();
         } else if let Some(pid) = line.strip_prefix("watcher: process ") {
             record.watcher = pid.parse().ok();
+        } else if let Some(pid) = line.strip_prefix("process: ") {
+            record.process = pid.parse().ok();
         } else if record.ready && line.starts_with("mount: lost the connection") {
             record.lost = true;
         } else if let Some(reason) = line.strip_prefix("mount: ") {
@@ -359,6 +362,10 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
     let record = read_log(&log_text(&log_path));
     let earlier = read_pid(&pid_file);
     let running = earlier.filter(|pid| runs_this_program(*pid));
+    if earlier.is_some() && running.is_none() {
+        // That `mount` is gone: its number may be given to another program.
+        let _ = std::fs::remove_file(&pid_file);
+    }
     if let (Some(pid), Some(point)) = (
         running,
         existing_point(&options.base, &options.machine, &options.folder),
@@ -399,12 +406,17 @@ fn ensure(options: &EnsureOptions) -> Result<PathBuf, Refused> {
     }
     // No mount of this flow is there to be used. An earlier `mount` at this place, or its
     // watcher, that still runs would take a new mount here for its own: it has to end first.
-    let pids: Vec<i32> = earlier.into_iter().chain(record.watcher).collect();
+    let pids: Vec<i32> = running
+        .into_iter()
+        .chain(record.process)
+        .chain(record.watcher)
+        .collect();
     if !wait_for_earlier(&pids, EARLIER_WITHIN) {
         return Err(failed(
             "an earlier mount of this folder is still ending; try again in a moment",
         ));
     }
+    let _ = std::fs::remove_file(&pid_file);
 
     // A new log for this run: an earlier `mount` that has not ended yet writes on in the old
     // one, not in this one.
@@ -582,13 +594,14 @@ pub fn release(options: &ReleaseOptions) -> Result<Released, String> {
             // The `mount` of the mount just taken off ends at once instead of at its next
             // look, when it is this flow's and still runs.
             let record = read_log(&log_text(&state.join(format!("{name}.log"))));
-            if let (Some(own), Some(pid)) =
-                (record.fsid, read_pid(&state.join(format!("{name}.pid"))))
-            {
+            let pid_file = state.join(format!("{name}.pid"));
+            if let (Some(own), Some(pid)) = (record.fsid, read_pid(&pid_file)) {
                 if on_top == Some(own) && runs_this_program(pid) {
                     // SAFETY: a signal to the process this flow started, by its number, which
                     // runs this program; its mount is gone, so it only ends.
                     unsafe { libc::kill(pid, libc::SIGTERM) };
+                    // Its number is in the log too, for an `ensure` that comes before it ended.
+                    let _ = std::fs::remove_file(&pid_file);
                 }
             }
             Ok(Released::Unmounted)
@@ -778,9 +791,11 @@ mod tests {
     #[test]
     fn the_log_says_ready_only_once_the_contents_are_answered() {
         assert_eq!(read_log(""), Record::default());
-        let started = read_log("watcher: process 12\n");
+        let started = read_log("process: 11\nwatcher: process 12\n");
         assert!(!started.ready);
+        assert_eq!(started.process, Some(11));
         assert_eq!(started.watcher, Some(12));
+        assert!(started.reasons.is_empty());
         let mounted = read_log(
             "watcher: process 12\nfsid: 50331660 30\nmounted proj of host read-only at /x after 0.1 s\n",
         );

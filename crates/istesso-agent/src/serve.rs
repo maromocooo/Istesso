@@ -189,12 +189,21 @@ struct LongLived {
 impl LongLived {
     /// One more place, when there is one.
     fn take(&self) -> Option<LongPlace<'_>> {
-        self.open
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
-                (open < MAX_LONG_LIVED).then_some(open + 1)
-            })
-            .ok()
-            .map(|_| LongPlace(self))
+        let mut open = self.open.load(Ordering::SeqCst);
+        loop {
+            if open >= MAX_LONG_LIVED {
+                return None;
+            }
+            match self.open.compare_exchange_weak(
+                open,
+                open + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(LongPlace(self)),
+                Err(now) => open = now,
+            }
+        }
     }
 }
 
