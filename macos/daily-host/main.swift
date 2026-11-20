@@ -3804,8 +3804,11 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         guard injector.mayPost, !settings.inputDry,
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = object["kind"] as? String else { return false }
+        // Only what starts something raises an application: a release (of a key or a button) goes
+        // where it goes, and never brings anything to the front.
         switch kind {
-        case "key", "text", "clipboard_copy", "clipboard_paste": return true
+        case "key": return object["pressed"] as? Bool == true
+        case "text", "clipboard_copy", "clipboard_paste": return true
         case "button": return object["pressed"] as? Bool == true
         default: return false
         }
