@@ -187,9 +187,13 @@ layout=${LAYOUT:-us}
 # Both go to the host as they are: only the forms they can take are let through.
 [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || { echo "error: SIZE is WIDTHxHEIGHT in pixels, such as 1720x720"; exit 2; }
 [[ "$layout" =~ ^[A-Za-z0-9_,-]+$ ]] || { echo "error: LAYOUT is the name of a keyboard layout, such as us or jp"; exit 2; }
-# Folders and files on the host are written into the host's scripts as they are: only a leading ~
-# and plain characters are let through, so that nothing in them can be read as a command there.
-safe_folder='^~?[A-Za-z0-9_./-]+$'
+# Folders and files on the host are written into the host's scripts as they are: only a leading ~/
+# or / and plain characters are let through, so that nothing in them can be read as a command
+# there. A ~ only before a slash (`~name` would be another account's home folder in those
+# scripts), and no leading - (an option to mkdir, tar or cp).
+safe_folder='^(~/|/)?[A-Za-z0-9_.][A-Za-z0-9_./-]*$'
+# A document of the trial's copy of the source (open --document): the same, inside that copy.
+safe_document='^[A-Za-z0-9_.][A-Za-z0-9_./-]*$'
 for each in "DAILY_HOST_DIR=$host_dir" "DAILY_PLUGIN_FROM=$plugin_from" "DAILY_AURA_CONFIG=${DAILY_AURA_CONFIG:-}" \
     "DAILY_HOST_CONFIG=${DAILY_HOST_CONFIG:-}" "DAILY_BLENDER_CONFIG=${DAILY_BLENDER_CONFIG:-}" \
     "DAILY_BLENDER=${DAILY_BLENDER:-}"; do
@@ -988,6 +992,8 @@ else
     # done to it) and handed to the application.
     doc=""
     if [ -n "$DOCUMENT" ]; then
+        # As on the Mac (do_open): it is pasted into the start line below.
+        [[ "$DOCUMENT" =~ ^[A-Za-z0-9_.][A-Za-z0-9_./-]*$ ]] || { echo "fail --document names a file inside the trial's copy of the source in letters, digits and _ . / -"; exit 2; }
         case "$DOCUMENT" in /* | *..*) echo "fail --document names a file inside the trial's copy of the source, like crates/istesso-agent/src/serve.rs"; exit 2 ;; esac
         [ -f "$src/$DOCUMENT" ] || { echo "fail there is no $DOCUMENT in the trial's copy of the source"; exit 2; }
         mkdir -p "$D/documents"; doc=$D/documents/$(basename "$DOCUMENT")
@@ -1367,6 +1373,9 @@ do_open() { # NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]
         *) echo "error: open NAME [--for aura] [--size WxH] [--document PATH] [--min-qp N]"; exit 2 ;;
         esac
     done
+    # Pasted into the application's start line on the host, like the folders above.
+    [ -z "$document" ] || { [[ "$document" =~ $safe_document ]] && [[ "$document" != *..* ]]; } ||
+        { echo "error: --document names a file inside the trial's copy of the source in letters, digits and _ . / -, like crates/istesso-agent/src/serve.rs"; exit 2; }
     known_name "$name" || { echo "error: the applications are: $apps"; exit 2; }
     case "$for_whom" in
     "") ;;

@@ -303,13 +303,51 @@ class TheHostGetsTheSettingsAsTheyAre(unittest.TestCase):
         hostile = f"~/a b$(touch {self.mark})"
         for setting in ("DAILY_HOST_CONFIG", "DAILY_HOST_DIR", "DAILY_BLENDER", "DAILY_PLUGIN_FROM",
                         "DAILY_AURA_CONFIG", "DAILY_BLENDER_CONFIG"):
-            for value in (hostile, "~/a;b", "x`y`", "~/it's"):
+            # A ~ only before a slash (`~root/x` would be another account's home folder in the host's
+            # scripts), and no leading - (an option to mkdir, tar or cp there).
+            for value in (hostile, "~/a;b", "x`y`", "~/it's", "~root/x", "~", "~/", "/", "-x", "--help",
+                          "~/a\n", "a b"):
                 env = dict(self.env, **{setting: value})
                 done = subprocess.run([self.daily, "list"], env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
                 self.assertIn(f"error: {setting} is a folder or file of the host", done.stdout)
         self.assertEqual(os.listdir(self.calls), [])
         self.assertFalse(os.path.exists(self.mark))
+
+    def test_the_folders_the_script_and_the_documents_give_pass(self):
+        values = ("~/.cache/istesso-daily-wip", "~/istesso-scratch/holes/gwd-trial35/target/release",
+                  "~/.cache/istesso-scroll-wip/gwd-trial34/target/release", "~/.cache/istesso-aura-trial/config",
+                  "~/cfg.d/x-1", "~/trial-dir", "/opt/b/blender", "planted", ".hidden/x_1")
+        for setting in ("DAILY_HOST_CONFIG", "DAILY_HOST_DIR", "DAILY_BLENDER", "DAILY_PLUGIN_FROM",
+                        "DAILY_AURA_CONFIG", "DAILY_BLENDER_CONFIG"):
+            for value in values:
+                env = dict(self.env, **{setting: value})
+                done = subprocess.run([self.daily, "list"], env=env, capture_output=True, text=True, timeout=60)
+                self.assertNotIn("is a folder or file of the host", done.stdout, (setting, value))
+        # And the defaults, with none of them set.
+        done = subprocess.run([self.daily, "list"], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertNotIn("is a folder or file of the host", done.stdout)
+
+    def open_document(self, document, ends):
+        write(self.answer, "host: firefox started (slot 1; windows: 1)\nslot 1\nway host-side\npeer stand-in-peer\n")
+        done = subprocess.run([self.daily, "open", "firefox", "--document", document], env=self.env,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, ends, done.stdout + done.stderr)
+        return done.stdout
+
+    def test_a_document_that_could_be_read_as_a_command_is_refused_here(self):
+        for value in (f"a$(touch {self.mark})", "a;b", "x`y`", "it's", "a b", "-x", "~/x", "/etc/hosts",
+                      "a/../b", "..", "a\n"):
+            said = self.open_document(value, 2)
+            self.assertIn("error: --document names a file inside the trial's copy", said, value)
+        self.assertEqual(os.listdir(self.calls), [])
+        self.assertFalse(os.path.exists(self.mark))
+
+    def test_the_document_the_documents_give_arrives_as_it_is(self):
+        self.open_document("crates/istesso-agent/src/serve.rs", 0)
+        calls = self.lines()
+        self.assertTrue(calls)
+        self.assertEqual(self.received("bash", calls[0][-1])["DOCUMENT"], "crates/istesso-agent/src/serve.rs")
 
     def test_quoted_values_mean_the_same_to_zsh_and_bash(self):
         with open(SCRIPT) as f:
