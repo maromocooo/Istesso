@@ -32,6 +32,11 @@ struct Pair {
 
 impl Pair {
     fn new(tag: &str) -> Self {
+        Pair::with(tag, |_| {})
+    }
+
+    /// As [`Pair::new`], with the host's agent's options changed by `change`.
+    fn with(tag: &str, change: impl FnOnce(&mut crate::AgentOptions)) -> Self {
         let (host, device) = (TempDir::new(tag), TempDir::new(tag));
         let identities =
             [&host, &device].map(|dir| Identity::load_or_create(&dir.paths().identity()).unwrap());
@@ -58,7 +63,7 @@ impl Pair {
             .clone();
         let log = Arc::new(Mutex::new(Vec::new()));
         let lines = log.clone();
-        let options = crate::AgentOptions {
+        let mut options = crate::AgentOptions {
             bind: std::net::Ipv4Addr::LOCALHOST.into(),
             port: 0,
             discovery: false,
@@ -69,6 +74,7 @@ impl Pair {
             open_requests: false,
             ..crate::AgentOptions::default()
         };
+        change(&mut options);
         let agent = crate::Agent::bind(
             host.paths(),
             &options,
@@ -95,18 +101,22 @@ impl Pair {
 
     /// Opens a shell, with or without forwards, in `project`.
     fn open(&self, forward: bool, project: Option<&std::path::Path>) -> Shell {
+        self.open_with(ShellRequest {
+            cols: 80,
+            rows: 24,
+            term: None,
+            locale: None,
+            project: project.map(|p| p.display().to_string()),
+            forward,
+            windows: false,
+        })
+    }
+
+    /// Opens a shell as `request` asks.
+    fn open_with(&self, request: ShellRequest) -> Shell {
         let mut client = self.connect();
         let peer_id = client.peer().id.clone();
-        let answer = client
-            .open_shell(ShellRequest {
-                cols: 80,
-                rows: 24,
-                term: None,
-                locale: None,
-                project: project.map(|p| p.display().to_string()),
-                forward,
-            })
-            .unwrap();
+        let answer = client.open_shell(request).unwrap();
         assert_eq!(answer, ShellAnswer::Open);
         let (mut reader, writer) = client.into_channel().split().unwrap();
         let (frames_in, frames) = mpsc::channel();
@@ -145,6 +155,20 @@ impl Shell {
         self.writer
             .send(&ShellFrame::Data(text.as_bytes().to_vec()).encode())
             .unwrap();
+    }
+
+    /// The next window the host opened for the shell.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn window(&self) -> istesso_link::shell::WindowOpen {
+        let began = Instant::now();
+        while let Some(left) = SOON.checked_sub(began.elapsed()) {
+            match self.frames.recv_timeout(left) {
+                Ok(ShellFrame::OpenWindow(window)) => return window,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        panic!("no window was opened");
     }
 
     /// The next list of ports for which `wanted` holds.
@@ -291,10 +315,14 @@ fn a_server_started_in_the_shell_is_reached_through_the_forward() {
     let answer = ask(&format!("rebind.example:{here}"));
     assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
     assert!(!answer.contains("hello from the host"));
-    assert!(pair
-        .log()
-        .iter()
-        .any(|line| line.contains(&format!("forwarded connection to port {there}"))));
+    // The host writes the line when the connection is over, which may be
+    // a moment after the answer has come here.
+    let forwarded = format!("forwarded connection to port {there}");
+    let began = Instant::now();
+    while !pair.log().iter().any(|line| line.contains(&forwarded)) {
+        assert!(began.elapsed() < SOON, "{:?}", pair.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // The host's log has numbers, never what was carried.
     assert!(!pair.log().iter().any(|line| line.contains("hello")));
 
@@ -448,5 +476,186 @@ fn a_forwarded_connection_ends_when_its_port_is_no_longer_listed() {
     while !pair.log().iter().any(said) {
         assert!(began.elapsed() < Duration::from_secs(5), "{:?}", pair.log());
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A file of the shell's project folder, asked for by a program inside the
+/// shell as `istesso-edit` asks, is handed to the host's main editor (a
+/// stand-in that writes down what it was given), and the device is told on
+/// which ports the window waits. A file outside, a link, a climb out, a
+/// shell whose device shows no windows: refused, and the editor is not
+/// started. Nothing of the places is written down.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_project_file_opens_in_the_main_editor_and_the_device_is_told_where_its_window_is() {
+    use istesso_link::shell::WindowOpen;
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no python3 here");
+        return;
+    }
+    let tools = TempDir::new("ed-tools");
+    let launched = tools.path().join("launched.txt");
+    let launcher = tools.path().join("launcher.sh");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$#\" \"$1\" \"$EDITOR_WINDOW_PLACE\" >> '{}'\n[ \"$1\" = stop ] && exit 0\necho 'window 26891 26892 Text Editor'\n",
+            launched.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // What `istesso-edit` sends, from a program in the shell's session.
+    let ask = tools.path().join("ask.py");
+    std::fs::write(
+        &ask,
+        "import os, socket, sys\n\
+         s = socket.socket(socket.AF_UNIX)\n\
+         s.connect(os.environ['ISTESSO_OPEN_SOCKET'])\n\
+         s.sendall(('file ' + sys.argv[1] + '\\n').encode())\n\
+         print(s.makefile().readline().strip(), flush=True)\n",
+    )
+    .unwrap();
+    let pair = Pair::with("ed-e2e", |options| {
+        options.open_requests = true;
+        options.main_editor = Some(launcher.clone());
+    });
+    let project = TempDir::new("ed-project");
+    let folder = project.path().canonicalize().unwrap();
+    std::fs::write(folder.join("notes.txt"), "x").unwrap();
+    let outside = TempDir::new("ed-outside");
+    let secret = outside.path().canonicalize().unwrap().join("secret.txt");
+    std::fs::write(&secret, "x").unwrap();
+    std::os::unix::fs::symlink(&secret, folder.join("link.txt")).unwrap();
+    let request = ShellRequest {
+        cols: 80,
+        rows: 24,
+        term: None,
+        locale: None,
+        project: Some(folder.display().to_string()),
+        forward: true,
+        windows: true,
+    };
+    let mut shell = pair.open_with(request.clone());
+    let (answers, others) = (
+        tools.path().join("answers.txt"),
+        tools.path().join("others.txt"),
+    );
+    let asking_into = |file: &str, into: &std::path::Path| {
+        format!(
+            "python3 '{}' {file} >> '{}'\n",
+            ask.display(),
+            into.display()
+        )
+    };
+    let asking = |file: &str| asking_into(file, &answers);
+    shell.type_in(&asking("\"$PWD/notes.txt\""));
+    assert_eq!(
+        shell.window(),
+        WindowOpen {
+            picture: 26891,
+            input: 26892,
+            title: "Text Editor".into(),
+            asked_by_program: Some(false),
+        }
+    );
+    // The same file asked for by a program in the shell (a script here), not
+    // the shell itself: the device is told so.
+    let script = tools.path().join("via-program.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "python3 '{}' \"$1\"\nstatus=$?\nexit $status\n",
+            ask.display()
+        ),
+    )
+    .unwrap();
+    shell.type_in(&format!(
+        "sh '{}' \"$PWD/notes.txt\" >> '{}'\n",
+        script.display(),
+        answers.display()
+    ));
+    assert_eq!(
+        shell.window(),
+        WindowOpen {
+            picture: 26891,
+            input: 26892,
+            title: "Text Editor".into(),
+            asked_by_program: Some(true),
+        }
+    );
+    shell.type_in(&asking(&format!("'{}'", secret.display())));
+    shell.type_in(&asking("\"$PWD/link.txt\""));
+    shell.type_in(&asking("\"$PWD/../notes.txt\""));
+    // A shell whose device does not show windows.
+    let mut without = pair.open_with(ShellRequest {
+        windows: false,
+        ..request
+    });
+    without.type_in(&asking_into("\"$PWD/notes.txt\"", &others));
+    let lines_of = |file: &std::path::Path, count: usize| {
+        let began = Instant::now();
+        loop {
+            let lines: Vec<String> = std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            if lines.len() >= count {
+                return lines;
+            }
+            assert!(began.elapsed() < SOON, "{lines:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut lines = lines_of(&answers, 5);
+    lines.extend(lines_of(&others, 1));
+    assert_eq!(lines[..2], ["ok", "ok"]);
+    assert!(lines[2].contains("only files inside the shell's project folder"));
+    assert!(lines[3].contains("symbolic link"));
+    assert!(lines[4].contains("without '..'"));
+    assert!(lines[5].contains("does not show windows"));
+    // The launcher was asked twice, with the place the host built, in its
+    // environment.
+    assert_eq!(
+        std::fs::read_to_string(&launched).unwrap(),
+        format!("1|open|{}\n", folder.join("notes.txt").display()).repeat(2)
+    );
+    // When the shell that asked is over, its editor is ended.
+    shell.type_in("exit\n");
+    let began = Instant::now();
+    while !pair
+        .log()
+        .iter()
+        .any(|line| line.contains("was ended with the shell"))
+    {
+        assert!(began.elapsed() < SOON, "{:?}", pair.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&launched).unwrap().lines().last(),
+        Some("1|stop|")
+    );
+    // Nothing of the places is written down.
+    let log = pair.log();
+    assert!(log
+        .iter()
+        .any(|line| line.contains("in the main editor") && line.contains("port 26891")));
+    assert!(log
+        .iter()
+        .any(|line| line.contains("(from the shell's foreground job)")));
+    assert!(log
+        .iter()
+        .any(|line| line.contains("(asked by a program in the shell)")));
+    for line in &log {
+        for word in ["notes", "secret", "link.txt", "ed-project", "ed-outside"] {
+            assert!(!line.contains(word), "{line}");
+        }
     }
 }

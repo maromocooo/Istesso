@@ -86,6 +86,13 @@ pub struct ShellRequest {
     /// A host that does not know this passes over it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub forward: bool,
+    /// Windows that the shell's workspace opens on the host (a file opened
+    /// in the host's main editor) may be shown on this device: send them on
+    /// this conversation ([`crate::shell::ShellFrame::OpenWindow`]).
+    /// Proposed in ADR 0007 ("メインのエディターで開く頼み"). A host that
+    /// does not know this passes over it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub windows: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,6 +273,7 @@ mod tests {
             locale: None,
             project: None,
             forward: false,
+            windows: false,
         });
         let json = serde_json::to_string(&bare).unwrap();
         assert_eq!(json, r#"{"type":"shell_open","cols":80,"rows":24}"#);
@@ -301,10 +309,30 @@ mod tests {
             locale: None,
             project: None,
             forward: true,
+            windows: false,
         });
         assert_eq!(
             serde_json::to_string(&asked).unwrap(),
             r#"{"type":"shell_open","cols":80,"rows":24,"forward":true}"#
+        );
+        // Windows are one more field, left out unless asked for.
+        let with_windows = Request::ShellOpen(ShellRequest {
+            cols: 80,
+            rows: 24,
+            term: None,
+            locale: None,
+            project: None,
+            forward: true,
+            windows: true,
+        });
+        let json = serde_json::to_string(&with_windows).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"shell_open","cols":80,"rows":24,"forward":true,"windows":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            with_windows
         );
         let id = "ab".repeat(16);
         let open = Request::ForwardOpen {

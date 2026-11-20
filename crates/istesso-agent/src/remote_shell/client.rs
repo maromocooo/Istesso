@@ -50,6 +50,12 @@ pub struct Options {
     pub forward: crate::workspace::device::Settings,
     /// Start at home, and forget the remembered folder.
     pub home: bool,
+    /// Show here the windows that the shell's workspace opens on the device
+    /// (a file in its main editor), with this program
+    /// ([`crate::workspace::windows`]). Asked for only together with
+    /// forwards: the device keeps a workspace only then.
+    pub windows: bool,
+    pub window_opener: Option<std::path::PathBuf>,
 }
 
 /// The folder a shell on the device `id` was last opened in, if one is
@@ -142,6 +148,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
             .or_else(|| variable("LANG")),
         project: project.clone(),
         forward: options.forward.enabled,
+        windows: options.windows && options.forward.enabled,
     };
     let peer_id = client.peer().id.clone();
     match client.open_shell(request) {
@@ -200,7 +207,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
     // to open a page are taken here. Notices go on a line of their own.
     // Made after the signals are blocked: its threads must not take them
     // (they would go to the handler that does nothing, and be lost).
-    let forwarder = match (options.forward.enabled, address) {
+    let forwarder = match (options.forward.enabled, &address) {
         (true, Ok(address)) => {
             let notice: crate::workspace::device::Notice = Arc::new(|line: &str| {
                 let _ = write!(std::io::stderr(), "\r\nistesso: {line}\r\n");
@@ -209,7 +216,7 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
                 paths,
                 &device,
                 &peer_id,
-                address,
+                *address,
                 options.forward.clone(),
                 notice,
             ) {
@@ -219,6 +226,22 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
                     None
                 }
             }
+        }
+        _ => None,
+    };
+    // Windows the host opens for the shell are looked for on the host the
+    // shell is on, at the address it was reached at.
+    let windows = match (options.windows && options.forward.enabled, &address) {
+        (true, Ok(address)) => {
+            let notice: crate::workspace::device::Notice = Arc::new(|line: &str| {
+                let _ = write!(std::io::stderr(), "\r\nistesso: {line}\r\n");
+            });
+            Some(crate::workspace::windows::Windows::new(
+                options.window_opener.clone(),
+                *address,
+                &peer_id,
+                notice,
+            ))
         }
         _ => None,
     };
@@ -296,6 +319,12 @@ pub fn run(paths: &Paths, options: &Options) -> u8 {
             Ok(ShellFrame::OpenUrl(address)) => {
                 if let Some(forwarder) = &forwarder {
                     forwarder.open_url(&address);
+                }
+            }
+            Ok(ShellFrame::OpenWindow(window)) => {
+                // Shown only when this device asked for windows.
+                if let Some(windows) = &windows {
+                    windows.open(&window);
                 }
             }
             // "Still here" is heard by the read itself; frames of a later version are

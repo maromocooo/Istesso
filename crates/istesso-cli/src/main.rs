@@ -117,6 +117,13 @@ enum Command {
         /// Also show what Git ignores, and `.git`, in the folder with this id
         #[arg(long, value_name = "ID")]
         mount_show_ignored: Vec<String>,
+        /// The program that starts this machine's main editor on a file of
+        /// a shell's project folder (`istesso-edit <file>` in a shell of
+        /// another device), and says on which ports its window's picture
+        /// and input wait. The request names a file and nothing else. A
+        /// prototype (ADR 0007, proposal)
+        #[arg(long, value_name = "PROGRAM")]
+        main_editor: Option<PathBuf>,
     },
     /// Open a shell on a paired device in this terminal, over Istesso's own
     /// encrypted channel. Any terminal application can run this instead of
@@ -170,6 +177,13 @@ enum Command {
         /// system's, or ISTESSO_URL_OPENER
         #[arg(long, value_name = "WHICH", default_value = "forwarded")]
         open_urls: OpenUrls,
+        /// Do not show here the windows that the shell's workspace opens on
+        /// the device (`istesso-edit <file>`: a file in the device's main
+        /// editor). They are shown by default, with the program
+        /// ISTESSO_WINDOW_OPENER names, and only with forwards (a
+        /// prototype, ADR 0007, proposal)
+        #[arg(long)]
+        no_windows: bool,
     },
     /// Show the ports forwarded to this machine from the shells open here
     /// (`istesso shell`), or stop forwarding them
@@ -677,10 +691,14 @@ fn main() -> ExitCode {
             [
                 istesso_agent::workspace::opener::OPEN_NAME,
                 istesso_agent::workspace::opener::XDG_OPEN_NAME,
+                istesso_agent::workspace::editor::EDIT_NAME,
             ]
             .contains(&name.as_str())
         }) {
             let rest: Vec<std::ffi::OsString> = args.collect();
+            if name == istesso_agent::workspace::editor::EDIT_NAME {
+                return ExitCode::from(istesso_agent::workspace::editor::run_as_edit(&rest));
+            }
             return ExitCode::from(istesso_agent::workspace::opener::run_as(&name, &rest));
         }
     }
@@ -697,6 +715,7 @@ fn main() -> ExitCode {
         no_forward,
         forward_pin,
         open_urls,
+        no_windows,
     } = &cli.command
     {
         let refuse = |message: &str| {
@@ -749,6 +768,10 @@ fn main() -> ExitCode {
                     .map(PathBuf::from),
             },
             home: *home,
+            windows: !no_windows,
+            window_opener: std::env::var_os(istesso_agent::workspace::windows::OPENER_VARIABLE)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         };
         return ExitCode::from(istesso_agent::remote_shell::client::run(
             &Paths::from_env(),
@@ -808,6 +831,7 @@ fn run(cli: Cli) -> Result<(), String> {
             mount_folder,
             allow_mount,
             mount_show_ignored,
+            main_editor,
         } => run_agent(AgentOptions {
             bind,
             port,
@@ -829,6 +853,7 @@ fn run(cli: Cli) -> Result<(), String> {
             mount_folders: mount_folder,
             mount_for: allow_mount,
             mount_show_ignored,
+            main_editor,
             ..AgentOptions::default()
         }),
         Command::Shell { .. } => Err("this machine cannot open shells on other devices".into()),
@@ -1728,12 +1753,17 @@ fn run_agent(options: AgentOptions) -> Result<(), String> {
     let addresses = istesso_doctor::lan_addresses();
     let paired = open_peers()?.peers().len();
 
+    let shells = options.shell_for.len();
+    let main_editor = options.main_editor.is_some();
     let agent = Agent::bind(paths, &options, Arc::new(|line| eprintln!("{line}")))?;
     let addr = agent.local_addr().map_err(|e| e.to_string())?;
     println!("{name} ({})", agent.fingerprint());
     println!("Answering paired devices on {addr}. Paired devices: {paired}. Stop with Ctrl-C.");
     for device in agent.shell_devices() {
         println!("Shells are open to {device}, as the user this agent runs as.");
+    }
+    if shells > 0 && main_editor {
+        println!("Files of a shell's project folder open in the main editor (istesso-edit), its window shown on the shell's device.");
     }
     let (mount_devices, folders) = agent.mount_devices();
     if folders > 0 {
