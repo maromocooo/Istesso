@@ -30,7 +30,9 @@ const WAIT: Duration = Duration::from_secs(5);
 /// How often a device that sends input is looked up again in the list of
 /// paired devices. A conversation with input stays open for as long as a
 /// window does; a pairing that is removed, or a right that is taken away,
-/// must stop it soon, not when the window is closed.
+/// must stop it soon, not when the window is closed. The look is taken
+/// once for all devices with input, whatever they send (see
+/// [`Shared::recheck_inputs`]), and never for each event.
 const INPUT_RECHECK: Duration = Duration::from_secs(1);
 /// How long a device that sends input may say nothing, once it has agreed to
 /// say "still here" twice a second (`alive` at `input_open`). A device that
@@ -159,6 +161,8 @@ impl ClipboardCounts {
 /// What is kept of a conversation that carries input, for ending it from
 /// another one.
 struct InputHold {
+    /// The device, as it was let in: what it may do is looked up again by this.
+    peer: istesso_pair::Peer,
     held: Arc<Mutex<Held>>,
     sink: InputSink,
     hang_up: HangUp,
@@ -248,6 +252,14 @@ impl Agent {
             for line in lines {
                 (shared.log)(line);
             }
+        });
+        // Every device with input is looked up again once a second, whatever it sends:
+        // one that only says "ping" (or asks what it may still ask) after its pairing
+        // was removed or its right taken away is let go of and cut off all the same.
+        let shared = self.shared.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(INPUT_RECHECK);
+            shared.recheck_inputs();
         });
         let shared = self.shared.clone();
         std::thread::spawn(move || {
@@ -548,6 +560,11 @@ impl NoControl {
 
 fn control_right(paths: &Paths, peer: &istesso_pair::Peer) -> Result<(), NoControl> {
     let peers = PeerStore::open(paths.peers()).map_err(|_| NoControl::Unreadable)?;
+    control_right_in(&peers, peer)
+}
+
+/// [`control_right`], in a list that has been read already.
+fn control_right_in(peers: &PeerStore, peer: &istesso_pair::Peer) -> Result<(), NoControl> {
     let known = peers
         .peers()
         .iter()
@@ -684,6 +701,9 @@ impl Shared {
                         earlier.let_go();
                         self.forget_input(session.peer(), &earlier);
                     }
+                    // So is the device's input on any other conversation: it may not
+                    // control there either.
+                    self.end_input_of(session.peer());
                     match input_refused.take() {
                         Some(why) => why.answer(),
                         None => NoControl::Unreadable.answer(),
@@ -859,6 +879,7 @@ impl Shared {
             return;
         };
         let hold = InputHold {
+            peer: session.peer().clone(),
             held: sink.held.clone(),
             sink: another,
             hang_up,
@@ -871,6 +892,70 @@ impl Shared {
         if let Some(earlier) = earlier {
             earlier.sink.let_go();
             earlier.hang_up.hang_up();
+        }
+    }
+
+    /// Ends the input of this device on whichever conversation carries it: its keys and
+    /// buttons come up, and that conversation is cut off.
+    fn end_input_of(&self, peer: &istesso_pair::Peer) {
+        let hold = self
+            .inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer.id);
+        if let Some(hold) = hold {
+            hold.sink.let_go();
+            hold.hang_up.hang_up();
+        }
+    }
+
+    /// Looks up every device with input in the list of paired devices, read once for all
+    /// of them, and ends the input of each that may no longer control this host (or of
+    /// all, when the list cannot be read): its keys and buttons come up, and its
+    /// conversation is cut off. This does not wait for the device to send input: one that
+    /// only pings, or asks what it may still ask, keeps nothing down.
+    fn recheck_inputs(&self) {
+        let holding: Vec<(istesso_pair::Peer, Arc<Mutex<Held>>)> = {
+            let inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+            if inputs.is_empty() {
+                return;
+            }
+            inputs
+                .values()
+                .map(|hold| (hold.peer.clone(), hold.held.clone()))
+                .collect()
+        };
+        let peers = PeerStore::open(self.paths.peers()).ok();
+        let ended: Vec<InputHold> = {
+            let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+            holding
+                .iter()
+                .filter(|(peer, _)| {
+                    peers
+                        .as_ref()
+                        .is_none_or(|peers| control_right_in(peers, peer).is_err())
+                })
+                .filter_map(|(peer, held)| {
+                    // Only the conversation that was looked up: one that took over in the
+                    // meantime was looked up when it opened, and is again at the next turn.
+                    let same = inputs
+                        .get(&peer.id)
+                        .is_some_and(|hold| Arc::ptr_eq(&hold.held, held));
+                    if same {
+                        inputs.remove(&peer.id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for hold in ended {
+            hold.sink.let_go();
+            hold.hang_up.hang_up();
+            (self.log)(format!(
+                "stopped taking input from {}: it is no longer allowed to control this host",
+                hold.peer.name
+            ));
         }
     }
 
@@ -1559,6 +1644,118 @@ mod tests {
             assert_eq!(pair.all_handed_over(A_MOMENT), [key(30, false), cleared()]);
             client.send_input(&[key(31, true)]).unwrap();
             assert_eq!(pair.handed_over(A_MOMENT), None);
+        }
+
+        /// Waits until the device is told that its conversation is over.
+        fn is_cut_off(client: &mut istesso_link::Client, within: Duration) -> bool {
+            let began = Instant::now();
+            while began.elapsed() < within {
+                if client.ping().is_err() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        }
+
+        #[test]
+        fn a_device_that_only_pings_after_its_pairing_is_removed_is_let_go_of_and_cut_off() {
+            let pair = InputPair::new("ip");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client.send_input(&[key(29, true), key(14, true)]).unwrap();
+            assert_eq!(pair.all_handed_over(A_MOMENT).len(), 2);
+
+            let mut peers = istesso_pair::PeerStore::open(pair.host.paths().peers()).unwrap();
+            peers.remove("a laptop").unwrap();
+            let removed = Instant::now();
+            // No input from here on: only pings, often enough to keep the conversation open.
+            let mut handed = Vec::new();
+            while handed.is_empty() {
+                assert!(
+                    removed.elapsed() < Duration::from_secs(3),
+                    "its keys are still down"
+                );
+                let _ = client.ping();
+                handed = pair.all_handed_over(Duration::from_millis(100));
+            }
+            let after = removed.elapsed();
+            // Keys come up in the order of their codes.
+            assert_eq!(handed, [key(14, false), key(29, false), cleared()]);
+            // Within about a second of the removal (the look is taken once a second).
+            assert!(
+                after < super::super::INPUT_RECHECK + Duration::from_millis(600),
+                "{after:?}"
+            );
+            // And the conversation is over, not only its input.
+            assert!(is_cut_off(&mut client, SOON), "it is still answered");
+        }
+
+        #[test]
+        fn a_device_that_only_pings_after_losing_the_right_to_control_is_cut_off() {
+            use istesso_pair::Permission;
+            let pair = InputPair::new("iq");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client.send_input(&[button(0x110, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(button(0x110, true)));
+            set_rights(&pair, &[Permission::View]);
+            let began = Instant::now();
+            let mut handed = Vec::new();
+            while handed.is_empty() {
+                assert!(
+                    began.elapsed() < Duration::from_secs(3),
+                    "its button is still down"
+                );
+                let _ = client.ping();
+                handed = pair.all_handed_over(Duration::from_millis(100));
+            }
+            assert_eq!(handed, [button(0x110, false), cleared()]);
+            assert!(is_cut_off(&mut client, SOON), "it is still answered");
+        }
+
+        #[test]
+        fn a_refused_request_on_a_second_conversation_ends_the_input_of_the_first() {
+            use istesso_pair::Permission;
+            let pair = InputPair::new("iy");
+            let mut first = pair.connect();
+            first.open_input_alive().unwrap();
+            first.send_input(&[key(42, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(42, true)));
+            // The first conversation only pings from here on.
+            first.ping().unwrap();
+
+            set_rights(&pair, &[Permission::View]);
+            let mut second = pair.connect();
+            assert!(refused(second.open_input_alive().unwrap()));
+            // At once, without waiting for the next look at the rights.
+            assert_eq!(pair.all_handed_over(A_MOMENT), [key(42, false), cleared()]);
+            assert!(
+                is_cut_off(&mut first, SOON),
+                "the first one is still answered"
+            );
+            // What the first one still sends goes nowhere.
+            let _ = first.send_input(&[key(43, true)]);
+            assert_eq!(pair.handed_over(A_MOMENT), None);
+            // The refused conversation itself may still look: it has that right.
+            second.ping().unwrap();
+        }
+
+        #[test]
+        fn a_device_that_keeps_its_rights_and_only_pings_keeps_its_input() {
+            let pair = InputPair::new("ik");
+            let mut client = pair.connect();
+            client.open_input_alive().unwrap();
+            client.send_input(&[key(42, true)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(42, true)));
+            // Three looks at the rights go by: nothing comes up.
+            let began = Instant::now();
+            while began.elapsed() < super::super::INPUT_RECHECK * 3 {
+                client.ping().unwrap();
+                assert_eq!(pair.handed_over(Duration::from_millis(200)), None);
+            }
+            client.send_input(&[key(42, false)]).unwrap();
+            assert_eq!(pair.handed_over(SOON), Some(key(42, false)));
         }
 
         #[test]
