@@ -1,0 +1,1147 @@
+PROTOTYPE ONLY (ADR 0027 proposal, new windows on the Linux host, docs/proto-new-windows-ubuntu.md).
+Never include this patch in a build used for a trial, the gate or a verdict.
+scripts/build-compositor.sh does not know it.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86. Apply the four measured patches in scripts/patches first, in order:
+render-on-commit, cursor-messages, windows, dialogs. Then apply these from scripts/patches/proto:
+  gst-wayland-display-proto-second-output.patch (U0)
+  gst-wayland-display-proto-second-output-on-commit.patch
+  gst-wayland-display-proto-second-output-window-list.patch
+  gst-wayland-display-proto-second-output-draw-before-copy.patch
+  gst-wayland-display-proto-second-output-input.patch (this patch, step 3)
+The lines of context are from that project and those patches.
+
+The element with output=1 forwards upstream pointer motion, buttons, scrolling and keys to the
+shared compositor. PointerMotionAbsoluteFor takes positions in the second output's own pixels
+and clamps them to its bounds. KeyboardFocus gives the keyboard to the top window on the
+requested output. CloseWindow asks only the second window to close. When keyboard focus is
+lost, the fallback prefers a window on the first output. In the wayland.second-window message,
+`key` is true while the second window or one of its popups has the keyboard.
+
+Popups of the second window are placed relative to their parent, constrained to the second
+output and drawn over the window. A popup under the pointer receives pointer input. Its grab
+is allowed only while its window has the keyboard. A popup commit can release a waiting frame
+on the second output when rendering on commit.
+
+With no second output, the first output behaves as before except for two log changes. The
+element no longer logs every upstream event at debug level or names an unknown key in warnings.
+Outside this patch are dialogs whose parent is on the second output, resizing and more than two outputs.
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index f9fb9a1..a0ed35d 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -174,12 +174,36 @@ trait EventHandler {
+ 
+ impl EventHandler for WaylandDisplaySrc {
+     fn handle_event(&self, event: &Event) -> bool {
+-        tracing::debug!("Received event: {:?}", event);
++        let output = self.settings.lock().unwrap().output as usize;
++        let send_input = |command| {
++            if output == 0 {
++                let _ = self.command_tx.send(command);
++            } else if let Some(attached) = self.attached.lock().unwrap().as_ref() {
++                let _ = attached.send(command);
++            }
++        };
++        let move_absolute = |x, y| {
++            send_input(if output == 0 {
++                Command::PointerMotionAbsolute((x, y).into())
++            } else {
++                Command::PointerMotionAbsoluteFor(output, (x, y).into())
++            });
++        };
+ 
+         match event.view() {
+             gst::EventView::CustomUpstream(e) => {
+                 let structure = e.structure().expect("Unable to get message structure");
+-                if structure.has_name("CloseWindows") {
++                if structure.has_name("KeyboardFocus") {
++                    send_input(Command::KeyboardFocus(output));
++                    return true;
++                } else if structure.has_name("CloseWindow") {
++                    send_input(Command::CloseWindow(output));
++                    return true;
++                } else if structure.has_name("CloseWindows") {
++                    if output != 0 {
++                        tracing::warn!("CloseWindows belongs to the first output.");
++                        return true;
++                    }
+                     // Asks the clients to close their windows, as a window manager's close
+                     // button does. Nothing is closed by force.
+                     let _ = self.command_tx.send(Command::CloseWindows);
+@@ -198,9 +222,7 @@ impl EventHandler for WaylandDisplaySrc {
+                         .get::<f64>("pointer_y")
+                         .expect("Should contain pointer_y");
+ 
+-                    let _ = self
+-                        .command_tx
+-                        .send(Command::PointerMotionAbsolute((x, y).into()));
++                    move_absolute(x, y);
+ 
+                     return true;
+                 } else if structure.has_name("MouseMoveRelative") {
+@@ -211,7 +233,7 @@ impl EventHandler for WaylandDisplaySrc {
+                         .get::<f64>("pointer_y")
+                         .expect("Should contain pointer_y");
+ 
+-                    let _ = self.command_tx.send(Command::PointerMotion((x, y).into()));
++                    send_input(Command::PointerMotion((x, y).into()));
+ 
+                     return true;
+                 } else if structure.has_name("MouseButton") {
+@@ -222,7 +244,7 @@ impl EventHandler for WaylandDisplaySrc {
+                         .get::<bool>("pressed")
+                         .expect("Should contain pressed");
+ 
+-                    let _ = self.command_tx.send(Command::PointerButton(
++                    send_input(Command::PointerButton(
+                         button,
+                         if pressed {
+                             ButtonState::Pressed
+@@ -236,7 +258,7 @@ impl EventHandler for WaylandDisplaySrc {
+                     let x = structure.get::<f64>("x").expect("Should contain x");
+                     let y = structure.get::<f64>("y").expect("Should contain y");
+ 
+-                    let _ = self.command_tx.send(Command::PointerAxis(x, y));
++                    send_input(Command::PointerAxis(x, y));
+ 
+                     return true;
+                 } else if structure.has_name("KeyboardKey") {
+@@ -245,7 +267,7 @@ impl EventHandler for WaylandDisplaySrc {
+                         .get::<bool>("pressed")
+                         .expect("Should contain pressed");
+ 
+-                    let _ = self.command_tx.send(Command::KeyboardInput(
++                    send_input(Command::KeyboardInput(
+                         key,
+                         if pressed {
+                             KeyState::Pressed
+@@ -286,15 +308,13 @@ impl EventHandler for WaylandDisplaySrc {
+ 
+                 match navigation_event {
+                     NavigationEvent::MouseMove { x, y, .. } => {
+-                        let _ = self
+-                            .command_tx
+-                            .send(Command::PointerMotionAbsolute((x, y).into()));
++                        move_absolute(x, y);
+ 
+                         return true;
+                     }
+                     NavigationEvent::MouseButtonPress { button, .. } => {
+                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Pressed) {
+-                            let _ = self.command_tx.send(cmd);
++                            send_input(cmd);
+                         } else {
+                             tracing::warn!("Unknown mouse button pressed: {:?}", button);
+                         }
+@@ -303,7 +323,7 @@ impl EventHandler for WaylandDisplaySrc {
+                     }
+                     NavigationEvent::MouseButtonRelease { button, .. } => {
+                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Released) {
+-                            let _ = self.command_tx.send(cmd);
++                            send_input(cmd);
+                         } else {
+                             tracing::warn!("Unknown mouse button released: {:?}", button);
+                         }
+@@ -312,28 +332,24 @@ impl EventHandler for WaylandDisplaySrc {
+                     }
+                     NavigationEvent::KeyPress { key, .. } => {
+                         if let Some(scancode) = gst_key_to_scancode(&key) {
+-                            let _ = self
+-                                .command_tx
+-                                .send(Command::KeyboardInput(scancode, KeyState::Pressed));
++                            send_input(Command::KeyboardInput(scancode, KeyState::Pressed));
+                         } else {
+-                            tracing::warn!("Unknown keyboard key pressed: {:?}", key);
++                            tracing::warn!("Unknown keyboard key.");
+                         }
+ 
+                         return true;
+                     }
+                     NavigationEvent::KeyRelease { key, .. } => {
+                         if let Some(scancode) = gst_key_to_scancode(&key) {
+-                            let _ = self
+-                                .command_tx
+-                                .send(Command::KeyboardInput(scancode, KeyState::Released));
++                            send_input(Command::KeyboardInput(scancode, KeyState::Released));
+                         } else {
+-                            tracing::warn!("Unknown keyboard key pressed: {:?}", key);
++                            tracing::warn!("Unknown keyboard key.");
+                         }
+ 
+                         return true;
+                     }
+                     _ => {
+-                        tracing::warn!("Unhandled event: {:?}", navigation_event);
++                        tracing::warn!("Unhandled navigation event.");
+                     }
+                 };
+             }
+diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
+index ce1ce1a..9f02541 100644
+--- a/wayland-display-core/src/comp/input.rs
++++ b/wayland-display-core/src/comp/input.rs
+@@ -61,7 +61,7 @@ impl State {
+                     if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.logo {
+                         match handle.modified_sym() {
+                             Keysym::Tab => {
+-                                if let Some(element) = data.space.elements().last().cloned() {
++                                if let Some(element) = data.top_window_for_output(0) {
+                                     data.surpressed_keys.insert(keysyms::KEY_Tab);
+                                     let location = data.space.element_location(&element).unwrap();
+                                     data.space.map_element(element.clone(), location, true);
+@@ -127,6 +127,24 @@ impl State {
+         }
+     }
+ 
++    fn pointer_target_at(
++        &self,
++        pos: Point<f64, Logical>,
++    ) -> Option<(FocusTarget, Point<f64, Logical>)> {
++        let (window, origin) = self.space.element_under(pos)?;
++        if self.second.as_ref().is_some_and(|second| second.is(window)) {
++            use smithay::desktop::WindowSurfaceType;
++            if let Some((surface, offset)) =
++                window.surface_under(pos - origin.to_f64(), WindowSurfaceType::POPUP)
++            {
++                if let Some(popup) = self.popups.find_popup(&surface) {
++                    return Some((popup.into(), (origin + offset).to_f64()));
++                }
++            }
++        }
++        Some((window.clone().into(), origin.to_f64()))
++    }
++
+     fn can_pointer_move(
+         &self,
+         under: &Option<(FocusTarget, Point<f64, Logical>)>,
+@@ -135,10 +153,7 @@ impl State {
+         let pointer = self.seat.get_pointer().unwrap();
+         let mut should_motion = true;
+ 
+-        let new_under = self
+-            .space
+-            .element_under(target_position)
+-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
++        let new_under = self.pointer_target_at(target_position);
+ 
+         if let Some((surface, surface_loc)) =
+             under
+@@ -197,16 +212,29 @@ impl State {
+         event_time_usec: u64,
+         delta: Point<f64, Logical>,
+         delta_unaccelerated: Point<f64, Logical>,
++    ) {
++        let position = self.clamp_coords(self.pointer_location + delta);
++        self.pointer_motion_to(
++            event_time_msec,
++            event_time_usec,
++            delta,
++            delta_unaccelerated,
++            position,
++        );
++    }
++
++    fn pointer_motion_to(
++        &mut self,
++        event_time_msec: u32,
++        event_time_usec: u64,
++        delta: Point<f64, Logical>,
++        delta_unaccelerated: Point<f64, Logical>,
++        possible_pos: Point<f64, Logical>,
+     ) {
+         self.last_pointer_movement = Instant::now();
+         let serial = SERIAL_COUNTER.next_serial();
+         let pointer = self.seat.get_pointer().unwrap();
+-        let mut under = self
+-            .space
+-            .element_under(self.pointer_location)
+-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+-
+-        let possible_pos = self.clamp_coords(self.pointer_location + delta);
++        let mut under = self.pointer_target_at(self.pointer_location);
+ 
+         // Pointer should only move if it's not locked or confined (and going out of bounds)
+         if self.can_pointer_move(&under, possible_pos) {
+@@ -214,10 +242,7 @@ impl State {
+             // The events go to the window under the pointer where it is now, not where it
+             // was: with more than one window in the picture the two differ, and a click
+             // after one jump would go to the window the pointer has left.
+-            under = self
+-                .space
+-                .element_under(self.pointer_location)
+-                .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
++            under = self.pointer_target_at(self.pointer_location);
+ 
+             // Not sure why, but order here matters (at least when using Sway nested)!!!
+             // If we send the motion event after the relative_motion it'll behave oddly
+@@ -254,10 +279,7 @@ impl State {
+         if pointer.is_grabbed() {
+             return;
+         }
+-        let under = self
+-            .space
+-            .element_under(self.pointer_location)
+-            .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
++        let under = self.pointer_target_at(self.pointer_location);
+         pointer.motion(
+             self,
+             under,
+@@ -276,22 +298,36 @@ impl State {
+     }
+ 
+     pub fn pointer_motion_absolute(&mut self, event_time_msec: u32, position: Point<f64, Logical>) {
+-        let relative_movement = (
+-            position.x - self.pointer_absolute_location.x,
+-            position.y - self.pointer_absolute_location.y,
+-        )
+-            .into();
+-
+-        self.pointer_motion(
++        let delta = position - self.pointer_absolute_location;
++        // Keep the first output's relative deltas for locked and confined pointers.
++        // Crossing from the other output starts from this picture's absolute position.
++        let target = if self.second_at_pointer().is_some() {
++            position
++        } else {
++            self.pointer_location + delta
++        };
++        let target = self.clamp_first_coords(target);
++        self.pointer_motion_to(
+             event_time_msec,
+-            event_time_msec as u64 * 1000,
+-            relative_movement,
+-            relative_movement,
++            u64::from(event_time_msec) * 1000,
++            delta,
++            delta,
++            target,
+         );
+-        //  pointer_absolute_location should always point to the unclamped position sent by Moonlight
+         self.pointer_absolute_location = position;
+     }
+ 
++    pub(crate) fn pointer_motion_absolute_second(
++        &mut self,
++        time: u32,
++        position: Point<f64, Logical>,
++    ) {
++        let Some(second) = &self.second else { return };
++        let target = second.clamp_coords(second.location().to_f64() + position);
++        let delta = target - self.pointer_location;
++        self.pointer_motion_to(time, u64::from(time) * 1000, delta, delta, target);
++    }
++
+     pub fn pointer_button(&mut self, event_time_msec: u32, button_code: u32, state: ButtonState) {
+         self.last_pointer_movement = Instant::now();
+         let serial = SERIAL_COUNTER.next_serial();
+@@ -545,7 +581,22 @@ impl State {
+         }
+     }
+ 
++    fn second_at_pointer(&self) -> Option<&super::second::SecondOutput> {
++        self.second.as_ref().filter(|second| {
++            self.space
++                .output_geometry(&second.output)
++                .is_some_and(|rect| rect.to_f64().contains(self.pointer_location))
++        })
++    }
++
+     fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
++        if let Some(second) = self.second_at_pointer() {
++            return second.clamp_coords(pos);
++        }
++        self.clamp_first_coords(pos)
++    }
++
++    fn clamp_first_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+         if let Some(output) = self.output.as_ref() {
+             if let Some(mode) = output.current_mode() {
+                 return (
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 55e5b48..de53a88 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -22,7 +22,7 @@ use smithay::{
+         },
+     },
+     desktop::{
+-        PopupManager, Space, Window,
++        PopupGrab, PopupManager, Space, Window,
+         utils::{
+             OutputPresentationFeedback, send_frames_surface_tree,
+             surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
+@@ -127,6 +127,8 @@ pub struct State {
+     pub seat: Seat<Self>,
+     pub space: Space<Window>,
+     pub popups: PopupManager,
++    /// The shared seat's menu grab, so switching windows can dismiss it.
++    pub(crate) popup_grab: Option<PopupGrab<Self>>,
+     pub(crate) pointer_location: Point<f64, Logical>,
+     pub(crate) pointer_absolute_location: Point<f64, Logical>,
+     last_pointer_movement: Instant,
+@@ -258,6 +260,7 @@ impl State {
+ 
+             space,
+             popups: PopupManager::default(),
++            popup_grab: None,
+             seat,
+             output: None,
+             pointer_location: (0., 0.).into(),
+@@ -495,6 +498,67 @@ impl State {
+         windows::place(window.geometry().size, parent, output)
+     }
+ 
++    fn top_window_for_output(&self, output: usize) -> Option<Window> {
++        use smithay::utils::IsAlive;
++        self.space
++            .elements()
++            .rev()
++            .find(|window| {
++                window.alive()
++                    && usize::from(self.second.as_ref().is_some_and(|s| s.is(window))) == output
++            })
++            .cloned()
++    }
++
++    pub(crate) fn keyboard_focus_for(&mut self, output: usize) {
++        let window = self.top_window_for_output(output);
++        if output == 0 || window.is_some() {
++            self.focus_window(window);
++        }
++    }
++
++    fn focus_window(&mut self, window: Option<Window>) {
++        let focus = window.map(FocusTarget::from);
++        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
++        let keyboard = self.seat.get_keyboard().unwrap();
++        // A request for the menu's own window leaves its grab in place.
++        let other_grab = self
++            .popup_grab
++            .take_if(|grab| grab.keyboard_grab_start_data().focus != focus);
++        if let Some(mut grab) = other_grab.filter(|grab| keyboard.has_grab(grab.serial())) {
++            grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
++            let pointer = self.seat.get_pointer().unwrap();
++            if pointer.has_grab(grab.serial()) {
++                let time: Duration = self.clock.now().into();
++                pointer.unset_grab(self, serial, time.as_millis() as u32);
++            }
++            if keyboard.has_grab(grab.serial()) {
++                keyboard.unset_grab(self);
++            }
++        }
++        keyboard.set_focus(self, focus, serial);
++        // Smithay calls focus_changed for enter/replace, but not when clearing focus.
++        if keyboard.current_focus().is_none() {
++            if let Some(second) = self.second.as_mut().filter(|s| s.key) {
++                second.key = false;
++                self.tell_second_window(false);
++            }
++        }
++    }
++
++    pub(crate) fn close_window_for(&self, output: usize) {
++        if output != 1 {
++            tracing::warn!(
++                output,
++                "CloseWindow is only available on the second output."
++            );
++            return;
++        }
++        if let Some(window) = self.top_window_for_output(1) {
++            window.toplevel().unwrap().send_close();
++        }
++    }
++
+     /// Gives the keyboard to the window that is on top, when the window that had it is not
+     /// shown any more or nothing has it. A dialog that closes hands the keyboard back to the
+     /// window under it this way.
+@@ -505,16 +569,20 @@ impl State {
+             Some(FocusTarget::Wayland(window)) => {
+                 !window.alive() || !self.space.elements().any(|w| *w == window)
+             }
+-            Some(FocusTarget::Popup(_)) => false,
++            Some(FocusTarget::Popup(popup)) => {
++                let root = smithay::desktop::find_popup_root_surface(&popup).ok();
++                !self.space.elements().any(|w| {
++                    w.toplevel()
++                        .is_some_and(|t| Some(t.wl_surface()) == root.as_ref())
++                })
++            }
+             None => true,
+         };
+         if lost {
+-            let top = self.space.elements().rev().find(|w| w.alive()).cloned();
+-            keyboard.set_focus(
+-                self,
+-                top.map(FocusTarget::from),
+-                smithay::utils::SERIAL_COUNTER.next_serial(),
+-            );
++            let top = self
++                .top_window_for_output(0)
++                .or_else(|| self.top_window_for_output(1));
++            self.focus_window(top);
+         }
+     }
+ 
+@@ -868,6 +936,8 @@ pub(crate) fn init(
+                     tracing::info!(output, "Updating the CUDA buffer pool of an output");
+                     second::update_cuda_pool(state, output, pool);
+                 }
++                Event::Msg(Command::CloseWindow(output)) => state.close_window_for(output),
++                Event::Msg(Command::KeyboardFocus(output)) => state.keyboard_focus_for(output),
+                 Event::Msg(Command::CloseWindows) => {
+                     let asked = state.close_windows();
+                     tracing::info!(asked, "Asked the windows to close.");
+@@ -929,6 +999,15 @@ pub(crate) fn init(
+                     state.pointer_motion_absolute(time.as_millis() as u32, position);
+                     pointer_moved(state);
+                 }
++                Event::Msg(Command::PointerMotionAbsoluteFor(output, position)) => {
++                    if output == 1 {
++                        let time: Duration = state.clock.now().into();
++                        state.pointer_motion_absolute_second(time.as_millis() as u32, position);
++                        pointer_moved(state);
++                    } else {
++                        tracing::warn!(output, "Only a second output is known.");
++                    }
++                }
+                 Event::Msg(Command::PointerButton(btn_code, btn_state)) => {
+                     let time: Duration = state.clock.now().into();
+                     state.pointer_button(time.as_millis() as u32, btn_code, btn_state);
+diff --git a/wayland-display-core/src/comp/second.rs b/wayland-display-core/src/comp/second.rs
+index 955b306..ff59647 100644
+--- a/wayland-display-core/src/comp/second.rs
++++ b/wayland-display-core/src/comp/second.rs
+@@ -14,8 +14,7 @@
+ //!   where they went before.
+ //! * Output 1 keeps its own pace. Its element can ask to render on a commit of its window,
+ //!   and that window receives frame callbacks only from this output.
+-//! * Nothing else: no pointer, no popups, no dialogs, no resize, no second window that goes and
+-//!   comes back.
++//! * Both outputs share one seat. A window and its popups share one picture.
+ 
+ use std::sync::mpsc::SyncSender;
+ #[cfg(feature = "cuda")]
+@@ -26,11 +25,11 @@ use gst_video::VideoInfo;
+ use smithay::backend::SwapBuffersError;
+ use smithay::backend::drm::DrmNode;
+ use smithay::backend::renderer::damage::{Error as DTRError, OutputDamageTracker};
+-use smithay::desktop::Window;
+ use smithay::desktop::utils::{
+     OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
+     surface_primary_scanout_output, update_surface_primary_scanout_output,
+ };
++use smithay::desktop::{PopupManager, Window, find_popup_root_surface};
+ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
+ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+@@ -38,7 +37,6 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+ use smithay::utils::{Logical, Point, Size};
+ use smithay::wayland::compositor::{get_parent, with_states};
+ use smithay::wayland::presentation::Refresh;
+-use smithay::wayland::seat::WaylandFocus;
+ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+ 
+ use super::State;
+@@ -92,9 +90,10 @@ impl State {
+             Some((
+                 window.toplevel()?.wl_surface(),
+                 second.output.current_mode()?.size,
++                second.key,
+             ))
+         });
+-        let Some((surface, size)) = mapped else {
++        let Some((surface, size, key)) = mapped else {
+             if self.last_second_window.take().is_some() || initial {
+                 sink(None);
+             }
+@@ -111,7 +110,6 @@ impl State {
+                 .unwrap();
+             let title = attrs.title.as_deref().unwrap_or_default();
+             let (width, height) = (size.w as u32, size.h as u32);
+-            let key = false; // Step 3 (input) sets this.
+             if self.last_second_window.as_ref().is_some_and(|last| {
+                 last.title == title
+                     && last.width == width
+@@ -146,6 +144,7 @@ pub(crate) struct SecondOutput {
+     /// The window it shows, from its first configure on.
+     pub(crate) window: Option<Window>,
+     pub(crate) frames: u64,
++    pub(crate) key: bool,
+ }
+ 
+ impl SecondOutput {
+@@ -160,8 +159,19 @@ impl SecondOutput {
+         (SECOND_AT, 0).into()
+     }
+ 
++    pub(super) fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
++        let origin = self.location().to_f64();
++        let size = self.size();
++        let local = pos - origin;
++        origin
++            + Point::from((
++                local.x.clamp(0.0, f64::from((size.w - 1).max(0))),
++                local.y.clamp(0.0, f64::from((size.h - 1).max(0))),
++            ))
++    }
++
+     /// Whether `surface`, or the surface it belongs to, is the window of this output.
+-    pub(crate) fn shows(&self, surface: &WlSurface) -> bool {
++    pub(crate) fn shows(&self, surface: &WlSurface, popups: &PopupManager) -> bool {
+         let Some(window) = self.window.as_ref() else {
+             return false;
+         };
+@@ -169,7 +179,15 @@ impl SecondOutput {
+         while let Some(parent) = get_parent(&root) {
+             root = parent;
+         }
+-        window.wl_surface().is_some_and(|s| *s == root)
++        let Some(toplevel) = window.toplevel() else {
++            return false;
++        };
++        toplevel.wl_surface() == &root
++            || popups
++                .find_popup(&root)
++                .and_then(|popup| find_popup_root_surface(&popup).ok())
++                .as_ref()
++                == Some(toplevel.wl_surface())
+     }
+ 
+     fn send_frame_callbacks(&self, now: Duration) {
+@@ -276,6 +294,7 @@ pub(crate) fn apply_video_info(
+         last_render: None,
+         window: None,
+         frames: 0,
++        key: false,
+     });
+ }
+ 
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index da7cee3..8e06251 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -40,6 +40,9 @@ pub enum Command {
+     KeyboardInput(u32, KeyState),
+     PointerMotion(Point<f64, Logical>),
+     PointerMotionAbsolute(Point<f64, Logical>),
++    PointerMotionAbsoluteFor(usize, Point<f64, Logical>),
++    KeyboardFocus(usize),
++    CloseWindow(usize),
+     PointerButton(u32, ButtonState),
+     PointerAxis(f64, f64),
+     GetSupportedDmaFormats(SyncSender<FormatSet>),
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index d1dd398..0976536 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -27,7 +27,7 @@ use wayland_protocols::{
+         viewporter::client::wp_viewport::WpViewport,
+         viewporter::client::wp_viewporter::WpViewporter,
+     },
+-    xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
++    xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
+ };
+ 
+ pub struct WaylandClient {
+@@ -62,6 +62,8 @@ struct State {
+     shm: Option<wl_shm::WlShm>,
+     cursor_surface: Option<wl_surface::WlSurface>,
+     keyboard: Option<wl_keyboard::WlKeyboard>,
++    keyboard_surface: Option<wl_surface::WlSurface>,
++    popup_geometry: Option<(i32, i32, i32, i32)>,
+     windows: Vec<Window>,
+     pub mouse_events: Vec<MouseEvents>,
+     pub output: Option<wl_output::WlOutput>,
+@@ -165,6 +167,7 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
+ delegate_noop!(State: ignore wl_region::WlRegion);
+ delegate_noop!(State: ignore WpViewporter);
+ delegate_noop!(State: ignore WpViewport);
++delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
+ delegate_noop!(State: ignore ZwpPointerConstraintsV1);
+ delegate_noop!(State: ignore ZwpLockedPointerV1);
+ delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
+@@ -196,6 +199,8 @@ impl WaylandClient {
+             shm: None,
+             cursor_surface: None,
+             keyboard: None,
++            keyboard_surface: None,
++            popup_geometry: None,
+             windows: Vec::new(),
+             mouse_events: Vec::new(),
+             output: None,
+@@ -361,8 +366,17 @@ impl WaylandClient {
+     /// as its first: the window is as large as the picture, as a dialog is that knows its
+     /// own size.
+     pub fn setup_window_of_one_colour(&mut self, (width, height): (i32, i32), bgra: [u8; 4]) {
++        let buffer = self.solid_buffer((width, height), bgra);
++        let window = self.state.windows.last_mut().unwrap();
++        window.set_title("A question");
++        window.attach_new_buffer(&buffer);
++        window.set_size(width as u16, height as u16);
++        window.ack_last_and_commit();
++    }
++
++    fn solid_buffer(&self, (width, height): (i32, i32), bgra: [u8; 4]) -> wl_buffer::WlBuffer {
+         use std::io::Write;
+-        let state = &mut self.state;
++        let state = &self.state;
+         let mut file = tempfile::tempfile().unwrap();
+         file.write_all(&bgra.repeat((width * height) as usize))
+             .unwrap();
+@@ -373,7 +387,7 @@ impl WaylandClient {
+             &state.qh,
+             (),
+         );
+-        let buffer = pool.create_buffer(
++        pool.create_buffer(
+             0,
+             width,
+             height,
+@@ -381,12 +395,53 @@ impl WaylandClient {
+             wl_shm::Format::Argb8888,
+             &state.qh,
+             (),
++        )
++    }
++
++    pub fn surface_at(&self, index: usize) -> &wl_surface::WlSurface {
++        &self.state.windows[index].surface
++    }
++
++    pub fn keyboard_surface(&self) -> Option<&wl_surface::WlSurface> {
++        self.state.keyboard_surface.as_ref()
++    }
++
++    pub fn asked_to_close_at(&self, index: usize) -> bool {
++        self.state.windows[index].close_requested
++    }
++
++    /// Request a menu against the bottom right corner of a 320 by 240 parent.
++    pub fn create_popup_at(&self, index: usize, serial: u32) -> wl_surface::WlSurface {
++        let state = &self.state;
++        let qh = &self.qh;
++        let surface = state.compositor.as_ref().unwrap().create_surface(qh, ());
++        let shell = state.wm_base.as_ref().unwrap();
++        let xdg = shell.get_xdg_surface(&surface, qh, PopupConfigure);
++        let positioner = shell.create_positioner(qh, ());
++        positioner.set_size(40, 30);
++        positioner.set_anchor_rect(318, 238, 2, 2);
++        positioner.set_anchor(xdg_positioner::Anchor::BottomRight);
++        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
++        positioner.set_constraint_adjustment(
++            xdg_positioner::ConstraintAdjustment::SlideX
++                | xdg_positioner::ConstraintAdjustment::SlideY,
+         );
+-        let window = state.windows.last_mut().unwrap();
+-        window.set_title("A question");
+-        window.attach_new_buffer(&buffer);
+-        window.set_size(width as u16, height as u16);
+-        window.ack_last_and_commit();
++        let popup = xdg.get_popup(Some(&state.windows[index].xdg_surface), &positioner, qh, ());
++        popup.grab(state.seat.as_ref().unwrap(), serial);
++        positioner.destroy();
++        surface.commit();
++        surface
++    }
++
++    pub fn popup_geometry(&self) -> Option<(i32, i32, i32, i32)> {
++        self.state.popup_geometry
++    }
++
++    pub fn paint_popup(&self, surface: &wl_surface::WlSurface) {
++        let (_, _, width, height) = self.popup_geometry().unwrap();
++        let buffer = self.solid_buffer((width, height), [255; 4]);
++        surface.attach(Some(&buffer), 0, 0);
++        surface.commit();
+     }
+ 
+     /// Whether the compositor has asked the last window to close.
+@@ -396,14 +451,19 @@ impl WaylandClient {
+ 
+     /// Closes the last window, as a client does that was asked to and has nothing to lose.
+     pub fn close_window(&mut self) {
+-        if let Some(window) = self.state.windows.pop() {
+-            window.viewport.destroy();
+-            window.xdg_toplevel.destroy();
+-            window.xdg_surface.destroy();
+-            window.surface.destroy();
++        if let Some(index) = self.state.windows.len().checked_sub(1) {
++            self.close_window_at(index);
+         }
+     }
+ 
++    pub fn close_window_at(&mut self, index: usize) {
++        let window = self.state.windows.remove(index);
++        window.viewport.destroy();
++        window.xdg_toplevel.destroy();
++        window.xdg_surface.destroy();
++        window.surface.destroy();
++    }
++
+     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
+         self.state.mouse_events.as_mut()
+     }
+@@ -617,6 +677,44 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
+     }
+ }
+ 
++struct PopupConfigure;
++
++impl Dispatch<xdg_surface::XdgSurface, PopupConfigure> for State {
++    fn event(
++        _: &mut Self,
++        surface: &xdg_surface::XdgSurface,
++        event: xdg_surface::Event,
++        _: &PopupConfigure,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let xdg_surface::Event::Configure { serial } = event {
++            surface.ack_configure(serial);
++        }
++    }
++}
++
++impl Dispatch<xdg_popup::XdgPopup, ()> for State {
++    fn event(
++        state: &mut Self,
++        _: &xdg_popup::XdgPopup,
++        event: xdg_popup::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        if let xdg_popup::Event::Configure {
++            x,
++            y,
++            width,
++            height,
++        } = event
++        {
++            state.popup_geometry = Some((x, y, width, height));
++        }
++    }
++}
++
+ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
+     fn event(
+         state: &mut Self,
+@@ -708,14 +806,18 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
+ 
+ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+     fn event(
+-        _state: &mut Self,
++        state: &mut Self,
+         _: &wl_keyboard::WlKeyboard,
+         event: wl_keyboard::Event,
+         _: &(),
+         _: &Connection,
+         _: &QueueHandle<Self>,
+     ) {
+-        tracing::debug!("{:?}", event);
++        match event {
++            wl_keyboard::Event::Enter { surface, .. } => state.keyboard_surface = Some(surface),
++            wl_keyboard::Event::Leave { .. } => state.keyboard_surface = None,
++            _ => {}
++        }
+     }
+ }
+ 
+diff --git a/wayland-display-core/src/tests/test_second_output.rs b/wayland-display-core/src/tests/test_second_output.rs
+index b94a817..65aace9 100644
+--- a/wayland-display-core/src/tests/test_second_output.rs
++++ b/wayland-display-core/src/tests/test_second_output.rs
+@@ -277,3 +277,193 @@ fn listening_before_second_output_negotiation_reports_an_empty_output() {
+     assert_eq!(reports.try_recv(), Ok(None));
+     assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
+ }
++
++fn assert_enter(f: &mut Fixture, window: usize, xy: (f64, f64)) {
++    use super::client::MouseEvents;
++    use wayland_client::protocol::wl_pointer;
++    let expected = f.client.surface_at(window).clone();
++    let enter = f
++        .client
++        .get_client_events()
++        .drain(..)
++        .find_map(|event| match event {
++            MouseEvents::Pointer(wl_pointer::Event::Enter {
++                surface,
++                surface_x,
++                surface_y,
++                ..
++            }) => Some((surface, (surface_x, surface_y))),
++            _ => None,
++        });
++    assert_eq!(enter, Some((expected, xy)));
++}
++
++#[test]
++fn absolute_input_selects_the_picture_and_relative_motion_stays_in_it() {
++    let mut f = fixture(true);
++    f.client.get_client_events().clear();
++    f.server
++        .pointer_motion_absolute_second(0, (11.0, 23.0).into());
++    f.round_trip();
++    assert_enter(&mut f, 1, (11.0, 23.0));
++    let delta = (-50000.0, 50000.0).into();
++    f.server.pointer_motion(0, 0, delta, delta);
++    assert_eq!(
++        f.server.pointer_location,
++        (f64::from(second::SECOND_AT), 239.0).into()
++    );
++    f.server
++        .pointer_motion_absolute_second(0, (50000.0, -5.0).into());
++    assert_eq!(
++        f.server.pointer_location,
++        (f64::from(second::SECOND_AT) + 319.0, 0.0).into()
++    );
++    f.server.pointer_motion_absolute(0, (17.0, 31.0).into());
++    f.round_trip();
++    assert_enter(&mut f, 0, (17.0, 31.0));
++}
++
++fn click_second(f: &mut Fixture) {
++    use smithay::backend::input::ButtonState;
++    f.server
++        .pointer_motion_absolute_second(0, (10.0, 10.0).into());
++    f.server.pointer_button(0, 0x110, ButtonState::Pressed);
++    f.server.pointer_button(0, 0x110, ButtonState::Released);
++    f.round_trip();
++}
++
++#[test]
++fn keyboard_enters_and_window_reports_follow_clicks_and_explicit_focus() {
++    let mut f = fixture(true);
++    let (tx, reports) = channel();
++    f.server.set_second_window_sink(Some(Box::new(move |info| {
++        tx.send(info.unwrap().key).unwrap()
++    })));
++    assert_eq!(f.client.keyboard_surface(), Some(f.client.surface_at(0)));
++    assert_eq!(reports.try_recv(), Ok(false));
++    click_second(&mut f);
++    assert_eq!(f.client.keyboard_surface(), Some(f.client.surface_at(1)));
++    assert_eq!(reports.try_recv(), Ok(true));
++    for output in [0, 1] {
++        f.server.keyboard_focus_for(output);
++        f.round_trip();
++        assert_eq!(
++            f.client.keyboard_surface(),
++            Some(f.client.surface_at(output))
++        );
++        assert_eq!(reports.try_recv(), Ok(output == 1));
++        f.server.keyboard_focus_for(output);
++        assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++    }
++}
++
++#[test]
++fn closing_a_dialog_restores_the_first_window_even_after_raising_the_second() {
++    let mut f = fixture(true);
++    click_second(&mut f);
++    f.client.create_child_window();
++    f.round_trip();
++    f.client.setup_window_of_one_colour((80, 40), [255; 4]);
++    f.round_trip();
++    assert_eq!(f.client.keyboard_surface(), Some(f.client.surface_at(2)));
++    f.client.close_window();
++    f.round_trip();
++    assert_eq!(f.client.keyboard_surface(), Some(f.client.surface_at(0)));
++}
++
++#[test]
++fn losing_the_last_first_output_window_gives_the_only_window_the_keyboard() {
++    let mut f = fixture(true);
++    f.client.close_window_at(0);
++    f.round_trip();
++    // The second window is now the only entry in the client's list.
++    assert_eq!(f.client.keyboard_surface(), Some(f.client.surface_at(0)));
++    let (tx, reports) = channel();
++    f.server.set_second_window_sink(Some(Box::new(move |info| {
++        tx.send(info.unwrap().key).unwrap()
++    })));
++    assert_eq!(reports.try_recv(), Ok(true));
++    f.server.keyboard_focus_for(0);
++    f.round_trip();
++    assert!(f.client.keyboard_surface().is_none());
++    assert_eq!(reports.try_recv(), Ok(false));
++}
++
++#[test]
++fn close_window_only_asks_the_second_toplevel() {
++    let mut f = fixture(true);
++    f.server.close_window_for(0);
++    f.round_trip();
++    assert!(!f.client.asked_to_close_at(0));
++    assert!(!f.client.asked_to_close_at(1));
++    f.server.close_window_for(1);
++    f.round_trip();
++    assert!(!f.client.asked_to_close_at(0));
++    assert!(f.client.asked_to_close_at(1));
++    assert_eq!(f.server.space.elements().count(), 2);
++}
++
++#[test]
++fn a_grabbed_menu_is_constrained_drawn_and_paced_on_the_second_output() {
++    use super::client::MouseEvents;
++    use wayland_client::protocol::wl_pointer;
++    let mut f = fixture(true);
++    click_second(&mut f);
++    let serial = f
++        .client
++        .get_client_events()
++        .iter()
++        .find_map(|event| match event {
++            MouseEvents::Pointer(wl_pointer::Event::Button { serial, .. }) => Some(*serial),
++            _ => None,
++        })
++        .unwrap();
++    let (tx, reports) = channel();
++    f.server.set_second_window_sink(Some(Box::new(move |info| {
++        tx.send(info.unwrap().key).unwrap()
++    })));
++    assert_eq!(reports.try_recv(), Ok(true));
++    let popup = f.client.create_popup_at(1, serial);
++    f.round_trip();
++    assert_eq!(f.client.popup_geometry(), Some((280, 210, 40, 30)));
++    assert_eq!(f.client.keyboard_surface(), Some(&popup));
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++
++    next_frame(&mut f);
++    let waiting = ask(&mut f);
++    // Let the rate limit expire, leaving only the idle deadline or a commit.
++    std::thread::sleep(FRAME);
++    f.update_server();
++    assert!(matches!(waiting.try_recv(), Err(TryRecvError::Empty)));
++    ask_first(&mut f);
++    f.client.paint_popup(&popup);
++    let mut frame = None;
++    wait_until(&mut f, FRAME / 2, |_| {
++        frame = waiting.try_recv().ok().map(Result::unwrap);
++        frame.is_some()
++    });
++    assert!(f.server.waiting_frame.is_some());
++    let frame = frame.unwrap();
++    let pixels = frame.map_readable().unwrap();
++    let pixel = |x, y| &pixels.as_slice()[(y * 320 + x) * 4..][..3];
++    assert_eq!(pixel(280usize, 210usize), [255; 3]);
++    assert_eq!(pixel(319, 239), [255; 3]);
++    assert_ne!(pixel(279, 210), [255; 3]);
++
++    f.server
++        .pointer_motion_absolute_second(0, (285.0, 217.0).into());
++    f.round_trip();
++    assert!(
++        f.client
++            .get_client_events()
++            .iter()
++            .any(|event| matches!(event,
++                MouseEvents::Pointer(wl_pointer::Event::Enter { surface, surface_x, surface_y, .. })
++                    if surface == &popup && (*surface_x, *surface_y) == (5.0, 7.0)
++            ))
++    );
++    f.server.keyboard_focus_for(0);
++    f.round_trip();
++    assert_eq!(f.client.keyboard_surface(), Some(f.client.surface_at(0)));
++    assert_eq!(reports.try_recv(), Ok(false));
++}
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index deaf7cd..2f94e9b 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -45,7 +45,7 @@ impl CompositorHandler for State {
+         let on_second = self
+             .second
+             .as_ref()
+-            .is_some_and(|second| second.shows(surface));
++            .is_some_and(|second| second.shows(surface, &self.popups));
+         if on_second {
+             crate::comp::second::client_committed(self);
+         } else {
+diff --git a/wayland-display-core/src/wayland/handlers/seat.rs b/wayland-display-core/src/wayland/handlers/seat.rs
+index 9bd9383..c43ce3f 100644
+--- a/wayland-display-core/src/wayland/handlers/seat.rs
++++ b/wayland-display-core/src/wayland/handlers/seat.rs
+@@ -17,6 +17,17 @@ impl SeatHandler for State {
+     }
+ 
+     fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
++        if let Some(second) = &mut self.second {
++            let key = match focus {
++                Some(FocusTarget::Wayland(window)) => second.is(window),
++                Some(FocusTarget::Popup(popup)) => second.shows(popup.wl_surface(), &self.popups),
++                None => false,
++            };
++            if second.key != key {
++                second.key = key;
++                self.tell_second_window(false);
++            }
++        }
+         if let Some(surface) = focus {
+             let client = match surface {
+                 FocusTarget::Wayland(w) => w.toplevel().unwrap().wl_surface().client(),
+diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
+index 494c9f6..5ddc8d5 100644
+--- a/wayland-display-core/src/wayland/handlers/xdg.rs
++++ b/wayland-display-core/src/wayland/handlers/xdg.rs
+@@ -15,7 +15,7 @@ use smithay::{
+     },
+ };
+ 
+-use crate::comp::{FocusTarget, State};
++use crate::comp::State;
+ 
+ impl XdgShellHandler for State {
+     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+@@ -41,6 +41,7 @@ impl XdgShellHandler for State {
+             // Prototype: the second output's window is gone; nothing takes its place.
+             if let Some(second) = self.second.as_mut().filter(|second| second.is(&gone)) {
+                 second.window = None;
++                second.key = false;
+                 self.tell_second_window(false);
+             }
+             self.space.unmap_elem(&gone);
+@@ -65,9 +66,14 @@ impl XdgShellHandler for State {
+                 .elements()
+                 .find(|w| w.wl_surface().map(|s| *s == root).unwrap_or(false))
+                 .cloned()
+-                .map(FocusTarget::from)
+         }) {
+-            let ret = self.popups.grab_popup(root, surface.into(), &seat, serial);
++            if self.second.as_ref().is_some_and(|s| s.is(&root) && !s.key) {
++                surface.send_popup_done();
++                return;
++            }
++            let ret = self
++                .popups
++                .grab_popup(root.into(), surface.into(), &seat, serial);
+             if let Ok(mut grab) = ret {
+                 if let Some(keyboard) = seat.get_keyboard() {
+                     if keyboard.is_grabbed()
+@@ -91,6 +97,7 @@ impl XdgShellHandler for State {
+                     }
+                     pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Clear);
+                 }
++                self.popup_grab = Some(grab);
+             }
+         }
+     }
+@@ -124,7 +131,13 @@ impl State {
+             return;
+         };
+ 
+-        let output = self.space.outputs().next().unwrap();
++        let output = self
++            .second
++            .as_ref()
++            .filter(|second| second.is(window))
++            .map(|second| &second.output)
++            .or(self.output.as_ref());
++        let Some(output) = output else { return };
+         let output_geo = self.space.output_geometry(output).unwrap();
+         let window_geo = self.space.element_geometry(window).unwrap();
+ 

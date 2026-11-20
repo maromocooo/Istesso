@@ -16,21 +16,24 @@ uses the same colour conversion and encoder as the first, with its own size and 
 istesso-media host listening on BIND. Both hosts use the host script's --config-dir.
 --second-pacing selects rendering on a window commit (the default) or on the frame-rate beat.
 
-The first host sends the latest window list when the second window appears, changes or closes.
+With --input, the first host sends its latest list after a version 1 windows request, then when the second window appears, changes or closes.
+Without --input the list is sent on every change, as in the A/B runs.
 A viewer connects to the port in that list for the second picture and gets a key frame.
 The second log records frame_out, encoded, sent and clock lines, and the pacing in its header.
 Each window_list line records the serial, window count, send result and time. Titles travel in
-the list. The second chain is picture only. Pause, resume, admit, cursor and input still apply
-to the first chain.
+the list. Both pictures share a keyboard and pointer. Numbered input selects an output.
 
-Before the host script starts, this program wraps ctypes.CDLL and Gst.parse_launch for
-one run. It then runs m1-step3-host.py unchanged.
+With --second, this program wraps ctypes.CDLL and Gst.parse_launch for one run. For input,
+it also wraps socket.socket. Only the AF_UNIX datagram socket the host script binds for input
+changes behaviour, with one extra JSON parse per input datagram. m1-step3-host.py itself
+runs unchanged. This wrapper is never used in a measured build.
 """
 
 import ctypes
 import os
 import re
 import runpy
+import socket
 import sys
 import time
 
@@ -129,14 +132,21 @@ def main():
         colour = option(host_args, "--colour", "srgb")
         config_dir = option(host_args, "--config-dir")
         media_lib = option(host_args, "--media-lib") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(host_script))), "target", "release", "libistesso_media.so")
-        install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media_lib)
+        input_flag = next((arg for arg in reversed(host_args) if arg in ("--input", "--no-input")), None)
+        input_path = None
+        if input_flag != "--no-input":
+            input_path = option(host_args, "--input-socket") or os.path.join(
+                os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache"), "istesso", "input.sock")
+        install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media_lib,
+                input_path, input_flag == "--input")
 
     sys.argv = [host_script] + host_args
     sys.path.insert(0, os.path.dirname(os.path.abspath(host_script)))
     runpy.run_path(host_script, run_name="__main__")
 
 
-def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media_lib):
+def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media_lib,
+            input_path, wait_for_windows):
     original_cdll = ctypes.CDLL
     media = original_cdll(media_lib)
     first_host = None
@@ -188,6 +198,7 @@ def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media
     done = {"pipeline": None}
 
     def parse_launch(description):
+        nonlocal consume_input
         pipeline = original(description)
         if done["pipeline"] is not None or not description.startswith("waylanddisplaysrc name=compositor"):
             return pipeline
@@ -223,8 +234,42 @@ def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media
             log_list(number, count, rc)
             return False
 
+        def queue_list(snapshot):
+            nonlocal pending
+            waiting = pending is not None
+            pending = snapshot
+            if first_host is not None:
+                send_pending()
+            elif not waiting:
+                GLib.timeout_add(100, send_pending)
+
+        lists = proto_windows_list.WindowLists(wait_for_windows, queue_list)
+        pads = {1: pipeline.get_by_name("compositor").get_static_pad("src"),
+                2: second.get_by_name("compositor2").get_static_pad("src")}
+        dropped = {}
+
+        def consume_input(data):
+            where, what = proto_windows_list.route_input(data, lists.second_present)
+            if where == "host":
+                return False
+            if where == "windows":
+                lists.request()
+            elif where == "drop":
+                dropped[what] = dropped.get(what, 0) + 1
+                if dropped[what] == 1:
+                    print(f"proto-windows-ubuntu: dropped {what} input", file=sys.stderr)
+            else:
+                if what in ("KeyboardFocus", "CloseWindow"):
+                    structure = Gst.Structure.new_empty(what)
+                else:
+                    structure = Gst.Structure.new_from_string(what)
+                    if isinstance(structure, tuple):
+                        structure = structure[0]
+                pads[where].send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+            return True
+
         def on_window(_bus, message):
-            nonlocal serial, pending
+            nonlocal serial
             structure = message.get_structure()
             if structure is None or structure.get_name() != "wayland.second-window":
                 return
@@ -238,12 +283,7 @@ def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media
             except (KeyError, TypeError, ValueError):
                 log_list(serial, int(present), -1)
                 return
-            waiting = pending is not None
-            pending = (serial, int(present), payload)
-            if first_host is not None:
-                send_pending()
-            elif not waiting:
-                GLib.timeout_add(100, send_pending)
+            lists.update(serial, bool(present), payload)
 
         # The host script installs the signal watch on this bus.
         pipeline.get_bus().connect("message::application", on_window)
@@ -325,6 +365,11 @@ def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media
         GLib.timeout_add(1000, clock_line)
         return pipeline
 
+    consume_input = None
+    if input_path is not None:
+        # The host builds its pipeline before it binds the input socket.
+        socket.socket = proto_windows_list.input_socket_class(socket.socket, input_path,
+                                                            lambda data: consume_input(data))
     Gst.parse_launch = parse_launch
 
 
