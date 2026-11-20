@@ -1,0 +1,682 @@
+PROTOTYPE ONLY (ADR 0027 proposal, new windows on the Linux host,
+docs/measurements/2026-11-20-new-windows-ubuntu.md). Never include this patch in a build
+used for a trial, the gate or a verdict.
+
+Apply to gst-wayland-display (MIT License), commit 1301f86. Apply the four measured patches
+in scripts/patches first, in order: render-on-commit, cursor-messages, windows, dialogs.
+Then apply scripts/patches/proto/gst-wayland-display-proto-second-output.patch (U0),
+followed by this patch, scripts/patches/proto/gst-wayland-display-proto-second-output-on-commit.patch.
+The context comes from that project and those patches.
+
+The element with output=1 can now set render-on-commit for its own output. A commit of its
+window releases a waiting frame as soon as the frame rate allows. After two quiet frame
+intervals a frame goes out to keep the stream running. Turning the switch off restores the
+U0 beat. As in the measured patches for the first output, the second output renders the
+frame, copies it into the element's buffer, then waits for it. This patch keeps that order.
+Frame requests, rate limits and draw callbacks belong to each output separately.
+The second window gets presentation feedback from the output that rendered it. The tests
+use two software outputs and a Wayland client.
+
+This step covers pacing only. Input for the second window, popups, dialogs, resizing,
+window lists and changes to the transport remain outside the prototype patch.
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 25bf5b0..2684165 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -444,9 +444,13 @@ impl ObjectImpl for WaylandDisplaySrc {
+             }
+             "render-on-commit" => {
+                 let enabled = value.get::<bool>().expect("Type checked upstream");
+-                self.settings.lock().unwrap().render_on_commit = enabled;
+-                // Taken in by the compositor when it runs; it may be changed while it does.
+-                let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
++                let mut settings = self.settings.lock().unwrap();
++                settings.render_on_commit = enabled;
++                if let Some(attached) = self.attached.lock().unwrap().as_ref() {
++                    let _ = attached.send(Command::RenderOnCommitFor(1, enabled));
++                } else if settings.output == 0 {
++                    let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
++                }
+             }
+             "window-messages" => {
+                 let enabled = value.get::<bool>().expect("Type checked upstream");
+@@ -950,7 +954,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+                     ("No compositor to attach to: an element with output=0 has to run in this process.")
+                 ));
+             };
++            // Keep a property change from racing the initial setting onto the channel.
++            let settings = self.settings.lock().unwrap();
+             *self.attached.lock().unwrap() = Some(found.clone());
++            let _ = found.send(Command::RenderOnCommitFor(1, settings.render_on_commit));
+             Some(found)
+         } else {
+             None
+@@ -1033,6 +1040,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+             *SHARED_COMPOSITOR.lock().unwrap() = None;
+         }
+         let mut state = self.state.lock().unwrap();
++        *self.attached.lock().unwrap() = None;
+         if let Some(state) = state.take() {
+             let subscriber = Registry::default().with(GstLayer);
+             tracing::subscriber::with_default(subscriber, || drop(state.display));
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index c7075a4..51068b4 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -158,6 +158,8 @@ pub struct State {
+     /// Prototype: the second output and the window it shows ([`second`]); `None` unless a
+     /// second element has attached to this compositor.
+     pub(crate) second: Option<second::SecondOutput>,
++    // The attached element can set its switch before caps create the output.
++    second_render_on_commit: bool,
+ }
+ 
+ impl State {
+@@ -282,6 +284,7 @@ impl State {
+             viewporter_state,
+             single_pixel_buffer_state,
+             second: None,
++            second_render_on_commit: false,
+         }
+     }
+ }
+@@ -627,6 +630,9 @@ pub(crate) fn send_frame_callbacks(state: &State) {
+         return;
+     };
+     for window in state.space.elements() {
++        if state.second.as_ref().is_some_and(|second| second.is(window)) {
++            continue;
++        }
+         window.send_frame(output, state.clock.now(), Some(Duration::ZERO), |_, _| {
+             Some(output.clone())
+         });
+@@ -724,6 +730,13 @@ pub(crate) fn init(
+                                     let mut output_presentation_feedback =
+                                         OutputPresentationFeedback::new(output);
+                                     for window in state.space.elements() {
++                                        if state
++                                            .second
++                                            .as_ref()
++                                            .is_some_and(|second| second.is(window))
++                                        {
++                                            continue;
++                                        }
+                                         window.with_surfaces(|surface, states| {
+                                             update_surface_primary_scanout_output(
+                                                 surface,
+@@ -829,6 +842,13 @@ pub(crate) fn init(
+                         tracing::warn!(output, "Only a second output is known.");
+                     }
+                 }
++                Event::Msg(Command::RenderOnCommitFor(output, enabled)) => {
++                    if output == 1 {
++                        second::set_render_on_commit(state, enabled);
++                    } else {
++                        tracing::warn!(output, "Only a second output is known.");
++                    }
++                }
+                 Event::Msg(Command::BufferFor(output, buffer_sender, _tracer)) => {
+                     if output == 1 {
+                         second::frame_asked(state, buffer_sender);
+@@ -877,6 +897,9 @@ pub(crate) fn init(
+                 }
+                 Event::Msg(Command::Quit) | Event::Closed => {
+                     state.pacing.report();
++                    if let Some(second) = &state.second {
++                        second.pacing.report();
++                    }
+                     state.should_quit = true;
+                 }
+                 Event::Msg(Command::KeyboardInput(scancode, key_state)) => {
+diff --git a/wayland-display-core/src/comp/second.rs b/wayland-display-core/src/comp/second.rs
+index f5fa3e1..131d2da 100644
+--- a/wayland-display-core/src/comp/second.rs
++++ b/wayland-display-core/src/comp/second.rs
+@@ -12,8 +12,8 @@
+ //! * The first window without a parent that comes while the first output already shows a
+ //!   window goes to output 1, sized to it, and does not take the keyboard. Later windows go
+ //!   where they went before.
+-//! * Output 1 is rendered on the beat of its frame rate (not on commit), and what its window
+-//!   commits does not make the first output render or tell its clients anything.
++//! * Output 1 keeps its own pace. Its element can ask to render on a commit of its window,
++//!   and that window receives frame callbacks only from this output.
+ //! * Nothing else: no pointer, no popups, no dialogs, no resize, no second window that goes and
+ //!   comes back.
+ 
+@@ -27,14 +27,21 @@ use smithay::backend::SwapBuffersError;
+ use smithay::backend::drm::DrmNode;
+ use smithay::backend::renderer::damage::{Error as DTRError, OutputDamageTracker};
+ use smithay::desktop::Window;
++use smithay::desktop::utils::{
++    OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
++    surface_primary_scanout_output, update_surface_primary_scanout_output,
++};
+ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
+ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+ use smithay::utils::{Logical, Point, Size};
+ use smithay::wayland::compositor::get_parent;
++use smithay::wayland::presentation::Refresh;
+ use smithay::wayland::seat::WaylandFocus;
+ 
+ use super::State;
++use super::pacing::{FramePacing, Tell};
+ use crate::utils::RenderTarget;
+ use crate::utils::allocator::{GsBufferType, GsDmaBuf, GsGlesbuffer};
+ #[cfg(feature = "cuda")]
+@@ -48,7 +55,10 @@ pub(crate) struct SecondOutput {
+     pub(crate) output: Output,
+     pub(crate) dtr: OutputDamageTracker,
+     pub(crate) buffer: GsBufferType,
+-    pub(crate) interval: Duration,
++    interval: Duration,
++    pub(super) pacing: FramePacing,
++    waiting_frame: Option<SyncSender<Result<gst::Buffer, SwapBuffersError>>>,
++    frame_request: u64,
+     pub(crate) last_render: Option<Instant>,
+     /// The window it shows, from its first configure on.
+     pub(crate) window: Option<Window>,
+@@ -79,6 +89,14 @@ impl SecondOutput {
+         window.wl_surface().is_some_and(|s| *s == root)
+     }
+ 
++    fn send_frame_callbacks(&self, now: Duration) {
++        if let Some(window) = &self.window {
++            window.send_frame(&self.output, now, Some(Duration::ZERO), |_, _| {
++                Some(self.output.clone())
++            });
++        }
++    }
++
+     pub(crate) fn is(&self, window: &Window) -> bool {
+         self.window.as_ref() == Some(window)
+     }
+@@ -98,9 +116,8 @@ pub(crate) fn apply_video_info(
+     let size: Size<i32, smithay::utils::Physical> =
+         (base_info.width() as i32, base_info.height() as i32).into();
+     let framerate = base_info.fps();
+-    let interval = Duration::from_secs_f64(
+-        framerate.denom().max(1) as f64 / framerate.numer().max(1) as f64,
+-    );
++    let interval =
++        Duration::from_secs_f64(framerate.denom().max(1) as f64 / framerate.numer().max(1) as f64);
+     let output = Output::new(
+         "HEADLESS-2".into(),
+         PhysicalProperties {
+@@ -159,11 +176,20 @@ pub(crate) fn apply_video_info(
+         height = size.h,
+         "Second output ready (prototype)."
+     );
++    let mut pacing = FramePacing::default();
++    pacing.set_frame_rate(
++        framerate.numer().max(0) as u64,
++        framerate.denom().max(0) as u64,
++    );
++    pacing.set_enabled(state.second_render_on_commit);
+     state.second = Some(SecondOutput {
+         output,
+         dtr,
+         buffer,
+         interval,
++        pacing,
++        waiting_frame: None,
++        frame_request: 0,
+         last_render: None,
+         window: None,
+         frames: 0,
+@@ -188,29 +214,100 @@ pub(crate) fn update_cuda_pool(
+     }
+ }
+ 
+-/// The second element asks for a frame: it is rendered one frame interval after the last one,
+-/// or now if that has passed.
++pub(crate) fn set_render_on_commit(state: &mut State, enabled: bool) {
++    tracing::info!(enabled, "Render on commit on the second output.");
++    state.second_render_on_commit = enabled;
++    if let Some(second) = state.second.as_mut() {
++        second.pacing.report();
++        second.pacing.set_enabled(enabled);
++        second.send_frame_callbacks(state.clock.now().into());
++        if second.waiting_frame.is_some() {
++            schedule_waiting_frame(state, Duration::ZERO);
++        }
++    }
++}
++
++pub(crate) fn client_committed(state: &mut State) {
++    let second = state.second.as_mut().unwrap();
++    if !second.pacing.changed() {
++        return;
++    }
++    if second.waiting_frame.is_some() {
++        schedule_waiting_frame(state, Duration::ZERO);
++    }
++
++    let second = state.second.as_mut().unwrap();
++    match second.pacing.tell(Instant::now()) {
++        Tell::Now => second.send_frame_callbacks(state.clock.now().into()),
++        Tell::Later(wait) => {
++            if let Err(err) =
++                state
++                    .handle
++                    .insert_source(Timer::from_duration(wait), |_, _, state| {
++                        let second = state.second.as_mut().unwrap();
++                        second.pacing.told(Instant::now());
++                        second.send_frame_callbacks(state.clock.now().into());
++                        TimeoutAction::Drop
++                    })
++            {
++                tracing::error!(?err, "Event loop error.");
++                state.should_quit = true;
++            }
++        }
++        Tell::Waiting => {}
++    }
++}
++
+ pub(crate) fn frame_asked(
+     state: &mut State,
+     sender: SyncSender<Result<gst::Buffer, SwapBuffersError>>,
+ ) {
+-    let Some(second) = state.second.as_ref() else {
++    let Some(second) = state.second.as_mut() else {
+         let _ = sender.send(Err(SwapBuffersError::ContextLost(
+             "the second output has no video info".into(),
+         )));
+         return;
+     };
+-    let wait = second
+-        .last_render
+-        .map(|last| second.interval.saturating_sub(last.elapsed()))
+-        .unwrap_or(Duration::ZERO);
++    let wait = if second.pacing.enabled() {
++        second
++            .pacing
++            .frame_asked(Instant::now(), second.last_render)
++    } else {
++        let wait = second
++            .last_render
++            .map(|last| second.interval.saturating_sub(last.elapsed()))
++            .unwrap_or(Duration::ZERO);
++        if wait.is_zero() {
++            render(state, sender);
++            return;
++        }
++        wait
++    };
++    second.waiting_frame = Some(sender);
++    schedule_waiting_frame(state, wait);
++}
++
++fn schedule_waiting_frame(state: &mut State, wait: Duration) {
++    let second = state.second.as_mut().unwrap();
++    let wait = wait.max(second.pacing.room(Instant::now()));
++    second.frame_request = second.frame_request.wrapping_add(1);
++    let request = second.frame_request;
++    let run = move |state: &mut State| {
++        let second = state.second.as_mut().unwrap();
++        if second.frame_request == request {
++            if let Some(sender) = second.waiting_frame.take() {
++                render(state, sender);
++            }
++        }
++    };
+     if wait.is_zero() {
+-        render(state, sender);
++        // Finish taking in the commit before drawing its surfaces.
++        state.handle.insert_idle(run);
+     } else if let Err(err) =
+         state
+             .handle
+             .insert_source(Timer::from_duration(wait), move |_, _, state| {
+-                render(state, sender.clone());
++                run(state);
+                 TimeoutAction::Drop
+             })
+     {
+@@ -220,22 +317,53 @@ pub(crate) fn frame_asked(
+ }
+ 
+ fn render(state: &mut State, sender: SyncSender<Result<gst::Buffer, SwapBuffersError>>) {
++    let second = state.second.as_mut().unwrap();
++    let started = Instant::now();
++    let tell_window = !second.pacing.enabled()
++        || (!second.pacing.frame_started(started) && second.pacing.tell_with_idle_frame(started));
+     match state.create_second_frame() {
+         Ok((buffer, result)) => {
+-            result
+-                .sync
+-                .wait()
+-                .expect("Error during render_result.sync");
++            result.sync.wait().expect("Error during render_result.sync");
+             let _ = sender.send(Ok(buffer));
+-            let now = state.clock.now();
+-            if let Some(second) = state.second.as_mut() {
+-                second.last_render = Some(Instant::now());
+-                second.frames += 1;
+-                if let Some(window) = second.window.as_ref() {
+-                    let output = second.output.clone();
+-                    window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
+-                        Some(output.clone())
+-                    });
++            let damaged = result.damage.is_some();
++            let states = result.states;
++
++            let second = state.second.as_mut().unwrap();
++            second.last_render = Some(Instant::now());
++            second.frames += 1;
++            if let Some(window) = &second.window {
++                let output = &second.output;
++                window.with_surfaces(|surface, data| {
++                    update_surface_primary_scanout_output(
++                        surface,
++                        output,
++                        data,
++                        &states,
++                        |next, _, _, _| next,
++                    );
++                });
++                if tell_window {
++                    second.send_frame_callbacks(state.clock.now().into());
++                }
++                let mut feedback = OutputPresentationFeedback::new(output);
++                window.take_presentation_feedback(
++                    &mut feedback,
++                    surface_primary_scanout_output,
++                    |surface, _| surface_presentation_feedback_flags_from_states(surface, &states),
++                );
++                if damaged {
++                    let refresh = output
++                        .current_mode()
++                        .map(|mode| {
++                            Refresh::fixed(Duration::from_secs_f64(1_000.0 / mode.refresh as f64))
++                        })
++                        .unwrap_or(Refresh::Unknown);
++                    feedback.presented(
++                        state.clock.now(),
++                        refresh,
++                        0,
++                        wp_presentation_feedback::Kind::Vsync,
++                    );
+                 }
+             }
+         }
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index 544ccc4..d14e1e0 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -63,7 +63,9 @@ pub enum Command {
+     /// Prototype (Istesso, new windows on the host): the video info of the second output, which
+     /// shows the second window that has no parent, on a stream of its own. Only output 1.
+     VideoInfoFor(usize, GstVideoInfo),
+-    /// Prototype: a frame of the second output, rendered on the beat of its frame rate.
++    /// Prototype: the attached element controls pacing for its own output.
++    RenderOnCommitFor(usize, bool),
++    /// Prototype: a frame of the second output.
+     BufferFor(
+         usize,
+         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
+@@ -295,7 +297,12 @@ impl WaylandDisplay {
+     /// waits for the next beat. Frames still keep the distance of the frame rate, and in no
+     /// one second do more of them start than it says. Off unless asked for.
+     pub fn set_render_on_commit(&self, enabled: bool) {
+-        let _ = self.command_tx.send(Command::RenderOnCommit(enabled));
++        let command = if self.output == 0 {
++            Command::RenderOnCommit(enabled)
++        } else {
++            Command::RenderOnCommitFor(self.output, enabled)
++        };
++        let _ = self.command_tx.send(command);
+     }
+ 
+     /// Leaves the cursor out of the frames and tells `sink` what it is, now and whenever it
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index d552363..5743255 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -231,14 +231,22 @@ impl WaylandClient {
+ 
+     /// Commits the last window as it is, as a client does that has drawn something.
+     pub fn commit_window(&self) {
+-        self.state.windows.last().unwrap().commit();
++        self.commit_window_at(self.state.windows.len() - 1);
++    }
++
++    pub fn commit_window_at(&self, index: usize) {
++        self.state.windows[index].commit();
+     }
+ 
+     /// Asks to be told when to draw the next frame of the last window (`wl_surface.frame`)
+     /// and commits. `done` is set once the compositor has said so.
+     pub fn commit_window_and_wait_to_be_told(&self) -> Arc<SyncData> {
++        self.commit_window_and_wait_to_be_told_at(self.state.windows.len() - 1)
++    }
++
++    pub fn commit_window_and_wait_to_be_told_at(&self, index: usize) -> Arc<SyncData> {
+         let data = Arc::new(SyncData::default());
+-        let window = self.state.windows.last().unwrap();
++        let window = &self.state.windows[index];
+         window.surface.frame(&self.qh, data.clone());
+         window.commit();
+         data
+diff --git a/wayland-display-core/src/tests/mod.rs b/wayland-display-core/src/tests/mod.rs
+index fc6caee..a04c696 100644
+--- a/wayland-display-core/src/tests/mod.rs
++++ b/wayland-display-core/src/tests/mod.rs
+@@ -6,4 +6,5 @@ mod test_dialogs;
+ mod test_frame_pacing;
+ mod test_pointer;
+ mod test_resolution;
++mod test_second_output;
+ mod test_windows;
+diff --git a/wayland-display-core/src/tests/test_second_output.rs b/wayland-display-core/src/tests/test_second_output.rs
+new file mode 100644
+index 0000000..c4fff80
+--- /dev/null
++++ b/wayland-display-core/src/tests/test_second_output.rs
+@@ -0,0 +1,188 @@
++//! Drive the same second-output handlers as the attached element, with a real Wayland client.
++
++use super::fixture::Fixture;
++use crate::comp::{schedule_waiting_frame, second, send_frame_callbacks};
++use crate::utils::RenderTarget;
++use crate::utils::video_info::GstVideoInfo;
++use gst::Fraction;
++use gst_video::{VideoFormat, VideoInfo};
++use smithay::backend::SwapBuffersError;
++use std::sync::atomic::Ordering;
++use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
++use std::time::{Duration, Instant};
++use test_log::test;
++
++const FPS: i32 = 20;
++const FRAME: Duration = Duration::from_millis(50);
++
++type Frame = Receiver<Result<gst::Buffer, SwapBuffersError>>;
++
++fn fixture(with_windows: bool) -> Fixture {
++    let mut f = Fixture::new();
++    // The element sends its switch at attach time, before set_caps makes the output.
++    second::set_render_on_commit(&mut f.server, true);
++    let info = VideoInfo::builder(VideoFormat::Rgba, 320, 240)
++        .fps(Fraction::new(FPS, 1))
++        .build()
++        .unwrap();
++    second::apply_video_info(
++        &mut f.server,
++        GstVideoInfo::RAW(info),
++        &RenderTarget::Software,
++        None,
++    );
++    f.server.pacing.set_frame_rate(FPS as u64, 1);
++    f.server.pacing.set_enabled(true);
++    if with_windows {
++        f.create_window(320, 240);
++        f.create_window(320, 240);
++        assert!(f.server.second.as_ref().unwrap().window.is_some());
++    }
++    f
++}
++
++fn ask(f: &mut Fixture) -> Frame {
++    // The receiver and the compositor run on this same thread.
++    let (tx, rx) = sync_channel(1);
++    second::frame_asked(&mut f.server, tx);
++    rx
++}
++
++fn wait_until(
++    f: &mut Fixture,
++    timeout: Duration,
++    mut ready: impl FnMut(&Fixture) -> bool,
++) -> Instant {
++    let deadline = Instant::now() + timeout;
++    loop {
++        if ready(f) {
++            return Instant::now();
++        }
++        assert!(
++            Instant::now() < deadline,
++            "timed out waiting for the compositor"
++        );
++        f.update_client();
++        f.update_server();
++        std::thread::sleep(Duration::from_millis(1));
++    }
++}
++
++fn received(f: &mut Fixture, frame: &Frame) -> Instant {
++    wait_until(f, FRAME * 5, |_| match frame.try_recv() {
++        Ok(result) => {
++            result.expect("second output failed to render");
++            true
++        }
++        Err(TryRecvError::Empty) => false,
++        Err(TryRecvError::Disconnected) => panic!("second output dropped the request"),
++    })
++}
++
++fn next_frame(f: &mut Fixture) {
++    let frame = ask(f);
++    received(f, &frame);
++}
++
++fn expect_idle_frame(f: &mut Fixture) {
++    // Rendering ends before the test thread gets to poll the receiver.
++    let last = f.server.second.as_ref().unwrap().last_render.unwrap();
++    let frame = ask(f);
++    let apart = received(f, &frame).duration_since(last);
++    assert!(
++        apart >= FRAME * 2 - Duration::from_millis(1) && apart < FRAME * 3,
++        "idle frame after {apart:?}"
++    );
++}
++
++#[test]
++fn a_second_commit_releases_a_frame_and_the_next_idle_frame_keeps_its_deadline() {
++    let mut f = fixture(true);
++    next_frame(&mut f);
++    let frame = ask(&mut f);
++    std::thread::sleep(FRAME / 2);
++    f.update_server();
++    assert!(matches!(frame.try_recv(), Err(TryRecvError::Empty)));
++
++    let committed = Instant::now();
++    f.client.commit_window_at(1);
++    assert!(received(&mut f, &frame).duration_since(committed) < FRAME / 2);
++    // The superseded timer for the committed frame will fire during this request.
++    expect_idle_frame(&mut f);
++}
++
++fn ask_first(f: &mut Fixture) {
++    let now = Instant::now();
++    f.server.pacing.frame_started(now);
++    let wait = f.server.pacing.frame_asked(now, Some(now));
++    f.server.waiting_frame = Some(Box::new(|state, now| {
++        state.pacing.frame_started(now);
++    }));
++    schedule_waiting_frame(&mut f.server, wait);
++}
++
++#[test]
++fn each_commit_releases_only_its_own_outputs_frame() {
++    let mut f = fixture(true);
++    next_frame(&mut f);
++    let second = ask(&mut f);
++    ask_first(&mut f);
++    f.client.commit_window_at(0);
++    wait_until(&mut f, FRAME / 2, |f| f.server.waiting_frame.is_none());
++    assert!(matches!(second.try_recv(), Err(TryRecvError::Empty)));
++
++    ask_first(&mut f);
++    let committed = Instant::now();
++    f.client.commit_window_at(1);
++    assert!(received(&mut f, &second).duration_since(committed) < FRAME / 2);
++    assert!(f.server.waiting_frame.is_some());
++}
++
++#[test]
++fn the_second_window_waits_for_its_own_draw_callback() {
++    let mut f = fixture(true);
++    // Just after a callback, the next commit must wait for this output's tell timer.
++    let first = f.client.commit_window_and_wait_to_be_told_at(1);
++    wait_until(&mut f, FRAME * 2, |_| first.done.load(Ordering::Relaxed));
++    let next = f.client.commit_window_and_wait_to_be_told_at(1);
++    let committed = f.client.send_sync();
++    wait_until(&mut f, FRAME / 2, |_| {
++        committed.done.load(Ordering::Relaxed)
++    });
++
++    send_frame_callbacks(&f.server);
++    f.server.dh.flush_clients().unwrap();
++    f.update_client();
++    assert!(
++        !next.done.load(Ordering::Relaxed),
++        "the first output told the second window"
++    );
++    wait_until(&mut f, FRAME * 2, |_| next.done.load(Ordering::Relaxed));
++}
++
++#[test]
++fn switching_to_the_beat_releases_the_waiter_and_uses_one_interval() {
++    let mut f = fixture(true);
++    next_frame(&mut f);
++    let waiting = ask(&mut f);
++    let switched = Instant::now();
++    second::set_render_on_commit(&mut f.server, false);
++    assert!(received(&mut f, &waiting).duration_since(switched) < FRAME / 2);
++
++    std::thread::sleep(FRAME);
++    let asked = Instant::now();
++    next_frame(&mut f);
++    assert!(
++        asked.elapsed() < FRAME / 2,
++        "a frame was held past its beat"
++    );
++}
++
++#[test]
++fn an_empty_second_output_keeps_streaming() {
++    let mut f = fixture(false);
++    assert!(f.server.second.as_ref().unwrap().window.is_none());
++    next_frame(&mut f);
++    expect_idle_frame(&mut f);
++    expect_idle_frame(&mut f);
++}
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index 985c23e..c81db03 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -46,7 +46,9 @@ impl CompositorHandler for State {
+             .second
+             .as_ref()
+             .is_some_and(|second| second.shows(surface));
+-        if !on_second {
++        if on_second {
++            crate::comp::second::client_committed(self);
++        } else {
+             crate::comp::client_committed(self);
+         }
+ 

@@ -25,6 +25,7 @@
 #   NW_PORT1, NW_PORT2, NW_FLASH_PORT   26930, 26931, 26932 unless given
 #   NW_RENDER   the render node, /dev/dri/renderD129 unless given
 #   NW_SECOND   what the second window shows: text (moving, the default) or still
+#   NW_SECOND_PACING  when the second output renders: commit (the default) or beat
 #   NW_COUNTED  1 for a run that counts, started by whoever has written the measuring signal
 #               (scripts/measuring.sh busy, on both machines) for it: then that signal is this
 #               run's own, and what stops it is a stream's own signal (stream-test-*) that says
@@ -41,6 +42,11 @@ export LC_ALL=C
 out=${1:?usage: proto-windows-ubuntu-ab.sh OUT PAIRS [COUNT]}
 pairs=${2:?usage: proto-windows-ubuntu-ab.sh OUT PAIRS [COUNT]}
 count=${3:-150}
+second_pacing=${NW_SECOND_PACING-commit}
+case "$second_pacing" in
+    commit|beat) ;;
+    *) echo "NW_SECOND_PACING must be commit or beat" >&2; exit 2 ;;
+esac
 here=$(cd "$(dirname "$0")" && pwd)
 : "${NW_TARGET:?}" "${NW_PLUGIN:?}" "${NW_CONFIG:?}" "${NW_BIND:?}"
 p1=${NW_PORT1:-26930} p2=${NW_PORT2:-26931} fp=${NW_FLASH_PORT:-26932}
@@ -90,9 +96,9 @@ run() {
     mkdir -p "$dir"
     if busy; then echo "$name: a signal says busy (measuring, or a stream's own when counted); nothing started"; return 3; fi
     local second=()
-    [ "$form" = two ] && second=(--second "$NW_BIND:$p2" --second-log "$dir/frames-2.jsonl")
+    [ "$form" = two ] && second=(--second "$NW_BIND:$p2" --second-log "$dir/frames-2.jsonl" --second-pacing "$second_pacing")
     {
-        echo "{\"kind\":\"run\",\"form\":\"$form\",\"name\":\"$name\",\"seed\":$seed,\"count\":$count,\"second\":\"$second_picture\",\"counted\":${NW_COUNTED:-0},\"started\":\"$(date +%H:%M:%S)\"}"
+        echo "{\"kind\":\"run\",\"form\":\"$form\",\"name\":\"$name\",\"seed\":$seed,\"count\":$count,\"second\":\"$second_picture\",\"pacing\":\"$second_pacing\",\"counted\":${NW_COUNTED:-0},\"started\":\"$(date +%H:%M:%S)\"}"
         echo "{\"kind\":\"load\",\"when\":\"before\",\"loadavg\":\"$(cut -d' ' -f1-3 /proc/loadavg)\",\"gpu\":\"$(nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,clocks.gr,pstate --format=csv,noheader 2>/dev/null | tr -d '\n')\"}"
     } > "$dir/run.jsonl"
     setsid "${isolated[@]}" GST_PLUGIN_PATH="$NW_PLUGIN" GST_REGISTRY="$out/registry.bin" \

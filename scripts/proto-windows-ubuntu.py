@@ -4,23 +4,24 @@ virtual session on a stream and a port of its own, next to the first window's st
 scripts/m1-step3-host.py makes it. For measuring only whether the first window's picture comes
 later while a second one streams; never for a trial or a measurement that counts.
 
-    proto-windows-ubuntu.py [--second BIND --second-log FILE [--second-size WxH]] HOST_SCRIPT [its arguments...]
+    proto-windows-ubuntu.py [--second BIND --second-log FILE [--second-size WxH] [--second-pacing commit|beat]] HOST_SCRIPT [its arguments...]
 
 Without --second the host script runs as it is (the "one window" form of an A/B comparison goes
 through this same program, so that both forms start the same way).
 
-With --second the compositor plugin has to be the one with the prototype patch
-(scripts/patches/proto/gst-wayland-display-proto-second-output.patch): its element takes
-`output=1`, attaches to the compositor that the first element runs in this process, and streams
+With --second the compositor plugin needs the U0 second-output patch and the prototype
+patch for pacing that output on commit. Its element takes `output=1`, attaches to the
+compositor that the first element runs in this process, and streams
 the compositor's second output, which shows the second window that has no parent. Once the
 host script's pipeline runs, a second chain is added to it: that element, the same colour
 conversion and encoder as the first chain (the host script's description, with names of their
 own and the second size), and a second istesso-media host listening on BIND with the same
-identity (--config-dir of the host script). The first chain is not touched.
+identity (--config-dir of the host script). --second-pacing selects when this output renders:
+on a commit of its window (commit, the default) or on its frame-rate beat (beat).
 
 The second chain writes its own frame log (--second-log): frame_out, encoded and sent lines as
-the host script writes them, with "window":2, and clock lines. A viewer that connects to BIND
-gets a key frame, as on the first port. Nothing else of the host script (pause, resume, admit,
+the host script writes them, with "window":2, and clock lines. Its header records the pacing.
+A viewer that connects to BIND gets a key frame, as on the first port. Nothing else of the host script (pause, resume, admit,
 cursor, input) applies to the second chain: it is a picture only.
 
 m1-step3-host.py is not changed: this program wraps Gst.parse_launch for this one run, before
@@ -64,11 +65,17 @@ def option(args, name, default=None):
     return default
 
 
-def second_description(first, size):
+def second_description(first, size, pacing):
     """The second chain, from the host script's description of the first."""
     if not first.startswith("waylanddisplaysrc name=compositor"):
         raise SystemExit("proto-windows-ubuntu: the pipeline description is not the one expected: nothing is started")
-    names = {"name=compositor": "name=compositor2 output=1", "name=convert ": "name=convert2 ", "name=enc ": "name=enc2 ", "name=net ": "name=net2 "}
+    on_commit = "true" if pacing == "commit" else "false"
+    names = {
+        "name=compositor": f"name=compositor2 output=1 render-on-commit={on_commit}",
+        "name=convert ": "name=convert2 ",
+        "name=enc ": "name=enc2 ",
+        "name=net ": "name=net2 ",
+    }
     second = first
     for old, new in names.items():
         if second.count(old) != 1:
@@ -87,6 +94,7 @@ def main():
     argv = sys.argv[1:]
     bind = log_path = None
     size = None
+    pacing = "commit"
     while argv and argv[0].startswith("--second"):
         word = argv.pop(0)
         if not argv:
@@ -96,6 +104,10 @@ def main():
             bind = value
         elif word == "--second-log":
             log_path = value
+        elif word == "--second-pacing":
+            if value not in ("commit", "beat"):
+                raise SystemExit("proto-windows-ubuntu: --second-pacing needs commit or beat")
+            pacing = value
         elif word == "--second-size":
             w, _, h = value.partition("x")
             size = (int(w), int(h))
@@ -117,14 +129,14 @@ def main():
         colour = option(host_args, "--colour", "srgb")
         config_dir = option(host_args, "--config-dir")
         media_lib = option(host_args, "--media-lib") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(host_script))), "target", "release", "libistesso_media.so")
-        install(bind, log_path, size, fps, chroma, colour, config_dir, media_lib)
+        install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media_lib)
 
     sys.argv = [host_script] + host_args
     sys.path.insert(0, os.path.dirname(os.path.abspath(host_script)))
     runpy.run_path(host_script, run_name="__main__")
 
 
-def install(bind, log_path, size, fps, chroma, colour, config_dir, media_lib):
+def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media_lib):
     media = ctypes.CDLL(media_lib)
     media.istesso_media_host_listen.restype = ctypes.c_void_p
     media.istesso_media_host_listen.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(MediaStreamInfo)]
@@ -149,9 +161,9 @@ def install(bind, log_path, size, fps, chroma, colour, config_dir, media_lib):
         host = media.istesso_media_host_listen(config_dir.encode() if config_dir else None, bind.encode(), ctypes.byref(info))
         if not host:
             raise SystemExit(f"proto-windows-ubuntu: cannot listen on the second port: {media.istesso_media_last_error().decode()}")
-        second = Gst.parse_bin_from_description(second_description(description, size), False)
+        second = Gst.parse_bin_from_description(second_description(description, size, pacing), False)
         log = open(log_path, "x", buffering=1 << 20)
-        log.write('{"kind":"header","side":"host","tool":"proto-windows-ubuntu","window":2,"size":"%dx%d","fps":%d}\n' % (size[0], size[1], fps))
+        log.write('{"kind":"header","side":"host","tool":"proto-windows-ubuntu","window":2,"size":"%dx%d","fps":%d,"pacing":"%s"}\n' % (size[0], size[1], fps, pacing))
 
         def clock_line():
             before = time.monotonic_ns()
