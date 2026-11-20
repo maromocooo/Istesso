@@ -1,0 +1,444 @@
+PROTOTYPE ONLY (ADR 0027 proposal, new windows on the Linux host, docs/proto-new-windows-ubuntu.md).
+Never include this patch in a build used for a trial, the gate or a verdict;
+scripts/build-compositor.sh does not know it.
+
+A patch against gst-wayland-display (https://github.com/games-on-whales/gst-wayland-display,
+MIT License), commit 1301f86. Apply the four measured patches in scripts/patches first, in order:
+render-on-commit, cursor-messages, windows, dialogs; then, from scripts/patches/proto,
+gst-wayland-display-proto-second-output.patch (U0), gst-wayland-display-proto-second-output-on-commit.patch
+(step 1), and this one (step 2). The lines of context are from that project and those patches.
+
+What it adds: the element with output=1 tells what its output shows. With its window-messages
+property on, it posts the application message wayland.second-window on its bus: `present`, and
+while a window is there its `title`, `width` and `height` (the second output's size in pixels) and
+`key` (false in this step). It is posted when the element attaches, when the window is mapped on
+the second output, when its title or the output's size changes (looked at on each commit of that
+window), and when the window goes; never the same thing twice in a row. The compositor's side is a
+sink (SecondWindowSink, Command::SecondWindowSink), as for the number of windows. The title is
+never written into a log. With output=0 nothing changes: window-messages still posts
+wayland.windows, the number of windows, which counts the second window as before.
+
+scripts/proto-windows-ubuntu.py turns these messages into the list of other windows (a packet of
+kind 6 of istesso-media) on the first window's connection. Three new compositor tests.
+
+Not in it: input for the second window, popups, dialogs and resizing on the second output.
+
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 2684165..f9fb9a1 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -98,6 +98,32 @@ fn window_sink(element: glib::WeakRef<super::WaylandDisplaySrc>) -> waylanddispl
+     })
+ }
+ 
++/// Posts `wayland.second-window` on the attached element's bus. Its `present` flag
++/// says whether the output shows a window. When present, `title`, pixel `width` and
++/// `height`, and `key` describe that window.
++fn second_window_sink(
++    element: glib::WeakRef<super::WaylandDisplaySrc>,
++) -> waylanddisplaycore::SecondWindowSink {
++    Box::new(move |window| {
++        let Some(element) = element.upgrade() else {
++            return;
++        };
++        let mut structure = Structure::builder("wayland.second-window")
++            .field("present", window.is_some());
++        if let Some(window) = window {
++            structure = structure
++                .field("title", window.title.as_str())
++                .field("width", window.width)
++                .field("height", window.height)
++                .field("key", window.key);
++        }
++        let message = Application::builder(structure.build()).src(&element).build();
++        if element.post_message(message).is_err() {
++            gst::warning!(CAT, "Failed to post the second window to the bus");
++        }
++    })
++}
++
+ /// Posts what the cursor is as an application message on the element's bus, as the element
+ /// posts its environment (`wayland.src`). The structure `wayland.cursor` has a `kind`:
+ /// "hidden"; "named", with a `name`, for a cursor there is no image of; or "image", with
+@@ -360,7 +386,7 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 glib::ParamSpecBoolean::builder("window-messages")
+                     .nick("Window messages")
+                     .blurb(
+-                        "Post an application message, wayland.windows, with the number of windows (toplevels) the clients have, whenever it changes; 0 when the last one has gone",
++                        "Post an application message, wayland.windows, with the number of windows (toplevels) the clients have, whenever it changes; on output 1, post wayland.second-window with the window on that output",
+                     )
+                     .default_value(false)
+                     .build(),
+@@ -454,10 +480,15 @@ impl ObjectImpl for WaylandDisplaySrc {
+             }
+             "window-messages" => {
+                 let enabled = value.get::<bool>().expect("Type checked upstream");
+-                self.settings.lock().unwrap().window_messages = enabled;
+-                let sink = enabled.then(|| window_sink(self.obj().downgrade()));
+-                // Taken in by the compositor when it runs; it may be changed while it does.
+-                let _ = self.command_tx.send(Command::WindowSink(sink));
++                let mut settings = self.settings.lock().unwrap();
++                settings.window_messages = enabled;
++                if let Some(attached) = self.attached.lock().unwrap().as_ref() {
++                    let sink = enabled.then(|| second_window_sink(self.obj().downgrade()));
++                    let _ = attached.send(Command::SecondWindowSink(sink));
++                } else if settings.output == 0 {
++                    let sink = enabled.then(|| window_sink(self.obj().downgrade()));
++                    let _ = self.command_tx.send(Command::WindowSink(sink));
++                }
+             }
+             "output" => {
+                 self.settings.lock().unwrap().output =
+@@ -958,6 +989,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+             let settings = self.settings.lock().unwrap();
+             *self.attached.lock().unwrap() = Some(found.clone());
+             let _ = found.send(Command::RenderOnCommitFor(1, settings.render_on_commit));
++            if settings.window_messages {
++                let sink = second_window_sink(self.obj().downgrade());
++                let _ = found.send(Command::SecondWindowSink(Some(sink)));
++            }
+             Some(found)
+         } else {
+             None
+@@ -1040,7 +1075,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+             *SHARED_COMPOSITOR.lock().unwrap() = None;
+         }
+         let mut state = self.state.lock().unwrap();
+-        *self.attached.lock().unwrap() = None;
++        if let Some(attached) = self.attached.lock().unwrap().take() {
++            let _ = attached.send(Command::SecondWindowSink(None));
++        }
+         if let Some(state) = state.take() {
+             let subscriber = Registry::default().with(GstLayer);
+             tracing::subscriber::with_default(subscriber, || drop(state.display));
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 51068b4..55e5b48 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -160,6 +160,8 @@ pub struct State {
+     pub(crate) second: Option<second::SecondOutput>,
+     // The attached element can set its switch before caps create the output.
+     second_render_on_commit: bool,
++    second_window_sink: Option<second::SecondWindowSink>,
++    last_second_window: Option<second::SecondWindowInfo>,
+ }
+ 
+ impl State {
+@@ -285,6 +287,8 @@ impl State {
+             single_pixel_buffer_state,
+             second: None,
+             second_render_on_commit: false,
++            second_window_sink: None,
++            last_second_window: None,
+         }
+     }
+ }
+@@ -868,6 +872,9 @@ pub(crate) fn init(
+                     let asked = state.close_windows();
+                     tracing::info!(asked, "Asked the windows to close.");
+                 }
++                Event::Msg(Command::SecondWindowSink(sink)) => {
++                    state.set_second_window_sink(sink);
++                }
+                 Event::Msg(Command::WindowSink(sink)) => {
+                     state.set_window_sink(sink);
+                 }
+diff --git a/wayland-display-core/src/comp/second.rs b/wayland-display-core/src/comp/second.rs
+index 131d2da..955b306 100644
+--- a/wayland-display-core/src/comp/second.rs
++++ b/wayland-display-core/src/comp/second.rs
+@@ -36,9 +36,10 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+ use smithay::utils::{Logical, Point, Size};
+-use smithay::wayland::compositor::get_parent;
++use smithay::wayland::compositor::{get_parent, with_states};
+ use smithay::wayland::presentation::Refresh;
+ use smithay::wayland::seat::WaylandFocus;
++use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+ 
+ use super::State;
+ use super::pacing::{FramePacing, Tell};
+@@ -51,6 +52,88 @@ use crate::utils::video_info::GstVideoInfo;
+ /// Where output 1 begins in the space: far to the right of any first output.
+ pub(crate) const SECOND_AT: i32 = 1 << 14;
+ 
++/// The mapped window on the second output, as advertised to the viewer.
++#[derive(Clone, PartialEq, Eq)]
++pub struct SecondWindowInfo {
++    pub title: String,
++    pub width: u32,
++    pub height: u32,
++    pub key: bool,
++}
++
++impl std::fmt::Debug for SecondWindowInfo {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("SecondWindowInfo")
++            .field("width", &self.width)
++            .field("height", &self.height)
++            .field("key", &self.key)
++            .finish_non_exhaustive()
++    }
++}
++
++/// Receives the current window on the compositor thread, or `None` for an empty output.
++pub type SecondWindowSink = Box<dyn Fn(Option<SecondWindowInfo>) + Send>;
++
++impl State {
++    pub(crate) fn set_second_window_sink(&mut self, sink: Option<SecondWindowSink>) {
++        self.second_window_sink = sink;
++        self.last_second_window = None;
++        self.tell_second_window(true);
++    }
++
++    pub(crate) fn tell_second_window(&mut self, initial: bool) {
++        let Some(sink) = &self.second_window_sink else {
++            return;
++        };
++        let mapped = self.second.as_ref().and_then(|second| {
++            let window = second.window.as_ref()?;
++            // Assigned at configure time, advertised only once it has a picture.
++            self.space.element_location(window)?;
++            Some((
++                window.toplevel()?.wl_surface(),
++                second.output.current_mode()?.size,
++            ))
++        });
++        let Some((surface, size)) = mapped else {
++            if self.last_second_window.take().is_some() || initial {
++                sink(None);
++            }
++            return;
++        };
++
++        // Most commits only change pixels. Compare the title in place on those frames.
++        let changed = with_states(surface, |states| {
++            let attrs = states
++                .data_map
++                .get::<XdgToplevelSurfaceData>()
++                .unwrap()
++                .lock()
++                .unwrap();
++            let title = attrs.title.as_deref().unwrap_or_default();
++            let (width, height) = (size.w as u32, size.h as u32);
++            let key = false; // Step 3 (input) sets this.
++            if self.last_second_window.as_ref().is_some_and(|last| {
++                last.title == title
++                    && last.width == width
++                    && last.height == height
++                    && last.key == key
++            }) {
++                return None;
++            }
++            Some(SecondWindowInfo {
++                title: title.to_owned(),
++                width,
++                height,
++                key,
++            })
++        });
++        if let Some(info) = changed {
++            self.last_second_window = Some(info.clone());
++            sink(Some(info));
++        }
++    }
++}
++
+ pub(crate) struct SecondOutput {
+     pub(crate) output: Output,
+     pub(crate) dtr: OutputDamageTracker,
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index d14e1e0..da7cee3 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod utils;
+ pub(crate) mod wayland;
+ 
+ pub use crate::comp::cursor::{Cursor, CursorImage, CursorSink};
++pub use crate::comp::second::{SecondWindowInfo, SecondWindowSink};
+ pub use crate::comp::windows::WindowSink;
+ pub use crate::utils::video_info::GstVideoInfo;
+ 
+@@ -60,6 +61,8 @@ pub enum Command {
+     /// Tell the sink how many windows the clients have, now and whenever that changes; with
+     /// `None`, nobody.
+     WindowSink(Option<WindowSink>),
++    /// Tell the attached element about the mapped window on output 1.
++    SecondWindowSink(Option<SecondWindowSink>),
+     /// Prototype (Istesso, new windows on the host): the video info of the second output, which
+     /// shows the second window that has no parent, on a stream of its own. Only output 1.
+     VideoInfoFor(usize, GstVideoInfo),
+diff --git a/wayland-display-core/src/tests/client.rs b/wayland-display-core/src/tests/client.rs
+index 5743255..d1dd398 100644
+--- a/wayland-display-core/src/tests/client.rs
++++ b/wayland-display-core/src/tests/client.rs
+@@ -234,6 +234,10 @@ impl WaylandClient {
+         self.commit_window_at(self.state.windows.len() - 1);
+     }
+ 
++    pub fn set_window_title_at(&self, index: usize, title: &str) {
++        self.state.windows[index].set_title(title);
++    }
++
+     pub fn commit_window_at(&self, index: usize) {
+         self.state.windows[index].commit();
+     }
+diff --git a/wayland-display-core/src/tests/test_second_output.rs b/wayland-display-core/src/tests/test_second_output.rs
+index c4fff80..b94a817 100644
+--- a/wayland-display-core/src/tests/test_second_output.rs
++++ b/wayland-display-core/src/tests/test_second_output.rs
+@@ -1,6 +1,7 @@
+ //! Drive the same second-output handlers as the attached element, with a real Wayland client.
+ 
+ use super::fixture::Fixture;
++use crate::SecondWindowInfo;
+ use crate::comp::{schedule_waiting_frame, second, send_frame_callbacks};
+ use crate::utils::RenderTarget;
+ use crate::utils::video_info::GstVideoInfo;
+@@ -8,7 +9,7 @@ use gst::Fraction;
+ use gst_video::{VideoFormat, VideoInfo};
+ use smithay::backend::SwapBuffersError;
+ use std::sync::atomic::Ordering;
+-use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
++use std::sync::mpsc::{Receiver, TryRecvError, channel, sync_channel};
+ use std::time::{Duration, Instant};
+ use test_log::test;
+ 
+@@ -186,3 +187,93 @@ fn an_empty_second_output_keeps_streaming() {
+     expect_idle_frame(&mut f);
+     expect_idle_frame(&mut f);
+ }
++
++#[test]
++fn the_second_window_is_reported_on_map_change_and_close() {
++    let mut f = fixture(false);
++    let (tx, reports) = channel();
++    f.server
++        .set_second_window_sink(Some(Box::new(move |info| tx.send(info).unwrap())));
++    let (tx, counts) = channel();
++    f.server
++        .set_window_sink(Some(Box::new(move |n| tx.send(n).unwrap())));
++    assert_eq!(reports.try_recv(), Ok(None));
++    assert_eq!(counts.try_recv(), Ok(0));
++
++    f.create_window(320, 240);
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++    assert_eq!(counts.try_recv(), Ok(1));
++
++    f.client.create_window();
++    f.round_trip();
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++    assert_eq!(counts.try_recv(), Ok(2));
++    f.client.setup_window(160, 120);
++    f.round_trip();
++    let mut expected = SecondWindowInfo {
++        title: "Hello World!".to_owned(),
++        width: 320,
++        height: 240,
++        key: false,
++    };
++    assert_eq!(reports.try_recv(), Ok(Some(expected.clone())));
++
++    f.client.commit_window_at(1);
++    f.round_trip();
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++    f.client.set_window_title_at(1, "Another title");
++    f.round_trip();
++    f.client.commit_window_at(0);
++    f.round_trip();
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++    f.client.commit_window_at(1);
++    f.round_trip();
++    expected.title = "Another title".to_owned();
++    assert_eq!(reports.try_recv(), Ok(Some(expected)));
++    assert_eq!(counts.try_recv(), Err(TryRecvError::Empty));
++
++    f.client.close_window();
++    f.round_trip();
++    assert_eq!(reports.try_recv(), Ok(None));
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++    assert_eq!(counts.try_recv(), Ok(1));
++    assert_eq!(counts.try_recv(), Err(TryRecvError::Empty));
++}
++
++#[test]
++fn a_late_listener_gets_the_mapped_window_and_then_its_new_mode_size() {
++    let mut f = fixture(true);
++    let (tx, reports) = channel();
++    f.server
++        .set_second_window_sink(Some(Box::new(move |info| tx.send(info).unwrap())));
++    let mut expected = SecondWindowInfo {
++        title: "Hello World!".to_owned(),
++        width: 320,
++        height: 240,
++        key: false,
++    };
++    assert_eq!(reports.try_recv(), Ok(Some(expected.clone())));
++
++    let output = &f.server.second.as_ref().unwrap().output;
++    let mut mode = output.current_mode().unwrap();
++    mode.size = (640, 480).into();
++    output.change_current_state(Some(mode), None, None, None);
++    f.client.commit_window_at(1);
++    f.round_trip();
++    expected.width = 640;
++    expected.height = 480;
++    assert_eq!(reports.try_recv(), Ok(Some(expected)));
++    f.client.commit_window_at(1);
++    f.round_trip();
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++}
++
++#[test]
++fn listening_before_second_output_negotiation_reports_an_empty_output() {
++    let mut f = Fixture::new();
++    let (tx, reports) = channel();
++    f.server
++        .set_second_window_sink(Some(Box::new(move |info| tx.send(info).unwrap())));
++    assert_eq!(reports.try_recv(), Ok(None));
++    assert_eq!(reports.try_recv(), Err(TryRecvError::Empty));
++}
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index c81db03..deaf7cd 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -52,12 +52,15 @@ impl CompositorHandler for State {
+             crate::comp::client_committed(self);
+         }
+ 
+-        if let Some(window) = self
++        let mapped_window = self
+             .space
+             .elements()
+-            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
+-        {
++            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false));
++        if let Some(window) = mapped_window {
+             window.on_commit();
++            if on_second {
++                self.tell_second_window(false);
++            }
+         }
+         self.popups.commit(surface);
+ 
+@@ -160,6 +163,7 @@ impl CompositorHandler for State {
+                 {
+                     // Prototype: on the second output, and the keyboard stays where it is.
+                     self.space.map_element(window.clone(), at, false);
++                    self.tell_second_window(false);
+                     tracing::info!("A window on the second output (prototype).");
+                     return;
+                 }
+diff --git a/wayland-display-core/src/wayland/handlers/xdg.rs b/wayland-display-core/src/wayland/handlers/xdg.rs
+index 8b5deb7..494c9f6 100644
+--- a/wayland-display-core/src/wayland/handlers/xdg.rs
++++ b/wayland-display-core/src/wayland/handlers/xdg.rs
+@@ -41,6 +41,7 @@ impl XdgShellHandler for State {
+             // Prototype: the second output's window is gone; nothing takes its place.
+             if let Some(second) = self.second.as_mut().filter(|second| second.is(&gone)) {
+                 second.window = None;
++                self.tell_second_window(false);
+             }
+             self.space.unmap_elem(&gone);
+         }

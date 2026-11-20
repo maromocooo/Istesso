@@ -17,7 +17,7 @@
 //!     without an image. With --field (trial only) it says that the
 //!     application's text field is a field, a password field, or that the
 //!     keyboard is outside a field (ADR 0015, "文字の入力の欄").
-//! picture stay ADDR [--config DIR] [--peer NAME] [--seconds S] [--every-second]
+//! picture stay ADDR [--config DIR] [--peer NAME] [--seconds S] [--every-second] [--windows]
 //!     A viewer that lasts: it takes the host's frames as `watch` does, and
 //!     when the connection is cut it connects again. Says each thing that
 //!     happens to the connection as it happens (connected, cut, the first
@@ -26,7 +26,8 @@
 //!     unless given). With --every-second it also says, once a second, how
 //!     many frames came, how many bits, and how long after the host's
 //!     encoder had finished them they were whole here: meaningful only when
-//!     the host runs on the same machine (one clock).
+//!     the host runs on the same machine (one clock). With --windows it prints
+//!     one timestamped line per list of other windows, omitting their titles.
 //! picture between LISTEN TO [--silent-after S] [--close-after S]
 //!     Stands between a viewer and a host: what connects to LISTEN is
 //!     passed on to TO, both ways. For trying what a viewer does when its
@@ -73,6 +74,15 @@ impl Args {
         }
         self.0.remove(at);
         Some(self.0.remove(at))
+    }
+
+    fn flag(&mut self, name: &str) -> bool {
+        if let Some(at) = self.0.iter().position(|arg| arg == name) {
+            self.0.remove(at);
+            true
+        } else {
+            false
+        }
     }
 
     fn paths(&mut self) -> Paths {
@@ -347,13 +357,8 @@ fn stay(mut args: Args) -> Result<(), Failure> {
     let paths = args.paths();
     let peer = args.option("--peer");
     let seconds: f64 = args.option("--seconds").map_or(Ok(20.0), |s| s.parse())?;
-    let every_second = match args.0.iter().position(|arg| arg == "--every-second") {
-        Some(at) => {
-            args.0.remove(at);
-            true
-        }
-        None => false,
-    };
+    let every_second = args.flag("--every-second");
+    let show_windows = args.flag("--windows");
     let addr = args
         .0
         .first()
@@ -413,6 +418,9 @@ fn stay(mut args: Args) -> Result<(), Failure> {
                     }
                 }
             }
+            Ok(Some(Step::Event(Event::Windows(list)))) if show_windows => {
+                write_windows(std::io::stdout().lock(), &at(began), list)?;
+            }
             Ok(Some(Step::Event(Event::Cursor(_) | Event::TextField(_) | Event::Windows(_)))) => {}
             Ok(Some(Step::Cut)) => {
                 since_cut = Some(Instant::now());
@@ -442,6 +450,33 @@ fn stay(mut args: Args) -> Result<(), Failure> {
         ),
     }
     Ok(())
+}
+
+fn write_windows(mut out: impl Write, time: &str, list: &wire::Windows) -> std::io::Result<()> {
+    write!(
+        out,
+        "{time}  windows serial={} count={}",
+        list.serial,
+        list.windows.len()
+    )?;
+    for window in &list.windows {
+        write!(
+            out,
+            " [id={} port={} {}x{} key={} modal={} attention={}",
+            window.id,
+            window.port,
+            window.width,
+            window.height,
+            window.key,
+            window.modal,
+            window.attention
+        )?;
+        if let Some([width, height]) = window.points {
+            write!(out, " points={width}x{height}")?;
+        }
+        write!(out, "]")?;
+    }
+    writeln!(out)
 }
 
 /// What came in one second, for `stay --every-second`.
@@ -641,5 +676,50 @@ fn main() {
     if let Err(err) = result {
         eprintln!("error: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_lists_take_one_line_and_omit_titles() {
+        let window = wire::Window {
+            id: 2,
+            port: 0,
+            width: 320,
+            height: 240,
+            title: "Hello World!".to_owned(),
+            key: false,
+            modal: false,
+            attention: true,
+            points: None,
+        };
+        let mut list = wire::Windows {
+            serial: 1,
+            windows: vec![],
+        };
+        let mut out = Vec::new();
+        write_windows(&mut out, "0.10 s", &list).unwrap();
+        list.serial += 1;
+        list.windows = vec![
+            window.clone(),
+            wire::Window {
+                id: 3,
+                points: Some([160, 120]),
+                ..window
+            },
+        ];
+        write_windows(&mut out, "0.20 s", &list).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "0.10 s  windows serial=1 count=0\n",
+                "0.20 s  windows serial=2 count=2",
+                " [id=2 port=0 320x240 key=false modal=false attention=true]",
+                " [id=3 port=0 320x240 key=false modal=false attention=true points=160x120]\n",
+            )
+        );
     }
 }

@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """Prototype (ADR 0027 proposal, the one-day look on the Linux host): a second window of the same
 virtual session on a stream and a port of its own, next to the first window's stream as
-scripts/m1-step3-host.py makes it. For measuring only whether the first window's picture comes
-later while a second one streams; never for a trial or a measurement that counts.
+scripts/m1-step3-host.py makes it. The first host sends the kind 6 window list to viewers
+only with --second. Use this program only for the prototype's own checks. Never use it for
+a trial or a measurement that counts.
 
     proto-windows-ubuntu.py [--second BIND --second-log FILE [--second-size WxH] [--second-pacing commit|beat]] HOST_SCRIPT [its arguments...]
 
 Without --second the host script runs as it is (the "one window" form of an A/B comparison goes
 through this same program, so that both forms start the same way).
 
-With --second the compositor plugin needs the U0 second-output patch and the prototype
-patch for pacing that output on commit. Its element takes `output=1`, attaches to the
-compositor that the first element runs in this process, and streams
-the compositor's second output, which shows the second window that has no parent. Once the
-host script's pipeline runs, a second chain is added to it: that element, the same colour
-conversion and encoder as the first chain (the host script's description, with names of their
-own and the second size), and a second istesso-media host listening on BIND with the same
-identity (--config-dir of the host script). --second-pacing selects when this output renders:
-on a commit of its window (commit, the default) or on its frame-rate beat (beat).
+With --second, the compositor needs the U0 second output, its commit pacing, and its window
+messages. The element with output=1 attaches to the compositor in this process. Its chain
+uses the same colour conversion and encoder as the first, with its own size and a second
+istesso-media host listening on BIND. Both hosts use the host script's --config-dir.
+--second-pacing selects rendering on a window commit (the default) or on the frame-rate beat.
 
-The second chain writes its own frame log (--second-log): frame_out, encoded and sent lines as
-the host script writes them, with "window":2, and clock lines. Its header records the pacing.
-A viewer that connects to BIND gets a key frame, as on the first port. Nothing else of the host script (pause, resume, admit,
-cursor, input) applies to the second chain: it is a picture only.
+The first host sends the latest window list when the second window appears, changes or closes.
+A viewer connects to the port in that list for the second picture and gets a key frame.
+The second log records frame_out, encoded, sent and clock lines, and the pacing in its header.
+Each window_list line records the serial, window count, send result and time. Titles travel in
+the list. The second chain is picture only. Pause, resume, admit, cursor and input still apply
+to the first chain.
 
-m1-step3-host.py is not changed: this program wraps Gst.parse_launch for this one run, before
-the host script runs (as scripts/daily-pipeline.py wraps m1_encoder), and runs the host script
-as it is.
+Before the host script starts, this program wraps ctypes.CDLL and Gst.parse_launch for
+one run. It then runs m1-step3-host.py unchanged.
 """
 
 import ctypes
@@ -37,6 +35,8 @@ import sys
 import time
 
 import gi
+
+import proto_windows_list
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
@@ -71,7 +71,7 @@ def second_description(first, size, pacing):
         raise SystemExit("proto-windows-ubuntu: the pipeline description is not the one expected: nothing is started")
     on_commit = "true" if pacing == "commit" else "false"
     names = {
-        "name=compositor": f"name=compositor2 output=1 render-on-commit={on_commit}",
+        "name=compositor": f"name=compositor2 output=1 window-messages=true render-on-commit={on_commit}",
         "name=convert ": "name=convert2 ",
         "name=enc ": "name=enc2 ",
         "name=net ": "name=net2 ",
@@ -137,7 +137,42 @@ def main():
 
 
 def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media_lib):
-    media = ctypes.CDLL(media_lib)
+    original_cdll = ctypes.CDLL
+    media = original_cdll(media_lib)
+    first_host = None
+    media_path = os.path.realpath(media_lib)
+
+    # The list goes on the first window's connection. Capture the host made by
+    # m1-step3-host.py without changing that script or wrapping our second host.
+    class Listen:
+        def __init__(self, function):
+            object.__setattr__(self, "function", function)
+
+        def __getattr__(self, name):
+            return getattr(self.function, name)
+
+        def __setattr__(self, name, value):
+            setattr(self.function, name, value)
+
+        def __call__(self, *args, **kwargs):
+            nonlocal first_host
+            result = self.function(*args, **kwargs)
+            if result and first_host is None:
+                first_host = result
+            return result
+
+    class CaptureFirstHost(original_cdll):
+        def __init__(self, name, *args, **kwargs):
+            super().__init__(name, *args, **kwargs)
+            if isinstance(name, (str, bytes, os.PathLike)) and os.path.realpath(os.fsdecode(name)) == media_path:
+                self.istesso_media_host_listen = Listen(self.istesso_media_host_listen)
+                self.istesso_media_host_listen_closed = Listen(self.istesso_media_host_listen_closed)
+
+    ctypes.CDLL = CaptureFirstHost
+    media.istesso_media_host_port.restype = ctypes.c_uint16
+    media.istesso_media_host_port.argtypes = [ctypes.c_void_p]
+    media.istesso_media_host_set_windows.restype = ctypes.c_int32
+    media.istesso_media_host_set_windows.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     media.istesso_media_host_listen.restype = ctypes.c_void_p
     media.istesso_media_host_listen.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(MediaStreamInfo)]
     media.istesso_media_host_send.restype = ctypes.c_int32
@@ -164,6 +199,54 @@ def install(bind, log_path, size, pacing, fps, chroma, colour, config_dir, media
         second = Gst.parse_bin_from_description(second_description(description, size, pacing), False)
         log = open(log_path, "x", buffering=1 << 20)
         log.write('{"kind":"header","side":"host","tool":"proto-windows-ubuntu","window":2,"size":"%dx%d","fps":%d,"pacing":"%s"}\n' % (size[0], size[1], fps, pacing))
+
+        port = media.istesso_media_host_port(host)
+        serial = 0
+        pending = None
+
+        def log_list(number, count, rc):
+            log.write('{"kind":"window_list","serial":%d,"windows":%d,"rc":%d,"t_ns":%d}\n'
+                      % (number, count, rc, time.monotonic_ns()))
+
+        def send_pending():
+            nonlocal pending
+            if pending is None:
+                return False
+            if first_host is None:
+                return True
+            number, count, payload = pending
+            pending = None
+            try:
+                rc = media.istesso_media_host_set_windows(first_host, payload)
+            except (ctypes.ArgumentError, OSError, ValueError):
+                rc = -1
+            log_list(number, count, rc)
+            return False
+
+        def on_window(_bus, message):
+            nonlocal serial, pending
+            structure = message.get_structure()
+            if structure is None or structure.get_name() != "wayland.second-window":
+                return
+            serial += 1
+            present = structure.get_value("present")
+            try:
+                info = None
+                if present:
+                    info = {k: structure.get_value(k) for k in ("title", "width", "height", "key")}
+                payload = proto_windows_list.window_list(serial, port, info)
+            except (KeyError, TypeError, ValueError):
+                log_list(serial, int(present), -1)
+                return
+            waiting = pending is not None
+            pending = (serial, int(present), payload)
+            if first_host is not None:
+                send_pending()
+            elif not waiting:
+                GLib.timeout_add(100, send_pending)
+
+        # The host script installs the signal watch on this bus.
+        pipeline.get_bus().connect("message::application", on_window)
 
         def clock_line():
             before = time.monotonic_ns()
