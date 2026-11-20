@@ -27,10 +27,12 @@
 #               that much extra work before every frame; unset for a run that compares
 #   LF_STATE_DIR  where the signals are (~/.local/state/istesso unless given)
 #
-# The measuring signal (AGENTS.md, "計測の合図") is read before every run and every 2 s while
-# it runs; when it says busy, the run is stopped and nothing more is started. A stream's own
-# signal (stream-test-*) that says busy stops it as well. Every process is started here in a
-# session of its own and stopped by the number it got. The test application gets folders of
+# The measuring signal (AGENTS.md, "計測の合図") is read before every run, every 0.25 to 2 s
+# while the compositor and the application start, and every 2 s while it runs; when it says
+# busy, the run is stopped (all three programs, istesso measure inputs too) and nothing more is
+# started. A stream's own signal (stream-test-*) that says busy stops it as well. Every process
+# is started here, the compositor and the application in a session of their own, and stopped by
+# the number it got (printed when it starts). The test application gets folders of
 # its own (XDG_*), and so does the compositor's socket (XDG_RUNTIME_DIR under OUT).
 set -u
 export LC_ALL=C
@@ -57,21 +59,33 @@ chmod 700 "$out/xdg/runtime"
 isolated=(env -u DISPLAY XDG_RUNTIME_DIR="$out/xdg/runtime" XDG_DATA_HOME="$out/xdg/data" XDG_CONFIG_HOME="$out/xdg/config"
     XDG_STATE_HOME="$out/xdg/state" XDG_CACHE_HOME="$out/xdg/cache" GSETTINGS_BACKEND=memory GIO_USE_VFS=local)
 pids=()
+measure=""
 
 stop_all() {
-    # Recorded numbers only: the test application first, then the host script (SIGINT: it
-    # closes its pipeline), then whatever is left of their sessions.
+    # Recorded numbers only: the sender of the inputs first, then the test application, then
+    # the host script (SIGINT: it closes its pipeline), then whatever is left of their sessions.
     local pid
+    [ -n "$measure" ] && kill -INT "$measure" 2>/dev/null
     for pid in "${pids[@]:1}"; do kill -TERM "$pid" 2>/dev/null; done
     [ ${#pids[@]} -gt 0 ] && kill -INT "${pids[0]}" 2>/dev/null
-    for _ in $(seq 1 40); do
+    # Up to 7.5 s: with the 2 s between readings, all is gone within 10 s of a busy signal.
+    for _ in $(seq 1 30); do
         local alive=0
-        for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+        for pid in $measure "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
         [ $alive = 0 ] && break
         sleep 0.25
     done
+    [ -n "$measure" ] && kill -KILL "$measure" 2>/dev/null
     for pid in "${pids[@]}"; do kill -KILL -- "-$pid" 2>/dev/null; done
     pids=()
+    measure=""
+}
+# Read while the programs start: stop them and say so when a signal says busy.
+stop_if_busy() {
+    busy || return 1
+    echo "$1: a signal turned busy while starting; stopped"
+    stop_all
+    return 0
 }
 trap 'stop_all; exit 130' INT TERM
 
@@ -92,8 +106,10 @@ run() {
         --log "$dir/frames-1.jsonl" --size $size --fps $fps --frames cuda --render-node "$render" \
         < /dev/null > "$dir/host.log" 2>&1 &
     pids=($!)
+    echo "$name: host script $!"
     local sock=""
     for _ in $(seq 1 80); do
+        stop_if_busy "$name" && return 3
         sock=$(sed -E 's/\x1b\[[0-9;]*m//g' "$dir/host.log" 2>/dev/null | grep -o 'socket_name="[^"]*"' | head -1 | cut -d'"' -f2)
         [ -n "$sock" ] && break
         sleep 0.25
@@ -102,21 +118,28 @@ run() {
     setsid "${isolated[@]}" WAYLAND_DISPLAY="$sock" "$LF_TARGET/istesso-flash" --borderless --picture grey --fps $fps "${flash_more[@]}" \
         --listen "127.0.0.1:$fp" --log "$dir/flash-1.jsonl" < /dev/null > "$dir/flash-1.err" 2>&1 &
     pids+=($!)
-    for _ in $(seq 1 40); do [ -s "$dir/flash-1.jsonl" ] && break; sleep 0.25; done
+    echo "$name: test application $!"
+    for _ in $(seq 1 40); do
+        stop_if_busy "$name" && return 3
+        [ -s "$dir/flash-1.jsonl" ] && break
+        sleep 0.25
+    done
     sleep 1.5
     # The encoder settles for 6 to 7 s after its first key frame.
     local waited=0
     while [ $waited -lt 16 ]; do
-        busy && { echo "$name: a signal turned busy; stopped"; stop_all; return 3; }
+        stop_if_busy "$name" && return 3
         sleep 0.5; waited=$((waited + 1))
     done
     "$LF_TARGET/istesso" measure inputs --to "127.0.0.1:$fp" --count "$count" --seed "$seed" --json > "$dir/inputs.json" 2> "$dir/inputs.err" &
-    local measure=$!
+    measure=$!
+    echo "$name: istesso measure inputs $measure"
     while kill -0 "$measure" 2>/dev/null; do
-        if busy; then echo "$name: a signal turned busy; stopped"; kill -INT "$measure"; stop_all; return 3; fi
+        if busy; then echo "$name: a signal turned busy; stopped"; stop_all; return 3; fi
         sleep 2
     done
     wait "$measure"
+    measure=""
     echo "{\"kind\":\"load\",\"when\":\"after\",\"loadavg\":\"$(cut -d' ' -f1-3 /proc/loadavg)\",\"gpu\":\"$(nvidia-smi --query-gpu=utilization.gpu,utilization.encoder,clocks.gr,pstate --format=csv,noheader 2>/dev/null | tr -d '\n')\",\"ended\":\"$(date +%H:%M:%S)\"}" >> "$dir/run.jsonl"
     stop_all
     sleep 1

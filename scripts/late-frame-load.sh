@@ -14,22 +14,25 @@
 #
 # What runs: its own compositor, a test application with moving text (85 frames a second,
 # painted on the CPU), its own encoder, port 26936, nobody watching. In a tmux session of its
-# own (late-frame-load). It reads the measuring signal every 5 s and ends itself when that
-# says busy; `stop` ends it through a file it looks for. Processes are stopped by the numbers
-# they got.
+# own (late-frame-load). It reads the measuring signal every second (also while it starts) and
+# ends itself when that says busy, everything gone within 10 s; `stop` ends it through a control
+# file it reads (one line: `go <epoch>` or `stop <epoch>`; written over, never removed).
+# Processes are stopped by the numbers they got.
 export LC_ALL=C
 L=$HOME/istesso-scratch/late-frame
 state=$HOME/.local/state/istesso
+control=$L/load.control
+stopped() { [ "$(cut -d' ' -f1 "$control" 2>/dev/null)" = stop ]; }
 busy() { local f; for f in "$state"/measuring "$state"/stream-test-*; do [ -f "$f" ] && [ "$(cut -d' ' -f1 "$f")" = busy ] && return 0; done; return 1; }
 case "${1:-}" in
 start)
     busy && { echo "signal busy"; exit 3; }
     tmux has-session -t =late-frame-load 2>/dev/null && { echo "already running"; exit 1; }
-    rm -f "$L/load.stop"
+    echo "go $(date +%s)" > "$control"
     tmux new-session -d -s late-frame-load "LF_BIND=${LF_BIND:?} bash $L/scripts/late-frame-load.sh run > $L/load.log 2>&1"
     echo "load started $(date +%H:%M:%S)" ;;
 stop)
-    touch "$L/load.stop"
+    echo "stop $(date +%s)" > "$control"
     for _ in $(seq 1 40); do tmux has-session -t =late-frame-load 2>/dev/null || break; sleep 0.5; done
     tmux has-session -t =late-frame-load 2>/dev/null && echo "load still there" || echo "load stopped $(date +%H:%M:%S)" ;;
 run)
@@ -46,20 +49,23 @@ run)
     host=$!
     sock=""
     for _ in $(seq 1 80); do
+        { stopped || busy; } && break
         sock=$(sed -E 's/\x1b\[[0-9;]*m//g' "$D/host.log" 2>/dev/null | grep -o 'socket_name="[^"]*"' | head -1 | cut -d'"' -f2)
         [ -n "$sock" ] && break; sleep 0.25
     done
     app=""
-    if [ -n "$sock" ]; then
+    if [ -n "$sock" ] && ! stopped && ! busy; then
         setsid "${isolated[@]}" WAYLAND_DISPLAY="$sock" "$L/bin/istesso-flash" --borderless --picture text --scroll 240 --fps 85 \
             < /dev/null > "$D/flash.err" 2>&1 &
         app=$!
     fi
     echo "load running: host $host app $app in $D $(date +%H:%M:%S)"
-    while [ ! -e "$L/load.stop" ] && ! busy && kill -0 "$host" 2>/dev/null; do sleep 5; done
+    # At most 1 s to see busy, 7.5 s for the host script to close its pipeline, then the rest.
+    while ! stopped && ! busy && kill -0 "$host" 2>/dev/null; do sleep 1; done
+    busy && echo "signal busy $(date +%H:%M:%S)"
     [ -n "$app" ] && kill -TERM "$app" 2>/dev/null
     kill -INT "$host" 2>/dev/null
-    for _ in $(seq 1 40); do kill -0 "$host" 2>/dev/null || break; sleep 0.25; done
+    for _ in $(seq 1 30); do kill -0 "$host" 2>/dev/null || break; sleep 0.25; done
     for p in $host $app; do kill -KILL -- "-$p" 2>/dev/null; done
     echo "load ended $(date +%H:%M:%S)" ;;
 *) echo "usage: late-frame-load.sh start|stop"; exit 2 ;;
