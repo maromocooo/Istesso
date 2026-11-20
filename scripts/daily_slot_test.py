@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -348,6 +349,91 @@ class TheHostReadsAFolderWithoutRunningIt(unittest.TestCase):
             self.assertEqual(path(f"$(touch {mark})"), f"$(touch {mark})")
             self.assertEqual(path(f"~/`touch {mark}`"), os.path.join(home, f"`touch {mark}`"))
             self.assertFalse(os.path.exists(mark))
+
+
+class APortIsTriedByBindingIt(unittest.TestCase):
+    """The host library's can_listen, against sockets of the test's own on the review checks' ports
+    (26950-26954, loopback only for the connections). Linux only, as the host."""
+
+    # The two of a slot; a picture port for the TIME-WAIT of the trial's own, one for another
+    # program's server, and one held by another program's outgoing connection (each leaves a
+    # TIME-WAIT of a minute where the others do not look).
+    PICTURE, AGENT, OWN, OTHER, HELD = 26950, 26951, 26952, 26953, 26954
+
+    def setUp(self):
+        if platform.system() != "Linux":
+            self.skipTest("the host's part runs on Linux (its rules for SO_REUSEADDR)")
+        if signal_busy():
+            self.skipTest("a latency measurement is running")
+        self.function = re.search(r"^can_listen\(\) \{.*?^\}$", host_library(), re.S | re.M).group(0)
+        self.sockets = []
+        self.addCleanup(lambda: [each.close() for each in self.sockets])
+
+    def can_listen(self, picture=PICTURE, agent=AGENT):
+        done = subprocess.run(["bash", "-c", self.function + '\ncan_listen "$1" "$2"', "-", str(picture),
+                               str(agent)], capture_output=True, text=True)
+        return done.returncode == 0
+
+    def socket(self, family=socket.AF_INET, reuse=False):
+        each = socket.socket(family, socket.SOCK_STREAM)
+        self.sockets.append(each)
+        if reuse:
+            each.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return each
+
+    def test_free_ports_can_be_listened_on(self):
+        self.assertTrue(self.can_listen())
+
+    def test_a_listener_of_another_program_is_in_the_way(self):
+        listener = self.socket()
+        listener.bind(("127.0.0.1", self.AGENT))
+        listener.listen()
+        self.assertFalse(self.can_listen())
+
+    def test_a_socket_that_only_holds_the_port_is_in_the_way(self):
+        # Bound, neither listening nor connected: `ss` does not list it.
+        self.socket(socket.AF_INET6).bind(("::", self.PICTURE))
+        self.assertFalse(self.can_listen())
+
+    def test_an_outgoing_connection_and_its_time_wait_are_in_the_way(self):
+        listener = self.socket(reuse=True)
+        listener.bind(("127.0.0.1", self.OTHER))
+        listener.listen()
+        outgoing = self.socket()
+        try:
+            outgoing.bind(("0.0.0.0", self.HELD))
+        except OSError:
+            self.skipTest("the connection of a run a moment ago still holds the port (TIME-WAIT, a minute)")
+        outgoing.connect(("127.0.0.1", self.OTHER))
+        accepted, _ = listener.accept()
+        self.sockets.append(accepted)
+        self.assertFalse(self.can_listen(agent=self.HELD))
+        # It ends from this side first, then the other side: its TIME-WAIT, without SO_REUSEADDR,
+        # still holds the port.
+        outgoing.close()
+        time.sleep(0.2)
+        accepted.close()
+        time.sleep(0.2)
+        said = subprocess.run(["ss", "-Htan", f"( sport = :{self.HELD} )"], capture_output=True, text=True).stdout
+        self.assertIn("TIME-WAIT", said)
+        self.assertFalse(self.can_listen(agent=self.HELD))
+
+    def test_the_time_wait_of_the_trials_own_connection_is_not(self):
+        # As the trial's programs listen: SO_REUSEADDR, and the trial ends the connection first.
+        listener = self.socket(socket.AF_INET6, reuse=True)
+        listener.bind(("::", self.OWN))
+        listener.listen()
+        window = socket.create_connection(("127.0.0.1", self.OWN))
+        self.sockets.append(window)
+        accepted, _ = listener.accept()
+        accepted.close()
+        time.sleep(0.2)
+        window.close()
+        listener.close()
+        time.sleep(0.2)
+        said = subprocess.run(["ss", "-Htan", f"( sport = :{self.OWN} )"], capture_output=True, text=True).stdout
+        self.assertIn("TIME-WAIT", said)
+        self.assertTrue(self.can_listen(picture=self.OWN))
 
 
 class TheTakenPortIsSaidPlainly(unittest.TestCase):

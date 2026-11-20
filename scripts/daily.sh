@@ -304,6 +304,22 @@ home_path() { # a folder as given in a setting: a leading ~ is the home folder h
     esac
 }
 D=$(home_path "$DAILY_DIR"); src=$D/src; plugin=$D/plugin
+can_listen() { # PICTURE_PORT AGENT_PORT: whether the trial's programs could listen there now
+    # A real bind, as they do it (the picture on [::], IPv4 and IPv6 at once; the agent on 0.0.0.0;
+    # both with SO_REUSEADDR), closed at once: nothing listens, and nothing is said to anyone.
+    python3 -c '
+import socket, sys
+for family, address, port in ((socket.AF_INET6, "::", sys.argv[1]), (socket.AF_INET, "0.0.0.0", sys.argv[2])):
+    s = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((address, int(port)))
+    except OSError:
+        sys.exit(1)
+    finally:
+        s.close()
+' "$1" "$2"
+}
 take_turn() { # one command of the trial at a time on the host, whoever sent it; held until it ends
     mkdir -p "$D/run"
     exec 9>>"$D/run/lock"
@@ -919,11 +935,13 @@ else
         [ -n "$slot" ] || { echo "fail three applications are open already: close one first"; exit 5; }
         port=$((PORT_BASE + 10 + slot)); agent_port=$((PORT_BASE + 20 + slot))
     fi
-    # Taken by a listener, or held by a connection of another program (an outgoing connection gets
-    # a port of 32768-60999 at random): the trial's programs could not listen on it.
-    # A connection that has just ended (TIME-WAIT, for a minute after the trial ended an application
-    # whose window was connected) does not: the trial's programs listen with SO_REUSEADDR.
-    if ss -Htan exclude time-wait "( sport = :$port or sport = :$agent_port )" 2>/dev/null | grep -q .; then
+    # Whether the trial's programs can listen on the two ports, tried by binding as they do. Taken by
+    # a listener, held by a connection of another program (an outgoing connection gets a port of
+    # 32768-60999 at random), or by one that has just ended without SO_REUSEADDR (its TIME-WAIT
+    # holds the port for a minute), they cannot. A connection of the trial's own that has just
+    # ended (TIME-WAIT, after the trial ended an application whose window was connected) does not
+    # stand in the way: its listener had SO_REUSEADDR.
+    if ! can_listen "$port" "$agent_port"; then
         echo "fail port $port or $agent_port is in use on the host by another program: open it again in a minute (it is free once that connection ends); \`scripts/daily.sh ports low\` takes ports no outgoing connection is given"; exit 5
     fi
     mkdir -p "$run/rt/istesso" "$run/agent-cache"; chmod 700 "$run" "$run/rt" "$run/rt/istesso"
