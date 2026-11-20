@@ -26,7 +26,8 @@
 # added into NEXT_KEEP/<stamp>/removed/ (on each machine; nothing is deleted), copies the kept files
 # back, and checks each one against the checksum it had before the install.
 #
-# Settings (environment), with the recommended values; the first four are the owner's to decide:
+# Settings (environment), with the recommended values; the first four are the owner's to decide.
+# The install keeps the ones it was given in its record; the rollback takes them from there.
 #   NEXT_NAME        ish                           the command's name
 #   NEXT_BIN         ~/.local/bin                  where it goes
 #   NEXT_MOUNT_ROOT  ~/Istesso                     where host folders are mounted (made at the first mount)
@@ -277,6 +278,13 @@ install() {
     mkdir -p "$rec/old" || fail "cannot make $rec"
     chmod 700 "$NEXT_KEEP" "$rec"
     : > "$rec/record"
+    # The settings of this install: the rollback takes them from here, so that it needs none.
+    local v
+    for v in NEXT_NAME NEXT_BIN NEXT_MOUNT_ROOT NEXT_FOLDERS NEXT_ZSH NEXT_AIR_DIR NEXT_PORT NEXT_HOST \
+        NEXT_HOST_DIR NEXT_HOST_KEEP NEXT_HOST_FROM NEXT_HOST_EDITOR_SRC NEXT_HOST_EDITOR_PLUGIN \
+        NEXT_HOST_STAGE NEXT_HOST_ENV; do
+        echo "$v=$(q "${!v}")"
+    done > "$rec/settings"
     echo "$stamp" > "$NEXT_KEEP/current"
     half() { echo "next-stage: the install stopped half way: $*. \`scripts/next-stage.sh rollback\` undoes what was done." >&2; exit 1; }
     # Whether the mount place was there before (the rollback leaves it then).
@@ -362,6 +370,10 @@ rollback() {
     stamp=$(cat "$NEXT_KEEP/current")
     rec=$NEXT_KEEP/$stamp
     [ -f "$rec/record" ] || fail "no record in $(short "$rec")"
+    # As the install was given them, whatever is set now.
+    # shellcheck disable=SC1091
+    [ -f "$rec/settings" ] && . "$rec/settings"
+    AD=$NEXT_AIR_DIR
     busy_here && fail "the measuring signal is busy on this Mac: nothing was done"
     # Nothing of the stage may still run here: a shell, a mount.
     if ps -axo command= | grep -F -- "$AD/bin/istesso shell" | grep -v -F grep > /dev/null; then
