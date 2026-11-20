@@ -636,6 +636,16 @@ func pictureHeldForVirtual(configured: Bool, onVirtual: Bool, streamMatches: Boo
     return !onVirtual || !streamMatches || restarting
 }
 
+/// Whether the shown window is moved onto the virtual display again (looked at every second). The
+/// first move is one Accessibility call, which the application may not take (busy, or its window
+/// still being made); without another try the picture stays at 1x, half the size, after the 5 s
+/// hold. Only while a viewer is there, not locked, no new stream being made, the window placed,
+/// and its middle not on the virtual display.
+func movesAgainToVirtual(viewed: Bool, locked: Bool, restarting: Bool, placed: Bool, window: CGRect?, virtual: CGRect?) -> Bool {
+    guard viewed, !locked, !restarting, placed, let window, let virtual else { return false }
+    return !virtual.contains(CGPoint(x: window.midX, y: window.midY))
+}
+
 /// What the pump does with the newest picture: nothing (nobody watches, nobody waits for a resumed
 /// picture), hold it (the window is on its way to the virtual display: the picture is kept, and the
 /// first one after the hold goes as a key frame), or encode it. A `resume` while nobody watches is
@@ -2019,6 +2029,17 @@ func selfTest() -> Never {
         checkPanel(held(on: true, matches: true), false, "2x: on it, the stream of its size: the picture goes")
         checkPanel(held(waited: 5.1), false, "2x: never held longer than 5 s")
         checkPanel(held(failed: true) || held(locked: true) || held(false), false, "2x: not held when the display could not be made, when locked, or without a virtual display")
+        let virtualFrame = CGRect(x: 1920, y: 0, width: 1920, height: 1080)
+        let onMain = CGRect(x: 100, y: 100, width: 800, height: 600), onIt = onMain.offsetBy(dx: 1920, dy: 0)
+        func again(viewed: Bool = true, locked: Bool = false, restarting: Bool = false, placed: Bool = true,
+                   window: CGRect? = onMain, virtual: CGRect? = virtualFrame) -> Bool {
+            movesAgainToVirtual(viewed: viewed, locked: locked, restarting: restarting, placed: placed, window: window, virtual: virtual)
+        }
+        checkPanel(again(), true, "2x: a window still on the main display is moved again")
+        checkPanel(again(window: onIt), false, "2x: not once it is on the virtual display")
+        checkPanel(again(viewed: false) || again(locked: true) || again(restarting: true) || again(placed: false), false,
+                   "2x: not without a viewer, when locked, while a new stream is made, or before it is placed")
+        checkPanel(again(window: nil) || again(virtual: nil), false, "2x: not when the window is not on the screen, nor without the virtual display")
         // The pump's gate (every path to the encoder: a new picture, a filler, the next after one).
         checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: false) == .held, true, "pump: a picture while held is kept, not encoded")
         checkPanel(encodeGate(heldForVirtual: true, viewers: 1, resumeWaiting: true) == .held, true, "pump: also with a resume waiting, while a viewer is there (the 5 s limit applies)")
@@ -3816,6 +3837,8 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var makingVirtual = false
     var virtualFailedAt: TimeInterval = -1000
     var movedFrom: [CGWindowID: CGRect] = [:]
+    /// The windows that were moved again at least once (said once each).
+    var movedAgain: Set<CGWindowID> = []
 
     /// Looked at every second: while a device is shown the picture (and the Mac is not locked),
     /// the shown window is on the virtual display; once nobody has been shown it for the time a
@@ -3842,6 +3865,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 say("virtual", [("state", "made"), ("points", "\(Int(frame.width))x\(Int(frame.height))")])
                 self.moveShownWindow(to: frame)
             }
+        } else if let screen = virtualScreen, let frame = screen.frame,
+                  movesAgainToVirtual(viewed: viewed, locked: screenLocked(), restarting: restarting, placed: windowBounds != .zero,
+                                      window: windowList().first(where: { $0.id == windowId })?.bounds, virtual: frame) {
+            // The window is on the screen now (a closed or minimised one is not moved, and its
+            // application not raised) and not on the virtual display: moved again.
+            if let id = windowId, !movedAgain.contains(id) {
+                movedAgain.insert(id)
+                note("the shown window is not on the virtual display: moved again (every second until it is)")
+            }
+            moveShownWindow(to: frame)
         } else if let screen = virtualScreen, !viewed, now - lastViewed > settings.virtualKeep {
             // The windows first (the moves are queued for Accessibility), the display after them.
             virtualScreen = nil
