@@ -1794,6 +1794,29 @@ func selfTest() -> Never {
         send(["kind": "button", "code": 0x110, "pressed": true])
         checkPanel(downs == 1 && ups == 1, true, "restarting: a held button is released, a new press is dropped")
     }
+    do {
+        // The window closes while the button is down: the release finds no window.
+        let injector = Injector()
+        var list = [appWin]
+        var downs = 0, ups = 0
+        injector.mayPost = true
+        injector.clickForm = 4
+        injector.listNow = { list }
+        injector.lockedNow = { false }
+        injector.inRange = { _, top in top?.pid == 100 }
+        injector.windowAt = { point in list.first { $0.bounds.contains(point) } }
+        injector.postSession = { event in
+            if event.type == .leftMouseDown { downs += 1 }
+            if event.type == .leftMouseUp { ups += 1 }
+        }
+        injector.postProcess = { _, _ in }
+        func send(_ object: [String: Any]) { injector.handle(try! JSONSerialization.data(withJSONObject: object)) }
+        send(["kind": "pointer_at", "x": 150, "y": 150])
+        send(["kind": "button", "code": 0x110, "pressed": true])
+        list = []
+        send(["kind": "button", "code": 0x110, "pressed": false])
+        checkPanel(downs == 1 && ups == 1 && !injector.holding, true, "injector: a release with no window lets the press go, and nothing stays held")
+    }
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: []), true, "resize: a running picture comes back")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["pause"]), false, "resize: a pause during the restart is kept")
     checkPanel(restartResumes(picture: "running", detached: false, offered: true, held: false, wordsMeanwhile: ["detach"]), false, "resize: a detach during the restart is kept")
@@ -2563,7 +2586,16 @@ final class Injector {
 
     private func button(_ code: UInt32, _ pressed: Bool) {
         if pressed { freshWindowList(); onButtonPressed?() }
-        guard let window = windowAt(point) else { return count("dropped_no_window") }
+        guard let window = windowAt(point) else {
+            // A release with no window under it (the window closed while the button was down):
+            // nothing is posted at the point, but the button is let go here, and every press
+            // posted through the session is released inside its own window, so none stays down.
+            if !pressed {
+                buttonsDown.remove(code)
+                releaseSessionPresses()
+            }
+            return count("dropped_no_window")
+        }
         let pid = window.pid
         if pressed { buttonsDown.insert(code) } else { buttonsDown.remove(code) }
         if pressed {
