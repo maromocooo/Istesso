@@ -159,14 +159,21 @@ public final class LauncherViewController: NSViewController, NSTableViewDataSour
             displayedRows = model.rows
             table.reloadData()
         }
+        showSelection()
+        if search.stringValue != model.query { search.stringValue = model.query }
+        statusLabel.stringValue = model.status
+    }
+
+    private func showSelection() {
+        let wasUpdating = updating
+        updating = true
+        defer { updating = wasUpdating }
         if let row = model.selectedRow {
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             table.scrollRowToVisible(row)
         } else {
             table.deselectAll(nil)
         }
-        if search.stringValue != model.query { search.stringValue = model.query }
-        statusLabel.stringValue = model.status
     }
 
     public func layoutForRendering() {
@@ -225,7 +232,9 @@ public final class LauncherViewController: NSViewController, NSTableViewDataSour
     }
 
     public func tableViewSelectionDidChange(_ notification: Notification) {
-        if !updating && table.selectedRow != model.selectedRow { model.select(row: table.selectedRow) }
+        guard !updating, table.selectedRow != model.selectedRow else { return }
+        model.select(row: table.selectedRow)
+        if table.selectedRow != model.selectedRow { showSelection() }
     }
 
     public func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 24 }
