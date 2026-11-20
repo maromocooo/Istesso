@@ -431,10 +431,11 @@ class APortIsTriedByBindingIt(unittest.TestCase):
 
     def test_the_time_wait_of_the_trials_own_connection_is_not(self):
         # As the trial's programs listen: SO_REUSEADDR, and the trial ends the connection first.
+        # On the loopback only: nothing on the network can call it meanwhile.
         listener = self.socket(socket.AF_INET6, reuse=True)
-        listener.bind(("::", self.OWN))
+        listener.bind(("::1", self.OWN))
         listener.listen()
-        window = socket.create_connection(("127.0.0.1", self.OWN))
+        window = socket.create_connection(("::1", self.OWN))
         self.sockets.append(window)
         accepted, _ = listener.accept()
         accepted.close()
