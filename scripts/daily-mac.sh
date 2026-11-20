@@ -619,6 +619,14 @@ HOST
                 [ "$keys_word" = keys-dropped ] && wanted="$base — この窓にまだ打てません。クリックしてください"
                 [ "$lock_word" = locked ] && wanted="$base — Studio はロック中"
                 [ "$prompt_word" = true ] && wanted="$wanted — Studio で確認が出ています"
+                # Off unless DAILY_CAPTURE_NOTICE=1. Reads only a copy of the record that is already in
+                # this Mac's state folder (this script fetches nothing); silent when it is unknown.
+                if [ "${DAILY_CAPTURE_NOTICE:-0}" = 1 ] && [ -s "$state/capture-approvals.json" ]; then
+                    local notice_word
+                    notice_word=$("$repo/scripts/studio-capture-notice.py" "$state/capture-approvals.json" \
+                        --bundle "$bundle_name" --ja --within 7 2>/dev/null) || notice_word=
+                    [ -n "$notice_word" ] && wanted="$wanted — $notice_word"
+                fi
                 if [ "$(head -1 "$mine/title" 2>/dev/null)" != "$wanted" ]; then
                     printf '%s\n\n' "$wanted" > "$mine/title"
                     kill -USR1 "$(number_in "$mine/viewer.pid")" 2>/dev/null
