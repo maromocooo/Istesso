@@ -369,9 +369,9 @@ class APortIsTriedByBindingIt(unittest.TestCase):
         self.sockets = []
         self.addCleanup(lambda: [each.close() for each in self.sockets])
 
-    def can_listen(self, picture=PICTURE, agent=AGENT):
-        done = subprocess.run(["bash", "-c", self.function + '\ncan_listen "$1" "$2"', "-", str(picture),
-                               str(agent)], capture_output=True, text=True)
+    def can_listen(self, picture=PICTURE, agent=AGENT, address=None):
+        done = subprocess.run(["bash", "-c", self.function + '\ncan_listen "$@"', "-", str(picture), str(agent),
+                               *([address] if address else [])], capture_output=True, text=True)
         return done.returncode == 0
 
     def socket(self, family=socket.AF_INET, reuse=False):
@@ -417,6 +417,17 @@ class APortIsTriedByBindingIt(unittest.TestCase):
         said = subprocess.run(["ss", "-Htan", f"( sport = :{self.HELD} )"], capture_output=True, text=True).stdout
         self.assertIn("TIME-WAIT", said)
         self.assertFalse(self.can_listen(agent=self.HELD))
+
+    def test_with_an_address_only_that_address_is_tried(self):
+        # Another program listens on another address of the host, with the same port.
+        elsewhere = self.socket()
+        elsewhere.bind(("127.0.0.2", self.PICTURE))
+        elsewhere.listen()
+        self.assertTrue(self.can_listen(address="127.0.0.1"))
+        # Everywhere (an AURA slot, or no way to the Mac) it is in the way.
+        self.assertFalse(self.can_listen())
+        # On the same address it is in the way too.
+        self.assertFalse(self.can_listen(address="127.0.0.2"))
 
     def test_the_time_wait_of_the_trials_own_connection_is_not(self):
         # As the trial's programs listen: SO_REUSEADDR, and the trial ends the connection first.

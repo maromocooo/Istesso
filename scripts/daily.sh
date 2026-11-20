@@ -304,12 +304,17 @@ home_path() { # a folder as given in a setting: a leading ~ is the home folder h
     esac
 }
 D=$(home_path "$DAILY_DIR"); src=$D/src; plugin=$D/plugin
-can_listen() { # PICTURE_PORT AGENT_PORT: whether the trial's programs could listen there now
-    # A real bind, as they do it (the picture on [::], IPv4 and IPv6 at once; the agent on 0.0.0.0;
-    # both with SO_REUSEADDR), closed at once: nothing listens, and nothing is said to anyone.
+can_listen() { # PICTURE_PORT AGENT_PORT [ADDRESS]: whether the trial's programs could listen there now
+    # A real bind, as they do it (on ADDRESS; without one, the picture on [::], IPv4 and IPv6 at
+    # once, and the agent on 0.0.0.0; always with SO_REUSEADDR), closed at once: nothing listens,
+    # and nothing is said to anyone.
     python3 -c '
 import socket, sys
-for family, address, port in ((socket.AF_INET6, "::", sys.argv[1]), (socket.AF_INET, "0.0.0.0", sys.argv[2])):
+if len(sys.argv) > 3 and sys.argv[3]:
+    places = ((socket.AF_INET, sys.argv[3], sys.argv[1]), (socket.AF_INET, sys.argv[3], sys.argv[2]))
+else:
+    places = ((socket.AF_INET6, "::", sys.argv[1]), (socket.AF_INET, "0.0.0.0", sys.argv[2]))
+for family, address, port in places:
     s = socket.socket(family, socket.SOCK_STREAM)
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -318,7 +323,7 @@ for family, address, port in ((socket.AF_INET6, "::", sys.argv[1]), (socket.AF_I
         sys.exit(1)
     finally:
         s.close()
-' "$1" "$2"
+' "$@"
 }
 take_turn() { # one command of the trial at a time on the host, whoever sent it; held until it ends
     mkdir -p "$D/run"
@@ -941,7 +946,13 @@ else
     # holds the port for a minute), they cannot. A connection of the trial's own that has just
     # ended (TIME-WAIT, after the trial ended an application whose window was connected) does not
     # stand in the way: its listener had SO_REUSEADDR.
-    if ! can_listen "$port" "$agent_port"; then
+    # A window of this Mac reaches the host at its address on the way to the Mac (the `way` it is
+    # told below): the picture and the agent of such a slot listen there only, not on every network
+    # of the host. AURA's slots listen everywhere, as before (AURA calls from where it is). Without
+    # a way (no route to the Mac), everywhere too.
+    on_way=""
+    [ "$FOR" = aura ] || on_way=$(ip -4 route get "$MAC" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+    if ! can_listen "$port" "$agent_port" $on_way; then
         echo "fail port $port or $agent_port is in use on the host by another program: open it again in a minute (it is free once that connection ends); \`scripts/daily.sh ports low\` takes ports no outgoing connection is given"; exit 5
     fi
     mkdir -p "$run/rt/istesso" "$run/agent-cache"; chmod 700 "$run" "$run/rt" "$run/rt/istesso"
@@ -1148,7 +1159,7 @@ echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/pipeline.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/pipeline.sid
 # The words for the pipeline are written into this pipe; it is held open so that it never ends.
 exec 3<>$run/control
-exec python3 -u $src/scripts/daily-pipeline.py --text --clipboard ${scroll:+$scroll }${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel $port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
+exec python3 -u $src/scripts/daily-pipeline.py --text --clipboard ${scroll:+$scroll }${MIN_QP:+--min-qp $MIN_QP }${flow:+$flow }$src/scripts/m1-step3-host.py --to-channel ${on_way:+$on_way:}$port $pipe_options --input-socket $run/rt/istesso/input.sock --size $SIZE --frames cuda ${node:+--render-node $node} --media-lib $src/target/release/libistesso_media.so ${config:+--config-dir $config} --log $frames <&3 3<&-
 SCRIPT
     chmod +x "$run/pipeline.sh"; : > "$run/pipeline.log"; : > "$run/pipeline.exit"
     [ -n "$MIN_QP" ] && echo "host: $NAME's encoder gets the quality floor min-qp $MIN_QP (trial only)"
@@ -1229,7 +1240,7 @@ SCRIPT
 export ISTESSO_DAILY_RECONNECT=1 XDG_RUNTIME_DIR=$run/rt ISTESSO_CACHE_DIR=$run/agent-cache ${config:+ISTESSO_CONFIG_DIR=$config}
 echo "\$\$ \$(ps -o lstart= -p \$\$)" > $run/agent.pid
 sid=\$(ps -o sid= -p \$\$ | tr -d ' '); echo "\$sid \$(ps -o lstart= -p \$sid)" > $run/agent.sid
-exec $src/target/release/istesso agent --port $agent_port --no-discovery --clipboard
+exec $src/target/release/istesso agent ${on_way:+--bind $on_way }--port $agent_port --no-discovery --clipboard
 SCRIPT
     chmod +x "$run/agent.sh"; : > "$run/agent.exit"
     tmux new-session -d -s "daily-$NAME-agent" "bash -c '$run/agent.sh > $run/agent.log 2>&1; echo \$? > $run/agent.exit'" 9>&-
