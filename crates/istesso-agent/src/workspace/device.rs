@@ -6,6 +6,9 @@
 //!   on ::1 (`localhost` may be either); the next free one above it when it
 //!   is not, with a notice. A pinned number is never moved: when it is
 //!   taken, that port is not forwarded, with a notice.
+//! * Only connections from programs of this user are taken
+//!   ([`super::peer`]); those of another user of this machine, and those
+//!   whose program cannot be found, are closed at once.
 //! * Only requests for `localhost` with this number go through
 //!   ([`super::gate`]).
 //! * The person stops one forward, or all of them, with `istesso forwards
@@ -92,9 +95,13 @@ struct Entry {
     /// Connections turned away because [`MAX_OPEN_PER_FORWARD`] were open,
     /// or no thread could be started for them.
     turned_away: AtomicU64,
+    /// Connections refused because they did not come from a program of
+    /// this user ([`super::peer`]).
+    other_user: AtomicU64,
     last_used: Mutex<Option<SystemTime>>,
     cut: AtomicBool,
     told_refused: AtomicBool,
+    told_other_user: AtomicBool,
 }
 
 impl Entry {
@@ -139,6 +146,11 @@ struct Inner {
     state: Mutex<State>,
     /// The socket for `istesso forwards`.
     control: Mutex<Option<PathBuf>>,
+    /// [`HEAD_WITHIN`], in milliseconds; tests change it.
+    head_within_ms: AtomicU64,
+    /// Who is at the other end of a connection: [`super::peer::of`]; tests
+    /// change it.
+    who: Mutex<fn(&TcpStream) -> super::peer::Peer>,
 }
 
 /// The forwards of one shell.
@@ -181,6 +193,8 @@ impl Forwarder {
             notice,
             state: Mutex::new(State::default()),
             control: Mutex::new(None),
+            head_within_ms: AtomicU64::new(HEAD_WITHIN.as_millis() as u64),
+            who: Mutex::new(super::peer::of),
         });
         match control_socket(paths) {
             Ok((path, listener)) => {
@@ -292,9 +306,11 @@ impl Forwarder {
                 refused: AtomicU64::new(0),
                 failed: AtomicU64::new(0),
                 turned_away: AtomicU64::new(0),
+                other_user: AtomicU64::new(0),
                 last_used: Mutex::new(None),
                 cut: AtomicBool::new(false),
                 told_refused: AtomicBool::new(false),
+                told_other_user: AtomicBool::new(false),
             });
             let program = if entry.process.is_empty() {
                 String::new()
@@ -534,15 +550,17 @@ fn listen(inner: &Arc<Inner>, entry: &Arc<Entry>, listener: TcpListener) {
             // The closure, and the connection in it, are dropped with the
             // error; its place is given back.
             entry.open.fetch_sub(1, Ordering::SeqCst);
-            entry.turned_away.fetch_add(1, Ordering::Relaxed);
+            entry.turned_away.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
 
-/// Closes a connection the forward cannot take, and says so once.
+/// Closes a connection the forward cannot take, and says so once. Counted
+/// before it is closed, so that whoever sees it closed sees it counted.
 fn turn_away(inner: &Inner, entry: &Entry, stream: TcpStream, why: &str) {
+    let first = entry.turned_away.fetch_add(1, Ordering::SeqCst) == 0;
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    if entry.turned_away.fetch_add(1, Ordering::Relaxed) == 0 {
+    if first {
         (inner.notice)(&format!(
             "turned a connection to localhost:{} away: {why} (more are counted in `istesso forwards`)",
             entry.here
@@ -559,10 +577,28 @@ impl Drop for Open<'_> {
     }
 }
 
-/// One connection to a forward: looked at, then carried to the host.
+/// One connection to a forward: its program's user, then its first
+/// request looked at, then carried to the host.
 fn take(inner: &Inner, entry: &Entry, mut stream: TcpStream) {
     *entry.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Some(SystemTime::now());
-    let deadline = std::time::Instant::now() + HEAD_WITHIN;
+    // Before a byte is read: another user's program is not let through to
+    // the host's port (the person's decision, 2026-11-20).
+    let who = *inner.who.lock().unwrap_or_else(|e| e.into_inner());
+    let peer = who(&stream);
+    if peer != super::peer::Peer::ThisUser {
+        entry.other_user.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        if !entry.told_other_user.swap(true, Ordering::SeqCst) {
+            (inner.notice)(&format!(
+                "refused a connection to localhost:{}: {} (more are counted in `istesso forwards`)",
+                entry.here,
+                peer.why()
+            ));
+        }
+        return;
+    }
+    let head_within = Duration::from_millis(inner.head_within_ms.load(Ordering::Relaxed));
+    let deadline = std::time::Instant::now() + head_within;
     let mut first = Vec::new();
     let mut buffer = [0u8; 4096];
     let look = loop {
@@ -660,6 +696,10 @@ pub struct Shown {
     pub failed: u64,
     #[serde(default)]
     pub turned_away: u64,
+    /// Connections refused because they did not come from a program of
+    /// this user (another user's, or one that could not be found).
+    #[serde(default)]
+    pub other_user: u64,
     /// When a connection last came, in seconds since 1970.
     pub last_used: Option<u64>,
 }
@@ -695,7 +735,8 @@ fn shown(inner: &Inner) -> ShellForwards {
                 connections: entry.connections.load(Ordering::Relaxed),
                 refused: entry.refused.load(Ordering::Relaxed),
                 failed: entry.failed.load(Ordering::Relaxed),
-                turned_away: entry.turned_away.load(Ordering::Relaxed),
+                turned_away: entry.turned_away.load(Ordering::SeqCst),
+                other_user: entry.other_user.load(Ordering::SeqCst),
                 last_used: entry
                     .last_used
                     .lock()
@@ -955,48 +996,140 @@ mod tests {
         let soon = |what: &dyn Fn() -> bool| {
             let began = std::time::Instant::now();
             while !what() {
-                assert!(began.elapsed() < Duration::from_secs(5));
+                assert!(
+                    began.elapsed() < Duration::from_secs(5),
+                    "{:?}",
+                    shown(&forwarder.inner).forwards[0]
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
 
+        // While the forward is filled, a long deadline for the head of a
+        // request: the idle connections are not cut while the next one is
+        // looked at, however slow this machine is at the moment.
+        forwarder
+            .inner
+            .head_within_ms
+            .store(60_000, Ordering::Relaxed);
         // As many idle connections as a forward takes...
         let idle: Vec<TcpStream> = (0..MAX_OPEN_PER_FORWARD)
             .map(|_| TcpStream::connect(("127.0.0.1", here)).unwrap())
             .collect();
         soon(&|| open_now() == MAX_OPEN_PER_FORWARD);
-        // ...and the next one is closed at once, not after the deadline.
+        // ...and the next one is closed at once, long before the deadline,
+        // and counted by the time it is seen closed.
         let mut extra = TcpStream::connect(("127.0.0.1", here)).unwrap();
         extra
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         let began = std::time::Instant::now();
-        let _ = extra.read(&mut [0u8; 16]);
-        assert!(began.elapsed() < HEAD_WITHIN / 2, "{:?}", began.elapsed());
-        assert!(shown(&forwarder.inner).forwards[0].turned_away >= 1);
-        // The idle ones are cut at the deadline for the request's head.
-        soon(&|| open_now() == 0);
+        let read = extra.read(&mut [0u8; 16]);
+        assert!(began.elapsed() < Duration::from_secs(10), "{read:?}");
+        assert!(matches!(read, Ok(0)), "{read:?}");
+        let now = shown(&forwarder.inner).forwards[0].clone();
+        assert_eq!((now.turned_away, now.open), (1, MAX_OPEN_PER_FORWARD));
+        // Closed on their side, the idle ones give their places back.
         drop(idle);
+        soon(&|| open_now() == 0);
 
-        // A request that trickles in, a byte at a time, is cut when the
-        // deadline for the whole head has passed.
+        // A request that trickles in, a byte every 0.1 s for 6 s, is cut
+        // when the deadline for the whole head has passed (1 s here), not
+        // when one byte is late. The deadline starts after the connection is
+        // made, so after `began`.
+        forwarder
+            .inner
+            .head_within_ms
+            .store(1_000, Ordering::Relaxed);
+        let began = std::time::Instant::now();
         let mut slow = TcpStream::connect(("127.0.0.1", here)).unwrap();
         let mut writer = slow.try_clone().unwrap();
         std::thread::spawn(move || {
-            for byte in b"GET / HTTP/1.1\r\nHost: localhost" {
+            let head = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Pad: aaaaaaaaaaaaaaaaaaaa";
+            assert_eq!(head.len(), 60);
+            for byte in head {
                 if writer.write_all(&[*byte]).is_err() {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
-        slow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let began = std::time::Instant::now();
+        slow.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let _ = slow.read(&mut [0u8; 16]);
         let lasted = began.elapsed();
         assert!(
-            lasted >= HEAD_WITHIN / 2 && lasted < HEAD_WITHIN * 3,
+            lasted >= Duration::from_secs(1) && lasted < Duration::from_secs(4),
             "{lasted:?}"
+        );
+        assert_eq!(shown(&forwarder.inner).forwards[0].turned_away, 2);
+        drop(forwarder);
+        std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_connection_from_another_users_program_is_closed_before_anything_is_read() {
+        use istesso_link::forward::ForwardedPort;
+        let device = crate::testing::TempDir::new("fwd-users");
+        let notices = Arc::new(Mutex::new(Vec::<String>::new()));
+        let heard = notices.clone();
+        let forwarder = Forwarder::new(
+            &device.paths(),
+            "a host",
+            "an id",
+            // Never reached: a refused connection goes no further.
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Settings {
+                enabled: true,
+                ..Settings::default()
+            },
+            Arc::new(move |line: &str| heard.lock().unwrap().push(line.to_string())),
+        )
+        .unwrap();
+        // As the system would answer for a program of another user.
+        *forwarder.inner.who.lock().unwrap() = |_| super::super::peer::Peer::OtherUser;
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let there = probe.local_addr().unwrap().port();
+        drop(probe);
+        forwarder.update(PortList {
+            watching: true,
+            ports: vec![ForwardedPort {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                port: there,
+                family: 4,
+                process: String::new(),
+                exposed: false,
+            }],
+            ..PortList::default()
+        });
+        let here = shown(&forwarder.inner).forwards[0].here;
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(("127.0.0.1", here)).unwrap();
+            // A whole request for the right name: it is not looked at.
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut answer = Vec::new();
+            let _ = stream.read_to_end(&mut answer);
+            // Closed, without the 403 of the look.
+            assert!(answer.is_empty(), "{answer:?}");
+        }
+        let now = shown(&forwarder.inner).forwards[0].clone();
+        assert_eq!(
+            (now.other_user, now.refused, now.failed, now.connections),
+            (2, 0, 0, 2)
+        );
+        let said = notices.lock().unwrap().join("\n");
+        assert_eq!(
+            said.matches(&format!(
+                "refused a connection to localhost:{here}: it comes from a program of another user"
+            ))
+            .count(),
+            1,
+            "{said}"
         );
         drop(forwarder);
         std::fs::remove_dir(super::super::private_dir(&device.paths()).unwrap()).unwrap();

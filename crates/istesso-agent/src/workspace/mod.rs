@@ -18,7 +18,9 @@
 //! * [`url`] reads the addresses of pages strictly and points those on the
 //!   host at the forwarded ports.
 //!
-//! [`pump`] carries the bytes of one forwarded connection, on both ends.
+//! [`pump`] carries the bytes of one forwarded connection, on both ends;
+//! [`peer`] tells whose program is at the other end of a connection to a
+//! forward, which takes this user's programs only.
 //!
 //! What is written down: port numbers, counts and times. Never the path or
 //! query of a page's address, and never a byte that was carried.
@@ -26,6 +28,7 @@
 pub mod device;
 pub mod gate;
 pub mod opener;
+pub mod peer;
 pub mod pump;
 pub mod url;
 pub mod watch;
