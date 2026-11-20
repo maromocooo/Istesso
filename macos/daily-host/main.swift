@@ -3581,7 +3581,9 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                 injector.releaseAll()
             }
             if line.hasPrefix("admit") { injector.releaseAll() }
-            return wordsDuringRestart.append(line)
+            // Whether the lock said it is kept with it: said again after the restart, the lock's
+            // pause must not clear pausedForLock as the controller's own pause does.
+            return wordsDuringRestart.append((line, lockWord))
         }
         let words = line.split(separator: " ").map(String.init)
         switch words.first {
@@ -4115,7 +4117,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     /// Who is shown the picture, as last said; a new stream (after a resize) starts with it.
     var admitState: AdmitState = settings.admitNobody ? .nobody : .paired
     /// Words that came while a new stream was being made: said to the new one, in order.
-    var wordsDuringRestart: [String] = []
+    var wordsDuringRestart: [(line: String, byLock: Bool)] = []
 
     // ---- A new size: the application's window was resized ----
 
@@ -4165,7 +4167,7 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     old.close()
                     // The words that came meanwhile decide who may look and whether it is offered
                     // BEFORE the new stream listens; it is never offered to anybody it should not be.
-                    let queued = self.wordsDuringRestart
+                    let queued = self.wordsDuringRestart.map(\.line)
                     let (admit, offer, gone) = stateAfter(words: queued, admit: self.admitState, offered: self.offered,
                                                           detached: self.detached, held: self.heldForSignal)
                     self.admitState = admit
@@ -4192,8 +4194,10 @@ final class DailyHost: NSObject, NSApplicationDelegate {
                     let words = self.wordsDuringRestart
                     self.wordsDuringRestart = []
                     let resumes = restartResumes(picture: self.picture, detached: self.detached, offered: self.offered,
-                                                 held: self.heldForSignal, wordsMeanwhile: words)
-                    for word in words { self.word(word) }
+                                                 held: self.heldForSignal, wordsMeanwhile: words.map(\.line))
+                    // The lock's own words as the lock's: a lock during the restart keeps
+                    // pausedForLock, so the picture comes back at the unlock (enforceLock).
+                    for word in words { if word.byLock { self.sayForLock(word.line) } else { self.word(word.line) } }
                     if resumes && self.picture == "running" && !self.detached && self.offered && !self.heldForSignal {
                         self.openPicture { why in if let why { note("after the resize: \(why)") } }
                     }
