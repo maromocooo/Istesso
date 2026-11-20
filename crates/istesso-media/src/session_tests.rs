@@ -486,6 +486,23 @@ fn the_named_device_still_loses_the_picture_when_it_is_unpaired() {
 }
 
 #[test]
+fn the_count_of_refusals_is_said_when_their_minute_is_over_without_another_caller() {
+    let pair = pair();
+    // Two refusals for the same reason a minute ago: the first was shown, the second counted.
+    let a_minute_ago = Instant::now()
+        .checked_sub(Duration::from_secs(61))
+        .expect("this machine has run for a minute");
+    {
+        let mut refusals = pair.host.refusals().lock().unwrap();
+        for _ in 0..2 {
+            refusals.refused(a_minute_ago, "unknown", "a caller", "planted".into());
+        }
+    }
+    // Nobody calls from here on: the count comes all the same.
+    pair.until(|| pair.said("1 more connection(s) from 1 caller(s) were refused"));
+}
+
+#[test]
 fn a_device_that_is_not_paired_is_refused() {
     let pair = pair();
     let stranger = Identity::generate();

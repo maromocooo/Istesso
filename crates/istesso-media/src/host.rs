@@ -387,6 +387,12 @@ impl Host {
         })
     }
 
+    /// The count of refused connections, for a test to plant refusals of a minute ago in.
+    #[cfg(test)]
+    pub(crate) fn refusals(&self) -> &Mutex<istesso_link::RefusalLog> {
+        &self.shared.refusals
+    }
+
     /// Where the host listens.
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
@@ -963,6 +969,15 @@ impl Shared {
     /// of its own, if there is a place for it.
     fn accept(self: Arc<Self>, listener: TcpListener) {
         while !self.stop.load(Ordering::SeqCst) {
+            // The count of refused connections that were not shown comes when their minute
+            // is over, even when nobody calls again: looked at every turn, a caller or not.
+            let lines = match self.refusals.lock() {
+                Ok(mut refusals) => refusals.tick(std::time::Instant::now()),
+                Err(_) => Vec::new(),
+            };
+            for line in lines {
+                (self.log)(line);
+            }
             match wait_for(&listener, None, Duration::from_millis(200)) {
                 Ok(Ready::Connection) => {}
                 Ok(_) => continue,
@@ -970,15 +985,6 @@ impl Shared {
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-            }
-            // The count of refused connections that were not shown comes when their minute
-            // is over, even when nobody calls again.
-            let lines = match self.refusals.lock() {
-                Ok(mut refusals) => refusals.tick(std::time::Instant::now()),
-                Err(_) => Vec::new(),
-            };
-            for line in lines {
-                (self.log)(line);
             }
             let Ok((stream, caller)) = listener.accept() else {
                 // Typically "too many open files"; give the system a moment.
