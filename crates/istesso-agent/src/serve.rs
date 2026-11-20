@@ -236,6 +236,19 @@ impl Agent {
         // Inspect the machine once up front and then regularly, so that
         // callers are answered from memory. A full inspection takes a second
         // or more on macOS; no caller should have to wait for one.
+        // The count of refused connections that were not shown comes when their minute is
+        // over, even when nobody calls again.
+        let shared = self.shared.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let lines = match shared.refusals.lock() {
+                Ok(mut refusals) => refusals.tick(Instant::now()),
+                Err(_) => Vec::new(),
+            };
+            for line in lines {
+                (shared.log)(line);
+            }
+        });
         let shared = self.shared.clone();
         std::thread::spawn(move || {
             shared.manifest();
@@ -577,7 +590,7 @@ impl Shared {
                     // A caller that calls again and again fills the log with a few lines a
                     // minute, and a count.
                     let lines = match self.refusals.lock() {
-                        Ok(mut refusals) => refusals.refused(Instant::now(), line),
+                        Ok(mut refusals) => refusals.refused(Instant::now(), &from, &from, line),
                         Err(_) => vec![line],
                     };
                     for line in lines {
@@ -1689,19 +1702,13 @@ mod tests {
             .is_err());
         }
         let began = Instant::now();
-        while refused() < istesso_link::refusals::SHOWN_A_MINUTE as usize
-            && began.elapsed() < Duration::from_secs(3)
-        {
+        while refused() < 1 && began.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(300));
-        // A few a minute; the rest are counted, and told when the next minute begins.
-        assert_eq!(
-            refused(),
-            istesso_link::refusals::SHOWN_A_MINUTE as usize,
-            "{:?}",
-            said.lock().unwrap()
-        );
+        // The first of this caller in a minute; the rest are counted, and told when the
+        // minute is over.
+        assert_eq!(refused(), 1, "{:?}", said.lock().unwrap());
     }
 
     #[test]

@@ -971,7 +971,16 @@ impl Shared {
                     continue;
                 }
             }
-            let Ok((stream, _)) = listener.accept() else {
+            // The count of refused connections that were not shown comes when their minute
+            // is over, even when nobody calls again.
+            let lines = match self.refusals.lock() {
+                Ok(mut refusals) => refusals.tick(std::time::Instant::now()),
+                Err(_) => Vec::new(),
+            };
+            for line in lines {
+                (self.log)(line);
+            }
+            let Ok((stream, caller)) = listener.accept() else {
                 // Typically "too many open files"; give the system a moment.
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
@@ -995,9 +1004,18 @@ impl Shared {
                     ) {
                         // A caller that calls again and again fills the log with a few
                         // lines a minute, and a count.
+                        // One line a minute for each reason, the callers counted.
                         let line = format!("refused a connection: {err}");
+                        let reason = match &err {
+                            Error::Link(LinkError::UnknownPeer) => "unknown",
+                            Error::Link(LinkError::Version { .. }) => "version",
+                            _ => "identity",
+                        };
+                        let caller = caller.ip().to_string();
                         let lines = match shared.refusals.lock() {
-                            Ok(mut refusals) => refusals.refused(std::time::Instant::now(), line),
+                            Ok(mut refusals) => {
+                                refusals.refused(std::time::Instant::now(), reason, &caller, line)
+                            }
                             Err(_) => vec![line],
                         };
                         for line in lines {
