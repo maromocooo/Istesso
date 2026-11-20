@@ -3437,20 +3437,27 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         }
         opening = true
         let done: (String?) -> Void = { why in self.opening = false; done(why) }
+        // The pump of this stream, taken now: everything below, the frames too, goes to it on its
+        // own queue, never to a pump a new stream (a resize) made meanwhile.
+        let pump: Pump = self.pump
         pump.queue.async {
-            if let why = self.pump.open() {
+            if let why = pump.open() {
                 return DispatchQueue.main.async { done("no encoder could be opened: \(why)") }
             }
-            if let asked = resumeAsked { self.pump.resumed(asked: asked) }
+            if let asked = resumeAsked { pump.resumed(asked: asked) }
             DispatchQueue.main.async {
+                // A pause or a detach that came while the encoder opened, or a new stream: no
+                // capture is started (that stop, or the new stream, closes this pump; the picture
+                // comes back by the next resume, or by the new stream's own start).
+                guard self.picture == "running", !self.restarting, self.pump === pump else { return done(nil) }
                 if settings.generated {
                     let source = Generated(width: self.width, height: self.height)
                     self.generated = source
-                    source.start(on: self.pump.queue, fps: settings.fps) { [weak self] buffer, at in self?.pump.picture(buffer, displayNs: at) }
+                    source.start(on: pump.queue, fps: settings.fps) { buffer, at in pump.picture(buffer, displayNs: at) }
                     return done(nil)
                 }
                 guard let display = self.display else { return done(nil) }  // the app's window comes later
-                let capture = Capture(queue: self.pump.queue) { [weak self] buffer, at in self?.pump.picture(buffer, displayNs: at) }
+                let capture = Capture(queue: pump.queue) { buffer, at in pump.picture(buffer, displayNs: at) }
                 capture.onStop = { why in note("the capture stopped: \(why)") }
                 let filter: SCContentFilter
                 var rect: CGRect?
@@ -3488,10 +3495,14 @@ final class DailyHost: NSObject, NSApplicationDelegate {
         generated = nil
         let capture = self.capture
         self.capture = nil
+        // The pump of the picture being stopped, taken now: a pause or a detach that overlaps a
+        // resize closes this one on its own queue, never the new stream's pump. The new stream
+        // stays closed as well (its start waits while the picture is stopping) until a resume.
+        let pump: Pump? = self.pump
         let finish: () -> Void = {
-            guard let pump = self.pump else { return done() }
+            guard let pump else { return done() }
             pump.queue.async {
-                self.pump.close()
+                pump.close()
                 let took = Double(nowNs() - asked) / 1e6
                 if frameLog.on { frameLog.write("{\"kind\":\"picture\",\"t_ns\":\(nowNs()),\"state\":\"paused\",\"offered\":\(offered ? 1 : 0),\"took_ms\":\(String(format: "%.3f", took))}") }
                 say("paused", [("offered", offered), ("took_ms", took)])
@@ -4081,14 +4092,16 @@ final class DailyHost: NSObject, NSApplicationDelegate {
     var resumeAfterSignal = false
 
     func startTimers() {
+        // The pump these timers were made for, on its own queue (never a later stream's).
+        let pump: Pump = self.pump
         let tick = DispatchSource.makeTimerSource(flags: .strict, queue: pump.queue)
         tick.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .microseconds(500))
-        tick.setEventHandler { [weak self] in self?.pump.tick() }
+        tick.setEventHandler { [weak pump] in pump?.tick() }
         tick.resume()
         let second = DispatchSource.makeTimerSource(queue: pump.queue)
         second.schedule(deadline: .now() + 1, repeating: .seconds(1))
-        second.setEventHandler { [weak self] in
-            self?.pump.second()
+        second.setEventHandler { [weak self, weak pump] in
+            pump?.second()
             DispatchQueue.main.async {
                 guard let self, frameLog.on, !self.injector.counts.isEmpty else { return }
                 let counts = self.injector.counts.map { "\"\($0.key)\":\($0.value)" }.joined(separator: ",")
