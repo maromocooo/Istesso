@@ -39,6 +39,24 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 | NVENC | NVIDIA のエンコーダー | ヘッダーは MIT、本体はドライバー | SDK 本体をリポジトリに入れない |
 | Zig 0.16.0（道具） | herdr の試しの版（v0.9.5 にブリッジのコマンドを足したもの）を作るときだけ。herdr が含む libghostty-vt（MIT）を組み立てる | MIT（Expat）。配布物の `lib/` には、LLVM の libc++ など（Apache-2.0 WITH LLVM-exception）、musl（MIT）、wasi-libc、FreeBSD の libc（BSD）、mingw-w64（ZPL-2.1 ほか）、glibc（LGPL）が入る | 機械の全体には入れない（流れのフォルダーの中だけ。キャッシュも）。Istesso のコードには入れない。作ったものは手元の試しだけで、配らない。2026-11-21 に、0.16.0 の配布物（aarch64-macos。sha256 は ziglang.org の `index.json` と一致）の LICENSE で確かめた |
 
+### herdr の試しの版を作るときに取ってきた部品（2026-11-21）
+
+Zig で herdr（v0.9.5 にブリッジのコマンドを足した手元の版）を作ったとき、herdr が同梱する libghostty-vt の依存の一覧（`build.zig.zon`）にある部品を、Zig が取ってきた。どれも、場所と中身の値（ハッシュ）が一覧に書かれている。置き場所は外付けの SSD の流れのフォルダーの中だけ。ライセンスは、取ってきたものの中のファイルを読んで確かめた（2026-11-21）。
+
+| 部品 | 取ってきた場所 | ライセンス |
+|---|---|---|
+| aro | github.com/vancluever/arocc | MIT。Unicode のデータは Unicode License v3 |
+| translate-c | codeberg.org/vancluever/translate-c | MIT（Expat、Zig contributors） |
+| highway | deps.files.ghostty.org | Apache-2.0 または BSD-3-Clause |
+| uucode | deps.files.ghostty.org | MIT |
+| wuffs | deps.files.ghostty.org | MIT または Apache-2.0 |
+| zlib | deps.files.ghostty.org | zlib。ただし、同じ包みの `contrib/ada/zlib.ads`（Ada の結び付け）は GPL-2.0 以降（リンクの例外つき）。作るときに使うのは zlib の本体の 15 の `.c` だけで、`contrib/` は使わない（`pkg/zlib/build.zig` で確かめた） |
+| pixels | deps.files.ghostty.org | CC0-1.0 |
+| ghostty-themes（色の組み合わせ 607 個） | deps.files.ghostty.org | 包みの中にライセンスのファイルがない（未確認） |
+
+- GPL・AGPL のコードは、作ったものに入っていない（上の zlib の 1 ファイルは、包みにあるだけで、組み立てに使わない）。
+- **作ったものは、手元の試しだけに使う。配らない、押さない。** 部品も、Istesso のリポジトリには入れない。
+
 ## OS の機能（呼び出すだけ）
 
 | 機能 | 用途 |
