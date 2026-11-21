@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use istesso_proto::{AppEntry, Launch, OsFamily};
 
+use crate::{read_small_file, MAX_ENTRY_BYTES};
+
 /// Reads the facts we need from the bytes of an `Info.plist` (XML or binary).
 ///
 /// Returns `None` for bundles without an identifier and for background-only
@@ -70,6 +72,7 @@ pub fn default_dirs() -> Vec<PathBuf> {
 }
 
 /// Reads every `.app` bundle directly inside `dirs`.
+/// Skips bundles whose Info.plist is not a regular file or is larger than 1 MiB.
 pub fn scan(dirs: &[PathBuf]) -> Vec<AppEntry> {
     let mut apps = Vec::new();
     for dir in dirs {
@@ -80,7 +83,8 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<AppEntry> {
             if bundle.extension().is_none_or(|ext| ext != "app") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(bundle.join("Contents/Info.plist")) else {
+            let Some(bytes) = read_small_file(&bundle.join("Contents/Info.plist"), MAX_ENTRY_BYTES)
+            else {
                 continue;
             };
             if let Some(app) = parse_info_plist(&bytes, &bundle.to_string_lossy()) {
@@ -164,6 +168,30 @@ mod tests {
         let no_id = plist_xml("<key>CFBundleName</key><string>NoId</string>");
         assert!(parse_info_plist(&no_id, "/Applications/NoId.app").is_none());
         assert!(parse_info_plist(b"not a plist", "/Applications/Bad.app").is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_skips_a_bundle_with_a_fifo_plist() {
+        let root =
+            std::env::temp_dir().join(format!("istesso-catalog-macos-fifo-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let pipe = root.join("Pipe.app/Contents");
+        std::fs::create_dir_all(&pipe).unwrap();
+        crate::tests::make_fifo(&pipe.join("Info.plist"));
+        let normal = root.join("Example.app/Contents");
+        std::fs::create_dir_all(&normal).unwrap();
+        std::fs::write(
+            normal.join("Info.plist"),
+            plist_xml("<key>CFBundleIdentifier</key><string>com.example.app</string>"), // check-private: ok, fictional bundle identifier
+        )
+        .unwrap();
+
+        let dirs = [root.clone()];
+        let apps = crate::tests::with_timeout(move || scan(&dirs));
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].id, "com.example.app"); // check-private: ok, fictional bundle identifier
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
