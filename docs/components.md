@@ -37,6 +37,7 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 | FFmpeg | 予備のコーデック経路 | LGPL（既定の構成） | `--enable-gpl` と `--enable-nonfree` を付けない。x264 / x265 を使わない。動的リンク |
 | Roc Toolkit | 音の配信（時計のずれ補正、欠落の補完） | MPL-2.0 | ライブラリとして使う。Roc 自体を変更した場合はその変更を公開する。`deny.toml` に個別登録 |
 | NVENC | NVIDIA のエンコーダー | ヘッダーは MIT、本体はドライバー | SDK 本体をリポジトリに入れない |
+| Zig 0.16.0（道具） | herdr の試しの版（v0.9.5 にブリッジのコマンドを足したもの）を作るときだけ。herdr が含む libghostty-vt（MIT）を組み立てる | MIT（Expat）。配布物の `lib/` には、LLVM の libc++ など（Apache-2.0 WITH LLVM-exception）、musl（MIT）、wasi-libc、FreeBSD の libc（BSD）、mingw-w64（ZPL-2.1 ほか）、glibc（LGPL）が入る | 機械の全体には入れない（流れのフォルダーの中だけ。キャッシュも）。Istesso のコードには入れない。作ったものは手元の試しだけで、配らない。2026-11-21 に、0.16.0 の配布物（aarch64-macos。sha256 は ziglang.org の `index.json` と一致）の LICENSE で確かめた |
 
 ## OS の機能（呼び出すだけ）
 
