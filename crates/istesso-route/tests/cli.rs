@@ -728,3 +728,26 @@ fn a_linked_program_is_started_by_its_real_path() {
     let started = std::fs::read_to_string(root.join("marker")).unwrap();
     assert_eq!(Path::new(&started), script.canonicalize().unwrap());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_choices_file_others_can_write_is_not_used() {
+    let project = Project::new("choices-writers");
+    let run = project.with_hosts("hosts-three.json", &["choose", "site", "tower"]);
+    assert_eq!(run.code, exit::OK, "{}", run.all());
+    let file = project.settings().join("choices.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+
+    set_mode(&file, 0o602);
+    let run = project.with_hosts("hosts-three.json", &["where", "deploy", "site"]);
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert!(
+        run.stderr.contains("are not used: others can write to it"),
+        "{}",
+        run.stderr
+    );
+    // Nor is it written over by another choice.
+    let run = project.with_hosts("hosts-three.json", &["choose", "site", "mini"]);
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+}
