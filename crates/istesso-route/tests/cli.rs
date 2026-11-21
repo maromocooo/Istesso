@@ -163,6 +163,27 @@ fn where_reads_the_table_from_a_file_and_from_stdin() {
 }
 
 #[test]
+fn machine_name_controls_are_escaped_for_text_and_preserved_in_json() {
+    let project = Project::new("shown");
+    let name = "tower\u{1b}]0;owned\u{7}\r"; // check-private: ok - fictional fixture name
+    let mut hosts: Value = serde_json::from_str(include_str!("fixtures/hosts-two.json")).unwrap();
+    hosts[1]["name"] = Value::from(name);
+    std::fs::write(project.root().join("hosts.json"), hosts.to_string()).unwrap();
+
+    for command in ["where", "check"] {
+        let run = project.plain(&[command, "deploy", "site", "--hosts", "hosts.json"]);
+        assert_eq!(run.code, exit::OK);
+        assert!(run.stdout.contains(r"\u{1b}]0;owned\u{7}\r"));
+        assert!(!run.all().bytes().any(|b| matches!(b, 0x1b | 0x07 | 0x0d)));
+    }
+
+    let run = project.plain(&["where", "deploy", "site", "--hosts", "hosts.json", "--json"]);
+    assert_eq!(run.code, exit::OK);
+    let value: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(value["place"]["name"], name);
+}
+
+#[test]
 fn where_prints_json() {
     let project = Project::new("json");
     let run = project.with_hosts("hosts-two.json", &["where", "deploy", "site", "--json"]);
@@ -706,4 +727,27 @@ fn a_linked_program_is_started_by_its_real_path() {
     assert_eq!(run.code, 0, "{}", run.all());
     let started = std::fs::read_to_string(root.join("marker")).unwrap();
     assert_eq!(Path::new(&started), script.canonicalize().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_choices_file_others_can_write_is_not_used() {
+    let project = Project::new("choices-writers");
+    let run = project.with_hosts("hosts-three.json", &["choose", "site", "tower"]);
+    assert_eq!(run.code, exit::OK, "{}", run.all());
+    let file = project.settings().join("choices.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+
+    set_mode(&file, 0o602);
+    let run = project.with_hosts("hosts-three.json", &["where", "deploy", "site"]);
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert!(
+        run.stderr.contains("are not used: others can write to it"),
+        "{}",
+        run.stderr
+    );
+    // Nor is it written over by another choice.
+    let run = project.with_hosts("hosts-three.json", &["choose", "site", "mini"]);
+    assert_eq!(run.code, exit::UNREADABLE, "{}", run.all());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
 }
