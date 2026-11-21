@@ -163,6 +163,27 @@ fn where_reads_the_table_from_a_file_and_from_stdin() {
 }
 
 #[test]
+fn machine_name_controls_are_escaped_for_text_and_preserved_in_json() {
+    let project = Project::new("shown");
+    let name = "tower\u{1b}]0;owned\u{7}\r"; // check-private: ok - fictional fixture name
+    let mut hosts: Value = serde_json::from_str(include_str!("fixtures/hosts-two.json")).unwrap();
+    hosts[1]["name"] = Value::from(name);
+    std::fs::write(project.root().join("hosts.json"), hosts.to_string()).unwrap();
+
+    for command in ["where", "check"] {
+        let run = project.plain(&[command, "deploy", "site", "--hosts", "hosts.json"]);
+        assert_eq!(run.code, exit::OK);
+        assert!(run.stdout.contains(r"\u{1b}]0;owned\u{7}\r"));
+        assert!(!run.all().bytes().any(|b| matches!(b, 0x1b | 0x07 | 0x0d)));
+    }
+
+    let run = project.plain(&["where", "deploy", "site", "--hosts", "hosts.json", "--json"]);
+    assert_eq!(run.code, exit::OK);
+    let value: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(value["place"]["name"], name);
+}
+
+#[test]
 fn where_prints_json() {
     let project = Project::new("json");
     let run = project.with_hosts("hosts-two.json", &["where", "deploy", "site", "--json"]);

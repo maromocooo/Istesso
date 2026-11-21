@@ -17,7 +17,7 @@ use istesso_route::exec::{carry_out, ExecError, Local};
 use istesso_route::find::{check_program, find_tasks, Found, Program};
 use istesso_route::table::{read_table, Candidate};
 use istesso_route::tasks::{read_tasks, Task, TaskFile, TaskKind, TASKS_FILE};
-use istesso_route::{exit, now_unix, utc_date, utc_time};
+use istesso_route::{exit, now_unix, shown, utc_date, utc_time};
 
 #[derive(Parser)]
 #[command(
@@ -133,7 +133,7 @@ fn main() -> ExitCode {
     let code = match run(cli.command) {
         Ok(code) => code,
         Err(Fail { code, message }) => {
-            eprintln!("istesso-route: {message}");
+            eprintln!("{}", shown(&format!("istesso-route: {message}")));
             code
         }
     };
@@ -164,11 +164,11 @@ fn run(command: Command) -> Result<i32, Fail> {
             let decision = decide_task(&project, &task, &hosts)?;
             if matches!(decision, Decision::Go { .. }) {
                 if let Err(Fail { code, message }) = check_program_of(&task, &project.root) {
-                    println!("not ready: deploy `{}`: {message}", task.name);
+                    print_line(&format!("not ready: deploy `{}`: {message}", task.name));
                     return Ok(code);
                 }
             }
-            println!("{}", one_line(&task, &decision));
+            print_line(&one_line(&task, &decision));
             Ok(decision.exit_code())
         }
         Command::Run(args) => Ok(run_task(TaskKind::Run, args)),
@@ -324,7 +324,7 @@ fn run_task(kind: TaskKind, args: RunArgs) -> i32 {
             decision,
         }) => (code, ran, Some((task, decision))),
         Err(Fail { code, message }) => {
-            eprintln!("istesso-route: {message}");
+            eprintln!("{}", shown(&format!("istesso-route: {message}")));
             (code, false, None)
         }
     };
@@ -341,7 +341,7 @@ fn run_task(kind: TaskKind, args: RunArgs) -> i32 {
         }
         eprintln!("{line}");
     } else {
-        eprintln!("{}", ran_line(kind, &args.task, ran, code));
+        eprintln!("{}", shown(&ran_line(kind, &args.task, ran, code)));
     }
     code
 }
@@ -474,18 +474,18 @@ fn choose(name: &str, machine: &str, hosts: &HostsArg) -> Result<i32, Fail> {
     choices
         .save()
         .map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
-    println!(
+    print_line(&format!(
         "{} `{name}` goes to {} ({}) from now on",
         task.kind, place.name, place.id
-    );
+    ));
     if !candidate.answers() {
-        println!(
+        print_line(&format!(
             "  {} does not answer now; the task waits for it",
             place.name
-        );
+        ));
     }
-    println!("  remembered for {key} in {}", path.display());
-    println!("  `istesso-route forget {name}` drops it");
+    print_line(&format!("  remembered for {key} in {}", path.display()));
+    print_line(&format!("  `istesso-route forget {name}` drops it"));
     Ok(exit::OK)
 }
 
@@ -531,9 +531,11 @@ fn forget(name: &str) -> Result<i32, Fail> {
         choices
             .save()
             .map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
-        println!("forgot the machine chosen for `{name}`");
+        print_line(&format!("forgot the machine chosen for `{name}`"));
     } else {
-        println!("no machine was remembered for `{name}` in this project");
+        print_line(&format!(
+            "no machine was remembered for `{name}` in this project"
+        ));
     }
     Ok(exit::OK)
 }
@@ -543,28 +545,32 @@ fn list_choices() -> Result<i32, Fail> {
     let choices = Choices::load(&path).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
     let all = choices.all();
     if all.is_empty() {
-        println!(
+        print_line(&format!(
             "no remembered choices (they are kept in {})",
             path.display()
-        );
+        ));
         return Ok(exit::OK);
     }
-    println!("remembered choices in {}:", path.display());
+    print_line(&format!("remembered choices in {}:", path.display()));
     for choice in all {
         let r = &choice.remembered;
-        println!(
+        print_line(&format!(
             "  {}: `{}` goes to {} ({}), chosen on {}",
             choice.project,
             choice.task,
             r.name,
             r.host,
             utc_date(r.chosen_at)
-        );
+        ));
     }
     Ok(exit::OK)
 }
 
 // ---- display -----------------------------------------------------------------
+
+fn print_line(line: &str) {
+    println!("{}", shown(line));
+}
 
 fn place_label(place: &Place) -> String {
     if place.local {
@@ -690,7 +696,11 @@ fn render(task: &Task, decision: &Decision) -> String {
             }
         }
     }
-    let mut text = out.join("\n");
+    let mut text = out
+        .iter()
+        .map(|line| shown(line))
+        .collect::<Vec<_>>()
+        .join("\n");
     text.push('\n');
     text
 }

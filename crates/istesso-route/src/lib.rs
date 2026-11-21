@@ -28,6 +28,28 @@ pub mod find;
 pub mod table;
 pub mod tasks;
 
+use std::borrow::Cow;
+
+/// A line as it is printed for a person: every control character (C0, DEL,
+/// C1) is written as its escape (`\u{1b}`, `\r`), so that a machine's name
+/// from the role table, or one remembered in the choices file, cannot move
+/// the cursor, rewrite earlier lines or set the terminal's title. JSON output
+/// does not go through it: serde_json escapes control characters itself.
+pub fn shown(text: &str) -> Cow<'_, str> {
+    if !text.contains(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut line = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            line.extend(c.escape_debug());
+        } else {
+            line.push(c);
+        }
+    }
+    Cow::Owned(line)
+}
+
 /// Exit codes of the `istesso-route` command.
 ///
 /// A task that was run here returns its own exit code instead. The numbers
@@ -112,6 +134,22 @@ pub fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_escapes_only_controls() {
+        assert_eq!(
+            shown("ノート\"\\\x1b\x07\r\n\t\0\x7f\u{9b}"),
+            r#"ノート"\\u{1b}\u{7}\r\n\t\0\u{7f}\u{9b}"#
+        );
+    }
+
+    #[test]
+    fn shown_borrows_text_without_controls() {
+        let samples = ["tower", "ノート", "\"", "\\"]; // check-private: ok - fictional fixture names
+        for text in samples {
+            assert!(matches!(shown(text), Cow::Borrowed(s) if s == text));
+        }
+    }
 
     #[test]
     fn times_are_written_in_utc() {
