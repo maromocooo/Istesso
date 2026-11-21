@@ -216,6 +216,23 @@ fn remembered_of(entry: &Value) -> Option<Remembered> {
     })
 }
 
+fn check_volume(
+    path: &Path,
+    item: &Path,
+    file: Option<&std::fs::File>,
+) -> Result<(), ChoicesError> {
+    if crate::volume::refuses(item, file).map_err(|e| ChoicesError::Io {
+        path: item.to_path_buf(),
+        why: e.to_string(),
+    })? {
+        return Err(ChoicesError::Untrusted {
+            path: path.to_path_buf(),
+            why: format!("{} ({})", crate::volume::REASON, item.display()),
+        });
+    }
+    Ok(())
+}
+
 /// The file's text, read from the handle that was checked; `None` when there
 /// is no file. What is checked is in the module's text.
 fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, ChoicesError> {
@@ -258,6 +275,7 @@ fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, Cho
         if !meta.is_dir() {
             return Err(io(format!("{} is not a folder", dir.display())));
         }
+        check_volume(path, dir, None)?;
         if meta.uid() != crate::find::effective_uid() && meta.uid() != 0 {
             return Err(untrusted(format!(
                 "its folder {} belongs to another user",
@@ -285,6 +303,7 @@ fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, Cho
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        check_volume(path, path, Some(&file))?;
         if meta.uid() != crate::find::effective_uid() {
             return Err(untrusted("it belongs to another user".into()));
         }
@@ -458,6 +477,8 @@ impl Choices {
                 builder.mode(0o700);
             }
             builder.create(dir).map_err(io)?;
+            // A first save can create the folder after load found it missing.
+            check_volume(&self.path, dir, None)?;
         }
         let mut text = serde_json::to_string_pretty(&self.doc).map_err(|e| ChoicesError::Io {
             path: self.path.clone(),

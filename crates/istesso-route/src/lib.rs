@@ -27,6 +27,9 @@ pub mod exec;
 pub mod find;
 pub mod table;
 pub mod tasks;
+mod volume;
+
+pub use volume::validate_ownership_setting;
 
 use std::borrow::Cow;
 

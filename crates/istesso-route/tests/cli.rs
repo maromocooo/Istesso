@@ -75,6 +75,7 @@ impl Project {
             .args(args)
             .current_dir(dir)
             .env("ISTESSO_ROUTE_DIR", self.settings())
+            .env_remove("ISTESSO_ROUTE_IGNORED_OWNERSHIP")
             .env("HOME", self.base.join("home"))
             .env_remove("XDG_CONFIG_HOME");
         command
@@ -368,6 +369,22 @@ fn usage_errors_end_with_2() {
 }
 
 #[test]
+fn an_invalid_ignored_ownership_setting_is_a_usage_error() {
+    let project = Project::new("ownership-setting");
+    let output = project
+        .command(&["choices"])
+        .env("ISTESSO_ROUTE_IGNORED_OWNERSHIP", "other")
+        .output()
+        .unwrap();
+    let run = Run::of(output);
+    assert_eq!(run.code, exit::USAGE);
+    assert!(run.stdout.is_empty());
+    assert!(run
+        .stderr
+        .contains("ISTESSO_ROUTE_IGNORED_OWNERSHIP must be empty, notice, or refuse"));
+}
+
+#[test]
 fn check_deploy_answers_in_one_line() {
     let project = Project::new("check");
     let run = project.with_hosts("hosts-two.json", &["check", "deploy", "site"]);
@@ -631,7 +648,15 @@ fn run_says_in_a_fixed_line_whether_the_task_ran() {
     assert_eq!(value["exit_code"], exit::ELSEWHERE);
     assert_eq!(value["decision"]["decision"], "go");
     assert_eq!(value["decision"]["place"]["name"], "tower");
-    assert_eq!(run.stderr.lines().count(), 1);
+    let mut lines = run.stderr.lines();
+    lines.next_back(); // The JSON result checked above.
+    if let Some(note) = lines.next() {
+        assert!(note.starts_with(
+            "note: this volume ignores file ownership, so the owner check has no effect here ("
+        ));
+        assert!(note.ends_with(')'));
+    }
+    assert_eq!(lines.next(), None);
     let run = project.with_hosts("hosts-two.json", &["build", "test", "--json"]);
     assert_eq!(run.code, 3);
     let value: Value = serde_json::from_str(last_line(&run.stderr)).unwrap();

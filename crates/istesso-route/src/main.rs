@@ -141,6 +141,7 @@ fn main() -> ExitCode {
 }
 
 fn run(command: Command) -> Result<i32, Fail> {
+    istesso_route::validate_ownership_setting().map_err(|why| fail(exit::USAGE, why))?;
     match command {
         Command::Where {
             kind,
