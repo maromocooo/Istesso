@@ -61,6 +61,8 @@ pub struct Found {
 /// Why a task file that was found is not used. Never skipped silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FindError {
+    /// The volume ignores ownership and the caller asked to refuse it.
+    IgnoredOwnership { path: PathBuf },
     /// The file or a folder leading to it belongs to another user.
     NotOwned { path: PathBuf },
     /// The file or a folder leading to it can be written by others.
@@ -92,6 +94,12 @@ impl fmt::Display for FindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let run_as_you = "and the task file's commands would run as you";
         match self {
+            FindError::IgnoredOwnership { path } => write!(
+                f,
+                "{} is not used: {}, {run_as_you}",
+                path.display(),
+                crate::volume::REASON
+            ),
             FindError::NotOwned { path } => write!(
                 f,
                 "{} is not used: it belongs to another user, {run_as_you}",
@@ -248,6 +256,16 @@ fn unreadable(path: &Path, e: impl fmt::Display) -> FindError {
     }
 }
 
+#[cfg(unix)]
+fn check_volume(path: &Path, file: Option<&std::fs::File>) -> Result<(), FindError> {
+    if crate::volume::refuses(path, file).map_err(|e| unreadable(path, e))? {
+        return Err(FindError::IgnoredOwnership {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 /// The canonical place of `path`, which must lie inside `allowed`.
 fn inside(path: &Path, allowed: &Path) -> Result<PathBuf, FindError> {
     let real = path.canonicalize().map_err(|e| unreadable(path, e))?;
@@ -302,6 +320,7 @@ fn check_folder(path: &Path, accounts: &AccountDb) -> Result<(), FindError> {
             path: path.to_path_buf(),
         });
     }
+    check_volume(path, None)?;
     let uid = meta.uid();
     if uid != effective_uid() && uid != 0 {
         return Err(FindError::NotOwned {
@@ -324,6 +343,7 @@ fn check_folder(_path: &Path, _accounts: &AccountDb) -> Result<(), FindError> {
 fn check_above(path: &Path, accounts: &AccountDb) -> Result<(), FindError> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).map_err(|e| unreadable(path, e))?;
+    check_volume(path, None)?;
     let uid = meta.uid();
     if uid != effective_uid() && uid != 0 {
         return Err(FindError::AboveNotOwned {
@@ -353,6 +373,7 @@ fn read_checked(path: &Path, accounts: &AccountDb) -> Result<String, FindError> 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        check_volume(path, Some(&file))?;
         if meta.uid() != effective_uid() {
             return Err(FindError::NotOwned {
                 path: path.to_path_buf(),
@@ -473,7 +494,7 @@ pub(crate) fn check_program_with(
 /// entry after the file's line; elsewhere `ls -ld` marks a file that has an
 /// ACL with `+` right after the mode. Anything unexpected is a refusal.
 #[cfg(unix)]
-fn check_no_acl(path: &Path) -> Result<(), FindError> {
+pub(crate) fn check_no_acl(path: &Path) -> Result<(), FindError> {
     if path.as_os_str().as_encoded_bytes().contains(&b'\n') {
         return Err(unreadable(path, "the path holds a line break"));
     }
@@ -525,8 +546,7 @@ fn has_acl(listing: &str, macos: bool) -> bool {
 ///
 /// The standard library has no safe call that gives the effective user id
 /// (`std::os::unix` exposes the owner of files, not of the process), and
-/// this crate takes no new dependency, so the C library's `geteuid` is
-/// declared here; it is the crate's only `unsafe`.
+/// the C library's `geteuid` is declared here.
 #[cfg(unix)]
 pub(crate) fn effective_uid() -> u32 {
     extern "C" {
@@ -540,7 +560,7 @@ pub(crate) fn effective_uid() -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const TEXT: &str = r#"{"version": 1, "tasks": {}}"#;
@@ -845,7 +865,7 @@ mod tests {
     /// Gives `path` an ACL that lets everyone write, with the system's tool.
     /// False when the tool is not there (Linux without `setfacl`).
     #[cfg(unix)]
-    fn give_acl(path: &Path, folder: bool) -> bool {
+    pub(crate) fn give_acl(path: &Path, folder: bool) -> bool {
         let status = if cfg!(target_os = "macos") {
             let entry = if folder {
                 "everyone allow add_file"

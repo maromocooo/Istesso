@@ -32,9 +32,9 @@
 //! or to root, the file to this user, and neither may be writable by others,
 //! nor by their group unless that group cannot hold anyone but this user
 //! (the rule of the task file, see `accounts`). The folder is checked before
-//! the file is opened, and the file on the open handle it is read from.
-//! Folders above that one, and access control lists, are not looked at: this
-//! command makes the folder 0700 and the file 0600 itself.
+//! the file is opened, and the file's owner and mode on the open handle it
+//! is read from. The folder and the file must also be free of access control
+//! lists. Folders above that one are not checked.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -53,29 +53,37 @@ pub const DIR_VARIABLE: &str = "ISTESSO_ROUTE_DIR";
 const FILE_NAME: &str = "choices.json";
 
 /// `ISTESSO_ROUTE_DIR`, or the platform's place for settings + "istesso-route".
-pub fn choices_dir() -> PathBuf {
+pub fn choices_dir() -> Result<PathBuf, ChoicesError> {
     if let Some(dir) = std::env::var_os(DIR_VARIABLE).filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
+    }
+    if !cfg!(target_os = "macos") {
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute())
+        {
+            return Ok(dir.join("istesso-route"));
+        }
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_default();
-    if cfg!(target_os = "macos") {
-        return home.join("Library/Application Support/istesso-route");
-    }
-    match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
-        Some(dir) if dir.is_absolute() => dir.join("istesso-route"),
-        _ => home.join(".config/istesso-route"),
-    }
+        .filter(|d| d.is_absolute())
+        .ok_or(ChoicesError::InvalidHome)?;
+    Ok(home.join(if cfg!(target_os = "macos") {
+        "Library/Application Support/istesso-route"
+    } else {
+        ".config/istesso-route"
+    }))
 }
 
 /// The file in [`choices_dir`].
-pub fn choices_path() -> PathBuf {
-    choices_dir().join(FILE_NAME)
+pub fn choices_path() -> Result<PathBuf, ChoicesError> {
+    Ok(choices_dir()?.join(FILE_NAME))
 }
 
 #[derive(Debug)]
 pub enum ChoicesError {
+    InvalidHome,
     Io {
         path: PathBuf,
         why: String,
@@ -99,6 +107,10 @@ pub enum ChoicesError {
 impl fmt::Display for ChoicesError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ChoicesError::InvalidHome => write!(
+                f,
+                "HOME must be set to an absolute path to locate the remembered choices"
+            ),
             ChoicesError::Io { path, why } => {
                 write!(f, "the remembered choices at {} cannot be used: {why}", path.display())
             }
@@ -204,6 +216,23 @@ fn remembered_of(entry: &Value) -> Option<Remembered> {
     })
 }
 
+fn check_volume(
+    path: &Path,
+    item: &Path,
+    file: Option<&std::fs::File>,
+) -> Result<(), ChoicesError> {
+    if crate::volume::refuses(item, file).map_err(|e| ChoicesError::Io {
+        path: item.to_path_buf(),
+        why: e.to_string(),
+    })? {
+        return Err(ChoicesError::Untrusted {
+            path: path.to_path_buf(),
+            why: format!("{} ({})", crate::volume::REASON, item.display()),
+        });
+    }
+    Ok(())
+}
+
 /// The file's text, read from the handle that was checked; `None` when there
 /// is no file. What is checked is in the module's text.
 fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, ChoicesError> {
@@ -217,6 +246,17 @@ fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, Cho
         why,
     };
     let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    #[cfg(unix)]
+    let check_acl = |item: &Path| {
+        // The open and metadata calls follow links. Check the same target with ls.
+        let target = item.canonicalize().map_err(|e| io(e.to_string()))?;
+        crate::find::check_no_acl(&target).map_err(|e| match e {
+            crate::find::FindError::HasAcl { .. } => {
+                untrusted(format!("{} carries an access control list", item.display()))
+            }
+            _ => io(e.to_string()),
+        })
+    };
 
     // The folder first: in a folder only this user can write to, nobody else
     // can put a file (or a link) in the file's place.
@@ -235,6 +275,7 @@ fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, Cho
         if !meta.is_dir() {
             return Err(io(format!("{} is not a folder", dir.display())));
         }
+        check_volume(path, dir, None)?;
         if meta.uid() != crate::find::effective_uid() && meta.uid() != 0 {
             return Err(untrusted(format!(
                 "its folder {} belongs to another user",
@@ -247,6 +288,7 @@ fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, Cho
                 dir.display()
             )));
         }
+        check_acl(dir)?;
     }
 
     let mut file = match std::fs::File::open(path) {
@@ -261,6 +303,7 @@ fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, Cho
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        check_volume(path, path, Some(&file))?;
         if meta.uid() != crate::find::effective_uid() {
             return Err(untrusted("it belongs to another user".into()));
         }
@@ -269,6 +312,7 @@ fn read_trusted(path: &Path, accounts: &AccountDb) -> Result<Option<String>, Cho
                 "{who} can write to it (`chmod go-w` it if that is not meant)"
             )));
         }
+        check_acl(path)?;
     }
     #[cfg(not(unix))]
     let _ = accounts;
@@ -433,6 +477,8 @@ impl Choices {
                 builder.mode(0o700);
             }
             builder.create(dir).map_err(io)?;
+            // A first save can create the folder after load found it missing.
+            check_volume(&self.path, dir, None)?;
         }
         let mut text = serde_json::to_string_pretty(&self.doc).map_err(|e| ChoicesError::Io {
             path: self.path.clone(),
@@ -440,27 +486,38 @@ impl Choices {
         })?;
         text.push('\n');
 
-        let mut temporary = self.path.clone().into_os_string();
-        temporary.push(format!(".{}.new", std::process::id()));
-        let temporary = PathBuf::from(temporary);
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let written = (|| {
+        for counter in 0..8 {
             use std::io::Write;
-            let mut file = options.open(&temporary)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, &self.path)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temporary);
+            let mut temporary = self.path.as_os_str().to_owned();
+            temporary.push(format!(".{}.{counter}.new", std::process::id()));
+            let temporary = PathBuf::from(temporary);
+            let mut file = match options.open(&temporary) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(io(e)),
+            };
+            let written = (|| {
+                file.write_all(text.as_bytes())?;
+                file.sync_all()?;
+                drop(file);
+                std::fs::rename(&temporary, &self.path)
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&temporary);
+            }
+            return written.map_err(io);
         }
-        written.map_err(io)
+        Err(io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "all temporary choices file names are in use",
+        )))
     }
 }
 
@@ -652,14 +709,72 @@ mod tests {
         assert_eq!(leftovers, 1);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn the_folder_follows_the_variable() {
-        // Only reads the variable; another test may run at the same time,
-        // so this one does not change it.
-        if let Some(dir) = std::env::var_os(DIR_VARIABLE).filter(|d| !d.is_empty()) {
-            assert_eq!(choices_dir(), PathBuf::from(dir));
+    fn an_acl_on_the_choices_file_or_folder_is_refused() {
+        for folder in [false, true] {
+            let dir = TempDir::new("acl");
+            set_mode(&dir.0, 0o700);
+            dir.write_by_hand(r#"{"version":1}"#);
+            let file = dir.file();
+            let item = if folder {
+                file.parent().unwrap()
+            } else {
+                &file
+            };
+            if !crate::find::tests::give_acl(item, folder) {
+                eprintln!("cannot set an ACL here; skipping the choices ACL test");
+                return;
+            }
+            set_mode(item, if folder { 0o700 } else { 0o600 });
+
+            let link = dir.0.join("link");
+            std::os::unix::fs::symlink(item, &link).unwrap();
+            let linked_file = if folder { link.join(FILE_NAME) } else { link };
+            for path in [file, linked_file] {
+                assert!(matches!(
+                    Choices::load(&path),
+                    Err(ChoicesError::Untrusted { why, .. }) if why.contains("access control list")
+                ));
+            }
         }
-        assert!(choices_path().ends_with("choices.json"));
+    }
+
+    #[test]
+    fn saving_skips_existing_temporary_files() {
+        let dir = TempDir::new("collision");
+        dir.write_by_hand(r#"{"version":1}"#);
+        let choices = Choices::load(&dir.file()).unwrap();
+        let pid = std::process::id();
+        let folder = choices.path().parent().unwrap();
+        let existing = [
+            folder.join(format!("{FILE_NAME}.{pid}.new")),
+            folder.join(format!("{FILE_NAME}.{pid}.0.new")),
+        ];
+        for path in &existing {
+            std::fs::write(path, "keep").unwrap();
+        }
+        choices.save().unwrap();
+        for path in existing {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+        }
+        assert!(Choices::load(choices.path()).unwrap().all().is_empty());
+        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn a_failed_rename_removes_the_temporary_file() {
+        let dir = TempDir::new("rename");
+        let choices = Choices::load(&dir.file()).unwrap();
+        std::fs::create_dir_all(choices.path()).unwrap();
+        assert!(matches!(choices.save(), Err(ChoicesError::Io { .. })));
+        assert!(choices.path().is_dir());
+        assert_eq!(
+            std::fs::read_dir(choices.path().parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]
