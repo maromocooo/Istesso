@@ -294,13 +294,18 @@ fn read_hosts(hosts: &HostsArg) -> Result<Vec<Candidate>, Fail> {
     read_table(&text).map_err(|e| fail(exit::UNREADABLE, e.to_string()))
 }
 
+fn load_choices() -> Result<Choices, Fail> {
+    choices_path()
+        .and_then(|path| Choices::load(&path))
+        .map_err(|e| fail(exit::UNREADABLE, e.to_string()))
+}
+
 /// The remembered choice for the task, for kinds that stop and list.
 fn remembered(project: &Project, task: &Task) -> Result<Option<Remembered>, Fail> {
     if when_several_match(task.kind) != SeveralMatch::StopAndList {
         return Ok(None);
     }
-    let choices =
-        Choices::load(&choices_path()).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
+    let choices = load_choices()?;
     Ok(choices.get(&project.key(), &task.name))
 }
 
@@ -466,8 +471,7 @@ fn choose(name: &str, machine: &str, hosts: &HostsArg) -> Result<i32, Fail> {
             ),
         ));
     }
-    let path = choices_path();
-    let mut choices = Choices::load(&path).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
+    let mut choices = load_choices()?;
     let place = Place::of(candidate);
     let key = project.key();
     choices.set(&key, name, &place, now_unix());
@@ -484,7 +488,10 @@ fn choose(name: &str, machine: &str, hosts: &HostsArg) -> Result<i32, Fail> {
             place.name
         ));
     }
-    print_line(&format!("  remembered for {key} in {}", path.display()));
+    print_line(&format!(
+        "  remembered for {key} in {}",
+        choices.path().display()
+    ));
     print_line(&format!("  `istesso-route forget {name}` drops it"));
     Ok(exit::OK)
 }
@@ -525,8 +532,7 @@ fn pick_machine<'a>(table: &'a [Candidate], machine: &str) -> Result<&'a Candida
 
 fn forget(name: &str) -> Result<i32, Fail> {
     let project = project()?;
-    let path = choices_path();
-    let mut choices = Choices::load(&path).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
+    let mut choices = load_choices()?;
     if choices.forget(&project.key(), name) {
         choices
             .save()
@@ -541,8 +547,8 @@ fn forget(name: &str) -> Result<i32, Fail> {
 }
 
 fn list_choices() -> Result<i32, Fail> {
-    let path = choices_path();
-    let choices = Choices::load(&path).map_err(|e| fail(exit::UNREADABLE, e.to_string()))?;
+    let choices = load_choices()?;
+    let path = choices.path();
     let all = choices.all();
     if all.is_empty() {
         print_line(&format!(

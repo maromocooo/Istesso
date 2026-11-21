@@ -473,7 +473,7 @@ pub(crate) fn check_program_with(
 /// entry after the file's line; elsewhere `ls -ld` marks a file that has an
 /// ACL with `+` right after the mode. Anything unexpected is a refusal.
 #[cfg(unix)]
-fn check_no_acl(path: &Path) -> Result<(), FindError> {
+pub(crate) fn check_no_acl(path: &Path) -> Result<(), FindError> {
     if path.as_os_str().as_encoded_bytes().contains(&b'\n') {
         return Err(unreadable(path, "the path holds a line break"));
     }
@@ -540,7 +540,7 @@ pub(crate) fn effective_uid() -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const TEXT: &str = r#"{"version": 1, "tasks": {}}"#;
@@ -845,7 +845,7 @@ mod tests {
     /// Gives `path` an ACL that lets everyone write, with the system's tool.
     /// False when the tool is not there (Linux without `setfacl`).
     #[cfg(unix)]
-    fn give_acl(path: &Path, folder: bool) -> bool {
+    pub(crate) fn give_acl(path: &Path, folder: bool) -> bool {
         let status = if cfg!(target_os = "macos") {
             let entry = if folder {
                 "everyone allow add_file"

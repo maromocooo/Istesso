@@ -305,18 +305,55 @@ fn unreadable_inputs_end_with_73() {
     // A broken choices file is used for nothing and left as it is.
     std::fs::write(project.root().join(".istesso/tasks.json"), TASKS).unwrap();
     std::fs::create_dir_all(project.settings()).unwrap();
-    std::fs::write(project.settings().join("choices.json"), "{ broken").unwrap();
+    set_mode(&project.settings(), 0o700);
+    let file = project.settings().join("choices.json");
+    std::fs::write(&file, "{ broken").unwrap();
+    set_mode(&file, 0o600);
     let run = project.with_hosts("hosts-three.json", &["where", "deploy", "site"]);
     assert_eq!(run.code, exit::UNREADABLE);
+    assert!(run.stderr.contains("cannot be read"));
     let run = project.with_hosts("hosts-three.json", &["choose", "site", "tower"]);
     assert_eq!(run.code, exit::UNREADABLE);
-    assert_eq!(
-        std::fs::read_to_string(project.settings().join("choices.json")).unwrap(),
-        "{ broken"
-    );
+    assert!(run.stderr.contains("cannot be read"));
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "{ broken");
     // Build tasks do not read the choices.
     let run = project.with_hosts("hosts-three.json", &["where", "build", "test"]);
     assert_eq!(run.code, exit::OK);
+}
+
+#[test]
+fn choices_require_an_absolute_home_when_the_location_depends_on_it() {
+    let project = Project::new("choices-home");
+    for home in [None, Some(""), Some("relative")] {
+        let mut command = project.command(&["choices"]);
+        command.env_remove("ISTESSO_ROUTE_DIR").env_remove("HOME");
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let run = Run::of(command.output().unwrap());
+        assert_eq!(run.code, exit::UNREADABLE);
+        assert!(run.stderr.contains("HOME") && run.stderr.contains("absolute"));
+    }
+
+    let mut command = project.command(&["choices"]);
+    command.env_remove("HOME");
+    let run = Run::of(command.output().unwrap());
+    assert_eq!(run.code, exit::OK);
+    let expected = project.settings().join("choices.json");
+    assert!(run.stdout.contains(expected.to_string_lossy().as_ref()));
+    #[cfg(not(target_os = "macos"))]
+    {
+        command
+            .env_remove("ISTESSO_ROUTE_DIR")
+            .env("XDG_CONFIG_HOME", project.settings());
+        let run = Run::of(command.output().unwrap());
+        assert_eq!(run.code, exit::OK);
+        let expected = project
+            .settings()
+            .join("istesso-route")
+            .join("choices.json");
+        assert!(run.stdout.contains(expected.to_string_lossy().as_ref()));
+    }
 }
 
 #[test]
