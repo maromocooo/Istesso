@@ -10,6 +10,7 @@ M5 は、統合ストレージ（R-06）、隔離（R-07）、インストール
 
 - [ADR 0013](adr/0013-unified-storage.md)：統合ストレージは、一覧と合算から作る。中身は、人が名指ししたコピーから始める。
 - [ADR 0014](adr/0014-dedicated-user-in-practice.md)：ホストの役は、丸ごと専用ユーザーで動かす。
+- [ADR 0021](adr/0021-isolation-and-settings.md)（2026-11-19 に足した。提案）：隔離と、机と同じ設定（R-04）を両立させる。土台の脅威モデルは [m5-threat-model.md](m5-threat-model.md)。
 
 土台は [ADR 0003](adr/0003-isolation.md)（隔離は専用ユーザーで行う）です。規約は先に [AGENTS.md](../AGENTS.md) を読んでください。
 
