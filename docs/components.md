@@ -13,6 +13,7 @@
 | webrtc-rs、str0m | 通信層の候補 | MIT OR Apache-2.0 | <https://github.com/webrtc-rs/webrtc>、<https://github.com/algesten/str0m> |
 | jiegec/usbip | USB/IP の出す側（Mac → Linux の共有にも対応）。今回の公開では、付け替えを作らないので、使わない。使うときは、`rusb` クレートを通じて libusb（LGPL-2.1）を呼ぶ。libusb を動的リンクにして、「条件つきで使える」に書く | MIT（クレート）。libusb は LGPL-2.1 | <https://github.com/jiegec/usbip> |
 | usbip-win2 | Windows が受け側になる場合の USB/IP クライアント | BSD-2-Clause（0.9.7.0 以降） | <https://github.com/vadimgrn/usbip-win2> |
+| herdr（実装の参考。本体は別のプログラムとして動かす） | 開発の機械の端末の会（エージェントのペイン）。ほかの機械の会を並べる口（ADR 0007 の検討） | Apache-2.0（0.8.0 以降）。0.8.0 より前は AGPL-3.0-or-later なので、読まない、写さない | <https://github.com/herdrdev/herdr>（2026-11-21 に v0.9.5 の `LICENSE` と `Cargo.toml` で確かめた） |
 | python-elgato-streamdeck（実装の参考。Elgato が公開している HID の仕様 <https://docs.elgato.com/streamdeck/hid/> を第一の情報源にし、足りないところだけ見る） | Stream Deck の直接制御 | HPND の系統の文面。プロジェクトは「MIT」と名乗っているが、LICENSE の本文は MIT ではない。SPDX の文面では HPND-sell-variant がいちばん近い（2026-11-16 に確認）。条件は、著作権表示と許諾の文を残すことと、作者の名前を宣伝に使わないこと。コピーレフトではない | <https://github.com/abcminiuser/python-elgato-streamdeck> |
 | hidapi（Rust のクレート）と、その中の HIDAPI（C のライブラリ） | 機器のフレームワークが、HID の機器と話す（`istesso-devices` の機能 `hid`）。macOS では、クレートに入っている HIDAPI の `mac/hid.c` をコンパイルして使う。Linux では、機能 `linux-native-basic-udev` だけを有効にして、Rust だけの実装を使う。C のコードも、システムの libudev も、libusb も使わない | クレートは MIT。HIDAPI（同梱の版は 0.15.0）は、GPL-3.0、BSD 形式、もとの HIDAPI ライセンスの 3 つから、使う側が選べる。**BSD 形式で使う（2026-11-17 に決定）。** HIDAPI の C のコードが入るのは、macOS 向けのビルドだけ。Linux 向けには入らない。文面は [third-party-licenses/HIDAPI-LICENSE-bsd.txt](../third-party-licenses/HIDAPI-LICENSE-bsd.txt) に置いた（クレートの `etc/hidapi/LICENSE-bsd.txt` と同じもの）。配布するものに、この文面を一緒に入れる。`deny.toml` にも、この選び方を書いてある。既定の機能（libudev を使う実装）と、libusb を使う機能（LGPL のライブラリが入る）は、有効にしない | <https://github.com/ruabmbua/hidapi-rs>、<https://github.com/libusb/hidapi> |
 | basic-udev、nix | hidapi が、Linux で機器を探して開くために使う | MIT OR Apache-2.0、MIT | <https://crates.io> |
@@ -36,6 +37,25 @@ Wolf は、アプリを Docker コンテナで起動する部分を使いませ�
 | FFmpeg | 予備のコーデック経路 | LGPL（既定の構成） | `--enable-gpl` と `--enable-nonfree` を付けない。x264 / x265 を使わない。動的リンク |
 | Roc Toolkit | 音の配信（時計のずれ補正、欠落の補完） | MPL-2.0 | ライブラリとして使う。Roc 自体を変更した場合はその変更を公開する。`deny.toml` に個別登録 |
 | NVENC | NVIDIA のエンコーダー | ヘッダーは MIT、本体はドライバー | SDK 本体をリポジトリに入れない |
+| Zig 0.16.0（道具） | herdr の試しの版（v0.9.5 にブリッジのコマンドを足したもの）を作るときだけ。herdr が含む libghostty-vt（MIT）を組み立てる | MIT（Expat）。配布物の `lib/` には、LLVM の libc++ など（Apache-2.0 WITH LLVM-exception）、musl（MIT）、wasi-libc、FreeBSD の libc（BSD）、mingw-w64（ZPL-2.1 ほか）、glibc（LGPL）が入る | 機械の全体には入れない（流れのフォルダーの中だけ。キャッシュも）。Istesso のコードには入れない。作ったものは手元の試しだけで、配らない。2026-11-21 に、0.16.0 の配布物（aarch64-macos。sha256 は ziglang.org の `index.json` と一致）の LICENSE で確かめた |
+
+### herdr の試しの版を作るときに取ってきた部品（2026-11-21）
+
+Zig で herdr（v0.9.5 にブリッジのコマンドを足した手元の版）を作ったとき、herdr が同梱する libghostty-vt の依存の一覧（`build.zig.zon`）にある部品を、Zig が取ってきた。どれも、場所と中身の値（ハッシュ）が一覧に書かれている。置き場所は外付けの SSD の流れのフォルダーの中だけ。ライセンスは、取ってきたものの中のファイルを読んで確かめた（2026-11-21）。
+
+| 部品 | 取ってきた場所 | ライセンス |
+|---|---|---|
+| aro | github.com/vancluever/arocc | MIT。Unicode のデータは Unicode License v3 |
+| translate-c | codeberg.org/vancluever/translate-c | MIT（Expat、Zig contributors） |
+| highway | deps.files.ghostty.org | Apache-2.0 または BSD-3-Clause |
+| uucode | deps.files.ghostty.org | MIT |
+| wuffs | deps.files.ghostty.org | MIT または Apache-2.0 |
+| zlib | deps.files.ghostty.org | zlib。ただし、同じ包みの `contrib/ada/zlib.ads`（Ada の結び付け）は GPL-2.0 以降（リンクの例外つき）。作るときに使うのは zlib の本体の 15 の `.c` だけで、`contrib/` は使わない（`pkg/zlib/build.zig` で確かめた） |
+| pixels | deps.files.ghostty.org | CC0-1.0 |
+| ghostty-themes（色の組み合わせ 607 個） | deps.files.ghostty.org | 包みの中にライセンスのファイルがない（未確認） |
+
+- GPL・AGPL のコードは、作ったものに入っていない（上の zlib の 1 ファイルは、包みにあるだけで、組み立てに使わない）。
+- **作ったものは、手元の試しだけに使う。配らない、押さない。** 部品も、Istesso のリポジトリには入れない。
 
 ## OS の機能（呼び出すだけ）
 
