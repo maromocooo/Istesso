@@ -1,0 +1,15 @@
+Package: istesso
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: maromocooo <3402352+maromocooo@users.noreply.github.com>
+Section: net
+Priority: optional
+Installed-Size: @SIZE@
+Depends: @DEPENDS@
+Recommends: pipewire, systemd
+Description: Show an application of another PC in a window of this one
+ Istesso lets a PC show, with low latency, the window of an application
+ that runs on another PC. This package contains the command line tool and
+ the agent that answers paired devices.
+ .
+ Licence: MIT OR Apache-2.0.
