@@ -914,6 +914,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "istesso-client"
+version = "0.0.1"
+dependencies = [
+ "istesso-agent",
+ "istesso-link",
+ "istesso-media",
+ "istesso-pair",
+ "istesso-proto",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "istesso-device-adapters"
 version = "0.0.1"
 dependencies = [
