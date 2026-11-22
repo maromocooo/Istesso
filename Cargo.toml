@@ -57,9 +57,34 @@ hidapi = { version = "2.6", default-features = false, features = ["linux-native-
 # Only in tests of the device framework. Already in the tree through serde and clap.
 proc-macro2 = "1"
 
+# Audio (istesso-audio), kept as one block at the end of this table.
+istesso-audio = { path = "crates/istesso-audio" }
+# A resampler whose ratio can be moved while it runs. Only the sinc resampler is used, so the FFT
+# one and its dependencies stay out.
+rubato = { version = "4.0", default-features = false }
+audioadapter-buffers = "4.0"
+# Hands samples to and from the threads of the sound system without waiting.
+rtrb = "0.4"
+# Core Audio (macOS only): the output unit, and the clock its time stamps are in.
+coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_unit", "core_audio"] }
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "HostTime", "AudioHardware"] }
+# PipeWire (Linux only, and only with the `pipewire` feature of istesso-audio): the capture.
+# libc for the clock PipeWire stamps its cycles with.
+# v0_3_49: a stream is told how many frames to produce.
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 strip = true
+
+# The audio path does arithmetic on every sample. Unoptimised, the resampler cannot keep up with a
+# sound card, and the simulated-clock tests of the drift correction take minutes, not seconds.
+[profile.dev.package.istesso-audio]
+opt-level = 2
+
+[profile.dev.package.rubato]
+opt-level = 3
 
 # Tests seal megabytes of frames. Unoptimised, the cipher alone keeps a processor busy for tens of
 # milliseconds a frame, and tests that run side by side then take the processors from each

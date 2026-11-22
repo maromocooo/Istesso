@@ -48,7 +48,7 @@
 | `scripts/m1-step3-host.py`、`scripts/m1-step3-breakdown.py`、`scripts/m1-channel-check.py`（Python） | 手順 3 の送信側と、内訳の集計。フレームごとの時刻を記録し、入力から表示までをどこで使っているかを出す。送信側は、暗号化していない UDP のほかに、`istesso-media` の暗号化した経路へも出せる（`--to-channel`）。`m1-channel-check.py` は、画面の計測なしで、フレームの数と、1 台の時計で閉じる区間を出す | 計測のためだけのもの。手順 4 の自前の実装では、同じ時刻を中から記録する |
 | `scripts/m1-quality.py`、`scripts/m1_encoder.py`（Python） | 画質の計測。送信側と同じ設定のエンコーダーに、テストアプリの絵を通して比べる | 計測のためだけのもの |
 | `istesso-media` | 映像を、ペアリング済みで「閲覧」の権限を持つ端末へ、制御チャンネルと同じ通信路で運ぶ（[ADR 0015](adr/0015-media-transport.md)）。送る側と受ける側、フレームの並び、流しているあいだの権限の確かめ直し、キーフレームの求め。C から呼ぶ口（`crates/istesso-media/include/istesso_media.h`）があり、共有ライブラリーと静的ライブラリーにもなる。圧縮と復号は、ここではしない | 実装済み（ADR 0015 は提案）。いまの使い手は、計測の道具（ホストのパイプラインと、Mac のビューアー）。封と開封にかかる時間は `cargo run --release -p istesso-media --example seal-bench` で測る |
-| `istesso-audio` | 音の出口と配信 | 未着手 |
+| `istesso-audio` | 音の配信：パケット、認証つきの接続、待ち行列、時計のずれ補正、ホストの取り込み（PipeWire）、Mac の再生、つなぎ直し、その Mac だけで鳴らす基準のプレーヤー、1 時間ごと・1 日ごとの記録（[m2-plan.md](m2-plan.md)） | 2 台で動く。音を聞こえるようにする切り替えは、まだ使っていない。出口の選択、常駐、新しい既定の機器に付いていくことは未着手 |
 | `istesso-media-*` | OS ごとの取り込み・圧縮・入力 | 未着手 |
 | `istesso-device-api` | 機器のアダプターに渡す口（[ADR 0012](adr/0012-device-framework.md)）。アダプターは、これにしか依存しない。依存クレートを持たない | 実装済み。口は固めていない（版 0） |
 | `istesso-device-adapters` | 機器ごとのアダプター。1 つのディレクトリが 1 つのアダプターで、ビルドのときに集める。標準ライブラリを持たず、`istesso-device-api` にしか依存しないので、アダプターは、それ以外のものを名指しできない | Stream Deck + のアダプターが入っている。macOS では、作者が実機で確かめた（2026-11-17）。Linux では、まだ確かめていない |
