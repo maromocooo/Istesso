@@ -22,8 +22,8 @@ pub use passing::PassLog;
 pub use paths::Paths;
 pub use serve::{Agent, AgentOptions};
 pub use survey::{
-    connect_peer, connect_peer_at, connect_peer_or_say_why, survey, ConnectFailure, HostView,
-    SurveyOptions,
+    connect_peer, connect_peer_and_say_where, connect_peer_at, connect_peer_or_say_why,
+    connect_peer_within, survey, ConnectFailure, HostView, Reaching, SurveyOptions,
 };
 
 #[cfg(test)]
@@ -116,11 +116,22 @@ pub(crate) mod testing {
         pub addr: std::net::SocketAddr,
         /// What a program that shows an application would be handed.
         pub taken: std::os::unix::net::UnixDatagram,
+        /// The agent's count of connections that have shown who they are
+        /// and not asked for anything yet.
+        pub waiting: istesso_link::Waiting,
+        /// What the agent told the person who runs it.
+        pub said: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[cfg(unix)]
     impl InputPair {
         pub fn new(tag: &str) -> Self {
+            Self::giving_a_request(tag, istesso_link::waiting::REQUEST_WITHIN)
+        }
+
+        /// The same, with an agent that gives a connection `within` this
+        /// time for its first request.
+        pub fn giving_a_request(tag: &str, within: std::time::Duration) -> Self {
             use istesso_pair::{Hello, Identity, Peer, PeerStore};
             let (host, device) = (TempDir::new(tag), TempDir::new(tag));
             let identities = [&host, &device]
@@ -150,15 +161,83 @@ pub(crate) mod testing {
                 input_socket: Some(socket),
                 ..crate::AgentOptions::default()
             };
-            let agent =
-                crate::Agent::bind(host.paths(), &options, std::sync::Arc::new(|_| {})).unwrap();
-            let addr = agent.local_addr().unwrap();
+            let said = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = {
+                let said = said.clone();
+                std::sync::Arc::new(move |line: String| said.lock().unwrap().push(line))
+            };
+            let agent = crate::Agent::bind(host.paths(), &options, log).unwrap();
+            agent.set_request_within(within);
+            let (addr, waiting) = (agent.local_addr().unwrap(), agent.waiting());
             std::thread::spawn(move || agent.run());
             InputPair {
                 host,
                 device,
                 addr,
                 taken,
+                waiting,
+                said,
+            }
+        }
+
+        /// Pairs another device with the host, with the rights a newly
+        /// paired device has. Its files are in the directory that comes
+        /// back; it trusts the host as "a host".
+        pub fn another_device(&self, tag: &str, name: &str) -> TempDir {
+            use istesso_pair::{Hello, Identity, Peer, PeerStore};
+            let device = TempDir::new(tag);
+            let identity = Identity::load_or_create(&device.paths().identity()).unwrap();
+            let host = Identity::load_or_create(&self.host.paths().identity()).unwrap();
+            for (dir, name, other) in [(&self.host, name, &identity), (&device, "a host", &host)] {
+                PeerStore::open(dir.paths().peers())
+                    .unwrap()
+                    .add(Peer::from_hello(&Hello {
+                        device_name: name.to_string(),
+                        public_key: other.public_key(),
+                    }))
+                    .unwrap();
+            }
+            device
+        }
+
+        /// A conversation of the device whose files are in `device` with
+        /// the host's agent. It has shown who it is, and asked for nothing.
+        pub fn connect_as(&self, device: &TempDir) -> istesso_link::Result<istesso_link::Client> {
+            let paths = device.paths();
+            let identity = istesso_pair::Identity::load_or_create(&paths.identity()).unwrap();
+            let keys = istesso_link::LocalKeys::new(&identity).unwrap();
+            let peers = istesso_pair::PeerStore::open(paths.peers()).unwrap();
+            let within = std::time::Duration::from_secs(3);
+            istesso_link::Client::connect(self.addr, &keys, &peers, None, within)
+        }
+
+        /// One try of the device at a conversation with whatever listens
+        /// at `addr`, as the relay makes them: with its own keys, and with
+        /// one deadline for connecting and the handshake together.
+        pub fn try_to(
+            &self,
+            addr: std::net::SocketAddr,
+            within: std::time::Duration,
+        ) -> Result<istesso_link::Client, crate::ConnectFailure> {
+            let paths = self.device.paths();
+            let identity = istesso_pair::Identity::load_or_create(&paths.identity()).unwrap();
+            let keys = istesso_link::LocalKeys::new(&identity).unwrap();
+            let peers = istesso_pair::PeerStore::open(paths.peers())
+                .map_err(|e| crate::ConnectFailure::Here(e.to_string()))?;
+            let by = std::time::Instant::now() + within;
+            istesso_link::Client::connect_by(addr, &keys, &peers, None, by, within)
+                .map_err(crate::ConnectFailure::Link)
+        }
+
+        /// Waits until `done`, for a few seconds at most.
+        pub fn until(&self, mut done: impl FnMut() -> bool) {
+            let began = std::time::Instant::now();
+            while !done() {
+                assert!(
+                    began.elapsed() < std::time::Duration::from_secs(5),
+                    "waited too long"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
 
@@ -216,6 +295,9 @@ pub(crate) mod testing {
     struct BetweenState {
         silent_below: std::sync::atomic::AtomicU64,
         made: std::sync::atomic::AtomicU64,
+        /// Nothing answers: connections that come in are taken and carry
+        /// nothing, as when the host is switched off.
+        away: std::sync::atomic::AtomicBool,
         stop: std::sync::atomic::AtomicBool,
     }
 
@@ -229,16 +311,24 @@ pub(crate) mod testing {
             let state = std::sync::Arc::new(BetweenState {
                 silent_below: 0.into(),
                 made: 0.into(),
+                away: false.into(),
                 stop: false.into(),
             });
             let shared = state.clone();
             std::thread::spawn(move || {
+                // Connections that came in while nothing answered: left open, and
+                // silent, until the test is over.
+                let mut unanswered = Vec::new();
                 while !shared.stop.load(Ordering::SeqCst) {
                     let Ok((near, _)) = listener.accept() else {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     };
                     let number = shared.made.fetch_add(1, Ordering::SeqCst);
+                    if shared.away.load(Ordering::SeqCst) {
+                        unanswered.push(near);
+                        continue;
+                    }
                     let Ok(far) = TcpStream::connect(to) else {
                         continue;
                     };
@@ -288,6 +378,16 @@ pub(crate) mod testing {
         pub fn fall_silent(&self) {
             let so_far = self.state.made.load(Ordering::SeqCst);
             self.state.silent_below.store(so_far, Ordering::SeqCst);
+        }
+
+        /// The host is away from now on: the connections there are carry
+        /// nothing, and one that comes in is taken and never answered. Or it
+        /// is back: connections that come in from now on are passed on.
+        pub fn host_is_away(&self, away: bool) {
+            if away {
+                self.fall_silent();
+            }
+            self.state.away.store(away, Ordering::SeqCst);
         }
 
         pub fn connections(&self) -> u64 {

@@ -11,85 +11,119 @@
 //! ([`Error::again`]). A host that says that the stream is over, that the
 //! picture is for another device now, or that this device may not look, is
 //! not asked again.
+//!
+//! Connecting again is done with tries that overlap
+//! ([`istesso_link::again`], ADR 0007): a host that does not answer makes
+//! each try wait its deadline out, and the next try does not wait for
+//! that. A try connects and runs the handshake ([`Viewer::open`]). The
+//! request for the picture goes on the first connection that gets that far,
+//! and on no other: the host closes the connection the device had before,
+//! and asks its encoder for a key frame, only when that request arrives.
+//! The numbers are the same as for input and for sound.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::viewer::{Asker, Event, Viewer};
+use istesso_link::{again, Pace, Racer, Turn};
+
+use crate::viewer::{Asker, Event, Opened, Viewer};
 use crate::wire::StreamInfo;
 use crate::{Again, Error, Result};
 
-/// How long after a failed attempt the next one is made, for as long as
-/// the cut is fresh. The same quarter of a second as for sound.
+/// How soon after it was made a connection has to be cut for the viewer
+/// not to connect again at once ([`Pace::short_lived`]).
+///
+/// (It was also how long after a failed first attempt the next one was
+/// made. That goes by the steps of [`First`] now.)
 pub const RETRY: Duration = Duration::from_millis(250);
-/// The same, once the host has been away for [`SOON_FOR`], and whenever
-/// the host said that it cannot take this device at the moment.
+/// Before there has ever been a connection: how long after a failed
+/// attempt the next one is made, once the viewer has been trying for
+/// [`SOON_FOR`], and whenever the host said that it cannot take this
+/// device at the moment.
 pub const RETRY_SLOWLY: Duration = Duration::from_secs(1);
-/// For how long after a cut the attempts follow each other closely. A host
-/// that is switched off is not knocked at four times a second for hours.
+/// For how long the first attempts follow each other closely.
 pub const SOON_FOR: Duration = Duration::from_secs(10);
 /// What connecting, the handshake and the host's answer may take together,
-/// the first time.
+/// the first time. When connecting again, a try has
+/// [`Pace::try_within`] for connecting and the handshake, and the answer
+/// [`Pace::answer_within`].
 pub const FIRST_WITHIN: Duration = Duration::from_secs(3);
-/// The same, when connecting again.
-pub const AGAIN_WITHIN: Duration = Duration::from_secs(1);
 
-/// When to connect again.
+/// When to make the next attempt at a first connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
     At(Instant),
     Never,
 }
 
-/// Decides when a viewer connects again. It holds no connection and reads
-/// no clock of its own.
+/// Decides when a viewer that has not had a connection yet makes its next
+/// attempt at one. These attempts are made one after the other, as they
+/// always were; tries that overlap are for connecting again after a cut.
+/// It holds no connection and reads no clock of its own.
+///
+/// The attempts go by the steps the tries after a cut go by (ADR 0007):
+/// counted from when the first attempt began, one after each of
+/// [`Pace::early`] and then one every [`Pace::quick`]. Right after an
+/// application was built anew, macOS drops the first connections it makes
+/// for a moment (about 13 ms at worst, as far as was seen): the attempt at
+/// the second early step is past that. This is for attempts that fail at
+/// once. One that hangs takes [`FIRST_WITHIN`], every step has passed by
+/// then, and the next attempt simply follows it at once: with one attempt
+/// at a time the steps mean nothing there.
 #[derive(Debug, Default)]
-pub struct Pace {
-    /// Since when there has been no connection.
+pub struct First {
+    /// Since when attempts have been failing.
     without_since: Option<Instant>,
-    /// When the last connection was made.
-    connected_at: Option<Instant>,
+    /// When the first attempt began: the steps are counted from here.
+    first_began: Option<Instant>,
 }
 
-impl Pace {
-    /// A connection has been made.
-    pub fn connected(&mut self, now: Instant) {
-        self.without_since = None;
-        self.connected_at = Some(now);
-    }
-
-    /// A connection has ended, or could not be made, at `now`; `what` is
+impl First {
+    /// The attempt that began at `began` has failed at `now`; `what` is
     /// what its error asks for.
-    pub fn after(&mut self, what: Again, now: Instant) -> Next {
+    pub fn after(&mut self, what: Again, began: Instant, now: Instant) -> Next {
+        let first = *self.first_began.get_or_insert(began);
         match what {
             Again::Never => Next::Never,
             Again::Slowly => {
                 self.without_since.get_or_insert(now);
                 Next::At(now + RETRY_SLOWLY)
             }
-            Again::Soon => match self.without_since {
-                // Cut just now: at once. Unless the connection had only just been
-                // made: a host that takes a device and lets go of it straight away
-                // is not asked again faster than any other.
-                None => {
-                    self.without_since = Some(now);
-                    let short_lived = self
-                        .connected_at
-                        .is_some_and(|at| now.saturating_duration_since(at) < RETRY);
-                    Next::At(if short_lived { now + RETRY } else { now })
+            Again::Soon => {
+                let since = *self.without_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= SOON_FOR {
+                    return Next::At(now + RETRY_SLOWLY);
                 }
-                Some(since) if now.saturating_duration_since(since) < SOON_FOR => {
-                    Next::At(now + RETRY)
-                }
-                Some(_) => Next::At(now + RETRY_SLOWLY),
-            },
+                // The step after the one this attempt began at: now, if its
+                // moment passed while the attempt was under way. One attempt
+                // for every step at most, and never two at once.
+                Next::At(
+                    step_after(began.saturating_duration_since(first))
+                        .map_or(now, |step| (first + step).max(now)),
+                )
+            }
         }
     }
 }
 
-/// Makes a connection to the host: to the device with this id if one is
-/// given, within this time.
-pub type Connect = Box<dyn FnMut(Option<&str>, Duration) -> Result<Viewer> + Send>;
+/// The first of the steps that lies later than `began` after the first
+/// attempt: the early ones, and then one every [`Pace::quick`]. Nothing
+/// where that cannot be said (a pace without a beat).
+fn step_after(began: Duration) -> Option<Duration> {
+    let pace = Pace::default();
+    let beats = began.as_nanos().checked_div(pace.quick.as_nanos())? + 1;
+    let beat = pace.quick.checked_mul(u32::try_from(beats).ok()?)?;
+    let early = pace.early.iter().copied().find(|step| *step > began);
+    Some(early.map_or(beat, |early| early.min(beat)))
+}
+
+/// Opens a connection to the host, to the device with this id if one is
+/// given: connecting and the handshake, within this time, all of it
+/// together ([`Viewer::open`]). The picture is not asked for here. When
+/// the viewer connects again, this is one try, and several run at once,
+/// each on a thread of its own: each makes its own keys and reads the list
+/// of paired devices for itself.
+pub type Open = Arc<dyn Fn(Option<&str>, Duration) -> Result<Opened> + Send + Sync>;
 
 /// What a lasting viewer hands over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,41 +162,56 @@ impl LastingAsker {
 
 /// A viewer that connects again when its connection is cut.
 pub struct Lasting {
-    connect: Connect,
+    open: Open,
+    /// What one try at connecting again does: `open`, to the device this
+    /// viewer began with. There once there has been a connection.
+    again: Option<again::Open<Opened, Error>>,
     viewer: Option<Viewer>,
     /// The device this viewer began with (its id). It is the only one a
     /// later connection is made to: another paired device that answers at
     /// the same address is not the same picture.
     peer: Option<String>,
-    pace: Pace,
-    /// When the next attempt is due. `None`: now.
+    /// The attempts at a first connection, and when the next is due.
+    /// `None`: now.
+    first: First,
     due: Option<Instant>,
+    /// The tries at connecting again, and how often the connection was
+    /// cut.
+    racer: Racer<Opened, Error>,
     /// When the host was last heard on the connection that was cut.
     heard: Option<Instant>,
     ever: bool,
-    cuts: u64,
     /// It is over, and was said to be: nothing is tried again.
     over: bool,
     asker: Arc<Mutex<Option<Asker>>>,
 }
 
 impl Lasting {
-    /// A viewer that connects with `connect` when it is first asked for
+    /// A viewer that connects with `open` when it is first asked for
     /// something. `peer` names the one device it may be shown the picture
     /// by (its id); without it, the device that answers first is the one.
-    pub fn new(connect: Connect, peer: Option<String>) -> Self {
+    pub fn new(open: Open, peer: Option<String>) -> Self {
         Lasting {
-            connect,
+            open,
+            again: None,
             viewer: None,
             peer,
-            pace: Pace::default(),
+            first: First::default(),
             due: None,
+            racer: Racer::new(Pace::default()),
             heard: None,
             ever: false,
-            cuts: 0,
             over: false,
             asker: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The same viewer with other numbers for its tries at connecting
+    /// again. For tests, which cannot wait two seconds for every try that
+    /// gets no answer. To be said before the viewer is used.
+    pub fn paced(mut self, pace: Pace) -> Self {
+        self.racer = Racer::new(pace);
+        self
     }
 
     /// What the host said about its picture on the connection there is.
@@ -176,8 +225,14 @@ impl Lasting {
     }
 
     /// How often the connection was cut and taken up again, or is being.
+    /// One cut is one, however many tries it took to come back.
     pub fn cuts(&self) -> u64 {
-        self.cuts
+        self.racer.tries().cuts()
+    }
+
+    /// How many tries at connecting again were started, over all cuts.
+    pub fn tries(&self) -> u64 {
+        self.racer.tries().started()
     }
 
     /// A handle for asking for a key frame from another thread.
@@ -185,18 +240,31 @@ impl Lasting {
         LastingAsker(self.asker.clone())
     }
 
-    /// Waits for the next thing, for `wait` at most (an attempt to connect
-    /// may take longer: [`FIRST_WITHIN`], [`AGAIN_WITHIN`]). `Ok(None)`
-    /// means that nothing came in that time. An error means that it is
-    /// over and is not tried again: the host said so or refused this
-    /// device. Whatever else ends a connection is answered with
-    /// [`Step::Cut`], and then with a new connection.
+    /// Waits for the next thing, for `wait` at most (the first connection
+    /// may take longer, [`FIRST_WITHIN`], and so may the host's answer when
+    /// connecting again, [`Pace::answer_within`]). `Ok(None)` means that
+    /// nothing came in that time. An error means that it is over and is
+    /// not tried again: the host said so or refused this device. Whatever
+    /// else ends a connection is answered with [`Step::Cut`], and then with
+    /// a new connection.
     pub fn next(&mut self, wait: Duration) -> Result<Option<Step<'_>>> {
         if self.over {
             return Err(Error::Ended);
         }
+        if self.viewer.is_none() {
+            return if self.ever {
+                self.connect_again(wait)
+            } else {
+                self.connect_first(wait)
+            };
+        }
+        // Tries that were dropped when the connection came back end later;
+        // what they bring is closed here.
+        if let Some(again) = &self.again {
+            let _ = self.racer.turn(Duration::ZERO, again, Error::again);
+        }
         let Some(viewer) = self.viewer.as_mut() else {
-            return self.connect_when_due(wait);
+            return Ok(None);
         };
         match viewer.pull_for(wait) {
             Ok(Some(pulled)) => Ok(self
@@ -209,15 +277,26 @@ impl Lasting {
                 let heard = viewer.last_heard();
                 self.viewer = None;
                 *self.asker.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                match self.pace.after(err.again(), Instant::now()) {
-                    Next::Never => {
+                match err.again() {
+                    Again::Never => {
                         self.over = true;
                         Err(err)
                     }
-                    Next::At(due) => {
-                        self.due = Some(due);
+                    Again::Soon => {
+                        // The first try at once, unless the connection had only
+                        // just been made.
+                        self.racer.tries_mut().cut(Instant::now());
                         self.heard = Some(heard);
-                        self.cuts += 1;
+                        Ok(Some(Step::Cut))
+                    }
+                    Again::Slowly => {
+                        // No error of a stream that runs asks for leisure today
+                        // (a host that is full says so in answer to the request,
+                        // and a list of paired devices is read when connecting).
+                        // Should one come to, the pause it asks for is kept, as
+                        // it was before tries overlapped.
+                        self.racer.tries_mut().cut_at_leisure(Instant::now());
+                        self.heard = Some(heard);
                         Ok(Some(Step::Cut))
                     }
                 }
@@ -225,7 +304,10 @@ impl Lasting {
         }
     }
 
-    fn connect_when_due(&mut self, wait: Duration) -> Result<Option<Step<'_>>> {
+    /// The first connection: one attempt after the other, each with the
+    /// request for the picture and its answer in it, as it always was.
+    /// When the next one is made after a failure is for [`First`] to say.
+    fn connect_first(&mut self, wait: Duration) -> Result<Option<Step<'_>>> {
         if let Some(due) = self.due {
             let now = Instant::now();
             if due > now {
@@ -235,30 +317,27 @@ impl Lasting {
                 }
             }
         }
-        let within = if self.ever {
-            AGAIN_WITHIN
-        } else {
-            FIRST_WITHIN
-        };
-        match (self.connect)(self.peer.as_deref(), within) {
+        let began = Instant::now();
+        match (self.open)(self.peer.as_deref(), FIRST_WITHIN).and_then(Opened::watch) {
             Ok(viewer) => {
-                let again = self.ever;
                 self.ever = true;
-                if self.peer.is_none() {
-                    self.peer = Some(viewer.peer().id.clone());
-                }
+                // Later connections go to this device and to no other.
+                let peer = self
+                    .peer
+                    .get_or_insert_with(|| viewer.peer().id.clone())
+                    .clone();
+                let open = self.open.clone();
+                self.again = Some(Arc::new(move |within| open(Some(&peer), within)));
                 *self.asker.lock().unwrap_or_else(|e| e.into_inner()) = Some(viewer.asker());
-                let silent_for = self
-                    .heard
-                    .take()
-                    .map(|heard| heard.elapsed())
-                    .unwrap_or_default();
                 self.viewer = Some(viewer);
-                self.pace.connected(Instant::now());
+                self.racer.tries_mut().made(Instant::now());
                 self.due = None;
-                Ok(Some(Step::Connected { again, silent_for }))
+                Ok(Some(Step::Connected {
+                    again: false,
+                    silent_for: Duration::ZERO,
+                }))
             }
-            Err(err) => match self.pace.after(err.again(), Instant::now()) {
+            Err(err) => match self.first.after(err.again(), began, Instant::now()) {
                 Next::Never => {
                     self.over = true;
                     Err(err)
@@ -270,57 +349,183 @@ impl Lasting {
             },
         }
     }
+
+    /// Connecting again: starts the tries that are due, waits for the
+    /// first whose handshake completes, and asks for the picture on that
+    /// connection.
+    fn connect_again(&mut self, wait: Duration) -> Result<Option<Step<'_>>> {
+        let Some(again) = self.again.clone() else {
+            return Ok(None);
+        };
+        // A connection that the host has closed since its handshake (it holds
+        // only so many of a device that have not asked for the picture yet) is
+        // not one that was opened: it counts as a try that failed.
+        let still_open = |opened: &Opened| !opened.closed_by_host();
+        let turn = self.racer.turn_if(wait, &again, Error::again, still_open);
+        let opened = match turn {
+            Turn::Nothing => return Ok(None),
+            Turn::Stopped(err) => {
+                self.over = true;
+                return Err(err);
+            }
+            Turn::Opened(opened) => opened,
+        };
+        // This is the connection that is used: the request goes on it and on
+        // no other. The host closes the one before, and makes a key frame,
+        // when it arrives.
+        let within = self.racer.tries().pace().answer_within;
+        match opened.watch_within(within) {
+            Ok(viewer) => {
+                *self.asker.lock().unwrap_or_else(|e| e.into_inner()) = Some(viewer.asker());
+                let silent_for = self
+                    .heard
+                    .take()
+                    .map(|heard| heard.elapsed())
+                    .unwrap_or_default();
+                self.viewer = Some(viewer);
+                self.racer.tries_mut().answered(Instant::now());
+                Ok(Some(Step::Connected {
+                    again: true,
+                    silent_for,
+                }))
+            }
+            Err(err) => {
+                // Refused for good, refused for the moment, or not answered: it
+                // is over, or the tries go on. It is still the same cut.
+                let what = err.again();
+                self.racer.tries_mut().unanswered(what, Instant::now());
+                if what == Again::Never {
+                    self.over = true;
+                    return Err(err);
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// (Until the early steps: made again at once, and then four times a
+    /// second.)
     #[test]
-    fn a_cut_is_answered_at_once_and_then_four_times_a_second() {
-        let mut pace = Pace::default();
+    fn a_first_attempt_that_fails_is_made_again_10_ms_and_50_ms_later_and_then_ten_times_a_second()
+    {
+        let mut first = First::default();
         let began = Instant::now();
-        pace.connected(began);
-        let cut = began + Duration::from_secs(60);
-        assert_eq!(pace.after(Again::Soon, cut), Next::At(cut));
-        // The attempt failed: a quarter of a second, each time.
-        assert_eq!(pace.after(Again::Soon, cut), Next::At(cut + RETRY));
-        let later = cut + Duration::from_secs(9);
-        assert_eq!(pace.after(Again::Soon, later), Next::At(later + RETRY));
+        // Each fails in the moment it began.
+        let after =
+            |first: &mut First, at: u64| first.after(Again::Soon, began + ms(at), began + ms(at));
+        assert_eq!(after(&mut first, 0), Next::At(began + ms(10)));
+        assert_eq!(after(&mut first, 10), Next::At(began + ms(50)));
+        // That failed as well: a tenth of a second, each time, counted from
+        // the first.
+        assert_eq!(after(&mut first, 50), Next::At(began + ms(100)));
+        assert_eq!(after(&mut first, 100), Next::At(began + ms(200)));
+        assert_eq!(after(&mut first, 9_000), Next::At(began + ms(9_100)));
+    }
+
+    /// What the steps are for: attempts that fail at once for the first
+    /// 13 ms after a start (the worst that was seen of macOS right after an
+    /// application was built anew) and pass from then on. The attempt at
+    /// 50 ms is the one that connects, and it is the third.
+    #[test]
+    fn a_start_whose_first_13_ms_fail_is_connected_by_the_attempt_at_50_ms() {
+        // The attempts of a start whose attempts fail, a millisecond after
+        // they began, for this long, and for a second at most: when each
+        // began, and whether the last of them passed.
+        let attempts = |fails_for: Duration| {
+            let mut first = First::default();
+            let base = Instant::now();
+            let (mut at, mut began) = (Duration::ZERO, Vec::new());
+            while at < Duration::from_secs(1) {
+                began.push(at.as_millis());
+                if at >= fails_for {
+                    return (began, true);
+                }
+                let failed = base + at + ms(1);
+                let Next::At(due) = first.after(Again::Soon, base + at, failed) else {
+                    panic!("given up");
+                };
+                assert!(due >= failed, "an attempt before the last has ended");
+                at = due - base;
+            }
+            (began, false)
+        };
+        assert_eq!(attempts(ms(13)), (vec![0, 10, 50], true));
+        // The usual moment (about 2 ms): the attempt at 10 ms.
+        assert_eq!(attempts(ms(2)), (vec![0, 10], true));
+        // Just after an early step: the next one, and after the second, the
+        // tenth of a second.
+        assert_eq!(attempts(ms(11)), (vec![0, 10, 50], true));
+        assert_eq!(attempts(ms(51)), (vec![0, 10, 50, 100], true));
+        // Failing on: twelve attempts in the first second.
+        let (began, passed) = attempts(Duration::from_secs(5));
+        assert!(!passed);
+        assert_eq!(began[..5], [0, 10, 50, 100, 200]);
+        assert_eq!(began.len(), 12);
+    }
+
+    /// One attempt at a time: an attempt that hangs until its time is up
+    /// is followed at once, and the steps mean nothing. An attempt that
+    /// takes a while is followed at the next step that has not passed.
+    #[test]
+    fn an_attempt_that_took_long_is_followed_at_once_and_never_by_two() {
+        let mut first = First::default();
+        let began = Instant::now();
+        let failed = began + FIRST_WITHIN;
+        assert_eq!(first.after(Again::Soon, began, failed), Next::At(failed));
+        let failed_again = failed + FIRST_WITHIN;
+        assert_eq!(
+            first.after(Again::Soon, failed, failed_again),
+            Next::At(failed_again)
+        );
+
+        // Thirty milliseconds each: at once for the step at 10 ms, at once
+        // for the one at 50 ms, and then the one at 100 ms is waited for.
+        let mut first = First::default();
+        let at = |n: u64| began + ms(n);
+        assert_eq!(first.after(Again::Soon, at(0), at(30)), Next::At(at(30)));
+        assert_eq!(first.after(Again::Soon, at(30), at(60)), Next::At(at(60)));
+        assert_eq!(first.after(Again::Soon, at(60), at(90)), Next::At(at(100)));
     }
 
     #[test]
-    fn a_host_that_stays_away_is_asked_once_a_second() {
-        let mut pace = Pace::default();
-        let cut = Instant::now();
-        assert_eq!(pace.after(Again::Soon, cut), Next::At(cut));
-        let later = cut + SOON_FOR;
+    fn a_host_that_was_never_there_is_asked_once_a_second() {
+        let mut first = First::default();
+        let began = Instant::now();
         assert_eq!(
-            pace.after(Again::Soon, later),
+            first.after(Again::Soon, began, began),
+            Next::At(began + ms(10))
+        );
+        let later = began + SOON_FOR;
+        assert_eq!(
+            first.after(Again::Soon, later, later),
             Next::At(later + RETRY_SLOWLY)
         );
-        // A connection, and the next cut is answered at once again.
-        let back = later + Duration::from_secs(5);
-        pace.connected(back);
-        let cut = back + Duration::from_secs(5);
-        assert_eq!(pace.after(Again::Soon, cut), Next::At(cut));
-    }
-
-    #[test]
-    fn a_connection_that_does_not_last_is_not_made_again_at_once() {
-        let mut pace = Pace::default();
-        let made = Instant::now();
-        pace.connected(made);
-        let cut = made + Duration::from_millis(20);
-        assert_eq!(pace.after(Again::Soon, cut), Next::At(cut + RETRY));
     }
 
     #[test]
     fn a_host_that_is_full_is_asked_at_leisure_and_one_that_refuses_never() {
-        let mut pace = Pace::default();
+        let mut first = First::default();
         let now = Instant::now();
-        assert_eq!(pace.after(Again::Slowly, now), Next::At(now + RETRY_SLOWLY));
-        assert_eq!(pace.after(Again::Never, now), Next::Never);
+        assert_eq!(
+            first.after(Again::Slowly, now, now),
+            Next::At(now + RETRY_SLOWLY)
+        );
+        assert_eq!(first.after(Again::Never, now, now), Next::Never);
+    }
+
+    #[test]
+    fn a_connection_that_does_not_last_is_not_made_again_at_once() {
+        // The quarter of a second of this module is the one the tries go by.
+        assert_eq!(Pace::default().short_lived, RETRY);
     }
 
     #[test]

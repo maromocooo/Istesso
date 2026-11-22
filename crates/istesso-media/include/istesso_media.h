@@ -234,10 +234,13 @@ void istesso_media_client_close(IstessoMediaClient *client);
 
 /*
  * A connection can end while both ends are alive (a network may stop delivering on it without
- * a word). This viewer then connects again by itself: at once, then four times a second, and
- * once a second when the host has been away for ten seconds. It does so only when nobody said
- * why the connection ended. When the host said that the stream is over, that the picture is
- * for another device or put aside, or refused this device, it is over, and stays so.
+ * a word). This viewer then connects again by itself: at once, and then with a new try every
+ * half second without waiting for the tries before (every tenth of a second during the first
+ * five seconds, while the tries fail at once), each try with two seconds for connecting and
+ * the handshake. The picture is asked for on the first connection that gets that far; the
+ * other tries are closed. It does so only when nobody said why the connection ended. When the
+ * host said that the stream is over, that the picture is for another device or put aside, or
+ * refused this device, it is over, and stays so.
  *
  * `addr` and `peer` as for istesso_media_client_connect(). Nothing is connected here: the
  * first call of istesso_media_watch_next() does that. Later connections are made only to the
@@ -247,8 +250,9 @@ IstessoMediaWatch *istesso_media_watch_open(const char *config_dir, const char *
                                             const char *peer);
 
 /*
- * Waits for the next thing, for `wait_ms` at most (an attempt to connect may take longer:
- * three seconds the first time, one second after a cut).
+ * Waits for the next thing, for `wait_ms` at most (longer when a connection is being made:
+ * three seconds for the first one, and after a cut one second for the host's answer on the
+ * connection that is used; the tries themselves are not waited for).
  *    1: `frame` is filled in.
  *    2: the host has said what the cursor is; fetch it with istesso_media_watch_cursor().
  *    0: nothing came in that time.

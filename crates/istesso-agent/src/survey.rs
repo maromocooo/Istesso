@@ -5,8 +5,9 @@
 //! timeout instead of several. A device that does not answer is still listed,
 //! with what it reported when it was last seen.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use istesso_link::{Client, LocalKeys, DEFAULT_PORT};
@@ -199,7 +200,181 @@ pub fn connect_peer_or_say_why(
     address: Option<&str>,
     timeout: Duration,
 ) -> Result<Client, ConnectFailure> {
+    connect_peer_and_say_where(paths, who, address, timeout).map(|(client, _)| client)
+}
+
+/// As [`connect_peer_or_say_why`], and says at which of the device's
+/// addresses the conversation was opened: where [`Reaching`] goes first
+/// when the conversation is cut.
+pub fn connect_peer_and_say_where(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    timeout: Duration,
+) -> Result<(Client, String), ConnectFailure> {
+    let known = known(paths, who, address, true)?;
+    let waits = Waits::Each(timeout);
+    connect_any(
+        known.addresses,
+        known.keys,
+        known.peers,
+        &known.peer.id,
+        waits,
+    )
+    .map_err(ConnectFailure::Link)
+}
+
+/// As [`connect_peer_or_say_why`], for one try at opening a conversation
+/// again (ADR 0007), at an address that is given or at the one the device
+/// is remembered at first: looking a name up, connecting and the handshake
+/// have `within` this time, all of it together, and the try is over when
+/// that time is. A device that is remembered at several addresses is
+/// reached with [`Reaching`].
+pub fn connect_peer_within(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    within: Duration,
+) -> Result<Client, ConnectFailure> {
+    Reaching::new(paths.clone(), who, address, None).open(within)
+}
+
+/// How long opening a conversation may take.
+#[derive(Debug, Clone, Copy)]
+enum Waits {
+    /// Connecting, and each step of the handshake: this long each.
+    Each(Duration),
+    /// Everything together is over by this time. Each wait after that may
+    /// take this long.
+    AllBy(Instant, Duration),
+}
+
+/// How many tries at opening a conversation again go to the address it
+/// last worked at, and to no other, before the device's other addresses
+/// are tried as well.
+pub const TRIES_AT_THE_LAST_ADDRESS: u32 = 8;
+/// From then on, every so many tries one of them also goes to one other
+/// address, each of the others in its turn.
+pub const ANOTHER_ADDRESS_EVERY: u32 = 4;
+
+/// The tries at opening a conversation with one device again (ADR 0007):
+/// what [`crate::relay::Connect`] is made of.
+///
+/// A device may be remembered at several addresses (a cable and a wireless
+/// network, an address it had last week). The first conversation tries all
+/// of them at once. Tries at opening it again are many, one every half
+/// second for as long as the device is away, and the host counts the
+/// connections it is sent, not the tries: so a try is one connection, to
+/// the address the conversation last worked at. Only when
+/// [`TRIES_AT_THE_LAST_ADDRESS`] tries have been made since it last worked
+/// does every [`ANOTHER_ADDRESS_EVERY`]th try make a second connection, to
+/// one of the other addresses in turn: a device that has moved is found,
+/// and the address it was at is still tried every time. A try is never
+/// more than two connections, and of eight tries at most two are.
+pub struct Reaching {
+    paths: Paths,
+    who: String,
+    address: Option<String>,
+    state: Mutex<Reached>,
+}
+
+#[derive(Debug, Default)]
+struct Reached {
+    /// Where the conversation last worked.
+    worked: Option<String>,
+    /// Tries made since then.
+    since: u32,
+    /// Which of the other addresses is next.
+    turn: usize,
+}
+
+impl Reaching {
+    /// Tries for the device named `who`, as for `istesso peers`. With
+    /// `address`, at that address only. `worked` is where the conversation
+    /// was opened ([`connect_peer_and_say_where`]).
+    pub fn new(paths: Paths, who: &str, address: Option<&str>, worked: Option<String>) -> Self {
+        Reaching {
+            paths,
+            who: who.to_string(),
+            address: address.map(str::to_string),
+            state: Mutex::new(Reached {
+                worked,
+                ..Reached::default()
+            }),
+        }
+    }
+
+    /// One try: looking a name up, connecting and the handshake have
+    /// `within` this time, all of it together, and the try is over when
+    /// that time is. Tries run beside each other, so each has to end when
+    /// it said it would. Each makes its own keys and reads the list of
+    /// paired devices for itself. Afterwards a wait for the other device
+    /// may take `within`.
+    pub fn open(&self, within: Duration) -> Result<Client, ConnectFailure> {
+        let waits = Waits::AllBy(Instant::now() + within, within);
+        let known = known(&self.paths, &self.who, self.address.as_deref(), false)?;
+        let targets = self.targets(&known.addresses);
+        let (client, address) =
+            connect_any(targets, known.keys, known.peers, &known.peer.id, waits)
+                .map_err(ConnectFailure::Link)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.worked = Some(address);
+        state.since = 0;
+        Ok(client)
+    }
+
+    /// Where this try goes: one address, or two.
+    fn targets(&self, addresses: &[String]) -> Vec<String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let made = state.since;
+        state.since = state.since.saturating_add(1);
+        // Where it last worked, if the device is still remembered there;
+        // otherwise where it is remembered first.
+        let last = state
+            .worked
+            .clone()
+            .filter(|worked| addresses.contains(worked))
+            .unwrap_or_else(|| addresses[0].clone());
+        let others: Vec<&String> = addresses.iter().filter(|a| **a != last).collect();
+        let mut targets = vec![last.clone()];
+        let another = made >= TRIES_AT_THE_LAST_ADDRESS
+            && (made - TRIES_AT_THE_LAST_ADDRESS) % ANOTHER_ADDRESS_EVERY == 0;
+        if another && !others.is_empty() {
+            targets.push(others[state.turn % others.len()].clone());
+            state.turn = state.turn.wrapping_add(1);
+        }
+        targets
+    }
+}
+
+/// What is needed for a connection to a paired device: this device's keys,
+/// made for this connection, the list of paired devices as it is now, the
+/// device, and where it may be reached.
+struct Known {
+    keys: Arc<LocalKeys>,
+    peers: Arc<PeerStore>,
+    peer: Peer,
+    addresses: Vec<String>,
+}
+
+/// Reads what a connection to `who` needs. With `address`, the device is
+/// reached there and nowhere else; without, at the addresses remembered
+/// for it, the one that worked last first. `create`: a device that has no
+/// identity yet is given one. A try at opening a conversation again never
+/// does that: there was a conversation, so there was an identity, and
+/// several tries that each found none would each make another.
+fn known(
+    paths: &Paths,
+    who: &str,
+    address: Option<&str>,
+    create: bool,
+) -> Result<Known, ConnectFailure> {
     let here = |e: &dyn std::fmt::Display| ConnectFailure::Here(e.to_string());
+    if !create && !paths.identity().exists() {
+        return Err(ConnectFailure::Here(
+            "this device has no identity any more".into(),
+        ));
+    }
     let identity = Identity::load_or_create(&paths.identity()).map_err(|e| here(&e))?;
     let peers = Arc::new(PeerStore::open(paths.peers()).map_err(|e| here(&e))?);
     let keys = Arc::new(LocalKeys::new(&identity).map_err(|e| here(&e))?);
@@ -208,7 +383,7 @@ pub fn connect_peer_or_say_why(
         .map_err(|e| here(&e))?
         .ok_or_else(|| ConnectFailure::Here(format!("no paired device matches {who:?}")))?
         .clone();
-    let candidates = match address {
+    let addresses = match address {
         Some(address) if address.parse::<std::net::IpAddr>().is_ok() => {
             // A bare address: IPv6 goes into brackets where a port follows.
             let host = if address.contains(':') {
@@ -223,14 +398,17 @@ pub fn connect_peer_or_say_why(
             .map(|snapshot| snapshot.addresses)
             .unwrap_or_default(),
     };
-    if candidates.is_empty() {
+    if addresses.is_empty() {
         return Err(ConnectFailure::Here(
             "no address is known for this device yet: run `istesso hosts` once".into(),
         ));
     }
-    connect_any(candidates, keys, peers, &peer.id, timeout)
-        .map(|(client, _)| client)
-        .map_err(ConnectFailure::Link)
+    Ok(Known {
+        keys,
+        peers,
+        peer,
+        addresses,
+    })
 }
 
 /// True when something accepts connections on the agent port of this
@@ -296,11 +474,16 @@ fn query_peer(
         );
     }
 
-    let (mut client, address) =
-        match connect_any(candidates, keys, peers, &peer.id, options.timeout) {
-            Ok(connected) => connected,
-            Err(err) => return unreachable_view(peer, snapshot, err.to_string()),
-        };
+    let (mut client, address) = match connect_any(
+        candidates,
+        keys,
+        peers,
+        &peer.id,
+        Waits::Each(options.timeout),
+    ) {
+        Ok(connected) => connected,
+        Err(err) => return unreachable_view(peer, snapshot, err.to_string()),
+    };
     // The device is there. From here on it gets more time: being slow to
     // answer is not the same as being away.
     let fetched = (|| -> istesso_link::Result<_> {
@@ -365,23 +548,42 @@ fn connect_any(
     keys: Arc<LocalKeys>,
     peers: Arc<PeerStore>,
     expected: &str,
-    timeout: Duration,
+    waits: Waits,
 ) -> istesso_link::Result<(Client, String)> {
     let (sender, receiver) = mpsc::channel();
     for candidate in candidates {
         let sender = sender.clone();
         let (keys, peers, expected) = (keys.clone(), peers.clone(), expected.to_string());
         std::thread::spawn(move || {
-            let result = resolve(&candidate)
-                .and_then(|addr| Client::connect(addr, &keys, &peers, Some(&expected), timeout));
+            let expected = Some(expected.as_str());
+            let result = match waits {
+                Waits::Each(timeout) => resolve(&candidate)
+                    .and_then(|addr| Client::connect(addr, &keys, &peers, expected, timeout)),
+                // One point in time for all of it, the looking up of a name
+                // included: this thread is over by then.
+                Waits::AllBy(by, afterwards) => look_up_by(&candidate, by, resolve)
+                    .and_then(|addr| {
+                        Client::connect_by(addr, &keys, &peers, expected, by, afterwards)
+                    })
+                    // A host that has as many connections of this device waiting
+                    // as it holds closes a further one right after the handshake:
+                    // that is not a conversation that was opened.
+                    .and_then(|client| match client.closed_by_peer() {
+                        true => Err(istesso_link::Error::Closed),
+                        false => Ok(client),
+                    }),
+            };
             // Nobody listens any more once another address has won.
             let _ = sender.send((candidate, result));
         });
     }
     drop(sender);
 
-    // Name resolution has no timeout of its own, so the wait is bounded here.
-    let deadline = Instant::now() + timeout * 3;
+    let deadline = match waits {
+        // Name resolution has no timeout of its own, so the wait is bounded here.
+        Waits::Each(timeout) => Instant::now() + timeout * 3,
+        Waits::AllBy(by, _) => by,
+    };
     let mut best: Option<istesso_link::Error> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -416,6 +618,87 @@ fn resolve(candidate: &str) -> istesso_link::Result<SocketAddr> {
         .or(addresses.first())
         .copied()
         .ok_or_else(not_found)
+}
+
+/// One looking up of a name that is under way, and what it found.
+struct LookUp {
+    /// `None` until it is over; then the address, or that there is none.
+    found: Mutex<Option<Option<SocketAddr>>>,
+    over: Condvar,
+}
+
+/// The names that are being looked up at this moment.
+static LOOKED_UP: Mutex<BTreeMap<String, Arc<LookUp>>> = Mutex::new(BTreeMap::new());
+
+/// What `look_up` finds for `candidate`, if it finds it by `by`.
+///
+/// Looking a name up cannot be given a time limit, and cannot be stopped:
+/// when the network is away it may take the system many seconds. So it is
+/// done on a thread of its own, and whoever asks waits for it only until
+/// `by`: a try at connecting that is addressed by name ends at its deadline
+/// like any other. While a name is being looked up, nobody starts looking
+/// it up again: everybody who asks meanwhile waits for the one answer, each
+/// until its own deadline. Tries that follow each other every half second
+/// therefore leave one thread behind for a name that does not resolve, and
+/// not one each.
+///
+/// An address in numbers is not looked up at all.
+fn look_up_by(
+    candidate: &str,
+    by: Instant,
+    look_up: fn(&str) -> istesso_link::Result<SocketAddr>,
+) -> istesso_link::Result<SocketAddr> {
+    if let Ok(addr) = candidate.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let under_way = {
+        let mut looked_up = LOOKED_UP.lock().unwrap_or_else(|e| e.into_inner());
+        match looked_up.get(candidate) {
+            Some(under_way) => under_way.clone(),
+            None => {
+                let new = Arc::new(LookUp {
+                    found: Mutex::new(None),
+                    over: Condvar::new(),
+                });
+                let (name, mine) = (candidate.to_string(), new.clone());
+                let spawned = std::thread::Builder::new()
+                    .name("istesso-look-up".into())
+                    .spawn(move || {
+                        let found = look_up(&name).ok();
+                        // The next one who asks looks the name up anew.
+                        LOOKED_UP
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&name);
+                        *mine.found.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+                        mine.over.notify_all();
+                    });
+                spawned.map_err(istesso_link::Error::Io)?;
+                looked_up.insert(candidate.to_string(), new.clone());
+                new
+            }
+        }
+    };
+    let mut found = under_way.found.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(found) = *found {
+            return found.ok_or_else(|| {
+                istesso_link::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{candidate} does not resolve to an address"),
+                ))
+            });
+        }
+        let left = by
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(istesso_link::Error::Timeout)?;
+        found = under_way
+            .over
+            .wait_timeout(found, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
 }
 
 /// How much an error tells the user about what to do. When several
@@ -839,6 +1122,248 @@ mod tests {
         assert_eq!(port_of("studio.local:47801"), 47801);
         assert_eq!(port_of("studio.local"), DEFAULT_PORT);
         assert_eq!(port_of("[::1]:6000"), 6000);
+    }
+
+    static LOOKED_UP_AND_STUCK: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Looking a name up when the network is away: it takes the system a
+    /// long time to say that it found nothing.
+    fn stuck(_name: &str) -> istesso_link::Result<SocketAddr> {
+        LOOKED_UP_AND_STUCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1500));
+        Err(istesso_link::Error::Timeout)
+    }
+
+    fn found(_name: &str) -> istesso_link::Result<SocketAddr> {
+        Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)))
+    }
+
+    #[test]
+    fn looking_a_name_up_ends_with_the_try_and_is_not_begun_again_meanwhile() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let name = "a-name-that-takes-long.invalid:47801";
+        // Four tries, one after the other, each with a fifth of a second.
+        for _ in 0..4 {
+            let began = Instant::now();
+            let result = look_up_by(name, began + Duration::from_millis(200), stuck);
+            let took = began.elapsed();
+            assert!(
+                matches!(result, Err(istesso_link::Error::Timeout)),
+                "{:?}",
+                result.err()
+            );
+            assert!(
+                took >= Duration::from_millis(150) && took < Duration::from_millis(700),
+                "the name was waited for {took:?}"
+            );
+        }
+        // All four waited for the one looking up that was under way.
+        assert_eq!(LOOKED_UP_AND_STUCK.load(SeqCst), 1);
+
+        // When that is over, the next try looks the name up anew.
+        let began = Instant::now();
+        while LOOKED_UP.lock().unwrap().contains_key(name) {
+            assert!(began.elapsed() < Duration::from_secs(5), "it never ends");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let by = Instant::now() + Duration::from_secs(5);
+        assert_eq!(look_up_by(name, by, found).unwrap().port(), 4242);
+
+        // An address in numbers is not looked up at all, deadline or not.
+        let numbers = SocketAddr::from((Ipv4Addr::LOCALHOST, 47801));
+        let past = Instant::now();
+        assert_eq!(
+            look_up_by(&numbers.to_string(), past, stuck).unwrap(),
+            numbers
+        );
+        assert_eq!(LOOKED_UP_AND_STUCK.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn a_try_has_one_deadline_for_all_of_it() {
+        let air = Device::new("air");
+        let ubuntu = Device::new("ubuntu");
+        pair(&air, &ubuntu);
+        // Something takes the connection there and never says a word.
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        air.knows_address_of(&ubuntu, silent.local_addr().unwrap());
+
+        let began = Instant::now();
+        let result = connect_peer_within(&air.paths(), "ubuntu", None, Duration::from_millis(300));
+        let took = began.elapsed();
+        assert!(
+            matches!(
+                result,
+                Err(ConnectFailure::Link(istesso_link::Error::Timeout))
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            took >= Duration::from_millis(250) && took < Duration::from_millis(900),
+            "the try took {took:?}"
+        );
+
+        // A device that is there is reached the same way.
+        let addr = ubuntu.start_agent();
+        let far = Device::new("far");
+        pair(&far, &ubuntu);
+        far.knows_address_of(&ubuntu, addr);
+        let mut client =
+            connect_peer_within(&far.paths(), "ubuntu", None, Duration::from_secs(2)).unwrap();
+        client.ping().unwrap();
+    }
+
+    fn names(addresses: &[&str]) -> Vec<String> {
+        addresses.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// A try at opening a conversation again is one connection, to the
+    /// address it last worked at. The device's other addresses come in
+    /// after eight tries, one of them in every fourth try, each in turn.
+    #[test]
+    fn a_try_goes_to_the_last_address_and_now_and_then_to_one_other() {
+        let air = Device::new("air");
+        let (a, b, c) = ("a.invalid:47801", "b.invalid:47801", "c.invalid:47801");
+        let remembered = names(&[b, a, c]);
+        let reaching = Reaching::new(air.paths(), "ubuntu", None, Some(a.to_string()));
+        let mut went: Vec<Vec<String>> = Vec::new();
+        for _ in 0..21 {
+            went.push(reaching.targets(&remembered));
+        }
+        for (made, targets) in went.iter().enumerate() {
+            let expected = match made {
+                8 | 16 => names(&[a, b]),
+                12 | 20 => names(&[a, c]),
+                _ => names(&[a]),
+            };
+            assert_eq!(*targets, expected, "try {made}");
+        }
+        // Never more than two connections in a try, and in eight tries that
+        // follow each other never more than ten in all.
+        let most = went.windows(8).map(|eight| eight.concat().len()).max();
+        assert_eq!(most, Some(10));
+
+        // With one address there is nothing to take turns.
+        let one = Reaching::new(air.paths(), "ubuntu", None, None);
+        for _ in 0..21 {
+            assert_eq!(one.targets(&names(&[a])), names(&[a]));
+        }
+        // Without an address that worked, or with one the device is not
+        // remembered at any more, the first one remembered is the one.
+        let none = Reaching::new(air.paths(), "ubuntu", None, Some("gone.invalid:1".into()));
+        assert_eq!(none.targets(&remembered), names(&[b]));
+    }
+
+    /// The same with connections: a device that has moved to another of
+    /// its addresses is found there, the address it was at gets one
+    /// connection for every try, and once it is found the tries go to
+    /// where it is.
+    #[test]
+    fn a_device_that_moved_is_found_at_another_of_its_addresses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let air = Device::new("air");
+        let ubuntu = Device::new("ubuntu");
+        pair(&air, &ubuntu);
+        // Where it was: something takes the connection and never says a word.
+        let was = TcpListener::bind("127.0.0.1:0").unwrap();
+        let was_at = was.local_addr().unwrap();
+        let came = Arc::new(AtomicUsize::new(0));
+        let counted = came.clone();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            for stream in was.incoming().flatten() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                kept.push(stream);
+            }
+        });
+        // Where it is now, and an address at which nothing is.
+        let is_at = ubuntu.start_agent();
+        air.knows_address_of(&ubuntu, was_at);
+        air.knows_address_of(&ubuntu, dead_address());
+        air.knows_address_of(&ubuntu, is_at);
+
+        let reaching = Reaching::new(air.paths(), "ubuntu", None, Some(was_at.to_string()));
+        // (Tries to an address that says nothing are given little time here, so
+        // that the test is short; one that may reach the device has the time a
+        // try has.)
+        let within = Duration::from_secs(2);
+        // Eight tries to where it was, and nowhere else.
+        for made in 0..8 {
+            let result = reaching.open(Duration::from_millis(150));
+            assert!(
+                matches!(
+                    result,
+                    Err(ConnectFailure::Link(istesso_link::Error::Timeout))
+                ),
+                "try {made}: {:?}",
+                result.err()
+            );
+        }
+        // The ninth also goes to one other address: the one remembered next.
+        let mut client = reaching.open(within).expect("the device was not found");
+        client.ping().unwrap();
+        let began = Instant::now();
+        while came.load(Ordering::SeqCst) < 9 {
+            assert!(
+                began.elapsed() < Duration::from_secs(3),
+                "a try left it out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // From here on the tries go to where it is, and only there.
+        for _ in 0..3 {
+            reaching.open(within).unwrap().ping().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(came.load(Ordering::SeqCst), 9);
+    }
+
+    /// A connection that the host closed right after the handshake is not
+    /// one that was opened: it can be told from one that is there.
+    #[test]
+    fn a_connection_that_the_host_closed_can_be_told() {
+        let air = Device::new("air");
+        let ubuntu = Device::new("ubuntu");
+        pair(&air, &ubuntu);
+        // A host that lets the device in, and closes at once: what one does
+        // that has as many connections of the device waiting as it holds.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closes_at = listener.local_addr().unwrap();
+        let paths = ubuntu.paths();
+        std::thread::spawn(move || {
+            let identity = Identity::load_or_create(&paths.identity()).unwrap();
+            let keys = LocalKeys::new(&identity).unwrap();
+            for stream in listener.incoming().flatten() {
+                let peers = PeerStore::open(paths.peers()).unwrap();
+                drop(Session::accept(
+                    stream,
+                    &keys,
+                    &peers,
+                    Duration::from_secs(5),
+                ));
+            }
+        });
+        let identity = Identity::load_or_create(&air.paths().identity()).unwrap();
+        let keys = LocalKeys::new(&identity).unwrap();
+        let peers = PeerStore::open(air.paths().peers()).unwrap();
+        let wait = Duration::from_secs(3);
+        let closed = Client::connect(closes_at, &keys, &peers, None, wait).unwrap();
+        let began = Instant::now();
+        while !closed.closed_by_peer() {
+            assert!(began.elapsed() < wait, "it looks open");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // One that is there does not look closed, before it has asked for
+        // anything or after.
+        let stays_at = ubuntu.start_agent();
+        let mut open = Client::connect(stays_at, &keys, &peers, None, wait).unwrap();
+        assert!(!open.closed_by_peer());
+        open.ping().unwrap();
+        assert!(!open.closed_by_peer());
     }
 
     #[test]

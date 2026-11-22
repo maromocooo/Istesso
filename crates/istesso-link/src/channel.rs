@@ -198,6 +198,76 @@ pub struct Channel<S> {
 }
 
 impl Channel<TcpStream> {
+    /// Opens a channel as the connecting side, as [`Channel::initiate`]
+    /// does, with the whole handshake over by `by`, however slowly the other
+    /// device answers: a caller that makes several tries at once gives each
+    /// of them one point in time at which it ends, and not as many waits as
+    /// the handshake has reads. Afterwards each wait for the other device
+    /// may take `timeout`. Only the waiting differs; what is exchanged is
+    /// what [`Channel::initiate`] exchanges.
+    pub fn initiate_by(
+        stream: TcpStream,
+        keys: &LocalKeys,
+        by: Instant,
+        timeout: Duration,
+        accept: impl FnOnce(&[u8; 32]) -> Result<()>,
+    ) -> Result<Self> {
+        let hurried = Hurried {
+            stream: &stream,
+            until: by,
+        };
+        let Channel {
+            transport,
+            peer_key,
+            scratch,
+            ..
+        } = Channel::initiate(hurried, keys, accept)?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|_| stream.set_write_timeout(Some(timeout)))
+            .map_err(Error::from_io)?;
+        Ok(Channel {
+            stream,
+            transport,
+            peer_key,
+            scratch,
+        })
+    }
+
+    /// As [`Channel::recv`], with the whole message there by `by`, however
+    /// slowly the other device sends it: every read is given what is left
+    /// of the time, not a wait of its own. A device that sends a byte now
+    /// and then gets no further than one that sends nothing.
+    ///
+    /// Afterwards the connection's wait for a read is whatever was left at
+    /// the last one: whoever goes on reading sets it anew.
+    pub fn recv_by(&mut self, by: Instant) -> Result<Vec<u8>> {
+        let mut hurried = Hurried {
+            stream: &self.stream,
+            until: by,
+        };
+        receive(&mut hurried, &mut self.transport, &mut self.scratch)
+    }
+
+    /// As [`Channel::send`], with the whole message on its way by `by`,
+    /// however little the other device takes at a time: every write is
+    /// given what is left of the time, not a wait of its own. A device that
+    /// reads nothing holds the sender no longer than one that reads
+    /// everything.
+    ///
+    /// When the time runs out, part of the message may have gone: as after
+    /// any error, the channel must be dropped. Afterwards the connection's
+    /// wait for a write is whatever was left at the last one: whoever goes
+    /// on writing sets it anew.
+    pub fn send_by(&mut self, message: &[u8], by: Instant) -> Result<()> {
+        let wire = self.seal(message)?;
+        let mut hurried = Hurried {
+            stream: &self.stream,
+            until: by,
+        };
+        write_all(&mut hurried, &wire)
+    }
+
     /// Opens a channel as the answering side, as [`Channel::respond`] does,
     /// with the whole handshake over `within` this time, however slowly the
     /// other device sends. Until it is over nobody knows who is calling: a
@@ -342,6 +412,15 @@ impl<S: Read + Write> Channel<S> {
 
     /// Sends one message.
     pub fn send(&mut self, message: &[u8]) -> Result<()> {
+        let wire = self.seal(message)?;
+        write_all(&mut self.stream, &wire)
+    }
+
+    /// Seals one message into the bytes that go onto the wire for it. What
+    /// [`Channel::send`] does before it writes; apart from it only so that
+    /// the same bytes can be written with one deadline for all of them
+    /// ([`Channel::send_by`]). Nothing differs but the waiting.
+    fn seal(&mut self, message: &[u8]) -> Result<Vec<u8>> {
         if message.len() > MAX_MESSAGE {
             return Err(Error::TooLarge);
         }
@@ -360,47 +439,58 @@ impl<S: Read + Write> Channel<S> {
                 .map_err(Error::crypto)?;
             encode_frame(&mut wire, &self.scratch[..n]);
         }
-        write_all(&mut self.stream, &wire)
+        Ok(wire)
     }
 
     /// Waits for the next message. [`Error::Closed`] means the other end hung
     /// up.
     pub fn recv(&mut self) -> Result<Vec<u8>> {
-        let mut plain: Vec<u8> = Vec::new();
-        let mut expected: Option<usize> = None;
-        loop {
-            let frame = read_frame(&mut self.stream, MAX_FRAME)?;
-            let n = self
-                .transport
-                .read_message(&frame, &mut self.scratch)
-                .map_err(Error::crypto)?;
-            if n == 0 {
-                return Err(Error::Malformed);
-            }
-            plain.extend_from_slice(&self.scratch[..n]);
+        receive(&mut self.stream, &mut self.transport, &mut self.scratch)
+    }
+}
 
-            let total = match expected {
-                Some(total) => total,
-                None => {
-                    if plain.len() < 4 {
-                        return Err(Error::Malformed);
-                    }
-                    let len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
-                    if len > MAX_MESSAGE {
-                        return Err(Error::TooLarge);
-                    }
-                    expected = Some(4 + len);
-                    4 + len
+/// Reads one message from `stream` and opens it. What [`Channel::recv`]
+/// does; apart from it only so that the same reading can be given one
+/// deadline for all of it ([`Channel::recv_by`]). Nothing differs but the
+/// waiting.
+fn receive<R: Read>(
+    stream: &mut R,
+    transport: &mut snow::TransportState,
+    scratch: &mut [u8],
+) -> Result<Vec<u8>> {
+    let mut plain: Vec<u8> = Vec::new();
+    let mut expected: Option<usize> = None;
+    loop {
+        let frame = read_frame(stream, MAX_FRAME)?;
+        let n = transport
+            .read_message(&frame, scratch)
+            .map_err(Error::crypto)?;
+        if n == 0 {
+            return Err(Error::Malformed);
+        }
+        plain.extend_from_slice(&scratch[..n]);
+
+        let total = match expected {
+            Some(total) => total,
+            None => {
+                if plain.len() < 4 {
+                    return Err(Error::Malformed);
                 }
-            };
-            match plain.len().cmp(&total) {
-                Ordering::Less => continue,
-                Ordering::Equal => {
-                    plain.drain(..4);
-                    return Ok(plain);
+                let len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+                if len > MAX_MESSAGE {
+                    return Err(Error::TooLarge);
                 }
-                Ordering::Greater => return Err(Error::Malformed),
+                expected = Some(4 + len);
+                4 + len
             }
+        };
+        match plain.len().cmp(&total) {
+            Ordering::Less => continue,
+            Ordering::Equal => {
+                plain.drain(..4);
+                return Ok(plain);
+            }
+            Ordering::Greater => return Err(Error::Malformed),
         }
     }
 }
@@ -622,6 +712,135 @@ mod tests {
             .write_all(&(MAX_HANDSHAKE_FRAME as u16 + 1).to_be_bytes())
             .unwrap();
         assert!(matches!(server.join().unwrap(), Err(Error::Malformed)));
+    }
+
+    /// A connection that also keeps what was written to it, as it went
+    /// onto the wire.
+    struct Tapped {
+        stream: TcpStream,
+        written: Vec<u8>,
+    }
+
+    impl Read for Tapped {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.stream.read(buf)
+        }
+    }
+
+    impl Write for Tapped {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = self.stream.write(buf)?;
+            self.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    /// One try of a device at reaching a host: its own keys for the key
+    /// exchange, its own handshake, its own channel.
+    fn a_try(device: &Identity, host: &Identity) -> (Channel<Tapped>, Channel<TcpStream>) {
+        let (listener, addr) = listener();
+        let host_keys = LocalKeys::new(host).unwrap();
+        let server =
+            thread::spawn(move || Channel::respond(accept(&listener), &host_keys, |_| true));
+        let tapped = Tapped {
+            stream: connect(addr),
+            written: Vec::new(),
+        };
+        let keys = LocalKeys::new(device).unwrap();
+        let client = Channel::initiate(tapped, &keys, |_| Ok(())).unwrap();
+        (client, server.join().unwrap().unwrap())
+    }
+
+    /// Test 12 of ADR 0007: two tries of the same device to the same host,
+    /// made at the same time, share neither keys nor counters.
+    #[test]
+    fn two_tries_of_one_device_share_no_key_and_no_counter() {
+        let device = Identity::generate();
+        let host = Identity::generate();
+        let (mut one, mut one_host) = a_try(&device, &host);
+        let (mut two, mut two_host) = a_try(&device, &host);
+        // Both are the same device to the host, and the same host to the device.
+        assert_eq!(one_host.peer_key(), two_host.peer_key());
+        assert_eq!(one.peer_key(), two.peer_key());
+
+        // The same first message on both: what goes onto the wire differs,
+        // although content, length and counter (the first of each) are the same.
+        let (before_one, before_two) = (one.stream.written.len(), two.stream.written.len());
+        one.send(b"use this one").unwrap();
+        two.send(b"use this one").unwrap();
+        let sealed_one = one.stream.written[before_one..].to_vec();
+        let sealed_two = two.stream.written[before_two..].to_vec();
+        assert_eq!(sealed_one.len(), sealed_two.len());
+        assert_ne!(sealed_one, sealed_two);
+        assert_eq!(one_host.recv().unwrap(), b"use this one");
+        assert_eq!(two_host.recv().unwrap(), b"use this one");
+
+        // Sent in turns, each channel counts for itself: everything arrives,
+        // in order, on the channel it was sent on, in both directions.
+        for round in 0..20u8 {
+            one.send(&[round]).unwrap();
+            if round % 3 == 0 {
+                two.send(&[round, round]).unwrap();
+                assert_eq!(two_host.recv().unwrap(), [round, round]);
+                two_host.send(&[round]).unwrap();
+                assert_eq!(two.recv().unwrap(), [round]);
+            }
+            assert_eq!(one_host.recv().unwrap(), [round]);
+        }
+
+        // What one try sealed does not open on the other: a message of the
+        // first, put on the wire of the second, ends the second.
+        let before = one.stream.written.len();
+        one.send(b"for the first only").unwrap();
+        let foreign = one.stream.written[before..].to_vec();
+        two.stream.stream.write_all(&foreign).unwrap();
+        assert!(matches!(two_host.recv(), Err(Error::Crypto(_))));
+        // The first is none the worse for it.
+        assert_eq!(one_host.recv().unwrap(), b"for the first only");
+        one.send(b"still here").unwrap();
+        assert_eq!(one_host.recv().unwrap(), b"still here");
+    }
+
+    /// The whole handshake of the connecting side has one deadline, as the
+    /// answering side's has: a host that answers a byte at a time does not
+    /// keep a try beyond its time.
+    #[test]
+    fn the_connecting_side_gives_the_handshake_one_deadline() {
+        let (listener, addr) = listener();
+        let slow = thread::spawn(move || {
+            let mut stream = accept(&listener);
+            // The version, then the length of a handshake message and its
+            // bytes one by one, each well inside a single wait.
+            let _ = stream.write_all(b"ISC1");
+            let _ = stream.write_all(&[0x00, 0x60]);
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(40));
+                if stream.write_all(&[0]).is_err() {
+                    return;
+                }
+            }
+        });
+        let keys = LocalKeys::new(&Identity::generate()).unwrap();
+        let began = Instant::now();
+        let result = Channel::initiate_by(
+            TcpStream::connect(addr).unwrap(),
+            &keys,
+            began + Duration::from_millis(300),
+            TIMEOUT,
+            |_| Ok(()),
+        );
+        let took = began.elapsed();
+        assert!(matches!(result, Err(Error::Timeout)), "{:?}", result.err());
+        assert!(
+            took >= Duration::from_millis(250) && took < Duration::from_millis(900),
+            "the host was waited for {took:?}"
+        );
+        drop(result);
+        slow.join().unwrap();
     }
 
     #[test]

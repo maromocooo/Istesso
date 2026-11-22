@@ -720,8 +720,10 @@ pub unsafe extern "C" fn istesso_media_watch_open(
             addr.ok_or_else(|| Error::Refused("no address to connect to was given".into()))?;
         let addr = address(&addr)?;
         Ok(Lasting::new(
-            Box::new(move |began_with, within| {
-                // Read anew for every connection: the pairing may have changed.
+            std::sync::Arc::new(move |began_with, within| {
+                // Read anew for every connection: the pairing may have changed. And
+                // made anew: of the tries at connecting again, several run at once,
+                // and each has its own keys.
                 let paths = paths(dir.clone());
                 let keys = LocalKeys::new(&identity(&paths)?)?;
                 let peers = PeerStore::open(paths.peers())?;
@@ -738,7 +740,7 @@ pub unsafe extern "C" fn istesso_media_watch_open(
                     ),
                     (None, None) => None,
                 };
-                Viewer::connect(addr, &keys, &peers, expected.as_deref(), within)
+                Viewer::open(addr, &keys, &peers, expected.as_deref(), within)
             }),
             None,
         ))
