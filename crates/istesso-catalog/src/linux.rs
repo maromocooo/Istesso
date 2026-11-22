@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use istesso_proto::{AppEntry, Launch, OsFamily};
 
+use crate::{read_small_file, MAX_ENTRY_BYTES};
+
 /// Parses the text of a `.desktop` file.
 ///
 /// Returns `None` for entries that are not launchable applications or that
@@ -122,6 +124,7 @@ pub fn default_dirs() -> Vec<PathBuf> {
 
 /// Reads every desktop entry in `dirs`. When the same desktop id appears in
 /// several directories the first one wins, as the specification requires.
+/// Skips entries that are not regular files or are larger than 1 MiB.
 pub fn scan(dirs: &[PathBuf]) -> Vec<AppEntry> {
     let mut seen = HashSet::new();
     let mut apps = Vec::new();
@@ -143,7 +146,10 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<AppEntry> {
             if !seen.insert(desktop_id.clone()) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Some(bytes) = read_small_file(&path, MAX_ENTRY_BYTES) else {
+                continue;
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
                 continue;
             };
             if let Some(app) = parse_desktop_entry(&text, &desktop_id) {
@@ -214,6 +220,29 @@ mod tests {
         assert_eq!(strip_field_codes("app %u --flag %i"), "app --flag");
         assert_eq!(strip_field_codes("echo 100%%"), "echo 100%");
         assert_eq!(strip_field_codes("app %"), "app");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_skips_special_and_oversized_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "istesso-catalog-linux-special-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("ok.desktop"), FIREFOX).unwrap();
+        crate::tests::make_fifo(&root.join("pipe.desktop"));
+        std::os::unix::fs::symlink("/dev/zero", root.join("zero.desktop")).unwrap();
+        let mut big = FIREFOX.as_bytes().to_vec();
+        big.resize(MAX_ENTRY_BYTES as usize + 1, b' ');
+        std::fs::write(root.join("big.desktop"), big).unwrap();
+        std::fs::create_dir(root.join("dir.desktop")).unwrap();
+
+        let dirs = [root.clone()];
+        let apps = crate::tests::with_timeout(move || scan(&dirs));
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].id, "ok.desktop");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

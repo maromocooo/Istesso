@@ -27,6 +27,33 @@ pub mod exec;
 pub mod find;
 pub mod table;
 pub mod tasks;
+mod volume;
+
+pub use volume::validate_ownership_setting;
+
+use std::borrow::Cow;
+
+/// Escapes control characters, bidirectional formatting and zero-width
+/// characters in text printed for a person.
+pub fn shown(text: &str) -> Cow<'_, str> {
+    let needs_escape = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+    };
+    if !text.contains(needs_escape) {
+        return Cow::Borrowed(text);
+    }
+    let mut line = String::with_capacity(text.len());
+    for c in text.chars() {
+        if needs_escape(c) {
+            line.extend(c.escape_debug());
+        } else {
+            line.push(c);
+        }
+    }
+    Cow::Owned(line)
+}
 
 /// Exit codes of the `istesso-route` command.
 ///
@@ -112,6 +139,34 @@ pub fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_escapes_controls() {
+        assert_eq!(
+            shown("ノート\"\\\x1b\x07\r\n\t\0\x7f\u{9b}"),
+            r#"ノート"\\u{1b}\u{7}\r\n\t\0\u{7f}\u{9b}"#
+        );
+    }
+
+    #[test]
+    fn shown_escapes_bidirectional_and_zero_width_characters() {
+        let text = "\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\
+                    \u{2066}\u{2067}\u{2068}\u{2069}\u{200b}\u{200c}\u{200d}\u{2060}\u{feff}";
+        for c in text.chars() {
+            assert_eq!(
+                shown(&format!("a{c}b")),
+                format!("a{}b", c.escape_unicode())
+            );
+        }
+    }
+
+    #[test]
+    fn shown_borrows_plain_text() {
+        let samples = ["tower", "ノート", "\"", "\\"]; // check-private: ok - fictional fixture names
+        for text in samples {
+            assert!(matches!(shown(text), Cow::Borrowed(s) if s == text));
+        }
+    }
 
     #[test]
     fn times_are_written_in_utc() {

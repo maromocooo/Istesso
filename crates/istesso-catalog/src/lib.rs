@@ -9,8 +9,33 @@ pub mod linux;
 pub mod macos;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::Path;
 
 use istesso_proto::{AppEntry, AppInstance, Badge, HostApps, HostState, OsFamily, UnifiedApp};
+
+/// Maximum size of a desktop entry or bundle Info.plist, in bytes.
+const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
+
+/// Reads a regular file, following links and skipping FIFOs, sockets, devices and directories.
+/// Checking the path before opening it avoids waiting for a FIFO writer. The scanned folders
+/// belong to the user or root. A same-user swap to a FIFO between the check and open is
+/// outside this guard. We recheck the open handle and bound the read to cap memory use
+/// even if the file grows.
+fn read_small_file(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
 
 /// Lists the applications installed on this machine.
 pub fn scan_local() -> Vec<AppEntry> {
@@ -133,6 +158,55 @@ pub fn merge(hosts: &[HostApps]) -> Vec<UnifiedApp> {
 mod tests {
     use super::*;
     use istesso_proto::{HostRef, Launch};
+
+    #[cfg(unix)]
+    pub(super) fn make_fifo(path: &Path) {
+        assert!(std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[cfg(unix)]
+    pub(super) fn with_timeout<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(work()).unwrap());
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("file read or scan did not finish")
+    }
+
+    #[test]
+    fn reads_files_up_to_the_size_limit() {
+        let root =
+            std::env::temp_dir().join(format!("istesso-catalog-limit-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("entry");
+        assert!(read_small_file(&path, MAX_ENTRY_BYTES).is_none());
+        let mut bytes = vec![b'x'; MAX_ENTRY_BYTES as usize];
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            read_small_file(&path, MAX_ENTRY_BYTES).as_deref(),
+            Some(bytes.as_slice())
+        );
+        bytes.push(b'x');
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_small_file(&path, MAX_ENTRY_BYTES).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_a_fifo_without_waiting_for_a_writer() {
+        let root =
+            std::env::temp_dir().join(format!("istesso-catalog-fifo-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let pipe = root.join("pipe");
+        make_fifo(&pipe);
+        assert!(with_timeout(move || read_small_file(&pipe, MAX_ENTRY_BYTES)).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn host(id: &str, state: HostState, local: bool, load: f32, wake: bool) -> HostRef {
         HostRef {

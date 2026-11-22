@@ -1033,6 +1033,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "istesso-proto",
+ "libc",
  "serde_json",
 ]
 

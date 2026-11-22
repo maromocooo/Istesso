@@ -121,8 +121,12 @@ mod real {
                 "{} ({:04x}:{:04x}), adapter {}",
                 device.product, device.id.vendor, device.id.product, device.adapter
             );
-            for name in software::running(device.entry.declaration.other_software) {
+            let look = software::look(device.entry.declaration.other_software);
+            for name in look.running {
                 println!("  in use by {name}: Istesso keeps its hands off while it runs");
+            }
+            for name in look.cannot_tell {
+                println!("  cannot tell whether {name} runs: Istesso keeps its hands off");
             }
         }
         Ok(ExitCode::SUCCESS)
@@ -188,11 +192,18 @@ mod real {
             device.product, device.id.vendor, device.id.product, device.adapter
         );
 
-        let busy = software::running(device.entry.declaration.other_software);
-        if !busy.is_empty() {
+        let look = software::look(device.entry.declaration.other_software);
+        if !look.running.is_empty() {
             println!(
                 "In use by {}. Istesso does not touch the device while it runs.",
-                busy.join(", ")
+                look.running.join(", ")
+            );
+            return Ok(ExitCode::from(4));
+        }
+        if !look.cannot_tell.is_empty() {
+            println!(
+                "Cannot tell whether {} runs. Istesso does not touch the device while it cannot tell.",
+                look.cannot_tell.join(", ")
             );
             return Ok(ExitCode::from(4));
         }
