@@ -6,6 +6,10 @@
 //! * [`encoder`], [`pump`] (macOS only): H.265 from the Mac's own encoder
 //!   (VideoToolbox), paced like a display, with the time each step took.
 //!   Needs no permission.
+//! * [`keep_awake`], [`feed`] (the second macOS only): while a device is
+//!   shown the session, the last picture is handed to the encoder again 20
+//!   times a second when nothing changes, so that the encoder does not slow
+//!   down; held back for 50 ms after an input. A setting switches it off.
 //! * [`pace`]: when pictures are handed over — a steady stream, or a still
 //!   screen with a change now and then.
 //! * [`annexb`]: from the encoder's bytes to what the picture's transport
@@ -34,6 +38,7 @@
 pub mod annexb;
 pub mod contract;
 pub mod input;
+pub mod keep_awake;
 pub mod keys;
 pub mod pace;
 pub mod picture;
@@ -44,6 +49,8 @@ pub mod stats;
 pub mod displays;
 #[cfg(target_os = "macos")]
 pub mod encoder;
+#[cfg(target_os = "macos")]
+pub mod feed;
 #[cfg(target_os = "macos")]
 pub mod pump;
 #[cfg(target_os = "macos")]
